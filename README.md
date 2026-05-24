@@ -140,24 +140,26 @@ $env:OPENAI_API_KEY = "sk-..."
 
 路径：`~/.agentgo/config.json`
 
+```json
 {
-"model": "deepseek-v4-pro",
-"provider": {
-"name": "deepseek",
-"api_key": "sk-xxx"
-},
-"permission_mode": "default",
-"max_budget_usd": 10,
-"thinking_tokens": 16000,
-"system_prompt": "",
-"mcp_servers": {
-"filesystem": {
-"command": "npx",
-"args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"],
-"type": "stdio"
+  "model": "deepseek-v4-pro",
+  "provider": {
+    "name": "deepseek",
+    "api_key": "***"
+  },
+  "permission_mode": "default",
+  "max_budget_usd": 10,
+  "thinking_tokens": 16000,
+  "system_prompt": "",
+  "mcp_servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"],
+      "type": "stdio"
+    }
+  }
 }
-}
-}
+```
 
 ### 项目级覆盖
 
