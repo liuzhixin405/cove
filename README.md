@@ -42,6 +42,7 @@ python scripts/release_build.py v1.0.1
 ```
 
 产物输出到：
+
 - `dist/v1.0.1/agentgo-v1.0.1-windows-amd64.zip`
 - `dist/v1.0.1/agentgo-v1.0.1-linux-amd64.tar.gz`
 - `dist/v1.0.1/agentgo-v1.0.1-darwin-amd64.tar.gz`
@@ -70,14 +71,17 @@ agentgo --debug             # 调试模式
 首次进入 REPL 时，若未配置 API key，程序会按“当前厂商 -> 对应环境变量 -> 常见兼容厂商示例”的顺序给出提示。
 
 最简单的配置方式：
+
 - 在当前 REPL 直接执行 `/api-key <key>`
 - 或在启动前设置环境变量，然后用 `/config` 确认 `api_key_set: true`
 
 内置 provider：
+
 - 原生：`anthropic`、`deepseek`、`openai`
 - 兼容 OpenAI：`openai-compatible`、`glm`、`kimi`、`qwen`、`doubao`、`openrouter`、`siliconflow`、`groq`、`together`、`fireworks`、`xai`、`mistral`
 
 常见环境变量示例：
+
 - `ANTHROPIC_API_KEY`
 - `DEEPSEEK_API_KEY`
 - `OPENAI_API_KEY`
@@ -92,32 +96,33 @@ agentgo --debug             # 调试模式
 
 ## 常用 REPL 命令
 
-| 命令 | 说明 |
-| --- | --- |
-| `/model <name>` | 切换模型 |
-| `/provider <name>` | 切换 Provider |
-| `/api-key <key>` | 保存 API Key 到配置；无 key 时 REPL 也会提示此命令 |
-| `/base-url <url>` | 自定义 API 端点 |
-| `/mode <mode>` | 权限模式：`default\|plan\|auto\|bypass` |
-| `/budget <amount>` | 设置会话预算上限 |
-| `/cost` | 查看 token 用量和费用 |
-| `/config` | 查看完整配置 |
-| `/system <prompt>` | 自定义系统提示词 |
-| `/cd <path>` | 切换工作目录 |
-| `/context` | 查看当前上下文 |
-| `/compact` | 压缩对话历史 |
-| `/resume [id]` | 列出/恢复已保存会话 |
-| `/memory [add|list]` | 管理持久内存 |
-| `/commit [msg]` | git add + commit |
-| `/review` | 查看工作区变化 |
-| `/diff` | git diff |
-| `/doctor` | 系统诊断 |
-| `/mcp` | MCP 服务器管理 |
-| `/plugin` | 插件管理 |
-| `/skills` | 技能列表 |
-| `/export` | 导出对话 |
-| `/help` | 帮助 |
-| `/exit` | 退出 |
+
+| 命令               | 说明                                               |
+| ------------------ | -------------------------------------------------- |
+| `/model <name>`    | 切换模型                                           |
+| `/provider <name>` | 切换 Provider                                      |
+| `/api-key <key>`   | 保存 API Key 到配置；无 key 时 REPL 也会提示此命令 |
+| `/base-url <url>`  | 自定义 API 端点                                    |
+| `/mode <mode>`     | 权限模式：`default|plan|auto|bypass`               |
+| `/budget <amount>` | 设置会话预算上限                                   |
+| `/cost`            | 查看 token 用量和费用                              |
+| `/config`          | 查看完整配置                                       |
+| `/system <prompt>` | 自定义系统提示词                                   |
+| `/cd <path>`       | 切换工作目录                                       |
+| `/context`         | 查看当前上下文                                     |
+| `/compact`         | 压缩对话历史                                       |
+| `/resume [id]`     | 列出/恢复已保存会话                                |
+| `/memory [add      | list]`                                             |
+| `/commit [msg]`    | git add + commit                                   |
+| `/review`          | 查看工作区变化                                     |
+| `/diff`            | git diff                                           |
+| `/doctor`          | 系统诊断                                           |
+| `/mcp`             | MCP 服务器管理                                     |
+| `/plugin`          | 插件管理                                           |
+| `/skills`          | 技能列表                                           |
+| `/export`          | 导出对话                                           |
+| `/help`            | 帮助                                               |
+| `/exit`            | 退出                                               |
 
 ## 配置
 
@@ -135,27 +140,24 @@ $env:OPENAI_API_KEY = "sk-..."
 
 路径：`~/.agentgo/config.json`
 
-```json
 {
-  "model": "deepseek-chat",
-  "provider": {
-    "name": "deepseek",
-    "api_key": "sk-xxx",
-    "base_url": ""
-  },
-  "permission_mode": "default",
-  "max_budget_usd": 10,
-  "thinking_tokens": 16000,
-  "system_prompt": "",
-  "mcp_servers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"],
-      "type": "stdio"
-    }
-  }
+"model": "deepseek-v4-pro",
+"provider": {
+"name": "deepseek",
+"api_key": "sk-xxx"
+},
+"permission_mode": "default",
+"max_budget_usd": 10,
+"thinking_tokens": 16000,
+"system_prompt": "",
+"mcp_servers": {
+"filesystem": {
+"command": "npx",
+"args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"],
+"type": "stdio"
 }
-```
+}
+}
 
 ### 项目级覆盖
 
@@ -204,6 +206,7 @@ printf '/plugin list\n/exit\n' | ./agentgo.exe
 GitHub Actions 发布入口：`.github/workflows/release.yml`
 
 支持：
+
 - 推送 tag：`v*`
 - 手动触发 workflow_dispatch
 
