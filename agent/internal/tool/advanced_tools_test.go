@@ -113,15 +113,15 @@ func (f *fakeRuntimeSkillManager) All() []skills.Skill {
 }
 
 type fakeMCPToolPool struct {
-	servers      []*mcp.ManagedServer
-	tools        []mcp.ToolRef
-	callResult   *mcp.CallToolResult
-	callErr      error
-	readResult   *mcp.ReadResourceResult
-	readErr      error
+	servers    []*mcp.ManagedServer
+	tools      []mcp.ToolRef
+	callResult *mcp.CallToolResult
+	callErr    error
+	readResult *mcp.ReadResourceResult
+	readErr    error
 }
 
-func (f *fakeMCPToolPool) AllTools() []mcp.ToolRef { return f.tools }
+func (f *fakeMCPToolPool) AllTools() []mcp.ToolRef          { return f.tools }
 func (f *fakeMCPToolPool) AllServers() []*mcp.ManagedServer { return f.servers }
 func (f *fakeMCPToolPool) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
 	return f.callResult, f.callErr
@@ -253,8 +253,8 @@ func TestTaskUpdateNotFound(t *testing.T) {
 
 	tu := NewTaskUpdateTool()
 	result, _ := tu.Call(context.Background(), Input{"taskId": "nonexistent", "status": "completed"}, ctx)
-	if result.IsError {
-		t.Errorf("task update for non-existent should not error: %s", result.Data)
+	if !result.IsError {
+		t.Errorf("task update for non-existent should error")
 	}
 }
 
@@ -266,8 +266,8 @@ func TestAgentTool(t *testing.T) {
 
 	// Without agent runner
 	result, _ := ta.Call(context.Background(), Input{"type": "general", "prompt": "do something"}, Context{})
-	if result.IsError {
-		t.Errorf("agent without runner failed: %s", result.Data)
+	if !result.IsError {
+		t.Errorf("agent without runner should report unavailable runner")
 	}
 
 	perm := ta.CheckPermissions(nil, Context{})
@@ -321,6 +321,9 @@ func TestCronTool(t *testing.T) {
 	if len(rt.Tasks) == 0 {
 		t.Fatal("cron should create a runtime task record")
 	}
+	if len(rt.CronSchedules) != 1 {
+		t.Fatalf("cron should create a schedule record, got %d", len(rt.CronSchedules))
+	}
 }
 
 func TestLSPTool(t *testing.T) {
@@ -329,7 +332,7 @@ func TestLSPTool(t *testing.T) {
 		t.Errorf("expected name 'lsp', got %q", tl.Def().Name)
 	}
 
-	result, _ := tl.Call(context.Background(), Input{"action": "diagnostics", "filePath": "test.go"}, Context{})
+	result, _ := tl.Call(context.Background(), Input{"action": "hover", "filePath": "test.go"}, Context{})
 	if !result.IsError {
 		t.Fatalf("lsp without backend should surface an error, got %q", result.Data)
 	}
@@ -365,6 +368,9 @@ func TestTeamTools(t *testing.T) {
 	}
 	if len(rt.Tasks) != 2 {
 		t.Fatalf("expected team members mirrored into runtime tasks, got %d", len(rt.Tasks))
+	}
+	if _, ok := rt.Teams["alpha"]; !ok {
+		t.Fatalf("expected team record to be stored in runtime")
 	}
 
 	// Team Delete permissions
@@ -406,17 +412,19 @@ func TestSendMessageTool(t *testing.T) {
 	if !strings.Contains(rt.Tasks["task-1"].Output, "hello world") {
 		t.Fatalf("expected runtime task output to include message, got %q", rt.Tasks["task-1"].Output)
 	}
+	if len(rt.Messages) != 1 {
+		t.Fatalf("expected message record to be stored, got %d", len(rt.Messages))
+	}
 }
-
 
 func TestMCPResourceTools(t *testing.T) {
 	pool := &fakeMCPToolPool{
 		servers: []*mcp.ManagedServer{{
-			Name: "demo",
-			Tools: []mcp.Tool{{Name: "search", Description: "Search docs"}},
+			Name:      "demo",
+			Tools:     []mcp.Tool{{Name: "search", Description: "Search docs"}},
 			Resources: []mcp.Resource{{URI: "file:///README.md", Name: "README", Description: "Project readme"}},
 		}},
-		tools: []mcp.ToolRef{{Server: "demo", Tool: mcp.Tool{Name: "search", Description: "Search docs"}}},
+		tools:      []mcp.ToolRef{{Server: "demo", Tool: mcp.Tool{Name: "search", Description: "Search docs"}}},
 		readResult: &mcp.ReadResourceResult{Contents: []mcp.ContentBlock{{Type: "text", Text: "hello from tool resource"}}},
 	}
 

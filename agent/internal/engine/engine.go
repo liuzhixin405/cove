@@ -72,6 +72,7 @@ func New(config Config) (*Engine, error) {
 	if permission.ValidMode(permission.Mode(config.PermissionMode)) {
 		perm.SetMode(permission.Mode(config.PermissionMode))
 	}
+	perm.SetBypassAvailable(true)
 	store, _ := session.NewStore()
 
 	e := &Engine{
@@ -87,9 +88,12 @@ func New(config Config) (*Engine, error) {
 		hookMgr:     config.HookManager,
 		classifier:  config.Classifier,
 		runtime: &tool.Runtime{
-			Tasks:        make(map[string]*tool.TaskRecord),
-			SkillManager: config.SkillManager,
-			SkillPrompts: make(map[string]string),
+			Tasks:         make(map[string]*tool.TaskRecord),
+			Teams:         make(map[string]*tool.TeamRecord),
+			CronSchedules: make(map[string]*tool.CronRecord),
+			Messages:      make([]tool.MessageRecord, 0),
+			SkillManager:  config.SkillManager,
+			SkillPrompts:  make(map[string]string),
 		},
 		fileHistory: make(map[string]bool),
 	}
@@ -132,6 +136,12 @@ func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
 func (e *Engine) ProviderName() string       { return e.provider.DisplayName() }
+func (e *Engine) SetPermissionMode(mode permission.Mode) {
+	if permission.ValidMode(mode) {
+		e.perm.SetMode(mode)
+		e.config.PermissionMode = string(mode)
+	}
+}
 
 func (e *Engine) Registry() *tool.Registry { return e.registry }
 func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
@@ -313,10 +323,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
 	}
 
+	cwd := ""
+	if e.projCtx != nil {
+		cwd = e.projCtx.Cwd
+	}
 	tctx := tool.Context{
-		Cwd:              e.projCtx.Cwd,
+		Cwd:              cwd,
 		ToolUseID:        tc.ID,
-		PermissionMode:   string(e.perm.Mode()),
+		PermissionMode:   toolPermissionMode(e.perm.Mode()),
 		IsNonInteractive: true,
 		Debug:            e.config.Debug,
 		Runtime:          e.runtime,
@@ -331,6 +345,25 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		if e.perm.Mode() == permission.Auto && e.classifier.ShouldAutoApprove(cmd) {
 			tctx.PermissionMode = "auto"
 		}
+	}
+
+	if errMsg := t.Validate(tc.Input); errMsg != "" {
+		return fmt.Sprintf("Error: invalid %s input: %s", tc.Name, errMsg)
+	}
+
+	toolDecision := t.CheckPermissions(tc.Input, tctx)
+	decision, reason := e.perm.Check(tc.Name, tc.Input, mapToolDecision(toolDecision.Decision))
+	if decision != permission.DAllow && decision != permission.DBypass {
+		if reason == "" {
+			reason = toolDecision.Reason
+		}
+		if reason == "" {
+			reason = "permission denied"
+		}
+		if decision == permission.DAsk && tctx.IsNonInteractive {
+			return fmt.Sprintf("Error: permission required for %s: %s", tc.Name, reason)
+		}
+		return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 	}
 
 	result, err := t.Call(ctx, tc.Input, tctx)
@@ -348,6 +381,28 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		return fmt.Sprintf("Error: %s", result.Data)
 	}
 	return output
+}
+
+func toolPermissionMode(mode permission.Mode) string {
+	switch mode {
+	case permission.Bypass, permission.Plan:
+		return string(mode)
+	default:
+		return string(permission.Default)
+	}
+}
+
+func mapToolDecision(decision tool.PermissionResult) permission.Decision {
+	switch decision {
+	case tool.Allow:
+		return permission.DAllow
+	case tool.Deny:
+		return permission.DDeny
+	case tool.Bypass:
+		return permission.DBypass
+	default:
+		return permission.DAsk
+	}
 }
 
 func (e *Engine) trackFileChanges(tc api.ToolCall) {

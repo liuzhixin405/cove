@@ -14,3 +14,6 @@
 *.pyc
 *.pyo
 *.pyd       
+agent/agentgo.exe
+agent/agentgo.exe~
+rewrite.md

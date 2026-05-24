@@ -29,15 +29,15 @@ const (
 )
 
 type Context struct {
-	Cwd               string
-	ToolUseID         string
-	SessionID         string
-	PermissionMode    string
-	AlwaysAllowRules  map[string][]string
-	AlwaysDenyRules   map[string][]string
-	IsNonInteractive  bool
-	Debug             bool
-	Runtime           *Runtime
+	Cwd              string
+	ToolUseID        string
+	SessionID        string
+	PermissionMode   string
+	AlwaysAllowRules map[string][]string
+	AlwaysDenyRules  map[string][]string
+	IsNonInteractive bool
+	Debug            bool
+	Runtime          *Runtime
 }
 
 type Runtime struct {
@@ -45,6 +45,9 @@ type Runtime struct {
 	PlanMode      bool
 	WorktreeDir   string
 	Tasks         map[string]*TaskRecord
+	Teams         map[string]*TeamRecord
+	CronSchedules map[string]*CronRecord
+	Messages      []MessageRecord
 	TaskCounter   int
 	AgentRunner   any
 	LSPRunner     LSPRunner
@@ -67,17 +70,50 @@ type TaskRecord struct {
 	Description string
 	Status      string
 	Output      string
+	Kind        string
+	ParentID    string
+	CreatedAt   string
+	UpdatedAt   string
+}
+
+type TeamRecord struct {
+	Name      string
+	Members   []TeamMemberRecord
+	Status    string
+	CreatedAt string
+}
+
+type TeamMemberRecord struct {
+	ID     string
+	Agent  string
+	Task   string
+	Status string
+	Output string
+}
+
+type CronRecord struct {
+	ID        string
+	Schedule  string
+	Task      string
+	Status    string
+	CreatedAt string
+}
+
+type MessageRecord struct {
+	To        string
+	Message   string
+	CreatedAt string
 }
 
 type Def struct {
-	Name             string
-	Aliases          []string
-	Description      string
-	Prompt           string
-	InputSchema      json.RawMessage
-	IsReadOnly       bool
+	Name              string
+	Aliases           []string
+	Description       string
+	Prompt            string
+	InputSchema       json.RawMessage
+	IsReadOnly        bool
 	IsConcurrencySafe bool
-	UserFacingName   string
+	UserFacingName    string
 }
 
 type Tool interface {
@@ -89,8 +125,8 @@ type Tool interface {
 
 type baseTool struct{ def Def }
 
-func (b *baseTool) Def() Def                          { return b.def }
-func (b *baseTool) Validate(input Input) string       { return "" }
+func (b *baseTool) Def() Def                    { return b.def }
+func (b *baseTool) Validate(input Input) string { return "" }
 func (b *baseTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return PermissionDecision{Decision: Deny, Reason: "not implemented"}
 }
@@ -110,8 +146,10 @@ func extractRequired(props string) string {
 	for i := 0; i < len(props); i++ {
 		if props[i] == '"' {
 			j := i + 1
-			for j < len(props) && props[j] != '"' { j++ }
-			return props[i+1:j]
+			for j < len(props) && props[j] != '"' {
+				j++
+			}
+			return props[i+1 : j]
 		}
 	}
 	return ""

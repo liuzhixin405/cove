@@ -45,10 +45,10 @@ type Policy struct {
 }
 
 type Manager struct {
-	mode           Mode
-	allow          []Rule
-	deny           []Rule
-	ask            []Rule
+	mode            Mode
+	allow           []Rule
+	deny            []Rule
+	ask             []Rule
 	bypassAvailable bool
 }
 
@@ -56,13 +56,33 @@ func NewManager(mode Mode) *Manager {
 	return &Manager{mode: mode}
 }
 
-func (m *Manager) SetMode(mode Mode)        { m.mode = mode }
-func (m *Manager) Mode() Mode               { return m.mode }
+func (m *Manager) SetMode(mode Mode)         { m.mode = mode }
+func (m *Manager) Mode() Mode                { return m.mode }
 func (m *Manager) SetBypassAvailable(v bool) { m.bypassAvailable = v }
 func (m *Manager) SetPolicy(p Policy) {
 	m.allow = p.Allow
 	m.deny = p.Deny
 	m.ask = p.Ask
+}
+
+func (m *Manager) AddRule(decision Decision, rule Rule) {
+	rule.Decision = decision
+	switch decision {
+	case DAllow:
+		m.allow = append(m.allow, rule)
+	case DDeny:
+		m.deny = append(m.deny, rule)
+	case DAsk:
+		m.ask = append(m.ask, rule)
+	}
+}
+
+func (m *Manager) Policy() Policy {
+	return Policy{
+		Allow: append([]Rule(nil), m.allow...),
+		Deny:  append([]Rule(nil), m.deny...),
+		Ask:   append([]Rule(nil), m.ask...),
+	}
 }
 
 func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecision Decision) (Decision, string) {
@@ -79,14 +99,20 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 			return DAllow, "allowed by policy rule"
 		}
 	}
+	for _, r := range m.ask {
+		if matchRule(r, toolName, toolInput) {
+			return DAsk, "approval required by policy rule"
+		}
+	}
 	switch m.mode {
 	case Auto:
-		return DAllow, "auto mode"
+		if defaultDecision == DAllow {
+			return DAllow, "auto mode: safe tool"
+		}
+		return defaultDecision, "auto mode: approval required"
 	case Plan:
-		for _, r := range m.allow {
-			if matchRule(r, toolName, toolInput) {
-				return DAllow, "allowed by policy rule"
-			}
+		if defaultDecision == DAllow {
+			return DAllow, "plan mode: read-only tool"
 		}
 		return DDeny, "plan mode - only read operations allowed"
 	default:

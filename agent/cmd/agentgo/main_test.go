@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -220,5 +221,54 @@ func TestKnownProviderValidation(t *testing.T) {
 	}
 	if api.IsKnownProvider("invalid-provider") {
 		t.Fatalf("expected invalid-provider to be rejected")
+	}
+}
+
+func TestCompleteSuggestsToolArgumentNames(t *testing.T) {
+	entries := []cmdEntry{{Name: "bash", Type: "tool", Args: []string{"command", "description", "timeout"}}}
+
+	got := complete("bash co", entries, nil)
+	if len(got) != 1 || got[0] != "bash command=" {
+		t.Fatalf("complete tool arg = %#v, want bash command=", got)
+	}
+
+	got = complete("bash command=ls d", entries, nil)
+	if len(got) != 1 || got[0] != "bash command=ls description=" {
+		t.Fatalf("complete second tool arg = %#v, want description", got)
+	}
+}
+
+func TestCompleteKeepsSlashCompletionToSlashCommands(t *testing.T) {
+	entries := []cmdEntry{
+		{Name: "/help", Type: "builtin"},
+		{Name: "bash", Type: "tool", Args: []string{"command"}},
+	}
+
+	got := complete("/", entries, nil)
+	if len(got) != 1 || got[0] != "/help" {
+		t.Fatalf("slash completion = %#v, want only /help", got)
+	}
+}
+
+func TestCompleteConfigValueHints(t *testing.T) {
+	entries := []cmdEntry{{Name: "/mode", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}}}
+
+	got := complete("/mode a", entries, nil)
+	if len(got) != 1 || got[0] != "/mode auto" {
+		t.Fatalf("mode completion = %#v, want /mode auto", got)
+	}
+}
+
+func TestToolArgNamesRequiredFirst(t *testing.T) {
+	raw := json.RawMessage(`{
+		"type":"object",
+		"properties":{"optional":{"type":"string"},"command":{"type":"string"},"timeout":{"type":"integer"}},
+		"required":["command"]
+	}`)
+
+	got := toolArgNames(raw)
+	want := []string{"command", "optional", "timeout"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("toolArgNames = %#v, want %#v", got, want)
 	}
 }

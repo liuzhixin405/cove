@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -360,6 +361,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			m := permission.Mode(strings.TrimPrefix(input, "/mode "))
 			if permission.ValidMode(m) {
 				pm.SetMode(m)
+				eng.SetPermissionMode(m)
 				cfg.PermissionMode = string(m)
 				as.PermissionMode = string(m)
 				config.Save(cfg)
@@ -405,9 +407,11 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 }
 
 type cmdEntry struct {
-	Name string
-	Desc string
-	Type string
+	Name     string
+	Desc     string
+	Type     string
+	Args     []string
+	ArgHints map[string][]string
 }
 
 func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEntry {
@@ -417,25 +421,39 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 	}
 	list = append(list,
 		cmdEntry{Name: "/model", Desc: "Set model name", Type: "config"},
-		cmdEntry{Name: "/provider", Desc: "Set API provider", Type: "config"},
+		cmdEntry{Name: "/provider", Desc: "Set API provider", Type: "config", ArgHints: map[string][]string{"": providerNameSuggestions()}},
 		cmdEntry{Name: "/api-key", Desc: "Set API key", Type: "config"},
 		cmdEntry{Name: "/base-url", Desc: "Set API base URL", Type: "config"},
-		cmdEntry{Name: "/mode", Desc: "Set permission mode (default|plan|auto|bypass)", Type: "config"},
+		cmdEntry{Name: "/mode", Desc: "Set permission mode (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
 		cmdEntry{Name: "/budget", Desc: "Set max budget ($)", Type: "config"},
 		cmdEntry{Name: "/help", Desc: "Show help", Type: "builtin"},
 		cmdEntry{Name: "/exit", Desc: "Exit agentgo", Type: "builtin"},
 	)
 	for _, t := range toolReg.All() {
 		d := t.Def()
-		list = append(list, cmdEntry{Name: d.Name, Desc: d.Description, Type: "tool"})
+		args := toolArgNames(d.InputSchema)
+		list = append(list, cmdEntry{Name: d.Name, Desc: d.Description, Type: "tool", Args: args})
+		for _, alias := range d.Aliases {
+			list = append(list, cmdEntry{Name: alias, Desc: d.Description, Type: "tool", Args: args})
+		}
 	}
 	return list
 }
 
 func complete(input string, commands []cmdEntry, skills map[string]string) []string {
+	input = strings.TrimLeft(input, " \t")
+	if input == "" {
+		return nil
+	}
+	if suggestions := completeArgs(input, commands); len(suggestions) > 0 {
+		return limitSuggestions(suggestions)
+	}
 	var matches []string
 	lower := strings.ToLower(input)
 	for _, c := range commands {
+		if strings.HasPrefix(input, "/") && c.Type == "tool" {
+			continue
+		}
 		if strings.HasPrefix(strings.ToLower(c.Name), lower) {
 			matches = append(matches, c.Name)
 		}
@@ -445,6 +463,145 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 			matches = append(matches, name)
 		}
 	}
+	sort.Strings(matches)
+	return limitSuggestions(matches)
+}
+
+func completeArgs(input string, commands []cmdEntry) []string {
+	head, rest, ok := strings.Cut(input, " ")
+	if !ok {
+		return nil
+	}
+	entry, found := findCompletionEntry(head, commands)
+	if !found {
+		return nil
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	base := head + " "
+	if hints := entry.ArgHints[""]; len(hints) > 0 {
+		return completeValueHints(base, rest, hints)
+	}
+	if len(entry.Args) == 0 {
+		return nil
+	}
+	used := usedArgNames(rest)
+	current := currentArgPrefix(rest)
+	var matches []string
+	for _, arg := range entry.Args {
+		if used[arg] {
+			continue
+		}
+		if current == "" || strings.HasPrefix(strings.ToLower(arg), strings.ToLower(current)) {
+			matches = append(matches, base+replaceCurrentArgPrefix(rest, current, arg+"="))
+		}
+	}
+	return matches
+}
+
+func completeValueHints(base, rest string, hints []string) []string {
+	current := strings.TrimSpace(rest)
+	var matches []string
+	for _, hint := range hints {
+		if current == "" || strings.HasPrefix(strings.ToLower(hint), strings.ToLower(current)) {
+			matches = append(matches, base+hint)
+		}
+	}
+	return matches
+}
+
+func findCompletionEntry(name string, commands []cmdEntry) (cmdEntry, bool) {
+	for _, c := range commands {
+		if strings.EqualFold(c.Name, name) {
+			return c, true
+		}
+	}
+	return cmdEntry{}, false
+}
+
+func usedArgNames(input string) map[string]bool {
+	used := map[string]bool{}
+	for _, part := range strings.Fields(input) {
+		part = strings.Trim(part, ` "'{},`)
+		if key, _, ok := strings.Cut(part, "="); ok {
+			used[strings.Trim(key, ` "'`)] = true
+			continue
+		}
+		if key, _, ok := strings.Cut(part, ":"); ok {
+			used[strings.Trim(key, ` "'`)] = true
+		}
+	}
+	return used
+}
+
+func currentArgPrefix(input string) string {
+	input = strings.TrimRight(input, " \t")
+	if input == "" {
+		return ""
+	}
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return ""
+	}
+	last := fields[len(fields)-1]
+	if strings.ContainsAny(last, "=:") {
+		return ""
+	}
+	return strings.Trim(last, ` "'{},`)
+}
+
+func replaceCurrentArgPrefix(input, current, replacement string) string {
+	if current == "" {
+		if strings.TrimSpace(input) == "" {
+			return replacement
+		}
+		return strings.TrimRight(input, " \t") + " " + replacement
+	}
+	idx := strings.LastIndex(input, current)
+	if idx < 0 {
+		return strings.TrimRight(input, " \t") + " " + replacement
+	}
+	return input[:idx] + replacement
+}
+
+func toolArgNames(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil
+	}
+	if len(schema.Properties) == 0 {
+		return nil
+	}
+	required := map[string]bool{}
+	for _, name := range schema.Required {
+		required[name] = true
+	}
+	names := make([]string, 0, len(schema.Properties))
+	for name := range schema.Properties {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if required[names[i]] != required[names[j]] {
+			return required[names[i]]
+		}
+		return names[i] < names[j]
+	})
+	return names
+}
+
+func providerNameSuggestions() []string {
+	return []string{
+		"anthropic", "deepseek", "openai", "openai-compatible", "glm", "kimi", "qwen", "doubao",
+		"openrouter", "siliconflow", "groq", "together", "fireworks", "xai", "mistral",
+	}
+}
+
+func limitSuggestions(matches []string) []string {
 	if len(matches) > 20 {
 		return matches[:20]
 	}
