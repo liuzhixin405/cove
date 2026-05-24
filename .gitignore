@@ -1,3 +1,16 @@
 生成.txt
 项目分析.md
 /dist
+/scripts/__pycache__
+/scripts/venv
+/.vscode
+/.idea
+/.pytest_cache
+/.mypy_cache
+/.coverage
+/.cache
+/.DS_Store
+*.log
+*.pyc
+*.pyo
+*.pyd       
