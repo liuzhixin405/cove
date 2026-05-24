@@ -131,7 +131,7 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
-func (e *Engine) ProviderName() string       { return e.provider.Name() }
+func (e *Engine) ProviderName() string       { return e.provider.DisplayName() }
 
 func (e *Engine) Registry() *tool.Registry { return e.registry }
 func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
@@ -243,18 +243,18 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 			return "", fmt.Errorf("api: %w", err)
 		}
 
-		e.costTracker.Add(e.config.Model, resp.InputTokens, resp.OutputTokens)
+		e.costTracker.AddDetailed(e.config.Model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
 
 		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
 			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
 
 		if len(resp.ToolCalls) == 0 {
-			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
+			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
 			e.saveSession()
 			return resp.Content, nil
 		}
 
-		assistantMsg := api.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls}
+		assistantMsg := api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: resp.ToolCalls}
 		e.messages = append(e.messages, assistantMsg)
 
 		type toolResult struct {

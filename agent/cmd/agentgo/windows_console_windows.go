@@ -42,7 +42,7 @@ func windowsConsoleEncodingNotice(platform string) string {
 			return msg
 		}
 	}
-	return windowsUTF8Notice(platform)
+	return ""
 }
 
 func tryEnableWindowsUTF8Console() {

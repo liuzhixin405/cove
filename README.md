@@ -16,7 +16,7 @@ cd <repo-root>
 ### 方式 2：手动构建并安装
 
 ```powershell
-cd demo
+cd agent
 go build -o $env:USERPROFILE\.agentgo\agentgo.exe ./cmd/agentgo
 ```
 
@@ -164,7 +164,7 @@ $env:OPENAI_API_KEY = "sk-..."
 ## 目录结构
 
 ```text
-demo/
+agent/
 ├── cmd/
 │   └── agentgo/main.go
 ├── internal/
@@ -192,7 +192,7 @@ demo/
 ## 构建与验证
 
 ```bash
-cd demo
+cd agent
 go test ./...
 go build -o agentgo.exe ./cmd/agentgo/
 ./agentgo.exe --version

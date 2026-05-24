@@ -12,11 +12,12 @@ type ToolCall struct {
 }
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
 }
 
 type ToolDef struct {
@@ -35,12 +36,16 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	Content      string
-	ToolCalls    []ToolCall
-	Model        string
-	InputTokens  int
-	OutputTokens int
-	StopReason   string
+	Content               string
+	ReasoningContent      string
+	ToolCalls             []ToolCall
+	Model                 string
+	InputTokens           int
+	OutputTokens          int
+	PromptCacheHitTokens  int
+	PromptCacheMissTokens int
+	ReasoningTokens       int
+	StopReason            string
 }
 
 type StreamEvent struct {
@@ -53,6 +58,7 @@ type StreamHandler func(event StreamEvent)
 
 type Provider interface {
 	Name() string
+	DisplayName() string
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
 	ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error)
 	Validate() error

@@ -262,9 +262,6 @@ func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext,
 	fmt.Printf("CWD: %s\n", pc.Cwd)
 	fmt.Printf("Tools: %d | Commands: %d\n", len(eng.Registry().All()), 15)
 	fmt.Printf("\nType /help | 输入 /help 查看帮助；Ctrl+C exit / Ctrl+C 退出\n")
-	if notice := windowsConsoleEncodingNotice(pc.Platform); notice != "" {
-		fmt.Println(notice)
-	}
 	fmt.Println()
 }
 
@@ -327,8 +324,14 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			}
 			fmt.Printf("Model: %s (saved)\n", cfg.Model)
 		case strings.HasPrefix(input, "/provider "):
+			providerName := strings.TrimSpace(strings.TrimPrefix(input, "/provider "))
+			if !api.IsKnownProvider(providerName) {
+				fmt.Printf("Invalid provider: %s\n", providerName)
+				fmt.Println(providerHelpLine())
+				continue
+			}
 			if err := applyProviderConfigChange(cfg, eng, func() error {
-				cfg.Provider.Name = strings.TrimSpace(strings.TrimPrefix(input, "/provider "))
+				cfg.Provider.Name = providerName
 				return config.Save(cfg)
 			}); err != nil {
 				fmt.Printf("Provider update failed: %v\n", err)
@@ -783,13 +786,6 @@ func missingAPIKeyMessage(provider string) string {
 		primaryEnv,
 		openAICompatList,
 	)
-}
-
-func windowsUTF8Notice(platform string) string {
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(platform)), "windows") {
-		return ""
-	}
-	return "Windows terminal encoding tip / Windows 终端编码提示: if Chinese still looks garbled, prefer Windows Terminal and UTF-8. You can run chcp 65001 in cmd before starting agentgo. 如果中文仍乱码，优先使用 Windows Terminal，并确认终端已切到 UTF-8；在 cmd 中可先执行 chcp 65001。"
 }
 
 func runChatInteraction(ctx context.Context, runner streamingRunner, input string) string {

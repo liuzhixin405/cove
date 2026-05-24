@@ -17,6 +17,19 @@ TARGETS = [
 ]
 
 
+def find_go_binary() -> str:
+    candidates = [
+        os.environ.get("GO_BIN", ""),
+        shutil.which("go") or "",
+        "/mnt/c/Program Files/Go/bin/go.exe",
+        r"C:\Program Files\Go\bin\go.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError("go executable not found; set GO_BIN or add Go to PATH")
+
+
 def run(cmd, *, cwd=None, env=None):
     print("+", " ".join(cmd))
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
@@ -72,7 +85,7 @@ def main():
     version_plain = version[1:]
 
     repo_root = Path(__file__).resolve().parents[1]
-    demo_dir = repo_root / "demo"
+    project_dir = repo_root / "agent"
     dist_dir = repo_root / "dist" / version
     dist_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +97,7 @@ def main():
     build_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     checksums = []
+    go_bin = find_go_binary()
 
     for goos, goarch, exe_suffix, archive_kind in TARGETS:
         binary_name = f"agentgo-{version}-{goos}-{goarch}{exe_suffix}"
@@ -95,12 +109,13 @@ def main():
             "CGO_ENABLED": "0",
         })
         ldflags = f"-X main.Version={version_plain} -X main.BuildTime={build_time} -X main.GitCommit={commit}"
+        output_arg = os.path.relpath(binary_path, project_dir)
         run([
-            "go", "build",
+            go_bin, "build",
             "-ldflags", ldflags,
-            "-o", str(binary_path),
+            "-o", output_arg,
             "./cmd/agentgo",
-        ], cwd=demo_dir, env=env)
+        ], cwd=project_dir, env=env)
 
         if archive_kind == "zip":
             archive_path = dist_dir / f"agentgo-{version}-{goos}-{goarch}.zip"

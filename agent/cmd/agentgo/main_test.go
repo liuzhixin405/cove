@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agentgo/internal/api"
 	"github.com/agentgo/internal/config"
 )
 
@@ -70,25 +71,6 @@ func TestMissingAPIKeyMessageIncludesProviderFirstSetupGuidance(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message missing %q\nfull message:\n%s", want, msg)
 		}
-	}
-}
-
-func TestWindowsUTF8NoticeIncludesTerminalGuidance(t *testing.T) {
-	notice := windowsUTF8Notice("windows")
-	checks := []string{
-		"Windows terminal encoding tip / Windows 终端编码提示",
-		"UTF-8",
-		"Windows Terminal",
-		"chcp 65001",
-	}
-	for _, want := range checks {
-		if !strings.Contains(notice, want) {
-			t.Fatalf("notice missing %q\nfull notice:\n%s", want, notice)
-		}
-	}
-
-	if windowsUTF8Notice("linux") != "" {
-		t.Fatalf("expected non-windows platforms to skip notice")
 	}
 }
 
@@ -226,5 +208,17 @@ func TestApplyProviderConfigChangeTrimsModelAndProviderValues(t *testing.T) {
 	}
 	if got, want := call.baseURL, "https://api.deepseek.com"; got != want {
 		t.Fatalf("reload baseURL = %q, want %q", got, want)
+	}
+}
+
+func TestKnownProviderValidation(t *testing.T) {
+	if !api.IsKnownProvider("deepseek") {
+		t.Fatalf("expected deepseek to be a known provider")
+	}
+	if !api.IsKnownProvider("openrouter") {
+		t.Fatalf("expected openrouter to be a known provider")
+	}
+	if api.IsKnownProvider("invalid-provider") {
+		t.Fatalf("expected invalid-provider to be rejected")
 	}
 }

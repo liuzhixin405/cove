@@ -117,3 +117,14 @@ func ProviderEnvCandidates(name string) []string {
 	appendEnv("LLM_API_KEY")
 	return envs
 }
+
+func IsKnownProvider(name string) bool {
+	normalized := NormalizeProviderName(name)
+	if normalized == "" {
+		return false
+	}
+	_, hasAlias := providerAliases[normalized]
+	_, hasBaseURL := providerBaseURLs[normalized]
+	_, hasEnv := providerEnvVars[normalized]
+	return hasAlias || hasBaseURL || hasEnv
+}

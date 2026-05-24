@@ -73,6 +73,37 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertIn("Warning: could not fully replace", out)
             self.assertIn("Warning: could not update", out)
 
+    def test_release_build_targets_agent_directory(self):
+        repo_root = Path("/tmp/repo-root")
+        expected_project_dir = repo_root / "agent"
+        expected_dist_dir = repo_root / "dist" / "v9.9.9"
+        fake_go = repo_root / "toolchain" / "go"
+
+        with mock.patch.object(release_build.Path, "resolve", return_value=repo_root / "scripts" / "release_build.py"):
+            with mock.patch.object(release_build.subprocess, "check_output", return_value="abc123\n"):
+                with mock.patch.object(release_build, "zip_single"):
+                    with mock.patch.object(release_build, "tar_gz_single"):
+                        with mock.patch.object(release_build, "sha256_file", return_value="deadbeef"):
+                            with mock.patch.object(release_build, "copy_latest_tree"):
+                                with mock.patch.object(release_build, "run") as run_mock:
+                                    with mock.patch.object(release_build, "find_go_binary", return_value=str(fake_go)):
+                                        with mock.patch("sys.argv", ["release_build.py", "v9.9.9"]):
+                                            release_build.main()
+
+        self.assertEqual(run_mock.call_count, 4)
+        for call in run_mock.call_args_list:
+            self.assertEqual(call.kwargs["cwd"], expected_project_dir)
+            self.assertEqual(call.args[0][0], str(fake_go))
+            self.assertIn("./cmd/agentgo", call.args[0])
+            self.assertFalse(call.args[0][call.args[0].index("-o") + 1].startswith("/tmp/repo-root"))
+        self.assertTrue(expected_dist_dir.exists())
+
+    def test_find_go_binary_prefers_go_bin_env(self):
+        with mock.patch.dict("os.environ", {"GO_BIN": "/custom/go"}, clear=False):
+            with mock.patch.object(release_build.shutil, "which", return_value=None):
+                with mock.patch.object(release_build, "Path", side_effect=lambda value: mock.Mock(exists=mock.Mock(return_value=(value == "/custom/go")))):
+                    self.assertEqual(release_build.find_go_binary(), "/custom/go")
+
 
 if __name__ == "__main__":
     unittest.main()

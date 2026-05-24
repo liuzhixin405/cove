@@ -64,3 +64,10 @@ func TestCustomProviderUsesOpenAICompatWithCustomBaseURL(t *testing.T) {
 		t.Fatalf("custom provider baseURL = %q", op.baseURL)
 	}
 }
+
+func TestProviderDisplayNamePreservesConfiguredProvider(t *testing.T) {
+	p := NewProvider(ProviderConfig{Name: "deepseek", APIKey: "test-key"})
+	if got, want := p.DisplayName(), "deepseek"; got != want {
+		t.Fatalf("DisplayName() = %q, want %q", got, want)
+	}
+}

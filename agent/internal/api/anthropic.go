@@ -30,7 +30,8 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 	}
 }
 
-func (p *anthropicProvider) Name() string { return "anthropic" }
+func (p *anthropicProvider) Name() string        { return "anthropic" }
+func (p *anthropicProvider) DisplayName() string { return "anthropic" }
 func (p *anthropicProvider) Validate() error {
 	if p.apiKey == "" {
 		return fmt.Errorf("API key required (set ANTHROPIC_API_KEY)")

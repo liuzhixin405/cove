@@ -1,6 +1,6 @@
 # agentgo v1.0.1 最终交付清单
 
-适用范围：`demo/` 下的 agentgo Windows 绿色版 / 多平台发布产物。
+适用范围：`agent/` 下的 agentgo Windows 绿色版 / 多平台发布产物。
 
 ## 1. 绿色版使用说明
 
@@ -78,8 +78,8 @@ python scripts/release_build.py v1.0.1
 
 工作流关键步骤：
 1. checkout
-2. setup go（读取 `demo/go.mod`）
-3. 在 `demo/` 下执行 `go test ./...`
+2. setup go（读取 `agent/go.mod`）
+3. 在 `agent/` 下执行 `go test ./...`
 4. 执行：`python scripts/release_build.py <version>`
 5. 上传：
    - `dist/<version>/agentgo-*.zip`
@@ -92,7 +92,7 @@ python scripts/release_build.py v1.0.1
 已验证命令：
 
 ```bash
-cd demo && go test ./...
+cd agent && go test ./...
 ```
 
 针对本次帮助/发布补丁，还额外验证过：
@@ -165,17 +165,17 @@ certutil -hashfile dist\v1.0.1\agentgo-v1.0.1-windows-amd64.zip SHA256
 ## 5. 目录说明
 
 ### 5.1 核心源码
-- `demo/`
+- `agent/`
   - agentgo 的 Go 实现主目录
 
 ### 5.2 主要文档
-- `demo/README.md`
+- `README.md`
   - 绿色版使用、配置、命令、目录说明
 - `README.md`
   - 根级说明与 portable/release 概览
-- `demo/docs/delivery-checklist-v1.0.1.md`
+- `agent/docs/delivery-checklist-v1.0.1.md`
   - 本最终交付清单
-- `demo/docs/plans/2026-05-23-demo-rewrite.md`
+- `agent/docs/plans/2026-05-23-demo-rewrite.md`
   - 本轮实现/验证计划记录
 
 ### 5.3 发布相关
