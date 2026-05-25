@@ -54,13 +54,26 @@ func (m *Manager) Init() {
 	m.scanPlugins()
 }
 
+func (m *Manager) Refresh() {
+	m.mu.Lock()
+	m.plugins = make(map[string]*Entry)
+	m.mu.Unlock()
+	m.scanPlugins()
+}
+
+func (m *Manager) Dir() string {
+	return m.dir
+}
+
 func (m *Manager) scanPlugins() {
 	entries, _ := os.ReadDir(m.dir)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		m.loadPlugin(e.Name())
+		if err := m.loadPlugin(e.Name()); err != nil {
+			m.recordPluginError(e.Name(), err)
+		}
 	}
 }
 
@@ -91,6 +104,22 @@ func (m *Manager) loadPlugin(name string) error {
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) recordPluginError(name string, err error) {
+	dirName := name
+	state := Error
+	if strings.HasSuffix(name, ".disabled") {
+		dirName = strings.TrimSuffix(name, ".disabled")
+	}
+	m.mu.Lock()
+	m.plugins[dirName] = &Entry{
+		Manifest: Manifest{Name: dirName, Version: "unknown", Description: "Plugin could not be loaded"},
+		Dir:      filepath.Join(m.dir, name),
+		State:    state,
+		Error:    err.Error(),
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Install(name string, url string) error {
@@ -224,4 +253,3 @@ func (m *Manager) EnabledCommands() []string {
 	}
 	return cmds
 }
-

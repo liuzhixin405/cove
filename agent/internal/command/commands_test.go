@@ -27,11 +27,11 @@ type fakeEngine struct {
 	cost     fakeCostTracker
 }
 
-func (f *fakeEngine) Messages() []api.Message              { return f.msgs }
-func (f *fakeEngine) LoadMessages(msgs []api.Message)      { f.loaded = msgs; f.msgs = msgs }
-func (f *fakeEngine) SetSystemOverride(prompt string)      { f.override = prompt }
-func (f *fakeEngine) SystemPrompt() string                 { return f.override }
-func (f *fakeEngine) CostTracker() CostTrackerView         { return f.cost }
+func (f *fakeEngine) Messages() []api.Message         { return f.msgs }
+func (f *fakeEngine) LoadMessages(msgs []api.Message) { f.loaded = msgs; f.msgs = msgs }
+func (f *fakeEngine) SetSystemOverride(prompt string) { f.override = prompt }
+func (f *fakeEngine) SystemPrompt() string            { return f.override }
+func (f *fakeEngine) CostTracker() CostTrackerView    { return f.cost }
 
 type fakePluginManager struct {
 	plugins    []plugin.Entry
@@ -39,6 +39,7 @@ type fakePluginManager struct {
 	enables    []string
 	disables   []string
 	uninstalls []string
+	refreshed  int
 }
 
 func (f *fakePluginManager) Install(name, url string) error {
@@ -58,6 +59,8 @@ func (f *fakePluginManager) Enable(name string) error {
 	return nil
 }
 func (f *fakePluginManager) AllPlugins() []plugin.Entry { return f.plugins }
+func (f *fakePluginManager) Refresh()                   { f.refreshed++ }
+func (f *fakePluginManager) Dir() string                { return "/tmp/.agentgo/plugins" }
 
 type fakeSkillManager struct {
 	all   []skills.Skill
@@ -94,11 +97,11 @@ type fakeMCPPool struct {
 func (f *fakeMCPPool) Connect(ctx context.Context, name string, cfg mcp.ServerConfig) error {
 	return nil
 }
-func (f *fakeMCPPool) Disconnect(name string)                {}
-func (f *fakeMCPPool) DisconnectAll()                        {}
-func (f *fakeMCPPool) AllServers() []*mcp.ManagedServer      { return f.servers }
-func (f *fakeMCPPool) AllTools() []mcp.ToolRef               { return nil }
-func (f *fakeMCPPool) AllResources() []mcp.ResourceRef       { return nil }
+func (f *fakeMCPPool) Disconnect(name string)           {}
+func (f *fakeMCPPool) DisconnectAll()                   {}
+func (f *fakeMCPPool) AllServers() []*mcp.ManagedServer { return f.servers }
+func (f *fakeMCPPool) AllTools() []mcp.ToolRef          { return nil }
+func (f *fakeMCPPool) AllResources() []mcp.ResourceRef  { return nil }
 func (f *fakeMCPPool) ReadResource(ctx context.Context, serverName, uri string) (*mcp.ReadResourceResult, error) {
 	if res, ok := f.readContents[serverName+"|"+uri]; ok {
 		return res, nil
@@ -167,6 +170,9 @@ func TestPluginCmdListAndInstall(t *testing.T) {
 	if !strings.Contains(out.Message, "demo") || !strings.Contains(out.Message, "enabled") {
 		t.Fatalf("expected listed plugin, got %q", out.Message)
 	}
+	if pm.refreshed != 1 {
+		t.Fatalf("expected plugin list to refresh manager, got %d refreshes", pm.refreshed)
+	}
 
 	_, err = cmd.Execute(context.Background(), Input{Args: []string{"install", "alpha", "https://example.com/plugin"}, PluginManager: pm})
 	if err != nil {
@@ -174,6 +180,19 @@ func TestPluginCmdListAndInstall(t *testing.T) {
 	}
 	if len(pm.installs) != 1 || pm.installs[0] != "alpha|https://example.com/plugin" {
 		t.Fatalf("unexpected installs: %#v", pm.installs)
+	}
+}
+
+func TestPluginCmdListShowsPluginDirWhenEmpty(t *testing.T) {
+	pm := &fakePluginManager{}
+	cmd := NewPluginCmd()
+
+	out, err := cmd.Execute(context.Background(), Input{Args: []string{"list"}, PluginManager: pm})
+	if err != nil {
+		t.Fatalf("list error: %v", err)
+	}
+	if !strings.Contains(out.Message, "No plugins installed") || !strings.Contains(out.Message, "/tmp/.agentgo/plugins") || !strings.Contains(out.Message, "/plugin install") {
+		t.Fatalf("expected diagnostic empty plugin list, got %q", out.Message)
 	}
 }
 

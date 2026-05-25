@@ -390,6 +390,8 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			handleResume(ctx, sessionID, eng)
 		case strings.HasPrefix(input, "/skill") || input == "/skills":
 			handleSkill(input, eng)
+		case isSkillInvocation(input, eng):
+			handleSkillInvocation(input, eng)
 		case strings.HasPrefix(input, "/"):
 			if handleUnknownCmd(input, cmdReg) {
 				continue
@@ -459,8 +461,12 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 		}
 	}
 	for name := range skills {
-		if strings.HasPrefix(strings.ToLower(name), lower) {
-			matches = append(matches, name)
+		candidate := name
+		if strings.HasPrefix(input, "/") {
+			candidate = "/" + name
+		}
+		if strings.HasPrefix(strings.ToLower(candidate), lower) {
+			matches = append(matches, candidate)
 		}
 	}
 	sort.Strings(matches)
@@ -797,6 +803,41 @@ func handleSkill(input string, eng *engine.Engine) {
 		}
 		repl.PrintSafe("\n[Skill: %s]\n\n%s\n\nFollow these instructions.\n", name, prompt)
 	}
+}
+
+func isSkillInvocation(input string, eng *engine.Engine) bool {
+	if eng == nil || eng.Runtime() == nil {
+		return false
+	}
+	parts := strings.Fields(input)
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "/") {
+		return false
+	}
+	name := strings.TrimPrefix(parts[0], "/")
+	if name == "" || name == "skill" || name == "skills" {
+		return false
+	}
+	_, ok := eng.Runtime().SkillPrompts[name]
+	return ok
+}
+
+func handleSkillInvocation(input string, eng *engine.Engine) {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return
+	}
+	name := strings.TrimPrefix(parts[0], "/")
+	prompt, ok := eng.Runtime().SkillPrompts[name]
+	if !ok {
+		repl.PrintSafe("Unknown skill: %s\n", name)
+		return
+	}
+	args := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+	repl.PrintSafe("\n[Skill: %s]\n\n%s\n", name, prompt)
+	if args != "" {
+		repl.PrintSafe("\nUser request:\n%s\n", args)
+	}
+	repl.PrintSafe("\nFollow these instructions.\n")
 }
 
 func handleExport(input string, eng *engine.Engine) {

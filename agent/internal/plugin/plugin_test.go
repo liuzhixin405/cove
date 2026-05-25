@@ -63,3 +63,31 @@ func TestManagerInstallDisableEnableAndReload(t *testing.T) {
 		t.Fatalf("expected plugin directory removed, stat err=%v", err)
 	}
 }
+
+func TestManagerRefreshReportsInvalidPlugin(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldUserProfile := os.Getenv("USERPROFILE")
+	t.Cleanup(func() {
+		_ = os.Setenv("HOME", oldHome)
+		_ = os.Setenv("USERPROFILE", oldUserProfile)
+	})
+	_ = os.Setenv("HOME", tmp)
+	_ = os.Setenv("USERPROFILE", tmp)
+
+	mgr := NewManager()
+	mgr.Init()
+	badDir := filepath.Join(mgr.dir, "broken")
+	if err := os.MkdirAll(badDir, 0755); err != nil {
+		t.Fatalf("create bad plugin dir: %v", err)
+	}
+
+	mgr.Refresh()
+	plugins := mgr.AllPlugins()
+	if len(plugins) != 1 {
+		t.Fatalf("expected one error plugin entry, got %#v", plugins)
+	}
+	if plugins[0].Manifest.Name != "broken" || plugins[0].State != Error || plugins[0].Error == "" {
+		t.Fatalf("expected broken plugin error entry, got %#v", plugins[0])
+	}
+}

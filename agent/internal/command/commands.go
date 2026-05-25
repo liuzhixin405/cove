@@ -162,7 +162,9 @@ func (c *ConfigCmd) Execute(ctx context.Context, in Input) (Output, error) {
 func (c *CompactCmd) Name() string        { return "compact" }
 func (c *CompactCmd) Aliases() []string   { return nil }
 func (c *CompactCmd) Description() string { return "Compact conversation history" }
-func (c *CompactCmd) Help() string        { return "/compact - Summarize earlier messages to free context window" }
+func (c *CompactCmd) Help() string {
+	return "/compact - Summarize earlier messages to free context window"
+}
 func (c *CompactCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	return Output{Message: "Use /compact from the REPL built-in path."}, nil
 }
@@ -375,7 +377,9 @@ func (c *McpCmd) Execute(ctx context.Context, in Input) (Output, error) {
 func (c *PluginCmd) Name() string        { return "plugin" }
 func (c *PluginCmd) Aliases() []string   { return nil }
 func (c *PluginCmd) Description() string { return "Manage plugins" }
-func (c *PluginCmd) Help() string        { return "/plugin [list|install|enable|disable|uninstall] - Manage plugins" }
+func (c *PluginCmd) Help() string {
+	return "/plugin [list|install|enable|disable|uninstall] - Manage plugins"
+}
 func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.PluginManager == nil {
 		return Output{Message: "Plugin manager unavailable"}, nil
@@ -386,14 +390,26 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	}
 	switch action {
 	case "list":
+		if refresher, ok := in.PluginManager.(interface{ Refresh() }); ok {
+			refresher.Refresh()
+		}
 		plugins := in.PluginManager.AllPlugins()
 		if len(plugins) == 0 {
-			return Output{Message: "No plugins installed"}, nil
+			dir := "~/.agentgo/plugins"
+			if withDir, ok := in.PluginManager.(interface{ Dir() string }); ok {
+				dir = withDir.Dir()
+			}
+			return Output{Message: fmt.Sprintf("No plugins installed\nPlugin dir: %s\nInstall: /plugin install <name> [url]", dir)}, nil
 		}
 		sort.Slice(plugins, func(i, j int) bool { return plugins[i].Manifest.Name < plugins[j].Manifest.Name })
 		var sb strings.Builder
+		sb.WriteString("Installed plugins:\n")
 		for _, p := range plugins {
-			sb.WriteString(fmt.Sprintf("- %s %s (%s)\n", p.Manifest.Name, p.Manifest.Version, pluginStateLabel(p.State)))
+			sb.WriteString(fmt.Sprintf("- %s %s (%s)", p.Manifest.Name, p.Manifest.Version, pluginStateLabel(p.State)))
+			if p.Error != "" {
+				sb.WriteString(fmt.Sprintf(" - %s", p.Error))
+			}
+			sb.WriteString("\n")
 		}
 		return Output{Message: sb.String()}, nil
 	case "install":
@@ -440,7 +456,9 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 func (c *SkillsCmd) Name() string        { return "skills" }
 func (c *SkillsCmd) Aliases() []string   { return []string{"skill"} }
 func (c *SkillsCmd) Description() string { return "List and inspect available skills" }
-func (c *SkillsCmd) Help() string        { return "/skills [list|name] - List bundled and user-defined skills" }
+func (c *SkillsCmd) Help() string {
+	return "/skills [list|name] - List bundled and user-defined skills"
+}
 func (c *SkillsCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.SkillManager == nil {
 		return Output{Message: "Skill manager unavailable"}, nil
