@@ -87,7 +87,11 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	}
 	if stderr.Len() > 0 {
 		sb.WriteString("\n[stderr]\n")
-		sb.WriteString(stderr.String())
+		errOut := stderr.String()
+		if len(errOut) > 100000 {
+			errOut = errOut[:100000] + fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-100000)
+		}
+		sb.WriteString(errOut)
 	}
 
 	if exitCode != 0 {

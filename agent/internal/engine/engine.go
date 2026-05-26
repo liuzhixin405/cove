@@ -40,25 +40,26 @@ type Config struct {
 }
 
 type Engine struct {
-	provider       api.Provider
-	registry       *tool.Registry
-	messages       []api.Message
-	config         Config
-	projCtx        *ctxt.ProjectContext
-	costTracker    *cost.Tracker
-	perm           *permission.Manager
-	store          *session.Store
-	session        *session.Record
-	memStore       *memory.Store
-	skillMgr       *skills.Manager
-	hookMgr        *hooks.Manager
-	classifier     *permission.Classifier
-	systemPrompt   string
-	systemOverride string
-	totalTokens    int
-	runtime        *tool.Runtime
-	fileHistory    map[string]bool
-	fileMu         sync.Mutex
+	provider         api.Provider
+	registry         *tool.Registry
+	messages         []api.Message
+	config           Config
+	projCtx          *ctxt.ProjectContext
+	costTracker      *cost.Tracker
+	perm             *permission.Manager
+	store            *session.Store
+	session          *session.Record
+	memStore         *memory.Store
+	skillMgr         *skills.Manager
+	hookMgr          *hooks.Manager
+	classifier       *permission.Classifier
+	systemPrompt     string
+	systemOverride   string
+	totalTokens      int
+	runtime          *tool.Runtime
+	fileHistory      map[string]bool
+	fileMu           sync.Mutex
+	PermissionPrompt func(toolName string, input map[string]any, reason string) bool
 }
 
 func New(config Config) (*Engine, error) {
@@ -141,6 +142,10 @@ func (e *Engine) SetPermissionMode(mode permission.Mode) {
 		e.perm.SetMode(mode)
 		e.config.PermissionMode = string(mode)
 	}
+}
+
+func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission.Rule) {
+	e.perm.AddRule(decision, rule)
 }
 
 func (e *Engine) Registry() *tool.Registry { return e.registry }
@@ -310,7 +315,7 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 
 		e.totalTokens = countTokens(e.messages)
 		if e.totalTokens > CompactTokenThreshold && iter > 5 {
-			e.compact(ctx)
+			e.Compact(ctx)
 		}
 	}
 
@@ -360,12 +365,19 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		if reason == "" {
 			reason = "permission denied"
 		}
-		if decision == permission.DAsk && tctx.IsNonInteractive {
-			return fmt.Sprintf("Error: permission required for %s: %s", tc.Name, reason)
+		if decision == permission.DAsk {
+			if e.PermissionPrompt != nil {
+				if e.PermissionPrompt(tc.Name, tc.Input, reason) {
+					// User approved, continue execution
+					goto executeCall
+				}
+			}
+			return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
 		}
 		return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 	}
 
+executeCall:
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
@@ -414,6 +426,9 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 			e.fileHistory[path] = true
 		}
 	case "bash":
+		if e.projCtx == nil {
+			return
+		}
 		if cmd, ok := tc.Input["command"].(string); ok {
 			for _, word := range strings.Fields(cmd) {
 				if strings.Contains(word, ".") && !strings.HasPrefix(word, "-") {
@@ -441,7 +456,7 @@ func resolvePath(p, cwd string) (string, bool) {
 	return "", false
 }
 
-func (e *Engine) compact(ctx context.Context) {
+func (e *Engine) Compact(ctx context.Context) {
 	log.Debugf("agent compacting: %d tokens, %d msgs", e.totalTokens, len(e.messages))
 	if len(e.messages) < 10 {
 		return
@@ -465,13 +480,22 @@ func (e *Engine) compact(ctx context.Context) {
 		return
 	}
 
-	newMsgs := make([]api.Message, 0, 3)
+	newMsgs := make([]api.Message, 0, 4)
 	newMsgs = append(newMsgs, e.messages[0])
 	newMsgs = append(newMsgs, api.Message{
 		Role:    "user",
 		Content: "[COMPACTED] " + compactResp.Content + "\n\nContinue from where you left off.",
 	})
-	newMsgs = append(newMsgs, e.messages[len(e.messages)-1])
+	// Ensure trailing messages form a valid sequence (don't end on a bare "tool" message)
+	lastMsg := e.messages[len(e.messages)-1]
+	if lastMsg.Role == "tool" && len(e.messages) >= 2 {
+		// Include the preceding assistant message that contains the tool_call
+		prevMsg := e.messages[len(e.messages)-2]
+		if prevMsg.Role == "assistant" {
+			newMsgs = append(newMsgs, prevMsg)
+		}
+	}
+	newMsgs = append(newMsgs, lastMsg)
 	e.messages = newMsgs
 	oldTokens := e.totalTokens
 	e.totalTokens = countTokens(e.messages)
@@ -507,8 +531,27 @@ func (e *Engine) saveSession() {
 	e.session.TokensOut = e.costTracker.TotalOutput
 	e.session.Cost = e.costTracker.TotalCost
 	e.session.UpdatedAt = time.Now()
+	// Auto-set title from first user message if still default
+	if e.session.Title == "New session" && len(e.messages) > 0 {
+		for _, m := range e.messages {
+			if m.Role == "user" && m.Content != "" {
+				title := m.Content
+				if len(title) > 60 {
+					title = title[:60] + "..."
+				}
+				e.session.Title = title
+				break
+			}
+		}
+	}
 	e.store.Save(e.session)
 }
+
+// SaveSession exports session persistence for the REPL to call on exit.
+func (e *Engine) SaveSession() { e.saveSession() }
+
+// HasMessages returns true if there are conversation messages worth saving.
+func (e *Engine) HasMessages() bool { return len(e.messages) > 0 }
 
 func countTokens(msgs []api.Message) int {
 	n := 0

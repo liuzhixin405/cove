@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -67,5 +69,46 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 }
 
 func (t *WebFetchTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
+	u, _ := input["url"].(string)
+	if isPrivateURL(u) {
+		return Denied("access to private/internal URLs is blocked")
+	}
 	return Allowed("webfetch is read-only")
+}
+
+func isPrivateURL(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	if !strings.HasPrefix(rawURL, "http") {
+		rawURL = "https://" + rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	host := parsed.Hostname()
+	if host == "localhost" || host == "metadata.google.internal" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Try resolving
+		ips, err := net.LookupIP(host)
+		if err != nil || len(ips) == 0 {
+			return false
+		}
+		ip = ips[0]
+	}
+	privateRanges := []string{
+		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+		"192.168.0.0/16", "169.254.0.0/16", "::1/128", "fc00::/7",
+	}
+	for _, cidr := range privateRanges {
+		_, network, _ := net.ParseCIDR(cidr)
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

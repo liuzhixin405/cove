@@ -9,13 +9,13 @@ import (
 )
 
 type ManagedServer struct {
-	Name       string
-	Config     ServerConfig
-	Client     *Client
-	Transport  Transport
-	Tools      []Tool
-	Resources  []Resource
-	Connected  bool
+	Name      string
+	Config    ServerConfig
+	Client    *Client
+	Transport Transport
+	Tools     []Tool
+	Resources []Resource
+	Connected bool
 }
 
 type Pool struct {
@@ -193,9 +193,7 @@ func (ms *ManagedServer) Close() {
 	if ms.Client != nil {
 		ms.Client.Close()
 	}
-	if ms.Transport != nil {
-		ms.Transport.Close()
-	}
+	// Note: transport is already closed by Client.Close(), no double-close
 }
 
 func ConnectFromConfig(ctx context.Context, servers map[string]ServerConfig) *Pool {
@@ -209,6 +207,7 @@ func ConnectFromConfig(ctx context.Context, servers map[string]ServerConfig) *Po
 }
 
 var logger = log.New(os.Stderr, "", 0)
+
 func logF(format string, args ...any) {
 	logger.Printf(format, args...)
 }

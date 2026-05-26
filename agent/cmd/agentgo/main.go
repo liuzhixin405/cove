@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/agentgo/internal/agent"
 	"github.com/agentgo/internal/api"
@@ -123,7 +124,9 @@ func main() {
 	mcpPool := mcp.NewPool()
 	for name, sc := range cfg.MCPServers {
 		go func(n string, s config.MCPServerConfig) {
-			mcpPool.Connect(context.Background(), n, mcp.ServerConfig{
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			mcpPool.Connect(ctx, n, mcp.ServerConfig{
 				Command: s.Command, Args: s.Args, Env: s.Env, Type: s.Type, URL: s.URL,
 			})
 		}(name, sc)
@@ -151,6 +154,46 @@ func main() {
 		os.Exit(1)
 	}
 	eng.SetProjectContext(projCtx)
+
+	// Set up interactive permission prompt for the REPL
+	eng.PermissionPrompt = func(toolName string, input map[string]any, reason string) bool {
+		desc := ""
+		switch toolName {
+		case "write":
+			if p, ok := input["filePath"].(string); ok {
+				desc = p
+			}
+		case "edit":
+			if p, ok := input["filePath"].(string); ok {
+				desc = p
+			}
+		case "bash":
+			if cmd, ok := input["command"].(string); ok {
+				if len(cmd) > 80 {
+					cmd = cmd[:80] + "..."
+				}
+				desc = cmd
+			}
+		default:
+			desc = reason
+		}
+		fmt.Printf("\n  ⚠ Permission required: [%s] %s\n", toolName, desc)
+		fmt.Print("  Allow? (y)es / (n)o / (a)lways: ")
+
+		var answer string
+		fmt.Scanln(&answer)
+		answer = strings.TrimSpace(strings.ToLower(answer))
+		switch answer {
+		case "y", "yes":
+			return true
+		case "a", "always":
+			// Add a permanent allow rule for this tool
+			eng.AddPermissionRule(permission.DAllow, permission.Rule{ToolPattern: toolName})
+			return true
+		default:
+			return false
+		}
+	}
 
 	if cfg.SystemPrompt != "" {
 		eng.SetSystemOverride(cfg.SystemPrompt)
@@ -266,15 +309,27 @@ func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext,
 	fmt.Println()
 }
 
-func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
+func withInterrupt(f func(ctx context.Context)) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
-		<-sigCh
-		cancel()
+		select {
+		case sig := <-sigCh:
+			if sig == syscall.SIGTERM {
+				os.Exit(0)
+			}
+			fmt.Print("\r\n[Interrupted]\r\n")
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
+	f(ctx)
+}
+
+func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
 
 	allCommands := buildCommandList(cmdReg, toolReg)
 	reader := repl.New(func(input string) []string {
@@ -288,6 +343,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			continue
 		}
 		if err == repl.ErrExit {
+			autoSaveSession(eng)
 			fmt.Println("Goodbye!")
 			return
 		}
@@ -303,6 +359,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		}
 		switch {
 		case input == "exit" || input == "/exit":
+			autoSaveSession(eng)
 			fmt.Println("Goodbye!")
 			return
 		case input == "/help":
@@ -387,7 +444,17 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			if strings.HasPrefix(input, "/resume ") {
 				sessionID = strings.TrimPrefix(input, "/resume ")
 			}
-			handleResume(ctx, sessionID, eng)
+			withInterrupt(func(ctx context.Context) { handleResume(ctx, sessionID, eng) })
+		case input == "/history":
+			handleHistory(eng)
+		case strings.HasPrefix(input, "/history "):
+			histID := strings.TrimSpace(strings.TrimPrefix(input, "/history "))
+			handleHistoryResume(histID, eng)
+		case input == "/compact":
+			withInterrupt(func(ctx context.Context) {
+				eng.Compact(ctx)
+				fmt.Println("Context window compacted.")
+			})
 		case strings.HasPrefix(input, "/skill") || input == "/skills":
 			handleSkill(input, eng)
 		case isSkillInvocation(input, eng):
@@ -396,14 +463,16 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			if handleUnknownCmd(input, cmdReg) {
 				continue
 			}
-			handleCommand(ctx, input, cmdReg, cfg, eng, mcpPool, skillMgr, memStore, pluginMgr, pm, projCtx, as)
+			withInterrupt(func(ctx context.Context) {
+				handleCommand(ctx, input, cmdReg, cfg, eng, mcpPool, skillMgr, memStore, pluginMgr, pm, projCtx, as)
+			})
 		default:
 			pc := cfg.EffectiveProvider()
 			if pc.APIKey == "" {
 				fmt.Println(missingAPIKeyMessage(pc.Name))
 				continue
 			}
-			fmt.Print(runChatInteraction(ctx, eng, input))
+			withInterrupt(func(ctx context.Context) { fmt.Print(runChatInteraction(ctx, eng, input)) })
 		}
 	}
 }
@@ -430,6 +499,7 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 		cmdEntry{Name: "/budget", Desc: "Set max budget ($)", Type: "config"},
 		cmdEntry{Name: "/help", Desc: "Show help", Type: "builtin"},
 		cmdEntry{Name: "/exit", Desc: "Exit agentgo", Type: "builtin"},
+		cmdEntry{Name: "/history", Desc: "View & continue past sessions", Type: "builtin"},
 	)
 	for _, t := range toolReg.All() {
 		d := t.Def()
@@ -885,6 +955,97 @@ func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 	repl.PrintSafe("Resumed: %s (%d msgs, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
 }
 
+func autoSaveSession(eng *engine.Engine) {
+	if eng.HasMessages() {
+		eng.SaveSession()
+		fmt.Println("Session auto-saved.")
+	}
+}
+
+func handleHistory(eng *engine.Engine) {
+	store := eng.Store()
+	if store == nil {
+		repl.PrintSafe("Session store unavailable\n")
+		return
+	}
+	records, _ := store.List()
+	if len(records) == 0 {
+		repl.PrintSafe("No history. Sessions are auto-saved on exit.\n")
+		return
+	}
+	repl.PrintSafe("\n  History (%d sessions):\n\n", len(records))
+	limit := 20
+	if len(records) < limit {
+		limit = len(records)
+	}
+	for i, r := range records[:limit] {
+		msgCount := len(r.Messages)
+		date := r.UpdatedAt.Format("01-02 15:04")
+		title := r.Title
+		if title == "New session" || title == "" {
+			title = sessionPreview(r)
+		}
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+		repl.PrintSafe("  %2d. [%s] %s  (%d msgs)\n", i+1, date, title, msgCount)
+	}
+	if len(records) > limit {
+		repl.PrintSafe("\n  ... and %d more.\n", len(records)-limit)
+	}
+	repl.PrintSafe("\n  Continue: /history <number>  (e.g. /history 1)\n\n")
+}
+
+func sessionPreview(r session.Record) string {
+	for _, m := range r.Messages {
+		if m.Role == "user" && m.Content != "" {
+			content := strings.ReplaceAll(m.Content, "\n", " ")
+			if len(content) > 50 {
+				content = content[:50] + "..."
+			}
+			return content
+		}
+	}
+	return "(empty)"
+}
+
+func handleHistoryResume(input string, eng *engine.Engine) {
+	store := eng.Store()
+	if store == nil {
+		repl.PrintSafe("Session store unavailable\n")
+		return
+	}
+
+	// Support number-based selection (e.g. "1", "2") or direct session ID
+	records, _ := store.List()
+	var idx int
+	if _, err := fmt.Sscanf(input, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
+		r := records[idx-1]
+		eng.LoadMessages(r.Messages)
+		title := r.Title
+		if title == "New session" || title == "" {
+			title = sessionPreview(r)
+		}
+		repl.PrintSafe("Resumed #%d: %s (%d msgs)\n", idx, title, len(r.Messages))
+		repl.PrintSafe("You can now continue the conversation.\n\n")
+		return
+	}
+
+	// Fallback: try loading by session ID
+	r, err := store.Load(input)
+	if err != nil {
+		repl.PrintSafe("Invalid selection: %s\nUse /history to see available sessions.\n", input)
+		return
+	}
+	eng.LoadMessages(r.Messages)
+	title := r.Title
+	if title == "New session" || title == "" {
+		title = sessionPreview(*r)
+	}
+	repl.PrintSafe("Resumed: %s (%d msgs)\n", title, len(r.Messages))
+	repl.PrintSafe("You can now continue the conversation.\n\n")
+}
+
 func showConfig() {
 	cfg, _ := config.Load()
 	pc := cfg.EffectiveProvider()
@@ -924,6 +1085,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 	fmt.Println("  /config             Show full config")
 	fmt.Println("\nSession:")
 	fmt.Println("  /compact            Compact conversation history")
+	fmt.Println("  /history            View & continue past sessions")
 	fmt.Println("  /resume [id]        Resume saved session")
 	fmt.Println("  /memory             Manage persistent memory")
 	fmt.Println("\nSystem:")

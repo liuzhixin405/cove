@@ -96,14 +96,14 @@ func stripCR(b []byte) []byte {
 }
 
 type Client struct {
-	transport Transport
+	transport  Transport
 	serverCaps ServerCaps
 	serverInfo Implementation
-	reqID     int
-	mu        sync.Mutex
-	pending   map[int]chan *Response
-	notifyCh  chan *Notification
-	closed    bool
+	reqID      int
+	mu         sync.Mutex
+	pending    map[int]chan *Response
+	notifyCh   chan *Notification
+	closed     bool
 }
 
 func NewClient(transport Transport) *Client {
@@ -251,8 +251,11 @@ func (c *Client) receiveLoop() {
 		}
 
 		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
 		ch, ok := c.pending[base.ID]
-		c.mu.Unlock()
 		if ok {
 			ch <- &Response{
 				JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
@@ -261,6 +264,7 @@ func (c *Client) receiveLoop() {
 				Error:   base.Error,
 			}
 		}
+		c.mu.Unlock()
 	}
 }
 
@@ -329,4 +333,3 @@ func ParseToolName(mcpToolName string) (server, tool string) {
 	}
 	return "", mcpToolName
 }
-

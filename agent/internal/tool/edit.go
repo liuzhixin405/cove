@@ -74,7 +74,11 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		result = strings.Replace(content, oldS, newS, 1)
 	}
 
-	if err := os.WriteFile(path, []byte(result), 0644); err != nil {
+	perm := os.FileMode(0644)
+	if info, err := os.Stat(path); err == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(path, []byte(result), perm); err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
 

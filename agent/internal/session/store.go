@@ -14,8 +14,8 @@ import (
 
 type Record struct {
 	ID        string        `json:"id"`
-	CreatedAt time.Time    `json:"created_at"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 	Title     string        `json:"title"`
 	Messages  []api.Message `json:"messages"`
 	Model     string        `json:"model"`
@@ -86,6 +86,6 @@ func (s *Store) List() ([]Record, error) {
 }
 
 func (s *Store) path(id string) string {
-	return filepath.Join(s.dir, id+".json")
+	clean := filepath.Base(id)
+	return filepath.Join(s.dir, clean+".json")
 }
-

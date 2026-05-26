@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -132,7 +133,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	}
 	defer httpResp.Body.Close()
 
-	raw, _ := io.ReadAll(httpResp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode >= 500 {
 		return nil, &RetryableError{Msg: fmt.Sprintf("server error %d: %s", httpResp.StatusCode, string(raw))}
 	}
@@ -345,15 +346,19 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		}
 	}
 
-	for i := 0; i < len(tcAccum)+10; i++ {
-		if acc, ok := tcAccum[i]; ok {
-			var input map[string]any
-			json.Unmarshal([]byte(acc.JSONBuf.String()), &input)
-			if input == nil {
-				input = map[string]any{}
-			}
-			toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+	indices := make([]int, 0, len(tcAccum))
+	for idx := range tcAccum {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+	for _, idx := range indices {
+		acc := tcAccum[idx]
+		var input map[string]any
+		json.Unmarshal([]byte(acc.JSONBuf.String()), &input)
+		if input == nil {
+			input = map[string]any{}
 		}
+		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}
 
 	return &ChatResponse{

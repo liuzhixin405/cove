@@ -7,24 +7,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 type sseTransport struct {
-	baseURL    string
-	client     *http.Client
-	sessionID  string
-	msgChan    chan json.RawMessage
-	ctx        context.Context
-	cancel     context.CancelFunc
+	baseURL   string
+	client    *http.Client
+	sessionID string
+	msgChan   chan json.RawMessage
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewSSETransport(baseURL string) (*sseTransport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &sseTransport{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 120 * time.Second},
+		client:  &http.Client{Timeout: 30 * time.Second},
 		msgChan: make(chan json.RawMessage, 64),
 		ctx:     ctx,
 		cancel:  cancel,
@@ -54,9 +55,11 @@ func NewSSETransport(baseURL string) (*sseTransport, error) {
 
 func (t *sseTransport) listenSSE() {
 	defer t.cancel()
-	req, _ := http.NewRequest("GET", fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, t.sessionID), nil)
+	req, _ := http.NewRequestWithContext(t.ctx, "GET", fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, url.QueryEscape(t.sessionID)), nil)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := t.client.Do(req)
+	// Use a client with no timeout for long-lived SSE stream
+	sseClient := &http.Client{}
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return
 	}
@@ -98,7 +101,7 @@ func (t *sseTransport) listenSSE() {
 func (t *sseTransport) Send(ctx context.Context, msg any) error {
 	data, _ := json.Marshal(msg)
 	req, _ := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, t.sessionID),
+		fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, url.QueryEscape(t.sessionID)),
 		bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.client.Do(req)

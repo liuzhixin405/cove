@@ -17,6 +17,7 @@ type LineReader struct {
 	histIdx        int
 	completer      Completer
 	prompt         string
+	placeholder    string
 	fallbackReader *bufio.Reader
 	rawReader      *bufio.Reader
 }
@@ -25,7 +26,11 @@ var ErrExit = fmt.Errorf("exit")
 var ErrInterrupt = fmt.Errorf("interrupt")
 
 func New(completer Completer) *LineReader {
-	return &LineReader{completer: completer, prompt: "> "}
+	return &LineReader{
+		completer:   completer,
+		prompt:      "> ",
+		placeholder: "(press / to show commands)",
+	}
 }
 
 func PrintSafe(format string, args ...any) {
@@ -47,7 +52,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 
 	var buf []rune
 	cursor := 0
-	fmt.Print(lr.prompt)
+	lr.redraw(buf, cursor)
 
 	for {
 		r, err := readInputRune(lr.rawReader)
@@ -78,6 +83,16 @@ func (lr *LineReader) ReadLine() (string, error) {
 				buf = buf[:len(buf)-1]
 				cursor--
 				lr.redraw(buf, cursor)
+				line := string(buf)
+				if strings.HasPrefix(line, "/") && lr.completer != nil {
+					suggestions := lr.completer(line)
+					if len(suggestions) > 0 && len(suggestions) <= 10 {
+						lr.showInlineSuggestions(suggestions, len(lr.prompt)+cursor)
+					} else if line == "/" && len(suggestions) > 10 {
+						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
+						fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
+					}
+				}
 			}
 		case 27:
 			if err := lr.handleEscape(&buf, &cursor); err != nil {
@@ -95,8 +110,11 @@ func (lr *LineReader) ReadLine() (string, error) {
 				line := string(buf)
 				if strings.HasPrefix(line, "/") && lr.completer != nil {
 					suggestions := lr.completer(line)
-					if len(suggestions) > 0 && len(suggestions) <= 8 {
-						lr.showInlineSuggestions(suggestions)
+					if len(suggestions) > 0 && len(suggestions) <= 10 {
+						lr.showInlineSuggestions(suggestions, len(lr.prompt)+cursor)
+					} else if line == "/" && len(suggestions) > 10 {
+						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
+						fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
 					}
 				}
 			}
@@ -159,17 +177,21 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 
 func (lr *LineReader) redraw(buf []rune, cursor int) {
 	fmt.Print("\r\x1b[K" + lr.prompt + string(buf))
-	if cursor < len(buf) {
+	if len(buf) == 0 && lr.placeholder != "" {
+		fmt.Print(" \x1b[90m" + lr.placeholder + "\x1b[0m")
+		fmt.Printf("\r\x1b[%dC", len(lr.prompt)) // Move cursor back to the end of prompt
+	} else if cursor < len(buf) {
 		fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
 	}
 }
 
-func (lr *LineReader) showInlineSuggestions(suggestions []string) {
+func (lr *LineReader) showInlineSuggestions(suggestions []string, cursorOffset int) {
 	fmt.Print("  \x1b[90m")
 	for _, s := range suggestions {
 		fmt.Print(s + "  ")
 	}
 	fmt.Print("\x1b[0m")
+	fmt.Printf("\r\x1b[%dC", cursorOffset)
 }
 
 func (lr *LineReader) historyUp(buf *[]rune, cursor *int) {

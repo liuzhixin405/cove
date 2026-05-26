@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -58,7 +59,7 @@ type oaiFuncCall struct {
 }
 type oaiMsg struct {
 	Role             string        `json:"role"`
-	Content          string        `json:"content,omitempty"`
+	Content          string        `json:"content"`
 	ReasoningContent string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
@@ -168,7 +169,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	}
 	defer httpResp.Body.Close()
 
-	raw, _ := io.ReadAll(httpResp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode >= 500 {
 		return nil, &RetryableError{Msg: fmt.Sprintf("server error %d", httpResp.StatusCode)}
 	}
@@ -417,11 +418,13 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	}
 
 	var toolCalls []ToolCall
-	for i := 0; ; i++ {
-		acc, ok := tcMap[i]
-		if !ok {
-			break
-		}
+	indices := make([]int, 0, len(tcMap))
+	for idx := range tcMap {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+	for _, idx := range indices {
+		acc := tcMap[idx]
 		var input map[string]any
 		json.Unmarshal([]byte(acc.ArgsBuf.String()), &input)
 		if input == nil {
