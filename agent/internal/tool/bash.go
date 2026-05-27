@@ -80,16 +80,16 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 
 	if stdout.Len() > 0 {
 		out := stdout.String()
-		if len(out) > 100000 {
-			out = out[:100000] + fmt.Sprintf("\n... [truncated %d bytes]", stdout.Len()-100000)
+		if len(out) > 30000 {
+			out = out[:30000] + fmt.Sprintf("\n... [truncated %d bytes, use grep for targeted search]", stdout.Len()-30000)
 		}
 		sb.WriteString(out)
 	}
 	if stderr.Len() > 0 {
 		sb.WriteString("\n[stderr]\n")
 		errOut := stderr.String()
-		if len(errOut) > 100000 {
-			errOut = errOut[:100000] + fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-100000)
+		if len(errOut) > 10000 {
+			errOut = errOut[:10000] + fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-10000)
 		}
 		sb.WriteString(errOut)
 	}

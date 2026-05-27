@@ -177,8 +177,8 @@ func main() {
 		default:
 			desc = reason
 		}
-		fmt.Printf("\n  ⚠ Permission required: [%s] %s\n", toolName, desc)
-		fmt.Print("  Allow? (y)es / (n)o / (a)lways: ")
+		fmt.Print(repl.PermissionPrompt(toolName, desc))
+		fmt.Printf("\n  %sAllow? (y)es / (n)o / (a)lways:%s ", repl.Dim, repl.Reset)
 
 		var answer string
 		fmt.Scanln(&answer)
@@ -296,17 +296,7 @@ func registerAllCommands() *command.Registry {
 }
 
 func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext, pm *permission.Manager, eng *engine.Engine) {
-	fmt.Println("┌─────────────────────────────────────────────┐")
-	fmt.Printf("│  agentgo v%-27s│\n", Version)
-	fmt.Println("└─────────────────────────────────────────────┘")
-	fmt.Printf("\nModel: %s  Provider: %s  Mode: %s\n", cfg.Model, eng.ProviderName(), pm.Mode())
-	if pc.IsGitRepo {
-		fmt.Printf("Git: %s (%s)\n", pc.GitBranch, pc.GitStatus)
-	}
-	fmt.Printf("CWD: %s\n", pc.Cwd)
-	fmt.Printf("Tools: %d | Commands: %d\n", len(eng.Registry().All()), 15)
-	fmt.Printf("\nType /help | 输入 /help 查看帮助；Ctrl+C exit / Ctrl+C 退出\n")
-	fmt.Println()
+	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, pc.GitStatus, len(eng.Registry().All()), pc.IsGitRepo))
 }
 
 func withInterrupt(f func(ctx context.Context)) {
@@ -472,7 +462,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				fmt.Println(missingAPIKeyMessage(pc.Name))
 				continue
 			}
-			withInterrupt(func(ctx context.Context) { fmt.Print(runChatInteraction(ctx, eng, input)) })
+			withInterrupt(func(ctx context.Context) { runChatInteraction(ctx, eng, input) })
 		}
 	}
 }
@@ -1149,16 +1139,29 @@ func missingAPIKeyMessage(provider string) string {
 }
 
 func runChatInteraction(ctx context.Context, runner streamingRunner, input string) string {
-	var sb strings.Builder
-	sb.WriteString("\n")
+	fmt.Print("\n")
+
+	spinner := repl.NewSpinner("Thinking...")
+	spinner.Start()
+	firstDelta := true
+	var totalOutput strings.Builder
+
 	_, err := runner.RunWithStream(ctx, input, func(delta string) {
-		sb.WriteString(delta)
+		if firstDelta {
+			spinner.Stop()
+			firstDelta = false
+		}
+		// Write directly to stdout for real-time streaming
+		fmt.Print(delta)
+		totalOutput.WriteString(delta)
 	})
+	spinner.Stop()
+
 	if err != nil {
-		sb.WriteString(fmt.Sprintf("Request failed: %v", err))
+		fmt.Printf("\n%s%s%s", repl.Red, err.Error(), repl.Reset)
 	}
-	sb.WriteString("\r\n\r\n")
-	return sb.String()
+	fmt.Print("\r\n\r\n")
+	return totalOutput.String()
 }
 
 func applyProviderConfigChange(cfg *config.Config, reloader providerReloader, mutate func() error) error {

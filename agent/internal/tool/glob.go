@@ -40,10 +40,18 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		if err != nil {
 			return nil
 		}
-		rel, _ := filepath.Rel(basePath, path)
-		if strings.HasPrefix(filepath.Base(path), ".") && info.IsDir() && path != basePath {
-			return filepath.SkipDir
+		if info.IsDir() {
+			name := filepath.Base(path)
+			// Skip common large/irrelevant directories
+			switch name {
+			case ".git", "node_modules", ".next", ".nuxt", "vendor", "dist", "__pycache__", ".venv", "venv", ".tox":
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(name, ".") && path != basePath {
+				return filepath.SkipDir
+			}
 		}
+		rel, _ := filepath.Rel(basePath, path)
 		match, _ := filepath.Match(pattern, filepath.Base(path))
 		if !match {
 			match, _ = filepath.Match(pattern, rel)

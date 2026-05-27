@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -15,10 +17,11 @@ import (
 )
 
 type openAICompatProvider struct {
-	name    string
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	name         string
+	apiKey       string
+	baseURL      string
+	client       *http.Client // for non-streaming (has Timeout)
+	streamClient *http.Client // for streaming (no global Timeout)
 }
 
 func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
@@ -26,11 +29,30 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL(cfg.Name)
 	}
+	transport := &http.Transport{
+		TLSHandshakeTimeout: 30 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+	}
 	return &openAICompatProvider{
 		name:    cfg.Name,
 		apiKey:  cfg.APIKey,
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		client:  &http.Client{Timeout: 180 * time.Second},
+		client: &http.Client{
+			Timeout:   300 * time.Second,
+			Transport: transport,
+		},
+		// Streaming client: no global Timeout so reading SSE body won't be killed
+		// Connection-level timeouts (TLS, dial, response header) still apply
+		streamClient: &http.Client{
+			Transport: transport,
+		},
 	}
 }
 
@@ -193,7 +215,9 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		reasoningContent := msg.ReasoningContent
 		for _, tc := range msg.ToolCalls {
 			var input map[string]any
-			json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+				continue // skip malformed tool calls
+			}
 			if input == nil {
 				input = map[string]any{}
 			}
@@ -349,7 +373,11 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	httpResp, err := p.client.Do(httpReq)
+	sc := p.streamClient
+	if sc == nil {
+		sc = p.client
+	}
+	httpResp, err := sc.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +392,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	var fullReasoningContent strings.Builder
 	var usage oaiUsage
 	scanner := bufio.NewScanner(httpResp.Body)
+	// Default scanner buffer is 64KB — insufficient for large tool call arguments
+	// DeepSeek may send entire file content in a single SSE line
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024) // up to 10MB per line
 
 	type tcAccum struct {
 		ID      string
@@ -417,6 +448,11 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		}
 	}
 
+	// Check for scanner errors (e.g. line too long even with expanded buffer)
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("stream read error: %w", err)
+	}
+
 	var toolCalls []ToolCall
 	indices := make([]int, 0, len(tcMap))
 	for idx := range tcMap {
@@ -426,11 +462,24 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	for _, idx := range indices {
 		acc := tcMap[idx]
 		var input map[string]any
-		json.Unmarshal([]byte(acc.ArgsBuf.String()), &input)
+		rawArgs := acc.ArgsBuf.String()
+		if rawArgs == "" {
+			continue // truncated tool call, skip
+		}
+		if err := json.Unmarshal([]byte(rawArgs), &input); err != nil {
+			continue // incomplete JSON from truncation, skip
+		}
 		if input == nil {
 			input = map[string]any{}
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+	}
+
+	// Detect actual stop reason from last chunk's finish_reason
+	stopReason := "stop"
+	if len(toolCalls) == 0 && len(tcMap) > 0 {
+		// Had tool calls started but none completed = truncation
+		stopReason = "length"
 	}
 
 	return &ChatResponse{
@@ -443,6 +492,6 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		PromptCacheHitTokens:  usage.cacheHitTokens(),
 		PromptCacheMissTokens: usage.cacheMissTokens(),
 		ReasoningTokens:       usage.reasoningTokens(),
-		StopReason:            "stop",
+		StopReason:            stopReason,
 	}, nil
 }

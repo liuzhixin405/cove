@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,8 +30,29 @@ func NewWriteTool() Tool {
 func (t *WriteTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	path, _ := input["filePath"].(string)
 	content, _ := input["content"].(string)
+
+	// Fallback: models sometimes use alternative key names
 	if path == "" {
-		return Result{Data: "Error: filePath required", IsError: true}, nil
+		for _, alt := range []string{"file_path", "path", "filepath", "file"} {
+			if v, ok := input[alt].(string); ok && v != "" {
+				path = v
+				break
+			}
+		}
+	}
+	if content == "" {
+		if v, ok := input["text"].(string); ok && v != "" {
+			content = v
+		}
+	}
+
+	if path == "" {
+		// Log the full input keys for debugging
+		keys := make([]string, 0, len(input))
+		for k := range input {
+			keys = append(keys, k)
+		}
+		return Result{Data: fmt.Sprintf("Error: filePath required (received keys: %v)", keys), IsError: true}, nil
 	}
 	if !filepath.IsAbs(path) && tctx.Cwd != "" {
 		path = filepath.Join(tctx.Cwd, path)

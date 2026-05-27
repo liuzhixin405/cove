@@ -17,13 +17,14 @@ import (
 	"github.com/agentgo/internal/log"
 	"github.com/agentgo/internal/memory"
 	"github.com/agentgo/internal/permission"
+	"github.com/agentgo/internal/repl"
 	"github.com/agentgo/internal/session"
 	"github.com/agentgo/internal/skills"
 	"github.com/agentgo/internal/token"
 	"github.com/agentgo/internal/tool"
 )
 
-const MaxIterations = 80
+const MaxIterations = 200
 const CompactTokenThreshold = 64000
 
 type Config struct {
@@ -40,26 +41,29 @@ type Config struct {
 }
 
 type Engine struct {
-	provider         api.Provider
-	registry         *tool.Registry
-	messages         []api.Message
-	config           Config
-	projCtx          *ctxt.ProjectContext
-	costTracker      *cost.Tracker
-	perm             *permission.Manager
-	store            *session.Store
-	session          *session.Record
-	memStore         *memory.Store
-	skillMgr         *skills.Manager
-	hookMgr          *hooks.Manager
-	classifier       *permission.Classifier
-	systemPrompt     string
-	systemOverride   string
-	totalTokens      int
-	runtime          *tool.Runtime
-	fileHistory      map[string]bool
-	fileMu           sync.Mutex
-	PermissionPrompt func(toolName string, input map[string]any, reason string) bool
+	provider          api.Provider
+	registry          *tool.Registry
+	messages          []api.Message
+	config            Config
+	projCtx           *ctxt.ProjectContext
+	costTracker       *cost.Tracker
+	perm              *permission.Manager
+	store             *session.Store
+	session           *session.Record
+	memStore          *memory.Store
+	skillMgr          *skills.Manager
+	hookMgr           *hooks.Manager
+	classifier        *permission.Classifier
+	systemPrompt      string
+	systemOverride    string
+	totalTokens       int
+	runtime           *tool.Runtime
+	fileHistory       map[string]bool
+	fileMu            sync.Mutex
+	cachedToolDefs    []api.ToolDef
+	lastSaveTime      time.Time
+	consecutiveErrors int // track consecutive tool failures for circuit breaking
+	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
 }
 
 func New(config Config) (*Engine, error) {
@@ -164,6 +168,10 @@ func (e *Engine) SystemPrompt() string {
 	if e.systemOverride != "" {
 		return e.systemOverride
 	}
+	// Return cached if already built (stable within a session unless context changes)
+	if e.systemPrompt != "" {
+		return e.systemPrompt
+	}
 	var sb strings.Builder
 	sb.WriteString(`You are an AI coding assistant. You MUST use tools to complete user tasks. Never describe what you would do — actually DO it.
 
@@ -174,6 +182,8 @@ RULES:
 4. Be concise. Use tools to act, not to describe actions.
 5. For git, tests, builds — use bash. For files — write/read/edit.
 6. Use webfetch for URLs. Use grep/glob for searching code.
+7. For creating or fully rewriting files (especially large ones like HTML/CSS/JS): use write with the COMPLETE content in ONE call. Do NOT use many small edit calls for new files.
+8. Each tool call response is ONE file operation. Do NOT attempt to write multiple large files in a single response — write them one at a time across iterations.
 
 Available tools:`)
 	for _, t := range e.registry.All() {
@@ -225,6 +235,7 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 	e.messages = append(e.messages, api.Message{Role: "user", Content: userMessage})
 	e.saveSession()
 
+	// Cache system prompt and tool defs across iterations (stable within a run)
 	sp := e.SystemPrompt()
 	toolDefs := e.buildAPIToolDefs()
 
@@ -237,21 +248,38 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 			Messages:   e.messages,
 			SystemBase: sp,
 			Tools:      toolDefs,
-			MaxTokens:  16000,
+			MaxTokens:  64000,
 		}
 
 		var resp *api.ChatResponse
 		var err error
 		useStream := onDelta != nil
 
+		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
+		var walker *repl.WalkingIndicator
+		if iter > 0 && !e.config.Debug {
+			walker = repl.NewWalkingIndicator("Thinking...")
+			walker.Start()
+		}
+
 		if useStream {
+			firstDelta := true
 			resp, err = e.provider.ChatStream(ctx, req, func(ev api.StreamEvent) {
+				if firstDelta && walker != nil {
+					walker.Stop()
+					walker = nil
+					firstDelta = false
+				}
 				if ev.Type == "delta" && onDelta != nil {
 					onDelta(ev.Delta)
 				}
 			})
 		} else {
 			resp, err = e.provider.Chat(ctx, req)
+		}
+
+		if walker != nil {
+			walker.Stop()
 		}
 
 		if err != nil {
@@ -262,6 +290,15 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 
 		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
 			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
+
+		// If response was truncated and no complete tool calls survived, ask model to continue
+		if (resp.StopReason == "max_tokens" || resp.StopReason == "length") && len(resp.ToolCalls) == 0 {
+			if resp.Content != "" {
+				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
+			}
+			e.messages = append(e.messages, api.Message{Role: "user", Content: "[system: your previous response was truncated due to length. Please continue, writing one file at a time.]"})
+			continue
+		}
 
 		if len(resp.ToolCalls) == 0 {
 			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
@@ -299,6 +336,10 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 			wg.Wait()
 		} else {
 			for i, tc := range resp.ToolCalls {
+				if !e.config.Debug {
+					// Show tool start
+					fmt.Fprintf(os.Stderr, "\r  \x1b[2m⏳ [%s]...\x1b[0m", tc.Name)
+				}
 				res := e.executeTool(ctx, tc)
 				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
 			}
@@ -306,11 +347,33 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 
 		for _, r := range results {
 			if !e.config.Debug {
-				fmt.Fprintf(os.Stderr, "\r  [%s] %s\n", r.Name, summarizeResult(r.Content))
+				isErr := strings.HasPrefix(r.Content, "Error:")
+				fmt.Fprintf(os.Stderr, "\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr))
 			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
 			})
+		}
+
+		// Circuit breaker: if tools keep failing, hint the model to change approach
+		allFailed := true
+		for _, r := range results {
+			if !strings.HasPrefix(r.Content, "Error:") {
+				allFailed = false
+				break
+			}
+		}
+		if allFailed && len(results) > 0 {
+			e.consecutiveErrors++
+			if e.consecutiveErrors >= 3 {
+				e.messages = append(e.messages, api.Message{
+					Role:    "user",
+					Content: "[system: The last 3+ tool calls all failed. Please try a different approach or ask the user for clarification. Do not repeat the same failing pattern.]",
+				})
+				e.consecutiveErrors = 0
+			}
+		} else {
+			e.consecutiveErrors = 0
 		}
 
 		e.totalTokens = countTokens(e.messages)
@@ -380,19 +443,56 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 executeCall:
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		// Retry once for transient errors (network, timeout, temporary file locks)
+		if isTransientError(err) {
+			time.Sleep(500 * time.Millisecond)
+			result, err = t.Call(ctx, tc.Input, tctx)
+			if err != nil {
+				return fmt.Sprintf("Error (after retry): %v", err)
+			}
+		} else {
+			return fmt.Sprintf("Error: %v", err)
+		}
 	}
 	if !result.IsError {
 		e.trackFileChanges(tc)
 	}
 	output := result.Data
 	if !result.IsError {
-		output = token.TruncateToTokens(output, 4000)
+		// Adaptive truncation: code/read results get more space than bash output
+		maxTokens := 4000
+		switch tc.Name {
+		case "read", "grep":
+			maxTokens = 6000 // source code context is more valuable
+		case "bash":
+			maxTokens = 3000 // build/test output is usually repetitive
+		case "webfetch":
+			maxTokens = 3000
+		}
+		output = token.TruncateToTokens(output, maxTokens)
 	}
 	if result.IsError {
-		return fmt.Sprintf("Error: %s", result.Data)
+		return result.Data
 	}
 	return output
+}
+
+// isTransientError checks if an error is likely transient and worth retrying
+func isTransientError(err error) bool {
+	msg := err.Error()
+	transientPatterns := []string{
+		"timeout", "connection refused", "connection reset",
+		"temporary failure", "i/o timeout", "TLS handshake",
+		"access is denied", // Windows file locks
+		"being used by another process",
+	}
+	lower := strings.ToLower(msg)
+	for _, p := range transientPatterns {
+		if strings.Contains(lower, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
 }
 
 func toolPermissionMode(mode permission.Mode) string {
@@ -458,52 +558,102 @@ func resolvePath(p, cwd string) (string, bool) {
 
 func (e *Engine) Compact(ctx context.Context) {
 	log.Debugf("agent compacting: %d tokens, %d msgs", e.totalTokens, len(e.messages))
-	if len(e.messages) < 10 {
-		return
-	}
-	history := e.messages[1 : len(e.messages)-3]
-	if len(history) < 6 {
+	if len(e.messages) < 12 {
 		return
 	}
 
-	compactReq := fmt.Sprintf(
-		"Summarize this conversation segment concisely. Include: key decisions, files created/modified, errors encountered, current state. Keep it under 500 words.\n\n%s",
-		formatMessages(history))
+	// Strategy: keep the first user message + last 6 messages intact.
+	// Summarize everything in between.
+	// Ensure we don't split assistant+tool pairs.
+	keepTail := 6
+	if keepTail > len(e.messages)-2 {
+		keepTail = len(e.messages) - 2
+	}
+
+	// Find a safe split point — never split inside an assistant→tool pair
+	splitIdx := len(e.messages) - keepTail
+	for splitIdx > 1 && splitIdx < len(e.messages) {
+		if e.messages[splitIdx].Role == "tool" {
+			splitIdx-- // include the preceding assistant msg
+		} else {
+			break
+		}
+	}
+	if splitIdx <= 1 {
+		return // nothing worth compacting
+	}
+
+	history := e.messages[1:splitIdx]
+	if len(history) < 4 {
+		return
+	}
+
+	// Build a more structured summary request
+	var summaryInput strings.Builder
+	summaryInput.WriteString("Summarize this conversation history concisely. Structure:\n")
+	summaryInput.WriteString("- Key decisions made\n- Files created/modified (paths)\n- Current task status\n- Errors encountered and resolutions\n- Important context for continuing\n\n")
+
+	for _, m := range history {
+		summaryInput.WriteString(fmt.Sprintf("[%s] ", m.Role))
+		content := m.Content
+		// For tool results, keep file paths but truncate output
+		if m.Role == "tool" {
+			if len(content) > 150 {
+				content = content[:150] + "..."
+			}
+		} else if len(content) > 400 {
+			content = content[:400] + "..."
+		}
+		summaryInput.WriteString(content)
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				if path, ok := tc.Input["filePath"].(string); ok {
+					summaryInput.WriteString(fmt.Sprintf(" → %s(%s)", tc.Name, path))
+				} else if cmd, ok := tc.Input["command"].(string); ok {
+					if len(cmd) > 60 {
+						cmd = cmd[:60] + "..."
+					}
+					summaryInput.WriteString(fmt.Sprintf(" → bash(%s)", cmd))
+				} else {
+					summaryInput.WriteString(fmt.Sprintf(" → %s()", tc.Name))
+				}
+			}
+		}
+		summaryInput.WriteString("\n")
+	}
 
 	compactResp, err := e.provider.Chat(ctx, api.ChatRequest{
 		Model:      e.config.Model,
-		SystemBase: "You are a conversation summarizer. Be concise and factual. Only include what's essential for continuing the work.",
-		Messages:   []api.Message{{Role: "user", Content: compactReq}},
-		MaxTokens:  1000,
+		SystemBase: "You are a conversation summarizer. Be concise and factual. Output a structured summary under 400 words. Include file paths mentioned.",
+		Messages:   []api.Message{{Role: "user", Content: summaryInput.String()}},
+		MaxTokens:  800,
 	})
 	if err != nil {
+		log.Debugf("compact failed: %v", err)
 		return
 	}
 
-	newMsgs := make([]api.Message, 0, 4)
-	newMsgs = append(newMsgs, e.messages[0])
+	// Rebuild message list: [first_user] + [summary] + [recent_tail]
+	newMsgs := make([]api.Message, 0, 2+keepTail)
+	newMsgs = append(newMsgs, e.messages[0]) // first user message
 	newMsgs = append(newMsgs, api.Message{
 		Role:    "user",
-		Content: "[COMPACTED] " + compactResp.Content + "\n\nContinue from where you left off.",
+		Content: "[Context Summary]\n" + compactResp.Content + "\n\n[Continue the task from where you left off.]",
 	})
-	// Ensure trailing messages form a valid sequence (don't end on a bare "tool" message)
-	lastMsg := e.messages[len(e.messages)-1]
-	if lastMsg.Role == "tool" && len(e.messages) >= 2 {
-		// Include the preceding assistant message that contains the tool_call
-		prevMsg := e.messages[len(e.messages)-2]
-		if prevMsg.Role == "assistant" {
-			newMsgs = append(newMsgs, prevMsg)
-		}
-	}
-	newMsgs = append(newMsgs, lastMsg)
-	e.messages = newMsgs
+	newMsgs = append(newMsgs, e.messages[splitIdx:]...) // recent messages preserved intact
+
 	oldTokens := e.totalTokens
+	oldMsgs := len(e.messages)
+	e.messages = newMsgs
 	e.totalTokens = countTokens(e.messages)
-	log.Debugf("agent compacted: %d tokens, %d msgs -> %d tokens, %d msgs",
-		oldTokens, len(history), e.totalTokens, len(e.messages))
+	log.Debugf("agent compacted: %d tokens/%d msgs -> %d tokens/%d msgs (kept tail %d)",
+		oldTokens, oldMsgs, e.totalTokens, len(e.messages), keepTail)
 }
 
 func (e *Engine) buildAPIToolDefs() []api.ToolDef {
+	if e.cachedToolDefs != nil {
+		return e.cachedToolDefs
+	}
 	var defs []api.ToolDef
 	for _, t := range e.registry.All() {
 		d := t.Def()
@@ -512,6 +662,7 @@ func (e *Engine) buildAPIToolDefs() []api.ToolDef {
 			Name: d.Name, Description: d.Description, InputSchema: schema,
 		})
 	}
+	e.cachedToolDefs = defs
 	return defs
 }
 
@@ -526,11 +677,17 @@ func (e *Engine) saveSession() {
 	if e.store == nil || e.session == nil {
 		return
 	}
+	// Debounce: save at most every 5 seconds during rapid iterations
+	now := time.Now()
+	if !e.lastSaveTime.IsZero() && now.Sub(e.lastSaveTime) < 5*time.Second {
+		return
+	}
+	e.lastSaveTime = now
 	e.session.Messages = e.messages
 	e.session.TokensIn = e.costTracker.TotalInput
 	e.session.TokensOut = e.costTracker.TotalOutput
 	e.session.Cost = e.costTracker.TotalCost
-	e.session.UpdatedAt = time.Now()
+	e.session.UpdatedAt = now
 	// Auto-set title from first user message if still default
 	if e.session.Title == "New session" && len(e.messages) > 0 {
 		for _, m := range e.messages {
@@ -548,7 +705,10 @@ func (e *Engine) saveSession() {
 }
 
 // SaveSession exports session persistence for the REPL to call on exit.
-func (e *Engine) SaveSession() { e.saveSession() }
+func (e *Engine) SaveSession() {
+	e.lastSaveTime = time.Time{} // force save
+	e.saveSession()
+}
 
 // HasMessages returns true if there are conversation messages worth saving.
 func (e *Engine) HasMessages() bool { return len(e.messages) > 0 }
@@ -556,10 +716,19 @@ func (e *Engine) HasMessages() bool { return len(e.messages) > 0 }
 func countTokens(msgs []api.Message) int {
 	n := 0
 	for _, m := range msgs {
-		n += token.Estimate(m.Content)
+		n += len(m.Content)/4 + 1 // fast approximation: ~4 chars per token
 		for _, tc := range m.ToolCalls {
-			args, _ := json.Marshal(tc.Input)
-			n += token.Estimate(tc.Name + string(args))
+			n += len(tc.Name)/4 + 1
+			// Estimate input size without re-marshaling
+			for k, v := range tc.Input {
+				n += len(k)/4 + 1
+				switch val := v.(type) {
+				case string:
+					n += len(val) / 4
+				default:
+					n += 10 // rough estimate for non-string values
+				}
+			}
 		}
 	}
 	return n
@@ -609,4 +778,19 @@ func formatMessages(msgs []api.Message) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// ANSI formatting for tool output lines
+func formatToolLine(name, summary string, isError bool) string {
+	const (
+		reset = "\x1b[0m"
+		dim   = "\x1b[2m"
+		cyan  = "\x1b[36m"
+		red   = "\x1b[31m"
+		green = "\x1b[32m"
+	)
+	if isError {
+		return fmt.Sprintf("  %s✗%s %s[%s]%s %s%s%s", red, reset, red, name, reset, red, summary, reset)
+	}
+	return fmt.Sprintf("  %s✓%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
 }

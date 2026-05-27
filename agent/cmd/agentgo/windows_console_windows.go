@@ -57,8 +57,18 @@ func tryEnableWindowsUTF8Console() {
 	_ = windows.SetConsoleOutputCP(65001)
 }
 
+func tryEnableVirtualTerminal() {
+	stdout := windows.Handle(os.Stdout.Fd())
+	var mode uint32
+	if err := windows.GetConsoleMode(stdout, &mode); err != nil {
+		return
+	}
+	_ = windows.SetConsoleMode(stdout, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+}
+
 func init() {
 	if len(os.Args) > 0 {
 		tryEnableWindowsUTF8Console()
+		tryEnableVirtualTerminal()
 	}
 }

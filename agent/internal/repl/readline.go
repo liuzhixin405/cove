@@ -1,4 +1,4 @@
-package repl
+﻿package repl
 
 import (
 	"bufio"
@@ -17,6 +17,7 @@ type LineReader struct {
 	histIdx        int
 	completer      Completer
 	prompt         string
+	promptWidth    int // visible character width (excluding ANSI codes)
 	placeholder    string
 	fallbackReader *bufio.Reader
 	rawReader      *bufio.Reader
@@ -28,7 +29,8 @@ var ErrInterrupt = fmt.Errorf("interrupt")
 func New(completer Completer) *LineReader {
 	return &LineReader{
 		completer:   completer,
-		prompt:      "> ",
+		prompt:      Prompt(),
+		promptWidth: 2, // "❯ " visible chars
 		placeholder: "(press / to show commands)",
 	}
 }
@@ -87,10 +89,10 @@ func (lr *LineReader) ReadLine() (string, error) {
 				if strings.HasPrefix(line, "/") && lr.completer != nil {
 					suggestions := lr.completer(line)
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
-						lr.showInlineSuggestions(suggestions, len(lr.prompt)+cursor)
+						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
 					} else if line == "/" && len(suggestions) > 10 {
 						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
-						fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
+						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}
 			}
@@ -111,10 +113,10 @@ func (lr *LineReader) ReadLine() (string, error) {
 				if strings.HasPrefix(line, "/") && lr.completer != nil {
 					suggestions := lr.completer(line)
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
-						lr.showInlineSuggestions(suggestions, len(lr.prompt)+cursor)
+						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
 					} else if line == "/" && len(suggestions) > 10 {
 						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
-						fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
+						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}
 			}
@@ -179,9 +181,9 @@ func (lr *LineReader) redraw(buf []rune, cursor int) {
 	fmt.Print("\r\x1b[K" + lr.prompt + string(buf))
 	if len(buf) == 0 && lr.placeholder != "" {
 		fmt.Print(" \x1b[90m" + lr.placeholder + "\x1b[0m")
-		fmt.Printf("\r\x1b[%dC", len(lr.prompt)) // Move cursor back to the end of prompt
+		fmt.Printf("\r\x1b[%dC", lr.promptWidth) // Move cursor back to the end of prompt
 	} else if cursor < len(buf) {
-		fmt.Printf("\r\x1b[%dC", len(lr.prompt)+cursor)
+		fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 	}
 }
 

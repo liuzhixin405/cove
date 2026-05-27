@@ -9,15 +9,17 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 )
 
 type anthropicProvider struct {
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	apiKey       string
+	baseURL      string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
@@ -25,9 +27,10 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 		cfg.BaseURL = "https://api.anthropic.com/v1"
 	}
 	return &anthropicProvider{
-		apiKey:  cfg.APIKey,
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		client:  &http.Client{Timeout: 180 * time.Second},
+		apiKey:       cfg.APIKey,
+		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
+		client:       &http.Client{Timeout: 300 * time.Second},
+		streamClient: &http.Client{},
 	}
 }
 
@@ -256,6 +259,7 @@ type anthropicDelta struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
 }
 
 func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error) {
@@ -279,7 +283,11 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 
-	httpResp, err := p.client.Do(httpReq)
+	sc := p.streamClient
+	if sc == nil {
+		sc = p.client
+	}
+	httpResp, err := sc.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -299,6 +307,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 	tcAccum := make(map[int]*accumTC)
 	var usage anthropicUsage
+	var stopReason string
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -338,6 +347,9 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 					if ev.Usage != nil {
 						usage = *ev.Usage
 					}
+					if ev.Delta != nil && ev.Delta.StopReason != "" {
+						stopReason = ev.Delta.StopReason
+					}
 				}
 			}
 		}
@@ -354,11 +366,25 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	for _, idx := range indices {
 		acc := tcAccum[idx]
 		var input map[string]any
-		json.Unmarshal([]byte(acc.JSONBuf.String()), &input)
+		rawJSON := acc.JSONBuf.String()
+		if rawJSON == "" {
+			// Empty JSON buffer means this tool call was truncated (likely max_tokens hit)
+			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: empty input (response likely truncated, stop=%s)\n", acc.Name, stopReason)
+			continue
+		}
+		if err := json.Unmarshal([]byte(rawJSON), &input); err != nil {
+			// Incomplete JSON from truncated response - skip this tool call
+			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: failed to parse input JSON: %v (stop=%s, raw: %s)\n", acc.Name, err, stopReason, truncate(rawJSON, 200))
+			continue
+		}
 		if input == nil {
 			input = map[string]any{}
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+	}
+
+	if stopReason == "" {
+		stopReason = "end_turn"
 	}
 
 	return &ChatResponse{
@@ -367,6 +393,6 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		Model:        req.Model,
 		InputTokens:  usage.InputTokens,
 		OutputTokens: usage.OutputTokens,
-		StopReason:   "end_turn",
+		StopReason:   stopReason,
 	}, nil
 }

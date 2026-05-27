@@ -123,4 +123,4 @@ type retryConfig struct {
 	BaseDelay  time.Duration
 }
 
-var defaultRetry = retryConfig{MaxRetries: 3, BaseDelay: time.Second}
+var defaultRetry = retryConfig{MaxRetries: 5, BaseDelay: 2 * time.Second}
