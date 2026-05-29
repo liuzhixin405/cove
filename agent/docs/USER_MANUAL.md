@@ -1,0 +1,1242 @@
+# AgentGo 完整使用手册
+
+> **版本**: 1.0.0  
+> **最后更新**: 2026-05-29
+
+---
+
+## 目录
+
+1. [快速开始](#1-快速开始)
+2. [安装与配置](#2-安装与配置)
+3. [启动参数](#3-启动参数)
+4. [REPL 交互](#4-repl-交互)
+5. [所有命令详解](#5-所有命令详解)
+6. [LLM 工具清单](#6-llm-工具清单)
+7. [权限系统](#7-权限系统)
+8. [配置文件](#8-配置文件)
+9. [环境变量](#9-环境变量)
+10. [供应商支持](#10-供应商支持)
+11. [Multi-Key 密钥池](#11-multi-key-密钥池)
+12. [插件系统与 Marketplace](#12-插件系统与-marketplace)
+13. [MCP 集成](#13-mcp-集成)
+14. [Skills 技能系统](#14-skills-技能系统)
+15. [检查点与回退](#15-检查点与回退)
+16. [上下文压缩](#16-上下文压缩)
+17. [护栏防循环](#17-护栏防循环)
+18. [子代理系统](#18-子代理系统)
+19. [记忆系统](#19-记忆系统)
+20. [Buddy 编程伙伴](#20-buddy-编程伙伴)
+21. [Dream 记忆整理](#21-dream-记忆整理)
+22. [渐进式引导](#22-渐进式引导)
+23. [提示缓存与速率限制](#23-提示缓存与速率限制)
+24. [文件与目录结构](#24-文件与目录结构)
+25. [高级用法与技巧](#25-高级用法与技巧)
+
+---
+
+## 1. 快速开始
+
+```bash
+# 设置 API Key（二选一）
+export ANTHROPIC_API_KEY="sk-ant-..."
+# 或
+agentgo --api-key "sk-ant-..."
+
+# 启动交互式 REPL
+agentgo
+
+# 单次查询模式（不进入 REPL）
+agentgo -p "用 Go 写一个 HTTP server"
+
+# 恢复上次会话
+agentgo --resume <session-id>
+```
+
+首次启动时会自动检测项目类型，建议运行 `/init` 生成项目指南文件（`CLAUDE.md`），让 AI 更好地理解你的项目。
+
+---
+
+## 2. 安装与配置
+
+### 2.1 安装
+
+```bash
+# 从源码构建
+cd agent/
+go build -o agentgo ./cmd/agentgo/
+```
+
+### 2.2 首次配置
+
+启动后使用以下命令快速配置：
+
+```
+/provider anthropic          # 选择供应商
+/api-key sk-ant-xxx...       # 设置 API Key
+/model claude-sonnet-4-20250514  # 选择模型
+/budget 5                    # 设置预算上限 ($5)
+```
+
+配置会自动保存到 `~/.agentgo/config.json`。
+
+---
+
+## 3. 启动参数
+
+| 参数 | 简写 | 说明 |
+|------|------|------|
+| `--version` | `-v` | 显示版本号 |
+| `--help` | `-h` | 显示帮助信息 |
+| `--debug` | `-d` | 启用调试日志（显示 API 请求/响应详情） |
+| `--print <prompt>` | `-p <prompt>` | 单次查询模式，执行完毕后退出 |
+| `--resume <id>` | `-r <id>` | 恢复指定的已保存会话 |
+| `--list-sessions` | — | 列出所有已保存的历史会话 |
+| `--doctor` | — | 运行系统诊断（检查 git、ripgrep、配置） |
+| `--config` | — | 以 JSON 格式输出当前配置 |
+| `--dump-system-prompt` | — | 输出完整系统提示词后退出 |
+| `--no-auto` | — | 禁用后台自动提取（extract/suggest） |
+
+### 示例
+
+```bash
+# 调试模式，查看所有 API 交互
+agentgo -d
+
+# 单次执行，适合脚本集成
+agentgo -p "列出当前目录所有 Go 文件" 2>/dev/null
+
+# 诊断环境问题
+agentgo --doctor
+```
+
+---
+
+## 4. REPL 交互
+
+### 4.1 按键绑定
+
+| 按键 | 功能 |
+|------|------|
+| `Enter` | 提交输入 |
+| `Ctrl+C` | 中断当前操作（工具执行/API 调用） |
+| `Ctrl+D` | 退出程序（输入缓冲为空时） |
+| `←` / `→` | 移动光标 |
+| `↑` / `↓` | 浏览历史输入 |
+| `Home` | 光标移到行首 |
+| `End` | 光标移到行尾 |
+| `Delete` | 删除光标后字符 |
+| `Backspace` | 删除光标前字符 |
+| `Tab` | 自动补全 |
+
+### 4.2 Tab 补全
+
+- **命令补全**: 输入 `/com` 按 Tab → 提示 `/commit`、`/compact`
+- **参数补全**: 输入 `/mode ` 按 Tab → 提示 `default`、`plan`、`auto`、`bypass`
+- **供应商补全**: 输入 `/provider ` 按 Tab → 列出所有支持的供应商
+- **技能补全**: 输入 `/skill ` 按 Tab → 列出可用技能名
+
+### 4.3 输入模式
+
+- **普通输入**: 直接输入自然语言问题或指令
+- **命令模式**: 以 `/` 开头触发命令（实时显示补全建议）
+- **多行输入**: 暂不支持，每次 Enter 即提交
+
+### 4.4 输出格式
+
+- **Markdown 渲染**: 代码块自动语法高亮
+- **工具调用进度**: 显示工具名称和简要参数
+- **成本追踪**: 每次交互后显示 token 用量
+- **Walking Indicator**: 多轮迭代时显示"思考中..."动画
+
+---
+
+## 5. 所有命令详解
+
+### 5.1 配置类命令
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/model <名称>` | 切换 LLM 模型 | `/model gpt-4o` |
+| `/provider <名称>` | 切换 AI 供应商 | `/provider deepseek` |
+| `/api-key <密钥>` | 设置 API 密钥 | `/api-key sk-xxx` |
+| `/base-url <URL>` | 设置自定义 API 地址 | `/base-url https://my-proxy.com/v1` |
+| `/mode <模式>` | 切换权限模式 | `/mode auto` |
+| `/budget <金额>` | 设置每会话预算上限(USD) | `/budget 10` |
+| `/config` | 查看完整配置 | `/config` |
+| `/config <键> <值>` | 修改配置字段 | `/config thinking_tokens 32000` |
+
+### 5.2 会话管理
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/cost` | 查看费用（当前+24h+7d+总计） | `/cost` |
+| `/ratelimit` | 查看 API 速率限制状态 | `/ratelimit` |
+| `/compact` | 手动压缩对话历史 | `/compact` |
+| `/history` | 列出历史会话 | `/history` |
+| `/history <编号>` | 恢复指定历史会话 | `/history 3` |
+| `/resume [id]` | 恢复已保存的会话 | `/resume abc123` |
+| `/export [文件]` | 导出对话到 markdown | `/export chat.md` |
+| `/context` | 查看会话上下文信息 | `/context` |
+| `/status` | 查看代理状态 | `/status` |
+| `/stats` | 查看会话统计 | `/stats` |
+
+### 5.3 项目操作
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/commit [消息]` | 暂存所有更改并 git 提交 | `/commit fix: 修复空指针` |
+| `/diff` | 显示当前 git diff | `/diff` |
+| `/review` | AI 审查工作区更改 | `/review` |
+| `/cd <路径>` | 切换工作目录 | `/cd src/` |
+| `/init` | 初始化项目（生成 CLAUDE.md） | `/init` |
+
+### 5.4 检查点
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/undo` | 回退到上一个文件检查点 | `/undo` |
+| `/checkpoints` | 列出所有检查点记录 | `/checkpoints` |
+
+### 5.5 记忆与技能
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/memory` | 列出所有记忆条目 | `/memory` |
+| `/memory add <内容>` | 手动添加记忆 | `/memory add 用户偏好 tab=4` |
+| `/memory remove <名称>` | 删除记忆条目 | `/memory remove auto` |
+| `/skills` | 列出所有可用技能 | `/skills` |
+| `/skills <名称>` | 查看技能详情 | `/skills debug` |
+| `/dream` | 手动运行记忆整理 | `/dream` |
+
+### 5.6 插件
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/plugin list` | 列出已安装插件 | `/plugin list` |
+| `/plugin install <名称>` | 从 marketplace 安装 | `/plugin install code-formatter` |
+| `/plugin install <url>` | 从 git URL 安装 | `/plugin install https://github.com/user/plugin.git` |
+| `/plugin uninstall <名称>` | 卸载插件 | `/plugin uninstall code-formatter` |
+| `/plugin enable <名称>` | 启用已禁用的插件 | `/plugin enable code-formatter` |
+| `/plugin disable <名称>` | 禁用插件（不删除） | `/plugin disable code-formatter` |
+| `/plugin search [关键词]` | 搜索 marketplace | `/plugin search formatter` |
+| `/plugin refresh` | 更新 marketplace 索引 | `/plugin refresh` |
+| `/plugin update [名称]` | 更新插件（空=全部） | `/plugin update` |
+
+### 5.7 MCP
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/mcp list` | 列出已连接的 MCP 服务器 | `/mcp list` |
+| `/mcp connect <名称>` | 连接配置中的 MCP 服务器 | `/mcp connect puppeteer` |
+| `/mcp disconnect <名称\|all>` | 断开 MCP 服务器连接 | `/mcp disconnect all` |
+| `/mcp read <服务器> <uri>` | 读取 MCP 资源 | `/mcp read fs file:///tmp/data.json` |
+
+### 5.8 其他
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `/help` | 显示帮助 | `/help` |
+| `/exit` | 退出程序 | `/exit` |
+| `/debug` | 切换调试模式 | `/debug` |
+| `/system [提示词]` | 查看/设置自定义系统提示词 | `/system 你是一个 Go 专家` |
+| `/permissions` | 查看当前权限设置 | `/permissions` |
+| `/buddy` | 与编程伙伴互动 | `/buddy pet` |
+| `/doctor` | 系统诊断 | `/doctor` |
+
+---
+
+## 6. LLM 工具清单
+
+以下是 AI 可以在对话中自动调用的工具：
+
+### 6.1 文件系统
+
+| 工具 | 只读 | 说明 | 参数 |
+|------|:----:|------|------|
+| `bash` | ✗ | 执行 shell 命令 | `command`(必填), `description`, `timeout`(ms, 默认120000) |
+| `powershell` | ✗ | 执行 PowerShell 命令(Windows) | `command`(必填), `description`, `timeout`(ms) |
+| `read` | ✓ | 读取文件内容/列出目录 | `filePath`(必填), `offset`(起始行), `limit`(行数) |
+| `write` | ✗ | 写入/创建文件(完整覆盖) | `filePath`(必填), `content`(必填) |
+| `edit` | ✗ | 精确字符串替换 | `filePath`(必填), `oldString`(必填), `newString`(必填), `replaceAll`(bool) |
+| `grep` | ✓ | 正则搜索文件内容(基于 ripgrep) | `pattern`(必填), `include`(glob过滤), `path`(搜索路径) |
+| `glob` | ✓ | 按通配符模式查找文件 | `pattern`(必填), `path`(搜索根目录) |
+
+### 6.2 网络
+
+| 工具 | 只读 | 说明 | 参数 |
+|------|:----:|------|------|
+| `webfetch` | ✓ | 获取 URL 内容(自动 HTTP→HTTPS 升级) | `url`(必填), `format`(text/html/json) |
+| `websearch` | ✓ | 网页搜索(DuckDuckGo) | `query`(必填) |
+
+### 6.3 交互
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `question` | 向用户提问以获取信息 | `questions`(数组, 每个含 header/question/options/multiple) |
+| `todowrite` | 创建/更新结构化任务列表 | `todos`(数组, 每个含 content/status/priority) |
+| `plan_mode` | 进入计划模式(只规划不执行) | `reason` |
+| `exit_plan_mode` | 退出计划模式恢复执行 | `summary` |
+| `brief` | 生成上下文摘要 | `what`(描述需要什么摘要) |
+| `sleep` | 暂停执行等待(最多300秒) | `seconds`(必填) |
+
+### 6.4 Git Worktree
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `worktree` | 创建 git worktree 分支隔离工作 | `branch`(必填) |
+| `exit_worktree` | 退出 worktree 并可选合并 | `merge`(bool) |
+
+### 6.5 任务管理
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `task` | 创建后台任务 | `title`(必填), `description`(必填) |
+| `task_list` | 列出所有任务 | (无参数) |
+| `task_update` | 更新任务状态 | `taskId`(必填), `status`(必填), `output` |
+| `task_stop` | 停止运行中的任务 | `taskId`(必填) |
+| `task_get` | 获取任务详情 | `taskId`(必填) |
+| `task_output` | 获取任务完整输出 | `taskId`(必填) |
+
+### 6.6 团队协作
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `agent` | 生成子代理处理复杂任务 | `type`(必填: general/explore/plan/review/test), `prompt`(必填) |
+| `team_create` | 创建并行代理团队 | `name`(必填), `members`(数组: [{agent, task}]) |
+| `team_delete` | 解散代理团队 | `name`(必填) |
+| `cron` | 调度定期任务(cron 表达式) | `schedule`(必填), `task`(必填) |
+| `send_message` | 给代理/用户发送消息 | `to`(必填), `message`(必填) |
+
+### 6.7 开发工具
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `lsp` | 语言服务器操作(诊断/hover/引用/定义) | `action`(必填), `filePath`(必填) |
+| `skill` | 调用预定义技能工作流 | `name`(必填), `args` |
+
+### 6.8 MCP 工具
+
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `mcp` | 调用 MCP 服务器工具 | `serverName`(必填), `toolName`(必填), `arguments`(对象) |
+| `mcp_resources` | 列出 MCP 服务器资源 | `server`(可选过滤) |
+| `mcp_read_resource` | 读取 MCP 资源内容 | `serverName`(必填), `uri`(必填) |
+
+---
+
+## 7. 权限系统
+
+### 7.1 四种权限模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| `default` | 每次写入/执行操作需用户确认 | 日常使用，安全第一 |
+| `plan` | 只允许只读操作，所有写入被拒绝 | 纯分析/规划，不修改任何文件 |
+| `auto` | 安全操作自动批准，危险操作仍需确认 | 信任 AI 做常规操作 |
+| `bypass` | 所有操作自动批准，完全不确认 | 完全信任（脚本/批处理场景） |
+
+### 7.2 权限交互
+
+当模式为 `default` 或 `auto` 时，危险操作会触发确认提示：
+
+```
+⚠ bash: rm -rf node_modules && npm install
+  允许执行此命令？ (y/n/a)
+```
+
+- **y** — 本次允许
+- **n** — 本次拒绝
+- **a** — 始终允许此类操作（添加永久规则）
+
+### 7.3 危险命令检测
+
+内置分类器自动识别危险命令：
+- 删除操作: `rm -rf`, `del /s`, `rmdir`
+- Git 危险操作: `push --force`, `reset --hard`, `rebase`
+- 系统修改: `chmod 777`, `chown`, `shutdown`
+- 网络操作: `curl | sh`, `wget | bash`
+
+### 7.4 切换模式
+
+```
+/mode default    # 恢复默认（每次确认）
+/mode auto       # 自动模式
+/mode plan       # 只读模式
+/mode bypass     # 跳过所有确认
+```
+
+---
+
+## 8. 配置文件
+
+### 8.1 全局配置
+
+路径: `~/.agentgo/config.json`
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "provider": {
+    "name": "anthropic",
+    "api_key": "sk-ant-...",
+    "api_keys": [],
+    "base_url": ""
+  },
+  "permission_mode": "default",
+  "max_budget_usd": 10,
+  "thinking_tokens": 16000,
+  "debug": false,
+  "verbose": false,
+  "system_prompt": "",
+  "mcp_servers": {}
+}
+```
+
+### 8.2 字段说明
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | string | `"claude-sonnet-4-20250514"` | 使用的 LLM 模型名称 |
+| `provider.name` | string | `"anthropic"` | AI 供应商名称 |
+| `provider.api_key` | string | `""` | 单个 API 密钥 |
+| `provider.api_keys` | []string | `[]` | 多密钥轮询池（优先于 api_key） |
+| `provider.base_url` | string | `""` | 自定义 API 端点 |
+| `permission_mode` | string | `"default"` | 权限模式 |
+| `max_budget_usd` | float64 | `10` | 每会话最大预算（美元） |
+| `thinking_tokens` | int | `16000` | 思考 token 配额（最低 1024） |
+| `debug` | bool | `false` | 调试模式 |
+| `verbose` | bool | `false` | 详细输出 |
+| `system_prompt` | string | `""` | 自定义系统提示词（追加到默认提示词后） |
+| `mcp_servers` | map | `{}` | MCP 服务器配置 |
+
+### 8.3 项目级配置
+
+路径: `<项目根目录>/.agentgo.json`
+
+项目级配置会覆盖全局配置中的以下字段：
+- `model`
+- `permission_mode`
+- `max_budget_usd`
+- `system_prompt`
+- `mcp_servers`
+
+```json
+{
+  "model": "deepseek-chat",
+  "permission_mode": "auto",
+  "max_budget_usd": 2,
+  "system_prompt": "这是一个 Go 微服务项目，使用 gin 框架",
+  "mcp_servers": {
+    "database": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {"POSTGRES_URL": "postgres://localhost/mydb"}
+    }
+  }
+}
+```
+
+---
+
+## 9. 环境变量
+
+### 9.1 通用
+
+| 环境变量 | 说明 |
+|----------|------|
+| `LLM_API_KEY` | 通用 API 密钥（任意供应商通用） |
+| `LLM_BASE_URL` | 通用 API 地址（所有供应商的 fallback） |
+
+### 9.2 按供应商
+
+| 供应商 | 环境变量 |
+|--------|----------|
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| DeepSeek | `DEEPSEEK_API_KEY` |
+| 智谱 GLM | `GLM_API_KEY` / `ZHIPU_API_KEY` / `BIGMODEL_API_KEY` |
+| Kimi | `KIMI_API_KEY` / `MOONSHOT_API_KEY` |
+| 通义千问 | `QWEN_API_KEY` / `DASHSCOPE_API_KEY` |
+| 豆包 | `DOUBAO_API_KEY` / `ARK_API_KEY` / `VOLCENGINE_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| 硅基流动 | `SILICONFLOW_API_KEY` |
+| Groq | `GROQ_API_KEY` |
+| Together | `TOGETHER_API_KEY` |
+| Fireworks | `FIREWORKS_API_KEY` |
+| xAI | `XAI_API_KEY` / `GROK_API_KEY` |
+| Mistral | `MISTRAL_API_KEY` |
+
+### 9.3 优先级
+
+1. `config.json` 中的 `provider.api_key`
+2. 供应商专用环境变量（如 `ANTHROPIC_API_KEY`）
+3. `LLM_API_KEY`（通用 fallback）
+
+---
+
+## 10. 供应商支持
+
+### 10.1 支持的供应商列表
+
+| 供应商 | 协议 | 默认 Base URL | 备注 |
+|--------|------|---------------|------|
+| `anthropic` | Anthropic Messages API | `https://api.anthropic.com/v1` | 默认供应商，支持提示缓存 |
+| `openai` | OpenAI Chat Completions | `https://api.openai.com/v1` | |
+| `deepseek` | OpenAI 兼容 | `https://api.deepseek.com` | |
+| `glm` | OpenAI 兼容 | `https://open.bigmodel.cn/api/paas/v4` | 智谱 |
+| `kimi` | OpenAI 兼容 | `https://api.moonshot.cn/v1` | |
+| `qwen` | OpenAI 兼容 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 通义千问 |
+| `doubao` | OpenAI 兼容 | `https://ark.cn-beijing.volces.com/api/v3` | 豆包/火山方舟 |
+| `openrouter` | OpenAI 兼容 | `https://openrouter.ai/api/v1` | 多模型网关 |
+| `siliconflow` | OpenAI 兼容 | `https://api.siliconflow.cn/v1` | 硅基流动 |
+| `groq` | OpenAI 兼容 | `https://api.groq.com/openai/v1` | 超快推理 |
+| `together` | OpenAI 兼容 | `https://api.together.xyz/v1` | |
+| `fireworks` | OpenAI 兼容 | `https://api.fireworks.ai/inference/v1` | |
+| `xai` | OpenAI 兼容 | `https://api.x.ai/v1` | Grok |
+| `mistral` | OpenAI 兼容 | `https://api.mistral.ai/v1` | |
+| `openai-compatible` | OpenAI 兼容 | (需要手动设置 base_url) | 任意兼容 API |
+
+### 10.2 切换供应商
+
+```
+/provider deepseek
+/model deepseek-chat
+/api-key sk-xxx
+```
+
+### 10.3 使用自定义/自建模型
+
+```
+/provider openai-compatible
+/base-url http://localhost:11434/v1
+/model llama3:70b
+/api-key ollama
+```
+
+---
+
+## 11. Multi-Key 密钥池
+
+当你有多个 API Key（比如多个 Anthropic 账号）时，可以配置密钥池实现自动轮转和故障转移。
+
+### 11.1 配置
+
+```json
+{
+  "provider": {
+    "name": "anthropic",
+    "api_keys": [
+      "sk-ant-key1...",
+      "sk-ant-key2...",
+      "sk-ant-key3..."
+    ]
+  }
+}
+```
+
+### 11.2 行为
+
+- **Round-Robin 轮询**: 每次 API 调用使用下一个 key
+- **限流自动跳过**: 被 429 的 key 自动冷却，到期后恢复
+- **永久失败标记**: 认证失败(401/403)的 key 标记为 Dead
+- **容错降级**: 所有 key 不可用时，选择冷却最快恢复的 key 继续尝试
+
+### 11.3 注意事项
+
+- `api_keys` 数组优先于 `api_key` 单值
+- 如果只配置 `api_key`，行为与之前完全一致
+- 建议至少配置 2-3 个 key 以获得更好的可用性
+
+---
+
+## 12. 插件系统与 Marketplace
+
+### 12.1 概述
+
+插件可以为 AgentGo 添加额外的命令、工具、技能和钩子。
+
+### 12.2 安装插件
+
+```bash
+# 从 Marketplace 安装（推荐）
+/plugin refresh                # 首次使用需刷新索引
+/plugin search formatter       # 搜索可用插件
+/plugin install code-formatter # 安装
+
+# 从 Git URL 直接安装
+/plugin install https://github.com/user/agentgo-plugin-xxx.git
+
+# 查看已安装
+/plugin list
+```
+
+### 12.3 管理插件
+
+```bash
+/plugin disable my-plugin    # 禁用（保留文件，不加载）
+/plugin enable my-plugin     # 重新启用
+/plugin update my-plugin     # 更新到最新版本
+/plugin update               # 更新所有插件
+/plugin uninstall my-plugin  # 彻底删除
+```
+
+### 12.4 Marketplace 来源
+
+默认使用官方 registry。可以添加自定义来源（企业私有 registry）：
+
+```json
+// ~/.agentgo/marketplace/sources.json
+[
+  {"name": "official", "type": "git", "url": "https://github.com/agentgo-plugins/registry.git", "enabled": true},
+  {"name": "company", "type": "git", "url": "https://git.company.com/agentgo-plugins.git", "enabled": true},
+  {"name": "local", "type": "directory", "url": "/path/to/local/plugins", "enabled": true}
+]
+```
+
+### 12.5 开发插件
+
+插件目录结构：
+
+```
+my-plugin/
+├── manifest.json    # 必须
+├── tools/           # 自定义工具
+├── skills/          # 自定义技能
+└── hooks/           # 生命周期钩子
+```
+
+`manifest.json` 格式：
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "我的自定义插件",
+  "author": "YourName",
+  "commands": ["my-cmd"],
+  "tools": ["my-tool"],
+  "hooks": ["on-start"],
+  "skills": ["my-workflow"]
+}
+```
+
+### 12.6 版本锁定
+
+安装信息保存在 `~/.agentgo/marketplace/lock.json`：
+
+```json
+{
+  "plugins": {
+    "code-formatter": {
+      "source": "https://github.com/user/code-formatter.git",
+      "version": "1.2.0",
+      "commit_sha": "abc1234...",
+      "installed_at": "2026-05-29T10:00:00Z",
+      "auto_update": true
+    }
+  }
+}
+```
+
+---
+
+## 13. MCP 集成
+
+### 13.1 什么是 MCP
+
+MCP (Model Context Protocol) 是一个开放协议，允许 AI 代理通过标准化接口调用外部工具和访问资源。
+
+### 13.2 配置 MCP 服务器
+
+在 `config.json` 或项目 `.agentgo.json` 中：
+
+```json
+{
+  "mcp_servers": {
+    "puppeteer": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-puppeteer"],
+      "type": "stdio"
+    },
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {
+        "POSTGRES_URL": "postgres://localhost:5432/mydb"
+      },
+      "type": "stdio"
+    },
+    "remote-api": {
+      "type": "sse",
+      "url": "http://localhost:8080/mcp/sse"
+    }
+  }
+}
+```
+
+### 13.3 传输类型
+
+| 类型 | 说明 |
+|------|------|
+| `stdio` | 启动本地子进程，通过标准输入/输出通信（默认） |
+| `sse` | 通过 Server-Sent Events 连接远程服务器 |
+| `http` | 通过 HTTP 请求连接远程服务器 |
+
+### 13.4 使用 MCP
+
+启动时自动连接配置中的所有 MCP 服务器（30秒超时）。
+
+```bash
+/mcp list                    # 查看已连接服务器及其工具/资源
+/mcp connect puppeteer       # 手动连接
+/mcp disconnect puppeteer    # 断开
+/mcp read postgres file:///schema.sql  # 读取资源
+```
+
+AI 可以直接调用 MCP 服务器提供的工具，就像使用内置工具一样。
+
+---
+
+## 14. Skills 技能系统
+
+### 14.1 概述
+
+技能是预定义的工作流程/提示词，让 AI 按照最佳实践执行特定任务。
+
+### 14.2 内置技能
+
+| 技能名 | 说明 |
+|--------|------|
+| `batch` | 并行工作编排（拆分任务并行执行） |
+| `debug` | 系统化调试（复现→定位→修复→验证） |
+| `refactor` | 安全重构（小步骤+测试验证） |
+| `review` | 代码审查（正确性/风格/性能/安全） |
+| `test` | 编写测试（单元/集成/边界案例） |
+| `verify` | 验证变更（构建+测试+lint） |
+| `simplify` | 代码精简（去除冗余，保持功能） |
+| `commit` | 生成规范的 git commit message |
+| `perf` | 性能分析与优化 |
+| `init` | 项目初始化 |
+| `remember` | 整理记忆文件 |
+| `update-config` | 修改项目配置 |
+| `loop` | 循环执行任务 |
+| `schedule` | 后台调度任务 |
+| `skillify` | 将工作模式保存为可复用技能 |
+| `stuck` | 诊断卡死的会话 |
+| `claude-api` | Claude API 使用指南 |
+| `claude-in-chrome` | 浏览器验证工作流 |
+| `keybindings-help` | 快捷键配置帮助 |
+| `lorem-ipsum` | 生成占位文本 |
+
+### 14.3 使用技能
+
+```bash
+/skills              # 列出所有可用技能
+/skills debug        # 查看 debug 技能详情
+/debug               # 直接使用技能名作为命令激活
+
+# 在对话中 AI 也可以自己调用 skill 工具
+```
+
+### 14.4 技能加载路径（按优先级）
+
+1. 内置 bundles
+2. `~/.agentgo/skills/` — 全局用户技能
+3. `~/.claude/skills/` — 兼容目录
+4. `<项目>/.claude/skills/` — 项目级技能
+5. `<项目>/.agentgo/skills/` — 项目级技能
+6. 父目录 `.claude/skills/`（递归向上查找）
+
+### 14.5 自定义技能
+
+创建文件 `~/.agentgo/skills/my-skill/SKILL.md`：
+
+```markdown
+---
+name: my-skill
+description: 我的自定义工作流
+paths: src/, lib/
+allowed_tools: read, grep, bash, write
+---
+
+# 我的工作流
+
+按照以下步骤操作：
+1. 搜索相关代码
+2. 分析上下文
+3. 生成方案
+4. 实施变更
+5. 验证结果
+```
+
+YAML frontmatter 字段：
+- `name` — 技能名称
+- `description` — 简要描述
+- `paths` — 适用的文件路径模式
+- `allowed_tools` — 允许使用的工具白名单
+
+---
+
+## 15. 检查点与回退
+
+### 15.1 原理
+
+AgentGo 使用 Git bare repository 作为影子存储，在每次文件修改前自动创建快照。
+
+### 15.2 自动行为
+
+- AI 执行 `write` 或 `edit` 工具前自动创建检查点
+- 标签格式：`工具名: 文件路径`（如 `write: src/main.go`）
+- 存储位置：`~/.agentgo/checkpoints/store/`（共享 bare repo）
+
+### 15.3 手动操作
+
+```bash
+/undo          # 回退到上一个检查点（恢复所有文件）
+/checkpoints   # 列出所有检查点（最新在前，最多20条）
+```
+
+### 15.4 排除列表
+
+以下文件/目录不会被纳入检查点：
+- `node_modules/`
+- `.git/`
+- `.venv/`
+- `__pycache__/`
+- `*.exe`, `*.dll`, `*.so`, `*.dylib`
+- `target/`, `dist/`, `build/`, `.next/`
+
+### 15.5 隔离性
+
+每个项目目录使用独立的 git ref（`refs/agentgo/<sha256(workdir)[:8]>`），互不干扰。
+
+---
+
+## 16. 上下文压缩
+
+### 16.1 自动触发
+
+当对话 token 数超过 **64,000** 且迭代次数 > 5 且消息数 > 16 时自动触发。
+
+### 16.2 两层压缩策略
+
+**Layer 1: 工具结果裁剪（无 API 开销）**
+- 将最后 6 条之前的 tool 消息结果压缩为 1 行摘要
+- 格式：`[工具名] 首行内容... (N chars原始输出已压缩)`
+- 保留 ≤200 字符的短结果
+
+**Layer 2: LLM 摘要（需要一次 API 调用）**
+- 如果 Layer 1 后仍超阈值，调用 LLM 总结中间对话
+- 保留首条用户消息 + 最后 6 条消息完整
+- 中间部分替换为结构化摘要（决策/文件/状态/错误/上下文）
+
+### 16.3 手动触发
+
+```bash
+/compact    # 立即执行压缩
+```
+
+---
+
+## 17. 护栏防循环
+
+### 17.1 三级检测
+
+| 级别 | 条件 | 阈值(Warn) | 阈值(Block) |
+|------|------|-----------|-------------|
+| 精确重复失败 | 相同工具+相同参数连续失败 | 2 次 | 5 次 |
+| 同工具失败 | 同一工具名连续失败 | 3 次 | 8 次 |
+| 幂等无进展 | 只读工具返回完全相同结果 | 2 次 | 5 次 |
+
+### 17.2 幂等工具
+
+以下工具被识别为幂等（结果会被跟踪去重）：
+- `read`
+- `grep`
+- `glob`
+- `webfetch`
+
+### 17.3 重置机制
+
+- 成功调用会重置该工具/参数的失败计数
+- 每个新用户输入会完全重置所有计数器
+
+---
+
+## 18. 子代理系统
+
+### 18.1 概述
+
+AI 可以自动生成独立的子代理来处理复杂的并行任务。子代理有自己独立的工具集和上下文。
+
+### 18.2 子代理类型
+
+| 类型 | 说明 | 系统提示 |
+|------|------|----------|
+| `general` | 通用多步骤任务 | "完成任务并返回清晰结果" |
+| `explore` | 代码探索 | "搜索代码库并报告发现" |
+| `plan` | 方案设计 | "创建详细结构化计划" |
+| `review` | 代码审查 | "检查正确性/风格/性能/安全" |
+| `test` | 编写测试 | "编写并运行全面测试" |
+
+### 18.3 子代理特性
+
+- **隔离环境**: 独立 tool registry，不能递归生成子代理
+- **自动批准**: 子代理内部工具调用不需要用户确认
+- **超时保护**: 5 分钟超时限制
+- **最大迭代**: 30 轮对话
+- **结果截断**: 工具输出限制 4000 字符
+
+### 18.4 内部委托系统
+
+Engine 内部的 `Delegator` 管理子代理生命周期：
+- 可以同时运行多个子代理
+- 支持取消正在运行的子代理
+- 任务完成后自动清理资源
+
+---
+
+## 19. 记忆系统
+
+### 19.1 自动学习
+
+每轮对话结束后，后台异步分析对话内容：
+- 识别**用户偏好**（编码风格、工具偏好、工作习惯）→ 保存为 MEMORY
+- 识别**可复用工作流**（解决特定问题的步骤）→ 保存为 SKILL
+
+### 19.2 手动管理
+
+```bash
+/memory              # 列出所有记忆条目
+/memory add <内容>   # 手动添加记忆
+/memory remove <名称> # 删除记忆
+```
+
+### 19.3 记忆在对话中的作用
+
+- 记忆内容被注入到系统提示词中
+- AI 可以参考记忆来更好地适应用户偏好
+- 自动学习的记忆以 `[auto]` 标签存储
+
+---
+
+## 20. Buddy 编程伙伴
+
+### 20.1 概述
+
+Buddy 是一个虚拟编程伙伴，在你工作时提供陪伴感和趣味性。
+
+### 20.2 孵化
+
+首次使用时基于用户 ID 确定性生成：
+
+```bash
+/buddy hatch    # 孵化你的编程伙伴
+```
+
+属性随机分配：
+- **18 种种族**: duck, goose, blob, cat, dragon, octopus, owl, penguin, turtle, snail, ghost, axolotl, capybara, cactus, robot, rabbit, mushroom, chonk
+- **5 级稀有度**: Common(60%), Uncommon(25%), Rare(10%), Epic(4%), Legendary(1%)
+- **5 项属性**: DEBUGGING, PATIENCE, CHAOS, WISDOM, SNARK (1-20)
+- **装饰品**: 帽子(crown, tophat, propeller, halo, wizard, beanie, tinyduck)
+
+### 20.3 互动
+
+```bash
+/buddy          # 查看伙伴状态
+/buddy pet      # 摸摸（连续摸有彩蛋！）
+/buddy stats    # 查看等级和属性
+/buddy fortune  # 今日运势
+```
+
+### 20.4 成长系统
+
+- 工具调用: +2 XP
+- 对话轮次: +1 XP
+- 摸摸: +1 XP
+- 等级随经验提升
+
+### 20.5 心情系统
+
+根据事件自动变化: happy → excited → chill → sleepy → annoyed → proud
+
+### 20.6 闲聊
+
+空闲时 Buddy 会在终端显示气泡消息，内容取决于种族和心情。
+
+---
+
+## 21. Dream 记忆整理
+
+### 21.1 概述
+
+Dream 是一个后台系统，定期回顾和整理记忆文件，类似于人类睡眠时的记忆巩固。
+
+### 21.2 触发条件
+
+- 会话启动时自动检查
+- 手动触发: `/dream`
+- 后台根据配置周期运行
+
+### 21.3 行为
+
+- 回顾近期会话中学到的内容
+- 合并重复或冲突的记忆
+- 整理记忆文件结构
+- 配置存储: `~/.agentgo/dream.json`
+
+---
+
+## 22. 渐进式引导
+
+### 22.1 概述
+
+首次使用各功能时显示一次性提示，帮助用户了解功能。
+
+### 22.2 提示列表
+
+| 触发场景 | 提示内容 |
+|----------|----------|
+| 首次 Ctrl+C | "按 Ctrl+C 可以中断当前操作。用 /stop 停止工具执行，/exit 退出程序。" |
+| 首次工具执行 | "工具执行时会显示进度。你可以用 /mode auto 自动批准安全操作。" |
+| 首次上下文压缩 | "对话过长时会自动压缩上下文。用 /compact 可手动触发。" |
+| 接近预算上限 | "接近预算上限。用 /budget <金额> 调整，或 /cost 查看详情。" |
+| 首次权限询问 | "权限模式可选：default/auto/plan。用 /mode 切换。" |
+| 长会话 | "我会自动记住重要的偏好和工作模式。用 /memory 查看已学习的内容。" |
+| 首次文件修改 | "文件修改前会自动创建检查点。用 /undo 可回退到修改前的状态。" |
+
+### 22.3 状态持久化
+
+提示显示状态保存在 `~/.agentgo/onboarding.json`，不会重复显示。
+
+---
+
+## 23. 提示缓存与速率限制
+
+### 23.1 Anthropic 提示缓存
+
+针对 Anthropic 供应商，自动在最后 3 条非系统消息上添加 `cache_control: ephemeral` 标记，实现跨请求的提示缓存。
+
+效果：
+- 减少重复 token 计费
+- 降低延迟（命中缓存时跳过编码）
+- 对其他供应商自动跳过，无副作用
+
+### 23.2 速率限制监控
+
+```bash
+/ratelimit    # 查看当前速率限制状态
+```
+
+输出示例：
+```
+速率限制: 请求:45/60(75%) 重置:15s | Token:85.0K/100.0K(85%) 重置:1m
+```
+
+### 23.3 自动警告
+
+当 token 剩余额度低于 **20%** 时，每次交互后自动显示黄色警告。
+
+### 23.4 支持的 Header
+
+自动解析：
+- 标准: `x-ratelimit-limit-requests`, `x-ratelimit-remaining-tokens` 等
+- Anthropic: `anthropic-ratelimit-requests-limit`, `anthropic-ratelimit-tokens-remaining` 等
+
+---
+
+## 24. 文件与目录结构
+
+### 24.1 全局目录 (`~/.agentgo/`)
+
+```
+~/.agentgo/
+├── config.json              # 全局配置
+├── buddy.json               # Buddy 伙伴数据
+├── onboarding.json          # 引导状态
+├── dream.json               # 梦境配置
+├── sessions/                # 会话存储
+│   └── <session-id>.json
+├── plugins/                 # 插件目录
+│   └── <plugin-name>/
+│       └── manifest.json
+├── skills/                  # 用户自定义技能
+│   └── <skill-name>/
+│       └── SKILL.md
+├── marketplace/             # 插件市场
+│   ├── sources.json         # 市场来源配置
+│   ├── index.json           # 缓存的插件索引
+│   ├── lock.json            # 安装版本锁定
+│   └── cache/               # 市场仓库缓存
+├── checkpoints/
+│   └── store/               # 检查点 git bare repo
+└── cost/                    # 费用历史记录
+```
+
+### 24.2 项目级文件
+
+```
+<project>/
+├── .agentgo.json            # 项目配置覆盖
+├── CLAUDE.md                # 项目指南（AI 上下文）
+├── AGENTS.md                # 子目录级 AI 指南
+├── .agentgo.md              # 同 CLAUDE.md（备选名）
+├── .cursorrules             # Cursor 兼容规则文件
+└── .agentgo/
+    └── skills/              # 项目级技能
+```
+
+### 24.3 子目录上下文发现
+
+当 AI 操作涉及子目录中的文件时，会自动向上（最多 5 级）搜索以下文件：
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.cursorrules`
+- `.agentgo.md`
+
+找到后，内容（最多 2000 字符）会自动注入到工具结果中，帮助 AI 理解该子目录的特殊规则。
+
+---
+
+## 25. 高级用法与技巧
+
+### 25.1 批处理/脚本集成
+
+```bash
+# 非交互模式执行任务
+agentgo -p "找出所有 TODO 注释并生成报告" > report.md
+
+# 管道输入
+echo "解释这段代码" | agentgo -p -
+```
+
+### 25.2 快速切换模型
+
+```bash
+# 对话中随时切换
+/model deepseek-chat         # 切到便宜的模型做简单任务
+/model claude-sonnet-4-20250514  # 切回高质量模型做复杂任务
+```
+
+### 25.3 预算控制
+
+```bash
+/budget 1        # 限制在 $1 以内（适合试验）
+/budget 50       # 长时间深度工作
+/cost            # 随时查看已用额度
+```
+
+### 25.4 高效使用 Plan 模式
+
+```bash
+/mode plan       # 先让 AI 只做分析和规划
+# AI 会读取文件、搜索代码，但不会修改任何内容
+# 确认方案后：
+/mode auto       # 切换到自动模式执行
+```
+
+### 25.5 自定义系统提示词
+
+```bash
+/system 你是一位资深 Go 工程师。遵循以下规范：
+- 使用 Go 1.22+ 特性
+- 错误处理使用 errors.Is/As
+- 测试使用 table-driven 风格
+- 不使用全局变量
+```
+
+### 25.6 MCP 服务器链
+
+配置多个 MCP 服务器实现能力叠加：
+
+```json
+{
+  "mcp_servers": {
+    "browser": {"command": "npx", "args": ["-y", "@anthropic/mcp-puppeteer"]},
+    "database": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-postgres"]},
+    "filesystem": {"command": "npx", "args": ["-y", "@anthropic/mcp-filesystem"], "env": {"ALLOWED_DIRS": "/tmp"}}
+  }
+}
+```
+
+### 25.7 技能开发最佳实践
+
+1. 在 YAML frontmatter 中明确 `allowed_tools`，限制技能可用工具范围
+2. 用 `paths` 限制技能作用的文件范围
+3. 提示词中使用清晰的步骤编号
+4. 用 `/skillify` 技能将当前工作模式自动保存为可复用技能
+
+### 25.8 性能优化建议
+
+- 大项目使用 `.agentgo.json` 指定 `system_prompt`，减少 AI 探索时间
+- 配置 `thinking_tokens` 为 32000+ 对复杂推理任务效果更好
+- 多 key 配置避免单 key 限流影响工作流
+- `/compact` 在长会话中定期手动触发，保持响应速度
+
+### 25.9 Engine 参数参考
+
+| 参数 | 值 |
+|------|------|
+| 最大迭代轮数 | 200 |
+| 压缩 Token 阈值 | 64,000 |
+| Max API 输出 tokens | 64,000 |
+| API 重试次数 | 3（指数退避） |
+| Bash 默认超时 | 120 秒 |
+| PowerShell 默认超时 | 120 秒 |
+| MCP 连接超时 | 30 秒 |
+| WebFetch 超时 | 30 秒 |
+| WebSearch 超时 | 15 秒 |
+| 子代理超时 | 5 分钟 |
+| 子代理最大迭代 | 30 |
+
+---
+
+## 附录 A: 故障排查
+
+### API Key 无效
+
+```bash
+agentgo --doctor    # 检查配置和连通性
+```
+
+### 工具执行超时
+
+增加 bash 超时：AI 会自动在 `timeout` 参数中指定更长的时间。如果系统性超时，检查网络连接。
+
+### 上下文窗口溢出
+
+```bash
+/compact    # 手动压缩
+/stats      # 查看当前 token 使用量
+```
+
+### 恢复误操作
+
+```bash
+/undo           # 回退上一步文件修改
+/checkpoints    # 查看可回退的检查点列表
+```
+
+### 插件安装失败
+
+```bash
+/plugin refresh  # 刷新索引
+# 确认 git 可用：
+git --version
+```
+
+---
+
+## 附录 B: 快速参考卡
+
+```
+配置:  /model /provider /api-key /base-url /mode /budget /config
+会话:  /cost /ratelimit /compact /history /resume /export /context /status /stats
+项目:  /commit /diff /review /cd /init
+检查:  /undo /checkpoints
+记忆:  /memory /dream /skills
+插件:  /plugin list|install|search|refresh|update|enable|disable|uninstall
+MCP:   /mcp list|connect|disconnect|read
+其他:  /help /exit /debug /system /permissions /buddy /doctor
+```
