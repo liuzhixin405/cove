@@ -31,7 +31,7 @@ func New(completer Completer) *LineReader {
 		completer:   completer,
 		prompt:      Prompt(),
 		promptWidth: 2, // "❯ " visible chars
-		placeholder: "(press / to show commands)",
+		placeholder: "(按 / 显示命令)",
 	}
 }
 
@@ -91,7 +91,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
 						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
 					} else if line == "/" && len(suggestions) > 10 {
-						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
+						fmt.Print("  \x1b[90m(按 Tab 列出可用命令)\x1b[0m")
 						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}
@@ -115,7 +115,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
 						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
 					} else if line == "/" && len(suggestions) > 10 {
-						fmt.Print("  \x1b[90m(press Tab to list available commands)\x1b[0m")
+						fmt.Print("  \x1b[90m(按 Tab 列出可用命令)\x1b[0m")
 						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}

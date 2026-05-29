@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -62,10 +63,10 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	content := string(body)
 	limit := 100000
 	if len(content) > limit {
-		content = content[:limit] + "\n... [truncated from " + itoa(len(body)) + " bytes]"
+		content = content[:limit] + "\n... [truncated from " + strconv.Itoa(len(body)) + " bytes]"
 	}
 
-	return Result{Data: "URL: " + url + "\nStatus: " + itoa(resp.StatusCode) + "\n\n" + strings.TrimSpace(content)}, nil
+	return Result{Data: "URL: " + url + "\nStatus: " + strconv.Itoa(resp.StatusCode) + "\n\n" + strings.TrimSpace(content)}, nil
 }
 
 func (t *WebFetchTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

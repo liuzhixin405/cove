@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -51,7 +52,7 @@ func (t *GrepTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		}
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		if len(lines) > 50 {
-			return Result{Data: strings.Join(lines, "\n") + "\n... " + itoa(len(lines)-50) + " more matches"}, nil
+			return Result{Data: strings.Join(lines, "\n") + "\n... " + strconv.Itoa(len(lines)-50) + " more matches"}, nil
 		}
 		return Result{Data: strings.TrimSpace(string(out))}, nil
 	}

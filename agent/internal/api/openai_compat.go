@@ -19,6 +19,7 @@ import (
 type openAICompatProvider struct {
 	name         string
 	apiKey       string
+	keyPool      *KeyPool
 	baseURL      string
 	client       *http.Client // for non-streaming (has Timeout)
 	streamClient *http.Client // for streaming (no global Timeout)
@@ -30,22 +31,33 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 		cfg.BaseURL = DefaultBaseURL(cfg.Name)
 	}
 	transport := &http.Transport{
-		TLSHandshakeTimeout: 30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   10 * time.Second,
+			KeepAlive: 60 * time.Second,
 		}).DialContext,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:          10,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 120 * time.Second,
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   20,
+		MaxConnsPerHost:       30,
+		IdleConnTimeout:       120 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+	}
+	var pool *KeyPool
+	if len(cfg.APIKeys) > 1 {
+		pool = NewKeyPool(cfg.APIKeys)
+	} else if len(cfg.APIKeys) == 1 {
+		cfg.APIKey = cfg.APIKeys[0]
 	}
 	return &openAICompatProvider{
 		name:    cfg.Name,
 		apiKey:  cfg.APIKey,
+		keyPool: pool,
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		client: &http.Client{
-			Timeout:   300 * time.Second,
+			Timeout:   180 * time.Second,
 			Transport: transport,
 		},
 		// Streaming client: no global Timeout so reading SSE body won't be killed
@@ -54,6 +66,13 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 			Transport: transport,
 		},
 	}
+}
+
+func (p *openAICompatProvider) activeKey() string {
+	if p.keyPool != nil {
+		return p.keyPool.Get()
+	}
+	return p.apiKey
 }
 
 func (p *openAICompatProvider) Name() string { return "openai-compatible" }
@@ -183,7 +202,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
 
 	httpResp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -236,6 +255,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 			PromptCacheMissTokens: cr.Usage.cacheMissTokens(),
 			ReasoningTokens:       cr.Usage.reasoningTokens(),
 			StopReason:            "stop",
+			RateLimitHeaders:      httpResp.Header,
 		}, nil
 	}
 
@@ -249,6 +269,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		PromptCacheMissTokens: cr.Usage.cacheMissTokens(),
 		ReasoningTokens:       cr.Usage.reasoningTokens(),
 		StopReason:            "stop",
+		RateLimitHeaders:      httpResp.Header,
 	}, nil
 }
 
@@ -371,7 +392,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
 
 	sc := p.streamClient
 	if sc == nil {
@@ -493,5 +514,6 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		PromptCacheMissTokens: usage.cacheMissTokens(),
 		ReasoningTokens:       usage.reasoningTokens(),
 		StopReason:            stopReason,
+		RateLimitHeaders:      httpResp.Header,
 	}, nil
 }

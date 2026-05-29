@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -82,44 +83,11 @@ func (t *ReadTool) readFile(path string, input Input) (Result, error) {
 		limit = int(l)
 	}
 
-	// If offset/limit specified, use streaming read to avoid loading entire file
-	if offset > 0 || limit > 0 {
-		return t.readFileRange(path, offset, limit)
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			return Result{Data: "Error: permission denied", IsError: true}, nil
-		}
-		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
-	}
-
-	content := string(data)
-	lines := strings.Split(content, "\n")
-
-	// Cap output to avoid sending huge files to the model
-	maxLines := 2000
-	end := len(lines)
-	if end > maxLines {
-		end = maxLines
-	}
-
-	var sb strings.Builder
-	sb.WriteString("File: " + path)
-	sb.WriteString(" (" + itoa(len(lines)) + " lines total)\n\n")
-
-	for i := 0; i < end && i < len(lines); i++ {
-		sb.WriteString(itoa(i+1) + ": " + lines[i] + "\n")
-	}
-	if len(lines) > maxLines {
-		sb.WriteString(fmt.Sprintf("\n... [truncated, showing %d/%d lines. Use offset/limit for more.]\n", maxLines, len(lines)))
-	}
-
-	return Result{Data: strings.TrimRight(sb.String(), "\n")}, nil
+	// Always use streaming read — avoids double memory allocation from ReadFile + Split
+	return t.readFileStream(path, offset, limit)
 }
 
-func (t *ReadTool) readFileRange(path string, offset, limit int) (Result, error) {
+func (t *ReadTool) readFileStream(path string, offset, limit int) (Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
@@ -132,25 +100,43 @@ func (t *ReadTool) readFileRange(path string, offset, limit int) (Result, error)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024) // support long lines
 
-	var sb strings.Builder
-	sb.WriteString("File: " + path + "\n\n")
-
-	lineNum := 0
-	collected := 0
 	maxCollect := limit
 	if maxCollect <= 0 {
 		maxCollect = 2000
 	}
 
+	// Pre-size the builder to avoid repeated reallocation
+	var sb strings.Builder
+	sb.Grow(maxCollect * 80) // estimate ~80 chars per line
+	sb.WriteString("File: ")
+	sb.WriteString(path)
+	sb.WriteByte('\n')
+	sb.WriteByte('\n')
+
+	lineNum := 0
+	collected := 0
+	totalLines := 0
+
 	for scanner.Scan() {
 		lineNum++
+		totalLines = lineNum
 		if lineNum <= offset {
 			continue
 		}
-		sb.WriteString(itoa(lineNum) + ": " + scanner.Text() + "\n")
-		collected++
 		if collected >= maxCollect {
-			break
+			// Keep counting total lines
+			continue
+		}
+		sb.WriteString(strconv.Itoa(lineNum))
+		sb.WriteString(": ")
+		sb.WriteString(scanner.Text())
+		sb.WriteByte('\n')
+		collected++
+	}
+	// Count remaining lines if we stopped collecting early
+	if collected >= maxCollect {
+		for scanner.Scan() {
+			totalLines++
 		}
 	}
 
@@ -158,21 +144,22 @@ func (t *ReadTool) readFileRange(path string, offset, limit int) (Result, error)
 		sb.WriteString("(no lines in range)\n")
 	}
 
-	return Result{Data: strings.TrimRight(sb.String(), "\n")}, nil
+	// Prepend total line info
+	header := fmt.Sprintf(" (%d lines total)", totalLines)
+	// Insert after filename on first line
+	result := sb.String()
+	nlIdx := strings.IndexByte(result, '\n')
+	if nlIdx > 0 {
+		result = result[:nlIdx] + header + result[nlIdx:]
+	}
+
+	if totalLines > offset+maxCollect {
+		result += fmt.Sprintf("\n... [truncated, showing %d/%d lines. Use offset/limit for more.]\n", collected, totalLines)
+	}
+
+	return Result{Data: strings.TrimRight(result, "\n")}, nil
 }
 
 func (t *ReadTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("read is read-only")
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var digits []byte
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits)
 }

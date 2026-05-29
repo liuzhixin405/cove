@@ -8,19 +8,23 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/agentgo/internal/agent"
 	"github.com/agentgo/internal/api"
+	"github.com/agentgo/internal/buddy"
 	"github.com/agentgo/internal/command"
 	"github.com/agentgo/internal/config"
 	ctxt "github.com/agentgo/internal/context"
+	"github.com/agentgo/internal/cost"
 	"github.com/agentgo/internal/engine"
 	"github.com/agentgo/internal/hooks"
 	"github.com/agentgo/internal/log"
 	"github.com/agentgo/internal/mcp"
 	"github.com/agentgo/internal/memory"
+	"github.com/agentgo/internal/onboarding"
 	"github.com/agentgo/internal/permission"
 	"github.com/agentgo/internal/plugin"
 	"github.com/agentgo/internal/repl"
@@ -34,7 +38,8 @@ type providerReloader interface {
 	ReloadProvider(provider, model, baseURL, apiKey string) error
 }
 
-type streamingRunner interface {
+// chatRunner is the interface needed for runChatInteraction.
+type chatRunner interface {
 	RunWithStream(ctx context.Context, input string, onDelta func(delta string)) (string, error)
 }
 
@@ -44,6 +49,8 @@ var (
 	GitCommit  = "unknown"
 	resumeMode = false
 	resumeID   = ""
+	dumpPrompt = false
+	noAuto     = false
 )
 
 func main() {
@@ -68,6 +75,10 @@ func main() {
 		case "--list-sessions":
 			listSessions()
 			return
+		case "--dump-system-prompt":
+			dumpPrompt = true
+		case "--no-auto":
+			noAuto = true
 		case "-d", "--debug":
 			debugMode = true
 		case "-p", "--print":
@@ -116,10 +127,14 @@ func main() {
 	classifier := permission.NewClassifier()
 	hookMgr := hooks.NewManager()
 	skillMgr := skills.NewManager()
-	skills.LoadAll(skillMgr, projCtx.Cwd)
 	memStore := memory.NewStore()
 	pluginMgr := plugin.NewManager()
-	pluginMgr.Init()
+
+	// Parallel initialization of IO-heavy subsystems
+	var initWg sync.WaitGroup
+	initWg.Add(2)
+	go func() { defer initWg.Done(); skills.LoadAll(skillMgr, projCtx.Cwd) }()
+	go func() { defer initWg.Done(); pluginMgr.Init() }()
 
 	mcpPool := mcp.NewPool()
 	for name, sc := range cfg.MCPServers {
@@ -132,6 +147,9 @@ func main() {
 		}(name, sc)
 	}
 
+	// Wait for skills and plugins to finish loading before using them
+	initWg.Wait()
+
 	toolReg := registerAllTools(mcpPool, skillMgr)
 	cmdReg := registerAllCommands()
 
@@ -142,7 +160,7 @@ func main() {
 		Debug:          debugMode || cfg.Debug,
 		Tools:          toolReg.All(),
 		Provider: api.ProviderConfig{
-			Name: pc.Name, APIKey: pc.APIKey, BaseURL: pc.BaseURL,
+			Name: pc.Name, APIKey: pc.APIKey, APIKeys: pc.APIKeys, BaseURL: pc.BaseURL,
 		},
 		MemoryStore:  memStore,
 		SkillManager: skillMgr,
@@ -154,6 +172,11 @@ func main() {
 		os.Exit(1)
 	}
 	eng.SetProjectContext(projCtx)
+
+	// Disable background API features if --no-auto flag is set
+	if noAuto {
+		eng.SetAutoExtract(false)
+	}
 
 	// Set up interactive permission prompt for the REPL
 	eng.PermissionPrompt = func(toolName string, input map[string]any, reason string) bool {
@@ -178,7 +201,7 @@ func main() {
 			desc = reason
 		}
 		fmt.Print(repl.PermissionPrompt(toolName, desc))
-		fmt.Printf("\n  %sAllow? (y)es / (n)o / (a)lways:%s ", repl.Dim, repl.Reset)
+		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
 
 		var answer string
 		fmt.Scanln(&answer)
@@ -219,11 +242,16 @@ func main() {
 		store := eng.Store()
 		if r, err := store.Load(resumeID); err == nil {
 			eng.LoadMessages(r.Messages)
-			repl.PrintSafe("Resumed session: %s (%d messages)\n", r.Title, len(r.Messages))
+			repl.PrintSafe("已恢复会话: %s (%d 条消息)\n", r.Title, len(r.Messages))
 		}
 	}
 
 	printBanner(cfg, appState, projCtx, permMgr, eng)
+
+	if dumpPrompt {
+		fmt.Println(eng.SystemPrompt())
+		return
+	}
 
 	if printMode && printPrompt != "" {
 		runPrintMode(eng, printPrompt, debugMode)
@@ -264,6 +292,7 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 	r.Register(tool.NewCronTool())
 	r.Register(tool.NewSendMessageTool())
 	r.Register(tool.NewLSPTool())
+	r.Register(tool.NewPowerShellTool())
 	r.Register(tool.NewMCPTool(mcpPool))
 	r.Register(tool.NewListMCPResourcesTool(mcpPool))
 	r.Register(tool.NewReadMCPResourceTool(mcpPool))
@@ -292,11 +321,29 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewPermissionsCmd())
 	r.Register(command.NewStatusCmd())
 	r.Register(command.NewStatsCmd())
+	r.Register(command.NewDreamCmd())
+	r.Register(command.NewBuddyCmd())
+	r.Register(command.NewInitCmd())
 	return r
 }
 
 func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext, pm *permission.Manager, eng *engine.Engine) {
 	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, pc.GitStatus, len(eng.Registry().All()), pc.IsGitRepo))
+
+	// Project onboarding check
+	obs := onboarding.Check(pc.Cwd)
+	if obs.NeedsOnboarding() {
+		fmt.Fprintf(os.Stderr, "\n  %s💡 未找到 CLAUDE.md。输入 /init 生成项目指南。%s\n", repl.Dim, repl.Reset)
+	}
+
+	// Buddy greeting at session start
+	if eng.BuddyDisplay != nil {
+		_ = eng.BuddyDisplay.ReactWithMood(buddy.EventStart, "")
+		fmt.Fprintf(os.Stderr, "\n%s\n", buddyFloatingBox(eng.BuddyDisplay))
+		// Show daily fortune + time greeting
+		fmt.Fprintf(os.Stderr, "  \x1b[33m%s %s\x1b[0m\n", buddy.TimeEmoji(), buddy.TimeGreeting())
+		fmt.Fprintf(os.Stderr, "  \x1b[35m🔮 %s\x1b[0m\n\n", eng.BuddyDisplay.Fortune.Today())
+	}
 }
 
 func withInterrupt(f func(ctx context.Context)) {
@@ -311,7 +358,7 @@ func withInterrupt(f func(ctx context.Context)) {
 			if sig == syscall.SIGTERM {
 				os.Exit(0)
 			}
-			fmt.Print("\r\n[Interrupted]\r\n")
+			fmt.Print("\r\n[已中断]\r\n")
 			cancel()
 		case <-ctx.Done():
 		}
@@ -326,19 +373,30 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		return complete(input, allCommands, eng.Runtime().SkillPrompts)
 	})
 
+	// Start buddy proactive idle chat listener
+	if eng.BuddyDisplay != nil {
+		go func() {
+			for msg := range eng.BuddyDisplay.IdleChatCh() {
+				// Print idle chat above the prompt line
+				fmt.Fprintf(os.Stderr, "\r\n  \x1b[36m💬 %s: %s\x1b[0m\r\n", eng.BuddyDisplay.Name(), msg)
+			}
+		}()
+		defer eng.BuddyDisplay.StopIdleChat()
+	}
+
 	for {
 		input, err := reader.ReadLine()
 		if err == repl.ErrInterrupt {
-			fmt.Println("Use /exit or Ctrl+D to quit")
+			fmt.Println("输入 /exit 或 Ctrl+D 退出")
 			continue
 		}
 		if err == repl.ErrExit {
 			autoSaveSession(eng)
-			fmt.Println("Goodbye!")
+			fmt.Println("再见！")
 			return
 		}
 		if err != nil {
-			repl.PrintSafe("\r\nRead error, restarting REPL...\r\n")
+			repl.PrintSafe("\r\n读取错误，正在重启 REPL...\r\n")
 			reader = repl.New(func(input string) []string {
 				return complete(input, allCommands, eng.Runtime().SkillPrompts)
 			})
@@ -347,10 +405,14 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		if input == "" {
 			continue
 		}
+		// Mark activity to reset buddy idle timer
+		if eng.BuddyDisplay != nil {
+			eng.BuddyDisplay.MarkActivity()
+		}
 		switch {
 		case input == "exit" || input == "/exit":
 			autoSaveSession(eng)
-			fmt.Println("Goodbye!")
+			fmt.Println("再见！")
 			return
 		case input == "/help":
 			printHelp(cmdReg, toolReg)
@@ -367,14 +429,14 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				as.Model = cfg.Model
 				return config.Save(cfg)
 			}); err != nil {
-				fmt.Printf("Model update failed: %v\n", err)
+				fmt.Printf("模型更新失败: %v\n", err)
 				continue
 			}
-			fmt.Printf("Model: %s (saved)\n", cfg.Model)
+			fmt.Printf("模型: %s（已保存）\n", cfg.Model)
 		case strings.HasPrefix(input, "/provider "):
 			providerName := strings.TrimSpace(strings.TrimPrefix(input, "/provider "))
 			if !api.IsKnownProvider(providerName) {
-				fmt.Printf("Invalid provider: %s\n", providerName)
+				fmt.Printf("无效的供应商: %s\n", providerName)
 				fmt.Println(providerHelpLine())
 				continue
 			}
@@ -382,28 +444,28 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				cfg.Provider.Name = providerName
 				return config.Save(cfg)
 			}); err != nil {
-				fmt.Printf("Provider update failed: %v\n", err)
+				fmt.Printf("供应商更新失败: %v\n", err)
 				continue
 			}
-			fmt.Printf("Provider: %s (saved)\n", cfg.Provider.Name)
+			fmt.Printf("供应商: %s（已保存）\n", cfg.Provider.Name)
 		case strings.HasPrefix(input, "/api-key "):
 			if err := applyProviderConfigChange(cfg, eng, func() error {
 				cfg.Provider.APIKey = strings.TrimSpace(strings.TrimPrefix(input, "/api-key "))
 				return config.Save(cfg)
 			}); err != nil {
-				fmt.Printf("API key update failed: %v\n", err)
+				fmt.Printf("API 密钥更新失败: %v\n", err)
 				continue
 			}
-			fmt.Println("API key saved")
+			fmt.Println("API 密钥已保存")
 		case strings.HasPrefix(input, "/base-url "):
 			if err := applyProviderConfigChange(cfg, eng, func() error {
 				cfg.Provider.BaseURL = strings.TrimSpace(strings.TrimPrefix(input, "/base-url "))
 				return config.Save(cfg)
 			}); err != nil {
-				fmt.Printf("Base URL update failed: %v\n", err)
+				fmt.Printf("Base URL 更新失败: %v\n", err)
 				continue
 			}
-			fmt.Println("Base URL saved")
+			fmt.Println("Base URL 已保存")
 		case strings.HasPrefix(input, "/mode "):
 			m := permission.Mode(strings.TrimPrefix(input, "/mode "))
 			if permission.ValidMode(m) {
@@ -412,9 +474,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				cfg.PermissionMode = string(m)
 				as.PermissionMode = string(m)
 				config.Save(cfg)
-				fmt.Printf("Mode: %s\n", m)
+				fmt.Printf("模式: %s\n", m)
 			} else {
-				fmt.Printf("Invalid. Choose: %s\n", permission.Modes())
+				fmt.Printf("无效模式。可选: %s\n", permission.Modes())
 			}
 		case strings.HasPrefix(input, "/budget "):
 			var b float64
@@ -423,12 +485,48 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				cfg.MaxBudgetUsd = b
 				as.MaxBudget = b
 				config.Save(cfg)
-				fmt.Printf("Budget: $%.2f\n", b)
+				fmt.Printf("预算: $%.2f\n", b)
 			}
 		case input == "/cost":
-			fmt.Println("Usage:", eng.CostTracker().Summary())
+			fmt.Println("本次会话:", eng.CostTracker().Summary())
+			ch := cost.NewCostHistory()
+			if len(ch.Records) > 0 {
+				fmt.Printf("近 24小时: $%.4f | 近 7天: $%.4f | 总计: $%.4f (%d 个会话)\n",
+					ch.Last24Hours(), ch.Last7Days(), ch.TotalAllTime(), len(ch.Records))
+			}
 		case strings.HasPrefix(input, "/export"):
 			handleExport(input, eng)
+		case input == "/undo":
+			if eng.CheckpointMgr() != nil {
+				if err := eng.CheckpointMgr().Restore(""); err != nil {
+					fmt.Printf("回退失败: %v\n", err)
+				} else {
+					fmt.Println("✓ 已回退到上一个检查点")
+				}
+			} else {
+				fmt.Println("检查点功能未初始化")
+			}
+		case input == "/checkpoints":
+			if eng.CheckpointMgr() != nil {
+				list := eng.CheckpointMgr().List()
+				if len(list) == 0 {
+					fmt.Println("暂无检查点")
+				} else {
+					fmt.Println("检查点记录:")
+					for _, cp := range list {
+						fmt.Println("  " + cp)
+					}
+				}
+			}
+		case input == "/ratelimit":
+			if eng.RateLimits() != nil {
+				info := eng.RateLimits().Current()
+				if info.HasData() {
+					fmt.Println("速率限制: " + info.Format())
+				} else {
+					fmt.Println("暂无速率限制数据（需至少一次 API 调用）")
+				}
+			}
 		case strings.HasPrefix(input, "/resume") || input == "/resume":
 			sessionID := ""
 			if strings.HasPrefix(input, "/resume ") {
@@ -443,7 +541,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		case input == "/compact":
 			withInterrupt(func(ctx context.Context) {
 				eng.Compact(ctx)
-				fmt.Println("Context window compacted.")
+				fmt.Println("上下文窗口已压缩。")
 			})
 		case strings.HasPrefix(input, "/skill") || input == "/skills":
 			handleSkill(input, eng)
@@ -463,6 +561,37 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				continue
 			}
 			withInterrupt(func(ctx context.Context) { runChatInteraction(ctx, eng, input) })
+			// Progressive onboarding: show tool progress hint on first interaction
+			if eng.OnboardHints() != nil {
+				if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
+					fmt.Fprint(os.Stderr, hint)
+				}
+			}
+			// Show rate limit status if getting low
+			if eng.RateLimits() != nil {
+				info := eng.RateLimits().Current()
+				if info.HasData() && info.TokensRemaining > 0 && info.TokensLimit > 0 {
+					pct := info.TokensRemaining * 100 / info.TokensLimit
+					if pct < 20 {
+						fmt.Fprintf(os.Stderr, "  \x1b[33m⚠ %s\x1b[0m\n", info.Format())
+					}
+				}
+			}
+			// Buddy reaction after text responses
+			if eng.BuddyDisplay != nil {
+				quip := eng.BuddyDisplay.ReactWithMood(buddy.EventTurn, "")
+				if quip != nil {
+					fmt.Fprintf(os.Stderr, "%s\n", buddyFloatingBox(eng.BuddyDisplay))
+				}
+			}
+			// Display follow-up suggestions if available
+			if sug := eng.Suggestions(); len(sug) > 0 {
+				fmt.Fprintf(os.Stderr, "  %s💡 建议:%s", repl.Dim, repl.Reset)
+				for _, s := range sug {
+					fmt.Fprintf(os.Stderr, " %s%s%s |", repl.Dim, s.Text, repl.Reset)
+				}
+				fmt.Fprintln(os.Stderr)
+			}
 		}
 	}
 }
@@ -481,15 +610,18 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 		list = append(list, cmdEntry{Name: "/" + c.Name(), Desc: c.Description(), Type: "cmd"})
 	}
 	list = append(list,
-		cmdEntry{Name: "/model", Desc: "Set model name", Type: "config"},
-		cmdEntry{Name: "/provider", Desc: "Set API provider", Type: "config", ArgHints: map[string][]string{"": providerNameSuggestions()}},
-		cmdEntry{Name: "/api-key", Desc: "Set API key", Type: "config"},
-		cmdEntry{Name: "/base-url", Desc: "Set API base URL", Type: "config"},
-		cmdEntry{Name: "/mode", Desc: "Set permission mode (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
-		cmdEntry{Name: "/budget", Desc: "Set max budget ($)", Type: "config"},
-		cmdEntry{Name: "/help", Desc: "Show help", Type: "builtin"},
-		cmdEntry{Name: "/exit", Desc: "Exit agentgo", Type: "builtin"},
-		cmdEntry{Name: "/history", Desc: "View & continue past sessions", Type: "builtin"},
+		cmdEntry{Name: "/model", Desc: "设置模型", Type: "config"},
+		cmdEntry{Name: "/provider", Desc: "设置供应商", Type: "config", ArgHints: map[string][]string{"": providerNameSuggestions()}},
+		cmdEntry{Name: "/api-key", Desc: "设置 API 密钥", Type: "config"},
+		cmdEntry{Name: "/base-url", Desc: "设置 API 地址", Type: "config"},
+		cmdEntry{Name: "/mode", Desc: "设置权限模式 (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
+		cmdEntry{Name: "/budget", Desc: "设置预算上限 ($)", Type: "config"},
+		cmdEntry{Name: "/undo", Desc: "回退到上一个检查点", Type: "builtin"},
+		cmdEntry{Name: "/checkpoints", Desc: "列出所有检查点", Type: "builtin"},
+		cmdEntry{Name: "/ratelimit", Desc: "查看 API 速率限制", Type: "builtin"},
+		cmdEntry{Name: "/help", Desc: "显示帮助", Type: "builtin"},
+		cmdEntry{Name: "/exit", Desc: "退出", Type: "builtin"},
+		cmdEntry{Name: "/history", Desc: "查看和继续历史会话", Type: "builtin"},
 	)
 	for _, t := range toolReg.All() {
 		d := t.Def()
@@ -520,10 +652,19 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 			matches = append(matches, c.Name)
 		}
 	}
+	// Build a set of existing command names to avoid duplicates with skills
+	cmdNames := make(map[string]bool, len(commands))
+	for _, c := range commands {
+		cmdNames[strings.ToLower(c.Name)] = true
+	}
 	for name := range skills {
 		candidate := name
 		if strings.HasPrefix(input, "/") {
 			candidate = "/" + name
+		}
+		// Skip if already exists as a command
+		if cmdNames[strings.ToLower(candidate)] {
+			continue
 		}
 		if strings.HasPrefix(strings.ToLower(candidate), lower) {
 			matches = append(matches, candidate)
@@ -675,7 +816,7 @@ func limitSuggestions(matches []string) []string {
 }
 
 func showQuickCommands(commands []cmdEntry) {
-	fmt.Println("\nAvailable commands:")
+	fmt.Println("\n可用命令:")
 	for _, c := range commands {
 		if c.Type == "cmd" || c.Type == "config" || c.Type == "builtin" {
 			fmt.Printf("  %-16s %s\n", c.Name, c.Desc)
@@ -693,13 +834,13 @@ func handleUnknownCmd(input string, cmdReg *command.Registry) bool {
 	}
 	suggestions := fuzzyMatch(name, cmdReg)
 	if len(suggestions) > 0 {
-		fmt.Printf("Unknown: /%s\nDid you mean?\n", name)
+		fmt.Printf("未知命令: /%s\n你是不是想输入?\n", name)
 		for _, s := range suggestions {
 			fmt.Printf("  /%s\n", s)
 		}
 		return true
 	}
-	fmt.Printf("Unknown: /%s. Type /help for available commands.\n", name)
+	fmt.Printf("未知命令: /%s。输入 /help 查看可用命令。\n", name)
 	return true
 }
 
@@ -748,7 +889,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 	name := strings.TrimPrefix(parts[0], "/")
 	c, ok := reg.Find(name)
 	if !ok {
-		fmt.Printf("Unknown: /%s. Try /help\n", name)
+		fmt.Printf("未知命令: /%s。输入 /help 查看帮助\n", name)
 		return
 	}
 	cwd, _ := os.Getwd()
@@ -766,6 +907,9 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 		MCPPool:           mcpPool,
 		ProjectContext:    projCtx,
 		AppState:          appState,
+		BuddyDisplay:      eng.BuddyDisplay,
+		BuddyChat:         eng.BuddyChat,
+		Provider:          eng.Provider(),
 	})
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -792,7 +936,7 @@ func handleSkill(input string, eng *engine.Engine) {
 	parts := strings.Fields(input)
 
 	if len(parts) == 1 || (len(parts) >= 2 && parts[1] == "list") {
-		repl.PrintSafe("\n%d skills:\n", len(prompts))
+		repl.PrintSafe("\n%d 个技能:\n", len(prompts))
 		for name, prompt := range prompts {
 			desc := strings.SplitN(prompt, "\n", 2)
 			d := ""
@@ -811,18 +955,18 @@ func handleSkill(input string, eng *engine.Engine) {
 	case "marketplace", "registry", "search":
 		entries, err := skills.FetchRegistry()
 		if err != nil {
-			repl.PrintSafe("Registry unavailable: %v\n", err)
+			repl.PrintSafe("技能市场不可用: %v\n", err)
 			return
 		}
-		repl.PrintSafe("\nSkill Marketplace (%d available):\n", len(entries))
+		repl.PrintSafe("\n技能市场 (%d 个可用):\n", len(entries))
 		for _, e := range entries {
 			installed := ""
 			if _, ok := prompts[e.Name]; ok {
-				installed = " [installed]"
+				installed = " [已安装]"
 			}
 			repl.PrintSafe("  %-16s %s%s\n", e.Name, truncateDesc(e.Description, 48), installed)
 		}
-		repl.PrintSafe("\nInstall: /skill install <name>\n")
+		repl.PrintSafe("\n安装: /skill install <名称>\n")
 
 	case "install":
 		if len(parts) < 3 {
@@ -838,30 +982,30 @@ func handleSkill(input string, eng *engine.Engine) {
 		for _, e := range entries {
 			if e.Name == name {
 				skills.InstallSkill(name, "url", e.URL)
-				repl.PrintSafe("Installed: %s — restart to load, or use /skill %s\n", name, name)
+				repl.PrintSafe("已安装: %s — 重启后生效，或直接输入 /skill %s\n", name, name)
 				return
 			}
 		}
 		skills.InstallSkill(name, "local", "")
-		repl.PrintSafe("Created: %s\nEdit ~/.agentgo/skills/%s/SKILL.md\n", name, name)
+		repl.PrintSafe("已创建: %s\n编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
 
 	case "create":
 		if len(parts) < 3 {
-			repl.PrintSafe("Usage: /skill create <name>\n")
+			repl.PrintSafe("用法: /skill create <名称>\n")
 			return
 		}
 		name := parts[2]
 		skills.InstallSkill(name, "local", "")
-		repl.PrintSafe("Created: %s — edit at ~/.agentgo/skills/%s/SKILL.md\n", name, name)
+		repl.PrintSafe("已创建: %s — 编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
 
 	default:
 		name := parts[1]
 		prompt, ok := prompts[name]
 		if !ok {
-			repl.PrintSafe("\nUnknown: %s\nType /skill marketplace to discover skills.\n", name)
+			repl.PrintSafe("\n未知技能: %s\n输入 /skill marketplace 发现更多技能。\n", name)
 			return
 		}
-		repl.PrintSafe("\n[Skill: %s]\n\n%s\n\nFollow these instructions.\n", name, prompt)
+		repl.PrintSafe("\n[技能: %s]\n\n%s\n\n请按照以上指引执行。\n", name, prompt)
 	}
 }
 
@@ -889,15 +1033,15 @@ func handleSkillInvocation(input string, eng *engine.Engine) {
 	name := strings.TrimPrefix(parts[0], "/")
 	prompt, ok := eng.Runtime().SkillPrompts[name]
 	if !ok {
-		repl.PrintSafe("Unknown skill: %s\n", name)
+		repl.PrintSafe("未知技能: %s\n", name)
 		return
 	}
 	args := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
-	repl.PrintSafe("\n[Skill: %s]\n\n%s\n", name, prompt)
+	repl.PrintSafe("\n[技能: %s]\n\n%s\n", name, prompt)
 	if args != "" {
-		repl.PrintSafe("\nUser request:\n%s\n", args)
+		repl.PrintSafe("\n用户请求:\n%s\n", args)
 	}
-	repl.PrintSafe("\nFollow these instructions.\n")
+	repl.PrintSafe("\n请按照以上指引执行。\n")
 }
 
 func handleExport(input string, eng *engine.Engine) {
@@ -907,30 +1051,30 @@ func handleExport(input string, eng *engine.Engine) {
 		filename = parts[1]
 	}
 	var sb strings.Builder
-	sb.WriteString("# Conversation Export\r\n\r\n")
+	sb.WriteString("# 对话导出\r\n\r\n")
 	for _, m := range eng.Messages() {
 		sb.WriteString(fmt.Sprintf("**%s**: %s\r\n\r\n", m.Role, m.Content))
 		for _, tc := range m.ToolCalls {
-			sb.WriteString(fmt.Sprintf("  > tool: %s(%v)\r\n\r\n", tc.Name, tc.Input))
+			sb.WriteString(fmt.Sprintf("  > 工具: %s(%v)\r\n\r\n", tc.Name, tc.Input))
 		}
 	}
 	os.WriteFile(filename, []byte(sb.String()), 0644)
-	repl.PrintSafe("Exported %d messages to %s\n", len(eng.Messages()), filename)
+	repl.PrintSafe("已导出 %d 条消息到 %s\n", len(eng.Messages()), filename)
 }
 
 func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("Session store unavailable\n")
+		repl.PrintSafe("会话存储不可用\n")
 		return
 	}
 	if sessionID == "" {
 		records, _ := store.List()
 		if len(records) == 0 {
-			repl.PrintSafe("No saved sessions\n")
+			repl.PrintSafe("没有已保存的会话\n")
 			return
 		}
-		repl.PrintSafe("%d saved sessions:\n", len(records))
+		repl.PrintSafe("%d 个已保存的会话:\n", len(records))
 		for _, r := range records {
 			repl.PrintSafe("  %s  %s  (%d tokens)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("15:04"))
 		}
@@ -938,32 +1082,46 @@ func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 	}
 	r, err := store.Load(sessionID)
 	if err != nil {
-		repl.PrintSafe("Session %s not found\n", sessionID)
+		repl.PrintSafe("会话 %s 未找到\n", sessionID)
 		return
 	}
 	eng.LoadMessages(r.Messages)
-	repl.PrintSafe("Resumed: %s (%d msgs, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
+	repl.PrintSafe("已恢复: %s (%d 条消息, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
 }
 
 func autoSaveSession(eng *engine.Engine) {
 	if eng.HasMessages() {
 		eng.SaveSession()
-		fmt.Println("Session auto-saved.")
+		// Persist cost history
+		ch := cost.NewCostHistory()
+		sessionID := ""
+		model := ""
+		if s := eng.Session(); s != nil {
+			sessionID = s.ID
+			model = s.Model
+		}
+		ch.Add(sessionID, model, eng.CostTracker())
+		ch.Save()
+		fmt.Println("会话已自动保存。")
+	}
+	// Save buddy chat history
+	if eng.BuddyChat != nil {
+		_ = eng.BuddyChat.SaveHistory()
 	}
 }
 
 func handleHistory(eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("Session store unavailable\n")
+		repl.PrintSafe("会话存储不可用\n")
 		return
 	}
 	records, _ := store.List()
 	if len(records) == 0 {
-		repl.PrintSafe("No history. Sessions are auto-saved on exit.\n")
+		repl.PrintSafe("暂无历史。退出时会自动保存会话。\n")
 		return
 	}
-	repl.PrintSafe("\n  History (%d sessions):\n\n", len(records))
+	repl.PrintSafe("\n  历史记录 (%d 个会话):\n\n", len(records))
 	limit := 20
 	if len(records) < limit {
 		limit = len(records)
@@ -978,12 +1136,12 @@ func handleHistory(eng *engine.Engine) {
 		if len(title) > 50 {
 			title = title[:50] + "..."
 		}
-		repl.PrintSafe("  %2d. [%s] %s  (%d msgs)\n", i+1, date, title, msgCount)
+		repl.PrintSafe("  %2d. [%s] %s  (%d 条)\n", i+1, date, title, msgCount)
 	}
 	if len(records) > limit {
-		repl.PrintSafe("\n  ... and %d more.\n", len(records)-limit)
+		repl.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
 	}
-	repl.PrintSafe("\n  Continue: /history <number>  (e.g. /history 1)\n\n")
+	repl.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n\n")
 }
 
 func sessionPreview(r session.Record) string {
@@ -996,13 +1154,13 @@ func sessionPreview(r session.Record) string {
 			return content
 		}
 	}
-	return "(empty)"
+	return "(空)"
 }
 
 func handleHistoryResume(input string, eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("Session store unavailable\n")
+		repl.PrintSafe("会话存储不可用\n")
 		return
 	}
 
@@ -1016,15 +1174,15 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 		if title == "New session" || title == "" {
 			title = sessionPreview(r)
 		}
-		repl.PrintSafe("Resumed #%d: %s (%d msgs)\n", idx, title, len(r.Messages))
-		repl.PrintSafe("You can now continue the conversation.\n\n")
+		repl.PrintSafe("已恢复 #%d: %s (%d 条消息)\n", idx, title, len(r.Messages))
+		repl.PrintSafe("可以继续对话了。\n\n")
 		return
 	}
 
 	// Fallback: try loading by session ID
 	r, err := store.Load(input)
 	if err != nil {
-		repl.PrintSafe("Invalid selection: %s\nUse /history to see available sessions.\n", input)
+		repl.PrintSafe("无效选择: %s\n输入 /history 查看可用会话。\n", input)
 		return
 	}
 	eng.LoadMessages(r.Messages)
@@ -1032,8 +1190,8 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	if title == "New session" || title == "" {
 		title = sessionPreview(*r)
 	}
-	repl.PrintSafe("Resumed: %s (%d msgs)\n", title, len(r.Messages))
-	repl.PrintSafe("You can now continue the conversation.\n\n")
+	repl.PrintSafe("已恢复: %s (%d 条消息)\n", title, len(r.Messages))
+	repl.PrintSafe("可以继续对话了。\n\n")
 }
 
 func showConfig() {
@@ -1055,38 +1213,41 @@ func showConfig() {
 }
 
 func providerHelpLine() string {
-	return "  /provider <name>    Set provider (anthropic, deepseek, openai, openai-compatible, glm, kimi, qwen, doubao, openrouter, siliconflow, groq, together, fireworks, xai, mistral)"
+	return "  /provider <名称>    设置供应商 (anthropic, deepseek, openai, openai-compatible, glm, kimi, qwen, doubao, openrouter, siliconflow, groq, together, fireworks, xai, mistral)"
 }
 
 func providerEnvHelpLine() string {
-	return "Env Vars: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
+	return "环境变量: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
 }
 
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 	fmt.Println("\n=== agentgo v" + Version + " ===")
-	fmt.Println("\nProvider / Model:")
-	fmt.Println("  /model <name>       Set model")
+	fmt.Println("\n供应商 / 模型:")
+	fmt.Println("  /model <名称>       设置模型")
 	fmt.Println(providerHelpLine())
-	fmt.Println("  /api-key <key>      Save API key")
-	fmt.Println("  /base-url <url>     Set custom base URL")
-	fmt.Println("  /mode <mode>        Set permission mode (default|plan|auto|bypass)")
-	fmt.Println("  /budget <amount>    Max cost per session ($)")
-	fmt.Println("  /cost               Show token/cost usage")
-	fmt.Println("  /config             Show full config")
-	fmt.Println("\nSession:")
-	fmt.Println("  /compact            Compact conversation history")
-	fmt.Println("  /history            View & continue past sessions")
-	fmt.Println("  /resume [id]        Resume saved session")
-	fmt.Println("  /memory             Manage persistent memory")
-	fmt.Println("\nSystem:")
-	fmt.Println("  /mcp                Manage MCP servers")
-	fmt.Println("  /plugin             Manage plugins")
-	fmt.Println("  /skills             List skills")
-	fmt.Println("\nCommands:")
+	fmt.Println("  /api-key <密钥>     保存 API 密钥")
+	fmt.Println("  /base-url <地址>    设置自定义接口地址")
+	fmt.Println("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
+	fmt.Println("  /budget <金额>      设置每会话预算上限 ($)")
+	fmt.Println("  /cost               查看用量和费用")
+	fmt.Println("  /ratelimit          查看 API 速率限制状态")
+	fmt.Println("  /config             查看完整配置")
+	fmt.Println("\n会话:")
+	fmt.Println("  /compact            压缩对话历史")
+	fmt.Println("  /undo               回退到上一个检查点")
+	fmt.Println("  /checkpoints        列出所有检查点")
+	fmt.Println("  /history            查看和继续历史会话")
+	fmt.Println("  /resume [id]        恢复已保存的会话")
+	fmt.Println("  /memory             管理持久化记忆")
+	fmt.Println("\n系统:")
+	fmt.Println("  /mcp                管理 MCP 服务器")
+	fmt.Println("  /plugin             管理插件")
+	fmt.Println("  /skills             列出技能")
+	fmt.Println("\n命令:")
 	for _, c := range cmdReg.All() {
 		fmt.Printf("  /%-16s %s\n", c.Name(), c.Description())
 	}
-	fmt.Println("\nTools:")
+	fmt.Println("\n工具:")
 	for _, t := range toolReg.All() {
 		d := t.Def()
 		ro := " "
@@ -1096,7 +1257,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
 	fmt.Println("\n" + providerEnvHelpLine())
-	fmt.Println("Flags: -p <prompt> | -d --debug | -v --version | --doctor | --config")
+	fmt.Println("启动参数: -p <提示> | -d --debug | -v --version | --doctor | --config")
 	fmt.Println()
 }
 
@@ -1138,13 +1299,45 @@ func missingAPIKeyMessage(provider string) string {
 	)
 }
 
-func runChatInteraction(ctx context.Context, runner streamingRunner, input string) string {
+// buddyFloatingBox renders the buddy sprite with speech bubble as a visible box.
+func buddyFloatingBox(d *buddy.Display) string {
+	rendered := d.RenderWithBubble()
+	// Add color: cyan for the whole block
+	lines := strings.Split(rendered, "\n")
+	var sb strings.Builder
+	sb.WriteString("  \x1b[36m") // cyan
+	for i, line := range lines {
+		if line == "" && i == len(lines)-1 {
+			continue
+		}
+		sb.WriteString("  ")
+		sb.WriteString(line)
+		sb.WriteString("\n\x1b[36m")
+	}
+	// Mood indicator line
+	m := d.Mood.Current()
+	sb.WriteString(fmt.Sprintf("  \x1b[2m%s %s  Lv.%d\x1b[0m",
+		buddy.MoodEmoji(m), buddy.MoodLabel(m), d.XP.Level))
+	sb.WriteString("\x1b[0m")
+	return sb.String()
+}
+
+func runChatInteraction(ctx context.Context, runner chatRunner, input string) string {
 	fmt.Print("\n")
 
-	spinner := repl.NewSpinner("Thinking...")
+	spinner := repl.NewSpinner("思考中...")
 	spinner.Start()
 	firstDelta := true
 	var totalOutput strings.Builder
+
+	// If runner is a full engine, wire up permission pause to stop spinner
+	if eng, ok := runner.(*engine.Engine); ok {
+		eng.OnPermissionPause = func() {
+			spinner.Stop()
+		}
+		eng.OnPermissionDone = nil
+		defer func() { eng.OnPermissionPause = nil }()
+	}
 
 	_, err := runner.RunWithStream(ctx, input, func(delta string) {
 		if firstDelta {
@@ -1158,9 +1351,12 @@ func runChatInteraction(ctx context.Context, runner streamingRunner, input strin
 	spinner.Stop()
 
 	if err != nil {
-		fmt.Printf("\n%s%s%s", repl.Red, err.Error(), repl.Reset)
+		errMsg := fmt.Sprintf("\nRequest failed: %s", err.Error())
+		fmt.Printf("%s%s%s", repl.Red, errMsg, repl.Reset)
+		totalOutput.WriteString(errMsg)
 	}
 	fmt.Print("\r\n\r\n")
+	totalOutput.WriteString("\r\n\r\n")
 	return totalOutput.String()
 }
 
@@ -1188,36 +1384,36 @@ func listSessions() {
 	s, _ := session.NewStore()
 	records, _ := s.List()
 	if len(records) == 0 {
-		fmt.Println("No saved sessions")
+		fmt.Println("没有已保存的会话")
 		return
 	}
-	fmt.Printf("%d sessions:\n", len(records))
+	fmt.Printf("%d 个会话:\n", len(records))
 	for _, r := range records {
 		fmt.Printf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
 	}
 }
 
 func printCLIHelp() {
-	fmt.Println(`agentgo — Go-powered AI coding assistant
+	fmt.Println(`agentgo — Go 驱动的 AI 编程助手
 
-Usage:
- agentgo                       Start interactive REPL
- agentgo -p <prompt>            Run a single query and exit
- agentgo -r <id>                Resume a saved session
- agentgo --list-sessions        List saved sessions
- agentgo -d                     Start with debug logging
- agentgo --doctor               Run diagnostics
- agentgo --config               Show configuration
- agentgo -v, --version          Show version
- agentgo -h, --help             Show this help
+用法:
+ agentgo                       启动交互式 REPL
+ agentgo -p <提示>              执行单次查询后退出
+ agentgo -r <id>                恢复已保存的会话
+ agentgo --list-sessions        列出已保存的会话
+ agentgo -d                     启用调试日志
+ agentgo --doctor               运行系统诊断
+ agentgo --config               显示配置
+ agentgo -v, --version          显示版本
+ agentgo -h, --help             显示帮助
 
-Skill Commands:
- /skill [name]                  Activate a skill
- /skill marketplace             Browse skill marketplace
- /skill install <name>          Install from marketplace
- /skill create <name>           Create new skill
+技能命令:
+ /skill [名称]                  激活技能
+ /skill marketplace             浏览技能市场
+ /skill install <名称>          从市场安装
+ /skill create <名称>           创建新技能
 
-REPL Commands:
+REPL 命令:
  /model, /provider, /api-key, /base-url, /mode, /budget
  /cost, /config, /system, /context, /compact
  /commit, /review, /diff, /export

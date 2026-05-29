@@ -154,7 +154,7 @@ func TestExportCmdWritesConversationMarkdown(t *testing.T) {
 		t.Fatalf("read exported file: %v", err)
 	}
 	text := string(data)
-	if !strings.Contains(text, "# Conversation Export") || !strings.Contains(text, "**assistant**: hello") {
+	if !strings.Contains(text, "# 对话导出") || !strings.Contains(text, "**assistant**: hello") {
 		t.Fatalf("unexpected export content: %s", text)
 	}
 }
@@ -167,7 +167,7 @@ func TestPluginCmdListAndInstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list error: %v", err)
 	}
-	if !strings.Contains(out.Message, "demo") || !strings.Contains(out.Message, "enabled") {
+	if !strings.Contains(out.Message, "demo") || !strings.Contains(out.Message, "已启用") {
 		t.Fatalf("expected listed plugin, got %q", out.Message)
 	}
 	if pm.refreshed != 1 {
@@ -191,7 +191,7 @@ func TestPluginCmdListShowsPluginDirWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list error: %v", err)
 	}
-	if !strings.Contains(out.Message, "No plugins installed") || !strings.Contains(out.Message, "/tmp/.agentgo/plugins") || !strings.Contains(out.Message, "/plugin install") {
+	if !strings.Contains(out.Message, "暂无已安装插件") || !strings.Contains(out.Message, "/tmp/.agentgo/plugins") || !strings.Contains(out.Message, "/plugin install") {
 		t.Fatalf("expected diagnostic empty plugin list, got %q", out.Message)
 	}
 }
@@ -232,7 +232,7 @@ func TestResumeCmdLoadsSessionMessages(t *testing.T) {
 	if len(eng.loaded) != 1 || eng.loaded[0].Content != "resume me" {
 		t.Fatalf("messages not loaded: %#v", eng.loaded)
 	}
-	if !strings.Contains(out.Message, "Resumed") {
+	if !strings.Contains(out.Message, "已恢复") {
 		t.Fatalf("unexpected output: %q", out.Message)
 	}
 }
@@ -258,16 +258,16 @@ func TestStatusCmdUsesLiveEngineState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status error: %v", err)
 	}
-	if !strings.Contains(out.Message, "Session: session-123") {
+	if !strings.Contains(out.Message, "会话: session-123") {
 		t.Fatalf("expected session id in output, got %q", out.Message)
 	}
-	if !strings.Contains(out.Message, "Messages: 2") {
+	if !strings.Contains(out.Message, "消息数: 2") {
 		t.Fatalf("expected live engine message count, got %q", out.Message)
 	}
-	if !strings.Contains(out.Message, "Cost: 10 in | 5 out | $1.23 / $5.00") {
+	if !strings.Contains(out.Message, "费用: 10 in | 5 out | $1.23 / $5.00") {
 		t.Fatalf("expected live cost in output, got %q", out.Message)
 	}
-	if !strings.Contains(out.Message, "Mode: auto") {
+	if !strings.Contains(out.Message, "模式: auto") {
 		t.Fatalf("expected permission mode in output, got %q", out.Message)
 	}
 }

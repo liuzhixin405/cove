@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -74,7 +75,7 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 
 	limit := 200
 	if len(matches) > limit {
-		return Result{Data: strings.Join(matches[:limit], "\n") + "\n... and " + itoa(len(matches)-limit) + " more files"}, nil
+		return Result{Data: strings.Join(matches[:limit], "\n") + "\n... and " + strconv.Itoa(len(matches)-limit) + " more files"}, nil
 	}
 	return Result{Data: strings.Join(matches, "\n")}, nil
 }

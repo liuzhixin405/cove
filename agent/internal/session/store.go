@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/agentgo/internal/api"
@@ -73,11 +72,34 @@ func (s *Store) List() ([]Record, error) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		r, err := s.Load(strings.TrimSuffix(e.Name(), ".json"))
+		// Read file but only decode metadata fields (skip Messages for speed)
+		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
 		if err != nil {
 			continue
 		}
-		records = append(records, *r)
+		var meta struct {
+			ID        string    `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Title     string    `json:"title"`
+			Model     string    `json:"model"`
+			TokensIn  int       `json:"tokens_in"`
+			TokensOut int       `json:"tokens_out"`
+			Cost      float64   `json:"cost"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		records = append(records, Record{
+			ID:        meta.ID,
+			CreatedAt: meta.CreatedAt,
+			UpdatedAt: meta.UpdatedAt,
+			Title:     meta.Title,
+			Model:     meta.Model,
+			TokensIn:  meta.TokensIn,
+			TokensOut: meta.TokensOut,
+			Cost:      meta.Cost,
+		})
 	}
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].UpdatedAt.After(records[j].UpdatedAt)

@@ -60,11 +60,12 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	}
 
 	content := string(data)
-	if strings.Count(content, oldS) == 0 {
+	count := strings.Count(content, oldS)
+	if count == 0 {
 		return Result{Data: "Error: oldString not found in file", IsError: true}, nil
 	}
-	if strings.Count(content, oldS) > 1 && !all {
-		return Result{Data: fmt.Sprintf("Error: oldString matches %d times. Use replaceAll=true or provide more context.", strings.Count(content, oldS)), IsError: true}, nil
+	if count > 1 && !all {
+		return Result{Data: fmt.Sprintf("Error: oldString matches %d times. Use replaceAll=true or provide more context.", count), IsError: true}, nil
 	}
 
 	var result string
@@ -82,11 +83,11 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
 
-	count := 1
+	replacements := 1
 	if all {
-		count = strings.Count(content, oldS)
+		replacements = count
 	}
-	return Result{Data: fmt.Sprintf("Edited %s: %d replacement(s)", path, count)}, nil
+	return Result{Data: fmt.Sprintf("Edited %s: %d replacement(s)", path, replacements)}, nil
 }
 
 func (t *EditTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

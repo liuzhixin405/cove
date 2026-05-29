@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -66,8 +67,8 @@ func (t *WriteTool) Call(ctx context.Context, input Input, tctx Context) (Result
 		return Result{Data: "Error: write: " + err.Error(), IsError: true}, nil
 	}
 
-	lines := len(strings.Split(content, "\n"))
-	return Result{Data: "Wrote " + itoa(len(content)) + " bytes (" + itoa(lines) + " lines) to " + path}, nil
+	lines := strings.Count(content, "\n") + 1
+	return Result{Data: "Wrote " + strconv.Itoa(len(content)) + " bytes (" + strconv.Itoa(lines) + " lines) to " + path}, nil
 }
 
 func (t *WriteTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

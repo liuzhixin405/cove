@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -17,6 +19,7 @@ import (
 
 type anthropicProvider struct {
 	apiKey       string
+	keyPool      *KeyPool
 	baseURL      string
 	client       *http.Client
 	streamClient *http.Client
@@ -26,12 +29,45 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.anthropic.com/v1"
 	}
-	return &anthropicProvider{
-		apiKey:       cfg.APIKey,
-		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
-		client:       &http.Client{Timeout: 300 * time.Second},
-		streamClient: &http.Client{},
+	transport := &http.Transport{
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 60 * time.Second,
+		}).DialContext,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     30,
+		IdleConnTimeout:     120 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
 	}
+	var pool *KeyPool
+	if len(cfg.APIKeys) > 1 {
+		pool = NewKeyPool(cfg.APIKeys)
+	} else if len(cfg.APIKeys) == 1 {
+		cfg.APIKey = cfg.APIKeys[0]
+	}
+	return &anthropicProvider{
+		apiKey:  cfg.APIKey,
+		keyPool: pool,
+		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
+		client: &http.Client{
+			Timeout:   300 * time.Second,
+			Transport: transport,
+		},
+		streamClient: &http.Client{
+			Transport: transport,
+		},
+	}
+}
+
+func (p *anthropicProvider) activeKey() string {
+	if p.keyPool != nil {
+		return p.keyPool.Get()
+	}
+	return p.apiKey
 }
 
 func (p *anthropicProvider) Name() string        { return "anthropic" }
@@ -44,14 +80,15 @@ func (p *anthropicProvider) Validate() error {
 }
 
 type anthropicContentBlock struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	Content   any            `json:"content,omitempty"`
-	IsError   *bool          `json:"is_error,omitempty"`
+	Type         string            `json:"type"`
+	Text         string            `json:"text,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Input        map[string]any    `json:"input,omitempty"`
+	ToolUseID    string            `json:"tool_use_id,omitempty"`
+	Content      any               `json:"content,omitempty"`
+	IsError      *bool             `json:"is_error,omitempty"`
+	CacheControl map[string]string `json:"cache_control,omitempty"`
 }
 
 type anthropicMsg struct {
@@ -126,7 +163,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("x-api-key", p.activeKey())
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 
@@ -158,12 +195,13 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	}
 
 	return &ChatResponse{
-		Content:      p.extractContent(ar.Content),
-		ToolCalls:    p.extractToolCalls(ar.Content),
-		Model:        ar.Model,
-		InputTokens:  ar.Usage.InputTokens,
-		OutputTokens: ar.Usage.OutputTokens,
-		StopReason:   ar.StopReason,
+		Content:          p.extractContent(ar.Content),
+		ToolCalls:        p.extractToolCalls(ar.Content),
+		Model:            ar.Model,
+		InputTokens:      ar.Usage.InputTokens,
+		OutputTokens:     ar.Usage.OutputTokens,
+		StopReason:       ar.StopReason,
+		RateLimitHeaders: httpResp.Header,
 	}, nil
 }
 
@@ -211,6 +249,11 @@ func (p *anthropicProvider) convertMessages(in []Message) []anthropicMsg {
 			}
 		default:
 			am.Content = []anthropicContentBlock{{Type: "text", Text: m.Content}}
+		}
+		// Inject cache_control if set on the message (prompt caching)
+		if m.CacheControl != "" && len(am.Content) > 0 {
+			last := &am.Content[len(am.Content)-1]
+			last.CacheControl = map[string]string{"type": m.CacheControl}
 		}
 		out = append(out, am)
 	}
@@ -279,7 +322,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("x-api-key", p.activeKey())
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 
@@ -388,11 +431,12 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 
 	return &ChatResponse{
-		Content:      strings.Join(texts, ""),
-		ToolCalls:    toolCalls,
-		Model:        req.Model,
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		StopReason:   stopReason,
+		Content:          strings.Join(texts, ""),
+		ToolCalls:        toolCalls,
+		Model:            req.Model,
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		StopReason:       stopReason,
+		RateLimitHeaders: httpResp.Header,
 	}, nil
 }

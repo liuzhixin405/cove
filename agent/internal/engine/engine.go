@@ -11,15 +11,24 @@ import (
 	"time"
 
 	"github.com/agentgo/internal/api"
+	"github.com/agentgo/internal/buddy"
+	"github.com/agentgo/internal/checkpoint"
 	ctxt "github.com/agentgo/internal/context"
 	"github.com/agentgo/internal/cost"
+	"github.com/agentgo/internal/delegate"
+	"github.com/agentgo/internal/dream"
+	"github.com/agentgo/internal/extract"
+	"github.com/agentgo/internal/guardrail"
 	"github.com/agentgo/internal/hooks"
 	"github.com/agentgo/internal/log"
 	"github.com/agentgo/internal/memory"
+	"github.com/agentgo/internal/notes"
+	"github.com/agentgo/internal/onboarding"
 	"github.com/agentgo/internal/permission"
 	"github.com/agentgo/internal/repl"
 	"github.com/agentgo/internal/session"
 	"github.com/agentgo/internal/skills"
+	"github.com/agentgo/internal/suggest"
 	"github.com/agentgo/internal/token"
 	"github.com/agentgo/internal/tool"
 )
@@ -63,7 +72,24 @@ type Engine struct {
 	cachedToolDefs    []api.ToolDef
 	lastSaveTime      time.Time
 	consecutiveErrors int // track consecutive tool failures for circuit breaking
+	lastSuggestions   []suggest.Suggestion
+	sugMu             sync.Mutex
+	autoExtract       bool // whether to run extract/suggest after each turn
 	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause func() // called before permission prompt to pause spinners
+	OnPermissionDone  func() // called after permission decision to resume
+	dreamRunner       *dream.Runner
+	extractRunner     *extract.Runner
+	suggestRunner     *suggest.Runner
+	sessionNotes      *notes.SessionNotes
+	BuddyDisplay      *buddy.Display
+	BuddyChat         *buddy.BuddyChat
+	guardrails        *guardrail.Tracker
+	checkpointMgr     *checkpoint.Manager
+	subdirHints       *ctxt.SubdirHints
+	rateLimits        *api.RateLimitTracker
+	delegator         *delegate.Delegator
+	onboardHints      *onboarding.Hints
 }
 
 func New(config Config) (*Engine, error) {
@@ -101,6 +127,7 @@ func New(config Config) (*Engine, error) {
 			SkillPrompts:  make(map[string]string),
 		},
 		fileHistory: make(map[string]bool),
+		autoExtract: true,
 	}
 
 	if config.SkillManager != nil {
@@ -117,6 +144,71 @@ func New(config Config) (*Engine, error) {
 			Model:     config.Model,
 		}
 	}
+
+	// Initialize auto-dream runner
+	sessionID := ""
+	if e.session != nil {
+		sessionID = e.session.ID
+	}
+	e.dreamRunner = dream.NewRunner(prov, config.Model, sessionID)
+
+	// Initialize memory extraction runner
+	e.extractRunner = extract.NewRunner(prov, config.Model)
+	e.extractRunner.OnSave = func(count int) {
+		fmt.Fprintf(os.Stderr, "  \x1b[2m💾 学到了 %d 条新记忆\x1b[0m\n", count)
+		if e.sessionNotes != nil {
+			e.sessionNotes.AddDiscovery(fmt.Sprintf("Extracted %d memories from conversation", count))
+		}
+	}
+
+	// Initialize prompt suggestion runner
+	e.suggestRunner = suggest.NewRunner(prov, config.Model)
+
+	// Initialize session notes
+	cwd, _ := os.Getwd()
+	if cwd != "" {
+		e.sessionNotes = notes.New(cwd)
+		e.sessionNotes.Load()
+	} else {
+		e.sessionNotes = notes.NewGlobal()
+	}
+
+	// Initialize buddy companion
+	userID := buddy.GetUserID()
+	if comp := buddy.LoadCompanion(userID); comp != nil {
+		e.BuddyDisplay = buddy.NewDisplay(comp)
+		e.BuddyChat = buddy.NewBuddyChat(comp, prov, config.Model)
+		e.BuddyChat.LoadHistory()
+		e.BuddyDisplay.ChatBackend = e.BuddyChat
+	}
+
+	// Initialize guardrails (tool loop detection)
+	e.guardrails = guardrail.New()
+
+	// Initialize checkpoint manager
+	if cwd != "" {
+		if cpMgr, err := checkpoint.New(cwd); err == nil {
+			e.checkpointMgr = cpMgr
+		}
+	}
+
+	// Initialize subdirectory hints tracker
+	if cwd != "" {
+		e.subdirHints = ctxt.NewSubdirHints(cwd)
+	}
+
+	// Initialize rate limit tracker
+	e.rateLimits = api.NewRateLimitTracker()
+
+	// Initialize sub-agent delegator
+	e.delegator = delegate.NewDelegator(prov, config.Model, config.Tools)
+
+	// Initialize progressive onboarding hints
+	e.onboardHints = onboarding.NewHints()
+
+	// Check dream on startup too (catches cases where previous sessions
+	// accumulated enough but the turn-end trigger never fired)
+	go e.dreamRunner.ExecuteAutoDream(context.Background())
 
 	return e, nil
 }
@@ -141,6 +233,7 @@ func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
 func (e *Engine) ProviderName() string       { return e.provider.DisplayName() }
+func (e *Engine) Provider() api.Provider     { return e.provider }
 func (e *Engine) SetPermissionMode(mode permission.Mode) {
 	if permission.ValidMode(mode) {
 		e.perm.SetMode(mode)
@@ -152,8 +245,13 @@ func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission
 	e.perm.AddRule(decision, rule)
 }
 
-func (e *Engine) Registry() *tool.Registry { return e.registry }
-func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
+func (e *Engine) Registry() *tool.Registry           { return e.registry }
+func (e *Engine) Runtime() *tool.Runtime             { return e.runtime }
+func (e *Engine) DreamRunner() *dream.Runner         { return e.dreamRunner }
+func (e *Engine) CheckpointMgr() *checkpoint.Manager { return e.checkpointMgr }
+func (e *Engine) RateLimits() *api.RateLimitTracker  { return e.rateLimits }
+func (e *Engine) Delegator() *delegate.Delegator     { return e.delegator }
+func (e *Engine) OnboardHints() *onboarding.Hints    { return e.onboardHints }
 func (e *Engine) FileHistory() []string {
 	e.fileMu.Lock()
 	defer e.fileMu.Unlock()
@@ -205,11 +303,24 @@ Available tools:`)
 		}
 	}
 
+	// Inject session notes for context continuity
+	if e.sessionNotes != nil {
+		if nc := e.sessionNotes.Content(); nc != "" {
+			sb.WriteString(nc)
+		}
+	}
+
 	if e.projCtx != nil {
 		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
 			e.projCtx.Cwd, e.projCtx.Platform, e.projCtx.Shell))
 		if e.projCtx.IsGitRepo {
 			sb.WriteString(fmt.Sprintf("\nGit: %s (%s)", e.projCtx.GitBranch, e.projCtx.GitStatus))
+			if e.projCtx.GitMain != "" && e.projCtx.GitMain != e.projCtx.GitBranch {
+				sb.WriteString(fmt.Sprintf(" | main branch: %s", e.projCtx.GitMain))
+			}
+			if e.projCtx.GitUser != "" {
+				sb.WriteString(fmt.Sprintf(" | user: %s", e.projCtx.GitUser))
+			}
 			if e.projCtx.GitLog != "" {
 				sb.WriteString(fmt.Sprintf("\nRecent commits:\n%s", e.projCtx.GitLog))
 			}
@@ -243,9 +354,15 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
 			iter, len(e.messages), e.totalTokens, len(toolDefs), e.config.Model, e.costTracker.Summary())
 
+		// Apply prompt cache breakpoints for Anthropic
+		reqMessages := e.messages
+		if e.provider.Name() == "anthropic" {
+			reqMessages = api.InjectCacheBreakpoints(e.messages)
+		}
+
 		req := api.ChatRequest{
 			Model:      e.config.Model,
-			Messages:   e.messages,
+			Messages:   reqMessages,
 			SystemBase: sp,
 			Tools:      toolDefs,
 			MaxTokens:  64000,
@@ -258,7 +375,7 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
 		var walker *repl.WalkingIndicator
 		if iter > 0 && !e.config.Debug {
-			walker = repl.NewWalkingIndicator("Thinking...")
+			walker = repl.NewWalkingIndicator("思考中...")
 			walker.Start()
 		}
 
@@ -288,6 +405,11 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 
 		e.costTracker.AddDetailed(e.config.Model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
 
+		// Update rate limit tracking
+		if e.rateLimits != nil && resp.RateLimitHeaders != nil {
+			e.rateLimits.Update(resp.RateLimitHeaders)
+		}
+
 		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
 			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
 
@@ -303,6 +425,8 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		if len(resp.ToolCalls) == 0 {
 			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
 			e.saveSession()
+			// Turn-end pipeline (all run in background)
+			e.runTurnEndPipeline()
 			return resp.Content, nil
 		}
 
@@ -317,10 +441,25 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		results := make([]toolResult, len(resp.ToolCalls))
 
 		if len(resp.ToolCalls) > 1 {
+			// Partition tool calls into concurrent-safe and serial groups.
+			// Additionally, write/edit calls targeting different files can run in parallel.
 			var wg sync.WaitGroup
+			serialFilePaths := make(map[string]bool) // track files being written to serialize conflicts
+
 			for i, tc := range resp.ToolCalls {
 				t, _ := e.registry.Find(tc.Name)
 				safe := t != nil && t.Def().IsConcurrencySafe
+
+				// write/edit to distinct files can also be parallelized
+				if !safe && (tc.Name == "write" || tc.Name == "edit") {
+					if fp, ok := tc.Input["filePath"].(string); ok && fp != "" {
+						if !serialFilePaths[fp] {
+							serialFilePaths[fp] = true
+							safe = true // different file, safe to parallelize
+						}
+					}
+				}
+
 				if safe {
 					wg.Add(1)
 					go func(idx int, tcall api.ToolCall) {
@@ -346,9 +485,27 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		}
 
 		for _, r := range results {
+			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
-				isErr := strings.HasPrefix(r.Content, "Error:")
 				fmt.Fprintf(os.Stderr, "\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr))
+				// Buddy reaction to tool results
+				if e.BuddyDisplay != nil {
+					var quip *buddy.Quip
+					if isErr {
+						quip = e.BuddyDisplay.ReactWithMood(buddy.EventToolError, r.Name)
+					} else {
+						quip = e.BuddyDisplay.ReactWithMood(buddy.EventToolSuccess, r.Name)
+					}
+					if quip != nil {
+						fmt.Fprintf(os.Stderr, "  \x1b[36m🐾 %s: %s\x1b[0m\n", e.BuddyDisplay.Reactor().Companion.Name, quip.Text)
+					}
+				}
+			}
+			// Session notes capture (always, regardless of debug mode)
+			if e.sessionNotes != nil {
+				if isErr {
+					e.sessionNotes.AddError(fmt.Sprintf("%s: %s", r.Name, summarizeResult(r.Content)))
+				}
 			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
@@ -377,7 +534,7 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 		}
 
 		e.totalTokens = countTokens(e.messages)
-		if e.totalTokens > CompactTokenThreshold && iter > 5 {
+		if e.totalTokens > CompactTokenThreshold && iter > 5 && len(e.messages) > 16 {
 			e.Compact(ctx)
 		}
 	}
@@ -389,6 +546,18 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	t, ok := e.registry.Find(tc.Name)
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
+	}
+
+	// Guardrail check before execution
+	if e.guardrails != nil {
+		decision := e.guardrails.BeforeCall(tc.Name, tc.Input)
+		switch decision.Action {
+		case guardrail.Block:
+			return fmt.Sprintf("Error: %s", decision.Message)
+		case guardrail.Warn:
+			// Inject warning but proceed
+			log.Debugf("guardrail warn: %s %s", tc.Name, decision.Message)
+		}
 	}
 
 	cwd := ""
@@ -430,7 +599,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		}
 		if decision == permission.DAsk {
 			if e.PermissionPrompt != nil {
-				if e.PermissionPrompt(tc.Name, tc.Input, reason) {
+				if e.OnPermissionPause != nil {
+					e.OnPermissionPause()
+				}
+				approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
+				if e.OnPermissionDone != nil {
+					e.OnPermissionDone()
+				}
+				if approved {
 					// User approved, continue execution
 					goto executeCall
 				}
@@ -441,16 +617,29 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	}
 
 executeCall:
+	// Checkpoint before destructive operations
+	if e.checkpointMgr != nil && (tc.Name == "write" || tc.Name == "edit" || tc.Name == "bash") {
+		if tc.Name == "write" || tc.Name == "edit" {
+			e.checkpointMgr.Create(tc.Name + ": " + shortPath(tc.Input))
+		}
+	}
+
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err != nil {
 		// Retry once for transient errors (network, timeout, temporary file locks)
 		if isTransientError(err) {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			result, err = t.Call(ctx, tc.Input, tctx)
 			if err != nil {
+				if e.guardrails != nil {
+					e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
+				}
 				return fmt.Sprintf("Error (after retry): %v", err)
 			}
 		} else {
+			if e.guardrails != nil {
+				e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
+			}
 			return fmt.Sprintf("Error: %v", err)
 		}
 	}
@@ -458,6 +647,12 @@ executeCall:
 		e.trackFileChanges(tc)
 	}
 	output := result.Data
+
+	// Record result in guardrails
+	if e.guardrails != nil {
+		e.guardrails.AfterCall(tc.Name, tc.Input, output, result.IsError)
+	}
+
 	if !result.IsError {
 		// Adaptive truncation: code/read results get more space than bash output
 		maxTokens := 4000
@@ -470,6 +665,19 @@ executeCall:
 			maxTokens = 3000
 		}
 		output = token.TruncateToTokens(output, maxTokens)
+
+		// Subdirectory hints: inject context from discovered AGENTS.md files
+		if e.subdirHints != nil {
+			var hint string
+			if path, ok := tc.Input["filePath"].(string); ok {
+				hint = e.subdirHints.CheckPath(path)
+			} else if cmd, ok := tc.Input["command"].(string); ok {
+				hint = e.subdirHints.CheckCommand(cmd)
+			}
+			if hint != "" {
+				output += hint
+			}
+		}
 	}
 	if result.IsError {
 		return result.Data
@@ -493,6 +701,19 @@ func isTransientError(err error) bool {
 		}
 	}
 	return false
+}
+
+func shortPath(input map[string]any) string {
+	if p, ok := input["filePath"].(string); ok {
+		return filepath.Base(p)
+	}
+	if cmd, ok := input["command"].(string); ok {
+		if len(cmd) > 40 {
+			return cmd[:40] + "..."
+		}
+		return cmd
+	}
+	return ""
 }
 
 func toolPermissionMode(mode permission.Mode) string {
@@ -524,6 +745,9 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 	case "write", "edit":
 		if path, ok := tc.Input["filePath"].(string); ok {
 			e.fileHistory[path] = true
+			if e.sessionNotes != nil {
+				e.sessionNotes.AddTask(fmt.Sprintf("File: %s", filepath.Base(path)))
+			}
 		}
 	case "bash":
 		if e.projCtx == nil {
@@ -558,10 +782,24 @@ func resolvePath(p, cwd string) (string, bool) {
 
 func (e *Engine) Compact(ctx context.Context) {
 	log.Debugf("agent compacting: %d tokens, %d msgs", e.totalTokens, len(e.messages))
+	if e.sessionNotes != nil {
+		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
+	}
 	if len(e.messages) < 12 {
 		return
 	}
 
+	// Layer 1: Trim old tool results to 1-line summaries (cheap, no API call)
+	e.trimOldToolResults()
+
+	// Recount after trimming
+	e.totalTokens = countTokens(e.messages)
+	if e.totalTokens <= CompactTokenThreshold {
+		log.Debugf("compact: trimming alone sufficient (%d tokens)", e.totalTokens)
+		return
+	}
+
+	// Layer 2: LLM summary of middle conversation
 	// Strategy: keep the first user message + last 6 messages intact.
 	// Summarize everything in between.
 	// Ensure we don't split assistant+tool pairs.
@@ -596,13 +834,13 @@ func (e *Engine) Compact(ctx context.Context) {
 	for _, m := range history {
 		summaryInput.WriteString(fmt.Sprintf("[%s] ", m.Role))
 		content := m.Content
-		// For tool results, keep file paths but truncate output
+		// For tool results, keep file paths but truncate output aggressively
 		if m.Role == "tool" {
-			if len(content) > 150 {
-				content = content[:150] + "..."
+			if len(content) > 100 {
+				content = content[:100] + "..."
 			}
-		} else if len(content) > 400 {
-			content = content[:400] + "..."
+		} else if len(content) > 250 {
+			content = content[:250] + "..."
 		}
 		summaryInput.WriteString(content)
 		if len(m.ToolCalls) > 0 {
@@ -624,9 +862,9 @@ func (e *Engine) Compact(ctx context.Context) {
 
 	compactResp, err := e.provider.Chat(ctx, api.ChatRequest{
 		Model:      e.config.Model,
-		SystemBase: "You are a conversation summarizer. Be concise and factual. Output a structured summary under 400 words. Include file paths mentioned.",
+		SystemBase: "You are a conversation summarizer. Be concise and factual. Output a structured summary under 300 words. Include file paths mentioned.",
 		Messages:   []api.Message{{Role: "user", Content: summaryInput.String()}},
-		MaxTokens:  800,
+		MaxTokens:  600,
 	})
 	if err != nil {
 		log.Debugf("compact failed: %v", err)
@@ -648,6 +886,34 @@ func (e *Engine) Compact(ctx context.Context) {
 	e.totalTokens = countTokens(e.messages)
 	log.Debugf("agent compacted: %d tokens/%d msgs -> %d tokens/%d msgs (kept tail %d)",
 		oldTokens, oldMsgs, e.totalTokens, len(e.messages), keepTail)
+}
+
+// trimOldToolResults replaces verbose tool results in old messages with 1-line summaries.
+// Preserves the last 6 messages intact. This is a cheap pre-processing step.
+func (e *Engine) trimOldToolResults() {
+	if len(e.messages) <= 8 {
+		return
+	}
+	// Only trim messages before the last 6
+	cutoff := len(e.messages) - 6
+	for i := 0; i < cutoff; i++ {
+		m := &e.messages[i]
+		if m.Role != "tool" {
+			continue
+		}
+		if len(m.Content) <= 200 {
+			continue // already short
+		}
+		// Generate a 1-line summary: [tool_name] first_line... (N chars)
+		firstLine := m.Content
+		if idx := strings.IndexByte(firstLine, '\n'); idx > 0 {
+			firstLine = firstLine[:idx]
+		}
+		if len(firstLine) > 80 {
+			firstLine = firstLine[:80] + "..."
+		}
+		m.Content = fmt.Sprintf("[%s] %s (%d chars原始输出已压缩)", m.Name, firstLine, len(m.Content))
+	}
 }
 
 func (e *Engine) buildAPIToolDefs() []api.ToolDef {
@@ -677,9 +943,9 @@ func (e *Engine) saveSession() {
 	if e.store == nil || e.session == nil {
 		return
 	}
-	// Debounce: save at most every 5 seconds during rapid iterations
+	// Debounce: save at most every 10 seconds during rapid iterations
 	now := time.Now()
-	if !e.lastSaveTime.IsZero() && now.Sub(e.lastSaveTime) < 5*time.Second {
+	if !e.lastSaveTime.IsZero() && now.Sub(e.lastSaveTime) < 10*time.Second {
 		return
 	}
 	e.lastSaveTime = now
@@ -715,18 +981,17 @@ func (e *Engine) HasMessages() bool { return len(e.messages) > 0 }
 
 func countTokens(msgs []api.Message) int {
 	n := 0
-	for _, m := range msgs {
-		n += len(m.Content)/4 + 1 // fast approximation: ~4 chars per token
-		for _, tc := range m.ToolCalls {
+	for i := range msgs {
+		n += len(msgs[i].Content)/4 + 1 // fast approximation: ~4 chars per token
+		for j := range msgs[i].ToolCalls {
+			tc := &msgs[i].ToolCalls[j]
 			n += len(tc.Name)/4 + 1
-			// Estimate input size without re-marshaling
 			for k, v := range tc.Input {
 				n += len(k)/4 + 1
-				switch val := v.(type) {
-				case string:
+				if val, ok := v.(string); ok {
 					n += len(val) / 4
-				default:
-					n += 10 // rough estimate for non-string values
+				} else {
+					n += 10
 				}
 			}
 		}
@@ -793,4 +1058,59 @@ func formatToolLine(name, summary string, isError bool) string {
 		return fmt.Sprintf("  %s✗%s %s[%s]%s %s%s%s", red, reset, red, name, reset, red, summary, reset)
 	}
 	return fmt.Sprintf("  %s✓%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
+}
+
+// runTurnEndPipeline executes post-turn background tasks (all non-blocking):
+// 1. Extract memories from conversation (background, costs API credits)
+// 2. Auto-dream consolidation check (background)
+// 3. Generate follow-up suggestions (background, cheap)
+// 4. Flush session notes (background)
+// 5. Background review for auto-learning (background, costs API credits)
+func (e *Engine) runTurnEndPipeline() {
+	msgs := e.messages // capture snapshot
+
+	// Session notes flush (background, no API cost)
+	go e.sessionNotes.Flush()
+
+	// Dream consolidation (background, conditional)
+	go e.dreamRunner.ExecuteAutoDream(context.Background())
+
+	// Background review for auto memory/skill learning
+	go e.backgroundReview()
+
+	// Only run API-calling features if autoExtract is enabled
+	if !e.autoExtract {
+		return
+	}
+
+	// Memory extraction (background)
+	go e.extractRunner.Extract(context.Background(), msgs)
+
+	// Suggestions: run in background to avoid blocking the REPL input loop.
+	// Results are available via Suggestions() for display on next prompt.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		sug := e.suggestRunner.Generate(ctx, msgs)
+		e.sugMu.Lock()
+		e.lastSuggestions = sug
+		e.sugMu.Unlock()
+	}()
+}
+
+// Suggestions returns the last generated follow-up suggestions.
+func (e *Engine) Suggestions() []suggest.Suggestion {
+	e.sugMu.Lock()
+	defer e.sugMu.Unlock()
+	return e.lastSuggestions
+}
+
+// SetAutoExtract enables/disables API-calling background features (extract, suggest).
+func (e *Engine) SetAutoExtract(on bool) {
+	e.autoExtract = on
+}
+
+// SessionNotes returns the session notes manager.
+func (e *Engine) SessionNotes() *notes.SessionNotes {
+	return e.sessionNotes
 }

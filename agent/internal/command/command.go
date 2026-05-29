@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/agentgo/internal/api"
+	"github.com/agentgo/internal/buddy"
 	"github.com/agentgo/internal/config"
 	ctxt "github.com/agentgo/internal/context"
 	"github.com/agentgo/internal/mcp"
@@ -80,6 +81,9 @@ type Input struct {
 	MCPPool           MCPPool
 	ProjectContext    *ctxt.ProjectContext
 	AppState          *state.AppState
+	BuddyDisplay      *buddy.Display
+	BuddyChat         *buddy.BuddyChat
+	Provider          api.Provider
 }
 
 type Output struct {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"net/http"
 	"time"
 )
 
@@ -18,6 +19,7 @@ type Message struct {
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string     `json:"tool_call_id,omitempty"`
 	Name             string     `json:"name,omitempty"`
+	CacheControl     string     `json:"cache_control,omitempty"` // Anthropic prompt caching
 }
 
 type ToolDef struct {
@@ -46,6 +48,7 @@ type ChatResponse struct {
 	PromptCacheMissTokens int
 	ReasoningTokens       int
 	StopReason            string
+	RateLimitHeaders      http.Header // raw rate limit headers from response
 }
 
 type StreamEvent struct {
@@ -67,6 +70,7 @@ type Provider interface {
 type ProviderConfig struct {
 	Name    string
 	APIKey  string
+	APIKeys []string
 	BaseURL string
 }
 
@@ -123,4 +127,4 @@ type retryConfig struct {
 	BaseDelay  time.Duration
 }
 
-var defaultRetry = retryConfig{MaxRetries: 5, BaseDelay: 2 * time.Second}
+var defaultRetry = retryConfig{MaxRetries: 3, BaseDelay: 1 * time.Second}

@@ -1,8 +1,12 @@
 package cost
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Price struct {
@@ -118,4 +122,104 @@ func ftoa(f float64) string {
 		return strconv.FormatFloat(f, 'f', 4, 64)
 	}
 	return strconv.FormatFloat(f, 'f', 2, 64)
+}
+
+// --- Cost Persistence ---
+
+// CostRecord represents a persisted cost entry for a session.
+type CostRecord struct {
+	SessionID string    `json:"session_id"`
+	Model     string    `json:"model"`
+	Input     int       `json:"input"`
+	Output    int       `json:"output"`
+	CacheHit  int       `json:"cache_hit"`
+	CacheMiss int       `json:"cache_miss"`
+	Cost      float64   `json:"cost"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// CostHistory manages persistent cost records across sessions.
+type CostHistory struct {
+	path    string
+	Records []CostRecord `json:"records"`
+}
+
+// NewCostHistory loads or creates a cost history file.
+func NewCostHistory() *CostHistory {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".agentgo")
+	os.MkdirAll(dir, 0700)
+	path := filepath.Join(dir, "cost_history.json")
+
+	h := &CostHistory{path: path}
+	h.load()
+	return h
+}
+
+func (h *CostHistory) load() {
+	data, err := os.ReadFile(h.path)
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &h.Records)
+}
+
+// Save persists the current cost history to disk.
+func (h *CostHistory) Save() error {
+	data, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(h.path, data, 0644)
+}
+
+// Add records a new cost entry.
+func (h *CostHistory) Add(sessionID, model string, t *Tracker) {
+	h.Records = append(h.Records, CostRecord{
+		SessionID: sessionID,
+		Model:     model,
+		Input:     t.TotalInput,
+		Output:    t.TotalOutput,
+		CacheHit:  t.TotalPromptCacheHit,
+		CacheMiss: t.TotalPromptCacheMiss,
+		Cost:      t.TotalCost,
+		Timestamp: time.Now(),
+	})
+	// Keep at most last 100 records
+	if len(h.Records) > 100 {
+		h.Records = h.Records[len(h.Records)-100:]
+	}
+}
+
+// TotalAllTime returns the sum of all historical costs.
+func (h *CostHistory) TotalAllTime() float64 {
+	var total float64
+	for _, r := range h.Records {
+		total += r.Cost
+	}
+	return total
+}
+
+// Last7Days returns the sum of costs in the last 7 days.
+func (h *CostHistory) Last7Days() float64 {
+	var total float64
+	cutoff := time.Now().AddDate(0, 0, -7)
+	for _, r := range h.Records {
+		if r.Timestamp.After(cutoff) {
+			total += r.Cost
+		}
+	}
+	return total
+}
+
+// Last24Hours returns the sum of costs in the last 24 hours.
+func (h *CostHistory) Last24Hours() float64 {
+	var total float64
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, r := range h.Records {
+		if r.Timestamp.After(cutoff) {
+			total += r.Cost
+		}
+	}
+	return total
 }

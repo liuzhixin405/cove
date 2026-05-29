@@ -14,7 +14,7 @@ import (
 func TestProviderHelpLineListsExpandedProviders(t *testing.T) {
 	line := providerHelpLine()
 	checks := []string{
-		"/provider <name>",
+		"/provider <\u540d\u79f0>",
 		"anthropic",
 		"deepseek",
 		"openai-compatible",

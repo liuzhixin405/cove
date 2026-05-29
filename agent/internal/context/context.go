@@ -5,7 +5,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 type ProjectContext struct {
@@ -14,6 +16,8 @@ type ProjectContext struct {
 	GitRoot   string
 	GitStatus string
 	GitLog    string
+	GitMain   string // main/master branch name
+	GitUser   string // git user.name
 	FileTree  string
 	Platform  string
 	Shell     string
@@ -27,13 +31,26 @@ func Collect() *ProjectContext {
 	}
 	c.Cwd, _ = os.Getwd()
 	c.GitRoot = findGitRoot(c.Cwd)
+
+	// Run git info collection and file tree in parallel
+	var wg sync.WaitGroup
 	if c.GitRoot != "" {
 		c.IsGitRepo = true
-		c.GitBranch = gitBranch(c.GitRoot)
-		c.GitStatus = gitStatus(c.GitRoot)
-		c.GitLog = gitLog(c.GitRoot)
+		wg.Add(5)
+		go func() { defer wg.Done(); c.GitBranch = gitBranch(c.GitRoot) }()
+		go func() { defer wg.Done(); c.GitStatus = gitStatus(c.GitRoot) }()
+		go func() { defer wg.Done(); c.GitLog = gitLog(c.GitRoot) }()
+		go func() { defer wg.Done(); c.GitMain = detectMainBranch(c.GitRoot) }()
+		go func() { defer wg.Done(); c.GitUser = gitUser(c.GitRoot) }()
 	}
-	c.FileTree = fileTree(c.Cwd, 3)
+
+	// File tree in parallel with git
+	var treeResult string
+	wg.Add(1)
+	go func() { defer wg.Done(); treeResult = fileTree(c.Cwd, 3) }()
+
+	wg.Wait()
+	c.FileTree = treeResult
 	return c
 }
 
@@ -64,7 +81,7 @@ func gitStatus(root string) string {
 	}
 	lines := strings.Count(s, "\n") + 1
 	if lines > 15 {
-		return strings.Join(strings.Split(s, "\n")[:15], "\n") + "\n... " + itoa(lines) + " files changed"
+		return strings.Join(strings.Split(s, "\n")[:15], "\n") + "\n... " + strconv.Itoa(lines) + " files changed"
 	}
 	return s
 }
@@ -80,7 +97,7 @@ func detectShell() string {
 }
 
 func gitLog(root string) string {
-	cmd := exec.Command("git", "log", "--oneline", "-10")
+	cmd := exec.Command("git", "log", "--oneline", "--format=%h %an %s", "-5")
 	cmd.Dir = root
 	out, _ := cmd.Output()
 	s := strings.TrimSpace(string(out))
@@ -88,6 +105,36 @@ func gitLog(root string) string {
 		return ""
 	}
 	return s
+}
+
+func detectMainBranch(root string) string {
+	// Try common remote main branch names
+	for _, name := range []string{"main", "master"} {
+		cmd := exec.Command("git", "rev-parse", "--verify", "refs/heads/"+name)
+		cmd.Dir = root
+		if err := cmd.Run(); err == nil {
+			return name
+		}
+	}
+	// Fallback: check remote HEAD
+	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err == nil {
+		ref := strings.TrimSpace(string(out))
+		parts := strings.Split(ref, "/")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
+	}
+	return "main" // default assumption
+}
+
+func gitUser(root string) string {
+	cmd := exec.Command("git", "config", "user.name")
+	cmd.Dir = root
+	out, _ := cmd.Output()
+	return strings.TrimSpace(string(out))
 }
 
 func fileTree(root string, depth int) string {
@@ -99,7 +146,7 @@ func fileTree(root string, depth int) string {
 	}
 	lines := strings.Count(r, "\n") + 1
 	if lines > 40 {
-		return r[:strings.LastIndex(r[:min(len(r), 2000)], "\n")] + "\n... " + itoa(lines) + " total entries"
+		return r[:strings.LastIndex(r[:min(len(r), 2000)], "\n")] + "\n... " + strconv.Itoa(lines) + " total entries"
 	}
 	return r
 }
@@ -122,15 +169,13 @@ func walkDir(root, current string, maxDepth, currentDepth int, sb *strings.Build
 			sb.WriteString(prefix + rel + "/\n")
 			walkDir(root, filepath.Join(current, e.Name()), maxDepth, currentDepth+1, sb)
 		} else {
-		sb.WriteString(prefix + rel + "\n")
+			sb.WriteString(prefix + rel + "\n")
+		}
 	}
 }
-}
-func min(a, b int) int { if a < b { return a }; return b }
-
-func itoa(n int) string {
-	if n == 0 { return "0" }
-	d := []byte{}
-	for n > 0 { d = append([]byte{byte('0'+n%10)}, d...); n /= 10 }
-	return string(d)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

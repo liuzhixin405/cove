@@ -10,9 +10,10 @@ import (
 )
 
 type ProviderConfig struct {
-	Name    string `json:"name"`
-	APIKey  string `json:"api_key,omitempty"`
-	BaseURL string `json:"base_url,omitempty"`
+	Name    string   `json:"name"`
+	APIKey  string   `json:"api_key,omitempty"`
+	APIKeys []string `json:"api_keys,omitempty"`
+	BaseURL string   `json:"base_url,omitempty"`
 }
 
 type Config struct {

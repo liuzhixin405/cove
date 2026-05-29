@@ -1,13 +1,33 @@
 package memory
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// MaxIndexLines is the maximum number of lines for any single memory file.
+	MaxIndexLines = 200
+	// MaxEntryBytes is the maximum size in bytes per memory entry.
+	MaxEntryBytes = 25 * 1024 // 25KB
+	// MaxTotalBytes is the maximum total size across all memory files.
+	MaxTotalBytes = 100 * 1024 // 100KB
 )
 
 type Store struct {
 	dirs []string
+
+	// Cache to avoid repeated disk reads on every system prompt build
+	mu          sync.Mutex
+	cachedAll   []Entry
+	cacheTime   time.Time
+	cacheTTL    time.Duration
+	promptCache string
+	promptDirty bool
 }
 
 func NewStore() *Store {
@@ -16,6 +36,8 @@ func NewStore() *Store {
 		dirs: []string{
 			filepath.Join(home, ".agentgo", "memory"),
 		},
+		cacheTTL:    30 * time.Second,
+		promptDirty: true,
 	}
 }
 
@@ -24,6 +46,14 @@ func (s *Store) AddDir(dir string) {
 }
 
 func (s *Store) All() []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Return cached if fresh
+	if s.cachedAll != nil && time.Since(s.cacheTime) < s.cacheTTL {
+		return s.cachedAll
+	}
+
 	var entries []Entry
 	seen := map[string]bool{}
 	for _, dir := range s.dirs {
@@ -55,6 +85,9 @@ func (s *Store) All() []Entry {
 		s.loadCLAUDEMD(filepath.Join(cwd, ".claude"), &entries, &seen)
 	}
 
+	s.cachedAll = entries
+	s.cacheTime = time.Now()
+	s.promptDirty = true
 	return entries
 }
 
@@ -81,6 +114,15 @@ func (s *Store) BuildPrompt() string {
 	if len(entries) == 0 {
 		return ""
 	}
+
+	s.mu.Lock()
+	if !s.promptDirty && s.promptCache != "" {
+		cached := s.promptCache
+		s.mu.Unlock()
+		return cached
+	}
+	s.mu.Unlock()
+
 	var sb strings.Builder
 	sb.WriteString("\n\n<user_memories>\n")
 	for _, e := range entries {
@@ -92,7 +134,13 @@ func (s *Store) BuildPrompt() string {
 		sb.WriteString("</memory>\n")
 	}
 	sb.WriteString("</user_memories>\n")
-	return sb.String()
+
+	result := sb.String()
+	s.mu.Lock()
+	s.promptCache = result
+	s.promptDirty = false
+	s.mu.Unlock()
+	return result
 }
 
 type Entry struct {
@@ -103,6 +151,16 @@ type Entry struct {
 }
 
 func (s *Store) Save(name, content string) error {
+	// Validate entry size
+	if len(content) > MaxEntryBytes {
+		return fmt.Errorf("memory entry %q exceeds max size (%d > %d bytes)", name, len(content), MaxEntryBytes)
+	}
+	// Validate line count
+	lines := strings.Count(content, "\n") + 1
+	if lines > MaxIndexLines {
+		return fmt.Errorf("memory entry %q exceeds max lines (%d > %d)", name, lines, MaxIndexLines)
+	}
+
 	var dir string
 	for _, d := range s.dirs {
 		if _, err := os.Stat(d); err == nil {
@@ -114,16 +172,67 @@ func (s *Store) Save(name, content string) error {
 		dir = s.dirs[0]
 		os.MkdirAll(dir, 0700)
 	}
-	return os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
+
+	// Check total size would not exceed limit
+	totalSize := 0
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err == nil {
+			if e.Name() == name {
+				continue // replacing this file, don't count old size
+			}
+			totalSize += int(info.Size())
+		}
+	}
+	if totalSize+len(content) > MaxTotalBytes {
+		return fmt.Errorf("total memory size would exceed limit (%d + %d > %d bytes)", totalSize, len(content), MaxTotalBytes)
+	}
+
+	err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
+	if err == nil {
+		s.invalidateCache()
+	}
+	return err
+}
+
+// TruncateEntry truncates content to fit within limits.
+func TruncateEntry(content string) string {
+	// Truncate by lines
+	lines := strings.Split(content, "\n")
+	if len(lines) > MaxIndexLines {
+		lines = lines[:MaxIndexLines]
+		content = strings.Join(lines, "\n") + "\n... [truncated to 200 lines]"
+	}
+	// Truncate by bytes
+	if len(content) > MaxEntryBytes {
+		content = content[:MaxEntryBytes-50] + "\n... [truncated to 25KB]"
+	}
+	return content
 }
 
 func (s *Store) Delete(name string) error {
 	for _, d := range s.dirs {
 		path := filepath.Join(d, name)
 		if _, err := os.Stat(path); err == nil {
-			return os.Remove(path)
+			err := os.Remove(path)
+			if err == nil {
+				s.invalidateCache()
+			}
+			return err
 		}
 	}
 	return nil
 }
 
+func (s *Store) invalidateCache() {
+	s.mu.Lock()
+	s.cachedAll = nil
+	s.cacheTime = time.Time{}
+	s.promptDirty = true
+	s.promptCache = ""
+	s.mu.Unlock()
+}
