@@ -21,10 +21,10 @@ import (
 	"github.com/agentgo/internal/api"
 )
 
-// Image processing limits (align with Claude Code & API best practices)
+// Image processing limits (align with upstream API best practices)
 const (
-	maxImageDim    = 1568 // max pixels on longest side
-	maxImageBytes  = 5 * 1024 * 1024 // 5MB target after compression
+	maxImageDim    = 1568             // max pixels on longest side
+	maxImageBytes  = 5 * 1024 * 1024  // 5MB target after compression
 	maxRawImage    = 32 * 1024 * 1024 // 32MB raw file read limit
 	jpegQuality    = 85
 	minJPEGQuality = 20
@@ -282,7 +282,13 @@ func buildImagePart(name, absPath string, raw []byte, mimeType, model string) (a
 	// Check if model supports vision
 	warning := ""
 	if model != "" && !api.IsVisionCapableModel(model) {
-		warning = fmt.Sprintf("⚠ 当前模型 %s 可能不支持图片视觉功能，建议切换到视觉模型 (如 deepseek-chat / gpt-4o / claude-sonnet-4)", model)
+		warning = fmt.Sprintf("⚠ 当前模型 %s 可能不支持图片视觉功能，已自动降级为文本提示。建议切换到视觉模型 (如 deepseek-chat / gpt-4o / claude-sonnet-4)", model)
+		return api.MessagePart{
+			Type:     "text",
+			MimeType: "text/plain",
+			FileName: name,
+			Text:     fmt.Sprintf("[已挂载图片 %s，但当前模型 %s 可能不支持视觉输入，图片内容未发送。请切换视觉模型后重试。]", name, model),
+		}, absPath, warning, nil
 	}
 
 	// Process image: resize + compress

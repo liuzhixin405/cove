@@ -34,3 +34,5 @@ go.work.sum
 agent/coverage.txt
 agent/*.test
 agent/internal/engine/.agentgo/session_notes.md
+agent/internal/engine/.agentgo/session_notes.md
+agent/internal/engine/.agentgo/session_notes.md

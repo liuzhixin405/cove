@@ -296,7 +296,7 @@ func main() {
 	}
 
 	if printMode && printPrompt != "" {
-		runPrintMode(eng, printPrompt, debugMode, printAttachments, cfg.Model)
+		runPrintMode(eng, printPrompt, debugMode, printAttachments, cfg)
 		return
 	}
 
@@ -615,6 +615,22 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				fmt.Printf("附件处理失败: %v\n", err)
 				continue
 			}
+			if shouldAutoSwitchToVision(warnings) {
+				if visionModel := preferredVisionModelForProvider(pc.Name, cfg.Model); visionModel != "" && visionModel != cfg.Model {
+					if err := applyProviderConfigChange(cfg, eng, func() error {
+						cfg.Model = visionModel
+						as.Model = visionModel
+						return nil
+					}); err == nil {
+						fmt.Printf("ℹ 检测到图片输入，已自动切换视觉模型: %s\n", visionModel)
+						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
+						if err != nil {
+							fmt.Printf("附件处理失败: %v\n", err)
+							continue
+						}
+					}
+				}
+			}
 			// Print warnings (e.g., non-vision model with image)
 			for _, w := range warnings {
 				fmt.Printf("  \x1b[33m%s\x1b[0m\n", w)
@@ -902,6 +918,31 @@ func providerNameSuggestions() []string {
 	}
 }
 
+func shouldAutoSwitchToVision(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, "已自动降级为文本提示") || strings.Contains(w, "不支持图片视觉") {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredVisionModelForProvider(providerName, currentModel string) string {
+	if api.IsVisionCapableModel(currentModel) {
+		return currentModel
+	}
+	switch api.NormalizeProviderName(providerName) {
+	case "deepseek":
+		return "deepseek-chat"
+	case "openai", "openai-compatible":
+		return "gpt-4o"
+	case "anthropic":
+		return "claude-sonnet-4-20250514"
+	default:
+		return ""
+	}
+}
+
 // shortDesc extracts a one-line short description (max 50 chars) from potentially
 // multi-line text. Used to show concise hints in Tab completion.
 func shortDesc(s string) string {
@@ -963,7 +1004,7 @@ func fuzzyMatch(input string, cmdReg *command.Registry) []string {
 	return matches
 }
 
-func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string, model string) {
+func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string, cfg *config.Config) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
@@ -971,10 +1012,26 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 	defer signal.Stop(sigCh)
 	go func() { <-sigCh; cancel() }()
 	cwd, _ := os.Getwd()
-	userMsg, warnings, err := buildUserMessage(prompt, cwd, attachmentPaths, model)
+	userMsg, warnings, err := buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	if shouldAutoSwitchToVision(warnings) {
+		pc := cfg.EffectiveProvider()
+		if visionModel := preferredVisionModelForProvider(pc.Name, cfg.Model); visionModel != "" && visionModel != cfg.Model {
+			if err := applyProviderConfigChange(cfg, eng, func() error {
+				cfg.Model = visionModel
+				return nil
+			}); err == nil {
+				fmt.Fprintf(os.Stderr, "ℹ 检测到图片输入，已自动切换视觉模型: %s\n", visionModel)
+				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		}
 	}
 	for _, w := range warnings {
 		fmt.Fprintf(os.Stderr, "⚠ %s\n", w)

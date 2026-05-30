@@ -350,6 +350,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	if userMessage.Role == "" {
 		userMessage.Role = "user"
 	}
+	prevMessages := append([]api.Message(nil), e.messages...)
 	e.messages = append(e.messages, userMessage)
 	e.saveSession()
 
@@ -360,6 +361,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	for iter := 0; iter < MaxIterations; iter++ {
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
 		if ctx.Err() != nil {
+			e.messages = prevMessages
+			e.saveSession()
 			return "", ctx.Err()
 		}
 		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
@@ -411,6 +414,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		if err != nil {
+			e.messages = prevMessages
+			e.saveSession()
 			return "", fmt.Errorf("api: %w", err)
 		}
 

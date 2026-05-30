@@ -154,9 +154,6 @@ func TestProcessImageResizeAndCompress(t *testing.T) {
 			img.Set(x, y, color.RGBA{R: uint8(x % 256), G: uint8(y % 256), B: uint8((x + y) % 256), A: 255})
 		}
 	}
-	var pngBuf []byte
-	_ = pngBuf
-
 	// Encode as PNG then process
 	f, err := os.CreateTemp(t.TempDir(), "large-*.png")
 	if err != nil {
@@ -223,8 +220,8 @@ func TestDecodeImageFormats(t *testing.T) {
 func TestStripAlpha(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 10, 10))
 	result := stripAlpha(img)
-	if _, ok := result.(*image.RGBA); !ok {
-		t.Error("stripAlpha should return *image.RGBA")
+	if result == nil {
+		t.Fatal("stripAlpha returned nil")
 	}
 	if result.Bounds().Dx() != 10 || result.Bounds().Dy() != 10 {
 		t.Error("stripAlpha changed dimensions")

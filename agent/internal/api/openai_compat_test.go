@@ -245,3 +245,69 @@ func TestOpenAICompatConvertMessagesSupportsImageParts(t *testing.T) {
 		t.Fatalf("second block type = %#v, want image_url", arr[1]["type"])
 	}
 }
+
+func TestOpenAICompatChatDowngradesImageForNonVisionModel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) == 0 {
+			t.Fatalf("messages missing in request body: %#v", body)
+		}
+		m0, _ := messages[0].(map[string]any)
+		content, _ := m0["content"].([]any)
+		if len(content) == 0 {
+			t.Fatalf("content missing in first message: %#v", m0)
+		}
+		for _, blockAny := range content {
+			block, _ := blockAny.(map[string]any)
+			if block["type"] == "image_url" {
+				t.Fatalf("non-vision model request should not contain image_url block: %#v", block)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"deepseek-reasoner","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	p := &openAICompatProvider{apiKey: "test-key", baseURL: server.URL, client: server.Client()}
+	_, err := p.Chat(context.Background(), ChatRequest{
+		Model: "deepseek-reasoner",
+		Messages: []Message{{
+			Role:  "user",
+			Parts: []MessagePart{{Type: "image", MimeType: "image/png", Data: "aGVsbG8=", FileName: "x.png"}},
+		}},
+		MaxTokens: 32,
+	})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+}
+
+func TestOpenAICompatChatReportsImageUnsupportedError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"Failed to deserialize: unknown variant `+"`image_url`"+`, expected `+"`text`"+`"}}`)
+	}))
+	defer server.Close()
+
+	p := &openAICompatProvider{apiKey: "test-key", baseURL: server.URL, client: server.Client()}
+	_, err := p.Chat(context.Background(), ChatRequest{
+		Model:     "deepseek-v4-pro",
+		MaxTokens: 32,
+		Messages: []Message{{
+			Role:  "user",
+			Parts: []MessagePart{{Type: "image", MimeType: "image/png", Data: "aGVsbG8=", FileName: "x.png"}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "不支持图片输入") {
+		t.Fatalf("error = %q, want friendly unsupported-image hint", err.Error())
+	}
+}

@@ -154,7 +154,8 @@ type oaiResp struct {
 }
 
 func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	msgs := p.convertMessages(req.Messages)
+	normalizedMessages := downgradeImagePartsForNonVision(req.Messages, req.Model)
+	msgs := p.convertMessages(normalizedMessages)
 	if req.System != "" || req.SystemBase != "" {
 		combined := req.SystemBase
 		if combined != "" && req.System != "" {
@@ -197,6 +198,7 @@ func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*Chat
 
 func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatResponse, error) {
 	data, _ := json.Marshal(body)
+	hadImage := oaiReqHasImageURL(body)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -218,7 +220,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		return nil, &RetryableError{Msg: "rate limited"}
 	}
 	if httpResp.StatusCode != 200 {
-		return nil, fmt.Errorf("API error %d: %s", httpResp.StatusCode, truncate(string(raw), 500))
+		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, raw, hadImage)
 	}
 
 	var cr oaiResp
@@ -429,6 +431,7 @@ type oaiStreamTC struct {
 }
 
 func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error) {
+	normalizedMessages := downgradeImagePartsForNonVision(req.Messages, req.Model)
 	messages := []oaiMsg{}
 	if req.SystemBase != "" || req.System != "" {
 		combined := req.SystemBase
@@ -438,7 +441,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		combined += req.System
 		messages = append(messages, oaiMsg{Role: "system", Content: combined})
 	}
-	messages = append(messages, p.convertMessages(req.Messages)...)
+	messages = append(messages, p.convertMessages(normalizedMessages)...)
 
 	tools := p.convertTools(req.Tools)
 	body := oaiReq{
@@ -450,6 +453,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		Stream:        true,
 		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
 	}
+	hadImage := oaiReqHasImageURL(body)
 
 	data, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
@@ -471,7 +475,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		return nil, fmt.Errorf("stream API error %d: %s", httpResp.StatusCode, string(b))
+		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, b, hadImage)
 	}
 
 	var fullContent strings.Builder
@@ -581,4 +585,62 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		StopReason:            stopReason,
 		RateLimitHeaders:      httpResp.Header,
 	}, nil
+}
+
+func downgradeImagePartsForNonVision(messages []Message, model string) []Message {
+	if IsVisionCapableModel(model) {
+		return messages
+	}
+	out := make([]Message, len(messages))
+	for i, m := range messages {
+		cp := m
+		if len(m.Parts) == 0 {
+			out[i] = cp
+			continue
+		}
+		cp.Parts = make([]MessagePart, 0, len(m.Parts))
+		for _, part := range m.Parts {
+			if part.Type != "image" {
+				cp.Parts = append(cp.Parts, part)
+				continue
+			}
+			name := part.FileName
+			if name == "" {
+				name = "image"
+			}
+			cp.Parts = append(cp.Parts, MessagePart{
+				Type: "text",
+				Text: fmt.Sprintf("[图片附件 %s 已自动降级：当前模型 %s 可能不支持视觉输入。请切换视觉模型后重试。]", name, model),
+			})
+		}
+		out[i] = cp
+	}
+	return out
+}
+
+func oaiReqHasImageURL(req oaiReq) bool {
+	for _, m := range req.Messages {
+		arr, ok := m.Content.([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, block := range arr {
+			if t, _ := block["type"].(string); t == "image_url" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func formatOpenAICompatAPIError(status int, raw []byte, hadImage bool) error {
+	msg := string(raw)
+	if hadImage {
+		lower := strings.ToLower(msg)
+		if strings.Contains(msg, "unknown variant `image_url`") ||
+			(strings.Contains(lower, "image_url") && strings.Contains(lower, "expected `text`")) {
+			return fmt.Errorf("API error %d: 当前接口不支持图片输入(image_url)。请移除附件或切换支持视觉的模型/端点。原始错误: %s", status, truncate(msg, 300))
+		}
+	}
+	return fmt.Errorf("API error %d: %s", status, truncate(msg, 500))
 }
