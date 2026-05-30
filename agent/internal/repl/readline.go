@@ -48,9 +48,10 @@ func (lr *LineReader) ReadLine() (string, error) {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	if lr.rawReader == nil {
-		lr.rawReader = bufio.NewReader(os.Stdin)
-	}
+	// Always create a fresh buffered reader to avoid stale data from
+	// previous ReadLine calls or from other stdin consumers (e.g. permission
+	// prompts) that may have left the OS buffer in an inconsistent state.
+	lr.rawReader = bufio.NewReader(os.Stdin)
 
 	var buf []rune
 	cursor := 0
@@ -135,6 +136,10 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 		return err
 	}
 	if first != '[' {
+		// Not an ANSI escape sequence (e.g. Alt+key on some terminals
+		// sends ESC followed by the modified key). Unread the byte so
+		// it can be processed as a regular character in the main loop.
+		lr.rawReader.UnreadRune()
 		return nil
 	}
 	second, err := readInputRune(lr.rawReader)
@@ -178,12 +183,25 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 }
 
 func (lr *LineReader) redraw(buf []rune, cursor int) {
-	fmt.Print("\r\x1b[K" + lr.prompt + string(buf))
+	// Use \x1b[0J (clear from cursor to end of display) instead of \x1b[K
+	// to handle multi-line buffer wrapping. When the buffer content spans
+	// multiple terminal lines, \x1b[K only clears the current line, leaving
+	// old wrapped content as visual artifacts that look like duplication.
+	display := lr.prompt + string(buf)
+	fmt.Print("\r\x1b[0J" + display)
 	if len(buf) == 0 && lr.placeholder != "" {
 		fmt.Print(" \x1b[90m" + lr.placeholder + "\x1b[0m")
 		fmt.Printf("\r\x1b[%dC", lr.promptWidth) // Move cursor back to the end of prompt
 	} else if cursor < len(buf) {
-		fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
+		// Cursor is inside the buffer (e.g. user moved with arrow keys).
+		// Move cursor left from the end by the character count difference.
+		// Note: \x1b[%dD is bounded by line start, so for multi-line content
+		// where cursor is on an earlier visual line, the cursor will stop at
+		// the left margin. This is an acceptable visual limitation.
+		charsFromEnd := len(buf) - cursor
+		if charsFromEnd > 0 {
+			fmt.Printf("\x1b[%dD", charsFromEnd)
+		}
 	}
 }
 

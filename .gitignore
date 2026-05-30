@@ -33,3 +33,4 @@ go.work.sum
 # Go build artifacts
 agent/coverage.txt
 agent/*.test
+agent/internal/engine/.agentgo/session_notes.md

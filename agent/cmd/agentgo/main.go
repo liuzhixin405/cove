@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -211,12 +210,21 @@ func main() {
 		fmt.Print(repl.PermissionPrompt(toolName, desc))
 		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
 
-		// Use a fresh buffered reader on stdin to avoid conflicts with raw-mode reader
-		scanner := bufio.NewScanner(os.Stdin)
-		var answer string
-		if scanner.Scan() {
-			answer = strings.TrimSpace(strings.ToLower(scanner.Text()))
+		// Read answer byte-by-byte from stdin to avoid buffered reads
+		// that could consume user input meant for the next ReadLine call.
+		var answerBytes []byte
+		var b [1]byte
+		for {
+			n, err := os.Stdin.Read(b[:])
+			if err != nil || n == 0 {
+				break
+			}
+			if b[0] == '\n' || b[0] == '\r' {
+				break
+			}
+			answerBytes = append(answerBytes, b[0])
 		}
+		answer := strings.TrimSpace(strings.ToLower(string(answerBytes)))
 		if answer == "" {
 			// Empty input (e.g. user just pressed Enter) defaults to deny
 			fmt.Printf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
