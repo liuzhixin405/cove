@@ -128,3 +128,46 @@ func IsKnownProvider(name string) bool {
 	_, hasEnv := providerEnvVars[normalized]
 	return hasAlias || hasBaseURL || hasEnv
 }
+
+// ---------------------------------------------------------------------------
+// Vision-capable model detection
+// ---------------------------------------------------------------------------
+
+// Vision-capable model patterns (case-insensitive substring match).
+// Models NOT matching any pattern will trigger a warning when images are attached.
+var visionModelPatterns = []string{
+	// Anthropic (all Claude 3+ models support vision)
+	"claude-sonnet", "claude-opus", "claude-haiku",
+	// OpenAI
+	"gpt-4o", "gpt-4-turbo", "gpt-4-vision", "o1", "o3", "o4",
+	// DeepSeek (deepseek-chat, deepseek-v*, deepseek-pro, deepseek-flash)
+	"deepseek-chat", "deepseek-v", "deepseek-pro", "deepseek-flash",
+	// GLM
+	"glm-4v", "cogview",
+	// Kimi
+	"kimi", "moonshot",
+	// Qwen
+	"qwen-vl", "qwen2-vl", "qwen2.5-vl", "qvq", "omni",
+	// Doubao
+	"doubao-1.5", "doubao-vision", "doubao-pro",
+	// Google
+	"gemini", "gemma",
+	// Others
+	"mistral", "pixtral", "llava", "phi-3-vision",
+	"llama-3.2-vision", "llama-4", "minicpm-v",
+}
+
+// IsVisionCapableModel returns true if the model name suggests vision support.
+// Returns true for empty string (assume capability if unknown).
+func IsVisionCapableModel(model string) bool {
+	if model == "" {
+		return true // assume capability if unknown
+	}
+	lower := strings.ToLower(model)
+	for _, pat := range visionModelPatterns {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}

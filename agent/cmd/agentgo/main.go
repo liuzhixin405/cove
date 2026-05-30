@@ -210,23 +210,32 @@ func main() {
 		fmt.Print(repl.PermissionPrompt(toolName, desc))
 		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
 
-		// Read answer byte-by-byte from stdin to avoid buffered reads
-		// that could consume user input meant for the next ReadLine call.
-		var answerBytes []byte
-		var b [1]byte
-		for {
-			n, err := os.Stdin.Read(b[:])
-			if err != nil || n == 0 {
-				break
+		readAnswer := func() string {
+			// Read answer byte-by-byte from stdin to avoid buffered reads
+			// that could consume user input meant for the next ReadLine call.
+			var answerBytes []byte
+			var b [1]byte
+			for {
+				n, err := os.Stdin.Read(b[:])
+				if err != nil || n == 0 {
+					break
+				}
+				if b[0] == '\n' || b[0] == '\r' {
+					break
+				}
+				answerBytes = append(answerBytes, b[0])
 			}
-			if b[0] == '\n' || b[0] == '\r' {
-				break
-			}
-			answerBytes = append(answerBytes, b[0])
+			return strings.TrimSpace(strings.ToLower(string(answerBytes)))
 		}
-		answer := strings.TrimSpace(strings.ToLower(string(answerBytes)))
+
+		answer := readAnswer()
 		if answer == "" {
-			// Empty input (e.g. user just pressed Enter) defaults to deny
+			// Some terminals may leave a stale CR/LF in stdin. Confirm once
+			// before denying to avoid accidental auto-reject.
+			fmt.Printf("\n  %s检测到空输入，请再次输入 (y/n/a):%s ", repl.Yellow, repl.Reset)
+			answer = readAnswer()
+		}
+		if answer == "" {
 			fmt.Printf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
 			return false
 		}
@@ -287,7 +296,7 @@ func main() {
 	}
 
 	if printMode && printPrompt != "" {
-		runPrintMode(eng, printPrompt, debugMode, printAttachments)
+		runPrintMode(eng, printPrompt, debugMode, printAttachments, cfg.Model)
 		return
 	}
 
@@ -601,10 +610,18 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				continue
 			}
 			cwd, _ := os.Getwd()
-			userMsg, err := buildUserMessage(input, cwd, attachedFiles)
+			userMsg, warnings, err := buildUserMessage(input, cwd, attachedFiles, cfg.Model)
 			if err != nil {
 				fmt.Printf("附件处理失败: %v\n", err)
 				continue
+			}
+			// Print warnings (e.g., non-vision model with image)
+			for _, w := range warnings {
+				fmt.Printf("  \x1b[33m%s\x1b[0m\n", w)
+			}
+			// Auto-clear attachments after sending (avoids resending images every turn)
+			if len(attachedFiles) > 0 {
+				attachedFiles = nil
 			}
 			withInterrupt(func(ctx context.Context) { runChatInteractionMessage(ctx, eng, userMsg) })
 			// Progressive onboarding: show tool progress hint on first interaction
@@ -946,7 +963,7 @@ func fuzzyMatch(input string, cmdReg *command.Registry) []string {
 	return matches
 }
 
-func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string) {
+func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string, model string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
@@ -954,10 +971,13 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 	defer signal.Stop(sigCh)
 	go func() { <-sigCh; cancel() }()
 	cwd, _ := os.Getwd()
-	userMsg, err := buildUserMessage(prompt, cwd, attachmentPaths)
+	userMsg, warnings, err := buildUserMessage(prompt, cwd, attachmentPaths, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "⚠ %s\n", w)
 	}
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil)
 	if err != nil {
