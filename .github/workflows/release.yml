@@ -13,19 +13,22 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  release:
-    name: Build & Release
+  build:
+    name: ${{ matrix.target.os }}-${{ matrix.target.arch }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target:
           - { os: windows, arch: amd64, ext: .exe, format: zip }
-          - { os: linux, arch: amd64, ext: '', format: tar.gz }
-          - { os: darwin, arch: amd64, ext: '', format: tar.gz }
-          - { os: darwin, arch: arm64, ext: '', format: tar.gz }
+          - { os: linux,   arch: amd64, ext: '',    format: tar.gz }
+          - { os: darwin,  arch: amd64, ext: '',    format: tar.gz }
+          - { os: darwin,  arch: arm64, ext: '',    format: tar.gz }
+
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
 
     steps:
       - name: Checkout code
@@ -35,80 +38,72 @@ jobs:
         id: version
         run: |
           if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+            V="v${{ inputs.version }}"
           else
-            VERSION="${GITHUB_REF#refs/tags/}"
+            V="${GITHUB_REF#refs/tags/}"
           fi
-          VERSION_PLAIN="${VERSION#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "version_plain=$VERSION_PLAIN" >> $GITHUB_OUTPUT
+          echo "tag=${V}" >> $GITHUB_OUTPUT
+          echo "plain=${V#v}" >> $GITHUB_OUTPUT
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache-dependency-path: agent/go.sum
-
-      - name: Get git commit
-        id: commit
-        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          go-version-file: agent/go.mod
+          check-latest: true
 
       - name: Build binary
-        working-directory: agent
-        env:
-          GOOS: ${{ matrix.target.os }}
-          GOARCH: ${{ matrix.target.arch }}
-          CGO_ENABLED: '0'
+        id: build
         run: |
-          BINARY_NAME="agentgo-${{ steps.version.outputs.version }}-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}"
+          NAME="agentgo-${{ steps.version.outputs.tag }}-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}"
+          cd agent
           go build \
-            -ldflags "-s -w -X main.Version=${{ steps.version.outputs.version_plain }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.GitCommit=${{ steps.commit.outputs.sha }}" \
-            -o "${BINARY_NAME}" \
+            -ldflags "-s -w -X main.Version=${{ steps.version.outputs.plain }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.GitCommit=$(git rev-parse --short HEAD)" \
+            -o "../${NAME}" \
             ./cmd/agentgo
-
-          # Package
-          if [ "${{ matrix.target.format }}" = "zip" ]; then
-            zip "agentgo-${{ steps.version.outputs.version }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip" "${BINARY_NAME}"
-            echo "artifact=agentgo-${{ steps.version.outputs.version }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip" >> $GITHUB_OUTPUT
-          else
-            tar -czf "agentgo-${{ steps.version.outputs.version }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz" "${BINARY_NAME}"
-            echo "artifact=agentgo-${{ steps.version.outputs.version }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz" >> $GITHUB_OUTPUT
-          fi
+          echo "binary=${NAME}" >> $GITHUB_OUTPUT
         shell: bash
 
-      - name: Generate checksum
-        working-directory: agent
+      - name: Package and checksum
+        id: package
         run: |
-          sha256sum "${{ steps.build.outputs.artifact }}" > "${{ steps.build.outputs.artifact }}.sha256"
+          BINARY="${{ steps.build.outputs.binary }}"
+          BASE="agentgo-${{ steps.version.outputs.tag }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+
+          if [ "${{ matrix.target.format }}" = "zip" ]; then
+            zip "${BASE}.zip" "${BINARY}"
+            ARTIFACT="${BASE}.zip"
+          else
+            tar -czf "${BASE}.tar.gz" "${BINARY}"
+            ARTIFACT="${BASE}.tar.gz"
+          fi
+
+          sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          echo "artifact=${ARTIFACT}" >> $GITHUB_OUTPUT
         shell: bash
 
-      - name: Upload build artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: |
-            agent/${{ steps.build.outputs.artifact }}
-            agent/${{ steps.build.outputs.artifact }}.sha256
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.artifact }}.sha256
           if-no-files-found: error
 
-  create-release:
+  release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: release
+    needs: build
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Determine version
         id: version
         run: |
           if [ -n "${{ inputs.version }}" ]; then
-            VERSION="v${{ inputs.version }}"
+            echo "tag=v${{ inputs.version }}" >> $GITHUB_OUTPUT
           else
-            VERSION="${GITHUB_REF#refs/tags/}"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -116,21 +111,24 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: List artifacts
+        run: find dist -type f -ls
+
       - name: Generate combined checksums
-        working-directory: dist
         run: |
-          cat *.sha256 > checksums.txt
-          rm -f *.sha256
+          find dist -name '*.sha256' -exec cat {} \; > dist/checksums.txt
+          find dist -name '*.sha256' -delete
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: agentgo ${{ steps.version.outputs.version }}
-          body_path: CHANGELOG.md
-          files: dist/*
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: agentgo ${{ steps.version.outputs.tag }}
+          files: |
+            dist/agentgo-*
+            dist/checksums.txt
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, 'rc') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.tag, 'rc') || contains(steps.version.outputs.tag, 'beta') || contains(steps.version.outputs.tag, 'alpha') }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

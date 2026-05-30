@@ -8,22 +8,23 @@ on:
 
 jobs:
   test:
-    name: Test (Go ${{ matrix.go-version }} on ${{ matrix.os }})
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: ['1.24', '1.25']
+        go-version: ['1.24', 'stable']
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go ${{ matrix.go-version }}
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
           cache-dependency-path: agent/go.sum
 
       - name: Run tests
@@ -31,7 +32,7 @@ jobs:
         run: go test -v -race -coverprofile=coverage.txt ./...
 
       - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable'
         uses: codecov/codecov-action@v4
         with:
           working-directory: agent
@@ -48,7 +49,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: stable
+          check-latest: true
           cache-dependency-path: agent/go.sum
 
       - name: golangci-lint
@@ -68,7 +70,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: stable
+          check-latest: true
           cache-dependency-path: agent/go.sum
 
       - name: Build
