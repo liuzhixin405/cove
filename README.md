@@ -1,156 +1,183 @@
-# agentgo
+<div align="center">
 
-纯 CLI 版 AI 编程助手。当前实现为单文件 Go 二进制，面向本地终端、脚本化调用与便携分发。
+# 🤖 agentgo
 
-## 安装
+**Go-powered AI Coding Assistant for the Terminal**
 
-### 方式 1：一键安装
+[![CI](https://github.com/agentgo/agentgo/actions/workflows/ci.yml/badge.svg)](https://github.com/agentgo/agentgo/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/agentgo/agentgo?include_prereleases)](https://github.com/agentgo/agentgo/releases)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/agentgo/agentgo?file=agent%2Fgo.mod)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-```powershell
-cd <repo-root>
-.\\install.bat
-```
+[English](#english) | [中文](#chinese)
 
-默认安装到：`%USERPROFILE%\.agentgo\agentgo.exe`
+</div>
 
-### 方式 2：手动构建并安装
+---
 
-```powershell
-cd agent
-go build -o $env:USERPROFILE\.agentgo\agentgo.exe ./cmd/agentgo
-```
+<a name="english"></a>
+## English
 
-然后把 `%USERPROFILE%\.agentgo` 加入 PATH。
+agentgo is a pure CLI AI programming assistant, implemented as a single-file Go binary. It runs in your terminal, supports multiple AI providers, and is designed for local development, scripting, and portable distribution.
 
-## 绿色版 / Portable
+### ✨ Features
 
-绿色版支持，且推荐用于分发：
+- 🎯 **Single Binary** — Zero dependencies, just download and run
+- 🌐 **Multi-Provider** — Anthropic, OpenAI, DeepSeek + 10+ OpenAI-compatible endpoints
+- 🖥️ **Cross-Platform** — Windows, macOS (Intel & Apple Silicon), Linux
+- 🎨 **Interactive REPL** — Rich terminal UI with 25+ slash commands
+- 🔧 **Flexible Tools** — File operations, shell commands, Git integration, web fetch
+- 🧠 **Memory & Sessions** — Persistent memory, session save/resume/export
+- 🔌 **MCP Support** — Model Context Protocol server integration (stdio + SSE)
+- 🎭 **Permission Modes** — default | plan | auto | bypass
+- 📦 **Plugin & Skills** — Extensible architecture with marketplace
+- 💰 **Cost Tracking** — Real-time token counting and cost estimation
+- 🐾 **Buddy System** — Interactive companion character with mood engine
 
-1. 运行 release 构建脚本生成压缩包
-2. 解压到任意目录
-3. 直接运行 `agentgo.exe`
-4. 如需全局命令，再手动把解压目录加入 PATH
+### 📥 Installation
 
-Windows 绿色版不依赖安装程序；解压即用。
-如果 Windows 终端里中文显示仍乱码，优先使用 Windows Terminal，并确认终端使用 UTF-8；在 cmd 中可先执行 `chcp 65001` 后再启动 `agentgo.exe`。
-新版本会在启动时尽量自动把 Windows 控制台输入/输出代码页切到 UTF-8；如果启动后仍看到控制台代码页提醒，请先在同一个窗口执行 `chcp 65001`，再重新启动。
+#### Download Pre-built Binary
 
-### 本地生成 release
+Go to [Releases](https://github.com/agentgo/agentgo/releases) and download the archive for your platform:
+
+| Platform | File |
+|----------|------|
+| Windows (amd64) | `agentgo-v*-windows-amd64.zip` |
+| macOS (Intel) | `agentgo-v*-darwin-amd64.tar.gz` |
+| macOS (Apple Silicon) | `agentgo-v*-darwin-arm64.tar.gz` |
+| Linux (amd64) | `agentgo-v*-linux-amd64.tar.gz` |
+
+Extract and run:
 
 ```bash
-python scripts/release_build.py v1.0.1
+# macOS / Linux
+tar -xzf agentgo-v*-linux-amd64.tar.gz
+./agentgo
+
+# Windows (PowerShell)
+Expand-Archive agentgo-v*-windows-amd64.zip -DestinationPath .
+.\agentgo.exe
 ```
 
-产物输出到：
+Optionally, add to your `PATH` for global access.
 
-- `dist/v1.0.1/agentgo-v1.0.1-windows-amd64.zip`
-- `dist/v1.0.1/agentgo-v1.0.1-linux-amd64.tar.gz`
-- `dist/v1.0.1/agentgo-v1.0.1-darwin-amd64.tar.gz`
-- `dist/v1.0.1/agentgo-v1.0.1-darwin-arm64.tar.gz`
-- `dist/v1.0.1/checksums.txt`
-
-### 校验发布包
+#### Build from Source
 
 ```bash
-certutil -hashfile dist\v1.0.1\agentgo-v1.0.1-windows-amd64.zip SHA256
+git clone https://github.com/agentgo/agentgo.git
+cd agentgo/agent
+go build -o agentgo ./cmd/agentgo
+./agentgo --version
 ```
 
-或对照 `checksums.txt` 进行校验。
+Requires Go 1.24+.
 
-## 使用
+#### Local Release Build
 
-```powershell
-agentgo                     # 交互 REPL
-agentgo -p "创建贪吃蛇 HTML"  # 单次执行
-agentgo --version           # 查看版本
-agentgo --doctor            # 诊断
-agentgo --config            # 查看配置
-agentgo --debug             # 调试模式
+```bash
+python scripts/release_build.py v2.0.0
 ```
 
-首次进入 REPL 时，若未配置 API key，程序会按“当前厂商 -> 对应环境变量 -> 常见兼容厂商示例”的顺序给出提示。
+Artifacts are output to `dist/v2.0.0/`.
 
-最简单的配置方式：
+### 🚀 Quick Start
 
-- 在当前 REPL 直接执行 `/api-key <key>`
-- 或在启动前设置环境变量，然后用 `/config` 确认 `api_key_set: true`
+```bash
+# Interactive REPL
+agentgo
 
-内置 provider：
+# One-shot query
+agentgo -p "Create a snake game in HTML"
 
-- 原生：`anthropic`、`deepseek`、`openai`
-- 兼容 OpenAI：`openai-compatible`、`glm`、`kimi`、`qwen`、`doubao`、`openrouter`、`siliconflow`、`groq`、`together`、`fireworks`、`xai`、`mistral`
+# View version
+agentgo --version
 
-常见环境变量示例：
-
-- `ANTHROPIC_API_KEY`
-- `DEEPSEEK_API_KEY`
-- `OPENAI_API_KEY`
-- `GLM_API_KEY` / `ZHIPU_API_KEY`
-- `KIMI_API_KEY` / `MOONSHOT_API_KEY`
-- `QWEN_API_KEY` / `DASHSCOPE_API_KEY`
-- `DOUBAO_API_KEY` / `ARK_API_KEY`
-- `OPENROUTER_API_KEY`
-- `SILICONFLOW_API_KEY`
-- 通用回退：`LLM_API_KEY`
-- 自定义兼容接口地址：`LLM_BASE_URL`
-
-## 常用 REPL 命令
-
-
-| 命令               | 说明                                               |
-| ------------------ | -------------------------------------------------- |
-| `/model <name>`    | 切换模型                                           |
-| `/provider <name>` | 切换 Provider                                      |
-| `/api-key <key>`   | 保存 API Key 到配置；无 key 时 REPL 也会提示此命令 |
-| `/base-url <url>`  | 自定义 API 端点                                    |
-| `/mode <mode>`     | 权限模式：`default|plan|auto|bypass`               |
-| `/budget <amount>` | 设置会话预算上限                                   |
-| `/cost`            | 查看 token 用量和费用                              |
-| `/config`          | 查看完整配置                                       |
-| `/system <prompt>` | 自定义系统提示词                                   |
-| `/cd <path>`       | 切换工作目录                                       |
-| `/context`         | 查看当前上下文                                     |
-| `/compact`         | 压缩对话历史                                       |
-| `/resume [id]`     | 列出/恢复已保存会话                                |
-| `/memory [add      | list]`                                             |
-| `/commit [msg]`    | git add + commit                                   |
-| `/review`          | 查看工作区变化                                     |
-| `/diff`            | git diff                                           |
-| `/doctor`          | 系统诊断                                           |
-| `/mcp`             | MCP 服务器管理                                     |
-| `/plugin`          | 插件管理                                           |
-| `/skills`          | 技能列表                                           |
-| `/export`          | 导出对话                                           |
-| `/help`            | 帮助                                               |
-| `/exit`            | 退出                                               |
-
-## 配置
-
-### 环境变量
-
-```powershell
-$env:LLM_API_KEY = "sk-xxx"
-$env:LLM_BASE_URL = "https://..."
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-$env:DEEPSEEK_API_KEY = "sk-..."
-$env:OPENAI_API_KEY = "sk-..."
+# System diagnostics
+agentgo --doctor
 ```
 
-### 用户级配置文件
+On first run, agentgo will guide you through API key setup. You can also set it directly:
 
-路径：`~/.agentgo/config.json`
+```bash
+# In REPL
+/api-key sk-your-key-here
+
+# Or via environment variable
+export DEEPSEEK_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+```
+
+### 🌍 Supported Providers
+
+| Provider | Type | Environment Variable |
+|----------|------|---------------------|
+| **Anthropic** | Native | `ANTHROPIC_API_KEY` |
+| **OpenAI** | Native | `OPENAI_API_KEY` |
+| **DeepSeek** | Native | `DEEPSEEK_API_KEY` |
+| **GLM (智谱)** | Compatible | `GLM_API_KEY` / `ZHIPU_API_KEY` |
+| **Kimi (月之暗面)** | Compatible | `KIMI_API_KEY` / `MOONSHOT_API_KEY` |
+| **Qwen (通义千问)** | Compatible | `QWEN_API_KEY` / `DASHSCOPE_API_KEY` |
+| **Doubao (豆包)** | Compatible | `DOUBAO_API_KEY` / `ARK_API_KEY` |
+| **OpenRouter** | Compatible | `OPENROUTER_API_KEY` |
+| **SiliconFlow** | Compatible | `SILICONFLOW_API_KEY` |
+| **Groq** | Compatible | `GROQ_API_KEY` |
+| **Together** | Compatible | `TOGETHER_API_KEY` |
+| **Fireworks** | Compatible | `FIREWORKS_API_KEY` |
+| **xAI (Grok)** | Compatible | `XAI_API_KEY` |
+| **Mistral** | Compatible | `MISTRAL_API_KEY` |
+| **Custom** | Compatible | `LLM_API_KEY` + `LLM_BASE_URL` |
+
+### ⌨️ REPL Commands
+
+| Command | Description |
+|---------|-------------|
+| `/model <name>` | Switch AI model |
+| `/provider <name>` | Switch provider |
+| `/api-key <key>` | Set API key |
+| `/base-url <url>` | Custom API endpoint |
+| `/mode <mode>` | Permission mode: `default\|plan\|auto\|bypass` |
+| `/budget <amount>` | Set session budget cap ($) |
+| `/cost` | View token usage & cost |
+| `/config` | View full configuration |
+| `/system <prompt>` | Custom system prompt |
+| `/cd <path>` | Change working directory |
+| `/context` | View current context |
+| `/compact` | Compress conversation history |
+| `/resume [id]` | List or resume saved sessions |
+| `/memory [add\|list]` | Manage persistent memory |
+| `/commit [msg]` | Git add + commit |
+| `/review` | Review working changes |
+| `/diff` | Show git diff |
+| `/doctor` | System diagnostics |
+| `/mcp` | MCP server management |
+| `/plugin` | Plugin management |
+| `/skills` | Skill listing |
+| `/export` | Export conversation |
+| `/help` | Show help |
+| `/exit` | Exit REPL |
+
+### ⚙️ Configuration
+
+Configuration is read from three tiers (lowest to highest priority):
+
+1. **Environment Variables** — `LLM_API_KEY`, `LLM_BASE_URL`, provider-specific keys
+2. **User Config** — `~/.agentgo/config.json`
+3. **Project Config** — `.agentgo.json` in project root
+
+Example `~/.agentgo/config.json`:
 
 ```json
 {
   "model": "deepseek-v4-pro",
   "provider": {
     "name": "deepseek",
-    "api_key": "***"
+    "api_key": "sk-***"
   },
   "permission_mode": "default",
   "max_budget_usd": 10,
   "thinking_tokens": 16000,
-  "system_prompt": "",
   "mcp_servers": {
     "filesystem": {
       "command": "npx",
@@ -161,57 +188,122 @@ $env:OPENAI_API_KEY = "sk-..."
 }
 ```
 
-### 项目级覆盖
-
-项目根目录可创建 `.agentgo.json`，覆盖 model、permission_mode、budget、system_prompt、mcp_servers。
-
-## 目录结构
+### 📂 Project Structure
 
 ```text
-agent/
-├── cmd/
-│   └── agentgo/main.go
-├── internal/
-│   ├── agent/
-│   ├── api/
-│   ├── command/
-│   ├── config/
-│   ├── context/
-│   ├── cost/
-│   ├── engine/
-│   ├── hooks/
-│   ├── mcp/
-│   ├── memory/
-│   ├── permission/
-│   ├── plugin/
-│   ├── session/
-│   ├── skills/
-│   ├── state/
-│   └── tool/
-├── docs/
-├── go.mod
-└── README.md
+agentgo/
+├── .github/            # GitHub CI/CD, templates
+│   └── workflows/      # CI & Release workflows
+├── agent/              # Go source code
+│   ├── cmd/agentgo/    # Entry point
+│   └── internal/       # 25+ internal packages
+├── dist/               # Release artifacts
+├── scripts/            # Build & test scripts
+├── CHANGELOG.md        # Release history
+├── CONTRIBUTING.md     # Contribution guide
+├── LICENSE             # MIT License
+└── README.md           # This file
 ```
 
-## 构建与验证
+### 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+### 📄 License
+
+MIT — see [LICENSE](LICENSE) for details.
+
+---
+
+<a name="chinese"></a>
+## 中文
+
+agentgo 是一个纯 CLI 的 AI 编程助手，以单文件 Go 二进制形式发布。它运行在终端中，支持多种 AI 提供商，专为本地开发、脚本调用和便携分发而设计。
+
+### ✨ 特性
+
+- 🎯 **单文件二进制** — 零依赖，下载即用
+- 🌐 **多提供商** — Anthropic、OpenAI、DeepSeek 及 10+ 个兼容接口
+- 🖥️ **跨平台** — Windows、macOS (Intel & Apple Silicon)、Linux
+- 🎨 **交互式 REPL** — 丰富的终端界面，25+ 个斜杠命令
+- 🔧 **灵活工具集** — 文件操作、shell 命令、Git 集成、网页抓取
+- 🧠 **记忆与会话** — 持久化记忆、会话保存/恢复/导出
+- 🔌 **MCP 支持** — Model Context Protocol 服务器集成 (stdio + SSE)
+- 🎭 **权限模式** — default | plan | auto | bypass
+- 📦 **插件与技能** — 可扩展架构，内置市场
+- 💰 **费用追踪** — 实时 token 计数和成本估算
+- 🐾 **伙伴系统** — 带情绪引擎的交互式伙伴角色
+
+### 📥 安装
+
+#### 下载预编译二进制
+
+前往 [Releases](https://github.com/agentgo/agentgo/releases) 下载对应平台的压缩包：
+
+| 平台 | 文件 |
+|------|------|
+| Windows (amd64) | `agentgo-v*-windows-amd64.zip` |
+| macOS (Intel) | `agentgo-v*-darwin-amd64.tar.gz` |
+| macOS (Apple Silicon) | `agentgo-v*-darwin-arm64.tar.gz` |
+| Linux (amd64) | `agentgo-v*-linux-amd64.tar.gz` |
+
+解压运行：
 
 ```bash
-cd agent
-go test ./...
-go build -o agentgo.exe ./cmd/agentgo/
-./agentgo.exe --version
-printf '/plugin list\n/exit\n' | ./agentgo.exe
+# macOS / Linux
+tar -xzf agentgo-v*-linux-amd64.tar.gz
+./agentgo
+
+# Windows (PowerShell)
+Expand-Archive agentgo-v*-windows-amd64.zip -DestinationPath .
+.\agentgo.exe
 ```
 
-## 发布
+建议将程序目录添加到 `PATH` 以便全局使用。
 
-GitHub Actions 发布入口：`.github/workflows/release.yml`
+#### 从源码构建
 
-支持：
+```bash
+git clone https://github.com/agentgo/agentgo.git
+cd agentgo/agent
+go build -o agentgo ./cmd/agentgo
+./agentgo --version
+```
 
-- 推送 tag：`v*`
-- 手动触发 workflow_dispatch
+需要 Go 1.24+。
 
-## 说明
+### 🚀 快速开始
 
-本目录是一个独立的 Go 实现与交付链路实验区，当前品牌、配置目录、构建入口、发布产物均统一为 `agentgo`。
+```bash
+# 交互式 REPL
+agentgo
+
+# 单次查询
+agentgo -p "创建一个贪吃蛇 HTML 游戏"
+
+# 查看版本
+agentgo --version
+
+# 系统诊断
+agentgo --doctor
+```
+
+首次运行时，agentgo 会引导你配置 API key。也可以直接设置：
+
+```bash
+# 在 REPL 中
+/api-key sk-your-key-here
+
+# 或通过环境变量
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+### 📄 许可证
+
+MIT — 详见 [LICENSE](LICENSE)。
+
+### ⭐ Star History
+
+如果这个项目对你有帮助，请给我们一个 Star ⭐！
+
+[![Star History Chart](https://api.star-history.com/svg?repos=agentgo/agentgo&type=Date)](https://star-history.com/#agentgo/agentgo&Date)

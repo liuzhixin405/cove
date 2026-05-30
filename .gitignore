@@ -1,20 +1,38 @@
+# Project-specific generated files
 生成.txt
 项目分析.md
+rewrite.md
+agent/agentgo.rar
+
+# Build output
 /dist
+agent/agentgo.exe
+agent/*.exe
+agent/*.exe~
+
+# Python
 /scripts/__pycache__
 /scripts/venv
+/scripts/*.pyc
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor
 /.vscode
 /.idea
 /.pytest_cache
 /.mypy_cache
 /.coverage
 /.cache
-/.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
-*.pyc
-*.pyo
-*.pyd       
-agent/agentgo.exe
-agent/agentgo.exe~
-rewrite.md
-agent/agentgo.rar
+
+# Go
+agent/coverage.txt
+agent/*.test
