@@ -212,6 +212,29 @@ func TestApplyProviderConfigChangeTrimsModelAndProviderValues(t *testing.T) {
 	}
 }
 
+func TestApplyProviderConfigChangeResolvesAutoModelForDeepSeek(t *testing.T) {
+	reloader := &stubProviderReloader{}
+	cfg := &config.Config{}
+
+	err := applyProviderConfigChange(cfg, reloader, func() error {
+		cfg.Model = "auto"
+		cfg.Provider.Name = "deepseek"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("applyProviderConfigChange returned error: %v", err)
+	}
+	if got, want := cfg.Model, "deepseek-v4-pro"; got != want {
+		t.Fatalf("cfg.Model = %q, want %q", got, want)
+	}
+	if len(reloader.calls) != 1 {
+		t.Fatalf("expected one reload call, got %d", len(reloader.calls))
+	}
+	if got, want := reloader.calls[0].model, "deepseek-v4-pro"; got != want {
+		t.Fatalf("reload model = %q, want %q", got, want)
+	}
+}
+
 func TestKnownProviderValidation(t *testing.T) {
 	if !api.IsKnownProvider("deepseek") {
 		t.Fatalf("expected deepseek to be a known provider")

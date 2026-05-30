@@ -90,8 +90,8 @@ func (lr *LineReader) ReadLine() (string, error) {
 					suggestions := lr.completer(line)
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
 						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
-					} else if line == "/" && len(suggestions) > 10 {
-						fmt.Print("  \x1b[90m(按 Tab 列出可用命令)\x1b[0m")
+					} else if len(suggestions) > 10 {
+						fmt.Printf("  \x1b[90m(按 Tab 列出 %d 个命令)\x1b[0m", len(suggestions))
 						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}
@@ -114,8 +114,8 @@ func (lr *LineReader) ReadLine() (string, error) {
 					suggestions := lr.completer(line)
 					if len(suggestions) > 0 && len(suggestions) <= 10 {
 						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
-					} else if line == "/" && len(suggestions) > 10 {
-						fmt.Print("  \x1b[90m(按 Tab 列出可用命令)\x1b[0m")
+					} else if len(suggestions) > 10 {
+						fmt.Printf("  \x1b[90m(按 Tab 列出 %d 个命令)\x1b[0m", len(suggestions))
 						fmt.Printf("\r\x1b[%dC", lr.promptWidth+cursor)
 					}
 				}
@@ -190,7 +190,12 @@ func (lr *LineReader) redraw(buf []rune, cursor int) {
 func (lr *LineReader) showInlineSuggestions(suggestions []string, cursorOffset int) {
 	fmt.Print("  \x1b[90m")
 	for _, s := range suggestions {
-		fmt.Print(s + "  ")
+		// Only show command name in inline hints (before \t)
+		if idx := strings.IndexByte(s, '\t'); idx >= 0 {
+			fmt.Print(s[:idx] + "  ")
+		} else {
+			fmt.Print(s + "  ")
+		}
 	}
 	fmt.Print("\x1b[0m")
 	fmt.Printf("\r\x1b[%dC", cursorOffset)
@@ -231,22 +236,38 @@ func (lr *LineReader) complete(buf *[]rune, cursor *int) {
 	if len(suggestions) == 0 {
 		return
 	}
+	// Extract command text (before \t if annotated)
+	texts := make([]string, len(suggestions))
+	for i, s := range suggestions {
+		if idx := strings.IndexByte(s, '\t'); idx >= 0 {
+			texts[i] = s[:idx]
+		} else {
+			texts[i] = s
+		}
+	}
 	if len(suggestions) == 1 {
-		*buf = []rune(suggestions[0])
+		*buf = []rune(texts[0])
 		*cursor = len(*buf)
 		lr.redraw(*buf, *cursor)
 		return
 	}
-	common := commonPrefix(suggestions)
+	common := commonPrefix(texts)
 	if len(common) > len(line) {
 		*buf = []rune(common)
 		*cursor = len(*buf)
 		lr.redraw(*buf, *cursor)
 		return
 	}
+	// Display all suggestions with descriptions
 	fmt.Print("\r\n")
 	for _, s := range suggestions {
-		fmt.Printf("  %s\r\n", s)
+		if idx := strings.IndexByte(s, '\t'); idx >= 0 {
+			name := s[:idx]
+			desc := s[idx+1:]
+			fmt.Printf("  \x1b[36m%-18s\x1b[0m \x1b[90m%s\x1b[0m\r\n", name, desc)
+		} else {
+			fmt.Printf("  %s\r\n", s)
+		}
 	}
 	lr.redraw(*buf, *cursor)
 }

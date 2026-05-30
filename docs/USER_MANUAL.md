@@ -1,7 +1,7 @@
 # AgentGo 完整使用手册
 
-> **版本**: 1.0.0  
-> **最后更新**: 2026-05-29
+> **版本**: 2.1.0
+> **最后更新**: 2026-05-30
 
 ---
 
@@ -32,6 +32,8 @@
 23. [提示缓存与速率限制](#23-提示缓存与速率限制)
 24. [文件与目录结构](#24-文件与目录结构)
 25. [高级用法与技巧](#25-高级用法与技巧)
+26. [诊断系统](#26-诊断系统)
+27. [稳定性保障](#27-稳定性保障)
 
 ---
 
@@ -243,6 +245,7 @@ agentgo --doctor
 | `/permissions` | 查看当前权限设置 | `/permissions` |
 | `/buddy` | 与编程伙伴互动 | `/buddy pet` |
 | `/doctor` | 系统诊断 | `/doctor` |
+| `/diagnose [模式]` | 结构化诊断: full/quick/codes | `/diagnose full` |
 
 ---
 
@@ -1194,6 +1197,12 @@ echo "解释这段代码" | agentgo -p -
 
 ## 附录 A: 故障排查
 
+### 一键诊断
+
+```bash
+/diagnose full    # 运行全部检查，自动修复可修复的问题
+```
+
 ### API Key 无效
 
 ```bash
@@ -1238,5 +1247,164 @@ git --version
 记忆:  /memory /dream /skills
 插件:  /plugin list|install|search|refresh|update|enable|disable|uninstall
 MCP:   /mcp list|connect|disconnect|read
-其他:  /help /exit /debug /system /permissions /buddy /doctor
+诊断:  /doctor /diagnose full|quick|codes
+其他:  /help /exit /debug /system /permissions /buddy
+```
+
+---
+
+## 26. 诊断系统
+
+### 26.1 概述
+
+AgentGo 内置了结构化诊断系统，可以自动检测和修复常见问题。诊断系统使用 30+ 个错误码，覆盖配置、API、网络、模型、Shell 和数据目录等六大类问题。
+
+### 26.2 启动自检
+
+程序启动时自动运行 `QuickCheck`，快速检测关键问题：
+- 配置文件是否存在且可读
+- API Key 是否配置
+- 模型名称是否合法
+
+发现问题时会以结构化格式输出错误码和修复建议，**不会阻断启动流程**。
+
+### 26.3 使用方式
+
+```bash
+# 在 REPL 中
+/diagnose           # 等同于 /diagnose full
+/diagnose full      # 运行全部 9 项检查
+/diagnose quick     # 仅运行关键检查（更快）
+/diagnose codes     # 列出所有已知错误码和修复方法
+
+# 命令行
+agentgo --doctor    # 等同于 /diagnose full
+```
+
+### 26.4 错误码分类
+
+| 范围 | 类别 | 说明 |
+|------|------|------|
+| E1001-E1099 | CONFIG | 配置文件问题（不存在、解析失败、权限错误） |
+| E2001-E2099 | API | API 密钥问题（未配置、格式错误、过期） |
+| E3001-E3099 | NETWORK | 网络连通性问题（超时、DNS、代理） |
+| E4001-E4099 | MODEL | 模型相关问题（不存在、不支持、名称错误） |
+| E5001-E5099 | SHELL | Shell 工具问题（git/rg 未安装、权限不足） |
+| E6001-E6099 | DATA | 数据目录问题（磁盘满、路径不存在、写入失败） |
+
+### 26.5 输出格式
+
+```
+[E2001] API_KEY_MISSING (严重)
+  API 密钥未配置
+  详情: provider "deepseek" 未找到有效的 API Key
+  修复: 使用 /api-key 命令设置，或设置环境变量 DEEPSEEK_API_KEY
+  ✓ 可自动修复，立即生效
+```
+
+每个诊断条目包含：
+- **错误码**: 唯一标识符，方便搜索和引用
+- **严重级别**: `critical`（阻断）| `warning`（影响体验）| `info`（建议）
+- **修复建议**: 具体的操作步骤
+- **热修复标记**: 标记为"可自动修复"的问题会尝试自动修复，修复后**立即生效**，无需重启程序
+
+### 26.6 9 项检查清单
+
+| 序号 | 检查项 | 说明 |
+|------|--------|------|
+| 1 | 配置文件存在性 | `~/.agentgo/config.json` 是否存在且可解析 |
+| 2 | API Key 有效性 | 当前 provider 是否配置了密钥 |
+| 3 | 模型名称校验 | 模型名是否在已知列表中（或为 "auto"） |
+| 4 | 网络连通性 | 能否访问当前 provider 的 API 端点 |
+| 5 | Shell 工具 | git、ripgrep 是否已安装 |
+| 6 | 数据目录 | `~/.agentgo/` 目录是否可写 |
+| 7 | 磁盘空间 | 数据目录所在分区是否有足够空间 |
+| 8 | 会话完整性 | 历史会话文件是否可正常加载 |
+| 9 | 提供商配置 | base_url 格式是否正确 |
+
+### 26.7 热修复 (HotFix)
+
+所有标记为 `HotFixable` 的问题在修复后**立即在当前进程中生效**，不需要重启 exe。
+
+可自动修复的场景：
+- 配置文件不存在 → 自动创建默认配置
+- 数据目录不存在 → 自动创建
+- 模型名设为 "auto" → 自动根据 provider 选择默认模型
+
+---
+
+## 27. 稳定性保障
+
+### 27.1 概述
+
+AgentGo 针对以下关键场景做了防护，确保不会出现卡死、崩溃等问题：
+
+### 27.2 已防护的场景
+
+| 场景 | 问题描述 | 防护措施 |
+|------|----------|----------|
+| 权限提示卡死 | `fmt.Scanln` 在某些终端下永久阻塞 | 改用 `bufio.Scanner`，空输入默认拒绝 |
+| 工具 panic 崩溃 | 单个工具的 panic 导致整个进程退出 | 所有工具 goroutine 包裹 `recover()`，panic 转为错误返回 |
+| Ctrl+C 无响应 | 引擎循环不检查 context 取消 | 每轮迭代开头检查 `ctx.Err()`，立即退出 |
+| 动画指示器泄漏 | `WalkingIndicator.Stop()` 异步导致 goroutine 泄漏 | 使用 `doneCh` 同步等待 goroutine 完成 |
+| 后台任务 panic | `runTurnEndPipeline` 中的 goroutine panic | 所有 `go` 调用包裹 `defer recover()` |
+| PermissionPrompt 未设置 | 权限回调为 nil 时调用导致 nil panic | nil 检查，默认拒绝 |
+
+### 27.3 测试覆盖
+
+引擎核心流程有 16 个集成测试用例，覆盖所有关键路径：
+
+```bash
+go test -v ./internal/engine/ -run "TestEngine"
+```
+
+测试矩阵：
+
+| 测试 | 验证内容 |
+|------|----------|
+| BasicMessageFlow | 正常消息收发流程 |
+| ContextCancellation | 超时/Ctrl+C 中断 |
+| ToolExecution | 工具调用完整流程 |
+| PermissionDenied | 用户拒绝权限 |
+| PermissionPromptNil | 权限回调未设置不卡死 |
+| ToolPanicRecovery | 工具 panic 不崩溃 |
+| APIError | API 错误正常返回 |
+| MultipleIterations | 多轮工具调用 |
+| CancelMidIteration | 工具执行中途取消 |
+| EmptyToolCalls | 空工具调用列表 |
+| PermissionAllowed | 用户批准权限 |
+| StreamDeltas | 流式输出回调 |
+| UnknownToolName | 不存在的工具名 |
+| ParallelToolExecution | 并行工具执行 |
+| AutoPermissionMode | auto 模式跳过确认 |
+
+### 27.4 错误恢复策略
+
+| 错误类型 | 恢复策略 |
+|----------|----------|
+| API 超时 | 指数退避重试 3 次 |
+| API 429 限流 | Multi-Key 自动轮转下一个 key |
+| 工具连续失败 | 护栏系统: 2次警告，5次阻断 |
+| 磁盘写入失败 | 降级到内存模式继续运行 |
+| MCP 连接失败 | 30 秒超时，跳过该服务器继续 |
+| 解析响应失败 | 返回原始文本，不崩溃 |
+
+### 27.5 验证方式
+
+确认程序稳定性的推荐步骤：
+
+```bash
+cd agent/
+
+# 1. 运行全量单元测试
+go test ./...
+
+# 2. 运行引擎集成测试（覆盖所有卡流程场景）
+go test -v -timeout 60s ./internal/engine/ -run "TestEngine"
+
+# 3. 静态分析
+go vet ./...
+
+# 4. 启动诊断
+agentgo --doctor
 ```

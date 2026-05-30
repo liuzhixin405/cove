@@ -12,14 +12,23 @@ type ToolCall struct {
 	Input map[string]any `json:"input"`
 }
 
+type MessagePart struct {
+	Type     string `json:"type"` // text | image | file
+	Text     string `json:"text,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Data     string `json:"data,omitempty"` // base64 payload for image/file parts
+	FileName string `json:"file_name,omitempty"`
+}
+
 type Message struct {
-	Role             string     `json:"role"`
-	Content          string     `json:"content,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
-	CacheControl     string     `json:"cache_control,omitempty"` // Anthropic prompt caching
+	Role             string        `json:"role"`
+	Content          string        `json:"content,omitempty"`
+	Parts            []MessagePart `json:"parts,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	CacheControl     string        `json:"cache_control,omitempty"` // Anthropic prompt caching
 }
 
 type ToolDef struct {

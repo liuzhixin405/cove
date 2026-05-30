@@ -104,3 +104,27 @@ func TestAnthropicChatStreamReturnsDecodeErrorForBrokenSSEPayload(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestAnthropicConvertMessagesSupportsImageParts(t *testing.T) {
+	p := &anthropicProvider{}
+	msgs := p.convertMessages([]Message{{
+		Role: "user",
+		Parts: []MessagePart{
+			{Type: "text", Text: "请描述这张图"},
+			{Type: "image", MimeType: "image/jpeg", Data: "aGVsbG8="},
+		},
+	}})
+
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if len(msgs[0].Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(msgs[0].Content))
+	}
+	if got := msgs[0].Content[1].Type; got != "image" {
+		t.Fatalf("second block type = %q, want image", got)
+	}
+	if got := msgs[0].Content[1].Source["media_type"]; got != "image/jpeg" {
+		t.Fatalf("media_type = %#v, want image/jpeg", got)
+	}
+}

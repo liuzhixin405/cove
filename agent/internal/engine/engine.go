@@ -339,11 +339,18 @@ func (e *Engine) Run(ctx context.Context, userMessage string) (string, error) {
 }
 
 func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta func(delta string)) (string, error) {
+	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Content: userMessage}, onDelta)
+}
+
+func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string)) (string, error) {
 	if e.costTracker.OverBudget() {
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
 	}
 
-	e.messages = append(e.messages, api.Message{Role: "user", Content: userMessage})
+	if userMessage.Role == "" {
+		userMessage.Role = "user"
+	}
+	e.messages = append(e.messages, userMessage)
 	e.saveSession()
 
 	// Cache system prompt and tool defs across iterations (stable within a run)
@@ -351,6 +358,10 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 	toolDefs := e.buildAPIToolDefs()
 
 	for iter := 0; iter < MaxIterations; iter++ {
+		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
 			iter, len(e.messages), e.totalTokens, len(toolDefs), e.config.Model, e.costTracker.Summary())
 
@@ -464,6 +475,11 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 					wg.Add(1)
 					go func(idx int, tcall api.ToolCall) {
 						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: fmt.Sprintf("Error: tool panicked: %v", r)}
+							}
+						}()
 						res := e.executeTool(ctx, tcall)
 						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: res}
 					}(i, tc)
@@ -1070,13 +1086,22 @@ func (e *Engine) runTurnEndPipeline() {
 	msgs := e.messages // capture snapshot
 
 	// Session notes flush (background, no API cost)
-	go e.sessionNotes.Flush()
+	go func() {
+		defer func() { recover() }()
+		e.sessionNotes.Flush()
+	}()
 
 	// Dream consolidation (background, conditional)
-	go e.dreamRunner.ExecuteAutoDream(context.Background())
+	go func() {
+		defer func() { recover() }()
+		e.dreamRunner.ExecuteAutoDream(context.Background())
+	}()
 
 	// Background review for auto memory/skill learning
-	go e.backgroundReview()
+	go func() {
+		defer func() { recover() }()
+		e.backgroundReview()
+	}()
 
 	// Only run API-calling features if autoExtract is enabled
 	if !e.autoExtract {
@@ -1084,11 +1109,15 @@ func (e *Engine) runTurnEndPipeline() {
 	}
 
 	// Memory extraction (background)
-	go e.extractRunner.Extract(context.Background(), msgs)
+	go func() {
+		defer func() { recover() }()
+		e.extractRunner.Extract(context.Background(), msgs)
+	}()
 
 	// Suggestions: run in background to avoid blocking the REPL input loop.
 	// Results are available via Suggestions() for display on next prompt.
 	go func() {
+		defer func() { recover() }()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		sug := e.suggestRunner.Generate(ctx, msgs)

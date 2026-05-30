@@ -16,6 +16,10 @@
 
 ---
 
+> **📖 [完整用户手册 / Full User Manual](docs/USER_MANUAL.md)** | **[文档中心 / Docs](docs/)**
+
+---
+
 <a name="english"></a>
 ## English
 
@@ -151,6 +155,7 @@ export OPENAI_API_KEY="sk-..."
 | `/review` | Review working changes |
 | `/diff` | Show git diff |
 | `/doctor` | System diagnostics |
+| `/diagnose [mode]` | Structured diagnostics: `full\|quick\|codes` |
 | `/mcp` | MCP server management |
 | `/plugin` | Plugin management |
 | `/skills` | Skill listing |
@@ -192,12 +197,10 @@ Example `~/.agentgo/config.json`:
 
 ```text
 agentgo/
-├── .github/            # GitHub CI/CD, templates
-│   └── workflows/      # CI & Release workflows
-├── agent/              # Go source code
-│   ├── cmd/agentgo/    # Entry point
+├── agent/              # Go source code (single module)
+│   ├── cmd/agentgo/    # CLI entry point
 │   └── internal/       # 25+ internal packages
-├── dist/               # Release artifacts
+├── docs/               # User manual & documentation
 ├── scripts/            # Build & test scripts
 ├── CHANGELOG.md        # Release history
 ├── CONTRIBUTING.md     # Contribution guide

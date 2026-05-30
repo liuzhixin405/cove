@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/agentgo/internal/config"
 	ctxt "github.com/agentgo/internal/context"
 	"github.com/agentgo/internal/cost"
+	"github.com/agentgo/internal/diagnostic"
 	"github.com/agentgo/internal/engine"
 	"github.com/agentgo/internal/hooks"
 	"github.com/agentgo/internal/log"
@@ -57,6 +59,7 @@ func main() {
 	args := os.Args[1:]
 	debugMode, printMode := false, false
 	var printPrompt string
+	var printAttachments []string
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -87,6 +90,11 @@ func main() {
 				printPrompt = args[i]
 			}
 			printMode = true
+		case "--image", "--file":
+			if i+1 < len(args) {
+				i++
+				printAttachments = append(printAttachments, args[i])
+			}
 		case "-r", "--resume":
 			if i+1 < len(args) {
 				i++
@@ -190,7 +198,7 @@ func main() {
 			if p, ok := input["filePath"].(string); ok {
 				desc = p
 			}
-		case "bash":
+		case "bash", "powershell":
 			if cmd, ok := input["command"].(string); ok {
 				if len(cmd) > 80 {
 					cmd = cmd[:80] + "..."
@@ -203,9 +211,17 @@ func main() {
 		fmt.Print(repl.PermissionPrompt(toolName, desc))
 		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
 
+		// Use a fresh buffered reader on stdin to avoid conflicts with raw-mode reader
+		scanner := bufio.NewScanner(os.Stdin)
 		var answer string
-		fmt.Scanln(&answer)
-		answer = strings.TrimSpace(strings.ToLower(answer))
+		if scanner.Scan() {
+			answer = strings.TrimSpace(strings.ToLower(scanner.Text()))
+		}
+		if answer == "" {
+			// Empty input (e.g. user just pressed Enter) defaults to deny
+			fmt.Printf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
+			return false
+		}
 		switch answer {
 		case "y", "yes":
 			return true
@@ -246,6 +262,15 @@ func main() {
 		}
 	}
 
+	// Startup diagnostic: quick check for critical issues
+	if issues := diagnostic.QuickCheck(cfg); len(issues) > 0 {
+		fmt.Fprintf(os.Stderr, "\n\x1b[33m⚠ 启动诊断发现问题:\x1b[0m\n")
+		for _, issue := range issues {
+			fmt.Fprintf(os.Stderr, "  %s\n", issue.Format())
+		}
+		fmt.Fprintf(os.Stderr, "  \x1b[2m运行 /diagnose 获取完整报告\x1b[0m\n\n")
+	}
+
 	printBanner(cfg, appState, projCtx, permMgr, eng)
 
 	if dumpPrompt {
@@ -254,7 +279,7 @@ func main() {
 	}
 
 	if printMode && printPrompt != "" {
-		runPrintMode(eng, printPrompt, debugMode)
+		runPrintMode(eng, printPrompt, debugMode, printAttachments)
 		return
 	}
 
@@ -324,6 +349,7 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewDreamCmd())
 	r.Register(command.NewBuddyCmd())
 	r.Register(command.NewInitCmd())
+	r.Register(command.NewDiagnoseCmd())
 	return r
 }
 
@@ -369,9 +395,12 @@ func withInterrupt(f func(ctx context.Context)) {
 func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
 
 	allCommands := buildCommandList(cmdReg, toolReg)
+	// Build skill description map (short descriptions, not full prompts)
+	skillDescs := buildSkillDescs(skillMgr)
 	reader := repl.New(func(input string) []string {
-		return complete(input, allCommands, eng.Runtime().SkillPrompts)
+		return complete(input, allCommands, skillDescs)
 	})
+	var attachedFiles []string
 
 	// Start buddy proactive idle chat listener
 	if eng.BuddyDisplay != nil {
@@ -398,7 +427,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		if err != nil {
 			repl.PrintSafe("\r\n读取错误，正在重启 REPL...\r\n")
 			reader = repl.New(func(input string) []string {
-				return complete(input, allCommands, eng.Runtime().SkillPrompts)
+				return complete(input, allCommands, skillDescs)
 			})
 			continue
 		}
@@ -423,9 +452,12 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			runDoctor()
 		case input == "/config":
 			showConfig()
+		case input == "/attach" || strings.HasPrefix(input, "/attach "):
+			cwd, _ := os.Getwd()
+			handleAttachCommand(input, cwd, &attachedFiles)
 		case strings.HasPrefix(input, "/model "):
 			if err := applyProviderConfigChange(cfg, eng, func() error {
-				cfg.Model = strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+				cfg.Model = config.ResolveModelForProvider(strings.TrimPrefix(input, "/model "), cfg.Provider.Name)
 				as.Model = cfg.Model
 				return config.Save(cfg)
 			}); err != nil {
@@ -560,7 +592,13 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				fmt.Println(missingAPIKeyMessage(pc.Name))
 				continue
 			}
-			withInterrupt(func(ctx context.Context) { runChatInteraction(ctx, eng, input) })
+			cwd, _ := os.Getwd()
+			userMsg, err := buildUserMessage(input, cwd, attachedFiles)
+			if err != nil {
+				fmt.Printf("附件处理失败: %v\n", err)
+				continue
+			}
+			withInterrupt(func(ctx context.Context) { runChatInteractionMessage(ctx, eng, userMsg) })
 			// Progressive onboarding: show tool progress hint on first interaction
 			if eng.OnboardHints() != nil {
 				if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
@@ -619,6 +657,7 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 		cmdEntry{Name: "/undo", Desc: "回退到上一个检查点", Type: "builtin"},
 		cmdEntry{Name: "/checkpoints", Desc: "列出所有检查点", Type: "builtin"},
 		cmdEntry{Name: "/ratelimit", Desc: "查看 API 速率限制", Type: "builtin"},
+		cmdEntry{Name: "/attach", Desc: "挂载图片或文件到后续提问", Type: "builtin", ArgHints: map[string][]string{"": {"list", "clear", "remove", "add"}}},
 		cmdEntry{Name: "/help", Desc: "显示帮助", Type: "builtin"},
 		cmdEntry{Name: "/exit", Desc: "退出", Type: "builtin"},
 		cmdEntry{Name: "/history", Desc: "查看和继续历史会话", Type: "builtin"},
@@ -634,14 +673,36 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 	return list
 }
 
+// buildSkillDescs creates a map of skill name → short description for Tab completion.
+func buildSkillDescs(mgr *skills.Manager) map[string]string {
+	descs := make(map[string]string)
+	if mgr == nil {
+		return descs
+	}
+	for _, s := range mgr.All() {
+		if s.Description != "" {
+			descs[s.Name] = s.Description
+		} else {
+			descs[s.Name] = "技能"
+		}
+	}
+	return descs
+}
+
 func complete(input string, commands []cmdEntry, skills map[string]string) []string {
 	input = strings.TrimLeft(input, " \t")
 	if input == "" {
 		return nil
 	}
 	if suggestions := completeArgs(input, commands); len(suggestions) > 0 {
-		return limitSuggestions(suggestions)
+		return suggestions
 	}
+	// Build description lookup
+	descMap := make(map[string]string, len(commands))
+	for _, c := range commands {
+		descMap[strings.ToLower(c.Name)] = c.Desc
+	}
+
 	var matches []string
 	lower := strings.ToLower(input)
 	for _, c := range commands {
@@ -649,7 +710,11 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(c.Name), lower) {
-			matches = append(matches, c.Name)
+			if c.Desc != "" {
+				matches = append(matches, c.Name+"\t"+shortDesc(c.Desc))
+			} else {
+				matches = append(matches, c.Name)
+			}
 		}
 	}
 	// Build a set of existing command names to avoid duplicates with skills
@@ -657,7 +722,7 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 	for _, c := range commands {
 		cmdNames[strings.ToLower(c.Name)] = true
 	}
-	for name := range skills {
+	for name, desc := range skills {
 		candidate := name
 		if strings.HasPrefix(input, "/") {
 			candidate = "/" + name
@@ -667,11 +732,15 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(candidate), lower) {
-			matches = append(matches, candidate)
+			if desc != "" {
+				matches = append(matches, candidate+"\t"+shortDesc(desc))
+			} else {
+				matches = append(matches, candidate+"\t"+"技能")
+			}
 		}
 	}
 	sort.Strings(matches)
-	return limitSuggestions(matches)
+	return matches
 }
 
 func completeArgs(input string, commands []cmdEntry) []string {
@@ -808,11 +877,21 @@ func providerNameSuggestions() []string {
 	}
 }
 
-func limitSuggestions(matches []string) []string {
-	if len(matches) > 20 {
-		return matches[:20]
+// shortDesc extracts a one-line short description (max 50 chars) from potentially
+// multi-line text. Used to show concise hints in Tab completion.
+func shortDesc(s string) string {
+	// Take only the first line
+	if idx := strings.IndexAny(s, "\n\r"); idx >= 0 {
+		s = s[:idx]
 	}
-	return matches
+	s = strings.TrimSpace(s)
+	// Truncate to max length
+	const maxLen = 50
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		s = string(runes[:maxLen-1]) + "…"
+	}
+	return s
 }
 
 func showQuickCommands(commands []cmdEntry) {
@@ -859,14 +938,20 @@ func fuzzyMatch(input string, cmdReg *command.Registry) []string {
 	return matches
 }
 
-func runPrintMode(eng *engine.Engine, prompt string, debug bool) {
+func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 	go func() { <-sigCh; cancel() }()
-	resp, err := eng.Run(ctx, prompt)
+	cwd, _ := os.Getwd()
+	userMsg, err := buildUserMessage(prompt, cwd, attachmentPaths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -1231,6 +1316,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 	fmt.Println("  /budget <金额>      设置每会话预算上限 ($)")
 	fmt.Println("  /cost               查看用量和费用")
 	fmt.Println("  /ratelimit          查看 API 速率限制状态")
+	fmt.Println("  /attach <文件...>   挂载图片或文件；list/remove/clear 管理列表")
 	fmt.Println("  /config             查看完整配置")
 	fmt.Println("\n会话:")
 	fmt.Println("  /compact            压缩对话历史")
@@ -1257,7 +1343,8 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
 	fmt.Println("\n" + providerEnvHelpLine())
-	fmt.Println("启动参数: -p <提示> | -d --debug | -v --version | --doctor | --config")
+	fmt.Println("启动参数: -p <提示> [--image <路径>] [--file <路径>] | -d --debug | -v --version | --doctor | --config")
+	fmt.Println("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
 	fmt.Println()
 }
 
@@ -1323,6 +1410,10 @@ func buddyFloatingBox(d *buddy.Display) string {
 }
 
 func runChatInteraction(ctx context.Context, runner chatRunner, input string) string {
+	return runChatInteractionMessage(ctx, runner, api.Message{Role: "user", Content: input})
+}
+
+func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg api.Message) string {
 	fmt.Print("\n")
 
 	spinner := repl.NewSpinner("思考中...")
@@ -1339,15 +1430,32 @@ func runChatInteraction(ctx context.Context, runner chatRunner, input string) st
 		defer func() { eng.OnPermissionPause = nil }()
 	}
 
-	_, err := runner.RunWithStream(ctx, input, func(delta string) {
-		if firstDelta {
-			spinner.Stop()
-			firstDelta = false
+	var err error
+	if richRunner, ok := runner.(interface {
+		RunMessageWithStream(context.Context, api.Message, func(string)) (string, error)
+	}); ok {
+		_, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
+			if firstDelta {
+				spinner.Stop()
+				firstDelta = false
+			}
+			fmt.Print(delta)
+			totalOutput.WriteString(delta)
+		})
+	} else {
+		if len(userMsg.Parts) > 0 {
+			err = fmt.Errorf("当前运行器不支持附件消息")
+		} else {
+			_, err = runner.RunWithStream(ctx, userMsg.Content, func(delta string) {
+				if firstDelta {
+					spinner.Stop()
+					firstDelta = false
+				}
+				fmt.Print(delta)
+				totalOutput.WriteString(delta)
+			})
 		}
-		// Write directly to stdout for real-time streaming
-		fmt.Print(delta)
-		totalOutput.WriteString(delta)
-	})
+	}
 	spinner.Stop()
 
 	if err != nil {
@@ -1370,6 +1478,7 @@ func applyProviderConfigChange(cfg *config.Config, reloader providerReloader, mu
 	cfg.Provider.Name = strings.TrimSpace(cfg.Provider.Name)
 	cfg.Provider.APIKey = strings.TrimSpace(cfg.Provider.APIKey)
 	cfg.Provider.BaseURL = strings.TrimSpace(cfg.Provider.BaseURL)
+	cfg.Model = config.ResolveModelForProvider(cfg.Model, cfg.Provider.Name)
 	if reloader == nil {
 		return nil
 	}
@@ -1399,6 +1508,8 @@ func printCLIHelp() {
 用法:
  agentgo                       启动交互式 REPL
  agentgo -p <提示>              执行单次查询后退出
+ agentgo -p <提示> --image <路径>  单次查询并附带图片
+ agentgo -p <提示> --file <路径>   单次查询并附带文件
  agentgo -r <id>                恢复已保存的会话
  agentgo --list-sessions        列出已保存的会话
  agentgo -d                     启用调试日志
@@ -1416,10 +1527,12 @@ func printCLIHelp() {
 REPL 命令:
  /model, /provider, /api-key, /base-url, /mode, /budget
  /cost, /config, /system, /context, /compact
+ /attach <文件...>, /attach list, /attach remove <序号>, /attach clear
  /commit, /review, /diff, /export
  /resume, /memory, /mcp, /plugin
  /doctor, /status, /stats, /permissions
  /cd, /help, /exit`)
+	fmt.Println("\n提示中可直接使用 @文件路径 附加文件，如: 分析这个日志 @logs/app.log")
 }
 
 func truncateDesc(s string, n int) string {

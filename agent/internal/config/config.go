@@ -105,8 +105,8 @@ func loadProjectOverride(cfg *Config) {
 
 func applyDefaults(cfg *Config) {
 	normalizeConfig(cfg)
-	if cfg.Model == "" {
-		cfg.Model = "claude-sonnet-4-20250514"
+	if cfg.Model == "" || strings.EqualFold(cfg.Model, "auto") {
+		cfg.Model = DefaultModelForProvider(cfg.Provider.Name)
 	}
 	if cfg.PermissionMode == "" {
 		cfg.PermissionMode = "default"
@@ -123,6 +123,25 @@ func normalizeConfig(cfg *Config) {
 	cfg.Provider.Name = strings.TrimSpace(cfg.Provider.Name)
 	cfg.Provider.APIKey = strings.TrimSpace(cfg.Provider.APIKey)
 	cfg.Provider.BaseURL = strings.TrimSpace(cfg.Provider.BaseURL)
+}
+
+func DefaultModelForProvider(providerName string) string {
+	switch api.NormalizeProviderName(providerName) {
+	case "deepseek":
+		return "deepseek-v4-pro"
+	case "openai", "openai-compatible":
+		return "gpt-4o"
+	default:
+		return "claude-sonnet-4-20250514"
+	}
+}
+
+func ResolveModelForProvider(model, providerName string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.EqualFold(model, "auto") {
+		return DefaultModelForProvider(providerName)
+	}
+	return model
 }
 
 func Save(cfg *Config) error {

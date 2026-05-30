@@ -100,7 +100,7 @@ type oaiFuncCall struct {
 }
 type oaiMsg struct {
 	Role             string        `json:"role"`
-	Content          string        `json:"content"`
+	Content          any           `json:"content"`
 	ReasoningContent string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
@@ -230,7 +230,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	var toolCalls []ToolCall
 	if len(cr.Choices) > 0 {
 		msg := cr.Choices[0].Message
-		content = msg.Content
+		content = extractOAIMsgText(msg.Content)
 		reasoningContent := msg.ReasoningContent
 		for _, tc := range msg.ToolCalls {
 			var input map[string]any
@@ -304,7 +304,7 @@ func (u oaiUsage) reasoningTokens() int {
 func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 	var out []oaiMsg
 	for _, m := range in {
-		om := oaiMsg{Role: m.Role, Content: m.Content, ReasoningContent: m.ReasoningContent, ToolCallID: m.ToolCallID}
+		om := oaiMsg{Role: m.Role, Content: p.convertMessageContent(m), ReasoningContent: m.ReasoningContent, ToolCallID: m.ToolCallID}
 		if len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
 				args, _ := json.Marshal(tc.Input)
@@ -317,6 +317,71 @@ func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 		out = append(out, om)
 	}
 	return out
+}
+
+func (p *openAICompatProvider) convertMessageContent(m Message) any {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	blocks := make([]map[string]any, 0, len(m.Parts)+1)
+	if m.Content != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
+	}
+	for _, part := range m.Parts {
+		switch part.Type {
+		case "image":
+			if part.Data == "" {
+				continue
+			}
+			mediaType := part.MimeType
+			if mediaType == "" {
+				mediaType = "image/png"
+			}
+			blocks = append(blocks, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": "data:" + mediaType + ";base64," + part.Data},
+			})
+		case "text", "file":
+			if part.Text == "" {
+				continue
+			}
+			blocks = append(blocks, map[string]any{"type": "text", "text": part.Text})
+		}
+	}
+	if len(blocks) == 0 {
+		return m.Content
+	}
+	return blocks
+}
+
+func extractOAIMsgText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := m["type"].(string)
+			if typ != "text" {
+				continue
+			}
+			text, _ := m["text"].(string)
+			if text == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(text)
+		}
+		return sb.String()
+	default:
+		return ""
+	}
 }
 
 func (p *openAICompatProvider) convertTools(tools []ToolDef) []oaiTool {

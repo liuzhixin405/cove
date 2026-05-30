@@ -217,3 +217,31 @@ func TestOpenAICompatChatStreamRequestsUsageInStreamOptions(t *testing.T) {
 		t.Fatalf("unexpected usage: in=%d out=%d", resp.InputTokens, resp.OutputTokens)
 	}
 }
+
+func TestOpenAICompatConvertMessagesSupportsImageParts(t *testing.T) {
+	p := &openAICompatProvider{}
+	msgs := p.convertMessages([]Message{{
+		Role: "user",
+		Parts: []MessagePart{
+			{Type: "text", Text: "请看这张图"},
+			{Type: "image", MimeType: "image/png", Data: "aGVsbG8="},
+		},
+	}})
+
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	arr, ok := msgs[0].Content.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected content array, got %T", msgs[0].Content)
+	}
+	if len(arr) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(arr))
+	}
+	if arr[0]["type"] != "text" {
+		t.Fatalf("first block type = %#v, want text", arr[0]["type"])
+	}
+	if arr[1]["type"] != "image_url" {
+		t.Fatalf("second block type = %#v, want image_url", arr[1]["type"])
+	}
+}

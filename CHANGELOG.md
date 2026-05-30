@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.0.0] - 2025-06-XX
+### Added
+- **Structured Diagnostic System** (`/diagnose`): 30+ error codes (E1xxx-E6xxx) covering config, API, network, model, shell, and data directory issues
+  - `diagnostic.QuickCheck()` runs at startup to detect common problems before user interaction
+  - `/diagnose full` — run all 9 diagnostic checks with detailed reports
+  - `/diagnose quick` — fast subset of critical checks
+  - `/diagnose codes` — list all known error codes and recovery actions
+  - All fixes marked as HotFixable — applied immediately without restarting the exe
+- **Integration Test Suite** (`engine_test.go`): 16 end-to-end tests covering all critical flow paths
+  - Basic message flow, context cancellation, tool execution, permission flows
+  - Tool panic recovery, API error handling, parallel tool execution
+  - Unknown tool names, empty tool calls, multi-iteration conversations
+  - Auto-permission mode, stream delta callbacks
+
+### Fixed
+- **Permission prompt hang**: Replaced `fmt.Scanln` with `bufio.Scanner` — empty input defaults to deny instead of blocking forever
+- **Tool goroutine panic crash**: Added `defer recover()` in parallel tool execution goroutines — panics are caught and reported as tool errors
+- **Engine loop after Ctrl+C**: Added `ctx.Err()` check at iteration start — immediately returns on context cancellation
+- **WalkingIndicator race condition**: Synchronized `Stop()` with `doneCh` channel — prevents goroutine leak and race
+- **Background goroutine panics**: Wrapped all `go` calls in `runTurnEndPipeline` with `recover()` — prevents uncaught panics from killing the process
+
+### Changed
+- Removed `NeedRestart` concept from diagnostic system — replaced with `HotFixable` field since all fixes apply immediately to the running process
+- Repository structure cleaned up: docs moved to `docs/`, stray files removed, `.gitignore` updated
 
 ### Added
 - Buddy system: interactive companion character with mood engine and sprite display

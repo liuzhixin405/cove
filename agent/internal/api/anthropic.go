@@ -82,6 +82,7 @@ func (p *anthropicProvider) Validate() error {
 type anthropicContentBlock struct {
 	Type         string            `json:"type"`
 	Text         string            `json:"text,omitempty"`
+	Source       map[string]any    `json:"source,omitempty"`
 	ID           string            `json:"id,omitempty"`
 	Name         string            `json:"name,omitempty"`
 	Input        map[string]any    `json:"input,omitempty"`
@@ -248,7 +249,10 @@ func (p *anthropicProvider) convertMessages(in []Message) []anthropicMsg {
 				am.Content = append(am.Content, anthropicContentBlock{Type: "text", Text: m.Content})
 			}
 		default:
-			am.Content = []anthropicContentBlock{{Type: "text", Text: m.Content}}
+			am.Content = convertAnthropicUserContent(m)
+		}
+		if len(am.Content) == 0 {
+			am.Content = []anthropicContentBlock{{Type: "text", Text: ""}}
 		}
 		// Inject cache_control if set on the message (prompt caching)
 		if m.CacheControl != "" && len(am.Content) > 0 {
@@ -258,6 +262,39 @@ func (p *anthropicProvider) convertMessages(in []Message) []anthropicMsg {
 		out = append(out, am)
 	}
 	return out
+}
+
+func convertAnthropicUserContent(m Message) []anthropicContentBlock {
+	blocks := make([]anthropicContentBlock, 0, len(m.Parts)+1)
+	if m.Content != "" {
+		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
+	}
+	for _, part := range m.Parts {
+		switch part.Type {
+		case "image":
+			if part.Data == "" {
+				continue
+			}
+			mediaType := part.MimeType
+			if mediaType == "" {
+				mediaType = "image/png"
+			}
+			blocks = append(blocks, anthropicContentBlock{
+				Type: "image",
+				Source: map[string]any{
+					"type":       "base64",
+					"media_type": mediaType,
+					"data":       part.Data,
+				},
+			})
+		case "text", "file":
+			if part.Text == "" {
+				continue
+			}
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: part.Text})
+		}
+	}
+	return blocks
 }
 
 func (p *anthropicProvider) convertTools(tools []ToolDef) []map[string]any {

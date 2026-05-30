@@ -81,13 +81,14 @@ type Spinner struct {
 	mu      sync.Mutex
 	active  bool
 	stopCh  chan struct{}
+	doneCh  chan struct{}
 	message string
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func NewSpinner(message string) *Spinner {
-	return &Spinner{message: message, stopCh: make(chan struct{})}
+	return &Spinner{message: message}
 }
 
 func (s *Spinner) Start() {
@@ -97,13 +98,18 @@ func (s *Spinner) Start() {
 		return
 	}
 	s.active = true
+	s.stopCh = make(chan struct{})
+	s.doneCh = make(chan struct{})
+	stopCh := s.stopCh
+	doneCh := s.doneCh
 	s.mu.Unlock()
 
 	go func() {
+		defer close(doneCh)
 		i := 0
 		for {
 			select {
-			case <-s.stopCh:
+			case <-stopCh:
 				fmt.Fprintf(os.Stderr, "\r\x1b[K") // Clear spinner line
 				return
 			default:
@@ -118,12 +124,17 @@ func (s *Spinner) Start() {
 
 func (s *Spinner) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.active {
+		s.mu.Unlock()
 		return
 	}
 	s.active = false
-	close(s.stopCh)
+	stopCh := s.stopCh
+	doneCh := s.doneCh
+	s.mu.Unlock()
+
+	close(stopCh)
+	<-doneCh
 }
 
 func (s *Spinner) SetMessage(msg string) {
@@ -137,6 +148,7 @@ type WalkingIndicator struct {
 	mu      sync.Mutex
 	active  bool
 	stopCh  chan struct{}
+	doneCh  chan struct{}
 	message string
 }
 
@@ -161,9 +173,11 @@ func (w *WalkingIndicator) Start() {
 		return
 	}
 	w.active = true
+	w.doneCh = make(chan struct{})
 	w.mu.Unlock()
 
 	go func() {
+		defer close(w.doneCh)
 		i := 0
 		for {
 			select {
@@ -186,13 +200,16 @@ func (w *WalkingIndicator) Start() {
 
 func (w *WalkingIndicator) Stop() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if !w.active {
+		w.mu.Unlock()
 		return
 	}
 	w.active = false
 	close(w.stopCh)
-	time.Sleep(20 * time.Millisecond) // let goroutine clean up
+	doneCh := w.doneCh
+	w.mu.Unlock()
+	// Wait for goroutine to finish clearing the line
+	<-doneCh
 }
 
 func (w *WalkingIndicator) SetMessage(msg string) {
