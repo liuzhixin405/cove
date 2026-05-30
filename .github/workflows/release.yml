@@ -27,9 +27,6 @@ jobs:
           - { os: darwin,  arch: amd64, ext: '',    format: tar.gz }
           - { os: darwin,  arch: arm64, ext: '',    format: tar.gz }
 
-    outputs:
-      artifact: ${{ steps.package.outputs.artifact }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,11 +47,6 @@ jobs:
         with:
           go-version: '1.24'
           check-latest: true
-
-      - name: Tidy modules
-        run: |
-          cd agent
-          go mod tidy -go=1.24
 
       - name: Build binary
         id: build
@@ -115,9 +107,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-
-      - name: List artifacts
-        run: find dist -type f -ls
 
       - name: Generate combined checksums
         run: |
