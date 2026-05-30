@@ -42,6 +42,10 @@ func PrintSafe(format string, args ...any) {
 }
 
 func (lr *LineReader) ReadLine() (string, error) {
+	if shouldUseFallbackReadline() {
+		return lr.fallbackRead()
+	}
+
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return lr.fallbackRead()
