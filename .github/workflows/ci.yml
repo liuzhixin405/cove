@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: ['1.24', 'stable']
+        go-version: ['1.23', '1.24']
 
     steps:
       - name: Checkout code
@@ -24,15 +24,18 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-          check-latest: true
           cache-dependency-path: agent/go.sum
+
+      - name: Tidy modules
+        working-directory: agent
+        run: go mod tidy -go=${{ matrix.go-version }}
 
       - name: Run tests
         working-directory: agent
         run: go test -v -race -coverprofile=coverage.txt ./...
 
       - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24'
         uses: codecov/codecov-action@v4
         with:
           working-directory: agent
@@ -49,9 +52,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
-          check-latest: true
+          go-version: '1.24'
           cache-dependency-path: agent/go.sum
+
+      - name: Tidy modules
+        working-directory: agent
+        run: go mod tidy -go=1.24
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
@@ -70,9 +76,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
-          check-latest: true
+          go-version: '1.24'
           cache-dependency-path: agent/go.sum
+
+      - name: Tidy modules
+        working-directory: agent
+        run: go mod tidy -go=1.24
 
       - name: Build
         working-directory: agent
