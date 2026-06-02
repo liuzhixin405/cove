@@ -241,6 +241,13 @@ func (e *Engine) SetPermissionMode(mode permission.Mode) {
 	}
 }
 
+func (e *Engine) SetMaxBudget(maxBudget float64) {
+	e.config.MaxBudget = maxBudget
+	if e.costTracker != nil {
+		e.costTracker.MaxBudget = maxBudget
+	}
+}
+
 func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission.Rule) {
 	e.perm.AddRule(decision, rule)
 }
@@ -975,20 +982,66 @@ func (e *Engine) saveSession() {
 	e.session.TokensOut = e.costTracker.TotalOutput
 	e.session.Cost = e.costTracker.TotalCost
 	e.session.UpdatedAt = now
-	// Auto-set title from first user message if still default
-	if e.session.Title == "New session" && len(e.messages) > 0 {
-		for _, m := range e.messages {
-			if m.Role == "user" && m.Content != "" {
-				title := m.Content
-				if len(title) > 60 {
-					title = title[:60] + "..."
-				}
-				e.session.Title = title
-				break
-			}
+	// Auto-set title from user intent and repair low-signal legacy titles.
+	if len(e.messages) > 0 && (e.session.Title == "New session" || e.session.Title == "" || isLowSignalSessionTitle(e.session.Title)) {
+		if title := pickSessionTitle(e.messages); title != "" {
+			e.session.Title = title
 		}
 	}
 	e.store.Save(e.session)
+}
+
+func pickSessionTitle(messages []api.Message) string {
+	fallback := ""
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(m.Content)
+		if text == "" {
+			continue
+		}
+		if len(text) > 60 {
+			text = text[:60] + "..."
+		}
+		if !isLowSignalSessionTitle(text) {
+			return text
+		}
+		if fallback == "" {
+			fallback = text
+		}
+	}
+	return fallback
+}
+
+func isLowSignalSessionTitle(s string) bool {
+	v := strings.TrimSpace(strings.ToLower(s))
+	if v == "" {
+		return true
+	}
+	if len([]rune(v)) <= 2 {
+		return true
+	}
+	noise := map[string]bool{
+		"write":        true,
+		"write a file": true,
+		"read":         true,
+		"read file":    true,
+		"grep":         true,
+		"continue":     true,
+		"继续":           true,
+		"hi":           true,
+		"hello":        true,
+		"你好":           true,
+		"?":            true,
+	}
+	if noise[v] {
+		return true
+	}
+	if strings.HasPrefix(v, "/") {
+		return true
+	}
+	return false
 }
 
 // SaveSession exports session persistence for the REPL to call on exit.
@@ -1033,10 +1086,120 @@ func parseSchema(raw json.RawMessage) map[string]any {
 
 func summarizeResult(result string) string {
 	s := strings.TrimSpace(result)
-	if len(s) > 80 {
-		s = s[:77] + "..."
+	if len(s) <= 80 {
+		return s
 	}
-	return s
+
+	// Preserve full file paths for common tool summaries like:
+	// "Wrote 123 bytes to D:\\path\\file.txt" or "Read ... from /tmp/a.txt"
+	if kept, ok := preservePathSummary(s, " to "); ok {
+		return kept
+	}
+	if kept, ok := preservePathSummary(s, " from "); ok {
+		return kept
+	}
+	if kept, ok := preservePathSummary(s, "File: "); ok {
+		return kept
+	}
+	if kept, ok := preservePathSummary(s, "file not found: "); ok {
+		return kept
+	}
+	if kept, ok := preservePathSummary(s, "Path: "); ok {
+		return kept
+	}
+
+	if kept, ok := preservePathTokenLine(s); ok {
+		return kept
+	}
+
+	return s[:77] + "..."
+}
+
+func preservePathSummary(s, marker string) (string, bool) {
+	idx := strings.LastIndex(s, marker)
+	if idx < 0 {
+		return "", false
+	}
+	pathPart := strings.TrimSpace(s[idx+len(marker):])
+	if pathPart == "" {
+		return "", false
+	}
+	if !looksLikePath(pathPart) {
+		return "", false
+	}
+
+	head := s[:idx+len(marker)]
+	if len(head) > 40 {
+		head = head[:37] + "..."
+	}
+	return head + pathPart, true
+}
+
+func preservePathTokenLine(s string) (string, bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return "", false
+	}
+
+	best := ""
+	for _, f := range fields {
+		candidate := strings.Trim(f, "\"'()[]{}<>,;")
+		if looksLikePath(candidate) && len(candidate) > len(best) {
+			best = candidate
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+
+	idx := strings.Index(s, best)
+	if idx < 0 {
+		return best, true
+	}
+
+	prefix := strings.TrimSpace(s[:idx])
+	suffix := strings.TrimSpace(s[idx+len(best):])
+
+	if len(prefix) > 40 {
+		prefix = prefix[:37] + "..."
+	}
+	if len(suffix) > 24 {
+		suffix = suffix[:21] + "..."
+	}
+
+	if prefix == "" && suffix == "" {
+		return best, true
+	}
+	if suffix == "" {
+		if prefix == "" {
+			return best, true
+		}
+		return prefix + " " + best, true
+	}
+	if prefix == "" {
+		return best + " " + suffix, true
+	}
+	return prefix + " " + best + " " + suffix, true
+}
+
+func looksLikePath(s string) bool {
+	if s == "" {
+		return false
+	}
+	if !strings.Contains(s, "\\") && !strings.Contains(s, "/") {
+		return false
+	}
+	if strings.Contains(s, ":\\") || strings.Contains(s, ":/") {
+		return true
+	}
+	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") || strings.HasPrefix(s, "~") {
+		return true
+	}
+	// Accept nested relative paths like foo/bar/baz.cs
+	if strings.Count(s, "/")+strings.Count(s, "\\") >= 2 {
+		return true
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

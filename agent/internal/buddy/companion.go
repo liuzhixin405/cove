@@ -104,7 +104,8 @@ func Roll(userID string) Bones {
 // StoredCompanion is what's saved to disk.
 type StoredCompanion struct {
 	Soul
-	HatchedAt int64 `json:"hatched_at"`
+	Preferences Preferences `json:"preferences"`
+	HatchedAt   int64       `json:"hatched_at"`
 }
 
 // configPath returns the buddy config file path.
@@ -127,18 +128,31 @@ func LoadCompanion(userID string) *Companion {
 		return nil
 	}
 	bones := Roll(userID)
+	prefs := NormalizePreferences(stored.Preferences)
+	if prefs == (Preferences{}) {
+		prefs = DefaultPreferences()
+	}
 	return &Companion{
-		Bones:     bones,
-		Soul:      stored.Soul,
-		HatchedAt: stored.HatchedAt,
+		Bones:       bones,
+		Soul:        stored.Soul,
+		Preferences: prefs,
+		HatchedAt:   stored.HatchedAt,
 	}
 }
 
 // SaveCompanion stores the soul (name + personality) to disk.
 func SaveCompanion(soul Soul) error {
+	prefs := DefaultPreferences()
+	if data, err := os.ReadFile(configPath()); err == nil {
+		var prev StoredCompanion
+		if json.Unmarshal(data, &prev) == nil {
+			prefs = NormalizePreferences(prev.Preferences)
+		}
+	}
 	stored := StoredCompanion{
-		Soul:      soul,
-		HatchedAt: time.Now().Unix(),
+		Soul:        soul,
+		Preferences: prefs,
+		HatchedAt:   time.Now().Unix(),
 	}
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
@@ -146,6 +160,28 @@ func SaveCompanion(soul Soul) error {
 	}
 	os.MkdirAll(filepath.Dir(configPath()), 0700)
 	return os.WriteFile(configPath(), data, 0644)
+}
+
+// UpdatePreferences updates only buddy style preferences in the saved companion.
+func UpdatePreferences(prefs Preferences) error {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return err
+	}
+	var stored StoredCompanion
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	if stored.Name == "" {
+		return os.ErrNotExist
+	}
+	stored.Preferences = NormalizePreferences(prefs)
+	out, err := json.MarshalIndent(stored, "", "  ")
+	if err != nil {
+		return err
+	}
+	os.MkdirAll(filepath.Dir(configPath()), 0700)
+	return os.WriteFile(configPath(), out, 0644)
 }
 
 // GetUserID returns a stable identifier for buddy generation.

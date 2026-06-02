@@ -34,6 +34,8 @@ type Reactor struct {
 	Companion *Companion
 	lastQuip  *Quip
 	rng       *rand.Rand
+	behavior  BehaviorPack
+	mode      CompanionMode
 }
 
 // NewReactor creates a reactor for the given companion.
@@ -41,7 +43,23 @@ func NewReactor(c *Companion) *Reactor {
 	return &Reactor{
 		Companion: c,
 		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		behavior:  BehaviorCoding,
+		mode:      CompanionPractical,
 	}
+}
+
+// SetBehaviorPack changes the behavior pack used for generated quips.
+func (r *Reactor) SetBehaviorPack(pack BehaviorPack) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.behavior = NormalizePreferences(Preferences{Behavior: pack}).Behavior
+}
+
+// SetCompanionMode changes chatter strategy (practical vs playful).
+func (r *Reactor) SetCompanionMode(mode CompanionMode) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mode = NormalizePreferences(Preferences{Mode: mode}).Mode
 }
 
 // React generates a quip for the given event. May return nil (no reaction).
@@ -79,34 +97,48 @@ func (r *Reactor) CurrentQuip() *Quip {
 
 func (r *Reactor) generateQuip(event Event, detail string) string {
 	c := r.Companion
+	pack := r.behavior
+	mode := r.mode
 	snark := c.Stats[StatSnark]
 	chaos := c.Stats[StatChaos]
 	patience := c.Stats[StatPatience]
+
+	if mode == CompanionPractical {
+		return practicalQuip(event, detail, pack)
+	}
 
 	switch event {
 	case EventToolSuccess:
 		if r.rng.Intn(100) > 30 { // Only react 30% of the time
 			return ""
 		}
-		return r.pickOne(toolSuccessQuips(c.Species, snark))
+		opts := toolSuccessQuips(c.Species, snark)
+		opts = append(opts, behaviorToolSuccessQuips(pack)...)
+		return r.pickOne(opts)
 
 	case EventToolError:
 		if r.rng.Intn(100) > 60 { // React 60% to errors
 			return ""
 		}
-		return r.pickOne(toolErrorQuips(c.Species, snark, patience))
+		opts := toolErrorQuips(c.Species, snark, patience)
+		opts = append(opts, behaviorToolErrorQuips(pack)...)
+		return r.pickOne(opts)
 
 	case EventIdle:
 		if r.rng.Intn(100) > 15 { // Rarely speak when idle
 			return ""
 		}
-		return r.pickOne(idleQuips(c.Species, chaos))
+		opts := idleQuips(c.Species, chaos)
+		opts = append(opts, behaviorIdleQuips(pack)...)
+		return r.pickOne(opts)
 
 	case EventTurn:
 		if r.rng.Intn(100) > 40 { // React 40% of the time after text responses
 			return ""
 		}
-		return r.pickOne(turnQuips(c.Species, snark, patience))
+		opts := turnQuips(c.Species, snark, patience)
+		opts = append(opts, behaviorTurnQuips(pack)...)
+		return r.pickOne(opts)
 
 	case EventStart:
 		return r.pickOne(startQuips(c.Name, c.Species))
@@ -125,6 +157,30 @@ func (r *Reactor) generateQuip(event Event, detail string) string {
 
 	default:
 		_ = chaos
+		return ""
+	}
+}
+
+func practicalQuip(event Event, detail string, pack BehaviorPack) string {
+	tool := strings.TrimSpace(detail)
+	if tool != "" {
+		tool = "（" + tool + "）"
+	}
+	switch event {
+	case EventStart:
+		return "实用模式已启用：输入 /buddy tip 查看下一步。"
+	case EventToolError:
+		switch pack {
+		case BehaviorReview:
+			return "工具失败" + tool + "：先看输入与边界，再做最小回归。"
+		case BehaviorDebug:
+			return "工具失败" + tool + "：先最小复现，再加日志定位。"
+		default:
+			return "工具失败" + tool + "：建议拆小步骤重试。"
+		}
+	case EventCompact:
+		return "上下文已压缩：如果中断，可输入“继续”。"
+	default:
 		return ""
 	}
 }
@@ -346,6 +402,62 @@ func turnQuips(species Species, snark, patience int) []string {
 		base = append(base, "*开心地晃腮须*")
 	}
 	return base
+}
+
+func behaviorTurnQuips(pack BehaviorPack) []string {
+	switch pack {
+	case BehaviorReview:
+		return []string{
+			"先看边界条件。",
+			"我先扫一遍风险点。",
+			"命名和意图一致吗？",
+		}
+	case BehaviorDebug:
+		return []string{
+			"先最小复现，再下结论。",
+			"日志里一定有线索。",
+			"从错误出现前一跳开始看。",
+		}
+	default:
+		return []string{
+			"这段代码可以更顺滑。",
+			"先写通，再打磨。",
+			"我在盯着复杂度。",
+		}
+	}
+}
+
+func behaviorToolSuccessQuips(pack BehaviorPack) []string {
+	switch pack {
+	case BehaviorReview:
+		return []string{"通过了，结构也挺干净。", "这次改动风险可控。"}
+	case BehaviorDebug:
+		return []string{"症状消失，继续观察。", "根因链路打通了。"}
+	default:
+		return []string{"完成一块积木。", "下一步可以并行推进。"}
+	}
+}
+
+func behaviorToolErrorQuips(pack BehaviorPack) []string {
+	switch pack {
+	case BehaviorReview:
+		return []string{"像是评审漏了一个前提。", "先补测试再改实现。"}
+	case BehaviorDebug:
+		return []string{"别慌，先抓第一条异常。", "我怀疑是状态没对齐。"}
+	default:
+		return []string{"迭代的一部分，继续。", "这块需要拆小一点。"}
+	}
+}
+
+func behaviorIdleQuips(pack BehaviorPack) []string {
+	switch pack {
+	case BehaviorReview:
+		return []string{"我在想有没有隐形耦合。"}
+	case BehaviorDebug:
+		return []string{"我去整理下可疑路径。"}
+	default:
+		return []string{"我在画下一步的草图。"}
+	}
 }
 
 // PetHearts returns the floating hearts animation frames for /buddy pet.

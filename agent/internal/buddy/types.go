@@ -120,5 +120,6 @@ type Soul struct {
 type Companion struct {
 	Bones
 	Soul
-	HatchedAt int64 `json:"hatched_at"`
+	Preferences Preferences `json:"preferences"`
+	HatchedAt   int64       `json:"hatched_at"`
 }

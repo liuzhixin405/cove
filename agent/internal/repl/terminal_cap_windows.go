@@ -13,22 +13,17 @@ func shouldUseFallbackReadline() bool {
 	if forcePlainReadline() {
 		return true
 	}
-	if !isWindowsTerminal() {
-		return true
-	}
 
-	// If VT processing is not enabled, ANSI redraw can leave visual artifacts
-	// in some Windows console hosts when pasting long lines.
+	// Only require VT processing to be enabled — any console host that supports
+	// VT sequences (Windows Terminal, ConEmu, VSCode, IntelliJ, etc.) qualifies.
+	// We no longer restrict to WT_SESSION because many capable terminals don't
+	// set that variable.
 	stdout := windows.Handle(os.Stdout.Fd())
 	var mode uint32
 	if err := windows.GetConsoleMode(stdout, &mode); err != nil {
 		return true
 	}
 	return mode&windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0
-}
-
-func isWindowsTerminal() bool {
-	return strings.TrimSpace(os.Getenv("WT_SESSION")) != ""
 }
 
 func forcePlainReadline() bool {

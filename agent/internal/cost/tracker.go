@@ -2,6 +2,7 @@ package cost
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -85,6 +86,21 @@ func (t *Tracker) OverBudget() bool {
 		return false
 	}
 	return t.TotalCost >= t.MaxBudget
+}
+
+// SuggestedBudget returns an auto-increased budget target based on current spend.
+// The result is rounded up to 2 decimals and is always higher than TotalCost.
+func (t *Tracker) SuggestedBudget() float64 {
+	base := t.TotalCost
+	if base < 0 {
+		base = 0
+	}
+	// Keep a practical headroom so one extra turn can complete.
+	target := base * 1.2
+	if target-base < 2 {
+		target = base + 2
+	}
+	return math.Ceil(target*100) / 100
 }
 
 func (t *Tracker) Summary() string {

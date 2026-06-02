@@ -151,7 +151,10 @@ func TestApplyProviderConfigChangeReturnsReloadError(t *testing.T) {
 
 func TestRunChatInteractionReturnsVisibleError(t *testing.T) {
 	runner := stubStreamingRunner{err: errors.New("api: connection refused")}
-	out := runChatInteraction(context.Background(), runner, "hello")
+	out, err := runChatInteraction(context.Background(), runner, "hello")
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
 	if !strings.Contains(out, "Request failed: api: connection refused") {
 		t.Fatalf("expected visible request failure, got %q", out)
 	}
@@ -159,7 +162,10 @@ func TestRunChatInteractionReturnsVisibleError(t *testing.T) {
 
 func TestRunChatInteractionStreamsAndTerminatesCleanly(t *testing.T) {
 	runner := stubStreamingRunner{result: "MOCK_REPLY: hello"}
-	out := runChatInteraction(context.Background(), runner, "hello")
+	out, err := runChatInteraction(context.Background(), runner, "hello")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
 	if !strings.Contains(out, "MOCK_REPLY: hello") {
 		t.Fatalf("expected streamed reply, got %q", out)
 	}

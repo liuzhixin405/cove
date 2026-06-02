@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"github.com/agentgo/internal/skills"
 	"github.com/agentgo/internal/state"
 	"github.com/agentgo/internal/tool"
+	"golang.org/x/term"
 )
 
 type providerReloader interface {
@@ -52,6 +54,15 @@ var (
 	resumeID   = ""
 	dumpPrompt = false
 	noAuto     = false
+
+	buddyOverlayMu sync.Mutex
+	buddyOverlay   struct {
+		valid bool
+		row   int
+		col   int
+		w     int
+		h     int
+	}
 )
 
 func main() {
@@ -210,33 +221,30 @@ func main() {
 		fmt.Print(repl.PermissionPrompt(toolName, desc))
 		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
 
+		// Route input through the REPL readline loop to avoid competing for
+		// stdin while readline holds raw mode.
+		answerCh := make(chan string, 1)
+		repl.SetPermInputCh(answerCh)
+		defer repl.ClearPermInputCh()
+
 		readAnswer := func() string {
-			// Read answer byte-by-byte from stdin to avoid buffered reads
-			// that could consume user input meant for the next ReadLine call.
-			var answerBytes []byte
-			var b [1]byte
-			for {
-				n, err := os.Stdin.Read(b[:])
-				if err != nil || n == 0 {
-					break
-				}
-				if b[0] == '\n' || b[0] == '\r' {
-					break
-				}
-				answerBytes = append(answerBytes, b[0])
+			select {
+			case s := <-answerCh:
+				return strings.TrimSpace(strings.ToLower(s))
+			case <-time.After(120 * time.Second):
+				return ""
 			}
-			return strings.TrimSpace(strings.ToLower(string(answerBytes)))
 		}
 
 		answer := readAnswer()
 		if answer == "" {
-			// Some terminals may leave a stale CR/LF in stdin. Confirm once
-			// before denying to avoid accidental auto-reject.
 			fmt.Printf("\n  %s检测到空输入，请再次输入 (y/n/a):%s ", repl.Yellow, repl.Reset)
+			// Re-register for the next line.
+			repl.SetPermInputCh(answerCh)
 			answer = readAnswer()
 		}
 		if answer == "" {
-			fmt.Printf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
+			fmt.Printf("  %s(超时或未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
 			return false
 		}
 		switch answer {
@@ -379,10 +387,14 @@ func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext,
 		fmt.Fprintf(os.Stderr, "\n  %s💡 未找到 CLAUDE.md。输入 /init 生成项目指南。%s\n", repl.Dim, repl.Reset)
 	}
 
-	// Buddy greeting at session start
+	// Buddy greeting at session start — print inline (no absolute overlay).
 	if eng.BuddyDisplay != nil {
 		_ = eng.BuddyDisplay.ReactWithMood(buddy.EventStart, "")
-		fmt.Fprintf(os.Stderr, "\n%s\n", buddyFloatingBox(eng.BuddyDisplay))
+		fmt.Fprint(os.Stderr, "\n")
+		rendered := eng.BuddyDisplay.RenderWithBubble()
+		for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
+			fmt.Fprintf(os.Stderr, "  %s\n", line)
+		}
 		// Show daily fortune + time greeting
 		fmt.Fprintf(os.Stderr, "  \x1b[33m%s %s\x1b[0m\n", buddy.TimeEmoji(), buddy.TimeGreeting())
 		fmt.Fprintf(os.Stderr, "  \x1b[35m🔮 %s\x1b[0m\n\n", eng.BuddyDisplay.Fortune.Today())
@@ -418,21 +430,163 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		return complete(input, allCommands, skillDescs)
 	})
 	var attachedFiles []string
+	historyPickPending := false
+	var pendingFailedMsg *api.Message
+	var taskMu sync.Mutex
+	taskRunning := false
+	var taskCancel context.CancelFunc
+	taskQueue := make([]api.Message, 0)
+
+	var startNextTaskLocked func()
+	startNextTaskLocked = func() {
+		if taskRunning || len(taskQueue) == 0 {
+			return
+		}
+		msg := taskQueue[0]
+		taskQueue = taskQueue[1:]
+		taskRunning = true
+		ctx, cancel := context.WithCancel(context.Background())
+		taskCancel = cancel
+
+		go func(userMsg api.Message) {
+			// Guard against panics inside the task: without this, a panic would
+			// leave taskRunning=true forever and silently freeze the whole queue.
+			defer func() {
+				if r := recover(); r != nil {
+					// Inner defer taskMu.Unlock() (if it had locked) already ran,
+					// so re-locking here is safe.
+					taskMu.Lock()
+					msgCopy := userMsg
+					pendingFailedMsg = &msgCopy
+					_ = saveInterruptedDraft(userMsg, fmt.Errorf("internal panic: %v", r))
+					taskRunning = false
+					taskCancel = nil
+					fmt.Printf("\r\n%s任务执行出现内部异常，已恢复输入。可输入“继续”重试。%s\r\n", repl.Red, repl.Reset)
+					startNextTaskLocked()
+					taskMu.Unlock()
+				}
+			}()
+			_, reqErr := runChatInteractionMessage(ctx, eng, userMsg)
+
+			taskMu.Lock()
+			defer taskMu.Unlock()
+
+			if reqErr != nil {
+				msgCopy := userMsg
+				pendingFailedMsg = &msgCopy
+				if isBudgetExceededError(reqErr) {
+					fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+				} else {
+					_ = saveInterruptedDraft(userMsg, reqErr)
+					fmt.Println("可输入“继续”重试刚才中断的任务。")
+				}
+			} else {
+				pendingFailedMsg = nil
+				_ = clearInterruptedDraft()
+				// Progressive onboarding: show tool progress hint on first interaction
+				if eng.OnboardHints() != nil {
+					if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
+						fmt.Fprint(os.Stderr, hint)
+					}
+				}
+				// Show rate limit status if getting low
+				if eng.RateLimits() != nil {
+					info := eng.RateLimits().Current()
+					if info.HasData() && info.TokensRemaining > 0 && info.TokensLimit > 0 {
+						pct := info.TokensRemaining * 100 / info.TokensLimit
+						if pct < 20 {
+							fmt.Fprintf(os.Stderr, "  \x1b[33m⚠ %s\x1b[0m\n", info.Format())
+						}
+					}
+				}
+				// Buddy reaction after text responses
+				if eng.BuddyDisplay != nil {
+					quip := eng.BuddyDisplay.ReactWithMood(buddy.EventTurn, "")
+					if quip != nil {
+						fmt.Fprint(os.Stderr, buddyFloatingBox(eng.BuddyDisplay))
+					}
+				}
+				// Display follow-up suggestions if available
+				if sug := eng.Suggestions(); len(sug) > 0 {
+					fmt.Fprintf(os.Stderr, "  %s💡 建议:%s", repl.Dim, repl.Reset)
+					for _, s := range sug {
+						fmt.Fprintf(os.Stderr, " %s%s%s |", repl.Dim, s.Text, repl.Reset)
+					}
+					fmt.Fprintln(os.Stderr)
+				}
+			}
+
+			taskRunning = false
+			taskCancel = nil
+			startNextTaskLocked()
+		}(msg)
+	}
+
+	isTaskRunning := func() bool {
+		taskMu.Lock()
+		defer taskMu.Unlock()
+		return taskRunning
+	}
+
+	enqueueTask := func(msg api.Message) (int, bool) {
+		taskMu.Lock()
+		defer taskMu.Unlock()
+
+		if taskRunning && len(taskQueue) > 0 {
+			for i := len(taskQueue) - 1; i >= 0; i-- {
+				if canMergeQueuedTask(taskQueue[i], msg) {
+					taskQueue[i] = mergeQueuedTask(taskQueue[i], msg)
+					return i, true
+				}
+			}
+		}
+
+		taskQueue = append(taskQueue, msg)
+		queueSize := len(taskQueue)
+		startNextTaskLocked()
+		if taskRunning {
+			if queueSize > 0 {
+				return queueSize - 1, false
+			}
+			return 0, false
+		}
+		return 0, false
+	}
 
 	// Start buddy proactive idle chat listener
 	if eng.BuddyDisplay != nil {
 		go func() {
 			for msg := range eng.BuddyDisplay.IdleChatCh() {
-				// Print idle chat above the prompt line
-				fmt.Fprintf(os.Stderr, "\r\n  \x1b[36m💬 %s: %s\x1b[0m\r\n", eng.BuddyDisplay.Name(), msg)
+				repl.PrintAbove(fmt.Sprintf("  \x1b[36m💬 %s: %s\x1b[0m", eng.BuddyDisplay.Name(), msg))
 			}
 		}()
 		defer eng.BuddyDisplay.StopIdleChat()
 	}
 
+	// On startup, check for interrupted draft and notify user
+	if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
+		title := draft.Title
+		if title == "" {
+			title = shortDesc(draft.UserContent)
+		}
+		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
+		fmt.Printf("\n  \x1b[33m⚡ 检测到中断任务: %s (%s)\x1b[0m\n", title, age)
+		fmt.Printf("  \x1b[2m输入「继续」恢复该任务，或直接输入新内容忽略。\x1b[0m\n\n")
+	}
+
 	for {
 		input, err := reader.ReadLine()
 		if err == repl.ErrInterrupt {
+			if isTaskRunning() {
+				taskMu.Lock()
+				cancel := taskCancel
+				taskMu.Unlock()
+				if cancel != nil {
+					cancel()
+					fmt.Println("已请求中断当前任务。")
+				}
+				continue
+			}
 			fmt.Println("输入 /exit 或 Ctrl+D 退出")
 			continue
 		}
@@ -451,15 +605,116 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		if input == "" {
 			continue
 		}
+
+		// If a permission prompt is waiting for an answer, route this line to it
+		// instead of processing it as a task.
+		if ch := repl.TakePermInputCh(); ch != nil {
+			ch <- input
+			continue
+		}
+
 		// Mark activity to reset buddy idle timer
 		if eng.BuddyDisplay != nil {
 			eng.BuddyDisplay.MarkActivity()
 		}
+		if historyPickPending && !strings.HasPrefix(input, "/") {
+			if isPositiveNumber(input) {
+				handleHistoryResume(input, eng)
+				historyPickPending = false
+				continue
+			}
+			historyPickPending = false
+		}
 		switch {
 		case input == "exit" || input == "/exit":
+			taskMu.Lock()
+			cancel := taskCancel
+			running := taskRunning
+			taskMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			// Wait briefly for the task goroutine to finish its cleanup (save draft)
+			if running {
+				deadline := time.After(3 * time.Second)
+				for {
+					time.Sleep(50 * time.Millisecond)
+					taskMu.Lock()
+					done := !taskRunning
+					taskMu.Unlock()
+					if done {
+						break
+					}
+					select {
+					case <-deadline:
+						goto exitNow
+					default:
+					}
+				}
+			}
+		exitNow:
 			autoSaveSession(eng)
 			fmt.Println("再见！")
 			return
+		case isContinueCommand(input):
+			if isTaskRunning() {
+				fmt.Println("当前已有任务在进行，继续输入内容会排队到当前任务后执行。")
+				historyPickPending = false
+				continue
+			}
+			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
+				fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+				historyPickPending = false
+				continue
+			}
+			taskMu.Lock()
+			pf := pendingFailedMsg
+			taskMu.Unlock()
+
+			if pf != nil {
+				if isLowSignalResumeInput(pf.Content) {
+					taskMu.Lock()
+					pendingFailedMsg = nil
+					taskMu.Unlock()
+					_ = clearInterruptedDraft()
+					fmt.Println("检测到中断草稿内容过短，已跳过并恢复最近有效任务。")
+					handleHistoryResumeMostRelevant(eng)
+					historyPickPending = false
+					continue
+				}
+				taskMu.Lock()
+				pendingFailedMsg = nil
+				taskMu.Unlock()
+				_, merged := enqueueTask(*pf)
+				if merged {
+					fmt.Println("检测到相似重试任务，已合并到队列中。")
+				} else {
+					fmt.Println("已加入重试队列，任务完成后会自动继续。")
+				}
+				historyPickPending = false
+				continue
+			}
+			if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
+				if isLowSignalResumeInput(draft.UserContent) {
+					_ = clearInterruptedDraft()
+					fmt.Println("检测到中断草稿内容过短，已跳过并恢复最近有效任务。")
+					handleHistoryResumeMostRelevant(eng)
+					historyPickPending = false
+					continue
+				}
+				msg := api.Message{Role: "user", Content: draft.UserContent}
+				_, merged := enqueueTask(msg)
+				if merged {
+					fmt.Println("检测到相似重试任务，已合并到队列中。")
+				} else {
+					fmt.Println("已加入重试队列，任务完成后会自动继续。")
+				}
+				historyPickPending = false
+				continue
+			}
+			handleHistoryResumeMostRelevant(eng)
+			historyPickPending = false
+			continue
 		case input == "/help":
 			printHelp(cmdReg, toolReg)
 		case input == "/":
@@ -528,11 +783,30 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				fmt.Printf("无效模式。可选: %s\n", permission.Modes())
 			}
 		case strings.HasPrefix(input, "/budget "):
+			arg := strings.TrimSpace(strings.TrimPrefix(input, "/budget "))
+			if strings.EqualFold(arg, "auto") {
+				b := cfg.MaxBudgetUsd
+				if tr := eng.CostTracker(); tr != nil {
+					suggested := tr.SuggestedBudget()
+					if suggested > b {
+						b = suggested
+					}
+				}
+				if b > 0 {
+					cfg.MaxBudgetUsd = b
+					as.MaxBudget = b
+					eng.SetMaxBudget(b)
+					config.Save(cfg)
+					fmt.Printf("预算已自动调整到: $%.2f\n", b)
+				}
+				continue
+			}
 			var b float64
-			fmt.Sscanf(strings.TrimPrefix(input, "/budget "), "%f", &b)
+			fmt.Sscanf(arg, "%f", &b)
 			if b > 0 {
 				cfg.MaxBudgetUsd = b
 				as.MaxBudget = b
+				eng.SetMaxBudget(b)
 				config.Save(cfg)
 				fmt.Printf("预算: $%.2f\n", b)
 			}
@@ -584,9 +858,16 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			withInterrupt(func(ctx context.Context) { handleResume(ctx, sessionID, eng) })
 		case input == "/history":
 			handleHistory(eng)
+			historyPickPending = true
 		case strings.HasPrefix(input, "/history "):
 			histID := strings.TrimSpace(strings.TrimPrefix(input, "/history "))
+			if strings.HasPrefix(strings.ToLower(histID), "detail ") {
+				handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng)
+				historyPickPending = false
+				continue
+			}
 			handleHistoryResume(histID, eng)
+			historyPickPending = false
 		case input == "/compact":
 			withInterrupt(func(ctx context.Context) {
 				eng.Compact(ctx)
@@ -605,6 +886,10 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			})
 		default:
 			pc := cfg.EffectiveProvider()
+			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
+				fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+				continue
+			}
 			if pc.APIKey == "" {
 				fmt.Println(missingAPIKeyMessage(pc.Name))
 				continue
@@ -639,37 +924,17 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			if len(attachedFiles) > 0 {
 				attachedFiles = nil
 			}
-			withInterrupt(func(ctx context.Context) { runChatInteractionMessage(ctx, eng, userMsg) })
-			// Progressive onboarding: show tool progress hint on first interaction
-			if eng.OnboardHints() != nil {
-				if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
-					fmt.Fprint(os.Stderr, hint)
+			queuedAhead, merged := enqueueTask(userMsg)
+			if merged {
+				if queuedAhead > 0 {
+					fmt.Printf("检测到相似任务，已合并到队列中（前方还有 %d 条）。\n", queuedAhead)
+				} else {
+					fmt.Println("检测到相似任务，已合并到队列中。")
 				}
-			}
-			// Show rate limit status if getting low
-			if eng.RateLimits() != nil {
-				info := eng.RateLimits().Current()
-				if info.HasData() && info.TokensRemaining > 0 && info.TokensLimit > 0 {
-					pct := info.TokensRemaining * 100 / info.TokensLimit
-					if pct < 20 {
-						fmt.Fprintf(os.Stderr, "  \x1b[33m⚠ %s\x1b[0m\n", info.Format())
-					}
-				}
-			}
-			// Buddy reaction after text responses
-			if eng.BuddyDisplay != nil {
-				quip := eng.BuddyDisplay.ReactWithMood(buddy.EventTurn, "")
-				if quip != nil {
-					fmt.Fprintf(os.Stderr, "%s\n", buddyFloatingBox(eng.BuddyDisplay))
-				}
-			}
-			// Display follow-up suggestions if available
-			if sug := eng.Suggestions(); len(sug) > 0 {
-				fmt.Fprintf(os.Stderr, "  %s💡 建议:%s", repl.Dim, repl.Reset)
-				for _, s := range sug {
-					fmt.Fprintf(os.Stderr, " %s%s%s |", repl.Dim, s.Text, repl.Reset)
-				}
-				fmt.Fprintln(os.Stderr)
+			} else if queuedAhead > 0 {
+				fmt.Printf("已加入进行中任务队列，前方还有 %d 条。\n", queuedAhead)
+			} else {
+				fmt.Println("任务已开始执行，可继续输入补充内容。")
 			}
 		}
 	}
@@ -960,6 +1225,32 @@ func shortDesc(s string) string {
 	return s
 }
 
+func isPositiveNumber(input string) bool {
+	var idx int
+	if _, err := fmt.Sscanf(strings.TrimSpace(input), "%d", &idx); err != nil {
+		return false
+	}
+	return idx > 0
+}
+
+func isTransientRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	transientHints := []string{
+		"timeout", "timed out", "awaiting response headers", "deadline exceeded",
+		"connection reset", "broken pipe", "connection refused", "eof",
+		"temporary", "temporarily unavailable", "server error 5", "bad gateway",
+	}
+	for _, h := range transientHints {
+		if strings.Contains(s, h) {
+			return true
+		}
+	}
+	return false
+}
+
 func showQuickCommands(commands []cmdEntry) {
 	fmt.Println("\n可用命令:")
 	for _, c := range commands {
@@ -1228,7 +1519,10 @@ func handleExport(input string, eng *engine.Engine) {
 			sb.WriteString(fmt.Sprintf("  > 工具: %s(%v)\r\n\r\n", tc.Name, tc.Input))
 		}
 	}
-	os.WriteFile(filename, []byte(sb.String()), 0644)
+	if err := os.WriteFile(filename, []byte(sb.String()), 0644); err != nil {
+		repl.PrintSafe("导出失败: %v\n", err)
+		return
+	}
 	repl.PrintSafe("已导出 %d 条消息到 %s\n", len(eng.Messages()), filename)
 }
 
@@ -1280,6 +1574,101 @@ func autoSaveSession(eng *engine.Engine) {
 	}
 }
 
+type interruptedDraft struct {
+	UpdatedAt   time.Time `json:"updated_at"`
+	Title       string    `json:"title"`
+	UserContent string    `json:"user_content"`
+	Error       string    `json:"error"`
+}
+
+func interruptedDraftPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".agentgo", "interrupted.json"), nil
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and renames
+// it into place, so a crash or power loss can never leave a half-written
+// (corrupt, unrecoverable) file at path.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op if rename already moved the file
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func saveInterruptedDraft(msg api.Message, reqErr error) error {
+	p, err := interruptedDraftPath()
+	if err != nil {
+		return err
+	}
+	d := interruptedDraft{
+		UpdatedAt:   time.Now(),
+		Title:       shortDesc(msg.Content),
+		UserContent: strings.TrimSpace(msg.Content),
+	}
+	if d.Title == "" {
+		d.Title = "(未命名中断任务)"
+	}
+	if reqErr != nil {
+		d.Error = reqErr.Error()
+	}
+	raw, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(p, raw, 0600)
+}
+
+func loadInterruptedDraft() (*interruptedDraft, error) {
+	p, err := interruptedDraftPath()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	var d interruptedDraft
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(d.UserContent) == "" {
+		return nil, fmt.Errorf("empty draft")
+	}
+	return &d, nil
+}
+
+func clearInterruptedDraft() error {
+	p, err := interruptedDraftPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(p); err != nil {
+		return nil
+	}
+	return os.Remove(p)
+}
+
 func handleHistory(eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
@@ -1287,20 +1676,27 @@ func handleHistory(eng *engine.Engine) {
 		return
 	}
 	records, _ := store.List()
-	if len(records) == 0 {
+	draft, _ := loadInterruptedDraft()
+	if len(records) == 0 && draft == nil {
 		repl.PrintSafe("暂无历史。退出时会自动保存会话。\n")
 		return
 	}
 	repl.PrintSafe("\n  历史记录 (%d 个会话):\n\n", len(records))
+	if draft != nil {
+		repl.PrintSafe("  ⚠ 中断草稿 [%s] %s\n", draft.UpdatedAt.Format("01-02 15:04"), shortDesc(draft.Title))
+	}
 	limit := 20
 	if len(records) < limit {
 		limit = len(records)
 	}
 	for i, r := range records[:limit] {
-		msgCount := len(r.Messages)
+		msgCount := r.MessageCount
+		if msgCount == 0 && len(r.Messages) > 0 {
+			msgCount = len(r.Messages)
+		}
 		date := r.UpdatedAt.Format("01-02 15:04")
 		title := r.Title
-		if title == "New session" || title == "" {
+		if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
 			title = sessionPreview(r)
 		}
 		if len(title) > 50 {
@@ -1311,18 +1707,35 @@ func handleHistory(eng *engine.Engine) {
 	if len(records) > limit {
 		repl.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
 	}
-	repl.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n\n")
+	repl.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
+	repl.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
+	repl.PrintSafe("  查看详情: /history detail <编号>\n\n")
+	if draft != nil {
+		repl.PrintSafe("  中断详情: /history detail interrupted\n\n")
+	}
 }
 
 func sessionPreview(r session.Record) string {
+	if r.Preview != "" {
+		return r.Preview
+	}
+	fallback := ""
 	for _, m := range r.Messages {
 		if m.Role == "user" && m.Content != "" {
 			content := strings.ReplaceAll(m.Content, "\n", " ")
 			if len(content) > 50 {
 				content = content[:50] + "..."
 			}
-			return content
+			if !isLowSignalHistoryTitle(content) {
+				return content
+			}
+			if fallback == "" {
+				fallback = content
+			}
 		}
+	}
+	if fallback != "" {
+		return fallback
 	}
 	return "(空)"
 }
@@ -1338,11 +1751,16 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	records, _ := store.List()
 	var idx int
 	if _, err := fmt.Sscanf(input, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
-		r := records[idx-1]
+		rMeta := records[idx-1]
+		r, err := store.Load(rMeta.ID)
+		if err != nil {
+			repl.PrintSafe("恢复失败: %v\n", err)
+			return
+		}
 		eng.LoadMessages(r.Messages)
 		title := r.Title
 		if title == "New session" || title == "" {
-			title = sessionPreview(r)
+			title = sessionPreview(*r)
 		}
 		repl.PrintSafe("已恢复 #%d: %s (%d 条消息)\n", idx, title, len(r.Messages))
 		repl.PrintSafe("可以继续对话了。\n\n")
@@ -1357,11 +1775,341 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	}
 	eng.LoadMessages(r.Messages)
 	title := r.Title
-	if title == "New session" || title == "" {
+	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
 		title = sessionPreview(*r)
 	}
 	repl.PrintSafe("已恢复: %s (%d 条消息)\n", title, len(r.Messages))
 	repl.PrintSafe("可以继续对话了。\n\n")
+}
+
+func handleHistoryDetail(input string, eng *engine.Engine) {
+	if strings.TrimSpace(input) == "" {
+		repl.PrintSafe("用法: /history detail <编号|session-id>\n")
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(input), "interrupted") {
+		draft, _ := loadInterruptedDraft()
+		if draft == nil {
+			repl.PrintSafe("当前没有中断草稿。\n")
+			return
+		}
+		repl.PrintSafe("\n  中断草稿详情\n")
+		repl.PrintSafe("  更新时间: %s\n", draft.UpdatedAt.Format("2006-01-02 15:04:05"))
+		repl.PrintSafe("  标题: %s\n", draft.Title)
+		repl.PrintSafe("  错误: %s\n\n", shortDesc(draft.Error))
+		repl.PrintSafe("  用户输入:\n")
+		repl.PrintSafe("  %s\n\n", draft.UserContent)
+		return
+	}
+	store := eng.Store()
+	if store == nil {
+		repl.PrintSafe("会话存储不可用\n")
+		return
+	}
+
+	resolve := func(sel string) (*session.Record, error) {
+		records, _ := store.List()
+		var idx int
+		if _, err := fmt.Sscanf(sel, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
+			return store.Load(records[idx-1].ID)
+		}
+		return store.Load(sel)
+	}
+
+	r, err := resolve(strings.TrimSpace(input))
+	if err != nil {
+		repl.PrintSafe("无效选择: %s\n输入 /history 查看可用会话。\n", input)
+		return
+	}
+
+	title := r.Title
+	if title == "" || title == "New session" || isLowSignalHistoryTitle(title) {
+		title = sessionPreview(*r)
+	}
+
+	repl.PrintSafe("\n  会话详情\n")
+	repl.PrintSafe("  ID: %s\n", r.ID)
+	repl.PrintSafe("  标题: %s\n", title)
+	repl.PrintSafe("  更新时间: %s\n", r.UpdatedAt.Format("2006-01-02 15:04:05"))
+	repl.PrintSafe("  消息数: %d\n\n", len(r.Messages))
+
+	if len(r.Messages) == 0 {
+		repl.PrintSafe("  该会话暂无消息。\n\n")
+		return
+	}
+
+	const window = 6
+	total := len(r.Messages)
+	indices := make([]int, 0, window)
+	if total <= window {
+		for i := 0; i < total; i++ {
+			indices = append(indices, i)
+		}
+	} else {
+		indices = append(indices, 0, 1, 2, total-3, total-2, total-1)
+	}
+
+	repl.PrintSafe("  消息预览:\n")
+	for i, idx := range indices {
+		if total > window && i == 3 {
+			repl.PrintSafe("    ...\n")
+		}
+		m := r.Messages[idx]
+		role := strings.ToUpper(strings.TrimSpace(m.Role))
+		if role == "" {
+			role = "UNKNOWN"
+		}
+		content := m.Content
+		if strings.TrimSpace(content) == "" && len(m.Parts) > 0 {
+			content = fmt.Sprintf("[%d part(s)]", len(m.Parts))
+		}
+		if strings.TrimSpace(content) == "" {
+			content = "(空)"
+		}
+		repl.PrintSafe("  [%03d] %-9s %s\n", idx+1, role, shortDesc(content))
+	}
+	repl.PrintSafe("\n")
+}
+
+func handleHistoryResumeMostRelevant(eng *engine.Engine) {
+	store := eng.Store()
+	if store == nil {
+		repl.PrintSafe("会话存储不可用\n")
+		return
+	}
+	records, _ := store.List()
+	if len(records) == 0 {
+		repl.PrintSafe("暂无历史。\n")
+		return
+	}
+
+	type candidate struct {
+		rec   *session.Record
+		idx   int
+		score int
+	}
+
+	best := candidate{score: -1}
+	for i, meta := range records {
+		rec, err := store.Load(meta.ID)
+		if err != nil {
+			continue
+		}
+		s := scoreSessionForResume(*rec)
+		if s > best.score {
+			best = candidate{rec: rec, idx: i + 1, score: s}
+		}
+		if i >= 30 {
+			break
+		}
+	}
+
+	if best.rec == nil {
+		handleHistoryResume("1", eng)
+		return
+	}
+
+	eng.LoadMessages(best.rec.Messages)
+	title := best.rec.Title
+	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+		title = sessionPreview(*best.rec)
+	}
+	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 条消息)\n", best.idx, title, len(best.rec.Messages))
+	repl.PrintSafe("可以继续对话了。\n\n")
+}
+
+func scoreSessionForResume(r session.Record) int {
+	if len(r.Messages) == 0 {
+		return -100
+	}
+	score := 0
+	if len(r.Messages) >= 6 {
+		score += 4
+	} else {
+		score += len(r.Messages)
+	}
+
+	userText := ""
+	toolCount := 0
+	assistantCount := 0
+	for _, m := range r.Messages {
+		if userText == "" && m.Role == "user" {
+			userText = strings.TrimSpace(m.Content)
+		}
+		if m.Role == "tool" {
+			toolCount++
+		}
+		if m.Role == "assistant" {
+			assistantCount++
+		}
+	}
+
+	if toolCount > 0 {
+		score += 4
+	}
+	if assistantCount > 1 {
+		score += 2
+	}
+
+	if isTrivialResumePrompt(userText) {
+		score -= 6
+	} else {
+		score += 3
+		if strings.Contains(userText, "http") || strings.Contains(userText, "https") {
+			score += 2
+		}
+		if len([]rune(userText)) >= 20 {
+			score += 1
+		}
+	}
+
+	return score
+}
+
+func isTrivialResumePrompt(s string) bool {
+	v := strings.TrimSpace(strings.ToLower(s))
+	if v == "" {
+		return true
+	}
+	trivial := map[string]bool{
+		"继续": true, "continue": true,
+		"hi": true, "hello": true, "你好": true,
+		"你": true, "我": true, "嗯": true, "好的": true,
+		"1": true, "2": true, "3": true, "4": true, "?": true,
+	}
+	if trivial[v] {
+		return true
+	}
+	if strings.HasPrefix(v, "继续") {
+		return true
+	}
+	if strings.HasPrefix(v, "/history") || strings.HasPrefix(v, "/resume") {
+		return true
+	}
+	return false
+}
+
+func isLowSignalHistoryTitle(s string) bool {
+	v := strings.TrimSpace(strings.ToLower(s))
+	if v == "" {
+		return true
+	}
+	if len([]rune(v)) <= 2 {
+		return true
+	}
+	noise := map[string]bool{
+		"write":        true,
+		"write a file": true,
+		"read":         true,
+		"read file":    true,
+		"grep":         true,
+		"继续":           true,
+		"continue":     true,
+		"hi":           true,
+		"hello":        true,
+		"你好":           true,
+		"?":            true,
+	}
+	if noise[v] {
+		return true
+	}
+	if strings.HasPrefix(v, "/") {
+		return true
+	}
+	return false
+}
+
+func isLowSignalResumeInput(s string) bool {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return true
+	}
+	if len([]rune(v)) <= 1 {
+		return true
+	}
+	return isTrivialResumePrompt(v)
+}
+
+func isContinueCommand(input string) bool {
+	v := strings.TrimSpace(strings.ToLower(input))
+	if v == "继续" || v == "continue" {
+		return true
+	}
+	return strings.HasPrefix(v, "继续") || strings.HasPrefix(v, "continue ")
+}
+
+func canMergeQueuedTask(existing, incoming api.Message) bool {
+	if existing.Role != "user" || incoming.Role != "user" {
+		return false
+	}
+	if len(existing.Parts) > 0 || len(incoming.Parts) > 0 {
+		return false
+	}
+	a := normalizeTaskForMerge(existing.Content)
+	b := normalizeTaskForMerge(incoming.Content)
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if strings.Contains(a, b) || strings.Contains(b, a) {
+		return true
+	}
+	if commonPrefixRunes(a, b) >= 24 {
+		return true
+	}
+	return false
+}
+
+func mergeQueuedTask(existing, incoming api.Message) api.Message {
+	merged := existing
+	add := strings.TrimSpace(incoming.Content)
+	if add == "" {
+		return merged
+	}
+	base := strings.TrimSpace(existing.Content)
+	if base == "" {
+		merged.Content = add
+		return merged
+	}
+	if strings.Contains(base, add) {
+		return merged
+	}
+	merged.Content = base + "\n\n[补充要求]\n" + add
+	return merged
+}
+
+func normalizeTaskForMerge(s string) string {
+	v := strings.ToLower(strings.TrimSpace(s))
+	if v == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"\n", " ", "\t", " ",
+		"，", " ", "。", " ", "！", " ", "？", " ",
+		",", " ", ".", " ", "!", " ", "?", " ",
+		"：", " ", ":", " ", ";", " ", "；", " ",
+	)
+	v = replacer.Replace(v)
+	return strings.Join(strings.Fields(v), " ")
+}
+
+func commonPrefixRunes(a, b string) int {
+	ar := []rune(a)
+	br := []rune(b)
+	n := len(ar)
+	if len(br) < n {
+		n = len(br)
+	}
+	count := 0
+	for i := 0; i < n; i++ {
+		if ar[i] != br[i] {
+			break
+		}
+		count++
+	}
+	return count
 }
 
 func showConfig() {
@@ -1398,7 +2146,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 	fmt.Println("  /api-key <密钥>     保存 API 密钥")
 	fmt.Println("  /base-url <地址>    设置自定义接口地址")
 	fmt.Println("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
-	fmt.Println("  /budget <金额>      设置每会话预算上限 ($)")
+	fmt.Println("  /budget <金额|auto> 设置每会话预算上限 ($)，auto 为一键提升")
 	fmt.Println("  /cost               查看用量和费用")
 	fmt.Println("  /ratelimit          查看 API 速率限制状态")
 	fmt.Println("  /attach <文件...>   挂载图片或文件；list/remove/clear 管理列表")
@@ -1473,84 +2221,216 @@ func missingAPIKeyMessage(provider string) string {
 
 // buddyFloatingBox renders the buddy sprite with speech bubble as a visible box.
 func buddyFloatingBox(d *buddy.Display) string {
+	buddyOverlayMu.Lock()
+	defer buddyOverlayMu.Unlock()
+
 	rendered := d.RenderWithBubble()
-	// Add color: cyan for the whole block
-	lines := strings.Split(rendered, "\n")
-	var sb strings.Builder
-	sb.WriteString("  \x1b[36m") // cyan
-	for i, line := range lines {
-		if line == "" && i == len(lines)-1 {
-			continue
-		}
-		sb.WriteString("  ")
-		sb.WriteString(line)
-		sb.WriteString("\n\x1b[36m")
+	prefs := d.Preferences()
+	if prefs.Overlay == buddy.OverlayOff {
+		buddyOverlay.valid = false
+		return ""
 	}
-	// Mood indicator line
+	lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+
+	// Keep mood line inside the floating block.
 	m := d.Mood.Current()
-	sb.WriteString(fmt.Sprintf("  \x1b[2m%s %s  Lv.%d\x1b[0m",
-		buddy.MoodEmoji(m), buddy.MoodLabel(m), d.XP.Level))
-	sb.WriteString("\x1b[0m")
+	lines = append(lines, fmt.Sprintf("%s %s  Lv.%d", buddy.MoodEmoji(m), buddy.MoodLabel(m), d.XP.Level))
+
+	width, height, err := term.GetSize(int(os.Stderr.Fd()))
+	if err != nil || width <= 0 || height <= 0 {
+		buddyOverlay.valid = false
+		// Fallback for non-TTY output.
+		var fallback strings.Builder
+		fallback.WriteString("\x1b[36m")
+		for _, line := range lines {
+			fallback.WriteString("  ")
+			fallback.WriteString(line)
+			fallback.WriteString("\n")
+		}
+		fallback.WriteString("\x1b[0m")
+		return fallback.String()
+	}
+
+	blockW := 0
+	for _, line := range lines {
+		if w := visibleRuneWidth(line); w > blockW {
+			blockW = w
+		}
+	}
+	if blockW <= 0 {
+		blockW = 1
+	}
+
+	blockH := len(lines)
+	// Reserve bottom 3 rows for the fixed input box — offset overlay above it.
+	const inputBoxRows = 3
+	startRow := maxInt(1, height-blockH-inputBoxRows)
+	startCol := 1
+	switch prefs.Position {
+	case buddy.OverlayLeftBottom:
+		startCol = 1
+	case buddy.OverlayRightMiddle:
+		startCol = maxInt(1, width-blockW)
+		startRow = maxInt(1, (height-blockH-inputBoxRows)/2)
+	default:
+		startCol = maxInt(1, width-blockW)
+	}
+
+	var sb strings.Builder
+	// Save and restore cursor so overlay does not shift the active input/output flow.
+	sb.WriteString("\x1b7")
+
+	// Clear previous overlay region to prevent ghosting artifacts.
+	if buddyOverlay.valid {
+		maxClearW := minInt(buddyOverlay.w, maxInt(0, width-buddyOverlay.col+1))
+		if maxClearW > 0 {
+			clearLine := strings.Repeat(" ", maxClearW)
+			for i := 0; i < buddyOverlay.h; i++ {
+				row := buddyOverlay.row + i
+				if row < 1 || row > height {
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("\x1b[%d;%dH", row, buddyOverlay.col))
+				sb.WriteString(clearLine)
+			}
+		}
+	}
+
+	for i, line := range lines {
+		row := startRow + i
+		if row > height {
+			break
+		}
+		sb.WriteString(fmt.Sprintf("\x1b[%d;%dH", row, startCol))
+		sb.WriteString("\x1b[36m")
+		sb.WriteString(line)
+		sb.WriteString("\x1b[K")
+		sb.WriteString("\x1b[0m")
+	}
+	buddyOverlay.valid = true
+	buddyOverlay.row = startRow
+	buddyOverlay.col = startCol
+	buddyOverlay.w = blockW
+	buddyOverlay.h = blockH
+	sb.WriteString("\x1b8")
 	return sb.String()
 }
 
-func runChatInteraction(ctx context.Context, runner chatRunner, input string) string {
+func visibleRuneWidth(s string) int {
+	return len([]rune(s))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func runChatInteraction(ctx context.Context, runner chatRunner, input string) (string, error) {
 	return runChatInteractionMessage(ctx, runner, api.Message{Role: "user", Content: input})
 }
 
-func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg api.Message) string {
-	fmt.Print("\n")
-
-	spinner := repl.NewSpinner("思考中...")
-	spinner.Start()
-	firstDelta := true
+func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg api.Message) (string, error) {
+	repl.BeginOutput()
+	defer repl.EndOutput()
 	var totalOutput strings.Builder
+	var finalErr error
 
-	// If runner is a full engine, wire up permission pause to stop spinner
-	if eng, ok := runner.(*engine.Engine); ok {
-		eng.OnPermissionPause = func() {
-			spinner.Stop()
-		}
-		eng.OnPermissionDone = nil
-		defer func() { eng.OnPermissionPause = nil }()
-	}
+	maxAttempts := 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		spinner := repl.NewSpinner("思考中...")
+		spinner.Start()
+		firstDelta := true
+		gotDelta := false
 
-	var err error
-	if richRunner, ok := runner.(interface {
-		RunMessageWithStream(context.Context, api.Message, func(string)) (string, error)
-	}); ok {
-		_, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
-			if firstDelta {
+		// If runner is a full engine, wire up permission pause to stop spinner
+		if eng, ok := runner.(*engine.Engine); ok {
+			eng.OnPermissionPause = func() {
 				spinner.Stop()
-				firstDelta = false
 			}
-			fmt.Print(delta)
-			totalOutput.WriteString(delta)
-		})
-	} else {
-		if len(userMsg.Parts) > 0 {
-			err = fmt.Errorf("当前运行器不支持附件消息")
-		} else {
-			_, err = runner.RunWithStream(ctx, userMsg.Content, func(delta string) {
+			eng.OnPermissionDone = nil
+			defer func() { eng.OnPermissionPause = nil }()
+		}
+
+		var err error
+		if richRunner, ok := runner.(interface {
+			RunMessageWithStream(context.Context, api.Message, func(string)) (string, error)
+		}); ok {
+			_, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
 				if firstDelta {
 					spinner.Stop()
 					firstDelta = false
 				}
+				gotDelta = true
 				fmt.Print(delta)
 				totalOutput.WriteString(delta)
 			})
+		} else {
+			if len(userMsg.Parts) > 0 {
+				err = fmt.Errorf("当前运行器不支持附件消息")
+			} else {
+				_, err = runner.RunWithStream(ctx, userMsg.Content, func(delta string) {
+					if firstDelta {
+						spinner.Stop()
+						firstDelta = false
+					}
+					gotDelta = true
+					fmt.Print(delta)
+					totalOutput.WriteString(delta)
+				})
+			}
 		}
-	}
-	spinner.Stop()
+		spinner.Stop()
 
-	if err != nil {
-		errMsg := fmt.Sprintf("\nRequest failed: %s", err.Error())
+		if err == nil {
+			finalErr = nil
+			break
+		}
+		finalErr = err
+		if gotDelta || attempt == maxAttempts || ctx.Err() != nil || !isTransientRequestError(err) {
+			break
+		}
+		note := fmt.Sprintf("\n网络波动，自动重试中 (%d/%d)...\n", attempt, maxAttempts)
+		fmt.Printf("%s%s%s", repl.Yellow, note, repl.Reset)
+		totalOutput.WriteString(note)
+		time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
+	}
+
+	if finalErr != nil {
+		errMsg := fmt.Sprintf("\nRequest failed: %s", finalErr.Error())
 		fmt.Printf("%s%s%s", repl.Red, errMsg, repl.Reset)
 		totalOutput.WriteString(errMsg)
 	}
-	fmt.Print("\r\n\r\n")
 	totalOutput.WriteString("\r\n\r\n")
-	return totalOutput.String()
+	return totalOutput.String(), finalErr
+}
+
+func isBudgetExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "budget exceeded")
+}
+
+func budgetExceededRetryHint(tr *cost.Tracker) string {
+	if tr != nil {
+		suggested := tr.SuggestedBudget()
+		if suggested > 0 {
+			return fmt.Sprintf("预算已超限，继续重试不会成功。可执行 /budget auto 一键提高到 $%.2f，或手动 /budget <金额>，然后再输入“继续”。", suggested)
+		}
+	}
+	return "预算已超限，继续重试不会成功。请先执行 /budget auto 或 /budget <更大金额>，然后再输入“继续”。"
 }
 
 func applyProviderConfigChange(cfg *config.Config, reloader providerReloader, mutate func() error) error {

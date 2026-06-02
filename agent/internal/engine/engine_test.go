@@ -271,6 +271,54 @@ func TestEngineToolExecution(t *testing.T) {
 	}
 }
 
+func TestSummarizeResultPreservesWritePath(t *testing.T) {
+	path := `D:\gitlab\RC_SZ\ccs-backend\CentralizedConfigurationSystem\very\long\nested\path\settings.yaml`
+	in := "Wrote 2751 bytes (60 lines) to " + path
+	out := summarizeResult(in)
+
+	if !strings.Contains(out, " to "+path) {
+		t.Fatalf("expected full path preserved, got %q", out)
+	}
+}
+
+func TestSummarizeResultTruncatesNonPathLongLine(t *testing.T) {
+	in := strings.Repeat("x", 120)
+	out := summarizeResult(in)
+	if len(out) > 80 {
+		t.Fatalf("expected truncated output <= 80 chars, got %d", len(out))
+	}
+	if !strings.HasSuffix(out, "...") {
+		t.Fatalf("expected ellipsis for truncated output, got %q", out)
+	}
+}
+
+func TestSummarizeResultPreservesFilePrefixPath(t *testing.T) {
+	path := `D:\gitlab\RC_SZ\ccs-backend\CentralizedConfigurationSystem.Application\Modules\MT5\Symbols\Handlers\TransferNewSymbolToServerHandler.cs`
+	in := "File: " + path
+	out := summarizeResult(in)
+	if !strings.Contains(out, path) {
+		t.Fatalf("expected file path preserved, got %q", out)
+	}
+}
+
+func TestSummarizeResultPreservesFileNotFoundPath(t *testing.T) {
+	path := `D:\gitlab\RC_SZ\ccs-backend\CentralizedConfigurationSystem.Api\Controllers\MissingController.cs`
+	in := "Error: file not found: " + path
+	out := summarizeResult(in)
+	if !strings.Contains(out, path) {
+		t.Fatalf("expected missing file path preserved, got %q", out)
+	}
+}
+
+func TestSummarizeResultPreservesGlobPathLine(t *testing.T) {
+	path := `CentralizedConfigurationSystem.Application\Modules\MT5\Symbols\Handlers\TransferNewSymbolToServerHandler.cs`
+	in := path + " matched by glob"
+	out := summarizeResult(in)
+	if !strings.Contains(out, path) {
+		t.Fatalf("expected glob path preserved, got %q", out)
+	}
+}
+
 // ===========================================================================
 // TEST: Permission denied — tool requires permission, user denies
 // ===========================================================================

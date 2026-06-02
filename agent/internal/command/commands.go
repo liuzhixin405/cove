@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agentgo/internal/api"
 	"github.com/agentgo/internal/buddy"
 	"github.com/agentgo/internal/config"
 	ctxt "github.com/agentgo/internal/context"
@@ -855,6 +856,15 @@ func (c *BuddyCmd) Help() string {
 /buddy reset - 重置伙伴对话历史
 /buddy pet - 摸摸伙伴（连续摸有彩蛋！）
 /buddy stats - 查看属性和等级
+/buddy style - 查看当前显示偏好
+/buddy style <position|intensity|behavior|overlay|mode> <值> - 设置偏好
+/buddy position <right-bottom|right-middle|left-bottom> - 快捷设置位置
+/buddy intensity <low|medium|high> - 快捷设置动画强度
+/buddy behavior <coding|review|debug> - 快捷设置行为包
+/buddy overlay <on|off> - 快捷开关悬浮层
+/buddy mode <practical|playful> - 设置伙伴模式
+/buddy tip - 输出当前行为包对应的实用清单
+/buddy next - 同 /buddy tip
 /buddy fortune - 今日运势
 /buddy hatch - 孵化一个新伙伴（仅首次）`
 }
@@ -912,6 +922,8 @@ func (c *BuddyCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
 		}
 		card := buddy.FormatBuddyCard(comp)
+		card += fmt.Sprintf("\n  样式: position=%s intensity=%s behavior=%s overlay=%s mode=%s\n",
+			comp.Preferences.Position, comp.Preferences.Intensity, comp.Preferences.Behavior, comp.Preferences.Overlay, comp.Preferences.Mode)
 		// Add XP/level info if display available
 		if in.BuddyDisplay != nil {
 			card += fmt.Sprintf("\n  等级: Lv.%d「%s」\n", in.BuddyDisplay.XP.Level, in.BuddyDisplay.XP.Title())
@@ -961,6 +973,140 @@ func (c *BuddyCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		}
 		return Output{Message: fmt.Sprintf("  %s 的对话记忆已清除，像新的一天一样开始吧~", name)}, nil
 
+	case "tip", "next", "plan":
+		if comp == nil {
+			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
+		}
+		prefs := buddy.NormalizePreferences(comp.Preferences)
+		var msgs []api.Message
+		if in.Engine != nil {
+			msgs = in.Engine.Messages()
+		}
+		return Output{Message: buildBuddyTipMessage(prefs, in.ProjectContext, msgs)}, nil
+
+	case "style", "config", "settings":
+		if comp == nil {
+			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
+		}
+		prefs := buddy.NormalizePreferences(comp.Preferences)
+		if len(in.Args) == 1 {
+			return Output{Message: fmt.Sprintf(
+				"当前伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s\n\n可选值:\n  position: right-bottom | right-middle | left-bottom\n  intensity: low | medium | high\n  behavior: coding | review | debug\n  overlay: on | off\n  mode: practical | playful\n\n示例: /buddy mode practical",
+				prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
+			)}, nil
+		}
+		if len(in.Args) < 3 {
+			return Output{Message: "用法: /buddy style <position|intensity|behavior|overlay|mode> <值>"}, nil
+		}
+
+		key := strings.ToLower(strings.TrimSpace(in.Args[1]))
+		value := strings.ToLower(strings.TrimSpace(strings.Join(in.Args[2:], " ")))
+
+		switch key {
+		case "position", "pos":
+			p, ok := buddy.ParsePosition(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid position: %s (可选: right-bottom | right-middle | left-bottom)", value)
+			}
+			prefs.Position = p
+		case "intensity", "power":
+			i, ok := buddy.ParseIntensity(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid intensity: %s (可选: low | medium | high)", value)
+			}
+			prefs.Intensity = i
+		case "behavior", "pack":
+			b, ok := buddy.ParseBehaviorPack(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid behavior: %s (可选: coding | review | debug)", value)
+			}
+			prefs.Behavior = b
+		case "overlay", "float":
+			o, ok := buddy.ParseOverlayMode(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid overlay: %s (可选: on | off)", value)
+			}
+			prefs.Overlay = o
+		case "mode":
+			m, ok := buddy.ParseCompanionMode(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid mode: %s (可选: practical | playful)", value)
+			}
+			prefs.Mode = m
+		default:
+			return Output{}, fmt.Errorf("unknown style key: %s (可选: position | intensity | behavior | overlay | mode)", key)
+		}
+
+		prefs = buddy.NormalizePreferences(prefs)
+		if err := buddy.UpdatePreferences(prefs); err != nil {
+			return Output{}, fmt.Errorf("保存伙伴样式失败: %w", err)
+		}
+		if in.BuddyDisplay != nil {
+			in.BuddyDisplay.SetPreferences(prefs)
+		}
+
+		return Output{Message: fmt.Sprintf(
+			"已更新伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s",
+			prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
+		)}, nil
+
+	case "position", "intensity", "behavior", "overlay", "mode":
+		if comp == nil {
+			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
+		}
+		if len(in.Args) < 2 {
+			return Output{Message: "用法: /buddy <position|intensity|behavior|overlay|mode> <值>"}, nil
+		}
+
+		prefs := buddy.NormalizePreferences(comp.Preferences)
+		value := strings.ToLower(strings.TrimSpace(strings.Join(in.Args[1:], " ")))
+
+		switch subCmd {
+		case "position":
+			p, ok := buddy.ParsePosition(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid position: %s (可选: right-bottom | right-middle | left-bottom)", value)
+			}
+			prefs.Position = p
+		case "intensity":
+			i, ok := buddy.ParseIntensity(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid intensity: %s (可选: low | medium | high)", value)
+			}
+			prefs.Intensity = i
+		case "behavior":
+			b, ok := buddy.ParseBehaviorPack(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid behavior: %s (可选: coding | review | debug)", value)
+			}
+			prefs.Behavior = b
+		case "overlay":
+			o, ok := buddy.ParseOverlayMode(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid overlay: %s (可选: on | off)", value)
+			}
+			prefs.Overlay = o
+		case "mode":
+			m, ok := buddy.ParseCompanionMode(value)
+			if !ok {
+				return Output{}, fmt.Errorf("invalid mode: %s (可选: practical | playful)", value)
+			}
+			prefs.Mode = m
+		}
+
+		prefs = buddy.NormalizePreferences(prefs)
+		if err := buddy.UpdatePreferences(prefs); err != nil {
+			return Output{}, fmt.Errorf("保存伙伴样式失败: %w", err)
+		}
+		if in.BuddyDisplay != nil {
+			in.BuddyDisplay.SetPreferences(prefs)
+		}
+
+		return Output{Message: fmt.Sprintf(
+			"已更新伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s",
+			prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
+		)}, nil
+
 	default:
 		if comp == nil {
 			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
@@ -998,8 +1144,183 @@ func (c *BuddyCmd) Execute(ctx context.Context, in Input) (Output, error) {
 				result += "\n\n  💬 输入 /buddy <消息> 和伙伴聊天"
 			}
 		}
+		result += "\n  ⚡ 实用模式: /buddy tip"
+		result += "\n  ⚙ 快速设置: /buddy position left-bottom | /buddy overlay off"
 		return Output{Message: result}, nil
 	}
+}
+
+func buildBuddyTipMessage(prefs buddy.Preferences, pc *ctxt.ProjectContext, msgs []api.Message) string {
+	pack := prefs.Behavior
+	clues := recentFailureClues(msgs, 3)
+	var sb strings.Builder
+	sb.WriteString("\n  🧭 Buddy 实用清单\n")
+	sb.WriteString(fmt.Sprintf("  行为包: %s\n", pack))
+
+	if pc != nil {
+		branch := pc.GitBranch
+		if branch == "" {
+			branch = "(unknown)"
+		}
+		status := "clean"
+		if pc.IsGitRepo && strings.TrimSpace(pc.GitStatus) != "" && strings.TrimSpace(pc.GitStatus) != "(clean)" {
+			status = fmt.Sprintf("dirty (%d files)", countGitStatusLines(pc.GitStatus))
+		}
+		sb.WriteString(fmt.Sprintf("  项目: %s\n", pc.Cwd))
+		sb.WriteString(fmt.Sprintf("  Git:  branch=%s, status=%s\n\n", branch, status))
+	} else {
+		sb.WriteString("\n")
+	}
+
+	if len(clues) > 0 {
+		sb.WriteString("  最近异常线索:\n")
+		for _, clue := range clues {
+			sb.WriteString(fmt.Sprintf("    - %s\n", clue))
+		}
+		sb.WriteString(fmt.Sprintf("  优先动作: %s\n\n", failureActionHint(clues)))
+	}
+
+	switch pack {
+	case buddy.BehaviorReview:
+		sb.WriteString("  1) 先看改动: /diff\n")
+		sb.WriteString("  2) 列风险点: 边界条件、错误处理、并发、回滚路径\n")
+		sb.WriteString("  3) 验证接口契约与兼容性（输入/输出、空值、异常）\n")
+		sb.WriteString("  4) 最后跑最小回归: go test ./... 或目标包测试\n")
+		sb.WriteString("\n  建议提问模板: “按高/中/低风险列出这个改动的问题和修复建议。”")
+	case buddy.BehaviorDebug:
+		sb.WriteString("  1) 固化复现: 写出最小复现步骤（输入、环境、期望、实际）\n")
+		sb.WriteString("  2) 加观测: 关键路径日志 + 错误上下文\n")
+		sb.WriteString("  3) 缩小范围: 二分排查（最近改动、依赖、配置）\n")
+		sb.WriteString("  4) 修后验证: 先复现失败，再确认修复后通过\n")
+		sb.WriteString("\n  建议命令: /doctor, /status, /history")
+	default:
+		sb.WriteString("  1) 先拆任务: 明确输入、输出、验收标准\n")
+		sb.WriteString("  2) 先跑通最小版本，再补边界和错误处理\n")
+		sb.WriteString("  3) 每次改动后做一次小验证（编译/单测）\n")
+		sb.WriteString("  4) 记录关键决定，方便后续继续任务\n")
+		sb.WriteString("\n  建议命令: /context, /checkpoints, /resume")
+	}
+
+	sb.WriteString("\n\n  可切换行为包: /buddy behavior review | debug | coding")
+	return sb.String()
+}
+
+func recentFailureClues(msgs []api.Message, limit int) []string {
+	if limit <= 0 || len(msgs) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, limit)
+	seen := make(map[string]bool, limit)
+
+	for i := len(msgs) - 1; i >= 0 && len(out) < limit; i-- {
+		m := msgs[i]
+		if m.Content == "" {
+			continue
+		}
+		if !looksLikeFailureMessage(m) {
+			continue
+		}
+		clue := summarizeFailureClue(m)
+		if clue == "" || seen[clue] {
+			continue
+		}
+		seen[clue] = true
+		out = append(out, clue)
+	}
+
+	return out
+}
+
+func looksLikeFailureMessage(m api.Message) bool {
+	text := strings.ToLower(strings.TrimSpace(m.Content))
+	if text == "" {
+		return false
+	}
+	if m.Role == "tool" && strings.HasPrefix(text, "error:") {
+		return true
+	}
+	keywords := []string{
+		"error:", "failed", "failure", "panic", "exception", "traceback",
+		"timeout", "timed out", "denied", "forbidden", "not found", "no such",
+		"invalid", "unable to", "cannot",
+		"错误", "失败", "异常", "超时", "未找到", "无效", "拒绝",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeFailureClue(m api.Message) string {
+	line := firstNonEmptyLine(m.Content)
+	if line == "" {
+		return ""
+	}
+	line = strings.TrimSpace(line)
+	line = trimRunes(line, 140)
+
+	source := ""
+	if m.Role == "tool" {
+		if m.Name != "" {
+			source = fmt.Sprintf("[%s] ", m.Name)
+		} else {
+			source = "[tool] "
+		}
+	}
+	return source + line
+}
+
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func trimRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "..."
+}
+
+func failureActionHint(clues []string) string {
+	if len(clues) == 0 {
+		return "先执行 /doctor 验证环境，再按 /buddy behavior debug 走最小复现。"
+	}
+	text := strings.ToLower(strings.Join(clues, " | "))
+	switch {
+	case strings.Contains(text, "denied") || strings.Contains(text, "forbidden") || strings.Contains(text, "拒绝"):
+		return "先检查权限与模式（/permissions、/mode），确认工具是否被拦截。"
+	case strings.Contains(text, "not found") || strings.Contains(text, "no such") || strings.Contains(text, "未找到"):
+		return "优先核对路径/文件名，再用 grep 或 ls 验证目标是否存在。"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "timed out") || strings.Contains(text, "超时"):
+		return "先缩小输入范围并减少并发，再重试一次确认是否稳定复现。"
+	case strings.Contains(text, "invalid") || strings.Contains(text, "schema") || strings.Contains(text, "无效"):
+		return "先对照命令/工具参数定义，逐项校验必填字段与格式。"
+	case strings.Contains(text, "panic") || strings.Contains(text, "nil"):
+		return "先抓首个栈帧位置，加空值保护并补最小回归测试。"
+	default:
+		return "按“最小复现 -> 增加观测 -> 二分排查 -> 修复回归”顺序推进。"
+	}
+}
+
+func countGitStatusLines(status string) int {
+	s := strings.TrimSpace(status)
+	if s == "" || s == "(clean)" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
 }
 
 // --- Init Command ---

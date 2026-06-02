@@ -15,6 +15,7 @@ type Display struct {
 	reactor   *Reactor
 	frame     int
 	tick      int
+	prefs     Preferences
 	petUntil  time.Time
 	Mood      *MoodTracker
 	XP        *XPTracker
@@ -36,9 +37,11 @@ var idleSequence = []int{0, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 2, 0, 0, 0}
 
 // NewDisplay creates a buddy display instance.
 func NewDisplay(c *Companion) *Display {
+	prefs := NormalizePreferences(c.Preferences)
 	d := &Display{
 		companion:    c,
 		reactor:      NewReactor(c),
+		prefs:        prefs,
 		Mood:         NewMoodTracker(),
 		XP:           NewXPTracker(0),
 		PetCombo:     NewPetCombo(),
@@ -47,6 +50,8 @@ func NewDisplay(c *Companion) *Display {
 		idleChatCh:   make(chan string, 1),
 		stopIdle:     make(chan struct{}),
 	}
+	d.reactor.SetBehaviorPack(prefs.Behavior)
+	d.reactor.SetCompanionMode(prefs.Mode)
 	go d.idleChatLoop()
 	return d
 }
@@ -61,8 +66,26 @@ func (d *Display) Name() string {
 	return d.companion.Name
 }
 
+// Preferences returns a snapshot of the current buddy rendering preferences.
+func (d *Display) Preferences() Preferences {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.prefs
+}
+
+// SetPreferences applies rendering/reaction preferences at runtime.
+func (d *Display) SetPreferences(p Preferences) {
+	d.mu.Lock()
+	d.prefs = NormalizePreferences(p)
+	d.companion.Preferences = d.prefs
+	d.mu.Unlock()
+	d.reactor.SetBehaviorPack(d.prefs.Behavior)
+	d.reactor.SetCompanionMode(d.prefs.Mode)
+}
+
 // ReactWithMood triggers an event and updates mood/XP. Returns quip.
 func (d *Display) ReactWithMood(event Event, detail string) *Quip {
+	prefs := d.Preferences()
 	d.Mood.OnEvent(event)
 	leveled := false
 	switch event {
@@ -74,12 +97,28 @@ func (d *Display) ReactWithMood(event Event, detail string) *Quip {
 		leveled = d.XP.Add(1)
 	}
 	if leveled {
+		expires := 10 * time.Second
+		switch prefs.Intensity {
+		case AnimationLow:
+			expires = 12 * time.Second
+		case AnimationHigh:
+			expires = 7 * time.Second
+		}
 		return &Quip{
 			Text:    fmt.Sprintf("🎉 升级了！Lv.%d「%s」", d.XP.Level, d.XP.Title()),
-			Expires: time.Now().Add(10 * time.Second),
+			Expires: time.Now().Add(expires),
 		}
 	}
-	return d.reactor.React(event, detail)
+	q := d.reactor.React(event, detail)
+	if q != nil {
+		switch prefs.Intensity {
+		case AnimationLow:
+			q.Expires = time.Now().Add(10 * time.Second)
+		case AnimationHigh:
+			q.Expires = time.Now().Add(6 * time.Second)
+		}
+	}
+	return q
 }
 
 // Tick advances the animation by one frame (call every ~500ms).
@@ -115,11 +154,11 @@ func (d *Display) Pet() *Quip {
 func (d *Display) Render() string {
 	d.mu.Lock()
 	isPetting := time.Now().Before(d.petUntil)
-	tick := d.tick
+	prefs := d.prefs
 	d.mu.Unlock()
 
 	// Determine frame
-	seqIdx := tick % len(idleSequence)
+	seqIdx := int(time.Now().UnixMilli()/frameStepMs(prefs.Intensity)) % len(idleSequence)
 	frameIdx := idleSequence[seqIdx]
 	if frameIdx < 0 {
 		frameIdx = 0 // blink uses frame 0 with different eye (simplified here)
@@ -133,7 +172,7 @@ func (d *Display) Render() string {
 	// Pet hearts above sprite
 	if isPetting {
 		elapsed := time.Since(d.petUntil.Add(-2500 * time.Millisecond))
-		heartFrame := int(elapsed.Milliseconds()/500) % len(PetHearts)
+		heartFrame := int(elapsed.Milliseconds()/heartStepMs(prefs.Intensity)) % len(PetHearts)
 		sb.WriteString(PetHearts[heartFrame])
 		sb.WriteString("\n")
 	}
@@ -154,6 +193,7 @@ func (d *Display) Render() string {
 func (d *Display) RenderWithBubble() string {
 	sprite := d.Render()
 	quip := d.reactor.CurrentQuip()
+	prefs := d.Preferences()
 
 	if quip == nil {
 		return sprite
@@ -179,13 +219,39 @@ func (d *Display) RenderWithBubble() string {
 		if i < len(bubbleLines) {
 			bubbleLine = bubbleLines[i]
 		}
-		// Pad sprite to fixed width
 		padded := padRight(spriteLine, 14)
-		sb.WriteString(padded)
-		sb.WriteString(bubbleLine)
+		if prefs.Position == OverlayLeftBottom {
+			sb.WriteString(bubbleLine)
+			sb.WriteString(padded)
+		} else {
+			sb.WriteString(padded)
+			sb.WriteString(bubbleLine)
+		}
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+func frameStepMs(intensity AnimationIntensity) int64 {
+	switch intensity {
+	case AnimationLow:
+		return 1200
+	case AnimationHigh:
+		return 350
+	default:
+		return 700
+	}
+}
+
+func heartStepMs(intensity AnimationIntensity) int64 {
+	switch intensity {
+	case AnimationLow:
+		return 700
+	case AnimationHigh:
+		return 250
+	default:
+		return 500
+	}
 }
 
 // renderBubble creates a speech bubble around text.
@@ -203,13 +269,19 @@ func renderBubble(text string) string {
 
 	var sb strings.Builder
 	// Top border
-	sb.WriteString("╭" + strings.Repeat("─", maxWidth+2) + "╮\n")
+	sb.WriteString("╭")
+	sb.WriteString(strings.Repeat("─", maxWidth+2))
+	sb.WriteString("╮\n")
 	// Content
 	for _, l := range lines {
-		sb.WriteString("│ " + padRight(l, maxWidth) + " │\n")
+		sb.WriteString("│ ")
+		sb.WriteString(padRight(l, maxWidth))
+		sb.WriteString(" │\n")
 	}
 	// Bottom border
-	sb.WriteString("╰" + strings.Repeat("─", maxWidth+2) + "╯\n")
+	sb.WriteString("╰")
+	sb.WriteString(strings.Repeat("─", maxWidth+2))
+	sb.WriteString("╯\n")
 	// Tail
 	sb.WriteString("  ╲\n")
 	return sb.String()
@@ -281,8 +353,13 @@ func (d *Display) idleChatLoop() {
 		d.mu.Lock()
 		elapsed := time.Since(d.lastActivity)
 		mood := d.Mood.Current()
+		prefs := d.prefs
 		chatBackend := d.ChatBackend
 		d.mu.Unlock()
+
+		if prefs.Mode == CompanionPractical {
+			continue
+		}
 
 		// Only chat if user has been idle for at least 30s
 		if elapsed < 30*time.Second {

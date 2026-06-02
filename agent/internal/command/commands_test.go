@@ -291,3 +291,35 @@ func TestMcpCmdReadResource(t *testing.T) {
 		t.Fatalf("expected resource content, got %q", out.Message)
 	}
 }
+
+func TestRecentFailureCluesExtractsToolErrors(t *testing.T) {
+	msgs := []api.Message{
+		{Role: "user", Content: "run tests"},
+		{Role: "tool", Name: "bash", Content: "Error: command failed with exit code 1\nstack..."},
+		{Role: "assistant", Content: "修复一下"},
+		{Role: "tool", Name: "read", Content: "Error: file not found: missing.go"},
+	}
+
+	clues := recentFailureClues(msgs, 3)
+	if len(clues) != 2 {
+		t.Fatalf("expected 2 clues, got %d (%v)", len(clues), clues)
+	}
+	if !strings.Contains(clues[0], "[read]") {
+		t.Fatalf("expected latest clue to include tool source, got %q", clues[0])
+	}
+	if !strings.Contains(strings.ToLower(clues[1]), "error") {
+		t.Fatalf("expected second clue include error text, got %q", clues[1])
+	}
+}
+
+func TestFailureActionHintByKeyword(t *testing.T) {
+	hint := failureActionHint([]string{"[bash] Error: permission denied"})
+	if !strings.Contains(hint, "权限") {
+		t.Fatalf("expected permission hint, got %q", hint)
+	}
+
+	hint = failureActionHint([]string{"[read] Error: file not found"})
+	if !strings.Contains(hint, "路径") {
+		t.Fatalf("expected path hint, got %q", hint)
+	}
+}

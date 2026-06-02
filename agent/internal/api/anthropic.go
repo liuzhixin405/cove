@@ -158,7 +158,10 @@ func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 }
 
 func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*ChatResponse, error) {
-	data, _ := json.Marshal(body)
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)

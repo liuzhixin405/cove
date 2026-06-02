@@ -309,22 +309,35 @@ func (m *Manager) MarketplaceSearch(query string) string {
 		return "marketplace 索引为空 (试试 /plugin refresh)"
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("找到 %d 个插件:\n", len(entries)))
-	for i, e := range entries {
-		if i >= 20 {
-			sb.WriteString(fmt.Sprintf("  ... 还有 %d 个\n", len(entries)-20))
-			break
-		}
+	sb.WriteString(fmt.Sprintf("可用插件 (%d 个):\n\n", len(entries)))
+
+	for _, e := range entries {
 		installed := ""
 		if _, err := os.Stat(filepath.Join(m.dir, e.Name)); err == nil {
 			installed = " [已安装]"
 		}
-		sb.WriteString(fmt.Sprintf("  %-20s %s v%s%s\n", e.Name, e.Description, e.Version, installed))
-		if e.Author != "" {
-			sb.WriteString(fmt.Sprintf("  %24s by %s\n", "", e.Author))
+		ver := e.Version
+		if ver == "" || ver == "latest" {
+			ver = ""
+		} else {
+			ver = " v" + ver
 		}
+		// Name + version + installed badge
+		sb.WriteString(fmt.Sprintf("  %s%s%s\n", e.Name, ver, installed))
+		// Description (truncated to keep it readable)
+		desc := e.Description
+		if len(desc) > 80 {
+			desc = desc[:77] + "..."
+		}
+		if desc != "" {
+			sb.WriteString(fmt.Sprintf("    %s\n", desc))
+		}
+		if e.Author != "" {
+			sb.WriteString(fmt.Sprintf("    by %s\n", e.Author))
+		}
+		sb.WriteString("\n")
 	}
-	sb.WriteString("\n安装: /plugin install <名称>")
+	sb.WriteString("安装: /plugin install <名称>")
 	return sb.String()
 }
 

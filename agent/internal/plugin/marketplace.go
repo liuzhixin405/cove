@@ -59,7 +59,7 @@ type Marketplace struct {
 	lockfile Lockfile
 }
 
-const defaultMarketplaceRepo = "https://github.com/agentgo-plugins/registry.git"
+const defaultMarketplaceRepo = "https://github.com/anthropics/claude-plugins-official.git"
 
 // NewMarketplace creates a marketplace manager.
 func NewMarketplace(pluginDir string) *Marketplace {
@@ -217,24 +217,104 @@ func (m *Marketplace) fetchSource(src MarketplaceSource) ([]MarketplaceEntry, er
 	}
 }
 
+// claudePluginJSON represents the .claude-plugin/plugin.json format used by
+// anthropics/claude-plugins-official.
+type claudePluginJSON struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Version     string `json:"version"`
+	Author      struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	} `json:"author"`
+	Homepage string `json:"homepage"`
+}
+
 func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry, error) {
 	repoDir := filepath.Join(m.cacheDir, sanitizeName(src.Name))
 
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
 		// Pull latest
-		cmd := exec.Command("git", "-C", repoDir, "pull", "--quiet", "--ff-only")
-		cmd.CombinedOutput() // best-effort
+		cmd := exec.Command("git", "-C", repoDir, "pull", "--ff-only")
+		cmd.Stderr = os.Stderr
+		cmd.Run() // best-effort
 	} else {
 		// Clone
 		os.MkdirAll(filepath.Dir(repoDir), 0755)
-		cmd := exec.Command("git", "clone", "--depth=1", "--quiet", src.URL, repoDir)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("git clone: %s: %w", string(out), err)
+		fmt.Fprintf(os.Stderr, "正在克隆 marketplace 源: %s ...\n", src.Name)
+		cmd := exec.Command("git", "clone", "--depth=1", "--progress", src.URL, repoDir)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("git clone %s failed: %w", src.URL, err)
 		}
 	}
 
-	// Read registry.json from the repo
-	return m.fetchFileSource(filepath.Join(repoDir, "registry.json"))
+	// Try registry.json first (flat index format)
+	registryPath := filepath.Join(repoDir, "registry.json")
+	if _, err := os.Stat(registryPath); err == nil {
+		return m.fetchFileSource(registryPath)
+	}
+
+	// Fall back to Claude plugins official format:
+	// scan plugins/*/.claude-plugin/plugin.json and external_plugins/*/.claude-plugin/plugin.json
+	return m.fetchClaudePluginsRepo(repoDir, src.URL)
+}
+
+// fetchClaudePluginsRepo scans a repo with anthropics/claude-plugins-official layout.
+func (m *Marketplace) fetchClaudePluginsRepo(repoDir, sourceURL string) ([]MarketplaceEntry, error) {
+	var entries []MarketplaceEntry
+
+	dirs := []string{
+		filepath.Join(repoDir, "plugins"),
+		filepath.Join(repoDir, "external_plugins"),
+	}
+
+	for _, dir := range dirs {
+		subdirs, err := os.ReadDir(dir)
+		if err != nil {
+			continue // directory may not exist
+		}
+		for _, sub := range subdirs {
+			if !sub.IsDir() {
+				continue
+			}
+			pluginJSONPath := filepath.Join(dir, sub.Name(), ".claude-plugin", "plugin.json")
+			data, err := os.ReadFile(pluginJSONPath)
+			if err != nil {
+				continue
+			}
+			var cp claudePluginJSON
+			if err := json.Unmarshal(data, &cp); err != nil {
+				continue
+			}
+			name := cp.Name
+			if name == "" {
+				name = sub.Name()
+			}
+			version := cp.Version
+			if version == "" {
+				version = "latest"
+			}
+			// Derive source URL for individual plugin install
+			plugSrc := sourceURL
+			if cp.Homepage != "" {
+				plugSrc = cp.Homepage
+			}
+			entries = append(entries, MarketplaceEntry{
+				Name:        name,
+				Description: cp.Description,
+				Author:      cp.Author.Name,
+				Version:     version,
+				Source:      plugSrc,
+				Category:    filepath.Base(dir), // "plugins" or "external_plugins"
+			})
+		}
+	}
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no registry.json and no .claude-plugin/plugin.json found in repo")
+	}
+	return entries, nil
 }
 
 func (m *Marketplace) fetchFileSource(path string) ([]MarketplaceEntry, error) {
@@ -378,6 +458,28 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 		return fmt.Errorf("plugin %q already installed (disabled)", name)
 	}
 
+	// Try to find plugin in local marketplace cache (from claude-plugins-official layout)
+	if cachedDir := m.findCachedPlugin(name); cachedDir != "" {
+		if err := copyDir(cachedDir, pluginDir); err != nil {
+			os.RemoveAll(pluginDir)
+			return fmt.Errorf("copy from cache: %w", err)
+		}
+		// Generate manifest.json from .claude-plugin/plugin.json if needed
+		m.ensureManifest(pluginDir)
+
+		if version == "" {
+			version = readManifestVersion(pluginDir)
+		}
+		m.lockfile.Plugins[name] = LockEntry{
+			Source:      source,
+			Version:     version,
+			InstalledAt: time.Now().Format(time.RFC3339),
+			AutoUpdate:  true,
+		}
+		m.saveLockfile()
+		return nil
+	}
+
 	// Validate source URL
 	if !isValidSource(source) {
 		return fmt.Errorf("invalid plugin source: %s", source)
@@ -399,11 +501,14 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 		}
 	}
 
+	// Generate manifest.json from .claude-plugin/plugin.json if needed
+	m.ensureManifest(pluginDir)
+
 	// Validate manifest exists
 	manifestPath := filepath.Join(pluginDir, "manifest.json")
 	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
 		os.RemoveAll(pluginDir)
-		return fmt.Errorf("plugin has no manifest.json — not a valid agentgo plugin")
+		return fmt.Errorf("plugin has no manifest.json or .claude-plugin/plugin.json")
 	}
 
 	// Get commit SHA for version lock
@@ -612,4 +717,90 @@ func copyDir(src, dst string) error {
 		}
 		return os.WriteFile(target, data, info.Mode())
 	})
+}
+
+// findCachedPlugin looks for a plugin by name in the local marketplace cache
+// (supports claude-plugins-official layout: plugins/<name>/ and external_plugins/<name>/).
+func (m *Marketplace) findCachedPlugin(name string) string {
+	// Scan all cached source repos
+	cacheEntries, _ := os.ReadDir(m.cacheDir)
+	for _, ce := range cacheEntries {
+		if !ce.IsDir() {
+			continue
+		}
+		repoDir := filepath.Join(m.cacheDir, ce.Name())
+		// Check plugins/<name> and external_plugins/<name>
+		for _, subdir := range []string{"plugins", "external_plugins"} {
+			candidate := filepath.Join(repoDir, subdir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+		// Also check root-level <name> (standard directory source)
+		candidate := filepath.Join(repoDir, name)
+		if _, err := os.Stat(filepath.Join(candidate, "manifest.json")); err == nil {
+			return candidate
+		}
+		if _, err := os.Stat(filepath.Join(candidate, ".claude-plugin", "plugin.json")); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// ensureManifest generates a manifest.json from .claude-plugin/plugin.json if the
+// plugin does not already have a manifest.json (Claude official format compatibility).
+func (m *Marketplace) ensureManifest(pluginDir string) {
+	manifestPath := filepath.Join(pluginDir, "manifest.json")
+	if _, err := os.Stat(manifestPath); err == nil {
+		return // already has manifest.json
+	}
+
+	cpPath := filepath.Join(pluginDir, ".claude-plugin", "plugin.json")
+	data, err := os.ReadFile(cpPath)
+	if err != nil {
+		return
+	}
+
+	var cp claudePluginJSON
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return
+	}
+
+	name := cp.Name
+	if name == "" {
+		name = filepath.Base(pluginDir)
+	}
+	version := cp.Version
+	if version == "" {
+		version = "0.0.0"
+	}
+
+	// Scan for skills, commands, agents
+	var skills, commands []string
+	if entries, err := os.ReadDir(filepath.Join(pluginDir, "skills")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				skills = append(skills, e.Name())
+			}
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(pluginDir, "commands")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				commands = append(commands, e.Name())
+			}
+		}
+	}
+
+	manifest := Manifest{
+		Name:        name,
+		Version:     version,
+		Description: cp.Description,
+		Author:      cp.Author.Name,
+		Skills:      skills,
+		Commands:    commands,
+	}
+	out, _ := json.MarshalIndent(manifest, "", "  ")
+	os.WriteFile(manifestPath, out, 0644)
 }

@@ -41,7 +41,7 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 		MaxIdleConnsPerHost:   20,
 		MaxConnsPerHost:       30,
 		IdleConnTimeout:       120 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: 180 * time.Second,
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 	}
@@ -197,7 +197,10 @@ func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*Chat
 }
 
 func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatResponse, error) {
-	data, _ := json.Marshal(body)
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
 	hadImage := oaiReqHasImageURL(body)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
 	if err != nil {
