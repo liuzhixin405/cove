@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -87,7 +88,7 @@ func NewQuestionTool() Tool {
 	}}}
 }
 func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-	if tctx.IsNonInteractive {
+	if tctx.IsNonInteractive || tctx.Runtime == nil || tctx.Runtime.AskUser == nil {
 		return Result{Data: "[Question requires interactive mode]", IsError: true}, nil
 	}
 	questions, _ := input["questions"].([]any)
@@ -96,15 +97,27 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		qm, _ := q.(map[string]any)
 		h, _ := qm["header"].(string)
 		qt, _ := qm["question"].(string)
-		sb.WriteString(fmt.Sprintf("[Q%d] %s\n%s\n", i+1, h, qt))
+		var prompt strings.Builder
+		prompt.WriteString(fmt.Sprintf("[Q%d] %s\n%s\n", i+1, h, qt))
 		opts, _ := qm["options"].([]any)
-		for _, o := range opts {
+		labels := make([]string, 0, len(opts))
+		for idx, o := range opts {
 			om, _ := o.(map[string]any)
-			sb.WriteString(fmt.Sprintf("  * %v: %v\n", om["label"], om["description"]))
+			label := fmt.Sprint(om["label"])
+			labels = append(labels, label)
+			prompt.WriteString(fmt.Sprintf("  %d. %v: %v\n", idx+1, om["label"], om["description"]))
 		}
-		sb.WriteString("\n")
+		answer := strings.TrimSpace(tctx.Runtime.AskUser(prompt.String()))
+		selected := answer
+		if n, err := strconv.Atoi(answer); err == nil && n >= 1 && n <= len(labels) {
+			selected = labels[n-1]
+		}
+		if selected == "" {
+			selected = "(empty)"
+		}
+		sb.WriteString(fmt.Sprintf("[Q%d] %s\nAnswer: %s\n\n", i+1, qt, selected))
 	}
-	return Result{Data: sb.String()}, nil
+	return Result{Data: strings.TrimSpace(sb.String())}, nil
 }
 func (t *QuestionTool) CheckPermissions(input Input, tctx Context) PermissionDecision { return Allowed("question is interactive") }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,7 +35,6 @@ import (
 	"github.com/agentgo/internal/skills"
 	"github.com/agentgo/internal/state"
 	"github.com/agentgo/internal/tool"
-	"golang.org/x/term"
 )
 
 type providerReloader interface {
@@ -218,33 +218,24 @@ func main() {
 		default:
 			desc = reason
 		}
-		fmt.Print(repl.PermissionPrompt(toolName, desc))
-		fmt.Printf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s ", repl.Yellow, repl.Reset)
-
-		// Route input through the REPL readline loop to avoid competing for
-		// stdin while readline holds raw mode.
-		answerCh := make(chan string, 1)
-		repl.SetPermInputCh(answerCh)
-		defer repl.ClearPermInputCh()
+		repl.PrintAbove(repl.PermissionPrompt(toolName, desc))
+		repl.PrintAbove(fmt.Sprintf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s", repl.Yellow, repl.Reset))
 
 		readAnswer := func() string {
-			select {
-			case s := <-answerCh:
-				return strings.TrimSpace(strings.ToLower(s))
-			case <-time.After(120 * time.Second):
+			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+			if err != nil {
 				return ""
 			}
+			return strings.TrimSpace(strings.ToLower(line))
 		}
 
 		answer := readAnswer()
 		if answer == "" {
-			fmt.Printf("\n  %s检测到空输入，请再次输入 (y/n/a):%s ", repl.Yellow, repl.Reset)
-			// Re-register for the next line.
-			repl.SetPermInputCh(answerCh)
+			repl.PrintAbove(fmt.Sprintf("\n  %s检测到空输入，请再次输入 (y/n/a):%s", repl.Yellow, repl.Reset))
 			answer = readAnswer()
 		}
 		if answer == "" {
-			fmt.Printf("  %s(超时或未输入，默认拒绝)%s\n", repl.Dim, repl.Reset)
+			repl.PrintAbove(fmt.Sprintf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset))
 			return false
 		}
 		switch answer {
@@ -390,13 +381,7 @@ func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext,
 	// Buddy greeting at session start — print inline (no absolute overlay).
 	if eng.BuddyDisplay != nil {
 		_ = eng.BuddyDisplay.ReactWithMood(buddy.EventStart, "")
-		fmt.Fprint(os.Stderr, "\n")
-		rendered := eng.BuddyDisplay.RenderWithBubble()
-		for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
-			fmt.Fprintf(os.Stderr, "  %s\n", line)
-		}
-		// Show daily fortune + time greeting
-		fmt.Fprintf(os.Stderr, "  \x1b[33m%s %s\x1b[0m\n", buddy.TimeEmoji(), buddy.TimeGreeting())
+		fmt.Fprintf(os.Stderr, "\n  \x1b[33m%s %s\x1b[0m", buddy.TimeEmoji(), buddy.TimeGreeting())
 		fmt.Fprintf(os.Stderr, "  \x1b[35m🔮 %s\x1b[0m\n\n", eng.BuddyDisplay.Fortune.Today())
 	}
 }
@@ -461,7 +446,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 					_ = saveInterruptedDraft(userMsg, fmt.Errorf("internal panic: %v", r))
 					taskRunning = false
 					taskCancel = nil
-					fmt.Printf("\r\n%s任务执行出现内部异常，已恢复输入。可输入“继续”重试。%s\r\n", repl.Red, repl.Reset)
+					repl.PrintAbove(fmt.Sprintf("\r\n%s任务执行出现内部异常，已恢复输入。可输入“继续”重试。%s\r\n", repl.Red, repl.Reset))
 					startNextTaskLocked()
 					taskMu.Unlock()
 				}
@@ -475,10 +460,10 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				msgCopy := userMsg
 				pendingFailedMsg = &msgCopy
 				if isBudgetExceededError(reqErr) {
-					fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+					repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\n")
 				} else {
 					_ = saveInterruptedDraft(userMsg, reqErr)
-					fmt.Println("可输入“继续”重试刚才中断的任务。")
+					repl.PrintAbove("可输入“继续”重试刚才中断的任务。\n")
 				}
 			} else {
 				pendingFailedMsg = nil
@@ -486,7 +471,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				// Progressive onboarding: show tool progress hint on first interaction
 				if eng.OnboardHints() != nil {
 					if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
-						fmt.Fprint(os.Stderr, hint)
+						repl.PrintAbove(hint)
 					}
 				}
 				// Show rate limit status if getting low
@@ -495,7 +480,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 					if info.HasData() && info.TokensRemaining > 0 && info.TokensLimit > 0 {
 						pct := info.TokensRemaining * 100 / info.TokensLimit
 						if pct < 20 {
-							fmt.Fprintf(os.Stderr, "  \x1b[33m⚠ %s\x1b[0m\n", info.Format())
+							repl.PrintAbove(fmt.Sprintf("  \x1b[33m⚠ %s\x1b[0m\n", info.Format()))
 						}
 					}
 				}
@@ -503,16 +488,18 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				if eng.BuddyDisplay != nil {
 					quip := eng.BuddyDisplay.ReactWithMood(buddy.EventTurn, "")
 					if quip != nil {
-						fmt.Fprint(os.Stderr, buddyFloatingBox(eng.BuddyDisplay))
+						repl.PrintAbove(buddyFloatingBox(eng.BuddyDisplay))
 					}
 				}
 				// Display follow-up suggestions if available
 				if sug := eng.Suggestions(); len(sug) > 0 {
-					fmt.Fprintf(os.Stderr, "  %s💡 建议:%s", repl.Dim, repl.Reset)
+					var suggestionLine strings.Builder
+					suggestionLine.WriteString(fmt.Sprintf("  %s💡 建议:%s", repl.Dim, repl.Reset))
 					for _, s := range sug {
-						fmt.Fprintf(os.Stderr, " %s%s%s |", repl.Dim, s.Text, repl.Reset)
+						suggestionLine.WriteString(fmt.Sprintf(" %s%s%s |", repl.Dim, s.Text, repl.Reset))
 					}
-					fmt.Fprintln(os.Stderr)
+					suggestionLine.WriteString("\n")
+					repl.PrintAbove(suggestionLine.String())
 				}
 			}
 
@@ -526,6 +513,18 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		taskMu.Lock()
 		defer taskMu.Unlock()
 		return taskRunning
+	}
+
+	waitForTaskIdle := func() {
+		for {
+			taskMu.Lock()
+			running := taskRunning
+			taskMu.Unlock()
+			if !running {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 
 	enqueueTask := func(msg api.Message) (int, bool) {
@@ -602,14 +601,13 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			})
 			continue
 		}
-		if input == "" {
-			continue
-		}
-
 		// If a permission prompt is waiting for an answer, route this line to it
 		// instead of processing it as a task.
 		if ch := repl.TakePermInputCh(); ch != nil {
 			ch <- input
+			continue
+		}
+		if input == "" {
 			continue
 		}
 
@@ -691,6 +689,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				} else {
 					fmt.Println("已加入重试队列，任务完成后会自动继续。")
 				}
+				waitForTaskIdle()
 				historyPickPending = false
 				continue
 			}
@@ -709,6 +708,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				} else {
 					fmt.Println("已加入重试队列，任务完成后会自动继续。")
 				}
+				waitForTaskIdle()
 				historyPickPending = false
 				continue
 			}
@@ -934,8 +934,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			} else if queuedAhead > 0 {
 				fmt.Printf("已加入进行中任务队列，前方还有 %d 条。\n", queuedAhead)
 			} else {
-				fmt.Println("任务已开始执行，可继续输入补充内容。")
+				fmt.Println("任务已开始执行。")
 			}
+			waitForTaskIdle()
 		}
 	}
 }
@@ -2219,7 +2220,9 @@ func missingAPIKeyMessage(provider string) string {
 	)
 }
 
-// buddyFloatingBox renders the buddy sprite with speech bubble as a visible box.
+// buddyFloatingBox renders the buddy sprite as regular scrollback output.
+// Avoid absolute-position overlays here: the REPL already has a fixed input
+// region, and another overlay can erase user-visible output or the input box.
 func buddyFloatingBox(d *buddy.Display) string {
 	buddyOverlayMu.Lock()
 	defer buddyOverlayMu.Unlock()
@@ -2239,83 +2242,15 @@ func buddyFloatingBox(d *buddy.Display) string {
 	m := d.Mood.Current()
 	lines = append(lines, fmt.Sprintf("%s %s  Lv.%d", buddy.MoodEmoji(m), buddy.MoodLabel(m), d.XP.Level))
 
-	width, height, err := term.GetSize(int(os.Stderr.Fd()))
-	if err != nil || width <= 0 || height <= 0 {
-		buddyOverlay.valid = false
-		// Fallback for non-TTY output.
-		var fallback strings.Builder
-		fallback.WriteString("\x1b[36m")
-		for _, line := range lines {
-			fallback.WriteString("  ")
-			fallback.WriteString(line)
-			fallback.WriteString("\n")
-		}
-		fallback.WriteString("\x1b[0m")
-		return fallback.String()
-	}
-
-	blockW := 0
-	for _, line := range lines {
-		if w := visibleRuneWidth(line); w > blockW {
-			blockW = w
-		}
-	}
-	if blockW <= 0 {
-		blockW = 1
-	}
-
-	blockH := len(lines)
-	// Reserve bottom 3 rows for the fixed input box — offset overlay above it.
-	const inputBoxRows = 3
-	startRow := maxInt(1, height-blockH-inputBoxRows)
-	startCol := 1
-	switch prefs.Position {
-	case buddy.OverlayLeftBottom:
-		startCol = 1
-	case buddy.OverlayRightMiddle:
-		startCol = maxInt(1, width-blockW)
-		startRow = maxInt(1, (height-blockH-inputBoxRows)/2)
-	default:
-		startCol = maxInt(1, width-blockW)
-	}
-
 	var sb strings.Builder
-	// Save and restore cursor so overlay does not shift the active input/output flow.
-	sb.WriteString("\x1b7")
-
-	// Clear previous overlay region to prevent ghosting artifacts.
-	if buddyOverlay.valid {
-		maxClearW := minInt(buddyOverlay.w, maxInt(0, width-buddyOverlay.col+1))
-		if maxClearW > 0 {
-			clearLine := strings.Repeat(" ", maxClearW)
-			for i := 0; i < buddyOverlay.h; i++ {
-				row := buddyOverlay.row + i
-				if row < 1 || row > height {
-					continue
-				}
-				sb.WriteString(fmt.Sprintf("\x1b[%d;%dH", row, buddyOverlay.col))
-				sb.WriteString(clearLine)
-			}
-		}
-	}
-
-	for i, line := range lines {
-		row := startRow + i
-		if row > height {
-			break
-		}
-		sb.WriteString(fmt.Sprintf("\x1b[%d;%dH", row, startCol))
-		sb.WriteString("\x1b[36m")
+	sb.WriteString("\x1b[36m")
+	for _, line := range lines {
+		sb.WriteString("  ")
 		sb.WriteString(line)
-		sb.WriteString("\x1b[K")
-		sb.WriteString("\x1b[0m")
+		sb.WriteString("\n")
 	}
-	buddyOverlay.valid = true
-	buddyOverlay.row = startRow
-	buddyOverlay.col = startCol
-	buddyOverlay.w = blockW
-	buddyOverlay.h = blockH
-	sb.WriteString("\x1b8")
+	sb.WriteString("\x1b[0m")
+	buddyOverlay.valid = false
 	return sb.String()
 }
 
@@ -2373,7 +2308,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 					firstDelta = false
 				}
 				gotDelta = true
-				fmt.Print(delta)
+				repl.StreamPrint(delta)
 				totalOutput.WriteString(delta)
 			})
 		} else {
@@ -2386,7 +2321,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 						firstDelta = false
 					}
 					gotDelta = true
-					fmt.Print(delta)
+					repl.StreamPrint(delta)
 					totalOutput.WriteString(delta)
 				})
 			}
@@ -2402,14 +2337,14 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			break
 		}
 		note := fmt.Sprintf("\n网络波动，自动重试中 (%d/%d)...\n", attempt, maxAttempts)
-		fmt.Printf("%s%s%s", repl.Yellow, note, repl.Reset)
+		repl.StreamPrint(fmt.Sprintf("%s%s%s", repl.Yellow, note, repl.Reset))
 		totalOutput.WriteString(note)
 		time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
 	}
 
 	if finalErr != nil {
 		errMsg := fmt.Sprintf("\nRequest failed: %s", finalErr.Error())
-		fmt.Printf("%s%s%s", repl.Red, errMsg, repl.Reset)
+		repl.StreamPrint(fmt.Sprintf("%s%s%s", repl.Red, errMsg, repl.Reset))
 		totalOutput.WriteString(errMsg)
 	}
 	totalOutput.WriteString("\r\n\r\n")

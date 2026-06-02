@@ -55,6 +55,7 @@ type Runtime struct {
 	SkillPrompts  map[string]string
 	PluginManager any
 	Cwd           string
+	AskUser       func(prompt string) string
 }
 
 func (r *Runtime) Lock()   { r.mu.Lock() }

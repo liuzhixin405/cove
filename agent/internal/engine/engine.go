@@ -596,7 +596,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		Cwd:              cwd,
 		ToolUseID:        tc.ID,
 		PermissionMode:   toolPermissionMode(e.perm.Mode()),
-		IsNonInteractive: true,
+		IsNonInteractive: e.runtime == nil || e.runtime.AskUser == nil,
 		Debug:            e.config.Debug,
 		Runtime:          e.runtime,
 	}

@@ -2,7 +2,6 @@ package repl
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -110,11 +109,11 @@ func (s *Spinner) Start() {
 		for {
 			select {
 			case <-stopCh:
-				fmt.Fprintf(os.Stderr, "\r\x1b[K") // Clear spinner line
+				PrintTransientStatus("")
 				return
 			default:
 				frame := spinnerFrames[i%len(spinnerFrames)]
-				fmt.Fprintf(os.Stderr, "\r  %s%s %s%s", Cyan, frame, s.message, Reset)
+				PrintTransientStatus(fmt.Sprintf("  %s%s %s%s", Cyan, frame, s.message, Reset))
 				i++
 				time.Sleep(80 * time.Millisecond)
 			}
@@ -182,15 +181,15 @@ func (w *WalkingIndicator) Start() {
 		for {
 			select {
 			case <-w.stopCh:
-				fmt.Fprintf(os.Stderr, "\r\x1b[K")
+				PrintTransientStatus("")
 				return
 			default:
 				frame := walkFrames[i%len(walkFrames)]
 				w.mu.Lock()
 				msg := w.message
 				w.mu.Unlock()
-				fmt.Fprintf(os.Stderr, "\r  %s%s%s %s%s%s",
-					Cyan, frame, Reset, Dim, msg, Reset)
+				PrintTransientStatus(fmt.Sprintf("  %s%s%s %s%s%s",
+					Cyan, frame, Reset, Dim, msg, Reset))
 				i++
 				time.Sleep(120 * time.Millisecond)
 			}
