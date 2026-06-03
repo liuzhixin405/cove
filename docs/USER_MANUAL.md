@@ -155,6 +155,8 @@ agentgo --doctor
 
 ## 5. 所有命令详解
 
+当前默认运行时已精简为核心交互面。插件、MCP、Skills、Buddy、Dream、检查点回退和自动速率提示不再默认注册或自动启动。
+
 ### 5.1 配置类命令
 
 | 命令 | 说明 | 用法 |
@@ -173,7 +175,6 @@ agentgo --doctor
 | 命令 | 说明 | 用法 |
 |------|------|------|
 | `/cost` | 查看费用（当前+24h+7d+总计） | `/cost` |
-| `/ratelimit` | 查看 API 速率限制状态 | `/ratelimit` |
 | `/compact` | 手动压缩对话历史 | `/compact` |
 | `/history` | 列出历史会话 | `/history` |
 | `/history <编号>` | 恢复指定历史会话 | `/history 3` |
@@ -193,48 +194,15 @@ agentgo --doctor
 | `/cd <路径>` | 切换工作目录 | `/cd src/` |
 | `/init` | 初始化项目（生成 CLAUDE.md） | `/init` |
 
-### 5.4 检查点
-
-| 命令 | 说明 | 用法 |
-|------|------|------|
-| `/undo` | 回退到上一个文件检查点 | `/undo` |
-| `/checkpoints` | 列出所有检查点记录 | `/checkpoints` |
-
-### 5.5 记忆与技能
+### 5.4 记忆
 
 | 命令 | 说明 | 用法 |
 |------|------|------|
 | `/memory` | 列出所有记忆条目 | `/memory` |
 | `/memory add <内容>` | 手动添加记忆 | `/memory add 用户偏好 tab=4` |
 | `/memory remove <名称>` | 删除记忆条目 | `/memory remove auto` |
-| `/skills` | 列出所有可用技能 | `/skills` |
-| `/skills <名称>` | 查看技能详情 | `/skills debug` |
-| `/dream` | 手动运行记忆整理 | `/dream` |
 
-### 5.6 插件
-
-| 命令 | 说明 | 用法 |
-|------|------|------|
-| `/plugin list` | 列出已安装插件 | `/plugin list` |
-| `/plugin install <名称>` | 从 marketplace 安装 | `/plugin install code-formatter` |
-| `/plugin install <url>` | 从 git URL 安装 | `/plugin install https://github.com/user/plugin.git` |
-| `/plugin uninstall <名称>` | 卸载插件 | `/plugin uninstall code-formatter` |
-| `/plugin enable <名称>` | 启用已禁用的插件 | `/plugin enable code-formatter` |
-| `/plugin disable <名称>` | 禁用插件（不删除） | `/plugin disable code-formatter` |
-| `/plugin search [关键词]` | 搜索 marketplace | `/plugin search formatter` |
-| `/plugin refresh` | 更新 marketplace 索引 | `/plugin refresh` |
-| `/plugin update [名称]` | 更新插件（空=全部） | `/plugin update` |
-
-### 5.7 MCP
-
-| 命令 | 说明 | 用法 |
-|------|------|------|
-| `/mcp list` | 列出已连接的 MCP 服务器 | `/mcp list` |
-| `/mcp connect <名称>` | 连接配置中的 MCP 服务器 | `/mcp connect puppeteer` |
-| `/mcp disconnect <名称\|all>` | 断开 MCP 服务器连接 | `/mcp disconnect all` |
-| `/mcp read <服务器> <uri>` | 读取 MCP 资源 | `/mcp read fs file:///tmp/data.json` |
-
-### 5.8 其他
+### 5.5 其他
 
 | 命令 | 说明 | 用法 |
 |------|------|------|
@@ -243,7 +211,6 @@ agentgo --doctor
 | `/debug` | 切换调试模式 | `/debug` |
 | `/system [提示词]` | 查看/设置自定义系统提示词 | `/system 你是一个 Go 专家` |
 | `/permissions` | 查看当前权限设置 | `/permissions` |
-| `/buddy` | 与编程伙伴互动 | `/buddy pet` |
 | `/doctor` | 系统诊断 | `/doctor` |
 | `/diagnose [模式]` | 结构化诊断: full/quick/codes | `/diagnose full` |
 

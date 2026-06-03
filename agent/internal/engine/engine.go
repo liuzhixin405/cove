@@ -11,24 +11,17 @@ import (
 	"time"
 
 	"github.com/agentgo/internal/api"
-	"github.com/agentgo/internal/buddy"
-	"github.com/agentgo/internal/checkpoint"
 	ctxt "github.com/agentgo/internal/context"
 	"github.com/agentgo/internal/cost"
-	"github.com/agentgo/internal/delegate"
-	"github.com/agentgo/internal/dream"
-	"github.com/agentgo/internal/extract"
 	"github.com/agentgo/internal/guardrail"
 	"github.com/agentgo/internal/hooks"
 	"github.com/agentgo/internal/log"
 	"github.com/agentgo/internal/memory"
 	"github.com/agentgo/internal/notes"
-	"github.com/agentgo/internal/onboarding"
 	"github.com/agentgo/internal/permission"
 	"github.com/agentgo/internal/repl"
 	"github.com/agentgo/internal/session"
 	"github.com/agentgo/internal/skills"
-	"github.com/agentgo/internal/suggest"
 	"github.com/agentgo/internal/token"
 	"github.com/agentgo/internal/tool"
 )
@@ -72,24 +65,13 @@ type Engine struct {
 	cachedToolDefs    []api.ToolDef
 	lastSaveTime      time.Time
 	consecutiveErrors int // track consecutive tool failures for circuit breaking
-	lastSuggestions   []suggest.Suggestion
-	sugMu             sync.Mutex
-	autoExtract       bool // whether to run extract/suggest after each turn
 	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
 	OnPermissionPause func() // called before permission prompt to pause spinners
 	OnPermissionDone  func() // called after permission decision to resume
-	dreamRunner       *dream.Runner
-	extractRunner     *extract.Runner
-	suggestRunner     *suggest.Runner
 	sessionNotes      *notes.SessionNotes
-	BuddyDisplay      *buddy.Display
-	BuddyChat         *buddy.BuddyChat
 	guardrails        *guardrail.Tracker
-	checkpointMgr     *checkpoint.Manager
 	subdirHints       *ctxt.SubdirHints
 	rateLimits        *api.RateLimitTracker
-	delegator         *delegate.Delegator
-	onboardHints      *onboarding.Hints
 }
 
 func New(config Config) (*Engine, error) {
@@ -127,7 +109,6 @@ func New(config Config) (*Engine, error) {
 			SkillPrompts:  make(map[string]string),
 		},
 		fileHistory: make(map[string]bool),
-		autoExtract: true,
 	}
 
 	if config.SkillManager != nil {
@@ -145,25 +126,6 @@ func New(config Config) (*Engine, error) {
 		}
 	}
 
-	// Initialize auto-dream runner
-	sessionID := ""
-	if e.session != nil {
-		sessionID = e.session.ID
-	}
-	e.dreamRunner = dream.NewRunner(prov, config.Model, sessionID)
-
-	// Initialize memory extraction runner
-	e.extractRunner = extract.NewRunner(prov, config.Model)
-	e.extractRunner.OnSave = func(count int) {
-		fmt.Fprintf(os.Stderr, "  \x1b[2m💾 学到了 %d 条新记忆\x1b[0m\n", count)
-		if e.sessionNotes != nil {
-			e.sessionNotes.AddDiscovery(fmt.Sprintf("Extracted %d memories from conversation", count))
-		}
-	}
-
-	// Initialize prompt suggestion runner
-	e.suggestRunner = suggest.NewRunner(prov, config.Model)
-
 	// Initialize session notes
 	cwd, _ := os.Getwd()
 	if cwd != "" {
@@ -173,24 +135,8 @@ func New(config Config) (*Engine, error) {
 		e.sessionNotes = notes.NewGlobal()
 	}
 
-	// Initialize buddy companion
-	userID := buddy.GetUserID()
-	if comp := buddy.LoadCompanion(userID); comp != nil {
-		e.BuddyDisplay = buddy.NewDisplay(comp)
-		e.BuddyChat = buddy.NewBuddyChat(comp, prov, config.Model)
-		e.BuddyChat.LoadHistory()
-		e.BuddyDisplay.ChatBackend = e.BuddyChat
-	}
-
 	// Initialize guardrails (tool loop detection)
 	e.guardrails = guardrail.New()
-
-	// Initialize checkpoint manager
-	if cwd != "" {
-		if cpMgr, err := checkpoint.New(cwd); err == nil {
-			e.checkpointMgr = cpMgr
-		}
-	}
 
 	// Initialize subdirectory hints tracker
 	if cwd != "" {
@@ -199,16 +145,6 @@ func New(config Config) (*Engine, error) {
 
 	// Initialize rate limit tracker
 	e.rateLimits = api.NewRateLimitTracker()
-
-	// Initialize sub-agent delegator
-	e.delegator = delegate.NewDelegator(prov, config.Model, config.Tools)
-
-	// Initialize progressive onboarding hints
-	e.onboardHints = onboarding.NewHints()
-
-	// Check dream on startup too (catches cases where previous sessions
-	// accumulated enough but the turn-end trigger never fired)
-	go e.dreamRunner.ExecuteAutoDream(context.Background())
 
 	return e, nil
 }
@@ -252,13 +188,9 @@ func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission
 	e.perm.AddRule(decision, rule)
 }
 
-func (e *Engine) Registry() *tool.Registry           { return e.registry }
-func (e *Engine) Runtime() *tool.Runtime             { return e.runtime }
-func (e *Engine) DreamRunner() *dream.Runner         { return e.dreamRunner }
-func (e *Engine) CheckpointMgr() *checkpoint.Manager { return e.checkpointMgr }
-func (e *Engine) RateLimits() *api.RateLimitTracker  { return e.rateLimits }
-func (e *Engine) Delegator() *delegate.Delegator     { return e.delegator }
-func (e *Engine) OnboardHints() *onboarding.Hints    { return e.onboardHints }
+func (e *Engine) Registry() *tool.Registry          { return e.registry }
+func (e *Engine) Runtime() *tool.Runtime            { return e.runtime }
+func (e *Engine) RateLimits() *api.RateLimitTracker { return e.rateLimits }
 func (e *Engine) FileHistory() []string {
 	e.fileMu.Lock()
 	defer e.fileMu.Unlock()
@@ -516,18 +448,6 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
 				fmt.Fprintf(os.Stderr, "\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr))
-				// Buddy reaction to tool results
-				if e.BuddyDisplay != nil {
-					var quip *buddy.Quip
-					if isErr {
-						quip = e.BuddyDisplay.ReactWithMood(buddy.EventToolError, r.Name)
-					} else {
-						quip = e.BuddyDisplay.ReactWithMood(buddy.EventToolSuccess, r.Name)
-					}
-					if quip != nil {
-						fmt.Fprintf(os.Stderr, "  \x1b[36m🐾 %s: %s\x1b[0m\n", e.BuddyDisplay.Reactor().Companion.Name, quip.Text)
-					}
-				}
 			}
 			// Session notes capture (always, regardless of debug mode)
 			if e.sessionNotes != nil {
@@ -645,13 +565,6 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	}
 
 executeCall:
-	// Checkpoint before destructive operations
-	if e.checkpointMgr != nil && (tc.Name == "write" || tc.Name == "edit" || tc.Name == "bash") {
-		if tc.Name == "write" || tc.Name == "edit" {
-			e.checkpointMgr.Create(tc.Name + ": " + shortPath(tc.Input))
-		}
-	}
-
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err != nil {
 		// Retry once for transient errors (network, timeout, temporary file locks)
@@ -1244,67 +1157,20 @@ func formatToolLine(name, summary string, isError bool) string {
 	return fmt.Sprintf("  %s✓%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
 }
 
-// runTurnEndPipeline executes post-turn background tasks (all non-blocking):
-// 1. Extract memories from conversation (background, costs API credits)
-// 2. Auto-dream consolidation check (background)
-// 3. Generate follow-up suggestions (background, cheap)
-// 4. Flush session notes (background)
-// 5. Background review for auto-learning (background, costs API credits)
+// runTurnEndPipeline executes quiet post-turn persistence only.
 func (e *Engine) runTurnEndPipeline() {
-	msgs := e.messages // capture snapshot
-
-	// Session notes flush (background, no API cost)
+	if e.sessionNotes == nil {
+		return
+	}
 	go func() {
 		defer func() { recover() }()
 		e.sessionNotes.Flush()
 	}()
-
-	// Dream consolidation (background, conditional)
-	go func() {
-		defer func() { recover() }()
-		e.dreamRunner.ExecuteAutoDream(context.Background())
-	}()
-
-	// Background review for auto memory/skill learning
-	go func() {
-		defer func() { recover() }()
-		e.backgroundReview()
-	}()
-
-	// Only run API-calling features if autoExtract is enabled
-	if !e.autoExtract {
-		return
-	}
-
-	// Memory extraction (background)
-	go func() {
-		defer func() { recover() }()
-		e.extractRunner.Extract(context.Background(), msgs)
-	}()
-
-	// Suggestions: run in background to avoid blocking the REPL input loop.
-	// Results are available via Suggestions() for display on next prompt.
-	go func() {
-		defer func() { recover() }()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		sug := e.suggestRunner.Generate(ctx, msgs)
-		e.sugMu.Lock()
-		e.lastSuggestions = sug
-		e.sugMu.Unlock()
-	}()
 }
 
-// Suggestions returns the last generated follow-up suggestions.
-func (e *Engine) Suggestions() []suggest.Suggestion {
-	e.sugMu.Lock()
-	defer e.sugMu.Unlock()
-	return e.lastSuggestions
-}
-
-// SetAutoExtract enables/disables API-calling background features (extract, suggest).
+// SetAutoExtract is kept for CLI compatibility; automatic API-calling background
+// features are disabled in the slimmed-down runtime.
 func (e *Engine) SetAutoExtract(on bool) {
-	e.autoExtract = on
 }
 
 // SessionNotes returns the session notes manager.

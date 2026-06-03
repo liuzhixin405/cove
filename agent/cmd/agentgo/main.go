@@ -14,9 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agentgo/internal/agent"
 	"github.com/agentgo/internal/api"
-	"github.com/agentgo/internal/buddy"
 	"github.com/agentgo/internal/command"
 	"github.com/agentgo/internal/config"
 	ctxt "github.com/agentgo/internal/context"
@@ -27,7 +25,6 @@ import (
 	"github.com/agentgo/internal/log"
 	"github.com/agentgo/internal/mcp"
 	"github.com/agentgo/internal/memory"
-	"github.com/agentgo/internal/onboarding"
 	"github.com/agentgo/internal/permission"
 	"github.com/agentgo/internal/plugin"
 	"github.com/agentgo/internal/repl"
@@ -54,15 +51,6 @@ var (
 	resumeID   = ""
 	dumpPrompt = false
 	noAuto     = false
-
-	buddyOverlayMu sync.Mutex
-	buddyOverlay   struct {
-		valid bool
-		row   int
-		col   int
-		w     int
-		h     int
-	}
 )
 
 func main() {
@@ -148,25 +136,7 @@ func main() {
 	memStore := memory.NewStore()
 	pluginMgr := plugin.NewManager()
 
-	// Parallel initialization of IO-heavy subsystems
-	var initWg sync.WaitGroup
-	initWg.Add(2)
-	go func() { defer initWg.Done(); skills.LoadAll(skillMgr, projCtx.Cwd) }()
-	go func() { defer initWg.Done(); pluginMgr.Init() }()
-
 	mcpPool := mcp.NewPool()
-	for name, sc := range cfg.MCPServers {
-		go func(n string, s config.MCPServerConfig) {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			mcpPool.Connect(ctx, n, mcp.ServerConfig{
-				Command: s.Command, Args: s.Args, Env: s.Env, Type: s.Type, URL: s.URL,
-			})
-		}(name, sc)
-	}
-
-	// Wait for skills and plugins to finish loading before using them
-	initWg.Wait()
 
 	toolReg := registerAllTools(mcpPool, skillMgr)
 	cmdReg := registerAllCommands()
@@ -254,20 +224,6 @@ func main() {
 		eng.SetSystemOverride(cfg.SystemPrompt)
 	}
 
-	agtRunner := agent.NewRunner(agent.Config{
-		Model:     cfg.Model,
-		Provider:  api.ProviderConfig{Name: pc.Name, APIKey: pc.APIKey, BaseURL: pc.BaseURL},
-		Tools:     toolReg.All(),
-		MaxBudget: cfg.MaxBudgetUsd,
-		Debug:     debugMode,
-	})
-	agtRunner.Register("general", "General-purpose sub-agent for complex multi-step tasks.", "You are a sub-agent. Complete the assigned task thoroughly and return a clear result.")
-	agtRunner.Register("explore", "Exploration agent. Searches codebase and gathers context.", "You are a code explorer. Gather relevant context and report findings concisely.")
-	agtRunner.Register("plan", "Planning agent. Designs solutions and creates plans.", "You are a planning agent. Create detailed, structured plans with clear steps.")
-	agtRunner.Register("review", "Code review agent. Checks for bugs, style, security.", "You are a code reviewer. Check for correctness, style, performance, and security.")
-	agtRunner.Register("test", "Testing agent. Writes and runs tests.", "You are a testing agent. Write comprehensive tests and run them.")
-	eng.Runtime().AgentRunner = agtRunner
-
 	_ = pluginMgr
 
 	if resumeMode && resumeID != "" {
@@ -311,32 +267,10 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 	r.Register(tool.NewGrepTool())
 	r.Register(tool.NewGlobTool())
 	r.Register(tool.NewWebFetchTool())
-	r.Register(tool.NewWebSearchTool())
 	r.Register(tool.NewQuestionTool())
 	r.Register(tool.NewTodoWriteTool())
-	r.Register(tool.NewPlanModeTool())
-	r.Register(tool.NewExitPlanModeTool())
-	r.Register(tool.NewEnterWorktreeTool())
-	r.Register(tool.NewExitWorktreeTool())
-	r.Register(tool.NewTaskCreateTool())
-	r.Register(tool.NewTaskListTool())
-	r.Register(tool.NewTaskUpdateTool())
-	r.Register(tool.NewTaskStopTool())
-	r.Register(tool.NewTaskGetTool())
-	r.Register(tool.NewTaskOutputTool())
-	r.Register(tool.NewSleepTool())
-	r.Register(tool.NewBriefTool())
-	r.Register(tool.NewSkillTool())
-	r.Register(tool.NewAgentTool())
-	r.Register(tool.NewTeamCreateTool())
-	r.Register(tool.NewTeamDeleteTool())
-	r.Register(tool.NewCronTool())
-	r.Register(tool.NewSendMessageTool())
-	r.Register(tool.NewLSPTool())
 	r.Register(tool.NewPowerShellTool())
-	r.Register(tool.NewMCPTool(mcpPool))
-	r.Register(tool.NewListMCPResourcesTool(mcpPool))
-	r.Register(tool.NewReadMCPResourceTool(mcpPool))
+	_ = mcpPool
 	_ = skillMgr
 	return r
 }
@@ -352,9 +286,6 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewDiffCmd())
 	r.Register(command.NewMemoryCmd())
 	r.Register(command.NewResumeCmd())
-	r.Register(command.NewMcpCmd())
-	r.Register(command.NewPluginCmd())
-	r.Register(command.NewSkillsCmd())
 	r.Register(command.NewExportCmd())
 	r.Register(command.NewSystemCmd())
 	r.Register(command.NewCdCmd())
@@ -362,8 +293,6 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewPermissionsCmd())
 	r.Register(command.NewStatusCmd())
 	r.Register(command.NewStatsCmd())
-	r.Register(command.NewDreamCmd())
-	r.Register(command.NewBuddyCmd())
 	r.Register(command.NewInitCmd())
 	r.Register(command.NewDiagnoseCmd())
 	return r
@@ -371,19 +300,6 @@ func registerAllCommands() *command.Registry {
 
 func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext, pm *permission.Manager, eng *engine.Engine) {
 	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, pc.GitStatus, len(eng.Registry().All()), pc.IsGitRepo))
-
-	// Project onboarding check
-	obs := onboarding.Check(pc.Cwd)
-	if obs.NeedsOnboarding() {
-		fmt.Fprintf(os.Stderr, "\n  %s💡 未找到 CLAUDE.md。输入 /init 生成项目指南。%s\n", repl.Dim, repl.Reset)
-	}
-
-	// Buddy greeting at session start — print inline (no absolute overlay).
-	if eng.BuddyDisplay != nil {
-		_ = eng.BuddyDisplay.ReactWithMood(buddy.EventStart, "")
-		fmt.Fprintf(os.Stderr, "\n  \x1b[33m%s %s\x1b[0m", buddy.TimeEmoji(), buddy.TimeGreeting())
-		fmt.Fprintf(os.Stderr, "  \x1b[35m🔮 %s\x1b[0m\n\n", eng.BuddyDisplay.Fortune.Today())
-	}
 }
 
 func withInterrupt(f func(ctx context.Context)) {
@@ -468,39 +384,6 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			} else {
 				pendingFailedMsg = nil
 				_ = clearInterruptedDraft()
-				// Progressive onboarding: show tool progress hint on first interaction
-				if eng.OnboardHints() != nil {
-					if hint := eng.OnboardHints().Show(onboarding.HintToolProgress); hint != "" {
-						repl.PrintAbove(hint)
-					}
-				}
-				// Show rate limit status if getting low
-				if eng.RateLimits() != nil {
-					info := eng.RateLimits().Current()
-					if info.HasData() && info.TokensRemaining > 0 && info.TokensLimit > 0 {
-						pct := info.TokensRemaining * 100 / info.TokensLimit
-						if pct < 20 {
-							repl.PrintAbove(fmt.Sprintf("  \x1b[33m⚠ %s\x1b[0m\n", info.Format()))
-						}
-					}
-				}
-				// Buddy reaction after text responses
-				if eng.BuddyDisplay != nil {
-					quip := eng.BuddyDisplay.ReactWithMood(buddy.EventTurn, "")
-					if quip != nil {
-						repl.PrintAbove(buddyFloatingBox(eng.BuddyDisplay))
-					}
-				}
-				// Display follow-up suggestions if available
-				if sug := eng.Suggestions(); len(sug) > 0 {
-					var suggestionLine strings.Builder
-					suggestionLine.WriteString(fmt.Sprintf("  %s💡 建议:%s", repl.Dim, repl.Reset))
-					for _, s := range sug {
-						suggestionLine.WriteString(fmt.Sprintf(" %s%s%s |", repl.Dim, s.Text, repl.Reset))
-					}
-					suggestionLine.WriteString("\n")
-					repl.PrintAbove(suggestionLine.String())
-				}
 			}
 
 			taskRunning = false
@@ -552,16 +435,6 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		return 0, false
 	}
 
-	// Start buddy proactive idle chat listener
-	if eng.BuddyDisplay != nil {
-		go func() {
-			for msg := range eng.BuddyDisplay.IdleChatCh() {
-				repl.PrintAbove(fmt.Sprintf("  \x1b[36m💬 %s: %s\x1b[0m", eng.BuddyDisplay.Name(), msg))
-			}
-		}()
-		defer eng.BuddyDisplay.StopIdleChat()
-	}
-
 	// On startup, check for interrupted draft and notify user
 	if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
 		title := draft.Title
@@ -611,10 +484,6 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			continue
 		}
 
-		// Mark activity to reset buddy idle timer
-		if eng.BuddyDisplay != nil {
-			eng.BuddyDisplay.MarkActivity()
-		}
 		if historyPickPending && !strings.HasPrefix(input, "/") {
 			if isPositiveNumber(input) {
 				handleHistoryResume(input, eng)
@@ -819,37 +688,6 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			}
 		case strings.HasPrefix(input, "/export"):
 			handleExport(input, eng)
-		case input == "/undo":
-			if eng.CheckpointMgr() != nil {
-				if err := eng.CheckpointMgr().Restore(""); err != nil {
-					fmt.Printf("回退失败: %v\n", err)
-				} else {
-					fmt.Println("✓ 已回退到上一个检查点")
-				}
-			} else {
-				fmt.Println("检查点功能未初始化")
-			}
-		case input == "/checkpoints":
-			if eng.CheckpointMgr() != nil {
-				list := eng.CheckpointMgr().List()
-				if len(list) == 0 {
-					fmt.Println("暂无检查点")
-				} else {
-					fmt.Println("检查点记录:")
-					for _, cp := range list {
-						fmt.Println("  " + cp)
-					}
-				}
-			}
-		case input == "/ratelimit":
-			if eng.RateLimits() != nil {
-				info := eng.RateLimits().Current()
-				if info.HasData() {
-					fmt.Println("速率限制: " + info.Format())
-				} else {
-					fmt.Println("暂无速率限制数据（需至少一次 API 调用）")
-				}
-			}
 		case strings.HasPrefix(input, "/resume") || input == "/resume":
 			sessionID := ""
 			if strings.HasPrefix(input, "/resume ") {
@@ -873,10 +711,6 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				eng.Compact(ctx)
 				fmt.Println("上下文窗口已压缩。")
 			})
-		case strings.HasPrefix(input, "/skill") || input == "/skills":
-			handleSkill(input, eng)
-		case isSkillInvocation(input, eng):
-			handleSkillInvocation(input, eng)
 		case strings.HasPrefix(input, "/"):
 			if handleUnknownCmd(input, cmdReg) {
 				continue
@@ -961,9 +795,6 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 		cmdEntry{Name: "/base-url", Desc: "设置 API 地址", Type: "config"},
 		cmdEntry{Name: "/mode", Desc: "设置权限模式 (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
 		cmdEntry{Name: "/budget", Desc: "设置预算上限 ($)", Type: "config"},
-		cmdEntry{Name: "/undo", Desc: "回退到上一个检查点", Type: "builtin"},
-		cmdEntry{Name: "/checkpoints", Desc: "列出所有检查点", Type: "builtin"},
-		cmdEntry{Name: "/ratelimit", Desc: "查看 API 速率限制", Type: "builtin"},
 		cmdEntry{Name: "/attach", Desc: "挂载图片或文件到后续提问", Type: "builtin", ArgHints: map[string][]string{"": {"list", "clear", "remove", "add"}}},
 		cmdEntry{Name: "/help", Desc: "显示帮助", Type: "builtin"},
 		cmdEntry{Name: "/exit", Desc: "退出", Type: "builtin"},
@@ -1369,8 +1200,6 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 		MCPPool:           mcpPool,
 		ProjectContext:    projCtx,
 		AppState:          appState,
-		BuddyDisplay:      eng.BuddyDisplay,
-		BuddyChat:         eng.BuddyChat,
 		Provider:          eng.Provider(),
 	})
 	if err != nil {
@@ -1568,10 +1397,6 @@ func autoSaveSession(eng *engine.Engine) {
 		ch.Add(sessionID, model, eng.CostTracker())
 		ch.Save()
 		fmt.Println("会话已自动保存。")
-	}
-	// Save buddy chat history
-	if eng.BuddyChat != nil {
-		_ = eng.BuddyChat.SaveHistory()
 	}
 }
 
@@ -2218,40 +2043,6 @@ func missingAPIKeyMessage(provider string) string {
 		primaryEnv,
 		openAICompatList,
 	)
-}
-
-// buddyFloatingBox renders the buddy sprite as regular scrollback output.
-// Avoid absolute-position overlays here: the REPL already has a fixed input
-// region, and another overlay can erase user-visible output or the input box.
-func buddyFloatingBox(d *buddy.Display) string {
-	buddyOverlayMu.Lock()
-	defer buddyOverlayMu.Unlock()
-
-	rendered := d.RenderWithBubble()
-	prefs := d.Preferences()
-	if prefs.Overlay == buddy.OverlayOff {
-		buddyOverlay.valid = false
-		return ""
-	}
-	lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
-	if len(lines) == 0 {
-		return ""
-	}
-
-	// Keep mood line inside the floating block.
-	m := d.Mood.Current()
-	lines = append(lines, fmt.Sprintf("%s %s  Lv.%d", buddy.MoodEmoji(m), buddy.MoodLabel(m), d.XP.Level))
-
-	var sb strings.Builder
-	sb.WriteString("\x1b[36m")
-	for _, line := range lines {
-		sb.WriteString("  ")
-		sb.WriteString(line)
-		sb.WriteString("\n")
-	}
-	sb.WriteString("\x1b[0m")
-	buddyOverlay.valid = false
-	return sb.String()
 }
 
 func visibleRuneWidth(s string) int {
