@@ -2,6 +2,12 @@ package skills
 
 import "testing"
 
+func TestInstallHTTPClientHasTimeout(t *testing.T) {
+	if installHTTPClient.Timeout <= 0 {
+		t.Fatal("InstallSkill HTTP client should have a timeout")
+	}
+}
+
 func TestRegisterBundlesIncludesClaudeStyleBuiltins(t *testing.T) {
 	mgr := NewManager()
 	RegisterBundles(mgr)
@@ -32,4 +38,3 @@ func TestRegisterBundlesIncludesClaudeStyleBuiltins(t *testing.T) {
 		}
 	}
 }
-

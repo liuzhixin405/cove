@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,27 +65,33 @@ func Load() (*Config, error) {
 		p := filepath.Join(dir, "config.json")
 		data, err := os.ReadFile(p)
 		if err == nil {
-			json.Unmarshal(data, cfg)
+			if err := json.Unmarshal(data, cfg); err != nil {
+				applyDefaults(cfg)
+				return cfg, fmt.Errorf("parse config %s: %w", p, err)
+			}
 		}
 	}
-	loadProjectOverride(cfg)
+	if err := loadProjectOverride(cfg); err != nil {
+		applyDefaults(cfg)
+		return cfg, err
+	}
 	applyDefaults(cfg)
 	return cfg, nil
 }
 
-func loadProjectOverride(cfg *Config) {
+func loadProjectOverride(cfg *Config) error {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return
+		return nil
 	}
 	p := filepath.Join(cwd, ".agentgo.json")
 	data, err := os.ReadFile(p)
 	if err != nil {
-		return
+		return nil
 	}
 	var override Config
 	if err := json.Unmarshal(data, &override); err != nil {
-		return
+		return fmt.Errorf("parse project config %s: %w", p, err)
 	}
 	if override.Model != "" {
 		cfg.Model = override.Model
@@ -101,6 +108,7 @@ func loadProjectOverride(cfg *Config) {
 	if len(override.MCPServers) > 0 {
 		cfg.MCPServers = override.MCPServers
 	}
+	return nil
 }
 
 func applyDefaults(cfg *Config) {

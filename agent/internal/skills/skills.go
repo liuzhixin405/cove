@@ -42,7 +42,8 @@ type frontmatter struct {
 func NewManager() *Manager { return &Manager{skills: make(map[string]Skill)} }
 
 func (m *Manager) AddDirectory(dir string) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.dirs = append(m.dirs, dir)
 	m.scanDir(dir)
 }
@@ -63,19 +64,29 @@ func (m *Manager) loadSkillFromDir(dir string) { m.loadSkillFile(filepath.Join(d
 
 func (m *Manager) loadSkillFile(path string) {
 	data, err := os.ReadFile(path)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	content := string(data)
 	name := strings.TrimSuffix(filepath.Base(path), ".md")
-	if name == "SKILL" || name == "skill" { name = filepath.Base(filepath.Dir(path)) }
+	if name == "SKILL" || name == "skill" {
+		name = filepath.Base(filepath.Dir(path))
+	}
 	fm := parseFrontmatter(content)
 	body := content
 	if fm != nil {
 		body = fm.Body
-		if fm.Name != "" { name = fm.Name }
+		if fm.Name != "" {
+			name = fm.Name
+		}
 	}
 	desc := body
-	if idx := strings.Index(body, "\n"); idx > 0 { desc = strings.TrimSpace(body[:idx]) }
-	if len(desc) > 120 { desc = desc[:117] + "..." }
+	if idx := strings.Index(body, "\n"); idx > 0 {
+		desc = strings.TrimSpace(body[:idx])
+	}
+	if len(desc) > 120 {
+		desc = desc[:117] + "..."
+	}
 	skill := Skill{Name: name, Description: desc, Prompt: body, FilePath: path, Directory: filepath.Dir(path)}
 	if fm != nil {
 		skill.Conditional = len(fm.Paths) > 0
@@ -86,66 +97,96 @@ func (m *Manager) loadSkillFile(path string) {
 }
 
 func parseFrontmatter(content string) *frontmatter {
-	if !strings.HasPrefix(content, "---\n") { return nil }
+	if !strings.HasPrefix(content, "---\n") {
+		return nil
+	}
 	end := strings.Index(content[4:], "\n---\n")
-	if end == -1 { return nil }
+	if end == -1 {
+		return nil
+	}
 	fmRaw := content[4 : 4+end]
 	body := content[4+end+5:]
 	fm := &frontmatter{Body: body}
 	sc := bufio.NewScanner(strings.NewReader(fmRaw))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		if line == "" { continue }
+		if line == "" {
+			continue
+		}
 		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 { continue }
+		if len(parts) != 2 {
+			continue
+		}
 		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		switch k {
-		case "name": fm.Name = v
-		case "description": fm.Description = v
+		case "name":
+			fm.Name = v
+		case "description":
+			fm.Description = v
 		case "paths":
-			for _, p := range strings.Split(v, ",") { fm.Paths = append(fm.Paths, strings.TrimSpace(p)) }
+			for _, p := range strings.Split(v, ",") {
+				fm.Paths = append(fm.Paths, strings.TrimSpace(p))
+			}
 		case "allowed_tools":
-			for _, t := range strings.Split(v, ",") { fm.AllowedTools = append(fm.AllowedTools, strings.TrimSpace(t)) }
+			for _, t := range strings.Split(v, ",") {
+				fm.AllowedTools = append(fm.AllowedTools, strings.TrimSpace(t))
+			}
 		}
 	}
 	return fm
 }
 
 func (m *Manager) Register(skill Skill) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.skills[skill.Name] = skill
 }
 
 func (m *Manager) Get(name string) (Skill, bool) {
-	m.mu.RLock(); defer m.mu.RUnlock()
-	s, ok := m.skills[name]; return s, ok
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.skills[name]
+	return s, ok
 }
 
 func (m *Manager) All() []Skill {
-	m.mu.RLock(); defer m.mu.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var r []Skill
-	for _, s := range m.skills { r = append(r, s) }
+	for _, s := range m.skills {
+		r = append(r, s)
+	}
 	return r
 }
 
 func (m *Manager) Matching(ctx context.Context, s string) []Skill {
-	m.mu.RLock(); defer m.mu.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var r []Skill
 	for _, sk := range m.skills {
-		if !sk.Conditional || strings.Contains(strings.ToLower(s), strings.ToLower(sk.Name)) { r = append(r, sk) }
+		if !sk.Conditional || strings.Contains(strings.ToLower(s), strings.ToLower(sk.Name)) {
+			r = append(r, sk)
+		}
 	}
 	return r
 }
 
 func (m *Manager) BuildPrompt() string {
-	m.mu.RLock(); defer m.mu.RUnlock()
-	if len(m.skills) == 0 { return "" }
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.skills) == 0 {
+		return ""
+	}
 	var sb strings.Builder
 	sb.WriteString("\n\n<available_skills>\n")
 	for _, s := range m.skills {
 		sb.WriteString("<skill>\n  <name>" + s.Name + "</name>\n  <description>" + s.Description + "</description>\n")
-		if len(s.AllowedTools) > 0 { sb.WriteString("  <allowed_tools>" + strings.Join(s.AllowedTools, ",") + "</allowed_tools>\n") }
-		if len(s.Paths) > 0 { sb.WriteString("  <paths>" + strings.Join(s.Paths, ",") + "</paths>\n") }
+		if len(s.AllowedTools) > 0 {
+			sb.WriteString("  <allowed_tools>" + strings.Join(s.AllowedTools, ",") + "</allowed_tools>\n")
+		}
+		if len(s.Paths) > 0 {
+			sb.WriteString("  <paths>" + strings.Join(s.Paths, ",") + "</paths>\n")
+		}
 		sb.WriteString("</skill>\n")
 	}
 	sb.WriteString("</available_skills>\n")
@@ -163,6 +204,7 @@ type RegistryEntry struct {
 
 var RegistryURL = "https://raw.githubusercontent.com/agentgo/skills-registry/main/skills-registry.json"
 var fallbackJSON = `[{"name":"security-audit","description":"Security audit: scan deps, check vulnerabilities.","author":"marketplace"},{"name":"api-design","description":"REST API design: endpoints, schemas, OpenAPI.","author":"marketplace"},{"name":"dockerize","description":"Docker: Dockerfile, compose, build, push.","author":"marketplace"},{"name":"i18n","description":"Internationalization: extract strings, translations.","author":"marketplace"},{"name":"ci-cd","description":"CI/CD: Actions, pipelines, testing.","author":"marketplace"}]`
+var installHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 func FetchRegistry() ([]RegistryEntry, error) {
 	c := &http.Client{Timeout: 10 * time.Second}
@@ -171,7 +213,9 @@ func FetchRegistry() ([]RegistryEntry, error) {
 		defer resp.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var entries []RegistryEntry
-		if json.Unmarshal(data, &entries) == nil { return entries, nil }
+		if json.Unmarshal(data, &entries) == nil {
+			return entries, nil
+		}
 	}
 	var fallback []RegistryEntry
 	json.Unmarshal([]byte(fallbackJSON), &fallback)
@@ -185,8 +229,10 @@ func InstallSkill(name, source, url string) error {
 
 	var content string
 	if source == "url" && url != "" {
-		resp, err := http.Get(url)
-		if err != nil { return fmt.Errorf("download: %w", err) }
+		resp, err := installHTTPClient.Get(url)
+		if err != nil {
+			return fmt.Errorf("download: %w", err)
+		}
 		defer resp.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
 		content = string(data)
@@ -220,7 +266,9 @@ var bundles = []Skill{
 }
 
 func RegisterBundles(m *Manager) {
-	for _, s := range bundles { m.Register(s) }
+	for _, s := range bundles {
+		m.Register(s)
+	}
 }
 
 func LoadAll(m *Manager, cwd string) {
@@ -247,7 +295,9 @@ func LoadAll(m *Manager, cwd string) {
 		for {
 			parent := filepath.Dir(dir)
 			m.AddDirectory(filepath.Join(parent, ".claude", "skills"))
-			if parent == dir { break }
+			if parent == dir {
+				break
+			}
 			dir = parent
 		}
 	}

@@ -8,7 +8,7 @@ import (
 )
 
 func TestNewError(t *testing.T) {
-	e := New(ErrConfigMissing, "/home/user/.agentgo/config.yaml")
+	e := New(ErrConfigMissing, "/home/user/.agentgo/config.json")
 	if e == nil {
 		t.Fatal("expected non-nil error")
 	}

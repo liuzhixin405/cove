@@ -55,10 +55,10 @@ func (t *WriteTool) Call(ctx context.Context, input Input, tctx Context) (Result
 		}
 		return Result{Data: fmt.Sprintf("Error: filePath required (received keys: %v)", keys), IsError: true}, nil
 	}
-	if !filepath.IsAbs(path) && tctx.Cwd != "" {
-		path = filepath.Join(tctx.Cwd, path)
+	path, err := resolvePathInCwd(path, tctx, true)
+	if err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
-	path = filepath.Clean(path)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return Result{Data: "Error: mkdir: " + err.Error(), IsError: true}, nil

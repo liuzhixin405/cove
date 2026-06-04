@@ -189,13 +189,13 @@ func (c *Checker) RunQuick() *Report {
 
 func (c *Checker) checkConfigExists(_ context.Context) CheckResult {
 	res := CheckResult{Name: "config_exists", Title: "配置文件"}
-	cfgPath := filepath.Join(c.homeDir, ".agentgo", "config.yaml")
+	cfgPath := filepath.Join(c.homeDir, ".agentgo", "config.json")
 
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		// Try to auto-fix by creating default config
 		dir := filepath.Dir(cfgPath)
 		if err := os.MkdirAll(dir, 0750); err == nil {
-			defaultCfg := "# AgentGo 配置文件\nprovider:\n  name: deepseek\n  base_url: https://api.deepseek.com/v1\nmodel: auto\npermission_mode: ask\n"
+			defaultCfg := "{\n  \"provider\": {\n    \"name\": \"deepseek\",\n    \"base_url\": \"https://api.deepseek.com/v1\"\n  },\n  \"model\": \"auto\",\n  \"permission_mode\": \"ask\"\n}\n"
 			if err := os.WriteFile(cfgPath, []byte(defaultCfg), 0640); err == nil {
 				res.Status = SevRecovered
 				res.Error = NewFixed(ErrConfigMissing, cfgPath)

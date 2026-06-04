@@ -7,13 +7,13 @@ import (
 type CmdCategory int
 
 const (
-	CatUnknown  CmdCategory = iota
-	CatSafe     // 只读，永远安全
-	CatGit      // git 操作，需区分读/写
-	CatBuild    // 构建/测试，需看具体命令
-	CatInstall  // 包管理器安装
-	CatFileWrite // 写文件
-	CatDangerous // rm -rf, fork bomb, etc.
+	CatUnknown   CmdCategory = iota
+	CatSafe                  // 只读，永远安全
+	CatGit                   // git 操作，需区分读/写
+	CatBuild                 // 构建/测试，需看具体命令
+	CatInstall               // 包管理器安装
+	CatFileWrite             // 写文件
+	CatDangerous             // rm -rf, fork bomb, etc.
 )
 
 type Classifier struct{}
@@ -30,6 +30,9 @@ func (c *Classifier) Classify(cmd string) CmdCategory {
 
 	if c.isDangerous(cmd) {
 		return CatDangerous
+	}
+	if c.hasShellControlOperator(cmd) {
+		return CatUnknown
 	}
 
 	switch base {
@@ -73,13 +76,23 @@ func (c *Classifier) isDangerous(cmd string) bool {
 		"chmod 777", "chmod -R 777",
 		"mv /*", "cp /*",
 		"> /dev/sda", "of=/dev/",
-		"wget -O - | sh", "curl | sh", "curl | bash",
+		"wget -O - | sh", "curl | sh", "curl | bash", "| sh", "| bash",
 		"eval ", "exec ",
 		"format c:", "format d:",
 		"del /f /s", "rd /s /q",
 	}
 	for _, d := range dangerous {
 		if strings.Contains(strings.ToLower(cmd), d) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Classifier) hasShellControlOperator(cmd string) bool {
+	operators := []string{"&&", "||", ";", "|", "`", "$(", " >", "<"}
+	for _, op := range operators {
+		if strings.Contains(cmd, op) {
 			return true
 		}
 	}

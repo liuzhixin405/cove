@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -37,10 +36,10 @@ func (t *ReadTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		return Result{Data: "Error: filePath is required", IsError: true}, nil
 	}
 
-	if !filepath.IsAbs(path) && tctx.Cwd != "" {
-		path = filepath.Join(tctx.Cwd, path)
+	path, err := resolvePathInCwd(path, tctx, false)
+	if err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
-	path = filepath.Clean(path)
 
 	info, err := os.Stat(path)
 	if err != nil {

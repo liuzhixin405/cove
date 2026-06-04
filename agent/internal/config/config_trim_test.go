@@ -104,3 +104,35 @@ func TestLoadResolvesAutoModelForDeepSeekProvider(t *testing.T) {
 		t.Fatalf("cfg.Model = %q, want %q", got, want)
 	}
 }
+
+func TestLoadReturnsErrorForInvalidConfigJSON(t *testing.T) {
+	home := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldUserProfile := os.Getenv("USERPROFILE")
+	t.Cleanup(func() {
+		_ = os.Setenv("HOME", oldHome)
+		_ = os.Setenv("USERPROFILE", oldUserProfile)
+	})
+	if err := os.Setenv("HOME", home); err != nil {
+		t.Fatalf("set HOME: %v", err)
+	}
+	if err := os.Setenv("USERPROFILE", home); err != nil {
+		t.Fatalf("set USERPROFILE: %v", err)
+	}
+
+	dir := filepath.Join(home, ".agentgo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"model":`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err == nil {
+		t.Fatal("expected invalid JSON error")
+	}
+	if cfg == nil || cfg.Model == "" {
+		t.Fatalf("expected defaulted config with error, got %#v", cfg)
+	}
+}

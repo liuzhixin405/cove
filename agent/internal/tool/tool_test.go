@@ -2,6 +2,9 @@ package tool
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +37,42 @@ func TestWriteTool(t *testing.T) {
 	perm = tw.CheckPermissions(nil, Context{PermissionMode: "plan"})
 	if perm.Decision != Deny {
 		t.Errorf("expected Deny in plan mode, got %v", perm.Decision)
+	}
+}
+
+func TestReadWriteToolsStayWithinCwd(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	read := NewReadTool()
+	result, _ := read.Call(context.Background(), Input{"filePath": outsideFile}, Context{Cwd: root})
+	if !result.IsError || !strings.Contains(result.Data, "outside working directory") {
+		t.Fatalf("expected outside read to be denied, got %+v", result)
+	}
+
+	write := NewWriteTool()
+	result, _ = write.Call(context.Background(), Input{"filePath": filepath.Join(outside, "out.txt"), "content": "data"}, Context{Cwd: root})
+	if !result.IsError || !strings.Contains(result.Data, "outside working directory") {
+		t.Fatalf("expected outside write to be denied, got %+v", result)
+	}
+}
+
+func TestWriteToolDeniesSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	write := NewWriteTool()
+	result, _ := write.Call(context.Background(), Input{"filePath": filepath.Join(link, "nested", "out.txt"), "content": "data"}, Context{Cwd: root})
+	if !result.IsError || !strings.Contains(result.Data, "outside working directory") {
+		t.Fatalf("expected symlink escape write to be denied, got %+v", result)
 	}
 }
 

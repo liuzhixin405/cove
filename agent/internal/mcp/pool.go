@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -89,8 +91,8 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 }
 
 func NewSTDIOTransport(name string, cfg ServerConfig) (Transport, error) {
-	if cfg.Command == "" {
-		return nil, fmt.Errorf("server %s: command is required", name)
+	if err := validateSTDIOCommand(cfg.Command); err != nil {
+		return nil, fmt.Errorf("server %s: %w", name, err)
 	}
 	args := cfg.Args
 	env := make(map[string]string, len(cfg.Env))
@@ -98,6 +100,27 @@ func NewSTDIOTransport(name string, cfg ServerConfig) (Transport, error) {
 		env[k] = v
 	}
 	return NewStdioTransport(cfg.Command, args, env)
+}
+
+func validateSTDIOCommand(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("command is required")
+	}
+	if strings.ContainsAny(command, ";&|`$<>\r\n") {
+		return fmt.Errorf("command contains shell control characters")
+	}
+
+	base := strings.ToLower(filepath.Base(command))
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	shells := map[string]bool{
+		"sh": true, "bash": true, "zsh": true, "ksh": true, "fish": true,
+		"cmd": true, "powershell": true, "pwsh": true,
+	}
+	if shells[base] {
+		return fmt.Errorf("shell wrappers are not allowed for MCP stdio servers: %s", command)
+	}
+	return nil
 }
 
 func (p *Pool) Disconnect(name string) {

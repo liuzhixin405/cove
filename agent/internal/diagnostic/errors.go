@@ -135,8 +135,8 @@ var registry = map[ErrorCode]*ErrorDef{}
 
 func init() {
 	// Config errors — all config fixes are hot-reloadable (take effect immediately)
-	register(&ErrorDef{ErrConfigMissing, CatConfig, SevFatal, "配置文件不存在", "找不到配置文件: %s", "运行 /init 创建默认配置，或手动创建 ~/.agentgo/config.yaml", true, true})
-	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevFatal, "配置文件格式错误", "YAML解析失败: %s", "检查配置文件语法，或删除后重新生成", true, true})
+	register(&ErrorDef{ErrConfigMissing, CatConfig, SevFatal, "配置文件不存在", "找不到配置文件: %s", "运行 /init 创建默认配置，或手动创建 ~/.agentgo/config.json", true, true})
+	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevFatal, "配置文件格式错误", "JSON解析失败: %s", "检查配置文件语法，或删除后重新生成", true, true})
 	register(&ErrorDef{ErrConfigModelInvalid, CatConfig, SevError, "模型名无效", "模型 '%s' 不被当前 provider 支持", "使用 /model 命令切换模型，或在配置中设置有效模型名", true, true})
 	register(&ErrorDef{ErrConfigProviderEmpty, CatConfig, SevFatal, "未配置 Provider", "provider.name 为空", "在配置中设置 provider.name (如 deepseek, openai, anthropic)", false, false})
 	register(&ErrorDef{ErrConfigAPIKeyMissing, CatConfig, SevFatal, "API Key 未设置", "provider '%s' 需要 API Key", "设置环境变量 LLM_API_KEY 或在配置中设置 provider.api_key", false, false})

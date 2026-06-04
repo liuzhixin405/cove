@@ -554,17 +554,17 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 				if e.OnPermissionDone != nil {
 					e.OnPermissionDone()
 				}
-				if approved {
-					// User approved, continue execution
-					goto executeCall
+				if !approved {
+					return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
 				}
+			} else {
+				return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
 			}
-			return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
+		} else {
+			return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 		}
-		return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 	}
 
-executeCall:
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err != nil {
 		// Retry once for transient errors (network, timeout, temporary file locks)
