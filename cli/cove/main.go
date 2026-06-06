@@ -228,6 +228,8 @@ func main() {
 
 	skillMgr := skills.NewManager()
 
+	skills.LoadAll(skillMgr, projCtx.Cwd)
+
 	memStore := memory.NewStore()
 
 	pluginMgr := plugin.NewManager()
@@ -469,6 +471,14 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 	r.Register(tool.NewSkillsListTool())
 
 	r.Register(tool.NewSkillViewTool())
+
+	// MCP proxy tools — expose tools/resources from connected MCP servers to the
+	// agent so it can invoke external capabilities once a server is connected.
+	r.Register(tool.NewMCPTool(mcpPool))
+
+	r.Register(tool.NewListMCPResourcesTool(mcpPool))
+
+	r.Register(tool.NewReadMCPResourceTool(mcpPool))
 
 	return r
 

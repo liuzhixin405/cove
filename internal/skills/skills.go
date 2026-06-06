@@ -2,12 +2,12 @@ package skills
 
 import (
 	"bufio"
-	"embed"
-	"io/fs"
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +23,7 @@ type Skill struct {
 	Conditional  bool     `json:"conditional,omitempty"`
 	Paths        []string `json:"paths,omitempty"`
 	AllowedTools []string `json:"allowed_tools,omitempty"`
+	Builtin      bool     `json:"-"`
 	FilePath     string   `json:"-"`
 	Directory    string   `json:"-"`
 }
@@ -69,11 +70,16 @@ func (m *Manager) loadSkillFile(path string) {
 	if err != nil {
 		return
 	}
-	content := string(data)
 	name := strings.TrimSuffix(filepath.Base(path), ".md")
 	if name == "SKILL" || name == "skill" {
 		name = filepath.Base(filepath.Dir(path))
 	}
+	m.skills[name] = parseSkill(name, string(data), path)
+}
+
+// parseSkill builds a Skill from raw SKILL.md content. It is a pure function
+// (no locking, no I/O) so it can be reused for both on-disk and embedded skills.
+func parseSkill(name, content, path string) Skill {
 	fm := parseFrontmatter(content)
 	body := content
 	if fm != nil {
@@ -86,6 +92,9 @@ func (m *Manager) loadSkillFile(path string) {
 	if idx := strings.Index(body, "\n"); idx > 0 {
 		desc = strings.TrimSpace(body[:idx])
 	}
+	if fm != nil && fm.Description != "" {
+		desc = fm.Description
+	}
 	if len(desc) > 120 {
 		desc = desc[:117] + "..."
 	}
@@ -95,7 +104,7 @@ func (m *Manager) loadSkillFile(path string) {
 		skill.Paths = fm.Paths
 		skill.AllowedTools = fm.AllowedTools
 	}
-	m.skills[name] = skill
+	return skill
 }
 
 func parseFrontmatter(content string) *frontmatter {
@@ -270,10 +279,9 @@ func InstallSkill(name, source, url string) error {
 	return os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0644)
 }
 
-
-
 // SeedDefaultSkills ensures built-in skills are present on disk.
 // On first run, copies the bundled SKILL.md files to ~/.cove/skills/.
+//
 //go:embed embedded
 var embeddedSkills embed.FS
 
@@ -309,11 +317,15 @@ func SeedDefaultSkills() {
 	}
 }
 
-
-
 func LoadAll(m *Manager, cwd string) {
-	SeedDefaultSkills()
+	// Built-in skills are loaded directly from the embedded filesystem into
+	// memory. This makes them available out of the box (no config required) and
+	// keeps them in sync with the binary on every upgrade.
+	m.LoadEmbedded()
 
+	// User- and project-level skills are loaded next. Because AddDirectory
+	// registers by name, a local skill with the same name transparently
+	// overrides the built-in one, allowing customization.
 	home, _ := os.UserHomeDir()
 	if home != "" {
 		m.AddDirectory(filepath.Join(home, ".cove", "skills"))
@@ -340,5 +352,30 @@ func LoadAll(m *Manager, cwd string) {
 			}
 			dir = parent
 		}
+	}
+}
+
+// LoadEmbedded registers all built-in skills bundled with the binary directly
+// into memory, without copying them to disk.
+func (m *Manager) LoadEmbedded() {
+	entries, err := fs.ReadDir(embeddedSkills, "embedded")
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		srcPath := "embedded/" + name + "/SKILL.md"
+		data, err := embeddedSkills.ReadFile(srcPath)
+		if err != nil {
+			continue
+		}
+		sk := parseSkill(name, string(data), srcPath)
+		sk.Builtin = true
+		m.skills[sk.Name] = sk
 	}
 }
