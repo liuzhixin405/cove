@@ -449,12 +449,17 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		sc = p.client
 	}
 
+	// Idle watchdog: abort the stream if no data arrives for streamIdleTimeout,
+	// preventing the UI from hanging forever on a silently dropped connection.
+	streamCtx, markProgress, stopWatchdog := newStreamWatchdog(ctx)
+	defer stopWatchdog()
+
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output; we therefore never retry after streaming begins.
 	var httpResp *http.Response
 	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
+		httpReq, err := http.NewRequestWithContext(streamCtx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
@@ -517,6 +522,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		markProgress() // reset the idle watchdog on every received line
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || line == "data: [DONE]" {
 			continue
@@ -566,6 +572,11 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 
 	// Check for scanner errors (e.g. line too long even with expanded buffer)
 	if err := scanner.Err(); err != nil {
+		// If the watchdog cancelled the read (idle stall) while the caller did
+		// not cancel, surface a clear timeout error instead of a generic one.
+		if streamCtx.Err() != nil && ctx.Err() == nil {
+			return nil, fmt.Errorf("stream stalled: no data received for %s", streamIdleTimeout)
+		}
 		return nil, fmt.Errorf("stream read error: %w", err)
 	}
 

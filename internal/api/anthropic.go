@@ -348,12 +348,17 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		sc = p.client
 	}
 
+	// Idle watchdog: abort the stream if no data arrives for streamIdleTimeout,
+	// preventing the UI from hanging forever on a silently dropped connection.
+	streamCtx, markProgress, stopWatchdog := newStreamWatchdog(ctx)
+	defer stopWatchdog()
+
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output.
 	var httpResp *http.Response
 	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
+		httpReq, err := http.NewRequestWithContext(streamCtx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
@@ -409,11 +414,16 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil && err != io.EOF {
+			// Distinguish an idle-watchdog abort from a genuine read error.
+			if streamCtx.Err() != nil && ctx.Err() == nil {
+				return nil, fmt.Errorf("stream stalled: no data received for %s", streamIdleTimeout)
+			}
 			return nil, fmt.Errorf("read anthropic SSE: %w", err)
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		markProgress() // reset the idle watchdog on every received line
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data: ") {
 			payload := strings.TrimPrefix(trimmed, "data: ")

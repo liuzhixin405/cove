@@ -151,6 +151,60 @@ func defaultHTTPTransport() *http.Transport {
 	return sharedTransport
 }
 
+// streamIdleTimeout is the maximum time a streaming response may go without
+// producing any new data before it is considered stalled. The streaming HTTP
+// clients intentionally have no overall Timeout (so long answers aren't cut
+// off), so this watchdog is what prevents the UI from hanging forever on
+// "思考中..." when a connection silently drops or the server stops sending.
+const streamIdleTimeout = 180 * time.Second
+
+// newStreamWatchdog derives a context that is cancelled if markProgress is not
+// called within streamIdleTimeout. Build the streaming HTTP request with the
+// returned context so that a stall aborts the blocking body read. Call
+// markProgress on every received chunk, and defer stop to release resources.
+func newStreamWatchdog(parent context.Context) (ctx context.Context, markProgress func(), stop func()) {
+	ctx, cancel := context.WithCancel(parent)
+	timer := time.NewTimer(streamIdleTimeout)
+	progress := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-timer.C:
+				cancel() // stalled: abort the in-flight read
+				return
+			case <-progress:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(streamIdleTimeout)
+			}
+		}
+	}()
+	markProgress = func() {
+		select {
+		case progress <- struct{}{}:
+		default:
+		}
+	}
+	var stopOnce sync.Once
+	stop = func() {
+		stopOnce.Do(func() {
+			close(done)
+			cancel()
+		})
+	}
+	return ctx, markProgress, stop
+}
+
 type AgentRunResult struct {
 	Output  string
 	Cost    float64
