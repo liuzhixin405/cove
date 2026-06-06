@@ -77,7 +77,7 @@ def copy_latest_tree(src_dir: Path, latest_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build release artifacts for agentgo")
+    parser = argparse.ArgumentParser(description="Build release artifacts for cove")
     parser.add_argument("version", help="semantic version, with or without leading v")
     args = parser.parse_args()
 
@@ -85,7 +85,6 @@ def main():
     version_plain = version[1:]
 
     repo_root = Path(__file__).resolve().parents[1]
-    project_dir = repo_root / "agent"
     dist_dir = repo_root / "dist" / version
     dist_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,7 +99,7 @@ def main():
     go_bin = find_go_binary()
 
     for goos, goarch, exe_suffix, archive_kind in TARGETS:
-        binary_name = f"agentgo-{version}-{goos}-{goarch}{exe_suffix}"
+        binary_name = f"cove-{version}-{goos}-{goarch}{exe_suffix}"
         binary_path = dist_dir / binary_name
         env = os.environ.copy()
         env.update({
@@ -109,20 +108,20 @@ def main():
             "CGO_ENABLED": "0",
         })
         ldflags = f"-X main.Version={version_plain} -X main.BuildTime={build_time} -X main.GitCommit={commit}"
-        output_arg = os.path.relpath(binary_path, project_dir)
+        output_arg = os.path.relpath(binary_path, repo_root)
         run([
             go_bin, "build",
             "-ldflags", ldflags,
             "-o", output_arg,
-            "./cmd/agentgo",
-        ], cwd=project_dir, env=env)
+            "./cmd/cove",
+        ], cwd=repo_root, env=env)
 
         if archive_kind == "zip":
-            archive_path = dist_dir / f"agentgo-{version}-{goos}-{goarch}.zip"
-            zip_single(binary_path, archive_path, arcname=f"agentgo{exe_suffix}")
+            archive_path = dist_dir / f"cove-{version}-{goos}-{goarch}.zip"
+            zip_single(binary_path, archive_path, arcname=f"cove{exe_suffix}")
         else:
-            archive_path = dist_dir / f"agentgo-{version}-{goos}-{goarch}.tar.gz"
-            tar_gz_single(binary_path, archive_path, arcname="agentgo")
+            archive_path = dist_dir / f"cove-{version}-{goos}-{goarch}.tar.gz"
+            tar_gz_single(binary_path, archive_path, arcname="cove")
 
         checksums.append((archive_path.name, sha256_file(archive_path)))
 

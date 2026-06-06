@@ -1,8 +1,15 @@
 # Build output
 /dist/
-agent/agentgo.exe
-agent/*.exe
-agent/*.exe~
+cove.exe
+cove
+*.exe
+*.exe~
+
+# Session runtime data
+.agentgo/
+.cove/
+internal/engine/.agentgo/
+internal/engine/.cove/
 
 # Python
 /scripts/__pycache__/
@@ -31,8 +38,5 @@ go.work
 go.work.sum
 
 # Go build artifacts
-agent/coverage.txt
-agent/*.test
-agent/internal/engine/.agentgo/session_notes.md
-agent/internal/engine/.agentgo/session_notes.md
-agent/internal/engine/.agentgo/session_notes.md
+coverage.txt
+*.test

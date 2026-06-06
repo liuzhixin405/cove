@@ -1,19 +1,28 @@
 # Changelog
 
-All notable changes to agentgo will be documented in this file.
+All notable changes to cove will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Project renamed from `cagentcli` to `cove`**: Repository, module path, binary, and data directory (`~/.cove/`) all updated
+- **Directory structure flattened**: `agent/` subdirectory removed, Go module root is now repository root
+- **`cmd/agentgo/` renamed to `cmd/cove/`**: Binary entry point updated
+  
+### Removed
+- **Legacy fix scripts**: 20 `fix*.py` debug scripts deleted
+- **`.claude/` config**: Claude-specific skills removed
+
 ### Added
 - **Structured Diagnostic System** (`/diagnose`): 30+ error codes (E1xxx-E6xxx) covering config, API, network, model, shell, and data directory issues
   - `diagnostic.QuickCheck()` runs at startup to detect common problems before user interaction
-  - `/diagnose full` — run all 9 diagnostic checks with detailed reports
-  - `/diagnose quick` — fast subset of critical checks
-  - `/diagnose codes` — list all known error codes and recovery actions
-  - All fixes marked as HotFixable — applied immediately without restarting the exe
+  - `/diagnose full` �?run all 9 diagnostic checks with detailed reports
+  - `/diagnose quick` �?fast subset of critical checks
+  - `/diagnose codes` �?list all known error codes and recovery actions
+  - All fixes marked as HotFixable �?applied immediately without restarting the exe
 - **Integration Test Suite** (`engine_test.go`): 16 end-to-end tests covering all critical flow paths
   - Basic message flow, context cancellation, tool execution, permission flows
   - Tool panic recovery, API error handling, parallel tool execution
@@ -21,14 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Auto-permission mode, stream delta callbacks
 
 ### Fixed
-- **Permission prompt hang**: Replaced `fmt.Scanln` with `bufio.Scanner` — empty input defaults to deny instead of blocking forever
-- **Tool goroutine panic crash**: Added `defer recover()` in parallel tool execution goroutines — panics are caught and reported as tool errors
-- **Engine loop after Ctrl+C**: Added `ctx.Err()` check at iteration start — immediately returns on context cancellation
-- **WalkingIndicator race condition**: Synchronized `Stop()` with `doneCh` channel — prevents goroutine leak and race
-- **Background goroutine panics**: Wrapped all `go` calls in `runTurnEndPipeline` with `recover()` — prevents uncaught panics from killing the process
+- **Permission prompt hang**: Replaced `fmt.Scanln` with `bufio.Scanner` �?empty input defaults to deny instead of blocking forever
+- **Tool goroutine panic crash**: Added `defer recover()` in parallel tool execution goroutines �?panics are caught and reported as tool errors
+- **Engine loop after Ctrl+C**: Added `ctx.Err()` check at iteration start �?immediately returns on context cancellation
+- **WalkingIndicator race condition**: Synchronized `Stop()` with `doneCh` channel �?prevents goroutine leak and race
+- **Background goroutine panics**: Wrapped all `go` calls in `runTurnEndPipeline` with `recover()` �?prevents uncaught panics from killing the process
 
 ### Changed
-- Removed `NeedRestart` concept from diagnostic system — replaced with `HotFixable` field since all fixes apply immediately to the running process
+- Removed `NeedRestart` concept from diagnostic system �?replaced with `HotFixable` field since all fixes apply immediately to the running process
 - Repository structure cleaned up: docs moved to `docs/`, stray files removed, `.gitignore` updated
 
 ### Added
@@ -79,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plugin system
 - Skills system
 
-[Unreleased]: https://github.com/agentgo/agentgo/compare/v2.0.0...HEAD
-[2.0.0]: https://github.com/agentgo/agentgo/compare/v1.0.2...v2.0.0
-[1.0.2]: https://github.com/agentgo/agentgo/compare/v1.0.1...v1.0.2
-[1.0.1]: https://github.com/agentgo/agentgo/releases/tag/v1.0.1
+[Unreleased]: https://github.com/cove/cove/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/cove/cove/compare/v1.0.2...v2.0.0
+[1.0.2]: https://github.com/cove/cove/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/cove/cove/releases/tag/v1.0.1
