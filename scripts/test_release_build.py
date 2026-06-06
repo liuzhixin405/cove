@@ -94,7 +94,7 @@ class ReleaseBuildTests(unittest.TestCase):
         for call in run_mock.call_args_list:
             self.assertEqual(call.kwargs["cwd"], expected_project_dir)
             self.assertEqual(call.args[0][0], str(fake_go))
-            self.assertIn("./cmd/agentgo", call.args[0])
+            self.assertIn("./cli/cove", call.args[0])
             self.assertFalse(call.args[0][call.args[0].index("-o") + 1].startswith("/tmp/repo-root"))
         self.assertTrue(expected_dist_dir.exists())
 

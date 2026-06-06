@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -46,10 +45,11 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		return Result{Data: "Error: oldString is empty", IsError: true}, nil
 	}
 
-	if !filepath.IsAbs(path) && tctx.Cwd != "" {
-		path = filepath.Join(tctx.Cwd, path)
+	var err error
+	path, err = resolvePathInCwd(path, tctx, true)
+	if err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
-	path = filepath.Clean(path)
 
 	data, err := os.ReadFile(path)
 	if err != nil {

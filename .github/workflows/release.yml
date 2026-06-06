@@ -58,7 +58,7 @@ jobs:
           CGO_ENABLED=0 GOOS=${{ matrix.target.os }} GOARCH=${{ matrix.target.arch }} go build \
             -ldflags "-s -w -X main.Version=${{ steps.version.outputs.plain }} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.GitCommit=$(git rev-parse --short HEAD)" \
             -o "${NAME}" \
-            ./cmd/cove
+            ./cli/cove
           echo "binary=${NAME}" >> $GITHUB_OUTPUT
         shell: bash
 

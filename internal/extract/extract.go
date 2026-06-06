@@ -84,6 +84,14 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 			m.Content = m.Content[:5000] + "\n... [truncated]"
 		}
 		path := filepath.Join(r.memoryDir, sanitizeFilename(m.Name))
+		// Deduplication: skip if >80% similar to existing memory
+		if existing, err := os.ReadFile(path); err == nil && len(existing) > 0 {
+			existingStr := string(existing)
+			if similarity(existingStr[:min(100, len(existingStr))], m.Content[:min(100, len(m.Content))]) > 0.8 {
+				// Merge instead of duplicate
+				m.Append = true
+			}
+		}
 		if m.Append {
 			existing, _ := os.ReadFile(path)
 			if len(existing) > 0 {
@@ -223,4 +231,42 @@ func sanitizeFilename(name string) string {
 		name += ".md"
 	}
 	return name
+}
+
+func min(a, b int) int {
+	if a < b { return a }
+	return b
+}
+
+// similarity computes a simple overlap coefficient between two strings.
+func similarity(a, b string) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	shorter := a
+	longer := b
+	if len(a) > len(b) {
+		shorter, longer = b, a
+	}
+	matches := 0
+	for i := 0; i <= len(longer)-len(shorter); i++ {
+		if longer[i:i+len(shorter)] == shorter {
+			matches++
+		}
+	}
+	if matches > 0 {
+		return 1.0
+	}
+	// Fallback: character-level Jaccard
+	setA := make(map[byte]bool)
+	for i := 0; i < len(a); i++ { setA[a[i]] = true }
+	setB := make(map[byte]bool)
+	for i := 0; i < len(b); i++ { setB[b[i]] = true }
+	intersection := 0
+	for k := range setA {
+		if setB[k] { intersection++ }
+	}
+	union := len(setA) + len(setB) - intersection
+	if union == 0 { return 0 }
+	return float64(intersection) / float64(union)
 }

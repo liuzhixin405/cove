@@ -17,6 +17,28 @@ type ProviderConfig struct {
 	BaseURL string   `json:"base_url,omitempty"`
 }
 
+// MarshalJSON masks the API key to prevent leakage in logs/display.
+func (p ProviderConfig) MarshalJSON() ([]byte, error) {
+	type alias ProviderConfig
+	a := alias(p)
+	if a.APIKey != "" {
+		a.APIKey = maskKey(a.APIKey)
+	}
+	for i := range a.APIKeys {
+		if a.APIKeys[i] != "" {
+			a.APIKeys[i] = maskKey(a.APIKeys[i])
+		}
+	}
+	return json.Marshal(a)
+}
+
+func maskKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
 type Config struct {
 	Model          string                     `json:"model"`
 	Provider       ProviderConfig             `json:"provider"`

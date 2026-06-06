@@ -20,6 +20,12 @@ func (e *Engine) backgroundReview() {
 	if len(e.messages) < 6 {
 		return // not enough conversation to review
 	}
+	// Throttle: only run if at least 4 new messages since last review
+	newMsgs := len(e.messages) - e.lastReviewMsgCount
+	if newMsgs < 4 {
+		return
+	}
+	e.lastReviewMsgCount = len(e.messages)
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

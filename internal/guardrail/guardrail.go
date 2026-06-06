@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 // Action represents the guardrail decision.
@@ -35,6 +36,13 @@ type Tracker struct {
 	sameToolFails   map[string]int       // same tool name failed repeatedly
 	idempotentSeen  map[signature]string // hash of last result for idempotent tools
 	idempotentCount map[signature]int    // count of identical results
+	recentFailures  []failureRecord      // sliding time-window for rapid-failure detection
+}
+
+type failureRecord struct {
+	time      time.Time
+	toolName  string
+	isError   bool
 }
 
 // New creates a new guardrail tracker.
@@ -68,6 +76,31 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// Rapid-failure circuit breaker: 3+ failures in 30s → immediate block
+	now := time.Now()
+	window := 30 * time.Second
+	cutoff := now.Add(-window)
+	var recentFails int
+	for _, f := range t.recentFailures {
+		if f.time.After(cutoff) && f.isError {
+			recentFails++
+		}
+	}
+	// Trim old records
+	var kept []failureRecord
+	for _, f := range t.recentFailures {
+		if f.time.After(cutoff) {
+			kept = append(kept, f)
+		}
+	}
+	t.recentFailures = kept
+
+	if recentFails >= 6 {
+		return Decision{Action: Block, Message: "短时间内连续失败过多，请暂停并检查根本原因。"}
+	} else if recentFails >= 4 {
+		// Don't warn on every single fail, but track
+	}
+
 	sig := makeSignature(name, args)
 
 	// Check exact failure count
@@ -100,6 +133,22 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 func (t *Tracker) AfterCall(name string, args map[string]any, result string, isError bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// Record in sliding window for rapid-failure detection (consecutive failures only)
+	if isError {
+		t.recentFailures = append(t.recentFailures, failureRecord{
+			time:     time.Now(),
+			toolName: name,
+			isError:  true,
+		})
+	} else {
+		// Success resets the rapid-failure window
+		t.recentFailures = nil
+	}
+	// Keep window bounded
+	if len(t.recentFailures) > 100 {
+		t.recentFailures = t.recentFailures[len(t.recentFailures)-100:]
+	}
 
 	sig := makeSignature(name, args)
 

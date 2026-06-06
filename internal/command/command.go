@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/buddy"
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/mcp"
@@ -81,8 +80,6 @@ type Input struct {
 	MCPPool           MCPPool
 	ProjectContext    *ctxt.ProjectContext
 	AppState          *state.AppState
-	BuddyDisplay      *buddy.Display
-	BuddyChat         *buddy.BuddyChat
 	Provider          api.Provider
 }
 

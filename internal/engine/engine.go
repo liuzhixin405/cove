@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"regexp"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,9 @@ import (
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/notes"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/checkpoint"
+	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove/internal/extract"
 	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
@@ -74,6 +78,10 @@ type Engine struct {
 	guardrails        *guardrail.Tracker
 	subdirHints       *ctxt.SubdirHints
 	rateLimits        *api.RateLimitTracker
+	extractRunner     *extract.Runner
+	dreamRunner       *dream.Runner
+	cpMgr             *checkpoint.Manager
+	lastReviewMsgCount int
 }
 
 func New(config Config) (*Engine, error) {
@@ -150,6 +158,24 @@ func New(config Config) (*Engine, error) {
 
 	// Initialize rate limit tracker
 	e.rateLimits = api.NewRateLimitTracker()
+
+	// Initialize extract runner (auto memory extraction)
+	e.extractRunner = extract.NewRunner(prov, config.Model)
+
+	// Initialize dream runner (periodic memory consolidation)
+	e.dreamRunner = dream.NewRunner(prov, config.Model, e.session.ID)
+
+	// Initialize checkpoint manager (git-based file snapshots)
+	if cpMgr, err := checkpoint.New(cwd); err == nil {
+		e.cpMgr = cpMgr
+	} else {
+		log.Debugf("[checkpoint] init failed: %v", err)
+	}
+
+	// Fire session start hooks
+	if e.hookMgr != nil {
+		e.hookMgr.Fire(context.Background(), hooks.SessionStart, nil)
+	}
 
 	return e, nil
 }
@@ -389,6 +415,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.saveSession()
 			// Turn-end pipeline (all run in background)
 			e.runTurnEndPipeline()
+			// Auto-track decisions and discoveries
+			e.recordSignals(userMessage.Content, resp.Content)
 			return resp.Content, nil
 		}
 
@@ -503,6 +531,13 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
 	}
 
+	// Fire pre-tool-use hooks
+	if e.hookMgr != nil {
+		e.hookMgr.Fire(ctx, hooks.PreToolUse, hooks.ToolUseInfo{
+			ToolName: tc.Name,
+			Input:    tc.Input,
+		})
+	}
 	// Guardrail check before execution
 	if e.guardrails != nil {
 		decision := e.guardrails.BeforeCall(tc.Name, tc.Input)
@@ -518,6 +553,15 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	cwd := ""
 	if e.projCtx != nil {
 		cwd = e.projCtx.Cwd
+	}
+	// Auto-checkpoint before file-mutating operations
+	if e.cpMgr != nil && (tc.Name == "write" || tc.Name == "edit") {
+		go func() {
+			defer func() { recover() }()
+			if hash, err := e.cpMgr.Create("auto-" + tc.Name); err == nil && hash != "" {
+				log.Debugf("[checkpoint] %s", hash[:8])
+			}
+		}()
 	}
 	tctx := tool.Context{
 		Cwd:              cwd,
@@ -602,6 +646,15 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	if e.guardrails != nil {
 		e.guardrails.AfterCall(tc.Name, tc.Input, output, result.IsError)
 	}
+	// Fire post-tool-use hooks
+	if e.hookMgr != nil {
+		e.hookMgr.Fire(ctx, hooks.PostToolUse, hooks.ToolUseInfo{
+			ToolName: tc.Name,
+			Input:    tc.Input,
+			Result:   output,
+			IsError:  result.IsError,
+		})
+	}
 
 	if !result.IsError {
 		// Adaptive truncation: code/read results get more space than bash output
@@ -616,6 +669,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		}
 		output = token.TruncateToTokens(output, maxTokens)
 
+		// Conditional skills: inject matching skill prompts based on file type
+		if e.skillMgr != nil {
+			if filePath, ok := tc.Input["filePath"].(string); ok && filePath != "" {
+				if prompt := e.skillMgr.MatchingPrompt(filePath); prompt != "" {
+					output += prompt
+				}
+			}
+		}
 		// Subdirectory hints: inject context from discovered AGENTS.md files
 		if e.subdirHints != nil {
 			var hint string
@@ -1168,18 +1229,72 @@ func formatToolLine(name, summary string, isError bool) string {
 
 // runTurnEndPipeline executes quiet post-turn persistence only.
 func (e *Engine) runTurnEndPipeline() {
+	// Flush session notes (sync, fast I/O)
+	if e.sessionNotes != nil {
+		e.sessionNotes.Flush()
+	}
+	// Extract durable memories from recent conversation (async, throttled internally)
+	if e.extractRunner != nil && len(e.messages) > 0 {
+		msgs := e.messages
+		go func() {
+			defer func() { recover() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			e.extractRunner.Extract(ctx, msgs)
+		}()
+	}
+	// Background review: auto-create skills/memories from conversation patterns
+	e.backgroundReview()
+	// Fire auto-dream consolidation if conditions met (async, throttled internally)
+	if e.dreamRunner != nil {
+		go func() {
+			defer func() { recover() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			e.dreamRunner.ExecuteAutoDream(ctx)
+		}()
+	}
+}
+
+// decision/discovery patterns for auto-tracking in session notes
+var (
+	decisionPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(?:use|using|we.ll use|go with|let.s use|switch to|prefer|stick with)\s+(.+?)(?:\.|$)`),
+		regexp.MustCompile(`(?i)(?:I prefer|I like|I want|let.s go with)\s+(.+?)(?:\.|$)`),
+	}
+	discoveryPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(?:I found|discovered|the issue is|the reason is|it turns out)\s+(.+?)(?:\.|$)`),
+		regexp.MustCompile(`(?i)(?:fixed by|resolved by|solved by)\s+(.+?)(?:\.|$)`),
+	}
+)
+
+// recordSignals scans user/assistant messages for decisions and discoveries, saving to session notes.
+func (e *Engine) recordSignals(userMsg, assistantMsg string) {
 	if e.sessionNotes == nil {
 		return
 	}
-	go func() {
-		defer func() { recover() }()
-		e.sessionNotes.Flush()
-	}()
+	for _, p := range decisionPatterns {
+		if m := p.FindStringSubmatch(userMsg); len(m) > 1 {
+			text := strings.TrimSpace(m[1])
+			if len(text) > 3 && len(text) < 200 {
+				e.sessionNotes.AddDecision(text)
+			}
+		}
+	}
+	for _, p := range discoveryPatterns {
+		if m := p.FindStringSubmatch(assistantMsg); len(m) > 1 {
+			text := strings.TrimSpace(m[1])
+			if len(text) > 3 && len(text) < 200 {
+				e.sessionNotes.AddDiscovery(text)
+			}
+		}
+	}
 }
 
-// SetAutoExtract is kept for CLI compatibility; automatic API-calling background
-// features are disabled in the slimmed-down runtime.
+// SetAutoExtract enables/disables automatic background memory extraction.
 func (e *Engine) SetAutoExtract(on bool) {
+	// Background extraction and review are always enabled now.
+	// This method is kept for CLI compatibility.
 }
 
 // SessionNotes returns the session notes manager.

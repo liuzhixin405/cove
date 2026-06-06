@@ -113,7 +113,7 @@ def main():
             go_bin, "build",
             "-ldflags", ldflags,
             "-o", output_arg,
-            "./cmd/cove",
+            "./cli/cove",
         ], cwd=repo_root, env=env)
 
         if archive_kind == "zip":

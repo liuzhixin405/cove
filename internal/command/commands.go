@@ -12,16 +12,15 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/buddy"
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
-	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/mcp"
 	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/onboarding"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove/internal/onboarding"
+	"github.com/liuzhixin405/cove/internal/dream"
 )
 
 type CommitCmd struct{}
@@ -38,14 +37,14 @@ type PluginCmd struct{}
 type SkillsCmd struct{}
 type ExportCmd struct{}
 type SystemCmd struct{}
+type DreamCmd struct{}
+
 type CdCmd struct{}
 type ContextCmd struct{}
 
 type PermissionsCmd struct{}
 type StatusCmd struct{}
 type StatsCmd struct{}
-type DreamCmd struct{}
-type BuddyCmd struct{}
 type InitCmd struct{}
 
 func NewCommitCmd() Command      { return &CommitCmd{} }
@@ -63,12 +62,11 @@ func NewSkillsCmd() Command      { return &SkillsCmd{} }
 func NewExportCmd() Command      { return &ExportCmd{} }
 func NewSystemCmd() Command      { return &SystemCmd{} }
 func NewCdCmd() Command          { return &CdCmd{} }
+	func NewDreamCmd() Command       { return &DreamCmd{} }
 func NewContextCmd() Command     { return &ContextCmd{} }
 func NewPermissionsCmd() Command { return &PermissionsCmd{} }
 func NewStatusCmd() Command      { return &StatusCmd{} }
 func NewStatsCmd() Command       { return &StatsCmd{} }
-func NewDreamCmd() Command       { return &DreamCmd{} }
-func NewBuddyCmd() Command       { return &BuddyCmd{} }
 func NewInitCmd() Command        { return &InitCmd{} }
 
 func (c *CommitCmd) Name() string        { return "commit" }
@@ -814,396 +812,13 @@ func pluginStateLabel(s plugin.State) string {
 	}
 }
 
-// --- DreamCmd ---
 
-func (c *DreamCmd) Name() string        { return "dream" }
-func (c *DreamCmd) Aliases() []string   { return nil }
-func (c *DreamCmd) Description() string { return "运行记忆整理 (梦境)" }
-func (c *DreamCmd) Help() string {
-	return "/dream - 手动触发记忆整理。回顾近期会话并整理记忆文件。"
-}
-func (c *DreamCmd) Execute(ctx context.Context, in Input) (Output, error) {
-	cfg := dream.LoadConfig()
-	if !cfg.Enabled {
-		return Output{Message: "自动梦境已禁用。请在 ~/.cove/dream.json 中启用。"}, nil
-	}
 
-	// Check if already running
-	if task := dream.ActiveTask(); task != nil {
-		return Output{Message: fmt.Sprintf("梦境已在运行中 (开始于 %s)", task.StartTime.Format("15:04:05"))}, nil
-	}
 
-	// Record consolidation timestamp
-	if err := dream.RecordConsolidation(); err != nil {
-		return Output{Message: fmt.Sprintf("记录整理失败: %v", err)}, nil
-	}
-
-	return Output{Message: "梦境已触发。记忆整理将在后台运行。"}, nil
-}
 
 var _ = memory.Entry{}
 var _ = skills.Skill{}
 
-// --- BuddyCmd ---
-
-func (c *BuddyCmd) Name() string        { return "buddy" }
-func (c *BuddyCmd) Aliases() []string   { return []string{"pet", "companion"} }
-func (c *BuddyCmd) Description() string { return "和你的独立 AI 编程伙伴互动" }
-func (c *BuddyCmd) Help() string {
-	return `/buddy <消息> - 和伙伴聊天（独立 AI 助手）
-/buddy chat <消息> - 同上
-/buddy ask <问题> - 向伙伴提问
-/buddy reset - 重置伙伴对话历史
-/buddy pet - 摸摸伙伴（连续摸有彩蛋！）
-/buddy stats - 查看属性和等级
-/buddy style - 查看当前显示偏好
-/buddy style <position|intensity|behavior|overlay|mode> <值> - 设置偏好
-/buddy position <right-bottom|right-middle|left-bottom> - 快捷设置位置
-/buddy intensity <low|medium|high> - 快捷设置动画强度
-/buddy behavior <coding|review|debug> - 快捷设置行为包
-/buddy overlay <on|off> - 快捷开关悬浮层
-/buddy mode <practical|playful> - 设置伙伴模式
-/buddy tip - 输出当前行为包对应的实用清单
-/buddy next - 同 /buddy tip
-/buddy fortune - 今日运势
-/buddy hatch - 孵化一个新伙伴（仅首次）`
-}
-func (c *BuddyCmd) Execute(ctx context.Context, in Input) (Output, error) {
-	subCmd := ""
-	if len(in.Args) > 0 {
-		subCmd = in.Args[0]
-	}
-
-	userID := buddy.GetUserID()
-	comp := buddy.LoadCompanion(userID)
-
-	switch subCmd {
-	case "hatch":
-		if comp != nil {
-			return Output{Message: fmt.Sprintf("你已经有伙伴了：%s（%s）！", comp.Name, comp.Species)}, nil
-		}
-		// Generate bones deterministically, use fallback naming
-		bones := buddy.Roll(userID)
-		names := []string{"像素", "字节", "火花", "嘟嘟", "芯片", "故障", "泡泡", "嘀嘀", "面条", "组件"}
-		rng := func() int { return int(bones.Stats[buddy.StatChaos]+bones.Stats[buddy.StatWisdom]) % len(names) }
-		soul := buddy.Soul{
-			Name:        names[rng()],
-			Personality: fmt.Sprintf("一只喜欢看你写代码的%s%s", bones.Rarity, bones.Species),
-		}
-		if err := buddy.SaveCompanion(soul); err != nil {
-			return Output{}, fmt.Errorf("failed to save companion: %w", err)
-		}
-		comp = &buddy.Companion{Bones: bones, Soul: soul}
-		sprite := buddy.RenderSprite(bones, 0)
-		card := buddy.FormatBuddyCard(comp)
-		msg := fmt.Sprintf("\n🥚 蛋裂开了……！\n\n%s\n\n欢迎 %s！\n%s",
-			strings.Join(sprite, "\n"), comp.Name, card)
-		return Output{Message: msg}, nil
-
-	case "pet":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		if in.BuddyDisplay != nil {
-			quip := in.BuddyDisplay.Pet()
-			text := ""
-			if quip != nil {
-				text = quip.Text
-			}
-			hearts := strings.Join(buddy.PetHearts[:3], "\n")
-			sprite := buddy.RenderSprite(comp.Bones, 1)
-			return Output{Message: fmt.Sprintf("\n%s\n%s\n  %s: %s",
-				hearts, strings.Join(sprite, "\n"), comp.Name, text)}, nil
-		}
-		return Output{Message: fmt.Sprintf("*摸摸 %s* ♡", comp.Name)}, nil
-
-	case "stats", "card":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		card := buddy.FormatBuddyCard(comp)
-		card += fmt.Sprintf("\n  样式: position=%s intensity=%s behavior=%s overlay=%s mode=%s\n",
-			comp.Preferences.Position, comp.Preferences.Intensity, comp.Preferences.Behavior, comp.Preferences.Overlay, comp.Preferences.Mode)
-		// Add XP/level info if display available
-		if in.BuddyDisplay != nil {
-			card += fmt.Sprintf("\n  等级: Lv.%d「%s」\n", in.BuddyDisplay.XP.Level, in.BuddyDisplay.XP.Title())
-			card += fmt.Sprintf("  经验: %s\n", in.BuddyDisplay.XP.ProgressBar())
-			card += fmt.Sprintf("  心情: %s %s\n", buddy.MoodEmoji(in.BuddyDisplay.Mood.Current()), buddy.MoodLabel(in.BuddyDisplay.Mood.Current()))
-		}
-		return Output{Message: "\n" + card}, nil
-
-	case "fortune", "运势":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		fortune := buddy.NewDailyFortune(buddy.GetUserID())
-		msg := fmt.Sprintf("\n  🔮 %s 的今日运势:\n\n  「%s」\n\n  %s %s",
-			comp.Name, fortune.Today(), buddy.TimeEmoji(), buddy.TimeGreeting())
-		return Output{Message: msg}, nil
-
-	case "chat", "ask":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		if in.BuddyChat == nil {
-			return Output{Message: "伙伴聊天未初始化（需要 AI 供应商配置）。"}, nil
-		}
-		// Join remaining args as the message
-		msg := ""
-		if len(in.Args) > 1 {
-			msg = strings.Join(in.Args[1:], " ")
-		}
-		if msg == "" {
-			return Output{Message: fmt.Sprintf("  💬 %s 正在听……\n  用法: /buddy chat <你想说的话>", comp.Name)}, nil
-		}
-		reply, err := in.BuddyChat.Chat(ctx, msg)
-		if err != nil {
-			return Output{}, fmt.Errorf("buddy chat: %w", err)
-		}
-		return Output{Message: fmt.Sprintf("\n  🗨️ %s:\n  %s", comp.Name, reply)}, nil
-
-	case "reset":
-		if in.BuddyChat == nil {
-			return Output{Message: "伙伴聊天未初始化。"}, nil
-		}
-		in.BuddyChat.Reset()
-		name := "Buddy"
-		if comp != nil {
-			name = comp.Name
-		}
-		return Output{Message: fmt.Sprintf("  %s 的对话记忆已清除，像新的一天一样开始吧~", name)}, nil
-
-	case "tip", "next", "plan":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		prefs := buddy.NormalizePreferences(comp.Preferences)
-		var msgs []api.Message
-		if in.Engine != nil {
-			msgs = in.Engine.Messages()
-		}
-		return Output{Message: buildBuddyTipMessage(prefs, in.ProjectContext, msgs)}, nil
-
-	case "style", "config", "settings":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		prefs := buddy.NormalizePreferences(comp.Preferences)
-		if len(in.Args) == 1 {
-			return Output{Message: fmt.Sprintf(
-				"当前伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s\n\n可选值:\n  position: right-bottom | right-middle | left-bottom\n  intensity: low | medium | high\n  behavior: coding | review | debug\n  overlay: on | off\n  mode: practical | playful\n\n示例: /buddy mode practical",
-				prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
-			)}, nil
-		}
-		if len(in.Args) < 3 {
-			return Output{Message: "用法: /buddy style <position|intensity|behavior|overlay|mode> <值>"}, nil
-		}
-
-		key := strings.ToLower(strings.TrimSpace(in.Args[1]))
-		value := strings.ToLower(strings.TrimSpace(strings.Join(in.Args[2:], " ")))
-
-		switch key {
-		case "position", "pos":
-			p, ok := buddy.ParsePosition(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid position: %s (可选: right-bottom | right-middle | left-bottom)", value)
-			}
-			prefs.Position = p
-		case "intensity", "power":
-			i, ok := buddy.ParseIntensity(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid intensity: %s (可选: low | medium | high)", value)
-			}
-			prefs.Intensity = i
-		case "behavior", "pack":
-			b, ok := buddy.ParseBehaviorPack(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid behavior: %s (可选: coding | review | debug)", value)
-			}
-			prefs.Behavior = b
-		case "overlay", "float":
-			o, ok := buddy.ParseOverlayMode(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid overlay: %s (可选: on | off)", value)
-			}
-			prefs.Overlay = o
-		case "mode":
-			m, ok := buddy.ParseCompanionMode(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid mode: %s (可选: practical | playful)", value)
-			}
-			prefs.Mode = m
-		default:
-			return Output{}, fmt.Errorf("unknown style key: %s (可选: position | intensity | behavior | overlay | mode)", key)
-		}
-
-		prefs = buddy.NormalizePreferences(prefs)
-		if err := buddy.UpdatePreferences(prefs); err != nil {
-			return Output{}, fmt.Errorf("保存伙伴样式失败: %w", err)
-		}
-		if in.BuddyDisplay != nil {
-			in.BuddyDisplay.SetPreferences(prefs)
-		}
-
-		return Output{Message: fmt.Sprintf(
-			"已更新伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s",
-			prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
-		)}, nil
-
-	case "position", "intensity", "behavior", "overlay", "mode":
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		if len(in.Args) < 2 {
-			return Output{Message: "用法: /buddy <position|intensity|behavior|overlay|mode> <值>"}, nil
-		}
-
-		prefs := buddy.NormalizePreferences(comp.Preferences)
-		value := strings.ToLower(strings.TrimSpace(strings.Join(in.Args[1:], " ")))
-
-		switch subCmd {
-		case "position":
-			p, ok := buddy.ParsePosition(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid position: %s (可选: right-bottom | right-middle | left-bottom)", value)
-			}
-			prefs.Position = p
-		case "intensity":
-			i, ok := buddy.ParseIntensity(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid intensity: %s (可选: low | medium | high)", value)
-			}
-			prefs.Intensity = i
-		case "behavior":
-			b, ok := buddy.ParseBehaviorPack(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid behavior: %s (可选: coding | review | debug)", value)
-			}
-			prefs.Behavior = b
-		case "overlay":
-			o, ok := buddy.ParseOverlayMode(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid overlay: %s (可选: on | off)", value)
-			}
-			prefs.Overlay = o
-		case "mode":
-			m, ok := buddy.ParseCompanionMode(value)
-			if !ok {
-				return Output{}, fmt.Errorf("invalid mode: %s (可选: practical | playful)", value)
-			}
-			prefs.Mode = m
-		}
-
-		prefs = buddy.NormalizePreferences(prefs)
-		if err := buddy.UpdatePreferences(prefs); err != nil {
-			return Output{}, fmt.Errorf("保存伙伴样式失败: %w", err)
-		}
-		if in.BuddyDisplay != nil {
-			in.BuddyDisplay.SetPreferences(prefs)
-		}
-
-		return Output{Message: fmt.Sprintf(
-			"已更新伙伴样式:\n  position: %s\n  intensity: %s\n  behavior: %s\n  overlay: %s\n  mode: %s",
-			prefs.Position, prefs.Intensity, prefs.Behavior, prefs.Overlay, prefs.Mode,
-		)}, nil
-
-	default:
-		if comp == nil {
-			return Output{Message: "还没有伙伴哦！用 /buddy hatch 孵化一个吧。"}, nil
-		}
-		// If there are args and no recognized subcommand, treat as direct chat
-		if len(in.Args) > 0 && in.BuddyChat != nil {
-			msg := strings.Join(in.Args, " ")
-			reply, err := in.BuddyChat.Chat(ctx, msg)
-			if err != nil {
-				return Output{}, fmt.Errorf("buddy chat: %w", err)
-			}
-			return Output{Message: fmt.Sprintf("\n  🗨️ %s:\n  %s", comp.Name, reply)}, nil
-		}
-		// Show buddy status
-		sprite := buddy.RenderSprite(comp.Bones, 0)
-		face := buddy.RenderFace(comp.Bones)
-		// Build status line
-		statusLine := ""
-		if in.BuddyDisplay != nil {
-			m := in.BuddyDisplay.Mood.Current()
-			statusLine = fmt.Sprintf("  %s Lv.%d「%s」  %s%s",
-				buddy.RarityStars[comp.Rarity], in.BuddyDisplay.XP.Level,
-				in.BuddyDisplay.XP.Title(),
-				buddy.MoodEmoji(m), buddy.MoodLabel(m))
-		} else {
-			statusLine = fmt.Sprintf("  %s %s  %s", buddy.RarityStars[comp.Rarity], comp.Name, face)
-		}
-		result := fmt.Sprintf("\n%s\n%s\n  \"%s\"",
-			strings.Join(sprite, "\n"), statusLine, comp.Personality)
-		if in.BuddyChat != nil {
-			histLen := in.BuddyChat.HistoryLen()
-			if histLen > 0 {
-				result += fmt.Sprintf("\n\n  💬 对话中 (%d 条消息) — /buddy <消息> 继续聊天", histLen/2)
-			} else {
-				result += "\n\n  💬 输入 /buddy <消息> 和伙伴聊天"
-			}
-		}
-		result += "\n  ⚡ 实用模式: /buddy tip"
-		result += "\n  ⚙ 快速设置: /buddy position left-bottom | /buddy overlay off"
-		return Output{Message: result}, nil
-	}
-}
-
-func buildBuddyTipMessage(prefs buddy.Preferences, pc *ctxt.ProjectContext, msgs []api.Message) string {
-	pack := prefs.Behavior
-	clues := recentFailureClues(msgs, 3)
-	var sb strings.Builder
-	sb.WriteString("\n  🧭 Buddy 实用清单\n")
-	sb.WriteString(fmt.Sprintf("  行为包: %s\n", pack))
-
-	if pc != nil {
-		branch := pc.GitBranch
-		if branch == "" {
-			branch = "(unknown)"
-		}
-		status := "clean"
-		if pc.IsGitRepo && strings.TrimSpace(pc.GitStatus) != "" && strings.TrimSpace(pc.GitStatus) != "(clean)" {
-			status = fmt.Sprintf("dirty (%d files)", countGitStatusLines(pc.GitStatus))
-		}
-		sb.WriteString(fmt.Sprintf("  项目: %s\n", pc.Cwd))
-		sb.WriteString(fmt.Sprintf("  Git:  branch=%s, status=%s\n\n", branch, status))
-	} else {
-		sb.WriteString("\n")
-	}
-
-	if len(clues) > 0 {
-		sb.WriteString("  最近异常线索:\n")
-		for _, clue := range clues {
-			sb.WriteString(fmt.Sprintf("    - %s\n", clue))
-		}
-		sb.WriteString(fmt.Sprintf("  优先动作: %s\n\n", failureActionHint(clues)))
-	}
-
-	switch pack {
-	case buddy.BehaviorReview:
-		sb.WriteString("  1) 先看改动: /diff\n")
-		sb.WriteString("  2) 列风险点: 边界条件、错误处理、并发、回滚路径\n")
-		sb.WriteString("  3) 验证接口契约与兼容性（输入/输出、空值、异常）\n")
-		sb.WriteString("  4) 最后跑最小回归: go test ./... 或目标包测试\n")
-		sb.WriteString("\n  建议提问模板: “按高/中/低风险列出这个改动的问题和修复建议。”")
-	case buddy.BehaviorDebug:
-		sb.WriteString("  1) 固化复现: 写出最小复现步骤（输入、环境、期望、实际）\n")
-		sb.WriteString("  2) 加观测: 关键路径日志 + 错误上下文\n")
-		sb.WriteString("  3) 缩小范围: 二分排查（最近改动、依赖、配置）\n")
-		sb.WriteString("  4) 修后验证: 先复现失败，再确认修复后通过\n")
-		sb.WriteString("\n  建议命令: /doctor, /status, /history")
-	default:
-		sb.WriteString("  1) 先拆任务: 明确输入、输出、验收标准\n")
-		sb.WriteString("  2) 先跑通最小版本，再补边界和错误处理\n")
-		sb.WriteString("  3) 每次改动后做一次小验证（编译/单测）\n")
-		sb.WriteString("  4) 记录关键决定，方便后续继续任务\n")
-		sb.WriteString("\n  建议命令: /context, /checkpoints, /resume")
-	}
-
-	sb.WriteString("\n\n  可切换行为包: /buddy behavior review | debug | coding")
-	return sb.String()
-}
 
 func recentFailureClues(msgs []api.Message, limit int) []string {
 	if limit <= 0 || len(msgs) == 0 {
@@ -1296,7 +911,7 @@ func trimRunes(s string, max int) string {
 
 func failureActionHint(clues []string) string {
 	if len(clues) == 0 {
-		return "先执行 /doctor 验证环境，再按 /buddy behavior debug 走最小复现。"
+		return "先执行 /doctor 验证环境，再排查具体错误信息。"
 	}
 	text := strings.ToLower(strings.Join(clues, " | "))
 	switch {
@@ -1349,3 +964,26 @@ func (c *InitCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		Message: fmt.Sprintf("✓ 已创建 %s\n  检测到: %s\n  编辑此文件可自定义项目约定。", path, obs.Summary()),
 	}, nil
 }
+
+// --- DreamCmd ---
+
+func (c *DreamCmd) Name() string        { return "dream" }
+func (c *DreamCmd) Aliases() []string   { return nil }
+func (c *DreamCmd) Description() string { return "运行记忆整理 (梦境)" }
+func (c *DreamCmd) Help() string {
+	return "/dream - 手动触发记忆整理。回顾近期会话并整理记忆文件。"
+}
+func (c *DreamCmd) Execute(ctx context.Context, in Input) (Output, error) {
+	cfg := dream.LoadConfig()
+	if !cfg.Enabled {
+		return Output{Message: "自动梦境已禁用。请在 ~/.cove/dream.json 中启用。"}, nil
+	}
+	if task := dream.ActiveTask(); task != nil {
+		return Output{Message: fmt.Sprintf("梦境已在运行中 (开始于 %s)", task.StartTime.Format("15:04:05"))}, nil
+	}
+	if err := dream.RecordConsolidation(); err != nil {
+		return Output{Message: fmt.Sprintf("记录整理失败: %v", err)}, nil
+	}
+	return Output{Message: "梦境已触发。记忆整理将在后台运行。"}, nil
+}
+
