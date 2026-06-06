@@ -24,11 +24,14 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	if a.APIKey != "" {
 		a.APIKey = maskKey(a.APIKey)
 	}
-	for i := range a.APIKeys {
-		if a.APIKeys[i] != "" {
-			a.APIKeys[i] = maskKey(a.APIKeys[i])
+	// Deep copy APIKeys to avoid mutating the original via shared slice backing array.
+	maskedKeys := make([]string, len(a.APIKeys))
+	for i, k := range a.APIKeys {
+		if k != "" {
+			maskedKeys[i] = maskKey(k)
 		}
 	}
+	a.APIKeys = maskedKeys
 	return json.Marshal(a)
 }
 
@@ -73,6 +76,9 @@ func DefaultConfig() *Config {
 }
 
 func ConfigDir() (string, error) {
+	if d := os.Getenv("COVE_CONFIG_DIR"); d != "" {
+		return d, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -180,8 +186,53 @@ func Save(cfg *Config) error {
 		return err
 	}
 	os.MkdirAll(dir, 0700)
-	data, _ := json.MarshalIndent(cfg, "", "  ")
+
+	// Backup APIKeys before the first marshal — MarshalJSON may mutate through
+	// shared slice backing array (defensive copy even though MarshalJSON was fixed).
+	origAPIKeys := make([]string, len(cfg.Provider.APIKeys))
+	copy(origAPIKeys, cfg.Provider.APIKeys)
+
+	// First marshal triggers ProviderConfig.MarshalJSON (masks keys for display).
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Unmarshal into map so we can fix the masked provider keys.
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	// Re-marshal provider using rawProvider — no masking MarshalJSON.
+	providerRaw, err := json.Marshal(rawProvider{
+		Name:    cfg.Provider.Name,
+		APIKey:  cfg.Provider.APIKey,
+		APIKeys: origAPIKeys,
+		BaseURL: cfg.Provider.BaseURL,
+	})
+	if err != nil {
+		return err
+	}
+	var providerVal interface{}
+	json.Unmarshal(providerRaw, &providerVal)
+	m["provider"] = providerVal
+
+	data, err = json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+
 	return os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+}
+
+// rawProvider mirrors ProviderConfig fields without the masking MarshalJSON method.
+// Used by Save to write full API keys to disk.
+type rawProvider struct {
+	Name    string   `json:"name"`
+	APIKey  string   `json:"api_key,omitempty"`
+	APIKeys []string `json:"api_keys,omitempty"`
+	BaseURL string   `json:"base_url,omitempty"`
 }
 
 func (c *Config) EffectiveProvider() ProviderConfig {

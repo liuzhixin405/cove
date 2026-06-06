@@ -40,11 +40,21 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 	rel, err := filepath.Rel(root, checkAbs)
 	if err != nil {
 		// Cross-drive on Windows: filepath.Rel fails when root and path are on different drives.
-		// Fall back to case-insensitive prefix matching.
-		if strings.EqualFold(root, checkAbs[:min(len(root), len(checkAbs))]) {
-			return path, nil
+		// Fall back to case-insensitive path comparison.
+		volRoot := filepath.VolumeName(root)
+		volPath := filepath.VolumeName(checkAbs)
+		if volRoot != "" && volPath != "" && !strings.EqualFold(volRoot, volPath) {
+			// Cross-drive: check if path is under a known project root via git
+			if gitRoot := findGitRoot(checkAbs); gitRoot != "" {
+				gitLower := strings.ToLower(filepath.Clean(gitRoot))
+				pathLower := strings.ToLower(filepath.Clean(checkAbs))
+				if strings.HasPrefix(pathLower, gitLower+string(os.PathSeparator)) || pathLower == gitLower {
+					return path, nil
+				}
+			}
+			return "", fmt.Errorf("path on different drive: %s (cwd is on %s)", path, volRoot)
 		}
-		// Also check if path is under root by normalizing both to lowercase
+		// Same drive but Rel still failed — try case-insensitive prefix matching
 		lowerRoot := strings.ToLower(filepath.Clean(root))
 		lowerPath := strings.ToLower(filepath.Clean(checkAbs))
 		if strings.HasPrefix(lowerPath, lowerRoot+string(os.PathSeparator)) || lowerPath == lowerRoot {
@@ -75,9 +85,17 @@ func nearestExistingParent(path string) string {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+
+func findGitRoot(path string) string {
+	dir := filepath.Dir(path)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
 	}
-	return b
 }
