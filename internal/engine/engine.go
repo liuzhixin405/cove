@@ -15,6 +15,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/checkpoint"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/cost"
+	"github.com/liuzhixin405/cove/internal/diagnostic"
 	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/extract"
 	"github.com/liuzhixin405/cove/internal/guardrail"
@@ -87,6 +88,13 @@ type Engine struct {
 	dreamRunner           *dream.Runner
 	cpMgr                 *checkpoint.Manager
 	lastReviewMsgCount    int
+
+	// Activity tracking powers the stall monitor: every blocking stage (model
+	// call, tool execution, compaction) registers an activity so that, when the
+	// app appears to hang ("一直无响应"), we can name exactly which stage is stuck.
+	actMu  sync.Mutex
+	acts   map[uint64]*activity
+	actSeq uint64
 }
 
 func New(config Config) (*Engine, error) {
@@ -323,6 +331,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
 	}
 
+	// Stall monitor: surfaces which stage is stuck if the run appears to hang.
+	stopMonitor := make(chan struct{})
+	go e.runStallMonitor(stopMonitor)
+	defer close(stopMonitor)
+
 	if userMessage.Role == "" {
 		userMessage.Role = "user"
 	}
@@ -372,7 +385,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 		if useStream {
 			firstDelta := true
+			modelAct := e.beginActivity("调用模型 " + e.config.Model)
 			resp, err = e.provider.ChatStream(ctx, req, func(ev api.StreamEvent) {
+				e.progressActivity(modelAct)
 				if firstDelta && walker != nil {
 					walker.Stop()
 					walker = nil
@@ -385,8 +400,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					onReasoning(ev.Reasoning)
 				}
 			})
+			e.endActivity(modelAct)
 		} else {
+			modelAct := e.beginActivity("调用模型 " + e.config.Model)
 			resp, err = e.provider.Chat(ctx, req)
+			e.endActivity(modelAct)
 		}
 
 		if walker != nil {
@@ -396,6 +414,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		if err != nil {
 			e.messages = prevMessages
 			e.saveSession()
+			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
+				fmt.Sprintf("模型调用失败: %s", err.Error()))
 			return "", fmt.Errorf("api: %w", err)
 		}
 
@@ -503,6 +523,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					e.sessionNotes.AddError(fmt.Sprintf("%s: %s", r.Name, summarizeResult(r.Content)))
 				}
 			}
+			if isErr {
+				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
+					fmt.Sprintf("工具 %s 失败: %s", r.Name, summarizeResult(r.Content)))
+			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
 			})
@@ -531,7 +555,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 		e.totalTokens = countTokens(e.messages)
 		if e.totalTokens > CompactTokenThreshold && iter > 5 && len(e.messages) > 16 {
+			compactAct := e.beginActivity("压缩上下文")
 			e.Compact(ctx)
+			e.endActivity(compactAct)
 		}
 	}
 
@@ -543,6 +569,11 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
 	}
+
+	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
+	// or MCP call that ignores ctx) is attributable by the stall monitor.
+	toolAct := e.beginActivity("执行工具 " + tc.Name)
+	defer e.endActivity(toolAct)
 
 	// Fire pre-tool-use hooks
 	if e.hookMgr != nil {
@@ -570,7 +601,11 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	// Auto-checkpoint before file-mutating operations
 	if e.cpMgr != nil && (tc.Name == "write" || tc.Name == "edit") {
 		go func() {
-			defer func() { recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("[checkpoint] panic: %v", r)
+				}
+			}()
 			if hash, err := e.cpMgr.Create("auto-" + tc.Name); err == nil && hash != "" {
 				log.Debugf("[checkpoint] %s", hash[:8])
 			}
@@ -614,9 +649,11 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 				if e.OnPermissionPause != nil {
 					e.OnPermissionPause()
 				}
+				e.pauseActivity(toolAct, true) // waiting on user, not stuck
 				e.promptMu.Lock()
 				approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
 				e.promptMu.Unlock()
+				e.pauseActivity(toolAct, false)
 				if e.OnPermissionDone != nil {
 					e.OnPermissionDone()
 				}
@@ -891,7 +928,7 @@ func (e *Engine) Compact(ctx context.Context) {
 		MaxTokens:  600,
 	})
 	if err != nil {
-		log.Debugf("compact failed: %v", err)
+		log.Warnf("compact failed: %v", err)
 		return
 	}
 
@@ -1253,7 +1290,11 @@ func (e *Engine) runTurnEndPipeline() {
 		// while a subsequent turn appends to it (data race).
 		msgs := append([]api.Message(nil), e.messages...)
 		go func() {
-			defer func() { recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("[extractMemories] panic: %v", r)
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			e.extractRunner.Extract(ctx, msgs)
@@ -1264,7 +1305,11 @@ func (e *Engine) runTurnEndPipeline() {
 	// Fire auto-dream consolidation if conditions met (async, throttled internally)
 	if e.dreamRunner != nil {
 		go func() {
-			defer func() { recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("[autoDream] panic: %v", r)
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			e.dreamRunner.ExecuteAutoDream(ctx)

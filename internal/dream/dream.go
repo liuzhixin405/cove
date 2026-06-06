@@ -57,7 +57,7 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	// --- Time gate ---
 	lastAt, err := ReadLastConsolidatedAt()
 	if err != nil {
-		log.Debugf("[autoDream] ReadLastConsolidatedAt failed: %v", err)
+		log.Warnf("[autoDream] ReadLastConsolidatedAt failed: %v", err)
 		return
 	}
 
@@ -85,7 +85,7 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	// --- Session gate ---
 	sessionIDs, err := ListSessionsTouchedSince(lastAt, r.sessionsDir)
 	if err != nil {
-		log.Debugf("[autoDream] ListSessionsTouchedSince failed: %v", err)
+		log.Warnf("[autoDream] ListSessionsTouchedSince failed: %v", err)
 		return
 	}
 
@@ -107,7 +107,7 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	// --- Lock ---
 	priorMtime, acquired, err := TryAcquireConsolidationLock()
 	if err != nil {
-		log.Debugf("[autoDream] lock acquire failed: %v", err)
+		log.Warnf("[autoDream] lock acquire failed: %v", err)
 		return
 	}
 	if !acquired {
@@ -162,7 +162,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 		resp, err := r.provider.Chat(ctx, req)
 		if err != nil {
-			log.Debugf("[autoDream] API error: %v", err)
+			log.Warnf("[autoDream] API error: %v", err)
 			task.Fail()
 			RollbackConsolidationLock(task.PriorMtime)
 			return

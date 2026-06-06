@@ -63,7 +63,7 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 		MaxTokens:  4000,
 	})
 	if err != nil {
-		log.Debugf("[extractMemories] API error: %v", err)
+		log.Warnf("[extractMemories] API error: %v", err)
 		return
 	}
 
@@ -103,7 +103,7 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 			m.Content = m.Content[:10240] + "\n... [truncated to 10KB]"
 		}
 		if err := os.WriteFile(path, []byte(m.Content), 0644); err != nil {
-			log.Debugf("[extractMemories] write failed: %v", err)
+			log.Warnf("[extractMemories] write failed: %v", err)
 			continue
 		}
 		saved++
@@ -234,7 +234,9 @@ func sanitizeFilename(name string) string {
 }
 
 func min(a, b int) int {
-	if a < b { return a }
+	if a < b {
+		return a
+	}
 	return b
 }
 
@@ -259,14 +261,22 @@ func similarity(a, b string) float64 {
 	}
 	// Fallback: character-level Jaccard
 	setA := make(map[byte]bool)
-	for i := 0; i < len(a); i++ { setA[a[i]] = true }
+	for i := 0; i < len(a); i++ {
+		setA[a[i]] = true
+	}
 	setB := make(map[byte]bool)
-	for i := 0; i < len(b); i++ { setB[b[i]] = true }
+	for i := 0; i < len(b); i++ {
+		setB[b[i]] = true
+	}
 	intersection := 0
 	for k := range setA {
-		if setB[k] { intersection++ }
+		if setB[k] {
+			intersection++
+		}
 	}
 	union := len(setA) + len(setB) - intersection
-	if union == 0 { return 0 }
+	if union == 0 {
+		return 0
+	}
 	return float64(intersection) / float64(union)
 }

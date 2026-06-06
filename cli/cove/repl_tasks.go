@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/repl"
 )
 
@@ -210,6 +211,7 @@ func (r *replTaskRunner) startNextLocked() {
 func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			log.Warnf("repl task panic: %v", recovered)
 			r.mu.Lock()
 			msgCopy := userMsg
 			r.pendingFailedMsg = &msgCopy

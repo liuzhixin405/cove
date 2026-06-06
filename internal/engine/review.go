@@ -61,7 +61,7 @@ func (e *Engine) backgroundReview() {
 			MaxTokens:  300,
 		})
 		if err != nil {
-			log.Debugf("background review failed: %v", err)
+			log.Warnf("background review failed: %v", err)
 			return
 		}
 

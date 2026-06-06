@@ -192,6 +192,12 @@ func main() {
 
 	config.Migrate(cfg, 0)
 
+	// Mirror every Warn/Error log entry into the persistent runtime error log so
+	// background-task failures are captured for later troubleshooting, not just
+	// printed to a possibly-silent stderr.
+
+	diagnostic.AttachToLogger()
+
 	if debugMode {
 
 		log.SetLevel(log.Debug)
@@ -422,6 +428,51 @@ func main() {
 
 	}
 
+	// Startup log scan: review errors recorded in previous sessions and remind
+	// the user what still needs fixing. After fixing, run /diagnose archive to
+	// archive the log and begin a fresh error cycle.
+
+	if scan := diagnostic.ScanRuntimeLogOnStartup(); scan.HasProblems() {
+
+		const reset = "\x1b[0m"
+
+		fmt.Fprintf(os.Stderr, "\n\x1b[33m⚠ 上次运行记录到 %d 条问题（最早 %s），建议修复：\x1b[0m\n",
+			scan.Total, scan.Since.Format("01-02 15:04"))
+
+		shown := 0
+
+		for _, s := range scan.Summaries {
+
+			if shown >= 5 {
+
+				break
+
+			}
+
+			count := ""
+
+			if s.Count > 1 {
+
+				count = fmt.Sprintf(" ×%d", s.Count)
+
+			}
+
+			fmt.Fprintf(os.Stderr, "  %s%s%s %s%s\n", s.Severity.Color(), s.Severity.String(), reset, s.Message, count)
+
+			if s.Recovery != "" {
+
+				fmt.Fprintf(os.Stderr, "    \x1b[2m%s\x1b[0m\n", s.Recovery)
+
+			}
+
+			shown++
+
+		}
+
+		fmt.Fprintf(os.Stderr, "  \x1b[2m查看全部: /diagnose errors  修复后归档: /diagnose archive\x1b[0m\n\n")
+
+	}
+
 	printBanner(cfg, appState, projCtx, permMgr, eng)
 
 	if dumpPrompt {
@@ -589,6 +640,50 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 	historyPickPending := false
 
 	tasks := newREPLTaskRunner(eng)
+
+	// Ctrl+C while a task is running:
+
+	// During reader.ReadLine() the terminal is in raw mode, so Ctrl+C arrives as
+
+	// a literal 0x03 byte and is handled as ErrInterrupt below. But while a task
+
+	// runs, the main loop blocks in tasks.WaitIdle() with the terminal restored
+
+	// to cooked mode, so Ctrl+C is delivered as a SIGINT signal instead. Without
+
+	// a handler the Go runtime's default action terminates the whole process —
+
+	// the reported "提示按 Ctrl+C 可中断，实际却直接退出" bug. Install a persistent
+
+	// handler that cancels the running task on SIGINT instead of killing the
+
+	// program. (SIGTERM is intentionally left to the default action so external
+
+	// `kill` still stops the program.)
+
+	taskSigCh := make(chan os.Signal, 1)
+
+	signal.Notify(taskSigCh, syscall.SIGINT)
+
+	defer signal.Stop(taskSigCh)
+
+	go func() {
+
+		for range taskSigCh {
+
+			// In raw-mode ReadLine no SIGINT is generated (Ctrl+C is read as a
+
+			// byte), so this only fires during task execution / cooked mode.
+
+			if tasks.CancelRunning() {
+
+				repl.PrintAbove(fmt.Sprintf("\r\n%s[已中断] 正在停止当前任务…%s\r\n", repl.Yellow, repl.Reset))
+
+			}
+
+		}
+
+	}()
 
 	// On startup, check for interrupted draft and notify user
 
