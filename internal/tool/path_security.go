@@ -39,7 +39,18 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 	checkAbs = filepath.Clean(checkAbs)
 	rel, err := filepath.Rel(root, checkAbs)
 	if err != nil {
-		return "", err
+		// Cross-drive on Windows: filepath.Rel fails when root and path are on different drives.
+		// Fall back to case-insensitive prefix matching.
+		if strings.EqualFold(root, checkAbs[:min(len(root), len(checkAbs))]) {
+			return path, nil
+		}
+		// Also check if path is under root by normalizing both to lowercase
+		lowerRoot := strings.ToLower(filepath.Clean(root))
+		lowerPath := strings.ToLower(filepath.Clean(checkAbs))
+		if strings.HasPrefix(lowerPath, lowerRoot+string(os.PathSeparator)) || lowerPath == lowerRoot {
+			return path, nil
+		}
+		return "", fmt.Errorf("path outside working directory: %s", path)
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("path outside working directory: %s", path)
@@ -62,4 +73,11 @@ func nearestExistingParent(path string) string {
 		}
 		path = parent
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
