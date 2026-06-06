@@ -30,7 +30,7 @@ func NewWebSearchTool() Tool {
 	return &WebSearchTool{baseTool{def: Def{
 		Name: "websearch", Description: "Search the web and return live results.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
-		IsReadOnly: true, IsConcurrencySafe: true, UserFacingName: "WebSearch",
+		IsReadOnly:  true, IsConcurrencySafe: true, UserFacingName: "WebSearch",
 	}}}
 }
 func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -73,7 +73,9 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	}
 	return Result{Data: strings.TrimSpace(sb.String())}, nil
 }
-func (t *WebSearchTool) CheckPermissions(input Input, tctx Context) PermissionDecision { return Allowed("websearch is read-only") }
+func (t *WebSearchTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
+	return Allowed("websearch is read-only")
+}
 
 func NewQuestionTool() Tool {
 	return &QuestionTool{baseTool{def: Def{
@@ -119,7 +121,9 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	}
 	return Result{Data: strings.TrimSpace(sb.String())}, nil
 }
-func (t *QuestionTool) CheckPermissions(input Input, tctx Context) PermissionDecision { return Allowed("question is interactive") }
+func (t *QuestionTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
+	return Allowed("question is interactive")
+}
 
 func NewTodoWriteTool() Tool {
 	return &TodoWriteTool{baseTool{def: Def{
@@ -163,15 +167,20 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		status, _ := tm["status"].(string)
 		mark := "[ ]"
 		switch status {
-		case "completed": mark = "[✓]"
-		case "in_progress": mark = "[>]"
-		case "cancelled": mark = "[x]"
+		case "completed":
+			mark = "[✓]"
+		case "in_progress":
+			mark = "[>]"
+		case "cancelled":
+			mark = "[x]"
 		}
 		sb.WriteString(fmt.Sprintf("%s %d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"]))
 	}
 	return Result{Data: sb.String()}, nil
 }
-func (t *TodoWriteTool) CheckPermissions(input Input, tctx Context) PermissionDecision { return Allowed("todowrite is local state") }
+func (t *TodoWriteTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
+	return Allowed("todowrite is local state")
+}
 
 type webSearchResult struct {
 	title   string

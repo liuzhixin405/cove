@@ -20,7 +20,7 @@ type mcpPoolView interface {
 
 func NewMCPTool(pool mcpPoolView) Tool {
 	return &mcpToolProxy{pool: pool, baseTool: baseTool{def: Def{
-		Name: "mcp",
+		Name:        "mcp",
 		Description: "Invoke tools from connected MCP servers. Use when you need capabilities provided by external tools.",
 		InputSchema: json.RawMessage(`{
 			"type":"object",
@@ -94,7 +94,7 @@ func (t *mcpToolProxy) Validate(input Input) string {
 
 func NewListMCPResourcesTool(pool mcpPoolView) Tool {
 	return &listMCPResources{pool: pool, baseTool: baseTool{def: Def{
-		Name: "mcp_resources",
+		Name:        "mcp_resources",
 		Description: "List available resources from connected MCP servers.",
 		InputSchema: json.RawMessage(`{
 			"type":"object",
@@ -106,7 +106,7 @@ func NewListMCPResourcesTool(pool mcpPoolView) Tool {
 
 func NewReadMCPResourceTool(pool mcpPoolView) Tool {
 	return &readMCPResource{pool: pool, baseTool: baseTool{def: Def{
-		Name: "mcp_read_resource",
+		Name:        "mcp_read_resource",
 		Description: "Read a resource exposed by a connected MCP server.",
 		InputSchema: json.RawMessage(`{
 			"type":"object",

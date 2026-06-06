@@ -50,13 +50,13 @@ func TestBuildUserMessageBuildsImagePart(t *testing.T) {
 		}
 	}
 	f, err := os.Create(imgPath)
-		if err != nil {
-			t.Fatalf("create png: %v", err)
-		}
-		defer f.Close()
-		if err := png.Encode(f, img); err != nil {
-			t.Fatalf("encode png: %v", err)
-		}
+	if err != nil {
+		t.Fatalf("create png: %v", err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
 
 	msg, warnings, err := buildUserMessage("看图", dir, []string{imgPath}, "deepseek-v4-pro")
 	if err != nil {

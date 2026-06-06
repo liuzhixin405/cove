@@ -39,8 +39,8 @@ type InitializeParams struct {
 }
 
 type ClientCaps struct {
-	Roots    *RootsCaps    `json:"roots,omitempty"`
-	Sampling *struct{}     `json:"sampling,omitempty"`
+	Roots    *RootsCaps `json:"roots,omitempty"`
+	Sampling *struct{}  `json:"sampling,omitempty"`
 }
 
 type RootsCaps struct {

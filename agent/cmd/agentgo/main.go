@@ -184,7 +184,7 @@ func main() {
 			desc = reason
 		}
 		repl.PrintAbove(repl.PermissionPrompt(toolName, desc))
-		repl.PrintAbove(fmt.Sprintf("  %s允许？ (y)确认 / (n)拒绝 / (a)始终允许:%s", repl.Yellow, repl.Reset))
+		repl.PrintAbove(fmt.Sprintf("\n  %s允许？(y)确认 / (n)拒绝 / (a)始终允许:%s", repl.Yellow, repl.Reset))
 
 		readAnswer := func() string {
 			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -196,11 +196,11 @@ func main() {
 
 		answer := readAnswer()
 		if answer == "" {
-			repl.PrintAbove(fmt.Sprintf("\n  %s检测到空输入，请再次输入 (y/n/a):%s", repl.Yellow, repl.Reset))
+			repl.PrintAbove(fmt.Sprintf("\n  %s检测到空输入，请重新输入 (y/n/a):%s", repl.Yellow, repl.Reset))
 			answer = readAnswer()
 		}
 		if answer == "" {
-			repl.PrintAbove(fmt.Sprintf("  %s(未输入，默认拒绝)%s\n", repl.Dim, repl.Reset))
+			repl.PrintAbove(fmt.Sprintf("  %s(按 y 确认，n 拒绝，a 全部接受)%s\n", repl.Dim, repl.Reset))
 			return false
 		}
 		switch answer {
@@ -225,17 +225,17 @@ func main() {
 		store := eng.Store()
 		if r, err := store.Load(resumeID); err == nil {
 			eng.LoadMessages(r.Messages)
-			repl.PrintSafe("已恢复会话: %s (%d 条消息)\n", r.Title, len(r.Messages))
+			repl.PrintSafe("宸叉仮澶嶄細璇? %s (%d 鏉℃秷鎭?\n", r.Title, len(r.Messages))
 		}
 	}
 
 	// Startup diagnostic: quick check for critical issues
 	if issues := diagnostic.QuickCheck(cfg); len(issues) > 0 {
-		fmt.Fprintf(os.Stderr, "\n\x1b[33m⚠ 启动诊断发现问题:\x1b[0m\n")
+		fmt.Fprintf(os.Stderr, "\n\x1b[33m⚠ 启动时检测到可能的问题：\x1b[0m\n")
 		for _, issue := range issues {
 			fmt.Fprintf(os.Stderr, "  %s\n", issue.Format())
 		}
-		fmt.Fprintf(os.Stderr, "  \x1b[2m运行 /diagnose 获取完整报告\x1b[0m\n\n")
+		fmt.Fprintf(os.Stderr, "  \x1b[2m杩愯 /diagnose 鑾峰彇瀹屾暣鎶ュ憡\x1b[0m\n\n")
 	}
 
 	printBanner(cfg, appState, projCtx, permMgr, eng)
@@ -290,6 +290,7 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewStatsCmd())
 	r.Register(command.NewInitCmd())
 	r.Register(command.NewDiagnoseCmd())
+	r.Register(command.NewPluginCmd())
 	return r
 }
 
@@ -306,10 +307,7 @@ func withInterrupt(f func(ctx context.Context)) {
 	go func() {
 		select {
 		case sig := <-sigCh:
-			if sig == syscall.SIGTERM {
-				os.Exit(0)
-			}
-			fmt.Print("\r\n[已中断]\r\n")
+			fmt.Printf("\r\n[宸蹭腑鏂?鎺ユ敹鍒颁俊鍙? %v]\r\n", sig)
 			cancel()
 		case <-ctx.Done():
 		}
@@ -336,8 +334,8 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			title = shortDesc(draft.UserContent)
 		}
 		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
-		fmt.Printf("\n  \x1b[33m⚡ 检测到中断任务: %s (%s)\x1b[0m\n", title, age)
-		fmt.Printf("  \x1b[2m输入「继续」恢复该任务，或直接输入新内容忽略。\x1b[0m\n\n")
+		fmt.Printf("您有一个未完成的片段草稿 (创建于 %v 前)。输入 'continue' 恢复，或直接输入新指令忽略。\n", age)
+		fmt.Printf("  \x1b[2m提示: 使用 /history 可查看全部可恢复的历史会话\x1b[0m\n\n")
 	}
 
 	for {
@@ -345,20 +343,20 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		if err == repl.ErrInterrupt {
 			if tasks.IsRunning() {
 				if tasks.CancelRunning() {
-					fmt.Println("已请求中断当前任务。")
+					fmt.Println("[系统] 等待任务停止...")
 				}
 				continue
 			}
-			fmt.Println("输入 /exit 或 Ctrl+D 退出")
+			fmt.Println("Type /exit or Ctrl+D to exit.")
 			continue
 		}
 		if err == repl.ErrExit {
 			autoSaveSession(eng)
-			fmt.Println("再见！")
+			fmt.Println("Goodbye!")
 			return
 		}
 		if err != nil {
-			repl.PrintSafe("\r\n读取错误，正在重启 REPL...\r\n")
+			repl.PrintSafe("\r\n终端读取错误，正在重新初始化 REPL...\r\n")
 			reader = repl.New(func(input string) []string {
 				return complete(input, allCommands, skillDescs)
 			})
@@ -389,11 +387,11 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
 			}
 			autoSaveSession(eng)
-			fmt.Println("再见！")
+			fmt.Println("Goodbye!")
 			return
 		case isContinueCommand(input):
 			if tasks.IsRunning() {
-				fmt.Println("当前已有任务在进行，继续输入内容会排队到当前任务后执行。")
+				fmt.Println("[提示] 当前有任务正在运行，请等待其结束后再重试。")
 				historyPickPending = false
 				continue
 			}
@@ -408,7 +406,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				if isLowSignalResumeInput(pf.Content) {
 					tasks.ClearPendingFailed()
 					_ = clearInterruptedDraft()
-					fmt.Println("检测到中断草稿内容过短，已跳过并恢复最近有效任务。")
+					fmt.Println("[提示] 已为您推荐相关历史任务...")
 					handleHistoryResumeMostRelevant(eng)
 					historyPickPending = false
 					continue
@@ -416,9 +414,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				tasks.ClearPendingFailed()
 				_, merged := tasks.Enqueue(*pf)
 				if merged {
-					fmt.Println("检测到相似重试任务，已合并到队列中。")
+					fmt.Println("[恢复] 任务记录已合并。")
 				} else {
-					fmt.Println("已加入重试队列，任务完成后会自动继续。")
+					fmt.Println("[恢复] 任务已排队，即将开始处理。")
 				}
 				tasks.WaitIdle()
 				historyPickPending = false
@@ -427,7 +425,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
 				if isLowSignalResumeInput(draft.UserContent) {
 					_ = clearInterruptedDraft()
-					fmt.Println("检测到中断草稿内容过短，已跳过并恢复最近有效任务。")
+					fmt.Println("[提示] 已为您推荐相关历史任务...")
 					handleHistoryResumeMostRelevant(eng)
 					historyPickPending = false
 					continue
@@ -435,9 +433,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 				msg := api.Message{Role: "user", Content: draft.UserContent}
 				_, merged := tasks.Enqueue(msg)
 				if merged {
-					fmt.Println("检测到相似重试任务，已合并到队列中。")
+					fmt.Println("[恢复] 任务记录已合并。")
 				} else {
-					fmt.Println("已加入重试队列，任务完成后会自动继续。")
+					fmt.Println("[恢复] 任务已排队，即将开始处理。")
 				}
 				tasks.WaitIdle()
 				historyPickPending = false
@@ -456,6 +454,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 		case input == "/attach" || strings.HasPrefix(input, "/attach "):
 			cwd, _ := os.Getwd()
 			handleAttachCommand(input, cwd, &attachedFiles)
+		case input == "/skill" || strings.HasPrefix(input, "/skill ") || input == "/skills" || strings.HasPrefix(input, "/skills "):
+			handleSkill(input, eng)
+			continue
 		case handleBuiltinConfigCommand(input, cfg, eng, pm, as):
 			continue
 		case handleSessionCommand(input, eng, &historyPickPending):
@@ -480,7 +481,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			cwd, _ := os.Getwd()
 			userMsg, warnings, err := buildUserMessage(input, cwd, attachedFiles, cfg.Model)
 			if err != nil {
-				fmt.Printf("附件处理失败: %v\n", err)
+				fmt.Printf("警告: 构建用户消息时出错: %v\n", err)
 				continue
 			}
 			if shouldAutoSwitchToVision(warnings) {
@@ -490,10 +491,10 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 						as.Model = visionModel
 						return nil
 					}); err == nil {
-						fmt.Printf("ℹ 检测到图片输入，已自动切换视觉模型: %s\n", visionModel)
+						fmt.Println("[恢复] 任务记录已合并。")
 						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
 						if err != nil {
-							fmt.Printf("附件处理失败: %v\n", err)
+							fmt.Printf("警告: 构建用户消息时出错: %v\n", err)
 							continue
 						}
 					}
@@ -510,14 +511,14 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			queuedAhead, merged := tasks.Enqueue(userMsg)
 			if merged {
 				if queuedAhead > 0 {
-					fmt.Printf("检测到相似任务，已合并到队列中（前方还有 %d 条）。\n", queuedAhead)
+					fmt.Printf("[已补充] 先前任务还在跑，前面排队: %d\n", queuedAhead)
 				} else {
-					fmt.Println("检测到相似任务，已合并到队列中。")
+					fmt.Println("[已补充] 已合并进当前处理任务")
 				}
 			} else if queuedAhead > 0 {
-				fmt.Printf("已加入进行中任务队列，前方还有 %d 条。\n", queuedAhead)
+				fmt.Printf("[任务排队中] 前方排队数: %d\n", queuedAhead)
 			} else {
-				fmt.Println("任务已开始执行。")
+				fmt.Println("[输入已接收]")
 			}
 			tasks.WaitIdle()
 		}
@@ -526,7 +527,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 func shouldAutoSwitchToVision(warnings []string) bool {
 	for _, w := range warnings {
-		if strings.Contains(w, "已自动降级为文本提示") || strings.Contains(w, "不支持图片视觉") {
+		if strings.Contains(w, "fallback") || strings.Contains(w, "vision") {
 			return true
 		}
 	}
@@ -561,7 +562,7 @@ func shortDesc(s string) string {
 	const maxLen = 50
 	runes := []rune(s)
 	if len(runes) > maxLen {
-		s = string(runes[:maxLen-1]) + "…"
+		s = string(runes[:maxLen-1]) + "..."
 	}
 	return s
 }
@@ -594,7 +595,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 				cfg.Model = visionModel
 				return nil
 			}); err == nil {
-				fmt.Fprintf(os.Stderr, "ℹ 检测到图片输入，已自动切换视觉模型: %s\n", visionModel)
+				fmt.Println("[恢复] 任务记录已合并。")
 				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -604,7 +605,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 		}
 	}
 	for _, w := range warnings {
-		fmt.Fprintf(os.Stderr, "⚠ %s\n", w)
+		fmt.Fprintf(os.Stderr, "闂?%s\n", w)
 	}
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil)
 	if err != nil {
@@ -629,7 +630,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 	name := strings.TrimPrefix(parts[0], "/")
 	c, ok := reg.Find(name)
 	if !ok {
-		fmt.Printf("未知命令: /%s。输入 /help 查看帮助\n", name)
+		fmt.Printf("未找到命令 /%s。请使用 /help 查看可用命令。\n", name)
 		return
 	}
 	cwd, _ := os.Getwd()
@@ -674,7 +675,7 @@ func handleSkill(input string, eng *engine.Engine) {
 	parts := strings.Fields(input)
 
 	if len(parts) == 1 || (len(parts) >= 2 && parts[1] == "list") {
-		repl.PrintSafe("\n%d 个技能:\n", len(prompts))
+		repl.PrintSafe("\n已安装的技能 (%d):\n", len(prompts))
 		for name, prompt := range prompts {
 			desc := strings.SplitN(prompt, "\n", 2)
 			d := ""
@@ -693,18 +694,18 @@ func handleSkill(input string, eng *engine.Engine) {
 	case "marketplace", "registry", "search":
 		entries, err := skills.FetchRegistry()
 		if err != nil {
-			repl.PrintSafe("技能市场不可用: %v\n", err)
+			repl.PrintSafe("获取技能市场列表失败: %v\n", err)
 			return
 		}
-		repl.PrintSafe("\n技能市场 (%d 个可用):\n", len(entries))
+		repl.PrintSafe("\n技能市场 (%d 个可用技能):\n", len(entries))
 		for _, e := range entries {
 			installed := ""
 			if _, ok := prompts[e.Name]; ok {
-				installed = " [已安装]"
+				installed = " [installed]"
 			}
 			repl.PrintSafe("  %-16s %s%s\n", e.Name, truncateDesc(e.Description, 48), installed)
 		}
-		repl.PrintSafe("\n安装: /skill install <名称>\n")
+		repl.PrintSafe("\n使用 /skill install <name> 安装技能\n")
 
 	case "install":
 		if len(parts) < 3 {
@@ -720,30 +721,30 @@ func handleSkill(input string, eng *engine.Engine) {
 		for _, e := range entries {
 			if e.Name == name {
 				skills.InstallSkill(name, "url", e.URL)
-				repl.PrintSafe("已安装: %s — 重启后生效，或直接输入 /skill %s\n", name, name)
+				repl.PrintSafe("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
 				return
 			}
 		}
 		skills.InstallSkill(name, "local", "")
-		repl.PrintSafe("已创建: %s\n编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
+		repl.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
 
 	case "create":
 		if len(parts) < 3 {
-			repl.PrintSafe("用法: /skill create <名称>\n")
+			repl.PrintSafe("用法: /skill create <name>\n")
 			return
 		}
 		name := parts[2]
 		skills.InstallSkill(name, "local", "")
-		repl.PrintSafe("已创建: %s — 编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
+		repl.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.agentgo/skills/%s/SKILL.md\n", name, name)
 
 	default:
 		name := parts[1]
 		prompt, ok := prompts[name]
 		if !ok {
-			repl.PrintSafe("\n未知技能: %s\n输入 /skill marketplace 发现更多技能。\n", name)
+			repl.PrintSafe("\n未找到技能 %s。您可以使用 /skill marketplace 浏览可用技能，或自建技能。\n", name)
 			return
 		}
-		repl.PrintSafe("\n[技能: %s]\n\n%s\n\n请按照以上指引执行。\n", name, prompt)
+		repl.PrintSafe("\n[Skill %s]\n\n%s\n\n", name, prompt)
 	}
 }
 
@@ -771,15 +772,15 @@ func handleSkillInvocation(input string, eng *engine.Engine) {
 	name := strings.TrimPrefix(parts[0], "/")
 	prompt, ok := eng.Runtime().SkillPrompts[name]
 	if !ok {
-		repl.PrintSafe("未知技能: %s\n", name)
+		repl.PrintSafe("未找到配置文件: %s\n", name)
 		return
 	}
 	args := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
-	repl.PrintSafe("\n[技能: %s]\n\n%s\n", name, prompt)
+	repl.PrintSafe("\n[闂佺懓鐏堥崑鎾绘煠? %s]\n\n%s\n", name, prompt)
 	if args != "" {
-		repl.PrintSafe("\n用户请求:\n%s\n", args)
+		repl.PrintSafe("\n无效的参数: %s\n", args)
 	}
-	repl.PrintSafe("\n请按照以上指引执行。\n")
+	repl.PrintSafe("\n")
 }
 
 func visibleRuneWidth(s string) int {
@@ -825,46 +826,45 @@ func listSessions() {
 	s, _ := session.NewStore()
 	records, _ := s.List()
 	if len(records) == 0 {
-		fmt.Println("没有已保存的会话")
+		fmt.Println("没有找到任何会话记录。")
 		return
 	}
-	fmt.Printf("%d 个会话:\n", len(records))
+	fmt.Printf("%d 条会话记录:\n", len(records))
 	for _, r := range records {
 		fmt.Printf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
 	}
 }
 
 func printCLIHelp() {
-	fmt.Println(`agentgo — Go 驱动的 AI 编程助手
-
+	fmt.Println(`agentgo 是一款基于 Go 的 AI 终端代理工具。
 用法:
  agentgo                       启动交互式 REPL
- agentgo -p <提示>              执行单次查询后退出
- agentgo -p <提示> --image <路径>  单次查询并附带图片
- agentgo -p <提示> --file <路径>   单次查询并附带文件
- agentgo -r <id>                恢复已保存的会话
- agentgo --list-sessions        列出已保存的会话
- agentgo -d                     启用调试日志
- agentgo --doctor               运行系统诊断
- agentgo --config               显示配置
- agentgo -v, --version          显示版本
- agentgo -h, --help             显示帮助
+ agentgo -p <prompt>           执行单次询问并输出结果
+ agentgo -p <prompt> --image <path> 执行单次带有图片的询问
+ agentgo -p <prompt> --file <path>  执行单次带有文件的询问
+ agentgo -r <id>               恢复之前的会话记录
+ agentgo --list-sessions       列出所有会话记录
+ agentgo -d                    开启调试模式并打印日志
+ agentgo --doctor              运行环境自检
+ agentgo --config              查看配置文件
+ agentgo -v, --version         输出版本信息
+ agentgo -h, --help            查看帮助信息
 
-技能命令:
- /skill [名称]                  激活技能
- /skill marketplace             浏览技能市场
- /skill install <名称>          从市场安装
- /skill create <名称>           创建新技能
+插件与技能指令:
+ /skill [name]               执行某个技能
+ /skill marketplace          查看技能市场
+ /skill install <name>       安装技能
+ /skill create <name>        创建新的本地技能
 
-REPL 命令:
+REPL 内置命令:
  /model, /provider, /api-key, /base-url, /mode, /budget
  /cost, /config, /system, /context, /compact
- /attach <文件...>, /attach list, /attach remove <序号>, /attach clear
+ /attach <path...>, /attach list, /attach remove <id>, /attach clear
  /commit, /review, /diff, /export
  /resume, /memory, /mcp, /plugin
  /doctor, /status, /stats, /permissions
  /cd, /help, /exit`)
-	fmt.Println("\n提示中可直接使用 @文件路径 附加文件，如: 分析这个日志 @logs/app.log")
+	fmt.Println("\n提示: 在 prompt 中可以使用 @文件路径 的形式来附带文件。例如: 帮我分析这段日志 @logs/app.log")
 }
 
 func truncateDesc(s string, n int) string {

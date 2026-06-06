@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/agentgo/internal/api"
 	"github.com/agentgo/internal/engine"
@@ -68,12 +67,11 @@ func (r *Runner) Run(ctx context.Context, name string, task string) (*api.AgentR
 	systemParts = append(systemParts, "Complete the assigned task and return the result. Be thorough and precise.")
 	eng.SetSystemOverride(strings.Join(systemParts, "\n"))
 
-	start := time.Now()
 	output, err := eng.Run(ctx, task)
 	return &api.AgentRunResult{
 		Output:  output,
 		Cost:    eng.CostTracker().TotalCost,
-		Steps:   int(time.Since(start).Seconds()),
+		Steps:   eng.IterCount(), // Fixed: correctly report steps instead of execution seconds
 		Success: err == nil,
 		Error:   errStr(err),
 	}, nil

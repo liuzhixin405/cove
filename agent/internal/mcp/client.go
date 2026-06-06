@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 )
 
 type Transport interface {
@@ -176,8 +175,6 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("mcp call %s timed out", method)
 	}
 }
 
@@ -214,6 +211,14 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) receiveLoop() {
+	defer func() {
+		c.mu.Lock()
+		for _, ch := range c.pending {
+			ch <- &Response{Error: &Error{Code: -32000, Message: "transport closed or connection lost"}}
+		}
+		c.mu.Unlock()
+	}()
+
 	for {
 		raw, err := c.transport.Receive(context.Background())
 		if err != nil {

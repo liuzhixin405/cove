@@ -76,8 +76,8 @@ func (s *Store) List() ([]Record, error) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		// Read file but only decode metadata fields (skip Messages for speed)
-		data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+		// Stream JSON decode to avoid large memory allocations for huge files
+		f, err := os.Open(filepath.Join(s.dir, e.Name()))
 		if err != nil {
 			continue
 		}
@@ -95,7 +95,9 @@ func (s *Store) List() ([]Record, error) {
 			TokensOut int     `json:"tokens_out"`
 			Cost      float64 `json:"cost"`
 		}
-		if err := json.Unmarshal(data, &meta); err != nil {
+		err = json.NewDecoder(f).Decode(&meta)
+		f.Close()
+		if err != nil {
 			continue
 		}
 		records = append(records, Record{

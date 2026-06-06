@@ -7,8 +7,8 @@ import (
 )
 
 func TestEstimateCountsNonASCIIConservatively(t *testing.T) {
-	if got := Estimate("hello world"); got != 3 {
-		t.Fatalf("Estimate(ascii) = %d, want 3", got)
+	if got := Estimate("hello world"); got != 4 {
+		t.Fatalf("Estimate(ascii) = %d, want 4", got)
 	}
 	if got := Estimate("你好世界"); got != 4 {
 		t.Fatalf("Estimate(chinese) = %d, want 4", got)

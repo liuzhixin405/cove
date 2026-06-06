@@ -64,7 +64,9 @@ type Engine struct {
 	fileMu            sync.Mutex
 	cachedToolDefs    []api.ToolDef
 	lastSaveTime      time.Time
-	consecutiveErrors int // track consecutive tool failures for circuit breaking
+	consecutiveErrors int        // track consecutive tool failures for circuit breaking
+	iterCount         int        // track how many tool/LLM loops have run
+	promptMu          sync.Mutex // lock for interactive permission prompts
 	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
 	OnPermissionPause func() // called before permission prompt to pause spinners
 	OnPermissionDone  func() // called after permission decision to resume
@@ -86,7 +88,10 @@ func New(config Config) (*Engine, error) {
 		perm.SetMode(permission.Mode(config.PermissionMode))
 	}
 	perm.SetBypassAvailable(true)
-	store, _ := session.NewStore()
+	store, err := session.NewStore()
+	if err != nil {
+		return nil, fmt.Errorf("failed to init session store: %w", err)
+	}
 
 	e := &Engine{
 		provider:    prov,
@@ -273,6 +278,7 @@ Available tools:`)
 	return e.systemPrompt
 }
 
+func (e *Engine) IterCount() int { return e.iterCount }
 func (e *Engine) Run(ctx context.Context, userMessage string) (string, error) {
 	return e.RunWithStream(ctx, userMessage, nil)
 }
@@ -298,6 +304,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	toolDefs := e.buildAPIToolDefs()
 
 	for iter := 0; iter < MaxIterations; iter++ {
+		e.iterCount = iter + 1
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
 		if ctx.Err() != nil {
 			e.messages = prevMessages
@@ -550,7 +557,9 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 				if e.OnPermissionPause != nil {
 					e.OnPermissionPause()
 				}
+				e.promptMu.Lock()
 				approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
+				e.promptMu.Unlock()
 				if e.OnPermissionDone != nil {
 					e.OnPermissionDone()
 				}

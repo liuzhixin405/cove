@@ -6,7 +6,7 @@ import (
 )
 
 // Estimate returns an approximate token count without allocating.
-// Uses ~4 ASCII bytes per token and one token per non-ASCII rune.
+// Uses ~3 ASCII bytes per token (code/symbols density) and one token per non-ASCII rune.
 func Estimate(text string) int {
 	if len(text) == 0 {
 		return 0
@@ -20,7 +20,7 @@ func Estimate(text string) int {
 			nonASCII++
 		}
 	}
-	return (asciiBytes+3)/4 + nonASCII
+	return (asciiBytes+2)/3 + nonASCII
 }
 
 func EstimateMessages(messages []string) int {
@@ -46,7 +46,7 @@ func TruncateToTokens(text string, maxTokens int) string {
 	for i, r := range text {
 		if r < utf8.RuneSelf {
 			asciiRun++
-			if asciiRun == 4 {
+			if asciiRun == 3 {
 				tokens++
 				asciiRun = 0
 			}

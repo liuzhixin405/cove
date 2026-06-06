@@ -12,8 +12,8 @@ import (
 type Event string
 
 const (
-	PreToolUse  Event = "pre_tool_use"
-	PostToolUse Event = "post_tool_use"
+	PreToolUse   Event = "pre_tool_use"
+	PostToolUse  Event = "post_tool_use"
 	SessionStart Event = "session_start"
 	SessionEnd   Event = "session_end"
 	PreCompact   Event = "pre_compact"
