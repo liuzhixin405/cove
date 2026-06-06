@@ -1,7 +1,7 @@
 # Build output
 /dist/
-cove.exe
-cove
+/cove.exe
+/cove
 *.exe
 *.exe~
 
