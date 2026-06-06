@@ -7,8 +7,9 @@ import (
 )
 
 type Registry struct {
-	tools map[string]Tool
-	order []string
+	tools   map[string]Tool
+	order   []string
+	version int
 }
 
 func NewRegistry() *Registry {
@@ -22,7 +23,12 @@ func (r *Registry) Register(t Tool) {
 		r.tools[a] = t
 	}
 	r.order = append(r.order, d.Name)
+	r.version++
 }
+
+// Version returns a counter that increments whenever a tool is registered.
+// Callers caching tool metadata can compare against this to detect staleness.
+func (r *Registry) Version() int { return r.version }
 
 func (r *Registry) Find(name string) (Tool, bool) {
 	t, ok := r.tools[name]

@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -29,20 +27,7 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.anthropic.com/v1"
 	}
-	transport := &http.Transport{
-		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 60 * time.Second,
-		}).DialContext,
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:        50,
-		MaxIdleConnsPerHost: 20,
-		MaxConnsPerHost:     30,
-		IdleConnTimeout:     120 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
-	}
+	transport := defaultHTTPTransport()
 	var pool *KeyPool
 	if len(cfg.APIKeys) > 1 {
 		pool = NewKeyPool(cfg.APIKeys)
@@ -357,22 +342,51 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 
 	data, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", p.activeKey())
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 
 	sc := p.streamClient
 	if sc == nil {
 		sc = p.client
 	}
-	httpResp, err := sc.Do(httpReq)
-	if err != nil {
-		return nil, err
+
+	// Retry the connection-establishment phase only. Once the body starts
+	// streaming, deltas have already been delivered to the handler so retrying
+	// would duplicate output.
+	var httpResp *http.Response
+	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-api-key", p.activeKey())
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
+
+		resp, err := sc.Do(httpReq)
+		if err != nil {
+			if attempt < defaultRetry.MaxRetries {
+				delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
+			return nil, err
+		}
+		if (resp.StatusCode >= 500 || resp.StatusCode == 429) && attempt < defaultRetry.MaxRetries {
+			resp.Body.Close()
+			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+		httpResp = resp
+		break
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode != http.StatusOK {
@@ -396,6 +410,9 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		line, err := reader.ReadString('\n')
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("read anthropic SSE: %w", err)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data: ") {

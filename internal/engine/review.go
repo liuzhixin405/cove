@@ -27,12 +27,16 @@ func (e *Engine) backgroundReview() {
 	}
 	e.lastReviewMsgCount = len(e.messages)
 
+	// Snapshot messages so the background goroutine does not read e.messages
+	// concurrently with a later turn appending to it (data race).
+	snapshotMsgs := append([]api.Message(nil), e.messages...)
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		// Build a concise snapshot of the conversation
-		snapshot := e.buildReviewSnapshot()
+		snapshot := buildReviewSnapshot(snapshotMsgs)
 		if snapshot == "" {
 			return
 		}
@@ -94,9 +98,8 @@ func (e *Engine) backgroundReview() {
 	}()
 }
 
-func (e *Engine) buildReviewSnapshot() string {
+func buildReviewSnapshot(msgs []api.Message) string {
 	// Take the last 10 messages (or all if fewer)
-	msgs := e.messages
 	start := 0
 	if len(msgs) > 10 {
 		start = len(msgs) - 10

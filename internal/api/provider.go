@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -110,13 +114,41 @@ func DetectProvider(model string, cfg ProviderConfig) Provider {
 
 func containsAny(s string, substrs ...string) bool {
 	for _, sub := range substrs {
-		for i := 0; i <= len(s)-len(sub); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
+		if strings.Contains(s, sub) {
+			return true
 		}
 	}
 	return false
+}
+
+// sharedTransport is a single process-wide HTTP transport reused by all
+// providers. http.Transport is safe for concurrent use and maintains its own
+// connection pool, so sharing one instance avoids duplicate pools when multiple
+// providers (or provider switches within a session) are created.
+var (
+	sharedTransportOnce sync.Once
+	sharedTransport     *http.Transport
+)
+
+func defaultHTTPTransport() *http.Transport {
+	sharedTransportOnce.Do(func() {
+		sharedTransport = &http.Transport{
+			TLSHandshakeTimeout: 10 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 60 * time.Second,
+			}).DialContext,
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			MaxIdleConns:          50,
+			MaxIdleConnsPerHost:   20,
+			MaxConnsPerHost:       30,
+			IdleConnTimeout:       120 * time.Second,
+			ResponseHeaderTimeout: 180 * time.Second,
+			DisableCompression:    false,
+			ForceAttemptHTTP2:     true,
+		}
+	})
+	return sharedTransport
 }
 
 type AgentRunResult struct {

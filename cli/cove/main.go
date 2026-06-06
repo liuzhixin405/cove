@@ -902,7 +902,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 					}); err == nil {
 
-						fmt.Println("[恢复] 任务记录已合并。")
+						fmt.Printf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
 						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
 
@@ -1100,7 +1100,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 			}); err == nil {
 
-				fmt.Println("[恢复] 任务记录已合并。")
+				fmt.Printf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
 				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
 

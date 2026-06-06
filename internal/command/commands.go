@@ -14,13 +14,11 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
+	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove/internal/onboarding"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/onboarding"
-	"github.com/liuzhixin405/cove/internal/dream"
 )
 
 type CommitCmd struct{}
@@ -62,7 +60,7 @@ func NewSkillsCmd() Command      { return &SkillsCmd{} }
 func NewExportCmd() Command      { return &ExportCmd{} }
 func NewSystemCmd() Command      { return &SystemCmd{} }
 func NewCdCmd() Command          { return &CdCmd{} }
-	func NewDreamCmd() Command       { return &DreamCmd{} }
+func NewDreamCmd() Command       { return &DreamCmd{} }
 func NewContextCmd() Command     { return &ContextCmd{} }
 func NewPermissionsCmd() Command { return &PermissionsCmd{} }
 func NewStatusCmd() Command      { return &StatusCmd{} }
@@ -812,14 +810,6 @@ func pluginStateLabel(s plugin.State) string {
 	}
 }
 
-
-
-
-
-var _ = memory.Entry{}
-var _ = skills.Skill{}
-
-
 func recentFailureClues(msgs []api.Message, limit int) []string {
 	if limit <= 0 || len(msgs) == 0 {
 		return nil
@@ -986,4 +976,3 @@ func (c *DreamCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	}
 	return Output{Message: "梦境已触发。记忆整理将在后台运行。"}, nil
 }
-

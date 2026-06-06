@@ -33,6 +33,10 @@ import (
 const MaxIterations = 200
 const CompactTokenThreshold = 64000
 
+// maxParallelTools caps how many concurrency-safe tool calls run simultaneously
+// within a single model response, preventing unbounded goroutine creation.
+const maxParallelTools = 8
+
 type Config struct {
 	Model          string
 	PermissionMode string
@@ -47,41 +51,42 @@ type Config struct {
 }
 
 type Engine struct {
-	provider           api.Provider
-	registry           *tool.Registry
-	messages           []api.Message
-	config             Config
-	projCtx            *ctxt.ProjectContext
-	costTracker        *cost.Tracker
-	perm               *permission.Manager
-	store              *session.Store
-	session            *session.Record
-	memStore           *memory.Store
-	skillMgr           *skills.Manager
-	hookMgr            *hooks.Manager
-	classifier         *permission.Classifier
-	systemPrompt       string
-	systemOverride     string
-	totalTokens        int
-	runtime            *tool.Runtime
-	fileHistory        map[string]bool
-	fileMu             sync.Mutex
-	cachedToolDefs     []api.ToolDef
-	lastSaveTime       time.Time
-	consecutiveErrors  int        // track consecutive tool failures for circuit breaking
-	iterCount          int        // track how many tool/LLM loops have run
-	promptMu           sync.Mutex // lock for interactive permission prompts
-	PermissionPrompt   func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause  func() // called before permission prompt to pause spinners
-	OnPermissionDone   func() // called after permission decision to resume
-	sessionNotes       *notes.SessionNotes
-	guardrails         *guardrail.Tracker
-	subdirHints        *ctxt.SubdirHints
-	rateLimits         *api.RateLimitTracker
-	extractRunner      *extract.Runner
-	dreamRunner        *dream.Runner
-	cpMgr              *checkpoint.Manager
-	lastReviewMsgCount int
+	provider              api.Provider
+	registry              *tool.Registry
+	messages              []api.Message
+	config                Config
+	projCtx               *ctxt.ProjectContext
+	costTracker           *cost.Tracker
+	perm                  *permission.Manager
+	store                 *session.Store
+	session               *session.Record
+	memStore              *memory.Store
+	skillMgr              *skills.Manager
+	hookMgr               *hooks.Manager
+	classifier            *permission.Classifier
+	systemPrompt          string
+	systemOverride        string
+	totalTokens           int
+	runtime               *tool.Runtime
+	fileHistory           map[string]bool
+	fileMu                sync.Mutex
+	cachedToolDefs        []api.ToolDef
+	cachedToolDefsVersion int
+	lastSaveTime          time.Time
+	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
+	iterCount             int        // track how many tool/LLM loops have run
+	promptMu              sync.Mutex // lock for interactive permission prompts
+	PermissionPrompt      func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause     func() // called before permission prompt to pause spinners
+	OnPermissionDone      func() // called after permission decision to resume
+	sessionNotes          *notes.SessionNotes
+	guardrails            *guardrail.Tracker
+	subdirHints           *ctxt.SubdirHints
+	rateLimits            *api.RateLimitTracker
+	extractRunner         *extract.Runner
+	dreamRunner           *dream.Runner
+	cpMgr                 *checkpoint.Manager
+	lastReviewMsgCount    int
 }
 
 func New(config Config) (*Engine, error) {
@@ -438,6 +443,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// Additionally, write/edit calls targeting different files can run in parallel.
 			var wg sync.WaitGroup
 			serialFilePaths := make(map[string]bool) // track files being written to serialize conflicts
+			// Bound concurrency so a single response with many tool calls cannot
+			// spawn an unbounded number of goroutines.
+			sem := make(chan struct{}, maxParallelTools)
 
 			for i, tc := range resp.ToolCalls {
 				t, _ := e.registry.Find(tc.Name)
@@ -455,8 +463,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 				if safe {
 					wg.Add(1)
+					sem <- struct{}{}
 					go func(idx int, tcall api.ToolCall) {
 						defer wg.Done()
+						defer func() { <-sem }()
 						defer func() {
 							if r := recover(); r != nil {
 								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: fmt.Sprintf("Error: tool panicked: %v", r)}
@@ -931,7 +941,7 @@ func (e *Engine) trimOldToolResults() {
 }
 
 func (e *Engine) buildAPIToolDefs() []api.ToolDef {
-	if e.cachedToolDefs != nil {
+	if e.cachedToolDefs != nil && e.cachedToolDefsVersion == e.registry.Version() {
 		return e.cachedToolDefs
 	}
 	var defs []api.ToolDef
@@ -943,6 +953,7 @@ func (e *Engine) buildAPIToolDefs() []api.ToolDef {
 		})
 	}
 	e.cachedToolDefs = defs
+	e.cachedToolDefsVersion = e.registry.Version()
 	return defs
 }
 
@@ -1238,7 +1249,9 @@ func (e *Engine) runTurnEndPipeline() {
 	}
 	// Extract durable memories from recent conversation (async, throttled internally)
 	if e.extractRunner != nil && len(e.messages) > 0 {
-		msgs := e.messages
+		// Snapshot the slice so the background goroutine never reads e.messages
+		// while a subsequent turn appends to it (data race).
+		msgs := append([]api.Message(nil), e.messages...)
 		go func() {
 			defer func() { recover() }()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -28,6 +28,11 @@ var Prices = map[string]Price{
 	"o3-mini":           {Input: 1.1, InputCacheHit: 1.1, Output: 4.4},
 }
 
+// defaultPrice is used when a model name does not match any entry in Prices.
+// Provides a conservative non-zero fallback so unknown models still produce a
+// cost estimate (per-million-token USD rates).
+var defaultPrice = Price{Input: 0.435, InputCacheHit: 0.003625, Output: 0.87}
+
 type Tracker struct {
 	TotalInput           int
 	TotalOutput          int
@@ -67,7 +72,7 @@ func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss i
 	t.TotalPromptCacheMiss += cacheMiss
 	p, ok := Prices[model]
 	if !ok {
-		p = Prices["claude-sonnet-4-20250514"]
+		p = defaultPrice
 		for k, v := range Prices {
 			if strings.Contains(model, k) {
 				p = v
@@ -105,28 +110,17 @@ func (t *Tracker) SuggestedBudget() float64 {
 
 func (t *Tracker) Summary() string {
 	sb := &strings.Builder{}
-	sb.WriteString(itoa(t.TotalInput) + " in")
+	sb.WriteString(strconv.Itoa(t.TotalInput) + " in")
 	if t.TotalPromptCacheHit > 0 || t.TotalPromptCacheMiss > 0 {
-		sb.WriteString(" (cache hit " + itoa(t.TotalPromptCacheHit) + ", miss " + itoa(t.TotalPromptCacheMiss) + ")")
+		sb.WriteString(" (cache hit " + strconv.Itoa(t.TotalPromptCacheHit) + ", miss " + strconv.Itoa(t.TotalPromptCacheMiss) + ")")
 	}
-	sb.WriteString(" | " + itoa(t.TotalOutput) + " out | $" + ftoa(t.TotalCost))
+	sb.WriteString(" | " + strconv.Itoa(t.TotalOutput) + " out | $" + ftoa(t.TotalCost))
 	if t.MaxBudget > 0 {
 		sb.WriteString(" / $" + ftoa(t.MaxBudget))
 	}
 	return sb.String()
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	d := []byte{}
-	for n > 0 {
-		d = append([]byte{byte('0' + n%10)}, d...)
-		n /= 10
-	}
-	return string(d)
-}
 func ftoa(f float64) string {
 	if f == 0 {
 		return "0.00"

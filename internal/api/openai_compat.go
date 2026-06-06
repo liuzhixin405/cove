@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -30,21 +28,7 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL(cfg.Name)
 	}
-	transport := &http.Transport{
-		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 60 * time.Second,
-		}).DialContext,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:          50,
-		MaxIdleConnsPerHost:   20,
-		MaxConnsPerHost:       30,
-		IdleConnTimeout:       120 * time.Second,
-		ResponseHeaderTimeout: 180 * time.Second,
-		DisableCompression:    false,
-		ForceAttemptHTTP2:     true,
-	}
+	transport := defaultHTTPTransport()
 	var pool *KeyPool
 	if len(cfg.APIKeys) > 1 {
 		pool = NewKeyPool(cfg.APIKeys)
@@ -459,20 +443,52 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	hadImage := oaiReqHasImageURL(body)
 
 	data, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
 
 	sc := p.streamClient
 	if sc == nil {
 		sc = p.client
 	}
-	httpResp, err := sc.Do(httpReq)
-	if err != nil {
-		return nil, err
+
+	// Retry the connection-establishment phase only. Once the body starts
+	// streaming, deltas have already been delivered to the handler so retrying
+	// would duplicate output; we therefore never retry after streaming begins.
+	var httpResp *http.Response
+	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
+
+		resp, err := sc.Do(httpReq)
+		if err != nil {
+			// Connection-level failures (dial/TLS/reset) are transient — retry.
+			if attempt < defaultRetry.MaxRetries {
+				delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
+			return nil, err
+		}
+
+		// Retry transient server-side failures before any streaming happens.
+		if (resp.StatusCode >= 500 || resp.StatusCode == 429) && attempt < defaultRetry.MaxRetries {
+			resp.Body.Close()
+			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+		httpResp = resp
+		break
 	}
 	defer httpResp.Body.Close()
 
@@ -497,6 +513,10 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	tcMap := make(map[int]*tcAccum)
 
 	for scanner.Scan() {
+		// Stop promptly if the caller cancelled (e.g. user pressed Ctrl+C).
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || line == "data: [DONE]" {
 			continue
