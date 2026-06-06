@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -36,13 +36,13 @@ jobs:
           if [ "${{ matrix.os }}" != "windows-latest" ]; then
             RACE="-race"
           fi
-          go test -v ${RACE} -coverprofile=coverage.txt ./...
+          cd agent; go test -v ${RACE} -coverprofile=coverage.txt ./...
 
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24'
         uses: codecov/codecov-action@v5
         with:
-          files: coverage.txt
+          files: agent/coverage.txt
           flags: unittests
 
   lint:
@@ -63,6 +63,7 @@ jobs:
         with:
           version: latest
           args: --timeout=5m
+          working-directory: agent
 
   build:
     name: Build Check
@@ -78,7 +79,7 @@ jobs:
           cache-dependency-path: agent/go.sum
 
       - name: Build
-        run: go build -o cove ./cli/cove
+        run: cd agent; go build -o ../cove ./cli/cove
 
       - name: Verify version
         run: ./cove --version
