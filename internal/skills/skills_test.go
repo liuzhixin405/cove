@@ -49,7 +49,7 @@ func TestSeedDefaultSkillsCreatesFiles(t *testing.T) {
 		t.Fatalf("expected at least 5 skills loaded, got %d", len(all))
 	}
 
-	for _, name := range []string{"batch", "debug", "verify", "commit", "review"} {
+	for _, name := range []string{"plan", "systematic-debugging", "test-driven-development", "spike", "requesting-code-review", "github-pr-workflow", "github-code-review"} {
 		if _, ok := mgr.Get(name); !ok {
 			t.Fatalf("expected skill %q to be loaded from disk", name)
 		}
