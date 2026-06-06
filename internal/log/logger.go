@@ -38,7 +38,9 @@ func (l *Logger) log(level Level, format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	ts := time.Now().Format("15:04:05.000")
-	fmt.Fprintf(l.writer, "[%s %s] %s\n", ts, levelNames[level], fmt.Sprintf(format, args...))
+	fmt.Fprintf(l.writer, "[%s %s] ", ts, levelNames[level])
+	fmt.Fprintf(l.writer, format, args...)
+	fmt.Fprintln(l.writer)
 }
 
 func Debugf(format string, args ...any) { defaultLogger.log(Debug, format, args...) }

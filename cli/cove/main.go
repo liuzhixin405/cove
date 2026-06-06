@@ -1124,7 +1124,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 	}
 
-	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil)
+	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil, nil)
 
 	if err != nil {
 

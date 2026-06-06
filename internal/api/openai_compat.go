@@ -520,6 +520,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			}
 			if d.ReasoningContent != "" {
 				fullReasoningContent.WriteString(d.ReasoningContent)
+				if handler != nil {
+					handler(StreamEvent{Type: "reasoning", Reasoning: d.ReasoningContent})
+				}
 			}
 			for _, tc := range d.ToolCalls {
 				acc, exists := tcMap[tc.Index]

@@ -32,6 +32,9 @@ const (
 	BrightYellow = "\x1b[93m"
 	BrightBlue   = "\x1b[94m"
 	BrightCyan   = "\x1b[96m"
+
+	// Reasoning
+	ReasoningStyle = "\x1b[2;3m\x1b[90m" // Dim + Italic + Gray
 )
 
 // Styled returns colored text

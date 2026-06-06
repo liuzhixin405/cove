@@ -2,27 +2,27 @@ package engine
 
 import (
 	"context"
-	"regexp"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/checkpoint"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/cost"
+	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove/internal/extract"
 	"github.com/liuzhixin405/cove/internal/guardrail"
 	"github.com/liuzhixin405/cove/internal/hooks"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/notes"
 	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/checkpoint"
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/extract"
 	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
@@ -47,40 +47,40 @@ type Config struct {
 }
 
 type Engine struct {
-	provider          api.Provider
-	registry          *tool.Registry
-	messages          []api.Message
-	config            Config
-	projCtx           *ctxt.ProjectContext
-	costTracker       *cost.Tracker
-	perm              *permission.Manager
-	store             *session.Store
-	session           *session.Record
-	memStore          *memory.Store
-	skillMgr          *skills.Manager
-	hookMgr           *hooks.Manager
-	classifier        *permission.Classifier
-	systemPrompt      string
-	systemOverride    string
-	totalTokens       int
-	runtime           *tool.Runtime
-	fileHistory       map[string]bool
-	fileMu            sync.Mutex
-	cachedToolDefs    []api.ToolDef
-	lastSaveTime      time.Time
-	consecutiveErrors int        // track consecutive tool failures for circuit breaking
-	iterCount         int        // track how many tool/LLM loops have run
-	promptMu          sync.Mutex // lock for interactive permission prompts
-	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause func() // called before permission prompt to pause spinners
-	OnPermissionDone  func() // called after permission decision to resume
-	sessionNotes      *notes.SessionNotes
-	guardrails        *guardrail.Tracker
-	subdirHints       *ctxt.SubdirHints
-	rateLimits        *api.RateLimitTracker
-	extractRunner     *extract.Runner
-	dreamRunner       *dream.Runner
-	cpMgr             *checkpoint.Manager
+	provider           api.Provider
+	registry           *tool.Registry
+	messages           []api.Message
+	config             Config
+	projCtx            *ctxt.ProjectContext
+	costTracker        *cost.Tracker
+	perm               *permission.Manager
+	store              *session.Store
+	session            *session.Record
+	memStore           *memory.Store
+	skillMgr           *skills.Manager
+	hookMgr            *hooks.Manager
+	classifier         *permission.Classifier
+	systemPrompt       string
+	systemOverride     string
+	totalTokens        int
+	runtime            *tool.Runtime
+	fileHistory        map[string]bool
+	fileMu             sync.Mutex
+	cachedToolDefs     []api.ToolDef
+	lastSaveTime       time.Time
+	consecutiveErrors  int        // track consecutive tool failures for circuit breaking
+	iterCount          int        // track how many tool/LLM loops have run
+	promptMu           sync.Mutex // lock for interactive permission prompts
+	PermissionPrompt   func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause  func() // called before permission prompt to pause spinners
+	OnPermissionDone   func() // called after permission decision to resume
+	sessionNotes       *notes.SessionNotes
+	guardrails         *guardrail.Tracker
+	subdirHints        *ctxt.SubdirHints
+	rateLimits         *api.RateLimitTracker
+	extractRunner      *extract.Runner
+	dreamRunner        *dream.Runner
+	cpMgr              *checkpoint.Manager
 	lastReviewMsgCount int
 }
 
@@ -310,10 +310,10 @@ func (e *Engine) Run(ctx context.Context, userMessage string) (string, error) {
 }
 
 func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta func(delta string)) (string, error) {
-	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Content: userMessage}, onDelta)
+	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Content: userMessage}, onDelta, nil)
 }
 
-func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string)) (string, error) {
+func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string), onReasoning func(reasoning string)) (string, error) {
 	if e.costTracker.OverBudget() {
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
 	}
@@ -375,6 +375,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				}
 				if ev.Type == "delta" && onDelta != nil {
 					onDelta(ev.Delta)
+				}
+				if ev.Type == "reasoning" && onReasoning != nil {
+					onReasoning(ev.Reasoning)
 				}
 			})
 		} else {

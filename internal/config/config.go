@@ -13,7 +13,7 @@ import (
 type ProviderConfig struct {
 	Name    string   `json:"name"`
 	APIKey  string   `json:"api_key,omitempty"`
-	APIKeys []string `json:"api_keys,omitempty"`
+	APIKeys []string `json:"-"`
 	BaseURL string   `json:"base_url,omitempty"`
 }
 
@@ -24,14 +24,6 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	if a.APIKey != "" {
 		a.APIKey = maskKey(a.APIKey)
 	}
-	// Deep copy APIKeys to avoid mutating the original via shared slice backing array.
-	maskedKeys := make([]string, len(a.APIKeys))
-	for i, k := range a.APIKeys {
-		if k != "" {
-			maskedKeys[i] = maskKey(k)
-		}
-	}
-	a.APIKeys = maskedKeys
 	return json.Marshal(a)
 }
 
@@ -159,6 +151,11 @@ func normalizeConfig(cfg *Config) {
 	cfg.Provider.Name = strings.TrimSpace(cfg.Provider.Name)
 	cfg.Provider.APIKey = strings.TrimSpace(cfg.Provider.APIKey)
 	cfg.Provider.BaseURL = strings.TrimSpace(cfg.Provider.BaseURL)
+	// Clear keys that look masked (contain ****) to force env-var fallback.
+	// This heals config files corrupted by earlier versions that saved masked keys.
+	if strings.Contains(cfg.Provider.APIKey, "****") {
+		cfg.Provider.APIKey = ""
+	}
 }
 
 func DefaultModelForProvider(providerName string) string {
@@ -187,18 +184,13 @@ func Save(cfg *Config) error {
 	}
 	os.MkdirAll(dir, 0700)
 
-	// Backup APIKeys before the first marshal — MarshalJSON may mutate through
-	// shared slice backing array (defensive copy even though MarshalJSON was fixed).
-	origAPIKeys := make([]string, len(cfg.Provider.APIKeys))
-	copy(origAPIKeys, cfg.Provider.APIKeys)
-
-	// First marshal triggers ProviderConfig.MarshalJSON (masks keys for display).
+	// First marshal triggers ProviderConfig.MarshalJSON (masks key for display).
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	// Unmarshal into map so we can fix the masked provider keys.
+	// Unmarshal into map so we can fix the masked api_key.
 	var m map[string]interface{}
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
@@ -208,7 +200,6 @@ func Save(cfg *Config) error {
 	providerRaw, err := json.Marshal(rawProvider{
 		Name:    cfg.Provider.Name,
 		APIKey:  cfg.Provider.APIKey,
-		APIKeys: origAPIKeys,
 		BaseURL: cfg.Provider.BaseURL,
 	})
 	if err != nil {
@@ -227,12 +218,11 @@ func Save(cfg *Config) error {
 }
 
 // rawProvider mirrors ProviderConfig fields without the masking MarshalJSON method.
-// Used by Save to write full API keys to disk.
+// Used by Save to write the full API key to disk.
 type rawProvider struct {
-	Name    string   `json:"name"`
-	APIKey  string   `json:"api_key,omitempty"`
-	APIKeys []string `json:"api_keys,omitempty"`
-	BaseURL string   `json:"base_url,omitempty"`
+	Name    string `json:"name"`
+	APIKey  string `json:"api_key,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
 }
 
 func (c *Config) EffectiveProvider() ProviderConfig {

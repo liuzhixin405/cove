@@ -61,9 +61,10 @@ type ChatResponse struct {
 }
 
 type StreamEvent struct {
-	Type     string    `json:"type"`
-	Delta    string    `json:"delta,omitempty"`
-	ToolCall *ToolCall `json:"tool_call,omitempty"`
+	Type      string    `json:"type"`
+	Delta     string    `json:"delta,omitempty"`
+	Reasoning string    `json:"reasoning,omitempty"`
+	ToolCall  *ToolCall `json:"tool_call,omitempty"`
 }
 
 type StreamHandler func(event StreamEvent)

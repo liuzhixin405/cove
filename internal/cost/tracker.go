@@ -17,15 +17,15 @@ type Price struct {
 }
 
 var Prices = map[string]Price{
-	"claude-sonnet-4-20250514": {Input: 3.0, InputCacheHit: 3.0, Output: 15.0},
-	"claude-opus-4-20250514":   {Input: 15.0, InputCacheHit: 15.0, Output: 75.0},
-	"claude-haiku-3-5":         {Input: 0.8, InputCacheHit: 0.8, Output: 4.0},
-	"deepseek-v4-flash":        {Input: 0.14, InputCacheHit: 0.0028, Output: 0.28},
-	"deepseek-v4-pro":          {Input: 0.435, InputCacheHit: 0.003625, Output: 0.87},
-	"deepseek-chat":            {Input: 0.14, InputCacheHit: 0.0028, Output: 0.28},
-	"deepseek-reasoner":        {Input: 0.14, InputCacheHit: 0.0028, Output: 0.28},
-	"gpt-4o":                   {Input: 2.5, InputCacheHit: 2.5, Output: 10.0},
-	"gpt-4o-mini":              {Input: 0.15, InputCacheHit: 0.15, Output: 0.6},
+	"claude-3-7-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
+	"claude-3-5-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
+	"claude-3-5-haiku":  {Input: 0.8, InputCacheHit: 0.08, Output: 4.0},
+	"claude-3-opus":     {Input: 15.0, InputCacheHit: 1.5, Output: 75.0},
+	"deepseek-chat":     {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
+	"deepseek-reasoner": {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
+	"gpt-4o":            {Input: 2.5, InputCacheHit: 1.25, Output: 10.0},
+	"gpt-4o-mini":       {Input: 0.15, InputCacheHit: 0.075, Output: 0.6},
+	"o3-mini":           {Input: 1.1, InputCacheHit: 1.1, Output: 4.4},
 }
 
 type Tracker struct {

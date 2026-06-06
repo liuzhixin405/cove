@@ -57,7 +57,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 
 		var err error
 		if richRunner, ok := runner.(interface {
-			RunMessageWithStream(context.Context, api.Message, func(string)) (string, error)
+			RunMessageWithStream(context.Context, api.Message, func(string), func(string)) (string, error)
 		}); ok {
 			_, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
 				if firstDelta {
@@ -67,6 +67,12 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				gotDelta = true
 				repl.StreamPrint(delta)
 				totalOutput.WriteString(delta)
+			}, func(reasoning string) {
+				if firstDelta {
+					spinner.Stop()
+					// Don't set firstDelta to false yet, we want next text delta to stop spinner too if reasoning stops early
+				}
+				repl.StreamPrint(repl.ReasoningStyle + reasoning + repl.Reset)
 			})
 		} else {
 			if len(userMsg.Parts) > 0 {
