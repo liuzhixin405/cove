@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 
 
@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [4.0.5] - 2026-06-07
+
+### Added
+
+- **CovePhone (Android App)**: First mobile companion app for cove
+  - Native Go AI engine (mobile/cove.go) compiled via gomobile into cove-core.aar
+  - Full chat UI with thinking display, batch-rendered thinking blocks
+  - Settings screen for API key, model, and provider configuration
+  - Persistent configuration via SharedPreferences (ViewModel-backed)
+  - DeepSeek API integration (real AI, not simulated responses)
+- **Mobile Go Engine**: Lightweight standalone engine in mobile/cove.go for Android use
+- **Release artifact**: covephone-v4.0.5.apk available in dist/v4.0.5/
+
+### Changed
+
+- **Documentation**: README updated with CovePhone sections (English & Chinese)
 ## [3.0.3] - 2026-06-06
 
 ### Fixed
