@@ -38,6 +38,10 @@ type Context struct {
 	IsNonInteractive bool
 	Debug            bool
 	Runtime          *Runtime
+	// OnProgress, when set, is invoked with incremental output chunks while a
+	// long-running tool (e.g. bash/powershell) executes. It lets the UI show
+	// live output and lets the stall monitor know the tool is still alive.
+	OnProgress func(chunk string)
 }
 
 type Runtime struct {

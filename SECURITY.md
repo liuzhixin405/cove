@@ -12,7 +12,7 @@
 
 如果您发现安全漏洞，请**不要**在公开的 issue 中报告。
 
-请发送邮件至：**security@agentgo.dev**（或通过 GitHub Security Advisory 私下报告）。
+请发送邮件至：**164910441@qq.com**（或通过 GitHub Security Advisory 私下报告）。
 
 我们将在 48 小时内确认收到报告，并在 7 天内提供初始评估。
 
@@ -32,3 +32,4 @@
 - **权限模式**: 生产环境建议使用 `default` 或 `plan` 模式
 - **MCP 服务器**: 仅连接到受信任的 MCP 服务器
 - **会话文件**: 不要分享包含 API key 的会话导出文件
+

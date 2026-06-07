@@ -52,7 +52,19 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				spinner.Stop()
 			}
 			eng.OnPermissionDone = nil
-			defer func() { eng.OnPermissionPause = nil }()
+			// Surface live output from long-running tools (bash/powershell) so the
+			// user can tell what a slow command is actually doing instead of only
+			// seeing the stall warning.
+			eng.OnToolProgress = func(toolName, chunk string) {
+				if firstDelta {
+					spinner.Stop()
+				}
+				repl.StreamPrint(repl.Dim + chunk + repl.Reset)
+			}
+			defer func() {
+				eng.OnPermissionPause = nil
+				eng.OnToolProgress = nil
+			}()
 		}
 
 		var err error

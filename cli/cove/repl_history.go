@@ -197,6 +197,10 @@ func handleHistory(eng *engine.Engine) {
 		if msgCount == 0 && len(r.Messages) > 0 {
 			msgCount = len(r.Messages)
 		}
+		turns := r.UserTurns
+		if turns == 0 && len(r.Messages) > 0 {
+			turns = countUserTurns(r.Messages)
+		}
 		date := r.UpdatedAt.Format("01-02 15:04")
 		title := r.Title
 		if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
@@ -205,7 +209,7 @@ func handleHistory(eng *engine.Engine) {
 		if len(title) > 50 {
 			title = title[:50] + "..."
 		}
-		repl.PrintSafe("  %2d. [%s] %s  (%d 条)\n", i+1, date, title, msgCount)
+		repl.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
 	}
 	if len(records) > limit {
 		repl.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
@@ -372,16 +376,16 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 	repl.PrintSafe("\n")
 }
 
-func handleHistoryResumeMostRelevant(eng *engine.Engine) {
+func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	store := eng.Store()
 	if store == nil {
 		repl.PrintSafe("会话存储不可用\n")
-		return
+		return false
 	}
 	records, _ := store.List()
 	if len(records) == 0 {
 		repl.PrintSafe("暂无历史。\n")
-		return
+		return false
 	}
 
 	type candidate struct {
@@ -407,7 +411,7 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) {
 
 	if best.rec == nil {
 		handleHistoryResume("1", eng)
-		return
+		return true
 	}
 
 	eng.LoadMessages(best.rec.Messages)
@@ -415,8 +419,47 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) {
 	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
 		title = sessionPreview(*best.rec)
 	}
-	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 条消息)\n", best.idx, title, len(best.rec.Messages))
-	repl.PrintSafe("可以继续对话了。\n\n")
+	userTurns := countUserTurns(best.rec.Messages)
+	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
+	return true
+}
+
+// countUserTurns reports how many *genuine* user-authored turns a session
+// contains, which is a far more meaningful number to the user than the raw
+// message count (which also includes assistant replies, tool-result messages,
+// and engine-injected synthetic prompts).
+//
+// The engine stores several non-user entries under Role=="user" — e.g. the
+// truncation-continuation nudge and the circuit-breaker hint, both prefixed
+// with "[system:". Those must be excluded or the "轮对话" figure looks wrong.
+func countUserTurns(msgs []api.Message) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role != "user" {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(m.Content), "[system:") {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// resumeAndContinue loads the most relevant past session AND then actually
+// drives the agent forward by enqueuing a real "继续" turn. Previously the
+// resume step only reloaded messages into context and stopped, so typing
+// "继续" appeared to do nothing — the model was never invoked.
+func resumeAndContinue(eng *engine.Engine, tasks *replTaskRunner) {
+	if !handleHistoryResumeMostRelevant(eng) {
+		return
+	}
+	if tasks == nil {
+		return
+	}
+	repl.PrintSafe("正在继续该任务…\n\n")
+	_, _ = tasks.Enqueue(api.Message{Role: "user", Content: "继续"})
+	tasks.WaitIdle()
 }
 
 func scoreSessionForResume(r session.Record) int {

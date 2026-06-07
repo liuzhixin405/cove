@@ -35,7 +35,7 @@
 
 ## 执法
 
-可以通过 security@agentgo.dev 联系项目团队报告辱骂、骚扰或其他不可接受的行为。
+可以通过 164910441@qq.com 联系项目团队报告辱骂、骚扰或其他不可接受的行为。
 所有投诉将被审查和调查，并将产生被认为必要且适合情况的回应。
 项目团队有义务对事件报告者保密。
 
@@ -44,3 +44,4 @@
 本行为准则改编自 [Contributor Covenant][homepage] 2.0 版。
 
 [homepage]: https://www.contributor-covenant.org/version/2/0/code_of_conduct.html
+

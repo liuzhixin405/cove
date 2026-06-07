@@ -699,7 +699,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
 
-		fmt.Printf("您有一个未完成的片段草稿 (创建于 %v 前)。输入 'continue' 恢复，或直接输入新指令忽略。\n", age)
+		fmt.Printf("您有一个未完成的片段草稿 (创建于 %v 前)。输入 “继续” 恢复，或直接输入新指令忽略。\n", age)
 
 		fmt.Printf("  \x1b[2m提示: 使用 /history 可查看全部可恢复的历史会话\x1b[0m\n\n")
 
@@ -839,7 +839,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 					fmt.Println("[提示] 已为您推荐相关历史任务...")
 
-					handleHistoryResumeMostRelevant(eng)
+					resumeAndContinue(eng, tasks)
 
 					historyPickPending = false
 
@@ -877,7 +877,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 					fmt.Println("[提示] 已为您推荐相关历史任务...")
 
-					handleHistoryResumeMostRelevant(eng)
+					resumeAndContinue(eng, tasks)
 
 					historyPickPending = false
 
@@ -907,7 +907,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			}
 
-			handleHistoryResumeMostRelevant(eng)
+			resumeAndContinue(eng, tasks)
 
 			historyPickPending = false
 

@@ -20,6 +20,7 @@ type Record struct {
 	Messages  []api.Message `json:"messages"`
 	// MessageCount and Preview are list-only metadata populated by List().
 	MessageCount int     `json:"-"`
+	UserTurns    int     `json:"-"`
 	Preview      string  `json:"-"`
 	Model        string  `json:"model"`
 	TokensIn     int     `json:"tokens_in"`
@@ -106,6 +107,7 @@ func (s *Store) List() ([]Record, error) {
 			UpdatedAt:    meta.UpdatedAt,
 			Title:        meta.Title,
 			MessageCount: len(meta.Messages),
+			UserTurns:    countGenuineUserTurns(meta.Messages),
 			Preview:      firstUserPreview(meta.Messages),
 			Model:        meta.Model,
 			TokensIn:     meta.TokensIn,
@@ -145,6 +147,28 @@ func firstUserPreview(messages []struct {
 		}
 	}
 	return fallback
+}
+
+// countGenuineUserTurns counts only real user-authored turns, excluding the
+// engine-injected synthetic prompts that are also stored under Role=="user"
+// (e.g. the truncation-continuation nudge and circuit-breaker hints, both
+// prefixed with "[system:"). The raw message count is misleading because it
+// also includes assistant replies and tool-result messages.
+func countGenuineUserTurns(messages []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}) int {
+	n := 0
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(m.Content), "[system:") {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func isLowSignalHistoryText(s string) bool {

@@ -65,17 +65,9 @@ func (t *PowerShellTool) Call(ctx context.Context, input Input, tctx Context) (R
 	cmd.Env = os.Environ()
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return Result{Data: fmt.Sprintf("Error: %v\nStderr: %s", err, stderr.String()), IsError: true}, nil
-		}
+	exitCode, runErr := streamCommand(execCtx, cmd, &stdout, &stderr, tctx.OnProgress)
+	if runErr != nil {
+		return Result{Data: fmt.Sprintf("Error: %v\nStderr: %s", runErr, stderr.String()), IsError: true}, nil
 	}
 
 	var sb strings.Builder

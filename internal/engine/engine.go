@@ -78,8 +78,9 @@ type Engine struct {
 	iterCount             int        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex // lock for interactive permission prompts
 	PermissionPrompt      func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause     func() // called before permission prompt to pause spinners
-	OnPermissionDone      func() // called after permission decision to resume
+	OnPermissionPause     func()                       // called before permission prompt to pause spinners
+	OnPermissionDone      func()                       // called after permission decision to resume
+	OnToolProgress        func(toolName, chunk string) // live output chunks from long-running tools
 	sessionNotes          *notes.SessionNotes
 	guardrails            *guardrail.Tracker
 	subdirHints           *ctxt.SubdirHints
@@ -618,6 +619,15 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		IsNonInteractive: e.runtime == nil || e.runtime.AskUser == nil,
 		Debug:            e.config.Debug,
 		Runtime:          e.runtime,
+		// Forward live tool output: reset the stall timer so an actively
+		// producing command isn't mislabeled as "stuck", and surface the
+		// chunk to the UI so the user can see what the command is doing.
+		OnProgress: func(chunk string) {
+			e.progressActivity(toolAct)
+			if e.OnToolProgress != nil {
+				e.OnToolProgress(tc.Name, chunk)
+			}
+		},
 	}
 
 	if e.classifier != nil && tc.Name == "bash" {
