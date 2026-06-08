@@ -434,6 +434,10 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			// Derive name from URL
 			parts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
 			name = parts[len(parts)-1]
+		} else if at := strings.IndexByte(name, '@'); at > 0 {
+			// Claude-style "plugin@marketplace" reference: keep only the plugin
+			// name. The marketplace source is resolved from the local index.
+			name = name[:at]
 		}
 
 		// Try marketplace install first (if no explicit URL and marketplace is available)
@@ -444,8 +448,14 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			if mi, ok := in.PluginManager.(marketInstaller); ok {
 				if err := mi.MarketplaceInstall(name); err == nil {
 					return Output{Message: fmt.Sprintf("✓ 已从 marketplace 安装: %s", name)}, nil
+				} else {
+					// Not found in marketplace. Do NOT silently scaffold an empty
+					// plugin (that produces an installed-but-useless entry). Tell
+					// the user how to install from a git URL instead.
+					return Output{Message: fmt.Sprintf(
+						"无法从 marketplace 安装 %q: %v\n如果你知道插件仓库地址，用: /plugin install %s <git-url>\n或先刷新索引: /plugin refresh",
+						name, err, name)}, nil
 				}
-				// Fallback to local scaffold if not in marketplace
 			}
 		}
 

@@ -8,6 +8,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -37,7 +38,7 @@ func providerEnvHelpLine() string {
 	return "环境变量: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
 }
 
-func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
+func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	fmt.Println("\n=== cove v" + Version + " ===")
 	fmt.Println("\n供应商 / 模型:")
 	fmt.Println("  /model <名称>       设置模型")
@@ -64,6 +65,14 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry) {
 	fmt.Println("\n命令:")
 	for _, c := range cmdReg.All() {
 		fmt.Printf("  /%-16s %s\n", c.Name(), c.Description())
+	}
+	if pluginMgr != nil {
+		if pcmds := pluginMgr.CommandPrompts(); len(pcmds) > 0 {
+			fmt.Println("\n插件命令:")
+			for name, c := range pcmds {
+				fmt.Printf("  /%-16s %s (%s)\n", name, c.Description, c.Plugin)
+			}
+		}
 	}
 	fmt.Println("\n工具:")
 	for _, t := range toolReg.All() {

@@ -40,3 +40,5 @@ go.work.sum
 # Go build artifacts
 coverage.txt
 *.test
+
+NUL

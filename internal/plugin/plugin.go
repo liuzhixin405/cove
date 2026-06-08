@@ -145,10 +145,13 @@ func (m *Manager) Install(name string, url string) error {
 			os.RemoveAll(pluginDir)
 			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
 		}
+		// Generate manifest.json from .claude-plugin/plugin.json if the repo uses
+		// the Claude plugin format instead of a native manifest.json.
+		ensureManifest(pluginDir)
 		// Validate manifest
 		if _, err := os.Stat(filepath.Join(pluginDir, "manifest.json")); os.IsNotExist(err) {
 			os.RemoveAll(pluginDir)
-			return fmt.Errorf("cloned repo has no manifest.json — not a valid plugin")
+			return fmt.Errorf("cloned repo has no manifest.json or .claude-plugin/plugin.json — not a valid plugin")
 		}
 		return m.loadPluginLocked(name)
 	}
@@ -292,6 +295,103 @@ func (m *Manager) EnabledCommands() []string {
 		cmds = append(cmds, p.Manifest.Commands...)
 	}
 	return cmds
+}
+
+// CommandPrompt holds an executable plugin command: its prompt body (markdown)
+// and a short description for help/completion.
+type CommandPrompt struct {
+	Plugin      string
+	Description string
+	Prompt      string
+}
+
+// CommandPrompts scans every enabled plugin's commands/ directory for markdown
+// command files and returns them keyed by command name (filename without the
+// .md extension). When a plugin command is invoked, its prompt body is injected
+// into the engine as a user message. Names from later plugins do not override
+// earlier ones (first writer wins) so behaviour is deterministic.
+func (m *Manager) CommandPrompts() map[string]CommandPrompt {
+	m.mu.RLock()
+	dirs := make([]string, 0, len(m.plugins))
+	names := make([]string, 0, len(m.plugins))
+	for name, p := range m.plugins {
+		if p.State != Enabled {
+			continue
+		}
+		dirs = append(dirs, p.Dir)
+		names = append(names, name)
+	}
+	m.mu.RUnlock()
+
+	out := make(map[string]CommandPrompt)
+	for i, dir := range dirs {
+		cmdDir := filepath.Join(dir, "commands")
+		entries, err := os.ReadDir(cmdDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+				continue
+			}
+			cmdName := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			if cmdName == "" {
+				continue
+			}
+			if _, exists := out[cmdName]; exists {
+				continue // first writer wins
+			}
+			data, err := os.ReadFile(filepath.Join(cmdDir, e.Name()))
+			if err != nil {
+				continue
+			}
+			desc, body := parseCommandMarkdown(string(data))
+			out[cmdName] = CommandPrompt{Plugin: names[i], Description: desc, Prompt: body}
+		}
+	}
+	return out
+}
+
+// parseCommandMarkdown strips an optional YAML frontmatter block from a plugin
+// command file and returns a short description plus the remaining prompt body.
+// The description comes from a frontmatter "description:" field when present,
+// otherwise the first non-empty content line.
+func parseCommandMarkdown(content string) (description, body string) {
+	body = content
+	if strings.HasPrefix(content, "---") {
+		rest := content[3:]
+		if idx := strings.Index(rest, "\n---"); idx >= 0 {
+			front := rest[:idx]
+			for _, line := range strings.Split(front, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(strings.ToLower(line), "description:") {
+					description = strings.TrimSpace(line[len("description:"):])
+					description = strings.Trim(description, "\"'")
+				}
+			}
+			// Advance past the closing delimiter line.
+			after := rest[idx+len("\n---"):]
+			if nl := strings.IndexByte(after, '\n'); nl >= 0 {
+				body = after[nl+1:]
+			} else {
+				body = ""
+			}
+		}
+	}
+	body = strings.TrimSpace(body)
+	if description == "" {
+		for _, line := range strings.Split(body, "\n") {
+			line = strings.TrimSpace(strings.TrimLeft(line, "#"))
+			if line != "" {
+				description = line
+				break
+			}
+		}
+	}
+	if len(description) > 60 {
+		description = description[:57] + "..."
+	}
+	return description, body
 }
 
 // --- Marketplace bridge methods (satisfy command interface assertions) ---

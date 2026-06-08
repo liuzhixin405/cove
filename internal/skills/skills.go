@@ -330,6 +330,19 @@ func LoadAll(m *Manager, cwd string) {
 	if home != "" {
 		m.AddDirectory(filepath.Join(home, ".cove", "skills"))
 		m.AddDirectory(filepath.Join(home, ".claude", "skills"))
+		// Installed plugins may bundle skills under plugins/<name>/skills/.
+		// Scan each enabled plugin's skills directory so plugin skills become
+		// available without manual symlinking. Directories suffixed .disabled
+		// are skipped to honour the plugin enable/disable state.
+		pluginsDir := filepath.Join(home, ".cove", "plugins")
+		if entries, err := os.ReadDir(pluginsDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasSuffix(e.Name(), ".disabled") {
+					continue
+				}
+				m.AddDirectory(filepath.Join(pluginsDir, e.Name(), "skills"))
+			}
+		}
 	}
 
 	if cwd != "" {

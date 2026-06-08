@@ -239,8 +239,16 @@ func main() {
 	memStore := memory.NewStore()
 
 	pluginMgr := plugin.NewManager()
+	pluginMgr.Init()
 
 	mcpPool := mcp.NewPool()
+	if len(cfg.MCPServers) > 0 {
+		servers := make(map[string]mcp.ServerConfig, len(cfg.MCPServers))
+		for name, sc := range cfg.MCPServers {
+			servers[name] = mcp.ServerConfig(sc)
+		}
+		mcpPool.LoadFromConfig(context.Background(), servers)
+	}
 
 	toolReg := registerAllTools(mcpPool, skillMgr)
 
@@ -430,9 +438,10 @@ func main() {
 
 	// Startup log scan: review errors recorded in previous sessions and remind
 	// the user what still needs fixing. After fixing, run /diagnose archive to
-	// archive the log and begin a fresh error cycle.
+	// archive the log and begin a fresh error cycle. These fix suggestions are
+	// developer-oriented, so only surface them in debug mode (hidden in release).
 
-	if scan := diagnostic.ScanRuntimeLogOnStartup(); scan.HasProblems() {
+	if scan := diagnostic.ScanRuntimeLogOnStartup(); (debugMode || cfg.Debug) && scan.HasProblems() {
 
 		const reset = "\x1b[0m"
 
@@ -579,6 +588,8 @@ func registerAllCommands() *command.Registry {
 
 	r.Register(command.NewDreamCmd())
 
+	r.Register(command.NewMcpCmd())
+
 	return r
 
 }
@@ -624,6 +635,12 @@ func withInterrupt(f func(ctx context.Context)) {
 func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
 
 	allCommands := buildCommandList(cmdReg, toolReg)
+
+	for name, c := range pluginMgr.CommandPrompts() {
+
+		allCommands = append(allCommands, cmdEntry{Name: "/" + name, Desc: c.Description, Type: "cmd"})
+
+	}
 
 	// Build skill description map (short descriptions, not full prompts)
 
@@ -915,7 +932,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 		case input == "/help":
 
-			printHelp(cmdReg, toolReg)
+			printHelp(cmdReg, toolReg, pluginMgr)
 
 		case input == "/":
 
@@ -948,6 +965,12 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 			continue
 
 		case strings.HasPrefix(input, "/"):
+
+			if handlePluginCommand(input, pluginMgr, tasks) {
+
+				continue
+
+			}
 
 			if handleUnknownCmd(input, cmdReg) {
 
@@ -1484,6 +1507,38 @@ func handleSkill(input string, eng *engine.Engine) {
 
 	}
 
+}
+
+// handlePluginCommand checks whether the slash command matches a command
+// provided by an enabled plugin. If so, it injects the command's prompt body
+// (plus any trailing arguments) into the engine as a user message and returns
+// true. Returns false when no plugin command matches.
+func handlePluginCommand(input string, pluginMgr *plugin.Manager, tasks *replTaskRunner) bool {
+	if pluginMgr == nil {
+		return false
+	}
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return false
+	}
+	name := strings.TrimPrefix(parts[0], "/")
+	cmds := pluginMgr.CommandPrompts()
+	cmd, ok := cmds[name]
+	if !ok {
+		return false
+	}
+	prompt := cmd.Prompt
+	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
+		prompt = prompt + "\n\n" + args
+	}
+	fmt.Printf("[插件命令: /%s (%s)]\n", name, cmd.Plugin)
+	_, merged := tasks.Enqueue(api.Message{Role: "user", Content: prompt})
+	if merged {
+		fmt.Println("[已补充] 已合并进当前处理任务")
+	} else {
+		fmt.Println("[输入已接收]")
+	}
+	return true
 }
 
 func isSkillInvocation(input string, eng *engine.Engine) bool {

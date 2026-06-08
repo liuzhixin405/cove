@@ -3,11 +3,11 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/log"
 )
 
 type ManagedServer struct {
@@ -43,7 +43,7 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 	var transport Transport
 	var err error
 
-	switch cfg.Type {
+	switch strings.ToLower(cfg.Type) {
 	case "sse":
 		if cfg.URL != "" {
 			transport, err = NewSSETransport(cfg.URL)
@@ -221,16 +221,21 @@ func (ms *ManagedServer) Close() {
 
 func ConnectFromConfig(ctx context.Context, servers map[string]ServerConfig) *Pool {
 	pool := NewPool()
-	for name, cfg := range servers {
-		if err := pool.Connect(ctx, name, cfg); err != nil {
-			logF("MCP: %s: %v", name, err)
-		}
-	}
+	pool.LoadFromConfig(ctx, servers)
 	return pool
 }
 
-var logger = log.New(os.Stderr, "", 0)
+// LoadFromConfig connects to all servers defined in the config map.
+func (p *Pool) LoadFromConfig(ctx context.Context, servers map[string]ServerConfig) {
+	for name, cfg := range servers {
+		if err := p.Connect(ctx, name, cfg); err != nil {
+			logF("MCP: %s: %v", name, err)
+		}
+	}
+}
 
+// logF emits diagnostic messages only when the global log level is Debug,
+// so MCP connection problems stay hidden in normal (release) runs.
 func logF(format string, args ...any) {
-	logger.Printf(format, args...)
+	log.Debugf(format, args...)
 }

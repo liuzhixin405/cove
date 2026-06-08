@@ -751,6 +751,12 @@ func (m *Marketplace) findCachedPlugin(name string) string {
 // ensureManifest generates a manifest.json from .claude-plugin/plugin.json if the
 // plugin does not already have a manifest.json (Claude official format compatibility).
 func (m *Marketplace) ensureManifest(pluginDir string) {
+	ensureManifest(pluginDir)
+}
+
+// ensureManifest generates a manifest.json from .claude-plugin/plugin.json if the
+// plugin does not already have a manifest.json (Claude official format compatibility).
+func ensureManifest(pluginDir string) {
 	manifestPath := filepath.Join(pluginDir, "manifest.json")
 	if _, err := os.Stat(manifestPath); err == nil {
 		return // already has manifest.json
