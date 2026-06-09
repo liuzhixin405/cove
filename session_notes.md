@@ -3,7 +3,7 @@
 ## Technical Support
 
 For technical support regarding CovePhone, please contact:
-- **Email**: 164910441@qq.com (刘志新)
+- **Email**: 164910441@qq.com
 - **GitHub Issues**: https://github.com/liuzhixin405/cove/issues
 
 ## Release Summary
