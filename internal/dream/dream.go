@@ -257,7 +257,13 @@ func (r *Runner) executeDreamBash(tc api.ToolCall) string {
 		}
 	}
 
-	// Block redirects and pipes to files
+	// Block shell meta operators to prevent command chaining/substitution.
+	// Dream mode allows only a single read-only command.
+	if strings.ContainsAny(cmd, "|;&`$<") || strings.Contains(cmd, "\n") || strings.Contains(cmd, "\r") {
+		allowed = false
+	}
+
+	// Block output/input redirection.
 	if strings.Contains(cmd, ">") || strings.Contains(cmd, ">>") {
 		allowed = false
 	}

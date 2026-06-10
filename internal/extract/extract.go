@@ -242,41 +242,85 @@ func min(a, b int) int {
 
 // similarity computes a simple overlap coefficient between two strings.
 func similarity(a, b string) float64 {
+	a = strings.TrimSpace(strings.ToLower(a))
+	b = strings.TrimSpace(strings.ToLower(b))
 	if len(a) == 0 || len(b) == 0 {
 		return 0
 	}
-	shorter := a
-	longer := b
-	if len(a) > len(b) {
-		shorter, longer = b, a
+	if a == b {
+		return 1
 	}
-	matches := 0
-	for i := 0; i <= len(longer)-len(shorter); i++ {
-		if longer[i:i+len(shorter)] == shorter {
-			matches++
-		}
+
+	ar := []rune(a)
+	br := []rune(b)
+	dist := levenshtein(ar, br)
+	maxLen := len(ar)
+	if len(br) > maxLen {
+		maxLen = len(br)
 	}
-	if matches > 0 {
-		return 1.0
-	}
-	// Fallback: character-level Jaccard
-	setA := make(map[byte]bool)
-	for i := 0; i < len(a); i++ {
-		setA[a[i]] = true
-	}
-	setB := make(map[byte]bool)
-	for i := 0; i < len(b); i++ {
-		setB[b[i]] = true
-	}
-	intersection := 0
-	for k := range setA {
-		if setB[k] {
-			intersection++
-		}
-	}
-	union := len(setA) + len(setB) - intersection
-	if union == 0 {
+	if maxLen == 0 {
 		return 0
 	}
-	return float64(intersection) / float64(union)
+	score := 1.0 - float64(dist)/float64(maxLen)
+
+	if strings.Contains(a, b) || strings.Contains(b, a) {
+		shorter := len(ar)
+		longer := len(br)
+		if shorter > longer {
+			shorter, longer = longer, shorter
+		}
+		containment := float64(shorter) / float64(longer)
+		if containment > score {
+			score = containment
+		}
+	}
+
+	if score < 0 {
+		return 0
+	}
+	if score > 1 {
+		return 1
+	}
+	return score
+}
+
+func levenshtein(a, b []rune) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := 0; j <= len(b); j++ {
+		prev[j] = j
+	}
+
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+
+			insertCost := curr[j-1] + 1
+			deleteCost := prev[j] + 1
+			replaceCost := prev[j-1] + cost
+
+			best := insertCost
+			if deleteCost < best {
+				best = deleteCost
+			}
+			if replaceCost < best {
+				best = replaceCost
+			}
+			curr[j] = best
+		}
+		prev, curr = curr, prev
+	}
+
+	return prev[len(b)]
 }

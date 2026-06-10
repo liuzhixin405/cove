@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type BashTool struct{}
@@ -73,7 +74,8 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	if stdout.Len() > 0 {
 		out := stdout.String()
 		if len(out) > 30000 {
-			out = out[:30000] + fmt.Sprintf("\n... [truncated %d bytes, use grep for targeted search]", stdout.Len()-30000)
+			trimmed, truncated := truncateUTF8(out, 30000)
+			out = trimmed + fmt.Sprintf("\n... [truncated %d bytes, use grep for targeted search]", truncated)
 		}
 		sb.WriteString(out)
 	}
@@ -81,7 +83,8 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		sb.WriteString("\n[stderr]\n")
 		errOut := stderr.String()
 		if len(errOut) > 10000 {
-			errOut = errOut[:10000] + fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-10000)
+			trimmed, truncated := truncateUTF8(errOut, 10000)
+			errOut = trimmed + fmt.Sprintf("\n... [stderr truncated %d bytes]", truncated)
 		}
 		sb.WriteString(errOut)
 	}
@@ -111,4 +114,19 @@ func detectShell() (string, string) {
 		return "pwsh", "-Command"
 	}
 	return "cmd", "/C"
+}
+
+func truncateUTF8(s string, maxBytes int) (string, int) {
+	if len(s) <= maxBytes {
+		return s, 0
+	}
+
+	cut := maxBytes
+	for cut > 0 && !utf8.ValidString(s[:cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return "", len(s)
+	}
+	return s[:cut], len(s) - cut
 }
