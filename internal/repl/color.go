@@ -258,6 +258,11 @@ func Prompt() string {
 	return BrightCyan + "❯ " + Reset
 }
 
+// PromptRunning returns the prompt shown when a background task is running.
+func PromptRunning() string {
+	return Yellow + "⚡ ❯ " + Reset
+}
+
 // SectionHeader renders a section label
 func SectionHeader(label string) string {
 	return fmt.Sprintf("\n  %s%s─── %s ───%s\n", Dim, "", label, Reset)

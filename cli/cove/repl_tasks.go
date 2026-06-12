@@ -21,6 +21,48 @@ type replTaskRunner struct {
 	cancel           context.CancelFunc
 	queue            []api.Message
 	pendingFailedMsg *api.Message
+	current          api.Message
+	currentStart     time.Time
+}
+
+// TaskSnapshot is a read-only view of the runner state for /tasks.
+type TaskSnapshot struct {
+	Running      bool
+	Current      string
+	Elapsed      time.Duration
+	Queued       []string
+	PendingRetry string
+}
+
+func taskPreview(msg api.Message) string {
+	s := strings.TrimSpace(msg.Content)
+	if s == "" && len(msg.Parts) > 0 {
+		s = "(含附件的消息)"
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	rs := []rune(s)
+	if len(rs) > 60 {
+		return string(rs[:60]) + "…"
+	}
+	return s
+}
+
+// Snapshot returns the current running/queued task state for display.
+func (r *replTaskRunner) Snapshot() TaskSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snap := TaskSnapshot{Running: r.running}
+	if r.running {
+		snap.Current = taskPreview(r.current)
+		snap.Elapsed = time.Since(r.currentStart)
+	}
+	for _, m := range r.queue {
+		snap.Queued = append(snap.Queued, taskPreview(m))
+	}
+	if r.pendingFailedMsg != nil {
+		snap.PendingRetry = taskPreview(*r.pendingFailedMsg)
+	}
+	return snap
 }
 
 func isContinueCommand(input string) bool {
@@ -103,6 +145,26 @@ func commonPrefixRunes(a, b string) int {
 		count++
 	}
 	return count
+}
+
+// formatTaskSnapshot renders a TaskSnapshot for the /tasks command.
+func formatTaskSnapshot(s TaskSnapshot) string {
+	var sb strings.Builder
+	if s.Running {
+		sb.WriteString(fmt.Sprintf("当前任务 (已运行 %s):\n  %s\n", s.Elapsed.Truncate(time.Second), s.Current))
+	} else {
+		sb.WriteString("当前没有运行中的任务\n")
+	}
+	if len(s.Queued) > 0 {
+		sb.WriteString(fmt.Sprintf("排队中 (%d):\n", len(s.Queued)))
+		for i, q := range s.Queued {
+			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, q))
+		}
+	}
+	if s.PendingRetry != "" {
+		sb.WriteString(fmt.Sprintf("可重试 (输入“继续”): %s\n", s.PendingRetry))
+	}
+	return sb.String()
 }
 
 func newREPLTaskRunner(eng *engine.Engine) *replTaskRunner {
@@ -202,6 +264,8 @@ func (r *replTaskRunner) startNextLocked() {
 	msg := r.queue[0]
 	r.queue = r.queue[1:]
 	r.running = true
+	r.current = msg
+	r.currentStart = time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 
@@ -249,5 +313,7 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 func (r *replTaskRunner) finishLocked() {
 	r.running = false
 	r.cancel = nil
+	r.current = api.Message{}
+	r.currentStart = time.Time{}
 	r.cond.Broadcast()
 }

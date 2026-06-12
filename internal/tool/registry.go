@@ -2,8 +2,6 @@ package tool
 
 import (
 	"encoding/json"
-	"fmt"
-	"strings"
 )
 
 type Registry struct {
@@ -60,6 +58,11 @@ func (r *Registry) Enabled(ctx Context) []Tool {
 }
 
 func (r *Registry) ToolDefs() []json.RawMessage {
+	type toolDefJSON struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		InputSchema json.RawMessage `json:"input_schema"`
+	}
 	var out []json.RawMessage
 	for _, t := range r.All() {
 		d := t.Def()
@@ -67,10 +70,15 @@ func (r *Registry) ToolDefs() []json.RawMessage {
 		if len(schema) == 0 {
 			schema = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
-		out = append(out, json.RawMessage(fmt.Sprintf(
-			`{"name":"%s","description":"%s","input_schema":%s}`,
-			d.Name, strings.ReplaceAll(d.Description, `"`, `\"`), string(schema),
-		)))
+		raw, err := json.Marshal(toolDefJSON{
+			Name:        d.Name,
+			Description: d.Description,
+			InputSchema: schema,
+		})
+		if err != nil {
+			continue
+		}
+		out = append(out, json.RawMessage(raw))
 	}
 	return out
 }

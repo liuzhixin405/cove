@@ -404,6 +404,17 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 			sb.WriteString(fmt.Sprintf("Messages: %d queued\n", len(tctx.Runtime.Messages)))
 		}
 	}
+
+	// If plan executor is available, auto-execute the team's pending tasks.
+	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
+		result, err := tctx.Runtime.PlanExecuteFunc(true)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("\n\n[执行失败] %v", err))
+		} else {
+			sb.WriteString("\n\n[团队执行结果]\n" + result)
+		}
+	}
+
 	return Result{Data: strings.TrimSpace(sb.String())}, nil
 }
 func (t *TeamCreateTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
@@ -501,30 +512,47 @@ func (t *SendMessageTool) Call(ctx context.Context, input Input, tctx Context) (
 	if tctx.Runtime != nil {
 		tctx.Runtime.Lock()
 		ensureRuntimeMaps(tctx.Runtime)
-		tctx.Runtime.Messages = append(tctx.Runtime.Messages, MessageRecord{To: to, Message: msg, CreatedAt: time.Now().Format(time.RFC3339)})
+		now := time.Now().Format(time.RFC3339)
+
+		// If the target task is still pending, queue an undelivered message so
+		// the plan executor injects it into that agent's prompt when it starts.
 		if tr, ok := tctx.Runtime.Tasks[to]; ok {
+			pending := tr.Status == "pending" || tr.Status == "scheduled"
+			tctx.Runtime.Messages = append(tctx.Runtime.Messages, MessageRecord{To: to, Message: msg, CreatedAt: now, Delivered: !pending})
 			if tr.Output != "" {
 				tr.Output += "\n"
 			}
 			tr.Output += fmt.Sprintf("message: %s", msg)
-			tr.UpdatedAt = time.Now().Format(time.RFC3339)
+			tr.UpdatedAt = now
 			tctx.Runtime.Unlock()
+			if pending {
+				return Result{Data: fmt.Sprintf("Message queued for task %s; it will be delivered into the agent's prompt when the task runs.", to)}, nil
+			}
 			return Result{Data: fmt.Sprintf("Delivered message to task %s", to)}, nil
 		}
+
 		if team, ok := tctx.Runtime.Teams[to]; ok {
+			// Broadcast to the team: queue for members that haven't started yet.
+			queued := 0
+			tctx.Runtime.Messages = append(tctx.Runtime.Messages, MessageRecord{To: to, Message: msg, CreatedAt: now, Delivered: false})
 			for _, member := range team.Members {
 				if tr, exists := tctx.Runtime.Tasks[member.ID]; exists {
+					if tr.Status == "pending" || tr.Status == "scheduled" {
+						queued++
+					}
 					if tr.Output != "" {
 						tr.Output += "\n"
 					}
 					tr.Output += fmt.Sprintf("team message: %s", msg)
-					tr.UpdatedAt = time.Now().Format(time.RFC3339)
+					tr.UpdatedAt = now
 				}
 			}
 			tctx.Runtime.Unlock()
-			return Result{Data: fmt.Sprintf("Delivered message to team %s (%d members)", to, len(team.Members))}, nil
+			return Result{Data: fmt.Sprintf("Broadcast message to team %s (%d members, %d pending will receive it on start)", to, len(team.Members), queued)}, nil
 		}
+
 		if to == "user" {
+			tctx.Runtime.Messages = append(tctx.Runtime.Messages, MessageRecord{To: to, Message: msg, CreatedAt: now, Delivered: true})
 			tctx.Runtime.Unlock()
 			return Result{Data: "Queued message for user in local runtime"}, nil
 		}
@@ -697,4 +725,47 @@ func (t *TaskOutputTool) Call(ctx context.Context, input Input, tctx Context) (R
 }
 func (t *TaskOutputTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("task output is read-only")
+}
+
+// --- execute_plan ---
+
+type ExecutePlanTool struct{ baseTool }
+
+func NewExecutePlanTool() Tool {
+	return &ExecutePlanTool{baseTool{def: Def{
+		Name: "execute_plan", Aliases: []string{"ExecutePlan"},
+		Description: "Execute all pending tasks defined by todowrite, respecting dependencies. " +
+			"Use ONLY for complex multi-step implementation plans (3+ tasks). " +
+			"Do NOT use for simple Q&A, single-file edits, or casual conversation. " +
+			"Independent tasks (same dependency level) run concurrently when parallel=true.",
+		InputSchema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"parallel":{"type":"boolean","description":"Run independent tasks concurrently when true"},
+				"max_agents":{"type":"integer","description":"Maximum concurrent agents (default 4)"}
+			},
+			"required":[]
+		}`),
+		IsReadOnly: false, IsConcurrencySafe: false, UserFacingName: "Execute Plan",
+	}}}
+}
+
+func (t *ExecutePlanTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
+	parallel, _ := input["parallel"].(bool)
+
+	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
+		result, err := tctx.Runtime.PlanExecuteFunc(parallel)
+		if err != nil {
+			return Result{Data: err.Error(), IsError: true}, nil
+		}
+		return Result{Data: result}, nil
+	}
+	// Plan executor not wired: suggest sequential execution
+	return Result{Data: "Plan executor not available. Execute the tasks listed in " +
+		"todowrite one at a time using the standard tools (read, write, bash, etc.). " +
+		"Work through them in dependency order."}, nil
+}
+
+func (t *ExecutePlanTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
+	return Allowed("plan execution has no safety risk")
 }

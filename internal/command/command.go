@@ -49,6 +49,8 @@ type MemoryStore interface {
 	All() []memory.Entry
 	Save(name, content string) error
 	Delete(name string) error
+	Search(query string, topK int) []memory.EntryMatch
+	Stats() memory.Stats
 }
 
 type PermissionManager interface {

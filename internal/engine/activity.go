@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/diagnostic"
@@ -100,9 +99,9 @@ func (e *Engine) runStallMonitor(stop <-chan struct{}) {
 			}
 			e.actMu.Unlock()
 			for _, s := range stuckList {
-				fmt.Fprintf(os.Stderr,
+				e.engineOutput(fmt.Sprintf(
 					"\r\x1b[K\x1b[33m⚠ 仍在「%s」，已 %s 无新进展（可能卡住，按 Ctrl+C 可中断）\x1b[0m\n",
-					s.label, s.idle.Round(time.Second))
+					s.label, s.idle.Round(time.Second)))
 				// Record once to the runtime log. We deliberately do NOT also call
 				// log.Warnf here: the live stderr line above already shows it, and
 				// log.Warnf would be mirrored into the same log via the sink,

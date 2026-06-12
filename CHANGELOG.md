@@ -28,6 +28,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Documentation**: README updated with CovePhone sections (English & Chinese)
+## [5.1.2] - 2026-06-11
+
+### Added
+- **Plan Executor (execute_plan)**: Declarative multi-step task plans with dependency DAG, topological sort, and parallel sub-agent execution (up to 4 concurrent)
+- **Multi-Agent Teams (team_create/team_delete)**: Create agent teams with member tasks and inter-agent message passing (send_message)
+- **Cron Scheduler (cron)**: Schedule recurring background tasks via cron expressions
+- **Background Task Queue**: Async REPL task execution with queue, merge detection, retry support, and interrupt drafts
+- **Checkpoint System**: Auto Git snapshots before write/edit operations with `/undo` and `/checkpoints` commands
+- **Headless Browser (browser)**: Chrome-based JS rendering and screenshot capture (chromedp build tag)
+- **Web Search (websearch)**: DuckDuckGo-based live web search tool
+- **Attachments (/attach)**: File and image attachment in REPL with `@path` inline syntax
+- **Session History (/history)**: Browse and resume past conversation sessions with detail view
+- **Rate Limit Tracking (/ratelimit)**: API rate limit status monitoring
+- **Budget Auto-Mode (/budget auto)**: Smart budget suggestion based on historical usage
+- **Git Worktree (worktree/exit_worktree)**: Isolated git worktree creation and cleanup
+- **User Manual**: Comprehensive Chinese user manual covering all features, commands, and tools
+
+### Changed
+- **REPL Commands**: `/tasks`, `/stop` commands for background task monitoring; `/dream` for manual memory consolidation
+- **README**: Added Agent Tools table, Plan Executor, Teams, Guardrails, Checkpoints, and Diagnostic System
+- **docs/**: Reorganized with index, fixed corrupted docs/README.md
+- **REPL UI**: Async task execution prevents input blocking; streaming-safe cursor handling
+
+### Fixed
+- **Permission prompt hang**: Replaced fmt.Scanln with bufio.Scanner — empty input defaults to deny
+- **Tool goroutine panic crash**: Added defer recover() in parallel tool execution goroutines
+- **Engine loop after Ctrl+C**: Added ctx.Err() check at iteration start
+- **WalkingIndicator race condition**: Synchronized Stop() with doneCh channel
+
 ## [3.0.3] - 2026-06-06
 
 ### Fixed
@@ -259,10 +288,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
-[Unreleased]: https://github.com/liuzhixin405/cove/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/liuzhixin405/cove/compare/v5.1.2...HEAD
 
-[2.0.0]: https://github.com/liuzhixin405/cove/compare/v1.0.2...v2.0.0
-
+[5.1.2]: https://github.com/liuzhixin405/cove/compare/v4.0.5...v5.1.2
+[4.0.5]: https://github.com/liuzhixin405/cove/compare/v3.0.3...v4.0.5
+[3.0.3]: https://github.com/liuzhixin405/cove/compare/v1.0.0...v3.0.3
+[1.0.0]: https://github.com/liuzhixin405/cove/compare/v1.0.2...v1.0.0
 [1.0.2]: https://github.com/liuzhixin405/cove/compare/v1.0.1...v1.0.2
 
 [1.0.1]: https://github.com/liuzhixin405/cove/releases/tag/v1.0.1

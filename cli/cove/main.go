@@ -290,6 +290,9 @@ func main() {
 
 	eng.SetProjectContext(projCtx)
 
+	// Wire the plan executor so execute_plan tool can run multi-step plans.
+	eng.WirePlanExecutor()
+
 	// Disable background API features if --no-auto flag is set
 
 	if noAuto {
@@ -346,7 +349,35 @@ func main() {
 
 		repl.PrintAbove(fmt.Sprintf("\n  %s请输入 (y)确认 / (n)拒绝 / (a)始终允许: %s", repl.Yellow, repl.Reset))
 
+		// REPL 交互模式下经输入通道复用唯一的固定输入行；
+
+		// 非交互（-p）模式无转发循环，回退到直接读 stdin。
+
 		readAnswer := func() string {
+
+			if replInteractive {
+
+				ch := make(chan string, 1)
+
+				repl.SetPermInputCh(ch)
+
+				// 授权提问期间引擎已阻塞等待答复，没有并发流式输出，
+				// 因此临时恢复可见输入行，让用户能看到并填写 y/n/a。
+				repl.BeginPromptInput()
+
+				line, ok := <-ch
+
+				repl.EndPromptInput()
+
+				if !ok {
+
+					return ""
+
+				}
+
+				return strings.TrimSpace(strings.ToLower(line))
+
+			}
 
 			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 
@@ -482,7 +513,7 @@ func main() {
 
 	}
 
-	printBanner(cfg, appState, projCtx, permMgr, eng)
+	bannerText := repl.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, projCtx.GitStatus, len(eng.Registry().All()), projCtx.IsGitRepo)
 
 	if dumpPrompt {
 
@@ -500,7 +531,7 @@ func main() {
 
 	}
 
-	runREPL(eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
+	runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
 }
 
@@ -522,9 +553,13 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 
 	r.Register(tool.NewWebFetchTool())
 
+	r.Register(tool.NewBrowserTool())
+
 	r.Register(tool.NewQuestionTool())
 
 	r.Register(tool.NewTodoWriteTool())
+
+	r.Register(tool.NewExecutePlanTool())
 
 	r.Register(tool.NewPowerShellTool())
 
@@ -632,7 +667,13 @@ func withInterrupt(f func(ctx context.Context)) {
 
 }
 
-func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
+// replInteractive 为 true 时表示处于交互式 REPL，主循环会经 TakePermInputCh
+// 转发权限确认输入；-p 一次性模式为 false，权限回退到直接读 stdin。
+var replInteractive bool
+
+func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
+
+	replInteractive = true
 
 	allCommands := buildCommandList(cmdReg, toolReg)
 
@@ -657,6 +698,9 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 	historyPickPending := false
 
 	tasks := newREPLTaskRunner(eng)
+
+	// Print the banner directly to the terminal (inline rendering).
+	fmt.Print(bannerText)
 
 	// Ctrl+C while a task is running:
 
@@ -716,13 +760,19 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
 
-		fmt.Printf("您有一个未完成的片段草稿 (创建于 %v 前)。输入 “继续” 恢复，或直接输入新指令忽略。\n", age)
+		repl.PrintAbove(fmt.Sprintf("您有一个未完成的片段草稿 (创建于 %v 前)。输入\u300e继续\u300f恢复，或直接输入新指令忽略。\r\n", age))
 
-		fmt.Printf("  \x1b[2m提示: 使用 /history 可查看全部可恢复的历史会话\x1b[0m\n\n")
+		repl.PrintAbove("  \x1b[2m提示: 使用 /history 可查看全部可恢复的历史会话\x1b[0m\r\n\r\n")
 
 	}
 
 	for {
+		// Dynamic prompt: show ⚡ when a background task is running.
+		if tasks.IsRunning() {
+			reader.SetPrompt(repl.PromptRunning())
+		} else {
+			reader.SetPrompt(repl.Prompt())
+		}
 
 		input, err := reader.ReadLine()
 
@@ -732,7 +782,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 				if tasks.CancelRunning() {
 
-					fmt.Println("[系统] 等待任务停止...")
+					repl.PrintAbove("[系统] 等待任务停止...\r\n")
 
 				}
 
@@ -740,7 +790,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			}
 
-			fmt.Println("Type /exit or Ctrl+D to exit.")
+			repl.PrintAbove("Type /exit or Ctrl+D to exit.\r\n")
 
 			continue
 
@@ -750,7 +800,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			autoSaveSession(eng)
 
-			fmt.Println("Goodbye!")
+			repl.PrintAbove("Goodbye!\r\n")
 
 			return
 
@@ -818,7 +868,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			autoSaveSession(eng)
 
-			fmt.Println("Goodbye!")
+			repl.PrintAbove("Goodbye!\r\n")
 
 			return
 
@@ -826,7 +876,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			if tasks.IsRunning() {
 
-				fmt.Println("[提示] 当前有任务正在运行，请等待其结束后再重试。")
+				repl.PrintAbove("[提示] 当前有任务正在运行，请等待其结束后再重试。\r\n")
 
 				historyPickPending = false
 
@@ -836,7 +886,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
 
-				fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
 
 				historyPickPending = false
 
@@ -854,7 +904,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 					_ = clearInterruptedDraft()
 
-					fmt.Println("[提示] 已为您推荐相关历史任务...")
+					repl.PrintAbove("[提示] 已为您推荐相关历史任务...\r\n")
 
 					resumeAndContinue(eng, tasks)
 
@@ -870,15 +920,15 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 				if merged {
 
-					fmt.Println("[恢复] 任务记录已合并。")
+					repl.PrintAbove("[恢复] 任务记录已合并。\r\n")
 
 				} else {
 
-					fmt.Println("[恢复] 任务已排队，即将开始处理。")
+					repl.PrintAbove("[恢复] 任务已排队，即将开始处理。\r\n")
 
 				}
 
-				tasks.WaitIdle()
+				// Don't block: task runs in the background.
 
 				historyPickPending = false
 
@@ -892,7 +942,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 					_ = clearInterruptedDraft()
 
-					fmt.Println("[提示] 已为您推荐相关历史任务...")
+					repl.PrintAbove("[提示] 已为您推荐相关历史任务...\r\n")
 
 					resumeAndContinue(eng, tasks)
 
@@ -908,15 +958,15 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 				if merged {
 
-					fmt.Println("[恢复] 任务记录已合并。")
+					repl.PrintAbove("[恢复] 任务记录已合并。\r\n")
 
 				} else {
 
-					fmt.Println("[恢复] 任务已排队，即将开始处理。")
+					repl.PrintAbove("[恢复] 任务已排队，即将开始处理。\r\n")
 
 				}
 
-				tasks.WaitIdle()
+				// Don't block: task runs in the background.
 
 				historyPickPending = false
 
@@ -928,6 +978,22 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			historyPickPending = false
 
+			continue
+
+		case input == "/stop" || input == "/cancel":
+
+			if tasks.IsRunning() {
+				if tasks.CancelRunning() {
+					repl.PrintAbove("[已取消] 当前任务已终止\r\n")
+				}
+			} else {
+				repl.PrintAbove("[提示] 当前没有运行中的任务\r\n")
+			}
+			continue
+
+		case input == "/tasks":
+
+			repl.PrintAbove(formatTaskSnapshot(tasks.Snapshot()))
 			continue
 
 		case input == "/help":
@@ -990,7 +1056,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
 
-				fmt.Println(budgetExceededRetryHint(eng.CostTracker()))
+				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
 
 				continue
 
@@ -998,7 +1064,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			if pc.APIKey == "" {
 
-				fmt.Println(missingAPIKeyMessage(pc.Name))
+				repl.PrintAbove(missingAPIKeyMessage(pc.Name) + "\r\n")
 
 				continue
 
@@ -1052,7 +1118,7 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 			for _, w := range warnings {
 
-				fmt.Printf("  \x1b[33m%s\x1b[0m\n", w)
+				repl.PrintAbove(fmt.Sprintf("  \x1b[33m%s\x1b[0m\r\n", w))
 
 			}
 
@@ -1070,25 +1136,26 @@ func runREPL(eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registr
 
 				if queuedAhead > 0 {
 
-					fmt.Printf("[已补充] 先前任务还在跑，前面排队: %d\n", queuedAhead)
+					repl.PrintAbove(fmt.Sprintf("[已补充] 先前任务还在跑，前面排队: %d\r\n", queuedAhead))
 
 				} else {
 
-					fmt.Println("[已补充] 已合并进当前处理任务")
+					repl.PrintAbove("[已补充] 已合并进当前处理任务\r\n")
 
 				}
 
 			} else if queuedAhead > 0 {
 
-				fmt.Printf("[任务排队中] 前方排队数: %d\n", queuedAhead)
+				repl.PrintAbove(fmt.Sprintf("[任务排队中] 前方排队数: %d\r\n", queuedAhead))
 
-			} else {
+			} else if !tasks.IsRunning() {
 
-				fmt.Println("[输入已接收]")
+				// Brief feedback only when this is the first and only task
+				repl.PrintAbove("[输入已接收]\r\n")
 
 			}
 
-			tasks.WaitIdle()
+			// Don't block: tasks run in the background, user can type again immediately.
 
 		}
 
@@ -1290,7 +1357,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if !ok {
 
-		fmt.Printf("未找到命令 /%s。请使用 /help 查看可用命令。\n", name)
+		repl.PrintAbove(fmt.Sprintf("未找到命令 /%s。请使用 /help 查看可用命令。\r\n", name))
 
 		return
 
@@ -1331,7 +1398,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if err != nil {
 
-		fmt.Printf("Error: %v\n", err)
+		repl.PrintAbove(fmt.Sprintf("Error: %v\r\n", err))
 
 		return
 
@@ -1339,13 +1406,13 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if out.Message != "" {
 
-		fmt.Printf("[%s] %s\n", c.Name(), out.Message)
+		repl.PrintAbove(fmt.Sprintf("[%s] %s\r\n", c.Name(), out.Message))
 
 	}
 
 	if out.Data != "" {
 
-		fmt.Println(out.Data)
+		repl.PrintAbove(out.Data + "\r\n")
 
 	}
 
@@ -1531,12 +1598,12 @@ func handlePluginCommand(input string, pluginMgr *plugin.Manager, tasks *replTas
 	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
 		prompt = prompt + "\n\n" + args
 	}
-	fmt.Printf("[插件命令: /%s (%s)]\n", name, cmd.Plugin)
+	repl.PrintAbove(fmt.Sprintf("[插件命令: /%s (%s)]\r\n", name, cmd.Plugin))
 	_, merged := tasks.Enqueue(api.Message{Role: "user", Content: prompt})
 	if merged {
-		fmt.Println("[已补充] 已合并进当前处理任务")
+		repl.PrintAbove("[已补充] 已合并进当前处理任务\r\n")
 	} else {
-		fmt.Println("[输入已接收]")
+		repl.PrintAbove("[输入已接收]\r\n")
 	}
 	return true
 }

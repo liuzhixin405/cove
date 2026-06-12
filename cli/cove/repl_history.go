@@ -459,7 +459,7 @@ func resumeAndContinue(eng *engine.Engine, tasks *replTaskRunner) {
 	}
 	repl.PrintSafe("正在继续该任务…\n\n")
 	_, _ = tasks.Enqueue(api.Message{Role: "user", Content: "继续"})
-	tasks.WaitIdle()
+	// Don't block the main loop — the task runs in the background.
 }
 
 func scoreSessionForResume(r session.Record) int {

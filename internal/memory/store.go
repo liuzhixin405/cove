@@ -1,9 +1,11 @@
 package memory
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,9 @@ const (
 
 type Store struct {
 	dirs []string
+
+	// BM25 keyword search (no embedding required)
+	bm25 *BM25
 
 	// Cache to avoid repeated disk reads on every system prompt build
 	mu          sync.Mutex
@@ -109,6 +114,84 @@ func (s *Store) loadCLAUDEMD(dir string, entries *[]Entry, seen *map[string]bool
 	})
 }
 
+// BuildPromptFor generates a prompt snippet with only memories relevant to
+// the user's message, using BM25 keyword search (no embeddings required).
+func (s *Store) BuildPromptFor(ctx context.Context, userMessage string) string {
+	entries := s.All()
+	if len(entries) == 0 {
+		return ""
+	}
+
+	// Initialize BM25 index if needed
+	s.mu.Lock()
+	if s.bm25 == nil {
+		s.bm25 = NewBM25(1.2, 0.75)
+	}
+	bm25 := s.bm25
+	s.mu.Unlock()
+
+	// Re-index with current entries
+	now := time.Now()
+	bm25.Clear()
+	for i, e := range entries {
+		bm25.Index(i, e.Content, now)
+	}
+
+	// Search for relevant memories
+	results := bm25.Search(userMessage, 5)
+	if len(results) == 0 {
+		// No relevant memories found; include INDEX.md summary
+		return s.buildIndexPrompt()
+	}
+
+	// Blend BM25 score with recency (48h decay)
+	var blended []scoredAndEntry
+	for _, r := range results {
+		blended = append(blended, scoredAndEntry{
+			entry: entries[r.ID],
+			score: r.CombinedScore(now, 48),
+		})
+	}
+	sort.Slice(blended, func(i, j int) bool {
+		return blended[i].score > blended[j].score
+	})
+
+	// Build prompt with top results, deduplicated by memory name
+	seen := make(map[string]bool)
+	var sb strings.Builder
+	sb.WriteString("\n\n<user_memories>\n")
+	for _, b := range blended {
+		if seen[b.entry.Name] {
+			continue
+		}
+		seen[b.entry.Name] = true
+		sb.WriteString("<memory>\n")
+		sb.WriteString("<name>" + b.entry.Name + "</name>\n")
+		sb.WriteString("<content>\n")
+		sb.WriteString(b.entry.Content)
+		sb.WriteString("\n</content>\n")
+		sb.WriteString("</memory>\n")
+	}
+	sb.WriteString("</user_memories>\n")
+	return sb.String()
+}
+
+type scoredAndEntry struct {
+	entry Entry
+	score float64
+}
+
+// buildIndexPrompt builds a prompt containing only the INDEX.md content.
+func (s *Store) buildIndexPrompt() string {
+	entries := s.All()
+	for _, e := range entries {
+		if strings.EqualFold(e.Name, "INDEX.md") {
+			return "\n\n<user_memories>\n<memory>\n<name>" + e.Name + "</name>\n<content>\n" + e.Content + "\n</content>\n</memory>\n</user_memories>\n"
+		}
+	}
+	return ""
+}
+
 func (s *Store) BuildPrompt() string {
 	entries := s.All()
 	if len(entries) == 0 {
@@ -141,6 +224,92 @@ func (s *Store) BuildPrompt() string {
 	s.promptDirty = false
 	s.mu.Unlock()
 	return result
+}
+
+// EntryMatch is one ranked memory entry returned by Search.
+type EntryMatch struct {
+	Entry Entry
+	Score float64
+}
+
+// Search runs BM25 keyword retrieval over all memory entries and returns the
+// top matches ranked by relevance (blended with recency). No embeddings are
+// used. Results are deduplicated by entry name.
+func (s *Store) Search(query string, topK int) []EntryMatch {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	if topK <= 0 {
+		topK = 5
+	}
+	entries := s.All()
+	if len(entries) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	if s.bm25 == nil {
+		s.bm25 = NewBM25(1.2, 0.75)
+	}
+	bm25 := s.bm25
+	s.mu.Unlock()
+
+	now := time.Now()
+	bm25.Clear()
+	for i, e := range entries {
+		bm25.Index(i, e.Content, now)
+	}
+
+	scored := bm25.Search(query, topK*2)
+	seen := make(map[string]bool)
+	var results []EntryMatch
+	for _, r := range scored {
+		if r.ID < 0 || r.ID >= len(entries) {
+			continue
+		}
+		e := entries[r.ID]
+		if seen[e.Name] {
+			continue
+		}
+		seen[e.Name] = true
+		results = append(results, EntryMatch{Entry: e, Score: r.CombinedScore(now, 48)})
+		if len(results) >= topK {
+			break
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+	return results
+}
+
+// Stats summarizes the memory store contents for observability.
+type Stats struct {
+	FileCount     int
+	ProjectCount  int
+	TotalBytes    int
+	TotalLines    int
+	MaxEntryBytes int
+	MaxTotalBytes int
+}
+
+// Stats returns aggregate statistics over all memory entries.
+func (s *Store) Stats() Stats {
+	entries := s.All()
+	st := Stats{
+		MaxEntryBytes: MaxEntryBytes,
+		MaxTotalBytes: MaxTotalBytes,
+	}
+	for _, e := range entries {
+		st.FileCount++
+		if e.Project {
+			st.ProjectCount++
+		}
+		st.TotalBytes += len(e.Content)
+		st.TotalLines += strings.Count(e.Content, "\n") + 1
+	}
+	return st
 }
 
 type Entry struct {

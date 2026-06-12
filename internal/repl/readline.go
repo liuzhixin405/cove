@@ -63,12 +63,34 @@ var ErrExit = fmt.Errorf("exit")
 var ErrInterrupt = fmt.Errorf("interrupt")
 
 func New(completer Completer) *LineReader {
-	return &LineReader{
+	lr := &LineReader{
 		completer:   completer,
-		prompt:      Prompt(),
-		promptWidth: 2,
 		placeholder: "(按 / 显示命令)",
 	}
+	lr.SetPrompt(Prompt()) // derives promptWidth correctly (skips ANSI codes)
+	return lr
+}
+
+// SetPrompt changes the prompt string and recalculates its visual width.
+// ANSI escape sequences are skipped so the width reflects only visible cells.
+func (lr *LineReader) SetPrompt(p string) {
+	lr.prompt = p
+	w := 0
+	inAnsi := false
+	for _, r := range []rune(p) {
+		if r == '\x1b' {
+			inAnsi = true
+			continue
+		}
+		if inAnsi {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inAnsi = false
+			}
+			continue
+		}
+		w += runeCellWidth(r)
+	}
+	lr.promptWidth = w
 }
 
 func PrintSafe(format string, args ...any) {
@@ -92,6 +114,14 @@ func PrintAbove(s string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 
+	// While a task is streaming we never keep an editable input line on screen,
+	// so print inline without erasing/redrawing (which would corrupt partial
+	// streamed lines that don't end in a newline).
+	if streamingActive {
+		printOutputLocked(s, !strings.HasSuffix(s, "\r\n"))
+		return
+	}
+
 	if activeReader == nil || !activeReader.reading {
 		fmt.Print(s)
 		return
@@ -104,8 +134,17 @@ func PrintAbove(s string) {
 
 func StreamPrint(s string) {
 	s = normalizeOutputNewlines(s)
+
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
+	// During streaming, print the chunk verbatim. Erasing/redrawing the input
+	// line here is what corrupted the "thinking"/answer stream, because a chunk
+	// without a trailing newline shares the current terminal line and the next
+	// erase (\r\x1b[2K) wiped it.
+	if streamingActive {
+		fmt.Print(s)
+		return
+	}
 	if activeReader != nil && activeReader.reading {
 		activeReader.eraseLineLocked()
 		fmt.Print(s)
@@ -119,6 +158,13 @@ func PrintTransientStatus(s string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 
+	// The spinner runs during streaming; just overwrite the current line in
+	// place without touching any input-line state.
+	if streamingActive {
+		fmt.Print("\x1b[0m\x1b[?25h\r\x1b[K" + s)
+		return
+	}
+
 	if activeReader != nil && activeReader.reading {
 		activeReader.eraseLineLocked()
 		fmt.Print("\x1b[0m\x1b[?25h" + s)
@@ -131,11 +177,37 @@ func PrintTransientStatus(s string) {
 func BeginOutput() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	streamingActive = true
+	// Erase any idle input line BEFORE marking streaming active (eraseLineLocked
+	// is a no-op once streamingActive is set).
 	if activeReader != nil && activeReader.reading {
 		activeReader.eraseLineLocked()
 	}
+	streamingActive = true
 	fmt.Print("\n")
+}
+
+// BeginPromptInput temporarily suspends streaming-output suppression so an
+// interactive prompt (e.g. a permission y/n/a question) can draw and echo the
+// input line normally. The engine is blocked awaiting the answer, so no
+// streaming output is produced meanwhile. Pair with EndPromptInput.
+func BeginPromptInput() {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	streamingActive = false
+	if activeReader != nil && activeReader.reading {
+		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
+	}
+}
+
+// EndPromptInput restores streaming-output suppression after an interactive
+// prompt has been answered.
+func EndPromptInput() {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	if activeReader != nil && activeReader.reading {
+		activeReader.eraseLineLocked()
+	}
+	streamingActive = true
 }
 
 func EndOutput() {
@@ -153,6 +225,12 @@ func HasActiveInput() bool {
 	defer consoleMu.Unlock()
 	return activeReader != nil && activeReader.reading
 }
+
+// waitStreamingDone is obsolete: streaming output no longer erases the input
+// line, so ReadLine may enter raw mode immediately even while a task streams
+// (this is what enables blind type-ahead into the task queue). Kept removed to
+// avoid the multi-second cooked-mode stall it used to impose on every
+// mid-task ReadLine.
 
 func (lr *LineReader) ReadLine() (string, error) {
 	if shouldUseFallbackReadline() {
@@ -218,8 +296,11 @@ func (lr *LineReader) ReadLine() (string, error) {
 			line := string(buf)
 			consoleMu.Lock()
 			lr.eraseLineLocked()
-			// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容
-			fmt.Print(lr.prompt + line + "\r\n")
+			// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容。
+			// 但在流式输出进行中（盲打补充输入）时不要回显，否则会把提示符+内容插进流式文本里造成错乱。
+			if !streamingActive {
+				fmt.Print(lr.prompt + line + "\r\n")
+			}
 			consoleMu.Unlock()
 
 			if line != "" && (len(lr.history) == 0 || lr.history[len(lr.history)-1] != line) {
@@ -308,16 +389,16 @@ func runesCellWidth(rs []rune) int {
 	return w
 }
 
-func inputDisplayWindow(buf []rune, cursor, maxCols int) ([]rune, int, int) {
+func inputDisplayWindow(buf []rune, cursor, maxCols int) (disp []rune, cursorCells, used, start int) {
 	if maxCols < 1 {
 		maxCols = 1
 	}
-	start := 0
+	start = 0
 	for start < cursor && runesCellWidth(buf[start:cursor]) > maxCols {
 		start++
 	}
 	end := start
-	used := 0
+	used = 0
 	for end < len(buf) {
 		cw := runeCellWidth(buf[end])
 		if used+cw > maxCols {
@@ -326,9 +407,9 @@ func inputDisplayWindow(buf []rune, cursor, maxCols int) ([]rune, int, int) {
 		used += cw
 		end++
 	}
-	disp := buf[start:end]
-	cursorCells := runesCellWidth(buf[start:cursor])
-	return disp, cursorCells, used
+	disp = buf[start:end]
+	cursorCells = runesCellWidth(buf[start:cursor])
+	return disp, cursorCells, used, start
 }
 
 func truncateAnsi(s string, maxCols int) string {
@@ -430,6 +511,12 @@ func (lr *LineReader) redraw(buf []rune, cursor int) {
 }
 
 func (lr *LineReader) eraseLineLocked() {
+	// While streaming, the input line is never drawn, so the current terminal
+	// line holds streamed output; erasing it would corrupt the stream.
+	if streamingActive {
+		lr.lineDrawn = false
+		return
+	}
 	fmt.Print("\x1b[0m\x1b[?25h\r\x1b[2K")
 	lr.lineDrawn = false
 }
@@ -440,6 +527,7 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	if streamingActive {
 		return
 	}
+	// Draw on the current line.
 	w, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil || w < 20 {
 		w = 80
@@ -449,7 +537,7 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	if maxVis < 1 {
 		maxVis = 1
 	}
-	disp, cells, _ := inputDisplayWindow(buf, cursor, maxVis)
+	disp, cells, _, start := inputDisplayWindow(buf, cursor, maxVis)
 	fmt.Print(lr.prompt)
 	if len(buf) == 0 && lr.placeholder != "" {
 		ph, _ := truncateRunesByCells([]rune(lr.placeholder), maxVis)
@@ -461,10 +549,14 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 			fmt.Print(truncateAnsi(lr.activeHint, rem))
 		}
 	}
+	// Position the cursor by re-emitting the prompt plus the visible text to the
+	// left of the cursor, letting the terminal advance the cursor with its own
+	// width rules. This avoids the half-cell drift that plain column arithmetic
+	// (\x1b[NC) causes with East Asian ambiguous-width glyphs such as the prompt
+	// arrow when running in a CJK terminal.
 	fmt.Print("\r")
-	if lr.promptWidth+cells > 0 {
-		fmt.Printf("\x1b[%dC", lr.promptWidth+cells)
-	}
+	left := buf[start:cursor]
+	fmt.Print(lr.prompt + "\x1b[0m" + string(left))
 	lr.lineDrawn = true
 }
 

@@ -15,6 +15,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/checkpoint"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/cost"
+	"github.com/liuzhixin405/cove/internal/delegate"
 	"github.com/liuzhixin405/cove/internal/diagnostic"
 	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/extract"
@@ -24,6 +25,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/notes"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/plan"
 	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
@@ -77,6 +79,9 @@ type Engine struct {
 	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
 	iterCount             int        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex // lock for interactive permission prompts
+	// OnEngineOutput, if set, receives engine diagnostic lines
+	// (tool progress, spinner, etc.) instead of writing to stderr.
+	OnEngineOutput func(line string)
 	PermissionPrompt      func(toolName string, input map[string]any, reason string) bool
 	OnPermissionPause     func()                       // called before permission prompt to pause spinners
 	OnPermissionDone      func()                       // called after permission decision to resume
@@ -506,7 +511,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			for i, tc := range resp.ToolCalls {
 				if !e.config.Debug {
 					// Show tool start
-					fmt.Fprintf(os.Stderr, "\r  \x1b[2m⏳ [%s]...\x1b[0m", tc.Name)
+					e.engineOutput(fmt.Sprintf("\r  \x1b[2m⏳ [%s]...\x1b[0m", tc.Name))
 				}
 				res := e.executeTool(ctx, tc)
 				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
@@ -516,7 +521,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		for _, r := range results {
 			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
-				fmt.Fprintf(os.Stderr, "\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr))
+				e.engineOutput(fmt.Sprintf("\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr)))
 			}
 			// Session notes capture (always, regardless of debug mode)
 			if e.sessionNotes != nil {
@@ -1371,4 +1376,48 @@ func (e *Engine) SetAutoExtract(on bool) {
 // SessionNotes returns the session notes manager.
 func (e *Engine) SessionNotes() *notes.SessionNotes {
 	return e.sessionNotes
+}
+
+// engineOutput emits a diagnostic line to the registered callback,
+// or falls back to stderr.
+func (e *Engine) engineOutput(line string) {
+	if e.OnEngineOutput != nil {
+		e.OnEngineOutput(line)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s", line)
+}
+
+// WirePlanExecutor sets up the PlanExecuteFunc on the runtime so the
+// execute_plan tool can decompose and run multi-step plans.
+// It uses the engine's own provider to power sub-agents.
+// When the provider is unavailable (no API key configured),
+// the function is still set but returns a guidance message for the LLM.
+func (e *Engine) WirePlanExecutor() {
+	if e.runtime == nil {
+		return
+	}
+
+	if e.provider != nil {
+		d := delegate.NewDelegator(e.provider, e.config.Model, e.registry.All())
+		pe := plan.NewPlanExecutor(d, e.runtime)
+		e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
+			pl, err := plan.FromRuntime("plan", e.runtime)
+			if err != nil {
+				return "", err
+			}
+			pl.Parallel = parallel
+			result := pe.Execute(context.Background(), pl)
+			return plan.FormatResult(result), nil
+		}
+		return
+	}
+
+	// No provider available: register a fallback that guides the LLM
+	// to execute tasks sequentially without sub-agents.
+	e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
+		return "No API provider configured. Execute tasks one at a time " +
+			"using available tools (read, write, bash, etc.) instead of " +
+			"sub-agents. Follow the todowrite plan sequentially.", nil
+	}
 }

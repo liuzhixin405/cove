@@ -381,8 +381,9 @@ func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
 		path = r.memoryRoot
 	}
 
-	// Use a simple grep via bash
-	cmd := fmt.Sprintf("grep -rn %q %s", pattern, path)
+	// Use a simple grep via bash. Both pattern and path are quoted to prevent
+	// shell injection from AI-generated tool input.
+	cmd := fmt.Sprintf("grep -rn %q %q", pattern, path)
 	return executeReadOnlyCommand(cmd)
 }
 

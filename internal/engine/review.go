@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -78,7 +77,7 @@ func (e *Engine) backgroundReview() {
 				if mem != "" && e.memStore != nil {
 					e.memStore.Save("auto", mem)
 					log.Debugf("background review saved memory: %s", mem)
-					fmt.Fprintf(os.Stderr, "  \x1b[2m🧠 记住了: %s\x1b[0m\n", reviewTruncate(mem, 50))
+					e.engineOutput(fmt.Sprintf("  \x1b[2m🧠 记住了: %s\x1b[0m\n", reviewTruncate(mem, 50)))
 				}
 			}
 			if strings.HasPrefix(line, "SKILL:") {
@@ -90,7 +89,7 @@ func (e *Engine) backgroundReview() {
 						content := strings.TrimSpace(parts[1])
 						e.skillMgr.Register(skills.Skill{Name: name, Prompt: content})
 						log.Debugf("background review saved skill: %s", name)
-						fmt.Fprintf(os.Stderr, "  \x1b[2m📚 学会了: %s\x1b[0m\n", name)
+						e.engineOutput(fmt.Sprintf("  \x1b[2m📚 学会了: %s\x1b[0m\n", name))
 					}
 				}
 			}

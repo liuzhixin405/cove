@@ -56,3 +56,26 @@ Expected: PASS
 ## After Saving
 
 Tell the user the plan path and ask if they want execution to begin.
+
+## Task Dependencies
+
+When using `todowrite` to convert a plan into executable tasks, declare dependencies
+using the `depends:<task-id>` prefix in the content field:
+
+- `depends:task-1` — single dependency, task runs after task-1 completes
+- `depends:task-1,task-2` — multiple dependencies, task waits for all
+- No `depends:` prefix — no dependencies, ready to execute immediately
+
+Example:
+```json
+{
+  "todos": [
+    {"content": "Create auth middleware", "status": "pending", "priority": "high"},
+    {"content": "depends:task-1 Create auth tests", "status": "pending", "priority": "high"},
+    {"content": "depends:task-1,task-2 Wire up routes", "status": "pending", "priority": "medium"}
+  ]
+}
+```
+
+After defining tasks, call `execute_plan` with parallel=true to run independent tasks
+concurrently. This respects the dependency graph automatically.

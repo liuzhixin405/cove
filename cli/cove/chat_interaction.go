@@ -61,9 +61,16 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				}
 				repl.StreamPrint(repl.Dim + chunk + repl.Reset)
 			}
+			// Route engine diagnostic lines (tool start/finish, stall warnings,
+			// memory/skill extraction notices) through StreamPrint so they appear
+			// in the conversation area in TUI mode.
+			eng.OnEngineOutput = func(line string) {
+				repl.StreamPrint(line)
+			}
 			defer func() {
 				eng.OnPermissionPause = nil
 				eng.OnToolProgress = nil
+				eng.OnEngineOutput = nil
 			}()
 		}
 

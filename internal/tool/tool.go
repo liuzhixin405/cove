@@ -60,6 +60,9 @@ type Runtime struct {
 	PluginManager any
 	Cwd           string
 	AskUser       func(prompt string) string
+	// PlanExecuteFunc, when set, is invoked by the execute_plan tool.
+	// It receives parallel flag and returns a formatted result summary.
+	PlanExecuteFunc func(parallel bool) (string, error)
 }
 
 func (r *Runtime) Lock()   { r.mu.Lock() }
@@ -108,6 +111,7 @@ type MessageRecord struct {
 	To        string
 	Message   string
 	CreatedAt string
+	Delivered bool
 }
 
 type Def struct {
@@ -137,28 +141,6 @@ func (b *baseTool) CheckPermissions(input Input, tctx Context) PermissionDecisio
 }
 
 func NewTool(d Def) *baseTool { return &baseTool{def: d} }
-
-func buildSchema(props string) json.RawMessage {
-	return json.RawMessage(`
-{
-	"type": "object",
-	"properties": ` + props + `,
-	"required": ["` + extractRequired(props) + `"]
-}`)
-}
-
-func extractRequired(props string) string {
-	for i := 0; i < len(props); i++ {
-		if props[i] == '"' {
-			j := i + 1
-			for j < len(props) && props[j] != '"' {
-				j++
-			}
-			return props[i+1 : j]
-		}
-	}
-	return ""
-}
 
 func Decision(d PermissionResult, reason string) PermissionDecision {
 	return PermissionDecision{Decision: d, Reason: reason}
