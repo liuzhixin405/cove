@@ -1,7 +1,6 @@
 package token
 
 import (
-	"strconv"
 	"unicode/utf8"
 )
 
@@ -21,14 +20,6 @@ func Estimate(text string) int {
 		}
 	}
 	return (asciiBytes+2)/3 + nonASCII
-}
-
-func EstimateMessages(messages []string) int {
-	total := 0
-	for _, m := range messages {
-		total += Estimate(m)
-	}
-	return total
 }
 
 // TruncateToTokens truncates text to approximately maxTokens.
@@ -75,11 +66,4 @@ func TruncateToTokens(text string, maxTokens int) string {
 		}
 	}
 	return text[:end] + "\n... [truncated]"
-}
-
-func TruncateBytes(data string, maxBytes int) string {
-	if len(data) <= maxBytes {
-		return data
-	}
-	return data[:maxBytes] + "\n... [truncated " + strconv.Itoa(len(data)-maxBytes) + " bytes]"
 }

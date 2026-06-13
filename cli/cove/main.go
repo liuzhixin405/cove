@@ -63,9 +63,9 @@ type chatRunner interface {
 }
 
 var (
-	Version = "3.0.3"
+	Version = "5.0.0"
 
-	BuildTime = "dev"
+	BuildTime = "pro"
 
 	GitCommit = "unknown"
 
@@ -539,6 +539,44 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 
 	r := tool.NewRegistry()
 
+	r.Register(tool.NewPlanModeTool())
+
+	r.Register(tool.NewExitPlanModeTool())
+
+	r.Register(tool.NewEnterWorktreeTool())
+
+	r.Register(tool.NewExitWorktreeTool())
+
+	r.Register(tool.NewTaskCreateTool())
+
+	r.Register(tool.NewTaskListTool())
+
+	r.Register(tool.NewTaskUpdateTool())
+
+	r.Register(tool.NewTaskStopTool())
+
+	r.Register(tool.NewTaskGetTool())
+
+	r.Register(tool.NewTaskOutputTool())
+
+	r.Register(tool.NewSleepTool())
+
+	r.Register(tool.NewBriefTool())
+
+	r.Register(tool.NewSkillTool())
+
+	r.Register(tool.NewAgentTool())
+
+	r.Register(tool.NewTeamCreateTool())
+
+	r.Register(tool.NewTeamDeleteTool())
+
+	r.Register(tool.NewCronTool())
+
+	r.Register(tool.NewSendMessageTool())
+
+	r.Register(tool.NewLSPTool())
+
 	r.Register(tool.NewBashTool())
 
 	r.Register(tool.NewReadTool())
@@ -560,6 +598,8 @@ func registerAllTools(mcpPool *mcp.Pool, skillMgr *skills.Manager) *tool.Registr
 	r.Register(tool.NewTodoWriteTool())
 
 	r.Register(tool.NewExecutePlanTool())
+
+	r.Register(tool.NewWebSearchTool())
 
 	r.Register(tool.NewPowerShellTool())
 

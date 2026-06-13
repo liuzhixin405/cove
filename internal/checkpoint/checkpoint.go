@@ -172,12 +172,6 @@ func (m *Manager) Count() int {
 	return m.count
 }
 
-// Prune removes old refs for projects that haven't been used in 30 days.
-func (m *Manager) Prune() error {
-	env := []string{"GIT_DIR=" + m.storeDir}
-	return m.gitCmd(env, "gc", "--auto", "--quiet")
-}
-
 func (m *Manager) getRef(env []string) string {
 	out, err := m.gitOutput(env, "rev-parse", m.refName)
 	if err != nil {

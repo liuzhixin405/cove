@@ -179,15 +179,6 @@ func (s *SessionNotes) Content() string {
 	sb.WriteString("</session_notes>\n")
 	return sb.String()
 }
-
-// Clear resets all notes (for new sessions).
-func (s *SessionNotes) Clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries = s.entries[:0]
-	s.modified = true
-}
-
 func titleCase(s string) string {
 	if s == "" {
 		return s
