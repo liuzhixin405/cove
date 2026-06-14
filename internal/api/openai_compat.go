@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -158,26 +157,9 @@ func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*Chat
 		MaxTokens:  req.MaxTokens,
 	}
 
-	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		resp, err := p.doChat(ctx, body)
-		if err == nil {
-			return resp, nil
-		}
-		if attempt == defaultRetry.MaxRetries {
-			return nil, err
-		}
-		if isRetryable(err) {
-			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-			continue
-		}
-		return nil, err
-	}
-	return nil, fmt.Errorf("max retries exceeded")
+	return retryWithBackoff(ctx, defaultRetry, func() (*ChatResponse, error) {
+		return p.doChat(ctx, body)
+	})
 }
 
 func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatResponse, error) {
@@ -457,43 +439,22 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output; we therefore never retry after streaming begins.
-	var httpResp *http.Response
-	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		httpReq, err := http.NewRequestWithContext(streamCtx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
-
-		resp, err := sc.Do(httpReq)
-		if err != nil {
-			// Connection-level failures (dial/TLS/reset) are transient — retry.
-			if attempt < defaultRetry.MaxRetries {
-				delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(delay):
-				}
-				continue
+	httpResp, err := retryConnectHTTP(
+		streamCtx,
+		defaultRetry,
+		func(callCtx context.Context) (*http.Response, error) {
+			httpReq, reqErr := http.NewRequestWithContext(callCtx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
+			if reqErr != nil {
+				return nil, reqErr
 			}
-			return nil, err
-		}
-
-		// Retry transient server-side failures before any streaming happens.
-		if (resp.StatusCode >= 500 || resp.StatusCode == 429) && attempt < defaultRetry.MaxRetries {
-			resp.Body.Close()
-			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-			continue
-		}
-		httpResp = resp
-		break
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
+			return sc.Do(httpReq)
+		},
+		func(statusCode int) bool { return statusCode >= 500 || statusCode == 429 },
+	)
+	if err != nil {
+		return nil, err
 	}
 	defer httpResp.Body.Close()
 

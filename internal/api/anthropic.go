@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -120,26 +119,9 @@ func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 		Tools:     p.convertTools(req.Tools),
 	}
 
-	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		resp, err := p.doChat(ctx, body)
-		if err == nil {
-			return resp, nil
-		}
-		if attempt == defaultRetry.MaxRetries {
-			return nil, err
-		}
-		if isRetryable(err) {
-			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-			continue
-		}
-		return nil, err
-	}
-	return nil, fmt.Errorf("max retries exceeded")
+	return retryWithBackoff(ctx, defaultRetry, func() (*ChatResponse, error) {
+		return p.doChat(ctx, body)
+	})
 }
 
 func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*ChatResponse, error) {
@@ -356,42 +338,24 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output.
-	var httpResp *http.Response
-	for attempt := 0; attempt <= defaultRetry.MaxRetries; attempt++ {
-		httpReq, err := http.NewRequestWithContext(streamCtx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("x-api-key", p.activeKey())
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
-
-		resp, err := sc.Do(httpReq)
-		if err != nil {
-			if attempt < defaultRetry.MaxRetries {
-				delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(delay):
-				}
-				continue
+	httpResp, err := retryConnectHTTP(
+		streamCtx,
+		defaultRetry,
+		func(callCtx context.Context) (*http.Response, error) {
+			httpReq, reqErr := http.NewRequestWithContext(callCtx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
+			if reqErr != nil {
+				return nil, reqErr
 			}
-			return nil, err
-		}
-		if (resp.StatusCode >= 500 || resp.StatusCode == 429) && attempt < defaultRetry.MaxRetries {
-			resp.Body.Close()
-			delay := time.Duration(math.Pow(2, float64(attempt))) * defaultRetry.BaseDelay
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-			continue
-		}
-		httpResp = resp
-		break
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("x-api-key", p.activeKey())
+			httpReq.Header.Set("anthropic-version", "2023-06-01")
+			httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
+			return sc.Do(httpReq)
+		},
+		func(statusCode int) bool { return statusCode >= 500 || statusCode == 429 },
+	)
+	if err != nil {
+		return nil, err
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode != http.StatusOK {
