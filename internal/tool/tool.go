@@ -61,8 +61,8 @@ type Runtime struct {
 	Cwd           string
 	AskUser       func(prompt string) string
 	// PlanExecuteFunc, when set, is invoked by the execute_plan tool.
-	// It receives parallel flag and returns a formatted result summary.
-	PlanExecuteFunc func(parallel bool) (string, error)
+	// It receives context plus parallel flag and returns a formatted result summary.
+	PlanExecuteFunc func(ctx context.Context, parallel bool) (string, error)
 }
 
 func (r *Runtime) Lock()   { r.mu.Lock() }

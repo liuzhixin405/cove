@@ -197,6 +197,10 @@ func handleHistory(eng *engine.Engine) {
 		if msgCount == 0 && len(r.Messages) > 0 {
 			msgCount = len(r.Messages)
 		}
+		toolCount := r.ToolMessages
+		if toolCount == 0 && len(r.Messages) > 0 {
+			toolCount = countToolMessages(r.Messages)
+		}
 		turns := r.UserTurns
 		if turns == 0 && len(r.Messages) > 0 {
 			turns = countUserTurns(r.Messages)
@@ -209,7 +213,7 @@ func handleHistory(eng *engine.Engine) {
 		if len(title) > 50 {
 			title = title[:50] + "..."
 		}
-		repl.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
+		repl.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 工具 / %d 消息)\n", i+1, date, title, turns, toolCount, msgCount)
 	}
 	if len(records) > limit {
 		repl.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
@@ -336,7 +340,9 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 	repl.PrintSafe("  ID: %s\n", r.ID)
 	repl.PrintSafe("  标题: %s\n", title)
 	repl.PrintSafe("  更新时间: %s\n", r.UpdatedAt.Format("2006-01-02 15:04:05"))
-	repl.PrintSafe("  消息数: %d\n\n", len(r.Messages))
+	repl.PrintSafe("  用户轮次: %d\n", countUserTurns(r.Messages))
+	repl.PrintSafe("  工具消息: %d\n", countToolMessages(r.Messages))
+	repl.PrintSafe("  总消息数: %d\n\n", len(r.Messages))
 
 	if len(r.Messages) == 0 {
 		repl.PrintSafe("  该会话暂无消息。\n\n")
@@ -420,7 +426,7 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 		title = sessionPreview(*best.rec)
 	}
 	userTurns := countUserTurns(best.rec.Messages)
-	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
+	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 工具 / %d 消息)\n", best.idx, title, userTurns, countToolMessages(best.rec.Messages), len(best.rec.Messages))
 	return true
 }
 
@@ -442,6 +448,16 @@ func countUserTurns(msgs []api.Message) int {
 			continue
 		}
 		n++
+	}
+	return n
+}
+
+func countToolMessages(msgs []api.Message) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			n++
+		}
 	}
 	return n
 }
