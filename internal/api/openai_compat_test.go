@@ -58,7 +58,7 @@ func TestOpenAICompatChatCarriesReasoningContentIntoResponse(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatConvertMessagesIncludesReasoningContent(t *testing.T) {
+func TestOpenAICompatConvertMessagesStripsReasoningContent(t *testing.T) {
 	p := &openAICompatProvider{}
 	msgs := p.convertMessages([]Message{{
 		Role:             "assistant",
@@ -78,8 +78,10 @@ func TestOpenAICompatConvertMessagesIncludesReasoningContent(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(msgs))
 	}
-	if got, want := msgs[0].ReasoningContent, "internal reasoning"; got != want {
-		t.Fatalf("assistant reasoning_content = %q, want %q", got, want)
+	// reasoning_content must be stripped from outgoing messages: DeepSeek
+	// returns 400 if it is present in input, and replaying it wastes context.
+	if got := msgs[0].ReasoningContent; got != "" {
+		t.Fatalf("assistant reasoning_content = %q, want empty (stripped)", got)
 	}
 	if got := msgs[1].ToolCallID; got != "call_1" {
 		t.Fatalf("tool message tool_call_id = %q, want call_1", got)

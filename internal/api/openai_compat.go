@@ -275,7 +275,11 @@ func (u oaiUsage) reasoningTokens() int {
 func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 	var out []oaiMsg
 	for _, m := range in {
-		om := oaiMsg{Role: m.Role, Content: p.convertMessageContent(m), ReasoningContent: m.ReasoningContent, ToolCallID: m.ToolCallID}
+		// reasoning_content is display/archival only and must NOT be echoed back
+		// to the API. DeepSeek rejects requests whose input messages carry
+		// reasoning_content (HTTP 400), and replaying long thinking traces would
+		// also bloat context and cost. We deliberately drop m.ReasoningContent.
+		om := oaiMsg{Role: m.Role, Content: p.convertMessageContent(m), ToolCallID: m.ToolCallID}
 		if len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
 				args, _ := json.Marshal(tc.Input)

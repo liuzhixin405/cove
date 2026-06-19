@@ -79,24 +79,21 @@ type Engine struct {
 	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
 	iterCount             int        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex // lock for interactive permission prompts
-	autoExtract           bool
-	autoReview            bool
-	autoDream             bool
 	// OnEngineOutput, if set, receives engine diagnostic lines
 	// (tool progress, spinner, etc.) instead of writing to stderr.
-	OnEngineOutput     func(line string)
-	PermissionPrompt   func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause  func()                       // called before permission prompt to pause spinners
-	OnPermissionDone   func()                       // called after permission decision to resume
-	OnToolProgress     func(toolName, chunk string) // live output chunks from long-running tools
-	sessionNotes       *notes.SessionNotes
-	guardrails         *guardrail.Tracker
-	subdirHints        *ctxt.SubdirHints
-	rateLimits         *api.RateLimitTracker
-	extractRunner      *extract.Runner
-	dreamRunner        *dream.Runner
-	cpMgr              *checkpoint.Manager
-	lastReviewMsgCount int
+	OnEngineOutput func(line string)
+	PermissionPrompt      func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause     func()                       // called before permission prompt to pause spinners
+	OnPermissionDone      func()                       // called after permission decision to resume
+	OnToolProgress        func(toolName, chunk string) // live output chunks from long-running tools
+	sessionNotes          *notes.SessionNotes
+	guardrails            *guardrail.Tracker
+	subdirHints           *ctxt.SubdirHints
+	rateLimits            *api.RateLimitTracker
+	extractRunner         *extract.Runner
+	dreamRunner           *dream.Runner
+	cpMgr                 *checkpoint.Manager
+	lastReviewMsgCount    int
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
@@ -144,9 +141,6 @@ func New(config Config) (*Engine, error) {
 			SkillPrompts:  make(map[string]string),
 		},
 		fileHistory: make(map[string]bool),
-		autoExtract: true,
-		autoReview:  true,
-		autoDream:   true,
 	}
 
 	if config.SkillManager != nil {
@@ -258,45 +252,9 @@ func (e *Engine) FileHistory() []string {
 }
 
 func (e *Engine) SystemPrompt() string {
-	return e.systemPromptFor(context.Background(), "")
-}
-
-func (e *Engine) systemPromptFor(ctx context.Context, userMessage string) string {
 	if e.systemOverride != "" {
 		return e.systemOverride
 	}
-
-	var sb strings.Builder
-	sb.WriteString(e.baseSystemPrompt())
-
-	if e.skillMgr != nil {
-		if sp := e.skillMgr.BuildPrompt(); sp != "" {
-			sb.WriteString(sp)
-		}
-	}
-
-	if e.memStore != nil {
-		var mp string
-		if strings.TrimSpace(userMessage) != "" {
-			mp = e.memStore.BuildPromptFor(ctx, userMessage)
-		} else {
-			mp = e.memStore.BuildPrompt()
-		}
-		if mp != "" {
-			sb.WriteString(mp)
-		}
-	}
-
-	if e.sessionNotes != nil {
-		if nc := e.sessionNotes.Content(); nc != "" {
-			sb.WriteString(nc)
-		}
-	}
-
-	return sb.String()
-}
-
-func (e *Engine) baseSystemPrompt() string {
 	// Return cached if already built (stable within a session unless context changes)
 	if e.systemPrompt != "" {
 		return e.systemPrompt
@@ -320,7 +278,26 @@ Available tools:`)
 		sb.WriteString(fmt.Sprintf("\n- %s: %s", d.Name, d.Description))
 	}
 
+	if e.skillMgr != nil {
+		if sp := e.skillMgr.BuildPrompt(); sp != "" {
+			sb.WriteString(sp)
+		}
+	}
+
 	sb.WriteString("\n\nBe concise. Use tools, not talk.")
+
+	if e.memStore != nil {
+		if mp := e.memStore.BuildPrompt(); mp != "" {
+			sb.WriteString(mp)
+		}
+	}
+
+	// Inject session notes for context continuity
+	if e.sessionNotes != nil {
+		if nc := e.sessionNotes.Content(); nc != "" {
+			sb.WriteString(nc)
+		}
+	}
 
 	if e.projCtx != nil {
 		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
@@ -373,7 +350,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	e.saveSession()
 
 	// Cache system prompt and tool defs across iterations (stable within a run)
-	sp := e.systemPromptFor(ctx, userMessage.Content)
+	sp := e.SystemPrompt()
 	toolDefs := e.buildAPIToolDefs()
 
 	for iter := 0; iter < MaxIterations; iter++ {
@@ -745,8 +722,6 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	}
 
 	if !result.IsError {
-		output = condenseToolOutput(tc.Name, output)
-
 		// Adaptive truncation: code/read results get more space than bash output
 		maxTokens := 4000
 		switch tc.Name {
@@ -1189,72 +1164,6 @@ func summarizeResult(result string) string {
 	return s[:77] + "..."
 }
 
-func condenseToolOutput(toolName, output string) string {
-	if toolName != "bash" && toolName != "powershell" {
-		return output
-	}
-	return condenseCommandOutput(output)
-}
-
-func condenseCommandOutput(output string) string {
-	const maxLines = 80
-	lines := strings.Split(output, "\n")
-	if len(lines) <= maxLines {
-		return output
-	}
-
-	keep := make([]string, 0, maxLines)
-	seen := make(map[string]bool)
-	add := func(line string) {
-		line = strings.TrimRight(line, "\r")
-		key := strings.TrimSpace(line)
-		if key == "" || seen[key] {
-			return
-		}
-		seen[key] = true
-		keep = append(keep, line)
-	}
-
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "error") || strings.Contains(lower, "fail:") || strings.Contains(lower, "failed") ||
-			strings.Contains(lower, "failure") || strings.Contains(lower, "panic") ||
-			strings.Contains(lower, "exception") || strings.Contains(lower, "traceback") ||
-			strings.Contains(lower, "undefined") || strings.Contains(lower, "cannot") ||
-			strings.Contains(lower, "not found") || strings.Contains(lower, "no such") ||
-			strings.Contains(lower, "exit status") || strings.Contains(lower, "fatal") ||
-			looksLikePath(line) {
-			add(line)
-		}
-		if len(keep) >= maxLines-10 {
-			break
-		}
-	}
-
-	if len(keep) == 0 {
-		for i := 0; i < 30 && i < len(lines); i++ {
-			add(lines[i])
-		}
-		for i := len(lines) - 30; i < len(lines); i++ {
-			if i >= 0 {
-				add(lines[i])
-			}
-		}
-	}
-
-	if len(keep) == 0 || len(keep) >= len(lines) {
-		return output
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[command output condensed: %d -> %d lines]\n", len(lines), len(keep)))
-	for _, line := range keep {
-		sb.WriteString(line)
-		sb.WriteString("\n")
-	}
-	return strings.TrimRight(sb.String(), "\n")
-}
-
 func preservePathSummary(s, marker string) (string, bool) {
 	idx := strings.LastIndex(s, marker)
 	if idx < 0 {
@@ -1391,7 +1300,7 @@ func (e *Engine) runTurnEndPipeline() {
 		e.sessionNotes.Flush()
 	}
 	// Extract durable memories from recent conversation (async, throttled internally)
-	if e.autoExtract && e.extractRunner != nil && len(e.messages) > 0 {
+	if e.extractRunner != nil && len(e.messages) > 0 {
 		// Snapshot the slice so the background goroutine never reads e.messages
 		// while a subsequent turn appends to it (data race).
 		msgs := append([]api.Message(nil), e.messages...)
@@ -1406,12 +1315,10 @@ func (e *Engine) runTurnEndPipeline() {
 			e.extractRunner.Extract(ctx, msgs)
 		}()
 	}
-	// Background review: auto-record session-local learnings from conversation patterns.
-	if e.autoReview {
-		e.backgroundReview()
-	}
+	// Background review: auto-create skills/memories from conversation patterns
+	e.backgroundReview()
 	// Fire auto-dream consolidation if conditions met (async, throttled internally)
-	if e.autoDream && e.dreamRunner != nil {
+	if e.dreamRunner != nil {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -1462,9 +1369,8 @@ func (e *Engine) recordSignals(userMsg, assistantMsg string) {
 
 // SetAutoExtract enables/disables automatic background memory extraction.
 func (e *Engine) SetAutoExtract(on bool) {
-	e.autoExtract = on
-	e.autoReview = on
-	e.autoDream = on
+	// Background extraction and review are always enabled now.
+	// This method is kept for CLI compatibility.
 }
 
 // SessionNotes returns the session notes manager.
@@ -1495,13 +1401,13 @@ func (e *Engine) WirePlanExecutor() {
 	if e.provider != nil {
 		d := delegate.NewDelegator(e.provider, e.config.Model, e.registry.All())
 		pe := plan.NewPlanExecutor(d, e.runtime)
-		e.runtime.PlanExecuteFunc = func(ctx context.Context, parallel bool) (string, error) {
+		e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
 			pl, err := plan.FromRuntime("plan", e.runtime)
 			if err != nil {
 				return "", err
 			}
 			pl.Parallel = parallel
-			result := pe.Execute(ctx, pl)
+			result := pe.Execute(context.Background(), pl)
 			return plan.FormatResult(result), nil
 		}
 		return
@@ -1509,7 +1415,7 @@ func (e *Engine) WirePlanExecutor() {
 
 	// No provider available: register a fallback that guides the LLM
 	// to execute tasks sequentially without sub-agents.
-	e.runtime.PlanExecuteFunc = func(ctx context.Context, parallel bool) (string, error) {
+	e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
 		return "No API provider configured. Execute tasks one at a time " +
 			"using available tools (read, write, bash, etc.) instead of " +
 			"sub-agents. Follow the todowrite plan sequentially.", nil

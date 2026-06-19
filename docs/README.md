@@ -1,8 +1,8 @@
 # Cove 文档目录
 
 - [使用手册 (User Manual)](USER_MANUAL.md) — 完整的中文使用手册，覆盖所有功能
-- [需求分析](need/cove-vs-top-agents-analysis.md) — Cove 与主流 AI Coding Agent 对比分析
-- [竞品仓库列表](need/github-agent-repos.md) — GitHub 上主流 AI Coding Agent 仓库汇总
+- [需求说明书](需求说明书.md) — 从现有实现反向推导的产品需求说明
+- [全流程图（端到端）](全流程图-端到端.md) — 总流程 + 各模块内部流程图
 - [项目 README](../README.md) — 中英双语项目总览
 - [更新日志](../CHANGELOG.md) — 版本发布历史
 - [贡献指南](../CONTRIBUTING.md) — 如何参与贡献

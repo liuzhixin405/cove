@@ -76,7 +76,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 
 	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
-		result, err := tctx.Runtime.PlanExecuteFunc(ctx, true)
+		result, err := tctx.Runtime.PlanExecuteFunc(true)
 		if err != nil {
 			sb.WriteString(fmt.Sprintf("\n\n[执行失败] %v", err))
 		} else {

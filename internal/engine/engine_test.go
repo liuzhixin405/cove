@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
@@ -319,64 +316,6 @@ func TestSummarizeResultPreservesGlobPathLine(t *testing.T) {
 	out := summarizeResult(in)
 	if !strings.Contains(out, path) {
 		t.Fatalf("expected glob path preserved, got %q", out)
-	}
-}
-
-func TestSystemPromptForUsesRelevantMemory(t *testing.T) {
-	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, "golang-style.md"), []byte("Prefer table-driven Go tests for parser changes."), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(tmp, "frontend-theme.md"), []byte("Use warm landing page colors for marketing pages."), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	store := memory.NewStore()
-	store.AddDir(tmp)
-	eng := newTestEngine(&mockProvider{})
-	eng.memStore = store
-
-	prompt := eng.systemPromptFor(context.Background(), "please update the golang parser tests")
-	if !strings.Contains(prompt, "table-driven Go tests") {
-		t.Fatalf("expected relevant Go memory in prompt, got %q", prompt)
-	}
-	if strings.Contains(prompt, "warm landing page colors") {
-		t.Fatalf("expected unrelated frontend memory to be omitted, got %q", prompt)
-	}
-}
-
-func TestSetAutoExtractDisablesBackgroundAI(t *testing.T) {
-	eng := newTestEngine(&mockProvider{})
-	eng.SetAutoExtract(false)
-	if eng.autoExtract || eng.autoReview || eng.autoDream {
-		t.Fatalf("expected all background AI flags disabled, got extract=%t review=%t dream=%t", eng.autoExtract, eng.autoReview, eng.autoDream)
-	}
-	eng.SetAutoExtract(true)
-	if !eng.autoExtract || !eng.autoReview || !eng.autoDream {
-		t.Fatalf("expected all background AI flags enabled, got extract=%t review=%t dream=%t", eng.autoExtract, eng.autoReview, eng.autoDream)
-	}
-}
-
-func TestCondenseCommandOutputKeepsFailuresAndPaths(t *testing.T) {
-	var sb strings.Builder
-	for i := 0; i < 120; i++ {
-		sb.WriteString(fmt.Sprintf("noise line %03d\n", i))
-	}
-	sb.WriteString("FAIL: TestImportantCase\n")
-	sb.WriteString(`internal/engine/engine.go:123: expected value mismatch` + "\n")
-	sb.WriteString("panic: runtime error\n")
-
-	out := condenseCommandOutput(sb.String())
-	if !strings.Contains(out, "command output condensed") {
-		t.Fatalf("expected condensed marker, got %q", out)
-	}
-	for _, want := range []string{"FAIL: TestImportantCase", "internal/engine/engine.go", "panic: runtime error"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("expected condensed output to keep %q, got %q", want, out)
-		}
-	}
-	if strings.Contains(out, "noise line 000") && strings.Contains(out, "noise line 119") {
-		t.Fatalf("expected repetitive noise to be reduced, got %q", out)
 	}
 }
 

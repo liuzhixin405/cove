@@ -21,7 +21,6 @@ type Record struct {
 	// MessageCount and Preview are list-only metadata populated by List().
 	MessageCount int     `json:"-"`
 	UserTurns    int     `json:"-"`
-	ToolMessages int     `json:"-"`
 	Preview      string  `json:"-"`
 	Model        string  `json:"model"`
 	TokensIn     int     `json:"tokens_in"`
@@ -109,7 +108,6 @@ func (s *Store) List() ([]Record, error) {
 			Title:        meta.Title,
 			MessageCount: len(meta.Messages),
 			UserTurns:    countGenuineUserTurns(meta.Messages),
-			ToolMessages: countToolMessages(meta.Messages),
 			Preview:      firstUserPreview(meta.Messages),
 			Model:        meta.Model,
 			TokensIn:     meta.TokensIn,
@@ -169,19 +167,6 @@ func countGenuineUserTurns(messages []struct {
 			continue
 		}
 		n++
-	}
-	return n
-}
-
-func countToolMessages(messages []struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}) int {
-	n := 0
-	for _, m := range messages {
-		if m.Role == "tool" {
-			n++
-		}
 	}
 	return n
 }

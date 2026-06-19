@@ -110,7 +110,7 @@ func (t *ExecutePlanTool) Call(ctx context.Context, input Input, tctx Context) (
 	parallel, _ := input["parallel"].(bool)
 
 	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
-		result, err := tctx.Runtime.PlanExecuteFunc(ctx, parallel)
+		result, err := tctx.Runtime.PlanExecuteFunc(parallel)
 		if err != nil {
 			return Result{Data: err.Error(), IsError: true}, nil
 		}

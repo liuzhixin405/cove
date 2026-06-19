@@ -8,11 +8,12 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/skills"
 )
 
-// backgroundReview runs after each turn to auto-record session-local learnings.
+// backgroundReview runs after each turn to auto-extract learnings into memory/skills.
 func (e *Engine) backgroundReview() {
-	if e.sessionNotes == nil {
+	if e.memStore == nil && e.skillMgr == nil {
 		return
 	}
 	if len(e.messages) < 6 {
@@ -39,11 +40,11 @@ func (e *Engine) backgroundReview() {
 			return
 		}
 
-		prompt := `你是一个对话回顾助手。分析以下对话片段，判断是否有值得记录到“当前会话笔记”的内容。
+		prompt := `你是一个对话回顾助手。分析以下对话片段，判断是否有值得记住的内容。
 
 只在以下情况输出：
-	1. 用户明确做出的技术选择 → 输出 DECISION: <一句话描述>
-	2. 调试或实现中发现的关键事实 → 输出 DISCOVERY: <一句话描述>
+1. 用户偏好（编码风格、工具偏好、工作习惯）→ 输出 MEMORY: <一句话描述>
+2. 可复用的工作流程（解决特定问题的步骤）→ 输出 SKILL: <技能名> | <简要步骤>
 
 不要输出：
 - 一次性的任务细节
@@ -68,24 +69,28 @@ func (e *Engine) backgroundReview() {
 			return
 		}
 
-		// Process session-note lines only. Durable long-term memory is owned by
-		// extract.Runner; cross-session consolidation is owned by dream.Runner.
+		// Process MEMORY lines
 		for _, line := range strings.Split(output, "\n") {
 			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "DECISION:") {
-				decision := strings.TrimSpace(strings.TrimPrefix(line, "DECISION:"))
-				if decision != "" {
-					e.sessionNotes.AddDecision(decision)
-					log.Debugf("background review saved decision: %s", decision)
-					e.engineOutput(fmt.Sprintf("  \x1b[2m记录决策: %s\x1b[0m\n", reviewTruncate(decision, 50)))
+			if strings.HasPrefix(line, "MEMORY:") {
+				mem := strings.TrimSpace(strings.TrimPrefix(line, "MEMORY:"))
+				if mem != "" && e.memStore != nil {
+					e.memStore.Save("auto", mem)
+					log.Debugf("background review saved memory: %s", mem)
+					e.engineOutput(fmt.Sprintf("  \x1b[2m🧠 记住了: %s\x1b[0m\n", reviewTruncate(mem, 50)))
 				}
 			}
-			if strings.HasPrefix(line, "DISCOVERY:") {
-				discovery := strings.TrimSpace(strings.TrimPrefix(line, "DISCOVERY:"))
-				if discovery != "" {
-					e.sessionNotes.AddDiscovery(discovery)
-					log.Debugf("background review saved discovery: %s", discovery)
-					e.engineOutput(fmt.Sprintf("  \x1b[2m记录发现: %s\x1b[0m\n", reviewTruncate(discovery, 50)))
+			if strings.HasPrefix(line, "SKILL:") {
+				skill := strings.TrimSpace(strings.TrimPrefix(line, "SKILL:"))
+				if skill != "" && e.skillMgr != nil {
+					parts := strings.SplitN(skill, "|", 2)
+					if len(parts) == 2 {
+						name := strings.TrimSpace(parts[0])
+						content := strings.TrimSpace(parts[1])
+						e.skillMgr.Register(skills.Skill{Name: name, Prompt: content})
+						log.Debugf("background review saved skill: %s", name)
+						e.engineOutput(fmt.Sprintf("  \x1b[2m📚 学会了: %s\x1b[0m\n", name))
+					}
 				}
 			}
 		}

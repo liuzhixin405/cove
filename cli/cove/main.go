@@ -38,6 +38,8 @@ import (
 	"github.com/liuzhixin405/cove/internal/skills"
 
 	"github.com/liuzhixin405/cove/internal/state"
+
+	"github.com/liuzhixin405/cove/internal/tui"
 )
 
 type providerReloader interface {
@@ -64,6 +66,10 @@ var (
 	dumpPrompt = false
 
 	noAuto = false
+
+	tuiMode = false
+
+	noTUI = false
 )
 
 func main() {
@@ -156,6 +162,14 @@ func main() {
 
 			resumeMode = true
 
+		case "--tui":
+
+			tuiMode = true
+
+		case "--no-tui":
+
+			noTUI = true
+
 		default:
 
 			if printMode && printPrompt == "" {
@@ -236,6 +250,60 @@ func main() {
 	if printMode && printPrompt != "" {
 
 		runPrintMode(eng, printPrompt, debugMode, printAttachments, cfg)
+
+		return
+
+	}
+
+	if useTUI() {
+
+		// Build the slash-command catalog for the palette and a runner that
+		// executes a command line and returns its rendered output.
+		var tuiCommands []tui.CommandItem
+		for _, c := range cmdReg.All() {
+			tuiCommands = append(tuiCommands, tui.CommandItem{Name: c.Name(), Desc: c.Description()})
+		}
+		runCommand := func(line string) string {
+			parts := strings.Fields(line)
+			if len(parts) == 0 {
+				return ""
+			}
+			name := strings.TrimPrefix(parts[0], "/")
+			cmd, ok := cmdReg.Find(name)
+			if !ok {
+				return "未知命令: /" + name + "（输入 /help 查看可用命令）"
+			}
+			cwd, _ := os.Getwd()
+			out, err := cmd.Execute(context.Background(), command.Input{
+				Args:              parts[1:],
+				Cwd:               cwd,
+				Config:            cfg,
+				SaveConfig:        config.Save,
+				Engine:            replEngineAdapter{eng: eng},
+				SessionStore:      eng.Store(),
+				PluginManager:     pluginMgr,
+				SkillManager:      skillMgr,
+				MemoryStore:       memStore,
+				PermissionManager: permMgr,
+				MCPPool:           mcpPool,
+				ProjectContext:    projCtx,
+				AppState:          appState,
+				Provider:          eng.Provider(),
+			})
+			if err != nil {
+				return "错误: " + err.Error()
+			}
+			msg := out.Message
+			if out.Data != "" {
+				if msg != "" {
+					msg += "\n"
+				}
+				msg += out.Data
+			}
+			return msg
+		}
+
+		runTUI(bannerText, debugMode, eng, cfg, projCtx, permMgr, tuiCommands, runCommand)
 
 		return
 
@@ -768,7 +836,10 @@ func printCLIHelp() {
 用法:
 
 
- cove                       启动交互式 REPL
+ cove                       启动交互式 REPL（默认全屏 TUI 界面）
+
+
+ cove --no-tui              使用经典逐行 REPL（关闭全屏 TUI）
 
 
  cove -p <prompt>           执行单次询问并输出结果
