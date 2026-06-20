@@ -204,12 +204,34 @@ func isLowSignalHistoryText(s string) bool {
 		"hi":           true,
 		"hello":        true,
 		"?":            true,
+		"list":         true,
+		"ls":           true,
+		"l":            true,
+		"bash":         true,
+		"show":         true,
+		"cat":          true,
 	}
 	if noise[v] {
 		return true
 	}
 	if strings.HasPrefix(v, "/") {
 		return true
+	}
+	// Filter out command line tools
+	fields := strings.Fields(v)
+	if len(fields) > 0 {
+		first := fields[0]
+		commonTools := map[string]bool{
+			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
+			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
+			"go": true, "python": true, "python3": true, "pip": true, "npm": true, "node": true,
+			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
+			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
+			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
+		}
+		if commonTools[first] {
+			return true
+		}
 	}
 	return false
 }

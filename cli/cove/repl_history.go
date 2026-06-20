@@ -256,35 +256,93 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 
 	records, _ := store.List()
 	var idx int
-	if _, err := fmt.Sscanf(input, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
+	var r *session.Record
+	var err error
+	var numberIdx int
+
+	if _, errScan := fmt.Sscanf(input, "%d", &idx); errScan == nil && idx >= 1 && idx <= len(records) {
 		rMeta := records[idx-1]
-		r, err := store.Load(rMeta.ID)
-		if err != nil {
-			repl.PrintSafe("恢复失败: %v\n", err)
-			return
+		r, err = store.Load(rMeta.ID)
+		numberIdx = idx
+	} else {
+		r, err = store.Load(input)
+		// Try to find the matching alphabetical index for visual logging
+		for i, rec := range records {
+			if rec.ID == input {
+				numberIdx = i + 1
+				break
+			}
 		}
-		eng.LoadMessages(r.Messages)
-		title := r.Title
-		if title == "New session" || title == "" {
-			title = sessionPreview(*r)
-		}
-		repl.PrintSafe("已恢复 #%d: %s (%d 条消息)\n", idx, title, len(r.Messages))
-		repl.PrintSafe("可以继续对话了。\n\n")
+	}
+
+	if err != nil {
+		repl.PrintSafe("恢复会话失败或无效选择: %s\n输入 /history 查看可用会话。\n", input)
 		return
 	}
 
-	r, err := store.Load(input)
-	if err != nil {
-		repl.PrintSafe("无效选择: %s\n输入 /history 查看可用会话。\n", input)
-		return
-	}
 	eng.LoadMessages(r.Messages)
 	title := r.Title
 	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
 		title = sessionPreview(*r)
 	}
-	repl.PrintSafe("已恢复: %s (%d 条消息)\n", title, len(r.Messages))
-	repl.PrintSafe("可以继续对话了。\n\n")
+
+	// Dynamic interactive feedback: print last 4 messages on main console instead of a dry summary!
+	repl.PrintSafe("\n==================================================\n")
+	if numberIdx > 0 {
+		repl.PrintSafe("  ★ 已成功拉回历史会话 #%d: %s\n", numberIdx, title)
+	} else {
+		repl.PrintSafe("  ★ 已成功拉回历史会话: %s\n", title)
+	}
+	repl.PrintSafe("==================================================\n\n")
+
+	if len(r.Messages) == 0 {
+		repl.PrintSafe("  (该历史会话为空，现在可以输入指令开始新的对话)\n\n")
+		return
+	}
+
+	// Show recent conversation messages to restore full context on the main interface
+	startIndex := 0
+	if len(r.Messages) > 4 {
+		startIndex = len(r.Messages) - 4
+		repl.PrintSafe("  ... (已隐藏前面 %d 条对话细节) ...\n\n", len(r.Messages)-4)
+	}
+
+	for i := startIndex; i < len(r.Messages); i++ {
+		msg := r.Messages[i]
+		// Format user instructions and assistant remarks beautifully
+		switch strings.ToLower(msg.Role) {
+		case "user":
+			if !strings.HasPrefix(strings.TrimSpace(msg.Content), "[system:") {
+				repl.PrintSafe("%s用户 (User):%s\n  %s\n\n", repl.Yellow, repl.Reset, strings.TrimSpace(msg.Content))
+			} else {
+				// Internal state prompts in dim/italics
+				repl.PrintSafe("%s内置微调状态 (System):%s\n  %s\n\n", repl.Dim, repl.Reset, strings.TrimSpace(msg.Content))
+			}
+		case "assistant":
+			if msg.Content != "" {
+				repl.PrintSafe("%s助手 (Assistant):%s\n%s\n\n", repl.Green, repl.Reset, strings.TrimSpace(msg.Content))
+			}
+			for _, tc := range msg.ToolCalls {
+				repl.PrintSafe("  %s↳ 触发核心工具: %s, 传入参数: %v%s\n", repl.Dim, tc.Name, tc.Input, repl.Reset)
+			}
+			if len(msg.ToolCalls) > 0 {
+				repl.PrintSafe("\n")
+			}
+		case "tool":
+			// Compress raw execution content so we don't dump 100 lines of compilation logs
+			toolContent := strings.TrimSpace(msg.Content)
+			if len(toolContent) > 200 {
+				toolContent = toolContent[:200] + " ... [数据包已在上下文内激活]"
+			}
+			repl.PrintSafe("  %s🛠️  工具返回结果: %s%s\n\n", repl.Dim, toolContent, repl.Reset)
+		}
+	}
+
+	repl.PrintSafe("%s历史会话与运行上下文已被完整恢复。您可以直接继续向 Cove 提问了：%s\n\n", repl.Green, repl.Reset)
+}
+
+func mtimeStr(s string) string {
+	return s
 }
 
 func handleHistoryDetail(input string, eng *engine.Engine) {
@@ -547,18 +605,41 @@ func isLowSignalHistoryTitle(s string) bool {
 		"read":         true,
 		"read file":    true,
 		"grep":         true,
-		"继续":           true,
 		"continue":     true,
+		"继续":           true,
 		"hi":           true,
 		"hello":        true,
 		"你好":           true,
 		"?":            true,
+		"list":         true,
+		"ls":           true,
+		"l":            true,
+		"bash":         true,
+		"show":         true,
+		"cat":          true,
 	}
 	if noise[v] {
 		return true
 	}
 	if strings.HasPrefix(v, "/") {
 		return true
+	}
+	// Check if this is just a short CLI command (single word or basic tool path)
+	fields := strings.Fields(v)
+	if len(fields) > 0 {
+		first := fields[0]
+		// Ban common command line / tool invocations
+		commonTools := map[string]bool{
+			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
+			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
+			"go": true, "python": true, "python3": true, "pip": true, "npm": true, "node": true,
+			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
+			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
+			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
+		}
+		if commonTools[first] {
+			return true
+		}
 	}
 	return false
 }

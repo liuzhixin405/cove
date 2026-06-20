@@ -145,7 +145,7 @@ func runTUI(bannerText string, debugMode bool, eng *engine.Engine, cfg *config.C
 	app = tui.NewApp(modelName, func(input string) {
 		queue.push(input)
 	}, func(id string) {
-		// Restore a past session picked from the history overlay.
+		// Restore a past session picked from the history overlay in TUI mode.
 		go func() {
 			r, err := eng.Store().Load(id)
 			if err != nil {
@@ -154,10 +154,53 @@ func runTUI(bannerText string, debugMode bool, eng *engine.Engine, cfg *config.C
 			}
 			eng.LoadMessages(r.Messages)
 			title := r.Title
-			if title == "" {
-				title = id
+			if title == "" || title == "New session" || isLowSignalHistoryTitle(title) {
+				title = sessionPreview(*r)
 			}
-			app.EngineLine(fmt.Sprintf("\n── 已恢复会话: %s（%d 条消息）──\n", title, len(r.Messages)))
+
+			// Show clean rich history in TUI display line-by-line!
+			app.EngineLine(fmt.Sprintf("\n==================================================\n  ★ 已恢复会话: %s\n==================================================\n\n", title))
+
+			if len(r.Messages) == 0 {
+				app.EngineLine("  (该历史会话为空，可直接输入指令开始新对话)\n\n")
+				return
+			}
+
+			startIndex := 0
+			if len(r.Messages) > 4 {
+				startIndex = len(r.Messages) - 4
+				app.EngineLine(fmt.Sprintf("  ... (已隐藏前面 %d 条对话细节) ...\n\n", len(r.Messages)-4))
+			}
+
+			for i := startIndex; i < len(r.Messages); i++ {
+				msg := r.Messages[i]
+				switch strings.ToLower(msg.Role) {
+				case "user":
+					if !strings.HasPrefix(strings.TrimSpace(msg.Content), "[system:") {
+						app.EngineLine(fmt.Sprintf("[用户 (User)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
+					} else {
+						app.EngineLine(fmt.Sprintf("[内置微调状态 (System)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
+					}
+				case "assistant":
+					if msg.Content != "" {
+						app.EngineLine(fmt.Sprintf("[助手 (Assistant)]:\n%s\n\n", strings.TrimSpace(msg.Content)))
+					}
+					for _, tc := range msg.ToolCalls {
+						app.EngineLine(fmt.Sprintf("  ↳ 触发核心工具: %s, 传入参数: %v\n", tc.Name, tc.Input))
+					}
+					if len(msg.ToolCalls) > 0 {
+						app.EngineLine("\n")
+					}
+				case "tool":
+					toolContent := strings.TrimSpace(msg.Content)
+					if len(toolContent) > 200 {
+						toolContent = toolContent[:200] + " ... [数据已装载]"
+					}
+					app.EngineLine(fmt.Sprintf("  🛠️  工具返回: %s\n\n", toolContent))
+				}
+			}
+
+			app.EngineLine("运行上下文与消息历史已被完整恢复。您可以直接继续对话了：\n\n")
 		}()
 	}, interrupt, commands)
 
