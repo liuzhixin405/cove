@@ -17,7 +17,7 @@ func TestTrackerAddDetailedUsesDeepSeekCacheHitPricing(t *testing.T) {
 		t.Fatalf("TotalPromptCacheMiss = %d, want 400", tracker.TotalPromptCacheMiss)
 	}
 
-	want := (400.0/1e6)*0.435 + (600.0/1e6)*0.003625 + (200.0/1e6)*0.87
+	want := (400.0/1e6)*0.14 + (600.0/1e6)*(0.14*0.1) + (200.0/1e6)*0.28
 	if diff := tracker.TotalCost - want; diff < -1e-12 || diff > 1e-12 {
 		t.Fatalf("TotalCost = %.12f, want %.12f", tracker.TotalCost, want)
 	}
@@ -49,7 +49,7 @@ func TestTrackerSummaryShowsSmallNonZeroCost(t *testing.T) {
 	tracker := NewTracker(10)
 	tracker.AddDetailed("deepseek-v4-pro", 9836, 54, 1280, 8556)
 	got := tracker.Summary()
-	if got != "9836 in (cache hit 1280, miss 8556) | 54 out | $0.0038 / $10.00" {
+	if got != "9836 in (cache hit 1280, miss 8556) | 54 out | $0.0012 / $10.00" {
 		t.Fatalf("Summary() = %q", got)
 	}
 }

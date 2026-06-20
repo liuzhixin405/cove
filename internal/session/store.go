@@ -171,6 +171,19 @@ func countGenuineUserTurns(messages []struct {
 	return n
 }
 
+func countToolMessages(messages []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}) int {
+	n := 0
+	for _, m := range messages {
+		if m.Role == "tool" {
+			n++
+		}
+	}
+	return n
+}
+
 func isLowSignalHistoryText(s string) bool {
 	v := strings.TrimSpace(strings.ToLower(s))
 	if v == "" {

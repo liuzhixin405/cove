@@ -63,7 +63,7 @@ func TestOpenAICompatConvertMessagesStripsReasoningContent(t *testing.T) {
 	msgs := p.convertMessages([]Message{{
 		Role:             "assistant",
 		Content:          "",
-		ReasoningContent: "internal reasoning",
+		ReasoningContent: "internal reasoning with tool calls",
 		ToolCalls: []ToolCall{{
 			ID:    "call_1",
 			Name:  "read_file",
@@ -73,18 +73,27 @@ func TestOpenAICompatConvertMessagesStripsReasoningContent(t *testing.T) {
 		Role:       "tool",
 		ToolCallID: "call_1",
 		Content:    "# cove",
+	}, {
+		Role:             "assistant",
+		Content:          "final reply",
+		ReasoningContent: "final internal reasoning without tool calls",
 	}})
 
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
 	}
-	// reasoning_content must be stripped from outgoing messages: DeepSeek
-	// returns 400 if it is present in input, and replaying it wastes context.
-	if got := msgs[0].ReasoningContent; got != "" {
-		t.Fatalf("assistant reasoning_content = %q, want empty (stripped)", got)
+	// DeepSeek guidelines:
+	// - Message 0 (has tool calls): reasoning_content MUST be retained.
+	if got := msgs[0].ReasoningContent; got != "internal reasoning with tool calls" {
+		t.Fatalf("assistant with tool calls: reasoning_content = %q, want 'internal reasoning with tool calls'", got)
 	}
+	// Message 1 (tool output): has tool_call_id
 	if got := msgs[1].ToolCallID; got != "call_1" {
 		t.Fatalf("tool message tool_call_id = %q, want call_1", got)
+	}
+	// Message 2 (no tool calls): reasoning_content MUST be stripped to avoid bloat/errors.
+	if got := msgs[2].ReasoningContent; got != "" {
+		t.Fatalf("assistant without tool calls: reasoning_content = %q, want empty (stripped)", got)
 	}
 }
 
@@ -311,5 +320,44 @@ func TestOpenAICompatChatReportsImageUnsupportedError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "不支持图片输入") {
 		t.Fatalf("error = %q, want friendly unsupported-image hint", err.Error())
+	}
+}
+
+func TestOpenAICompatReasonerStripsTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody map[string]any
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(bodyBytes, &reqBody)
+
+		if _, exists := reqBody["tools"]; exists {
+			t.Errorf("reasoner model should not receive 'tools' in body")
+		}
+		if _, exists := reqBody["tool_choice"]; exists {
+			t.Errorf("reasoner model should not receive 'tool_choice' in body")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"deepseek-reasoner","choices":[{"index":0,"message":{"role":"assistant","content":"understood"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	p := &openAICompatProvider{apiKey: "test-key", baseURL: server.URL, client: server.Client()}
+	resp, err := p.Chat(context.Background(), ChatRequest{
+		Model: "deepseek-reasoner",
+		Messages: []Message{{
+			Role:    "user",
+			Content: "hello",
+		}},
+		Tools: []ToolDef{{
+			Name:        "test_tool",
+			Description: "does nothing",
+		}},
+		MaxTokens: 32,
+	})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if resp.Content != "understood" {
+		t.Fatalf("unexpected content: %q", resp.Content)
 	}
 }

@@ -148,12 +148,18 @@ func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*Chat
 		msgs = append([]oaiMsg{{Role: "system", Content: combined}}, msgs...)
 	}
 
-	tools := p.convertTools(req.Tools)
+	var tools []oaiTool
+	var toolChoice string
+	if !isReasonerModel(req.Model) {
+		tools = p.convertTools(req.Tools)
+		toolChoice = p.toolChoice(tools)
+	}
+
 	body := oaiReq{
 		Model:      req.Model,
 		Messages:   msgs,
 		Tools:      tools,
-		ToolChoice: p.toolChoice(tools),
+		ToolChoice: toolChoice,
 		MaxTokens:  req.MaxTokens,
 	}
 
@@ -275,12 +281,15 @@ func (u oaiUsage) reasoningTokens() int {
 func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 	var out []oaiMsg
 	for _, m := range in {
-		// reasoning_content is display/archival only and must NOT be echoed back
-		// to the API. DeepSeek rejects requests whose input messages carry
-		// reasoning_content (HTTP 400), and replaying long thinking traces would
-		// also bloat context and cost. We deliberately drop m.ReasoningContent.
 		om := oaiMsg{Role: m.Role, Content: p.convertMessageContent(m), ToolCallID: m.ToolCallID}
 		if len(m.ToolCalls) > 0 {
+			// DeepSeek Think/Tool-use guidelines:
+			// 1. If the assistant performed tool calls, its reasoning_content MUST be included in the
+			//    context history and sent back to the API in subsequent turns.
+			// 2. If NO tool calls were made, reasoning_content can be safely omitted/stripped to
+			//    avoid bloat or errors since it is ignored by the API anyway.
+			om.ReasoningContent = m.ReasoningContent
+
 			for _, tc := range m.ToolCalls {
 				args, _ := json.Marshal(tc.Input)
 				om.ToolCalls = append(om.ToolCalls, oaiToolCall{
@@ -416,12 +425,18 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	}
 	messages = append(messages, p.convertMessages(normalizedMessages)...)
 
-	tools := p.convertTools(req.Tools)
+	var tools []oaiTool
+	var toolChoice string
+	if !isReasonerModel(req.Model) {
+		tools = p.convertTools(req.Tools)
+		toolChoice = p.toolChoice(tools)
+	}
+
 	body := oaiReq{
 		Model:         req.Model,
 		Messages:      messages,
 		Tools:         tools,
-		ToolChoice:    p.toolChoice(tools),
+		ToolChoice:    toolChoice,
 		MaxTokens:     req.MaxTokens,
 		Stream:        true,
 		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
@@ -645,4 +660,9 @@ func formatOpenAICompatAPIError(status int, raw []byte, hadImage bool) error {
 		}
 	}
 	return fmt.Errorf("API error %d: %s", status, truncate(msg, 500))
+}
+
+func isReasonerModel(model string) bool {
+	m := strings.ToLower(model)
+	return strings.Contains(m, "deepseek-reasoner") || strings.Contains(m, "deepseek-r1") || strings.Contains(m, "deepseek/deepseek-r1")
 }

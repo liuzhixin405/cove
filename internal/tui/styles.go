@@ -38,6 +38,21 @@ var (
 			Foreground(lipgloss.Color("231")).
 			Background(accent).
 			Bold(true)
+
+	btnAllowStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("231")).
+			Background(good).
+			Bold(true)
+
+	btnDenyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("231")).
+			Background(lipgloss.Color("196")). // Red background
+			Bold(true)
+
+	btnAlwaysStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("231")).
+			Background(warn).
+			Bold(true)
 )
 
 func (m *Model) renderStatusBar() string {
@@ -243,8 +258,12 @@ func (m *Model) renderPermission(height int) string {
 		b.WriteString("\n")
 	}
 
-	hint := dimStyle.Render("(y) 允许 · (n) 拒绝 · (a) 始终允许 · Esc 拒绝")
-	content := b.String() + "\n" + hint
+	allowBtn := btnAllowStyle.Render(" 允许 (y) ")
+	denyBtn := btnDenyStyle.Render(" 拒绝 (n) ")
+	alwaysBtn := btnAlwaysStyle.Render(" 始终允许 (a) ")
+	buttonsLine := allowBtn + "  " + denyBtn + "  " + alwaysBtn + "  " + dimStyle.Render("(或按 Esc/n 拒绝)")
+
+	content := b.String() + "\n" + buttonsLine
 	return overlayBoxStyle.Width(m.width - 2).MaxHeight(height).Render(content)
 }
 

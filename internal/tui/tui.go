@@ -345,6 +345,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseClickMsg:
+		if m.overlay == overlayPermission && msg.Button == tea.MouseLeft {
+			oH := m.height - 5
+			if oH < 3 {
+				oH = 3
+			}
+			if msg.Y == oH-1 {
+				xOffset := 2
+				wAllow := lipgloss.Width(" 允许 (y) ")
+				wDeny := lipgloss.Width(" 拒绝 (n) ")
+				wAlways := lipgloss.Width(" 始终允许 (a) ")
+
+				allowStart := xOffset
+				allowEnd := allowStart + wAllow
+
+				denyStart := allowEnd + 2
+				denyEnd := denyStart + wDeny
+
+				alwaysStart := denyEnd + 2
+				alwaysEnd := alwaysStart + wAlways
+
+				if msg.X >= allowStart-1 && msg.X <= allowEnd+1 {
+					m.resolvePermission(PermAllow)
+					return m, nil
+				} else if msg.X >= denyStart-1 && msg.X <= denyEnd+1 {
+					m.resolvePermission(PermDeny)
+					return m, nil
+				} else if msg.X >= alwaysStart-1 && msg.X <= alwaysEnd+1 {
+					m.resolvePermission(PermAlways)
+					return m, nil
+				}
+			}
+		}
+
 		// A left click on a folded/expanded thinking header toggles it. The
 		// viewport body starts at screen row 1 (row 0 is the status bar); add the
 		// scroll offset to map the click to a wrapped content row.
@@ -513,39 +546,40 @@ func (m *Model) updateOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *Model) resolvePermission(d PermDecision) {
+	if m.permReply != nil {
+		m.permReply <- d
+		m.permReply = nil
+	}
+	m.permTool = ""
+	m.permDesc = ""
+	m.closeOverlay()
+}
+
 // updatePermission handles key input while the permission-confirmation overlay
 // is active. It always sends exactly one decision back to the blocked worker
 // goroutine and then dismisses the overlay. Esc/n reject; y/Enter allow once; a
 // allows and asks the caller to remember the rule.
 func (m *Model) updatePermission(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	reply := func(d PermDecision) {
-		if m.permReply != nil {
-			m.permReply <- d
-			m.permReply = nil
-		}
-		m.permTool = ""
-		m.permDesc = ""
-		m.closeOverlay()
-	}
 	switch msg.String() {
 	case "ctrl+c":
-		reply(PermDeny)
+		m.resolvePermission(PermDeny)
 		m.quitting = true
 		return m, tea.Quit
 	case "esc":
-		reply(PermDeny)
+		m.resolvePermission(PermDeny)
 		return m, nil
 	case "enter":
-		reply(PermAllow)
+		m.resolvePermission(PermAllow)
 		return m, nil
 	}
 	switch strings.ToLower(msg.Text) {
 	case "y":
-		reply(PermAllow)
+		m.resolvePermission(PermAllow)
 	case "n":
-		reply(PermDeny)
+		m.resolvePermission(PermDeny)
 	case "a":
-		reply(PermAlways)
+		m.resolvePermission(PermAlways)
 	}
 	return m, nil
 }

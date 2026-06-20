@@ -379,7 +379,7 @@ func preferredVisionModelForProvider(providerName, currentModel string) string {
 
 	case "deepseek":
 
-		return "deepseek-chat"
+		return "deepseek-v4-flash"
 
 	case "openai", "openai-compatible":
 

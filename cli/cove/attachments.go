@@ -282,7 +282,7 @@ func buildImagePart(name, absPath string, raw []byte, mimeType, model string) (a
 	// Check if model supports vision
 	warning := ""
 	if model != "" && !api.IsVisionCapableModel(model) {
-		warning = fmt.Sprintf("⚠ 当前模型 %s 可能不支持图片视觉功能，已自动降级为文本提示。建议切换到视觉模型 (如 deepseek-chat / gpt-4o / claude-sonnet-4)", model)
+		warning = fmt.Sprintf("⚠ 当前模型 %s 可能不支持图片视觉功能，已自动降级为文本提示。建议切换到视觉模型 (如 deepseek-v4-flash / gpt-4o / claude-sonnet-4)", model)
 		return api.MessagePart{
 			Type:     "text",
 			MimeType: "text/plain",
