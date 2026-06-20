@@ -81,19 +81,19 @@ type Engine struct {
 	promptMu              sync.Mutex // lock for interactive permission prompts
 	// OnEngineOutput, if set, receives engine diagnostic lines
 	// (tool progress, spinner, etc.) instead of writing to stderr.
-	OnEngineOutput func(line string)
-	PermissionPrompt      func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause     func()                       // called before permission prompt to pause spinners
-	OnPermissionDone      func()                       // called after permission decision to resume
-	OnToolProgress        func(toolName, chunk string) // live output chunks from long-running tools
-	sessionNotes          *notes.SessionNotes
-	guardrails            *guardrail.Tracker
-	subdirHints           *ctxt.SubdirHints
-	rateLimits            *api.RateLimitTracker
-	extractRunner         *extract.Runner
-	dreamRunner           *dream.Runner
-	cpMgr                 *checkpoint.Manager
-	lastReviewMsgCount    int
+	OnEngineOutput     func(line string)
+	PermissionPrompt   func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause  func()                       // called before permission prompt to pause spinners
+	OnPermissionDone   func()                       // called after permission decision to resume
+	OnToolProgress     func(toolName, chunk string) // live output chunks from long-running tools
+	sessionNotes       *notes.SessionNotes
+	guardrails         *guardrail.Tracker
+	subdirHints        *ctxt.SubdirHints
+	rateLimits         *api.RateLimitTracker
+	extractRunner      *extract.Runner
+	dreamRunner        *dream.Runner
+	cpMgr              *checkpoint.Manager
+	lastReviewMsgCount int
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
@@ -317,6 +317,9 @@ Available tools:`)
 		if e.projCtx.FileTree != "" {
 			sb.WriteString(fmt.Sprintf("\nProject structure:\n%s", e.projCtx.FileTree))
 		}
+		if e.projCtx.RepoMap != "" {
+			sb.WriteString(fmt.Sprintf("\nRepository Micro-Map (Defined API structures/schemas):\n%s", e.projCtx.RepoMap))
+		}
 	}
 
 	e.systemPrompt = sb.String()
@@ -335,6 +338,13 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string), onReasoning func(reasoning string)) (string, error) {
 	if e.costTracker.OverBudget() {
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
+	}
+
+	// Automatically re-collect project context, git status, file changes, and AST repo-map
+	// right before running user query to keep the LLM completely synchronized with local file changes.
+	if e.projCtx != nil {
+		e.projCtx = ctxt.Collect()
+		e.systemPrompt = "" // Invalidate the compiled system prompt to force reconstruction with the fresh context
 	}
 
 	// Stall monitor: surfaces which stage is stuck if the run appears to hang.

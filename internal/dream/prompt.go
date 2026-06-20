@@ -52,13 +52,21 @@ Focus on:
 - Converting relative dates ("yesterday", "last week") to absolute dates so they remain interpretable after time passes
 - Deleting contradicted facts — if today's investigation disproves an old memory, fix it at the source
 
-## Phase 4 — Prune and index
+## Phase 4 — Experience & Action Rules Extraction (Self-Learning Loop)
+
+Analyze previous session logs specifically for "Problem -> Tried -> Failed -> Repaired" trajectories:
+- Identify repeated mistakes, build/run failures, or command flags that were corrected.
+- Distill these successful remedial pathways and CLI workflows into dynamic rules.
+- Write/update these Action Rules inside a designated file in the memory directory (e.g., 'rules_and_patterns.md' or a project-specific rules file like 'rules_projectName.md').
+- This file acts as Cove's "reusable muscle memory", ensuring future sessions instantly avoid these pitfalls.
+
+## Phase 5 — Prune and index
 
 Update %s so it stays under %d lines AND under ~25KB. It's an **index**, not a dump — each entry should be one line under ~150 characters: - [Title](file.md) — one-line hook. Never write memory content directly into it.
 
 - Remove pointers to memories that are now stale, wrong, or superseded
 - Demote verbose entries: if an index line is over ~200 chars, it's carrying content that belongs in the topic file — shorten the line, move the detail
-- Add pointers to newly important memories
+- Add pointers to newly important memories and the updated action rules file
 - Resolve contradictions — if two files disagree, fix the wrong one
 
 ---

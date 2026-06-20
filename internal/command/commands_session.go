@@ -182,5 +182,12 @@ func (c *ContextCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			sb.WriteString("\n")
 		}
 	}
+	if pc.RepoMap != "" {
+		sb.WriteString("\n代码大纲地图 (Repo Map):\n")
+		sb.WriteString(pc.RepoMap)
+		if !strings.HasSuffix(pc.RepoMap, "\n") {
+			sb.WriteString("\n")
+		}
+	}
 	return Output{Message: sb.String()}, nil
 }

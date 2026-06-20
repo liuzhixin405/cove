@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/repomap"
 )
 
 type ProjectContext struct {
@@ -19,6 +21,7 @@ type ProjectContext struct {
 	GitMain   string // main/master branch name
 	GitUser   string // git user.name
 	FileTree  string
+	RepoMap   string // AST-based lightweight global schema index
 	Platform  string
 	Shell     string
 	IsGitRepo bool
@@ -32,7 +35,7 @@ func Collect() *ProjectContext {
 	c.Cwd, _ = os.Getwd()
 	c.GitRoot = findGitRoot(c.Cwd)
 
-	// Run git info collection and file tree in parallel
+	// Run git info collection, file tree, and RepoMap in parallel
 	var wg sync.WaitGroup
 	if c.GitRoot != "" {
 		c.IsGitRepo = true
@@ -49,8 +52,22 @@ func Collect() *ProjectContext {
 	wg.Add(1)
 	go func() { defer wg.Done(); treeResult = fileTree(c.Cwd, 3) }()
 
+	// Repo Map generation in parallel
+	var repoMapResult string
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanDir := c.GitRoot
+		if scanDir == "" {
+			scanDir = c.Cwd
+		}
+		gen := repomap.NewGenerator(scanDir)
+		repoMapResult = gen.Generate(50) // Extract top 50 ranked files
+	}()
+
 	wg.Wait()
 	c.FileTree = treeResult
+	c.RepoMap = repoMapResult
 	return c
 }
 

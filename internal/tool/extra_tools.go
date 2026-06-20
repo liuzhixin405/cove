@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,6 +41,17 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		return Result{Data: "Error: query required", IsError: true}, nil
 	}
 
+	// 1. High-fidelity Grounding: Tavily Search API
+	if apiKey := os.Getenv("TAVILY_API_KEY"); apiKey != "" {
+		return t.queryTavily(ctx, apiKey, q)
+	}
+
+	// 2. High-fidelity Grounding: Brave Search API
+	if apiKey := os.Getenv("BRAVE_API_KEY"); apiKey != "" {
+		return t.queryBrave(ctx, apiKey, q)
+	}
+
+	// 3. Zero-config Fallback: DuckDuckGo Scraper
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, webSearchEndpoint+"?q="+urlQueryEscape(q), nil)
 	if err != nil {
 		return Result{Data: "WebSearch error: " + err.Error(), IsError: true}, nil
@@ -63,11 +75,118 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("WebSearch: %s\n", q))
+	sb.WriteString(fmt.Sprintf("WebSearch (DuckDuckGo Fallback): %s\n", q))
 	for i, result := range results {
 		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, result.title, result.url))
 		if result.snippet != "" {
 			sb.WriteString(fmt.Sprintf("\n   %s", result.snippet))
+		}
+		sb.WriteString("\n")
+	}
+	return Result{Data: strings.TrimSpace(sb.String())}, nil
+}
+
+func (t *WebSearchTool) queryTavily(ctx context.Context, apiKey string, query string) (Result, error) {
+	payload := map[string]any{
+		"api_key":     apiKey,
+		"query":       query,
+		"max_results": 5,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return Result{Data: "Tavily JSON marshal error: " + err.Error(), IsError: true}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.tavily.com/search", strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return Result{Data: "Tavily build request error: " + err.Error(), IsError: true}, nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Result{Data: "Tavily API call error: " + err.Error(), IsError: true}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return Result{Data: fmt.Sprintf("Tavily error response (status %d): %s", resp.StatusCode, string(respBody)), IsError: true}, nil
+	}
+
+	var res struct {
+		Results []struct {
+			Title   string  `json:"title"`
+			URL     string  `json:"url"`
+			Content string  `json:"content"`
+			Score   float64 `json:"score"`
+		} `json:"results"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return Result{Data: "Tavily JSON decode error: " + err.Error(), IsError: true}, nil
+	}
+
+	if len(res.Results) == 0 {
+		return Result{Data: fmt.Sprintf("WebSearch (Tavily): %s\nNo results found.", query)}, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("WebSearch (Tavily Grounding): %s\n", query))
+	for i, item := range res.Results {
+		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, item.Title, item.URL))
+		if item.Content != "" {
+			sb.WriteString(fmt.Sprintf("\n   %s", strings.TrimSpace(item.Content)))
+		}
+		sb.WriteString("\n")
+	}
+	return Result{Data: strings.TrimSpace(sb.String())}, nil
+}
+
+func (t *WebSearchTool) queryBrave(ctx context.Context, apiKey string, query string) (Result, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.search.brave.com/res/v1/web/search?q="+urlQueryEscape(query), nil)
+	if err != nil {
+		return Result{Data: "Brave build request error: " + err.Error(), IsError: true}, nil
+	}
+	req.Header.Set("X-Subscription-Token", apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Result{Data: "Brave API call error: " + err.Error(), IsError: true}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return Result{Data: fmt.Sprintf("Brave error response (status %d): %s", resp.StatusCode, string(respBody)), IsError: true}, nil
+	}
+
+	var res struct {
+		Web struct {
+			Results []struct {
+				Title       string `json:"title"`
+				URL         string `json:"url"`
+				Description string `json:"description"`
+			} `json:"results"`
+		} `json:"web"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return Result{Data: "Brave JSON decode error: " + err.Error(), IsError: true}, nil
+	}
+
+	if len(res.Web.Results) == 0 {
+		return Result{Data: fmt.Sprintf("WebSearch (Brave): %s\nNo results found.", query)}, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("WebSearch (Brave Grounding): %s\n", query))
+	for i, item := range res.Web.Results {
+		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, item.Title, item.URL))
+		if item.Description != "" {
+			sb.WriteString(fmt.Sprintf("\n   %s", strings.TrimSpace(item.Description)))
 		}
 		sb.WriteString("\n")
 	}
