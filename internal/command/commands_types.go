@@ -9,6 +9,7 @@ type CostCmd struct{}
 type DiffCmd struct{}
 type MemoryCmd struct{}
 type ResumeCmd struct{}
+type HistoryCmd struct{}
 type McpCmd struct{}
 type PluginCmd struct{}
 type SkillsCmd struct{}
@@ -33,6 +34,7 @@ func NewCostCmd() Command        { return &CostCmd{} }
 func NewDiffCmd() Command        { return &DiffCmd{} }
 func NewMemoryCmd() Command      { return &MemoryCmd{} }
 func NewResumeCmd() Command      { return &ResumeCmd{} }
+func NewHistoryCmd() Command     { return &HistoryCmd{} }
 func NewMcpCmd() Command         { return &McpCmd{} }
 func NewPluginCmd() Command      { return &PluginCmd{} }
 func NewSkillsCmd() Command      { return &SkillsCmd{} }

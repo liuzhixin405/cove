@@ -67,3 +67,61 @@ func (c *ResumeCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	}
 	return Output{Message: fmt.Sprintf("已恢复: %s (%d 条消息, %d tokens)", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)}, nil
 }
+
+func (c *HistoryCmd) Name() string        { return "history" }
+func (c *HistoryCmd) Aliases() []string   { return nil }
+func (c *HistoryCmd) Description() string { return "查看或选回历史会话" }
+func (c *HistoryCmd) Help() string {
+	return "/history - 获取详细的交互式历史会话菜单列表"
+}
+func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
+	if in.SessionStore == nil {
+		return Output{Message: "会话存储不可用"}, nil
+	}
+	records, err := in.SessionStore.List()
+	if err != nil {
+		return Output{}, err
+	}
+	if len(records) == 0 {
+		return Output{Message: "暂无已保存的会话"}, nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("历史记录 (%d 个会话):\n\n", len(records)))
+	limit := 20
+	if len(records) < limit {
+		limit = len(records)
+	}
+	for i, r := range records[:limit] {
+		msgCount := r.MessageCount
+		if msgCount == 0 && len(r.Messages) > 0 {
+			msgCount = len(r.Messages)
+		}
+		title := r.Title
+		if title == "New session" || title == "" {
+			// Use preview from first user message
+			preview := ""
+			for _, m := range r.Messages {
+				if m.Role == "user" && m.Content != "" {
+					content := strings.ReplaceAll(m.Content, "\n", " ")
+					if len(content) > 50 {
+						content = content[:50] + "..."
+					}
+					preview = content
+					break
+				}
+			}
+			if preview != "" {
+				title = preview
+			}
+		}
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("  %d. [%s] %s  (%d 条)\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title, msgCount))
+	}
+	if len(records) > limit {
+		sb.WriteString(fmt.Sprintf("\n  ... 还有 %d 条。使用 Ctrl+R 查看全部。\n", len(records)-limit))
+	}
+	sb.WriteString("\n提示: 在 TUI 界面中使用 Ctrl+R 可唤起选择浮层直接选回历史会话。\n")
+	return Output{Message: sb.String()}, nil
+}

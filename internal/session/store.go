@@ -192,24 +192,35 @@ func isLowSignalHistoryText(s string) bool {
 	if len([]rune(v)) <= 2 {
 		return true
 	}
+	// Pre-clean punctuation and emojis to prevent bypasses like "??" or "!!"
+	v = strings.TrimFunc(v, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r >= 0x4e00)
+	})
+	if v == "" {
+		return true
+	}
+	// Direct exact match noises
 	noise := map[string]bool{
-		"write":        true,
-		"write a file": true,
-		"read":         true,
-		"read file":    true,
-		"grep":         true,
-		"继续":           true,
-		"continue":     true,
-		"你好":           true,
-		"hi":           true,
-		"hello":        true,
-		"?":            true,
-		"list":         true,
-		"ls":           true,
-		"l":            true,
-		"bash":         true,
-		"show":         true,
-		"cat":          true,
+		"write":             true,
+		"write a file":      true,
+		"read":              true,
+		"read file":         true,
+		"grep":              true,
+		"继续":                true,
+		"continue":          true,
+		"你好":                true,
+		"hi":                true,
+		"hello":             true,
+		"?":                 true,
+		"list":              true,
+		"ls":                true,
+		"l":                 true,
+		"bash":              true,
+		"show":              true,
+		"cat":               true,
+		"run slow tool":     true,
+		"do something":      true,
+		"do something slow": true,
 	}
 	if noise[v] {
 		return true
@@ -217,10 +228,12 @@ func isLowSignalHistoryText(s string) bool {
 	if strings.HasPrefix(v, "/") {
 		return true
 	}
-	// Filter out command line tools
+	// Filter out command line tools & exact low-value verbs
 	fields := strings.Fields(v)
 	if len(fields) > 0 {
 		first := fields[0]
+
+		// If the title starts with a common tool verb, discard it
 		commonTools := map[string]bool{
 			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
 			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
@@ -228,6 +241,8 @@ func isLowSignalHistoryText(s string) bool {
 			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
 			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
 			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
+			"run": true, "do": true, "exec": true, "execute": true, "test": true,
+			"write": true, "read": true,
 		}
 		if commonTools[first] {
 			return true

@@ -78,6 +78,7 @@ func registerAllCommands() *command.Registry {
 	r.Register(command.NewCostCmd())
 	r.Register(command.NewMemoryCmd())
 	r.Register(command.NewResumeCmd())
+	r.Register(command.NewHistoryCmd())
 	r.Register(command.NewExportCmd())
 	r.Register(command.NewSystemCmd())
 	r.Register(command.NewStatusCmd())

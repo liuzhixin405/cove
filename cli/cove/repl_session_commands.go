@@ -21,6 +21,8 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 		withInterrupt(func(ctx context.Context) { handleResume(ctx, sessionID, eng) })
 		return true
 	case input == "/history":
+		// Display the history list and set pick-pending state so the next numeric
+		// input is treated as a session selection by the main loop.
 		handleHistory(eng)
 		*historyPickPending = true
 		return true

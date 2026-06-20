@@ -251,9 +251,13 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		})
 		items := make([]tui.HistoryItem, 0, len(recs))
 		for _, r := range recs {
+			title := r.Title
+			if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+				title = sessionPreview(r)
+			}
 			items = append(items, tui.HistoryItem{
 				ID:       r.ID,
-				Title:    r.Title,
+				Title:    title,
 				Subtitle: fmt.Sprintf("%s · %d 条", r.UpdatedAt.Format("01-02 15:04"), r.MessageCount),
 			})
 		}
@@ -367,6 +371,12 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 					app.EngineLine("\n[错误] " + err.Error() + "\n")
 				}
 			}
+
+			// Auto save session at the end of each turn in TUI mode as well!
+			if eng.HasMessages() {
+				eng.SaveSession()
+			}
+
 			app.EndStream()
 			app.ClearActivity()
 
