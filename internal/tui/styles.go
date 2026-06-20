@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	accent = lipgloss.Color("69")  // soft blue
+	accent = lipgloss.Color("14")  // ANSI Bright Cyan (Maps exactly to \x1b[96m, which is the exact color of the Cove Logo)
 	subtle = lipgloss.Color("240") // grey
 	good   = lipgloss.Color("70")  // green
 	warn   = lipgloss.Color("214") // amber
@@ -35,8 +35,8 @@ var (
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(accent)
 
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("231")).
-			Background(accent).
+			Foreground(lipgloss.Color("232")). // Muted dark text for superb contrast on light cyan bar
+			Background(accent).                // Soft Cyan palette (matching BrightCyan logo)
 			Bold(true)
 
 	btnAllowStyle = lipgloss.NewStyle().
@@ -60,17 +60,25 @@ func (m *Model) renderStatusBar() string {
 	if model == "" {
 		model = "?"
 	}
-	left := " cove · " + model
+
+	// Create centered content
+	ver := m.status.Version
+	if ver == "" {
+		ver = "5.0.0" // fallback
+	}
+
+	centerParts := []string{"cove v" + ver, model}
 	if m.status.Provider != "" {
-		left += " · " + m.status.Provider
+		centerParts = append(centerParts, m.status.Provider)
 	}
 	if m.status.Git != "" {
-		left += "   " + m.status.Git
+		centerParts = append(centerParts, m.status.Git)
 	}
 	if m.status.PermMode != "" {
-		left += "   ⏵ " + m.status.PermMode
+		centerParts = append(centerParts, "⏵ "+m.status.PermMode)
 	}
-	left += " "
+
+	centerText := " " + strings.Join(centerParts, " · ") + " "
 
 	state := "就绪"
 	if m.task.Running {
@@ -79,12 +87,46 @@ func (m *Model) renderStatusBar() string {
 	right := " " + state + " "
 
 	w := m.width
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 0 {
-		gap = 0
-		right = ""
+
+	// Determine how much space is left
+	contentLen := lipgloss.Width(centerText)
+	rightLen := lipgloss.Width(right)
+
+	var bar string
+	if w <= contentLen+rightLen {
+		// Terminal too narrow, just render centerText
+		bar = centerText
+		if len(bar) > w {
+			bar = bar[:w]
+		}
+	} else {
+		// Center alignment calculation
+		// We want centerText to be exactly centered in total width w.
+		// Total left padding for centerText = (w - contentLen) / 2.
+		// Then we place 'right' at the far right.
+		leftPad := (w - contentLen) / 2
+		if leftPad < 0 {
+			leftPad = 0
+		}
+
+		rightStart := w - rightLen
+		if leftPad+contentLen > rightStart {
+			// Offset if overlap with right state
+			leftPad = rightStart - contentLen
+			if leftPad < 0 {
+				leftPad = 0
+			}
+		}
+
+		leftSpaces := strings.Repeat(" ", leftPad)
+		middleAndLeft := leftSpaces + centerText
+		rightPad := w - len(middleAndLeft) - rightLen
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		bar = middleAndLeft + strings.Repeat(" ", rightPad) + right
 	}
-	bar := left + strings.Repeat(" ", gap) + right
+
 	return statusBarStyle.Width(w).Render(bar)
 }
 
@@ -265,6 +307,47 @@ func (m *Model) renderPermission(height int) string {
 
 	content := b.String() + "\n" + buttonsLine
 	return overlayBoxStyle.Width(m.width - 2).MaxHeight(height).Render(content)
+}
+
+func (m *Model) renderGitPanel() string {
+	status := strings.TrimSpace(m.status.GitStatus)
+	if status == "" || status == "(clean)" {
+		return ""
+	}
+
+	lines := strings.Split(status, "\n")
+	var files []string
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed != "" {
+			files = append(files, trimmed)
+		}
+	}
+	if len(files) == 0 {
+		return ""
+	}
+
+	w := m.width
+	branchInfo := ""
+	if m.status.Git != "" {
+		// Strip possible trailing dirty star to get clean branch name
+		branchInfo = " [" + strings.TrimSuffix(m.status.Git, "*") + "]"
+	}
+
+	if !m.gitExpanded {
+		text := fmt.Sprintf("  ▸ 工作区%s有 %d 个文件变更 (按 Ctrl+G 或点击此处展开变动详情)", branchInfo, len(files))
+		return lipgloss.NewStyle().Foreground(warn).Bold(true).Width(w).Render(text)
+	}
+
+	var sb strings.Builder
+	header := fmt.Sprintf("  ▾ 工作区%s变动文件列表 (共 %d 个，按 Ctrl+G 或点击此处折叠隐藏)：", branchInfo, len(files))
+	sb.WriteString(lipgloss.NewStyle().Foreground(warn).Bold(true).Render(header) + "\n")
+
+	for _, f := range files {
+		sb.WriteString("    " + lipgloss.NewStyle().Foreground(subtle).Render(f) + "\n")
+	}
+
+	return strings.TrimSuffix(sb.String(), "\n")
 }
 
 func truncate(s string, max int) string {

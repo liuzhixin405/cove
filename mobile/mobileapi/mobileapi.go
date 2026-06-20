@@ -40,12 +40,12 @@ type ToolDef struct {
 
 // ChatRequest is the request to the chat API
 type ChatRequest struct {
-	Model      string      `json:"model"`
-	Messages   []Message   `json:"messages"`
-	SystemBase string      `json:"-"`
-	System     string      `json:"-"`
-	Tools      []ToolDef   `json:"tools,omitempty"`
-	MaxTokens  int         `json:"max_tokens,omitempty"`
+	Model      string    `json:"model"`
+	Messages   []Message `json:"messages"`
+	SystemBase string    `json:"-"`
+	System     string    `json:"-"`
+	Tools      []ToolDef `json:"tools,omitempty"`
+	MaxTokens  int       `json:"max_tokens,omitempty"`
 }
 
 // StreamEvent is a streaming response event
@@ -159,16 +159,16 @@ type oaiToolCallFunction struct {
 }
 
 type oaiToolCall struct {
-	Index    int                `json:"index"`
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
+	Index    int                 `json:"index"`
+	ID       string              `json:"id"`
+	Type     string              `json:"type"`
 	Function oaiToolCallFunction `json:"function"`
 }
 
 type oaiResponseChoice struct {
-	Index        int           `json:"index"`
-	Message      oaiRespMsg    `json:"message"`
-	FinishReason string        `json:"finish_reason"`
+	Index        int        `json:"index"`
+	Message      oaiRespMsg `json:"message"`
+	FinishReason string     `json:"finish_reason"`
 }
 
 type oaiRespMsg struct {

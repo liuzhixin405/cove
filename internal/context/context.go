@@ -13,6 +13,7 @@ import (
 )
 
 type ProjectContext struct {
+	mu        sync.RWMutex
 	Cwd       string
 	GitBranch string
 	GitRoot   string
@@ -24,7 +25,29 @@ type ProjectContext struct {
 	RepoMap   string // AST-based lightweight global schema index
 	Platform  string
 	Shell     string
-	IsGitRepo bool
+	IsGitRepo bool // 是否在 git 仓库内
+}
+
+func (c *ProjectContext) RefreshGit() {
+	if c == nil || !c.IsGitRepo || c.GitRoot == "" {
+		return
+	}
+	branch := gitBranch(c.GitRoot)
+	status := gitStatus(c.GitRoot)
+
+	c.mu.Lock()
+	c.GitBranch = branch
+	c.GitStatus = status
+	c.mu.Unlock()
+}
+
+func (c *ProjectContext) GetGitInfo() (branch string, status string) {
+	if c == nil {
+		return "", ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.GitBranch, c.GitStatus
 }
 
 func Collect() *ProjectContext {

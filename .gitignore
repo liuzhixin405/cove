@@ -43,3 +43,6 @@ coverage.txt
 
 
 NUL
+
+# Documentation
+*.md

@@ -237,7 +237,7 @@ func main() {
 
 	runStartupDiagnostics(cfg, debugMode)
 
-	bannerText := repl.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, projCtx.GitStatus, len(eng.Registry().All()), projCtx.IsGitRepo)
+	bannerText := repl.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, "", len(eng.Registry().All()), projCtx.IsGitRepo)
 
 	if dumpPrompt {
 
@@ -303,7 +303,7 @@ func main() {
 			return msg
 		}
 
-		runTUI(bannerText, debugMode, eng, cfg, projCtx, permMgr, tuiCommands, runCommand)
+		runTUI(Version, bannerText, debugMode, eng, cfg, projCtx, permMgr, tuiCommands, runCommand)
 
 		return
 
@@ -315,7 +315,7 @@ func main() {
 
 func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext, pm *permission.Manager, eng *engine.Engine) {
 
-	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, pc.GitStatus, len(eng.Registry().All()), pc.IsGitRepo))
+	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, "", len(eng.Registry().All()), pc.IsGitRepo))
 
 }
 

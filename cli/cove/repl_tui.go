@@ -84,17 +84,10 @@ func (q *tuiJobQueue) pop() (cur string, rest []string, ok bool) {
 // commands is the static catalog shown in the palette; runCommand executes a
 // "/name args" line and returns its rendered output (run on the task worker so
 // commands stay serialized with engine turns and never race shared state).
-func runTUI(bannerText string, debugMode bool, eng *engine.Engine, cfg *config.Config, projCtx *ctxt.ProjectContext, permMgr *permission.Manager, commands []tui.CommandItem, runCommand func(string) string) {
+func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.Engine, cfg *config.Config, projCtx *ctxt.ProjectContext, permMgr *permission.Manager, commands []tui.CommandItem, runCommand func(string) string) {
 	modelName := cfg.Model
 	provider := eng.ProviderName()
 
-	git := ""
-	if projCtx != nil && projCtx.IsGitRepo {
-		git = projCtx.GitBranch
-		if strings.TrimSpace(projCtx.GitStatus) != "" {
-			git += "*"
-		}
-	}
 	permMode := ""
 	if permMgr != nil {
 		permMode = string(permMgr.Mode())
@@ -102,13 +95,27 @@ func runTUI(bannerText string, debugMode bool, eng *engine.Engine, cfg *config.C
 
 	// makeStatus snapshots current usage from the cost tracker for the bars.
 	makeStatus := func(elapsed string) tui.StatusInfo {
+		displayGit := ""
+		gitStatusStr := ""
+		if projCtx != nil && projCtx.IsGitRepo {
+			projCtx.RefreshGit()
+			branch, status := projCtx.GetGitInfo()
+			displayGit = branch
+			gitStatusStr = status
+			if strings.TrimSpace(status) != "" && strings.TrimSpace(status) != "(clean)" {
+				displayGit += "*"
+			}
+		}
+
 		s := tui.StatusInfo{
-			Model:    modelName,
-			Provider: provider,
-			Git:      git,
-			PermMode: permMode,
-			Budget:   cfg.MaxBudgetUsd,
-			Elapsed:  elapsed,
+			Version:   appVersion,
+			Model:     modelName,
+			Provider:  provider,
+			Git:       displayGit,
+			GitStatus: gitStatusStr,
+			PermMode:  permMode,
+			Budget:    cfg.MaxBudgetUsd,
+			Elapsed:   elapsed,
 		}
 		if ct := eng.CostTracker(); ct != nil {
 			s.TokensIn = ct.TotalInput
@@ -221,6 +228,16 @@ func runTUI(bannerText string, debugMode bool, eng *engine.Engine, cfg *config.C
 
 	// Seed the status bars (Send blocks until the program starts consuming).
 	go func() { app.SetStatus(makeStatus("")) }()
+
+	// Background ticker to periodically refresh git status so manual edits
+	// made outside Cove are automatically picked up and dynamically shown in the UI.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			app.SetStatus(makeStatus(""))
+		}
+	}()
 
 	// Load recent sessions into the history overlay. Send blocks until the
 	// program starts consuming, so this runs in its own goroutine before Run().

@@ -189,35 +189,8 @@ func runStartupDiagnostics(cfg *config.Config, debugMode bool) {
 // issues, last-run problems) as a string so both the classic REPL (printed to
 // stderr) and the full-screen TUI (seeded into the transcript) can show them.
 func startupDiagnosticsText(cfg *config.Config, debugMode bool) string {
-	var b strings.Builder
 	if issues := diagnostic.QuickCheck(cfg); len(issues) > 0 {
-		fmt.Fprintf(&b, "\n\x1b[33m? 启动时检测到可能的问题：\x1b[0m\n")
-		for _, issue := range issues {
-			fmt.Fprintf(&b, "  %s\n", issue.Format())
-		}
-		fmt.Fprintf(&b, "  \x1b[2m运行 /diagnose 获取完整报告\x1b[0m\n\n")
+		return "\n  \x1b[90m⚠️  系统检测到潜在环境或配置异常，建议输入 \x1b[36m/diagnose\x1b[90m 查看并进行一键修复。\x1b[0m\n"
 	}
-
-	if scan := diagnostic.ScanRuntimeLogOnStartup(); (debugMode || cfg.Debug) && scan.HasProblems() {
-		const reset = "\x1b[0m"
-		fmt.Fprintf(&b, "\n\x1b[33m⚠ 上次运行记录到 %d 条问题（最早 %s），建议修复：\x1b[0m\n",
-			scan.Total, scan.Since.Format("01-02 15:04"))
-		shown := 0
-		for _, s := range scan.Summaries {
-			if shown >= 5 {
-				break
-			}
-			count := ""
-			if s.Count > 1 {
-				count = fmt.Sprintf(" ×%d", s.Count)
-			}
-			fmt.Fprintf(&b, "  %s%s%s %s%s\n", s.Severity.Color(), s.Severity.String(), reset, s.Message, count)
-			if s.Recovery != "" {
-				fmt.Fprintf(&b, "    \x1b[2m%s\x1b[0m\n", s.Recovery)
-			}
-			shown++
-		}
-		fmt.Fprintf(&b, "  \x1b[2m查看全部: /diagnose errors  修复后归档: /diagnose archive\x1b[0m\n\n")
-	}
-	return b.String()
+	return ""
 }

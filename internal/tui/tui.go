@@ -35,9 +35,11 @@ type TaskInfo struct {
 
 // StatusInfo carries status-bar data shown in the top and bottom bars.
 type StatusInfo struct {
+	Version   string
 	Model     string
 	Provider  string
 	Git       string // e.g. "main*" ("" when not a repo)
+	GitStatus string // raw git status output representing modified files
 	PermMode  string
 	TokensIn  int
 	TokensOut int
@@ -145,6 +147,8 @@ type Model struct {
 	// task/tool is running ("" hides the transient zone entirely).
 	activity string
 
+	gitExpanded bool
+
 	// overlay is the modal layer drawn over the conversation body
 	// (overlayNone when hidden). search/overlayIdx drive it.
 	overlay    int
@@ -201,6 +205,7 @@ func New(modelName string, onSubmit, onResume func(string), onInterrupt func(), 
 		onInterrupt: onInterrupt,
 		curTurn:     -1,
 		streamTurn:  -1,
+		gitExpanded: false,
 	}
 }
 
@@ -318,6 +323,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+r":
 			m.openHistory()
 			return m, nil
+		case "ctrl+g":
+			status := strings.TrimSpace(m.status.GitStatus)
+			if status != "" && status != "(clean)" {
+				m.gitExpanded = !m.gitExpanded
+				m.layout()
+				m.refreshViewport(true)
+			}
+			return m, nil
 		case "/":
 			// "/" on an empty input opens the command palette.
 			if strings.TrimSpace(m.ta.Value()) == "" {
@@ -382,7 +395,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// viewport body starts at screen row 1 (row 0 is the status bar); add the
 		// scroll offset to map the click to a wrapped content row.
 		if m.overlay == overlayNone && msg.Button == tea.MouseLeft {
-			contentRow := (msg.Y - 1) + m.vp.YOffset()
+			gitH := m.gitPanelHeight()
+			if gitH > 0 && msg.Y >= 1 && msg.Y <= gitH {
+				m.gitExpanded = !m.gitExpanded
+				m.layout()
+				m.refreshViewport(true)
+				return m, nil
+			}
+			contentRow := (msg.Y - 1 - gitH) + m.vp.YOffset()
 			if ti, ok := m.clickMap[contentRow]; ok {
 				m.turns[ti].expanded = !m.turns[ti].expanded
 				m.refreshViewport(false)
@@ -449,6 +469,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case statusUpdateMsg:
 		m.status = StatusInfo(msg)
+		m.layout()
+		m.refreshViewport(false)
 	case historyMsg:
 		m.history = []HistoryItem(msg)
 	case permRequestMsg:
@@ -641,6 +663,27 @@ func (m *Model) filteredCommands() []CommandItem {
 	return out
 }
 
+func (m *Model) gitPanelHeight() int {
+	status := strings.TrimSpace(m.status.GitStatus)
+	if status == "" || status == "(clean)" {
+		return 0
+	}
+	if !m.gitExpanded {
+		return 1 // folding line
+	}
+	lines := strings.Split(status, "\n")
+	numFiles := 0
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			numFiles++
+		}
+	}
+	if numFiles == 0 {
+		return 0
+	}
+	return numFiles + 1
+}
+
 // layout recomputes child component sizes from the current terminal size.
 //
 // Layout philosophy: the conversation is the body and spans the full width.
@@ -652,7 +695,8 @@ func (m *Model) layout() {
 	const bottomH = 1    // bottom status line
 	const inputH = 2     // horizontal rule + one input line
 	const transientH = 1 // activity line is always reserved to keep layout stable
-	midH := m.height - statusH - transientH - bottomH - inputH
+	gitH := m.gitPanelHeight()
+	midH := m.height - statusH - transientH - bottomH - inputH - gitH
 	if midH < 3 {
 		midH = 3
 	}
@@ -729,7 +773,12 @@ func (m *Model) View() tea.View {
 	// changes. MaxHeight clamps any residual overflow (e.g. wide glyphs).
 	main := mainAreaStyle.Width(m.width).Height(m.vp.Height()).MaxHeight(m.vp.Height()).Render(m.vp.View())
 
-	v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, main, transient, bottomBar, hr, m.ta.View())
+	gitPanel := m.renderGitPanel()
+	if gitPanel != "" {
+		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, gitPanel, main, transient, bottomBar, hr, m.ta.View())
+	} else {
+		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, main, transient, bottomBar, hr, m.ta.View())
+	}
 	v.Cursor = m.inputCursor()
 	return v
 }
@@ -742,7 +791,8 @@ func (m *Model) inputCursor() *tea.Cursor {
 	if c == nil {
 		return nil
 	}
-	c.Y += m.vp.Height() + 4
+	gitH := m.gitPanelHeight()
+	c.Y += m.vp.Height() + 4 + gitH
 	return c
 }
 

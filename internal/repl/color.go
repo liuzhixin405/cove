@@ -225,13 +225,13 @@ func Banner(version, model, provider, mode, cwd, gitBranch, gitStatus string, to
 	var sb strings.Builder
 
 	sb.WriteString("\n")
-	sb.WriteString(Styled(BrightCyan+Bold, "  ╭─────────────────────────────────────────╮") + "\n")
-	sb.WriteString(fmt.Sprintf("  %s│%s  %s◆ cove%s %-30s%s│%s\n",
-		BrightCyan+Bold, Reset,
-		BrightCyan+Bold, Reset,
-		"v"+version,
-		BrightCyan+Bold, Reset))
-	sb.WriteString(Styled(BrightCyan+Bold, "  ╰─────────────────────────────────────────╯") + "\n")
+	sb.WriteString(Styled(BrightCyan+Bold, "     ______   ____  _    __  ______") + "\n")
+	sb.WriteString(Styled(BrightCyan+Bold, "    / ____/  / __ \\ | |  / / / ____/") + "\n")
+	sb.WriteString(Styled(BrightCyan+Bold, "   / /      / / / / | | / / / __/   ") + "\n")
+	sb.WriteString(Styled(BrightCyan+Bold, "  / /___  / /_/ /  | |/ / / /___   ") + "\n")
+	sb.WriteString(Styled(BrightCyan+Bold, "  \\____/  \\____/   |___/ /_____/   ") + "\n")
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("    %scove v%s%s  •  高效、安全的本地 AI 协同编程终端\n", Bold, version, Reset))
 	sb.WriteString("\n")
 
 	// Info line
@@ -240,8 +240,8 @@ func Banner(version, model, provider, mode, cwd, gitBranch, gitStatus string, to
 	sb.WriteString(fmt.Sprintf("  %s│%s  %s模式:%s %s\n", Dim, Reset, Dim, Reset, mode))
 
 	if isGit {
-		sb.WriteString(fmt.Sprintf("  %sGit:%s %s%s%s %s(%s)%s\n",
-			Dim, Reset, Green, gitBranch, Reset, Dim, gitStatus, Reset))
+		sb.WriteString(fmt.Sprintf("  %sGit:%s %s%s%s\n",
+			Dim, Reset, Green, gitBranch, Reset))
 	}
 	sb.WriteString(fmt.Sprintf("  %s目录:%s %s\n", Dim, Reset, cwd))
 	sb.WriteString(fmt.Sprintf("  %s工具:%s %d 个\n", Dim, Reset, toolCount))

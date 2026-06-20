@@ -15,7 +15,7 @@ import (
 )
 
 // ---------- exported types for gomobile / Kotlin ----------
-
+// ToolDef describes a phone-operation tool available to the AI.
 // ToolDef describes a phone-operation tool available to the AI.
 type ToolDef struct {
 	Name        string
