@@ -1,4 +1,4 @@
-﻿# Session Notes - CovePhone v4.0.5 Release
+# Session Notes - CovePhone v4.0.5 Release
 
 ## Technical Support
 

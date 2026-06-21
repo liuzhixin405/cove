@@ -1,4 +1,4 @@
-﻿# Code of Conduct
+# Code of Conduct
 
 ## 我们的承诺
 

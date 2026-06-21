@@ -1,4 +1,4 @@
-﻿//go:build chromedp
+//go:build chromedp
 
 package main
 
