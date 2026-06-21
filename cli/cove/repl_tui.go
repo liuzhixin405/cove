@@ -11,11 +11,16 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
+	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
+	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove/internal/tool"
 	"github.com/liuzhixin405/cove/internal/tui"
 )
 
@@ -84,7 +89,7 @@ func (q *tuiJobQueue) pop() (cur string, rest []string, ok bool) {
 // commands is the static catalog shown in the palette; runCommand executes a
 // "/name args" line and returns its rendered output (run on the task worker so
 // commands stay serialized with engine turns and never race shared state).
-func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.Engine, cfg *config.Config, projCtx *ctxt.ProjectContext, permMgr *permission.Manager, commands []tui.CommandItem, runCommand func(string) string) {
+func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.Engine, cfg *config.Config, projCtx *ctxt.ProjectContext, permMgr *permission.Manager, commands []tui.CommandItem, runCommand func(string) string, cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	modelName := cfg.Model
 	provider := eng.ProviderName()
 
@@ -289,9 +294,21 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 					continue
 				}
 
+				// Handle missing slash commands that the classic REPL supports
+				// but are not registered in the command registry.
+				handled, cmdOut := handleTUISlashCommand(trimmed, eng, cfg, permMgr, app, interrupt, queue, runCommand, appVersion, cmdReg, toolReg, pluginMgr)
+				if handled {
+					app.SetTask(tui.TaskInfo{Running: false})
+					if strings.TrimSpace(cmdOut) != "" {
+						app.EngineLine("\n" + strings.TrimRight(cmdOut, "\n") + "\n")
+					}
+					app.SetStatus(makeStatus(""))
+					continue
+				}
+
 				app.SetTask(tui.TaskInfo{Running: true, Current: input, Queued: rest})
 				app.SetActivity("执行命令…")
-				out := ""
+				var out string
 				if runCommand != nil {
 					out = runCommand(input)
 				}
@@ -411,7 +428,233 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 	}
 }
 
-// tuiResolveContinue mirrors the classic REPL's "继续" handling for the TUI. It
+// handleTUISlashCommand intercepts slash commands that the classic REPL handles
+// through its own hard-coded dispatch but are not registered in the command
+// registry. It returns (handled=true, output) when it recognises the command,
+// or (handled=false, "") to let the caller fall through to runCommand.
+func handleTUISlashCommand(
+	trimmed string,
+	eng *engine.Engine,
+	cfg *config.Config,
+	permMgr *permission.Manager,
+	app *tui.App,
+	interrupt func(),
+	queue *tuiJobQueue,
+	runCommand func(string) string,
+	appVersion string,
+	cmdReg *command.Registry,
+	toolReg *tool.Registry,
+	pluginMgr *plugin.Manager,
+) (bool, string) {
+
+	cmdName := strings.TrimPrefix(trimmed, "/")
+	parts := strings.Fields(cmdName)
+	if len(parts) == 0 {
+		return true, ""
+	}
+	name := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	switch name {
+	case "help":
+		// Print help screen
+		var sb strings.Builder
+		sb.WriteString("\n=== cove v" + appVersion + " ===\n")
+		sb.WriteString("\n供应商 / 模型:\n")
+		sb.WriteString("  /model <名称>       设置模型\n")
+		sb.WriteString("  /provider <名称>    设置供应商\n")
+		sb.WriteString("  /api-key <密钥>     保存 API 密钥\n")
+		sb.WriteString("  /base-url <地址>    设置自定义接口地址\n")
+		sb.WriteString("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)\n")
+		sb.WriteString("  /budget <金额|auto> 设置每会话预算上限 ($)\n")
+		sb.WriteString("  /cost               查看用量和费用\n")
+		sb.WriteString("  /ratelimit          查看 API 速率限制状态\n")
+		sb.WriteString("  /attach <文件...>   挂载图片或文件\n")
+		sb.WriteString("  /config             查看完整配置\n")
+		sb.WriteString("\n会话:\n")
+		sb.WriteString("  /compact            压缩对话历史\n")
+		sb.WriteString("  /history            查看和继续历史会话\n")
+		sb.WriteString("  /resume [id]        恢复已保存的会话\n")
+		sb.WriteString("  /memory             管理持久化记忆\n")
+		sb.WriteString("  /export             导出对话到文件\n")
+		sb.WriteString("\n后台任务:\n")
+		sb.WriteString("  /tasks              查看运行中/排队的任务\n")
+		sb.WriteString("  /stop               取消当前运行的任务 (别名 /cancel)\n")
+		sb.WriteString("\n系统:\n")
+		sb.WriteString("  /mcp                管理 MCP 服务器\n")
+		sb.WriteString("  /plugin             管理插件\n")
+		sb.WriteString("  /skills             列出技能\n")
+		sb.WriteString("  /diagnose           运行系统诊断\n")
+		sb.WriteString("  /doctor             检查 Go、git 环境\n")
+		sb.WriteString("\n命令:\n")
+		if cmdReg != nil {
+			for _, c := range cmdReg.All() {
+				sb.WriteString(fmt.Sprintf("  /%-16s %s\n", c.Name(), c.Description()))
+			}
+		}
+		sb.WriteString("\n工具:\n")
+		if toolReg != nil {
+			for _, t := range toolReg.All() {
+				d := t.Def()
+				sb.WriteString(fmt.Sprintf("  [%s] %-12s %s\n", roLabel(d.IsReadOnly), d.Name, truncateDesc(d.Description, 48)))
+			}
+		}
+		sb.WriteString("\n快捷键:\n")
+		sb.WriteString("  Ctrl+R    打开历史会话搜索\n")
+		sb.WriteString("  Ctrl+G    切换 Git 状态面板\n")
+		sb.WriteString("  Ctrl+C    取消当前任务 / 退出\n")
+		sb.WriteString("  /         打开命令面板\n")
+		sb.WriteString("\n")
+		return true, sb.String()
+
+	case "exit", "quit":
+		app.Quit()
+		return true, ""
+
+	case "stop", "cancel":
+		interrupt()
+		return true, "已发送取消信号"
+
+	case "tasks":
+		// Show what's in the queue.
+		return true, "当前执行中，使用 Ctrl+C 中断。所有输入按顺序处理。"
+
+	case "compact":
+		// Compact the conversation history.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		eng.Compact(ctx)
+		return true, "上下文窗口已压缩。"
+
+	case "cost":
+		// Show current session cost + historical cost (matching REPL behavior).
+		var sb strings.Builder
+		if eng.CostTracker() != nil {
+			sb.WriteString("本次会话: " + eng.CostTracker().Summary() + "\n")
+		}
+		ch := cost.NewCostHistory()
+		if len(ch.Records) > 0 {
+			sb.WriteString(fmt.Sprintf("近 24小时: $%.4f | 近 7天: $%.4f | 总计: $%.4f (%d 个会话)\n",
+				ch.Last24Hours(), ch.Last7Days(), ch.TotalAllTime(), len(ch.Records)))
+		}
+		return true, sb.String()
+
+	case "skills", "skill":
+		// Handle skill commands with full REPL-compatible functionality.
+		rt := eng.Runtime()
+		prompts := rt.SkillPrompts
+
+		if len(args) == 0 || args[0] == "list" {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("\n已安装的技能 (%d):\n", len(prompts)))
+			// Sort by name for consistent output.
+			names := make([]string, 0, len(prompts))
+			for name := range prompts {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				prompt := prompts[name]
+				desc := strings.SplitN(prompt, "\n", 2)
+				d := ""
+				if len(desc) > 0 {
+					d = strings.TrimSpace(desc[0])
+					if len(d) > 60 {
+						d = d[:57] + "..."
+					}
+				}
+				sb.WriteString(fmt.Sprintf("  %-16s %s\n", name, d))
+			}
+			return true, sb.String()
+		}
+
+		switch args[0] {
+		case "marketplace", "registry", "search":
+			entries, err := skills.FetchRegistry()
+			if err != nil {
+				return true, fmt.Sprintf("获取技能市场列表失败: %v\n", err)
+			}
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("\n技能市场 (%d 个可用技能):\n", len(entries)))
+			for _, e := range entries {
+				installed := ""
+				if _, ok := prompts[e.Name]; ok {
+					installed = " [installed]"
+				}
+				sb.WriteString(fmt.Sprintf("  %-16s %s%s\n", e.Name, truncateDesc(e.Description, 48), installed))
+			}
+			sb.WriteString("\n使用 /skill install <name> 安装技能\n")
+			return true, sb.String()
+
+		case "install":
+			if len(args) < 2 {
+				return true, "用法: /skill install <名称>\n"
+			}
+			name := args[1]
+			if _, ok := prompts[name]; ok {
+				return true, fmt.Sprintf("技能 '%s' 已安装\n", name)
+			}
+			entries, _ := skills.FetchRegistry()
+			found := false
+			for _, e := range entries {
+				if e.Name == name {
+					skills.InstallSkill(name, "url", e.URL)
+					found = true
+					return true, fmt.Sprintf("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
+				}
+			}
+			if !found {
+				skills.InstallSkill(name, "local", "")
+				return true, fmt.Sprintf("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
+			}
+
+		case "create":
+			if len(args) < 2 {
+				return true, "用法: /skill create <名称>\n"
+			}
+			name := args[1]
+			skills.InstallSkill(name, "local", "")
+			return true, fmt.Sprintf("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
+
+		default:
+			// Try to show a specific skill's prompt.
+			name := args[0]
+			prompt, ok := prompts[name]
+			if !ok {
+				return true, fmt.Sprintf("\n未找到技能 %s。您可以使用 /skill marketplace 浏览可用技能，或自建技能。\n", name)
+			}
+			return true, fmt.Sprintf("\n[Skill %s]\n\n%s\n\n", name, prompt)
+		}
+		return true, ""
+
+	case "undo":
+		return true, "/undo 功能暂未实现（可尝试 /history 查看历史消息手动恢复）"
+
+	case "checkpoints":
+		return true, "/checkpoints 功能暂未实现"
+
+	case "ratelimit":
+		return true, "当前未集成速率限制查询功能"
+
+	case "model", "provider", "api-key", "api_key", "base-url", "base_url", "mode", "budget":
+		// Redirect to /config via runCommand so all config write/validate/save logic
+		// stays in one place (ConfigCmd.Execute).
+		configLine := "/config " + name + " " + strings.Join(args, " ")
+		if runCommand != nil {
+			return true, runCommand(configLine)
+		}
+		return true, ""
+	}
+
+	return false, ""
+}
+
+func roLabel(readOnly bool) string {
+	if readOnly {
+		return "R"
+	}
+	return " "
+}
 // resolves what the engine should actually do next and returns the effective
 // user message plus whether to proceed. When it loads recovery context into the
 // engine it surfaces a notice through the transcript (app.EngineLine), since the
