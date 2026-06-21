@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/x/term"
@@ -58,6 +59,14 @@ func newTUIJobQueue() *tuiJobQueue {
 func (q *tuiJobQueue) push(s string) {
 	q.mu.Lock()
 	q.items = append(q.items, s)
+	q.mu.Unlock()
+	q.cond.Signal()
+}
+
+// pushFront inserts at the front of the queue (for interrupt + immediate retry).
+func (q *tuiJobQueue) pushFront(s string) {
+	q.mu.Lock()
+	q.items = append([]string{s}, q.items...)
 	q.mu.Unlock()
 	q.cond.Signal()
 }
@@ -131,6 +140,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 	}
 
 	queue := newTUIJobQueue()
+	var running atomic.Bool
 
 	// cancelCurrent cancels the context of the in-flight engine task. It is set
 	// by the worker before each run and invoked by the Ctrl+C handler so an
@@ -155,6 +165,13 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 
 	var app *tui.App
 	app = tui.NewApp(modelName, func(input string) {
+		if running.Load() {
+			// Agent is busy — interrupt current task and re-queue the new input
+			// at the front so it runs immediately (matches Hermes interrupt pattern).
+			interrupt()
+			queue.pushFront(input)
+			return
+		}
 		queue.push(input)
 	}, func(id string) {
 		// Restore a past session picked from the history overlay in TUI mode.
@@ -371,6 +388,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			eng.OnEngineOutput = func(line string) { app.EngineLine(line) }
 
 			app.BeginStream("")
+			running.Store(true)
 			ctx, cancel := context.WithCancel(context.Background())
 			setCancel(cancel)
 			_, err = eng.RunMessageWithStream(
@@ -381,6 +399,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			)
 			cancel()
 			setCancel(nil)
+			running.Store(false)
 			if err != nil {
 				if ctx.Err() != nil {
 					app.EngineLine("\n[已取消] 当前任务已终止\n")

@@ -73,6 +73,8 @@ type Engine struct {
 	runtime               *tool.Runtime
 	fileHistory           map[string]bool
 	fileMu                sync.Mutex
+	steerMu               sync.Mutex
+	pendingSteer          string
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
 	lastSaveTime          time.Time
@@ -335,6 +337,31 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Content: userMessage}, onDelta, nil)
 }
 
+// Steer injects user guidance into the running agent loop without interrupting.
+// Thread-safe: callable from UI goroutine while RunMessageWithStream is blocking.
+// The text is appended to the last tool result before the next LLM call, so the
+// model sees the guidance at its next iteration.
+func (e *Engine) Steer(text string) {
+	if text == "" {
+		return
+	}
+	e.steerMu.Lock()
+	defer e.steerMu.Unlock()
+	if e.pendingSteer != "" {
+		e.pendingSteer += "\n" + text
+	} else {
+		e.pendingSteer = text
+	}
+}
+
+func (e *Engine) drainPendingSteer() string {
+	e.steerMu.Lock()
+	defer e.steerMu.Unlock()
+	s := e.pendingSteer
+	e.pendingSteer = ""
+	return s
+}
+
 func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string), onReasoning func(reasoning string)) (string, error) {
 	if e.costTracker.OverBudget() {
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
@@ -368,11 +395,31 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
 		if ctx.Err() != nil {
 			e.messages = prevMessages
+			e.drainPendingSteer() // discard pending steer on cancel
 			e.saveSession()
 			return "", ctx.Err()
 		}
 		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
 			iter, len(e.messages), e.totalTokens, len(toolDefs), e.config.Model, e.costTracker.Summary())
+
+		// Drain pending steer: inject user guidance into the last tool message
+		// so the model sees it on this iteration (matches Hermes /steer pattern).
+		// If no tool message exists yet, put the steer back so the next
+		// iteration (after tool execution) can inject it.
+		if steer := e.drainPendingSteer(); steer != "" {
+			injected := false
+			for si := len(e.messages) - 1; si >= 0; si-- {
+				if e.messages[si].Role == "tool" {
+					e.messages[si].Content += "\n\n[用户指引] " + steer
+					injected = true
+					break
+				}
+			}
+			if !injected {
+				// No tool message yet — put it back
+				e.Steer(steer)
+			}
+		}
 
 		// Apply prompt cache breakpoints for Anthropic
 		reqMessages := e.messages
@@ -577,6 +624,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 	}
 
+	e.drainPendingSteer() // discard pending steer on max iterations
 	return "", fmt.Errorf("max iterations (%d) reached, cost: %s", MaxIterations, e.costTracker.Summary())
 }
 

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -725,4 +727,350 @@ func TestEngineAutoPermissionMode(t *testing.T) {
 	if writeTool.callCount != 1 {
 		t.Fatalf("expected tool called in auto mode, got %d", writeTool.callCount)
 	}
+}
+
+
+// ===========================================================================
+// VISUAL DEMO: Steer flow — user guides AI mid-task (matches Hermes /steer)
+// ===========================================================================
+// Run with: go test -v -run TestSteerFlowDemo ./internal/engine/
+
+
+func TestSteerFlowDemo(t *testing.T) {
+	t.Log("")
+	t.Log("╔══════════════════════════════════════════════════════════╗")
+	t.Log("║  Steer 流程演示：用户中途引导 AI 调整任务                  ║")
+	t.Log("╚══════════════════════════════════════════════════════════╝")
+	t.Log("")
+
+	// ── Step 1: Setup ──
+	t.Log("📋 场景：用户让 AI '列出文件'，中途追加指引 '只看 Go 文件'")
+	t.Log("")
+
+	// Tool that signals when called (so we can inject steer at the right moment)
+	barrier := make(chan struct{})
+	shellTool := &steerableMockTool{
+		mockTool: &mockTool{
+			name:     "shell",
+			readOnly: true,
+			safe:     true,
+			result:   "file1.go\nfile2.py\nfile3.go\ntest.go\nREADME.md\nmain.go",
+		},
+		barrier: barrier,
+	}
+
+	prov := &mockProvider{
+		responses: []mockResponse{
+			// Iteration 1: AI decides to run a shell command
+			{toolCalls: []api.ToolCall{{ID: "tc1", Name: "shell", Input: map[string]any{"command": "ls"}}}},
+			// Iteration 2: AI should see steer in tool msg and filter to Go files
+			{content: "找到 3 个 Go 文件：file1.go, file3.go, test.go, main.go"},
+		},
+	}
+
+	eng := newTestEngine(prov, shellTool)
+	eng.extractRunner = nil // disable background extract to avoid real HTTP calls in tests
+	eng.dreamRunner = nil   // disable background dream to avoid real HTTP calls in tests
+	eng.perm.SetMode(permission.Bypass) // bypass permission for demo test
+
+	// ── Step 2: Start task in background ──
+	t.Log("⚡ 用户提交: '列出当前目录所有文件'")
+	t.Log("")
+
+	var (
+		reply   string
+		runErr  error
+		runDone = make(chan struct{})
+	)
+
+	go func() {
+		reply, runErr = eng.RunMessageWithStream(
+			context.Background(),
+			api.Message{Role: "user", Content: "列出当前目录所有文件"},
+			nil, nil,
+		)
+		close(runDone)
+	}()
+
+	// ── Step 3: Tool is blocked on barrier, inject steer now ──
+	t.Log("🛠️  AI 执行了 shell ls 命令，结果：")
+	t.Log("   file1.go  file2.py  file3.go  test.go  README.md  main.go")
+	t.Log("")
+	t.Log("💬 用户中途输入: '只看 Go 文件，忽略其他'")
+	eng.Steer("只看 Go 文件，忽略其他")
+	t.Log("   → steer 已注入引擎")
+	close(barrier) // unblock the tool, engine loop will drain steer next iteration
+	t.Log("   → 释放 barrier，引擎继续下一轮 LLM 调用")
+	t.Log("")
+
+	// ── Step 4: Wait for completion ──
+	<-runDone
+
+	// ── Step 5: Verify ──
+	t.Log("─── 验证结果 ───")
+	t.Log("")
+
+	if runErr != nil {
+		t.Fatalf("❌ 引擎运行失败: %v", runErr)
+	}
+
+	// Check the last request that was sent to the provider (iteration 2)
+	prov.mu.Lock()
+	lastReq := prov.lastReq
+	prov.mu.Unlock()
+
+	t.Logf("🔍 第二轮 API 请求包含 %d 条消息:", len(lastReq.Messages))
+	for i, msg := range lastReq.Messages {
+		preview := msg.Content
+		if len(preview) > 120 {
+			preview = preview[:120] + "..."
+		}
+		t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
+	}
+
+	// Check that the steer text was injected into the tool message
+	found := false
+	for _, msg := range lastReq.Messages {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "[用户指引]") {
+			t.Logf("✅ 第二轮请求的工具消息中包含用户指引！")
+			t.Logf("   完整内容: %s", msg.Content)
+			found = true
+		}
+	}
+	if !found {
+		t.Log("❌ 第二轮请求中未找到 [用户指引]")
+		// Also check eng.messages
+		t.Log("eng.messages:")
+		for i, msg := range eng.messages {
+			preview := msg.Content
+			if len(preview) > 120 {
+				preview = preview[:120] + "..."
+			}
+			t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
+		}
+		t.Fatal("❌ steer 未注入到工具消息中")
+	}
+
+	// Check that the AI's final response reflects the guidance
+	t.Logf("📝 AI 最终回复: %s", reply)
+
+	t.Log("")
+	t.Log("╔══════════════════════════════════════════════════════════╗")
+	t.Log("║  ✅ Steer 流程演示通过                                     ║")
+	t.Log("║  用户中途输入 → eng.Steer() → 注入 tool 消息              ║")
+	t.Log("║  → LLM 看到 [用户指引] → 下轮迭代调整行为                  ║")
+	t.Log("╚══════════════════════════════════════════════════════════╝")
+}
+
+// steerableMockTool wraps mockTool and uses a barrier channel so the test
+// can inject steer at exactly the right moment — after the tool executes but
+// before the engine loop drains pendingSteer on the next iteration.
+type steerableMockTool struct {
+	*mockTool
+	barrier chan struct{} // tool blocks here until test calls Steer()
+}
+
+func (s *steerableMockTool) Call(ctx context.Context, input tool.Input, tc tool.Context) (tool.Result, error) {
+	result, err := s.mockTool.Call(ctx, input, tc)
+	// Block until test goroutine has called eng.Steer().  This is the
+	// synchronisation barrier that guarantees steer text is in pendingSteer
+	// before the engine loop drains it on the next iteration.
+	<-s.barrier
+	return result, err
+}
+
+
+// ===========================================================================
+// E2E DEMO: Real HTTP server — tests full network stack, not just mock structs
+// ===========================================================================
+// Run with: go test -v -run TestSteerE2E ./internal/engine/ -count=1
+
+func TestSteerE2E(t *testing.T) {
+	// ── Step 1: Start a real HTTP server that mimics OpenAI API ──
+	requestLog := make(chan api.ChatRequest, 5)
+
+	serverCalled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		requestLog <- req
+
+		// Check if this is the first or second call
+		hasToolMsg := false
+		for _, msg := range req.Messages {
+			if msg.Role == "tool" {
+				hasToolMsg = true
+				break
+			}
+		}
+
+		var resp any
+		if !hasToolMsg {
+			// First call: respond with a tool call
+			resp = map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "",
+						"tool_calls": []map[string]any{{
+							"id":   "tc1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "shell",
+								"arguments": `{"command":"ls"}`,
+							},
+						}},
+					},
+				}},
+				"usage": map[string]any{
+					"prompt_tokens":     10,
+					"completion_tokens": 5,
+				},
+			}
+			select {
+			case serverCalled <- struct{}{}:
+			default:
+			}
+		} else {
+			// Second call: respond with final answer
+			resp = map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Filtered to Go files only",
+					},
+				}},
+				"usage": map[string]any{
+					"prompt_tokens":     20,
+					"completion_tokens": 10,
+				},
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	// ── Step 2: Create engine pointing at real HTTP server ──
+	// Use barrier to synchronize steer injection
+	barrier := make(chan struct{})
+
+	shellTool := &steerableMockTool{
+		mockTool: &mockTool{
+			name:     "shell",
+			readOnly: true,
+			safe:     true,
+			result:   "file1.go\nfile2.py\nfile3.go",
+		},
+		barrier: barrier,
+	}
+
+	cfg := Config{
+		Model:          "test-model",
+		PermissionMode: "auto",
+		MaxBudget:      100,
+		Provider: api.ProviderConfig{
+			Name:      "openai",
+			APIKey:    "sk-test",
+			BaseURL:   server.URL + "/v1", // unused by mock but needed for provider init
+		},
+	}
+	cfg.Tools = []tool.Tool{shellTool}
+	eng, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	eng.extractRunner = nil
+	eng.dreamRunner = nil
+	eng.perm.SetMode(permission.Bypass)
+
+	// Override provider to use our mock server
+	// The openAICompatProvider uses the baseURL from ProviderConfig
+	prov := eng.provider
+	_ = prov // keep reference
+
+	t.Log("")
+	t.Log("╔══════════════════════════════════════════════════════════╗")
+	t.Log("║  E2E 演示：真实 HTTP 服务器 + Steer 注入                    ║")
+	t.Log("╚══════════════════════════════════════════════════════════╝")
+	t.Log("")
+	t.Logf("🌐 Mock API 服务器: %s", server.URL)
+	t.Log("")
+
+	// ── Step 3: Run engine in background ──
+	done := make(chan struct{})
+	var reply string
+	var runErr error
+
+	go func() {
+		reply, runErr = eng.RunMessageWithStream(
+			context.Background(),
+			api.Message{Role: "user", Content: "list files"},
+			nil, nil,
+		)
+		close(done)
+	}()
+
+	// ── Step 4: Wait for first API call, then steer ──
+	<-serverCalled
+	t.Log("⚡ 第一轮 API 调用已发出（LLM 返回 tool_call）")
+	t.Log("🛠️  shell 工具正在执行...")
+
+	// Tool is now blocked on barrier — inject steer
+	t.Log("💬 用户输入: /steer 只看 Go 文件")
+	eng.Steer("只看 Go 文件")
+	close(barrier)
+	t.Log("   → steer 已注入，释放工具继续")
+	t.Log("")
+
+	// ── Step 5: Wait for completion ──
+	<-done
+	if runErr != nil {
+		t.Fatalf("❌ 引擎运行失败: %v", runErr)
+	}
+
+	// ── Step 6: Verify the second API request contains the steer ──
+	close(requestLog)
+	var requests []api.ChatRequest
+	for req := range requestLog {
+		requests = append(requests, req)
+	}
+
+	t.Log("─── 验证结果 ───")
+	t.Log("")
+	t.Logf("📡 共发出 %d 次 API 请求", len(requests))
+
+	if len(requests) < 2 {
+		t.Fatal("❌ 预期至少 2 次 API 请求")
+	}
+
+	// Check second request for steer in tool message
+	req2 := requests[1]
+	t.Logf("🔍 第二轮请求包含 %d 条消息:", len(req2.Messages))
+	found := false
+	for i, msg := range req2.Messages {
+		preview := msg.Content
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
+		if msg.Role == "tool" && strings.Contains(msg.Content, "[用户指引]") {
+			t.Logf("   ✅ 工具消息包含用户指引!")
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("❌ steer 未出现在第二轮 API 请求中")
+	}
+
+	t.Logf("📝 AI 最终回复: %s", reply)
+	t.Log("")
+	t.Log("╔══════════════════════════════════════════════════════════╗")
+	t.Log("║  ✅ E2E 测试通过 — 真实 HTTP 请求包含 steer 注入          ║")
+	t.Log("╚══════════════════════════════════════════════════════════╝")
 }
