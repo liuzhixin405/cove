@@ -75,14 +75,14 @@ func (m *Model) renderStatusBar() string {
 		centerParts = append(centerParts, m.status.Git)
 	}
 	if m.status.PermMode != "" {
-		centerParts = append(centerParts, "�?"+m.status.PermMode)
+		centerParts = append(centerParts, "⏵ "+m.status.PermMode)
 	}
 
 	centerText := " " + strings.Join(centerParts, " · ") + " "
 
 	state := "就绪"
 	if m.task.Running {
-		state = "运行�?�?
+		state = "运行中 ⚡"
 	}
 	right := " " + state + " "
 
@@ -143,7 +143,7 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+R 历史 · / 命令 · Ctrl+C 退�?"
+	right := "Ctrl+R 历史 · / 命令 · Ctrl+C 退出 "
 
 	w := m.width
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
@@ -169,9 +169,9 @@ func (m *Model) renderTransient() string {
 	left := ""
 	switch {
 	case m.activity != "":
-		left = "�?" + m.activity
+		left = "⚙ " + m.activity
 	case m.task.Running:
-		left = "�?处理中�?
+		left = "⚙ 处理中…"
 	}
 	if m.task.Elapsed != "" && (m.activity != "" || m.task.Running) {
 		left += "  " + m.task.Elapsed
@@ -208,21 +208,21 @@ func (m *Model) renderOverlay(height int) string {
 	var labels []string
 	if m.overlay == overlayCommand {
 		title = "命令面板"
-		hint = "�?�?选择 · Enter 执行 · Esc 关闭"
+		hint = "↑/↓ 选择 · Enter 执行 · Esc 关闭"
 		for _, c := range m.filteredCommands() {
 			label := "/" + c.Name
 			if c.Desc != "" {
-				label += " �?" + c.Desc
+				label += " — " + c.Desc
 			}
 			labels = append(labels, label)
 		}
 	} else {
 		title = "历史会话"
-		hint = "�?�?选择 · Enter 恢复 · Esc 关闭"
+		hint = "↑/↓ 选择 · Enter 恢复 · Esc 关闭"
 		for _, h := range m.filteredHistory() {
 			t := h.Title
 			if t == "" {
-				t = "(未命�?"
+				t = "(未命名)"
 			}
 			labels = append(labels, t)
 		}
@@ -243,7 +243,7 @@ func (m *Model) renderOverlay(height int) string {
 		for i := start; i < len(labels) && i < start+maxRows; i++ {
 			line := truncate(labels[i], innerW-2)
 			if i == m.overlayIdx {
-				b.WriteString(selectedStyle.Render("�?"+line) + "\n")
+				b.WriteString(selectedStyle.Render("▸ "+line) + "\n")
 			} else {
 				b.WriteString("  " + line + "\n")
 			}
@@ -282,7 +282,7 @@ func (m *Model) renderPermission(height int) string {
 		tool = "?"
 	}
 	rows := []string{
-		"工具 " + warnStyle.Render(tool) + " 请求执行�?,
+		"工具 " + warnStyle.Render(tool) + " 请求执行：",
 	}
 	if d := strings.TrimSpace(m.permDesc); d != "" {
 		rows = append(rows, "  "+truncate(d, innerW-2))
@@ -335,12 +335,12 @@ func (m *Model) renderGitPanel() string {
 	}
 
 	if !m.gitExpanded {
-		text := fmt.Sprintf("  �?工作�?s�?%d 个文件变�?(�?Ctrl+G 或点击此处展开变动详情)", branchInfo, len(files))
+		text := fmt.Sprintf("  ▸ 工作区%s有 %d 个文件变更 (按 Ctrl+G 或点击此处展开变动详情)", branchInfo, len(files))
 		return lipgloss.NewStyle().Foreground(warn).Bold(true).Width(w).Render(text)
 	}
 
 	var sb strings.Builder
-	header := fmt.Sprintf("  �?工作�?s变动文件列表 (�?%d 个，�?Ctrl+G 或点击此处折叠隐�?�?, branchInfo, len(files))
+	header := fmt.Sprintf("  ▾ 工作区%s变动文件列表 (共 %d 个，按 Ctrl+G 或点击此处折叠隐藏)：", branchInfo, len(files))
 	sb.WriteString(lipgloss.NewStyle().Foreground(warn).Bold(true).Render(header) + "\n")
 
 	for _, f := range files {
@@ -359,5 +359,5 @@ func truncate(s string, max int) string {
 	if max < 1 {
 		return ""
 	}
-	return string(r[:max-1]) + "�?
+	return string(r[:max-1]) + "…"
 }
