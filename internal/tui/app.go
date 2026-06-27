@@ -52,6 +52,11 @@ func (a *App) EngineLine(s string) { a.program.Send(engineLineMsg(s)) }
 // EndStream marks the end of an assistant response.
 func (a *App) EndStream() { a.program.Send(streamEndMsg{}) }
 
+// EndStreamAlign marks the end of an assistant response and provides the
+// ground-truth final text. If any streaming deltas were dropped by the
+// message channel, the UI model fills the gap to prevent truncation.
+func (a *App) EndStreamAlign(final string) { a.program.Send(streamEndMsg{final: final}) }
+
 // SetTask updates the task-queue sidebar and status bar.
 func (a *App) SetTask(info TaskInfo) { a.program.Send(taskStateMsg(info)) }
 

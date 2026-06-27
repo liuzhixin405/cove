@@ -391,7 +391,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			running.Store(true)
 			ctx, cancel := context.WithCancel(context.Background())
 			setCancel(cancel)
-			_, err = eng.RunMessageWithStream(
+			reply, err := eng.RunMessageWithStream(
 				ctx,
 				userMsg,
 				func(delta string) { app.Delta(delta) },
@@ -413,7 +413,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 				eng.SaveSession()
 			}
 
-			app.EndStream()
+			app.EndStreamAlign(reply)
 			app.ClearActivity()
 
 			app.SetStatus(makeStatus(time.Since(start).Truncate(time.Millisecond).String()))

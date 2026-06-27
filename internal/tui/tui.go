@@ -85,7 +85,7 @@ type (
 	streamDeltaMsg     string
 	streamReasoningMsg string
 	engineLineMsg      string
-	streamEndMsg       struct{}
+	streamEndMsg       struct{ final string }
 	taskStateMsg       TaskInfo
 	statusUpdateMsg    StatusInfo
 	historyMsg         []HistoryItem
@@ -111,8 +111,9 @@ const (
 type turn struct {
 	user      string          // user input ("" for system/assistant-only turns)
 	reasoning strings.Builder // streamed thinking; display/fold only
-	answer    strings.Builder // streamed answer + interleaved engine/tool lines
-	expanded  bool            // user clicked the thinking header open
+	answer       strings.Builder // streamed answer + interleaved engine/tool lines
+	streamedText strings.Builder // ONLY text deltas (no engine lines); used for end-of-stream alignment
+	expanded     bool            // user clicked the thinking header open
 	system    bool            // standalone engine output, not foldable
 }
 
@@ -437,6 +438,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDeltaMsg:
 		if m.streamTurn >= 0 {
 			m.turns[m.streamTurn].answer.WriteString(string(msg))
+			m.turns[m.streamTurn].streamedText.WriteString(string(msg))
 			m.refreshViewport(true)
 		}
 	case streamReasoningMsg:
@@ -448,6 +450,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.streamTurn >= 0:
 			m.turns[m.streamTurn].answer.WriteString(string(msg))
+			m.turns[m.streamTurn].streamedText.WriteString(string(msg))
 			m.refreshViewport(true)
 		case m.curTurn >= 0:
 			m.turns[m.curTurn].answer.WriteString(string(msg))
@@ -457,8 +460,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case streamEndMsg:
 		m.streaming = false
+		turnIdx := m.streamTurn
 		m.streamTurn = -1
 		m.curTurn = -1
+		if msg.final != "" && turnIdx >= 0 && turnIdx < len(m.turns) {
+			streamed := m.turns[turnIdx].streamedText.String()
+			if len(msg.final) > len(streamed) {
+				missing := msg.final[len(streamed):]
+				m.turns[turnIdx].answer.WriteString(missing)
+			}
+		}
 		m.refreshViewport(true)
 	case taskStateMsg:
 		prev := m.transientVisible()
