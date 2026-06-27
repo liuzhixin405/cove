@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,10 @@ type Engine struct {
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
 	lastSaveTime          time.Time
+	currentModel          string     // currently active model (starts as config.Model, may change on fallback)
+	fallbackActive        bool       // true if we have already switched to the fallback model
 	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
+	loopHistory          []string   // recent tool-call fingerprints for loop detection
 	iterCount             int        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex // lock for interactive permission prompts
 	// OnEngineOutput, if set, receives engine diagnostic lines
@@ -421,6 +425,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 		}
 
+		// Compress message history if approaching context limits
+		e.compressHistory()
+
 		// Apply prompt cache breakpoints for Anthropic
 		reqMessages := e.messages
 		if e.provider.Name() == "anthropic" {
@@ -428,7 +435,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		req := api.ChatRequest{
-			Model:      e.config.Model,
+			Model:      e.currentModel,
 			Messages:   reqMessages,
 			SystemBase: sp,
 			Tools:      toolDefs,
@@ -448,7 +455,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 		if useStream {
 			firstDelta := true
-			modelAct := e.beginActivity("调用模型 " + e.config.Model)
+			modelAct := e.beginActivity("调用模型 " + e.currentModel)
 			resp, err = e.provider.ChatStream(ctx, req, func(ev api.StreamEvent) {
 				e.progressActivity(modelAct)
 				if firstDelta && walker != nil {
@@ -465,7 +472,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			})
 			e.endActivity(modelAct)
 		} else {
-			modelAct := e.beginActivity("调用模型 " + e.config.Model)
+			modelAct := e.beginActivity("调用模型 " + e.currentModel)
 			resp, err = e.provider.Chat(ctx, req)
 			e.endActivity(modelAct)
 		}
@@ -513,6 +520,20 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 		assistantMsg := api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: resp.ToolCalls}
 		e.messages = append(e.messages, assistantMsg)
+
+		// Loop detection: track tool-call fingerprints to break repetitive cycles
+		// that waste tokens. If the same pattern appears 3+ times in 5 consecutive
+		// iterations, inject a guidance message asking the model to change approach.
+		loopFp := e.fingerprintToolCalls(resp.ToolCalls)
+		e.loopHistory = append(e.loopHistory, loopFp)
+		if len(e.loopHistory) > 10 {
+			e.loopHistory = e.loopHistory[1:]
+		}
+		if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
+			log.Warnf("loop detected: %s", loopFp)
+			e.messages = append(e.messages, api.Message{Role: "user", Content: "[system: 检测到重复循环 — 你最近多次调用了相同的工具和参数组合。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助。]"})
+			e.loopHistory = nil // reset after injecting guidance
+		}
 
 		type toolResult struct {
 			ID      string
@@ -995,7 +1016,7 @@ func (e *Engine) Compact(ctx context.Context) {
 	}
 
 	compactResp, err := e.provider.Chat(ctx, api.ChatRequest{
-		Model:      e.config.Model,
+		Model:      e.currentModel,
 		SystemBase: "You are a conversation summarizer. Be concise and factual. Output a structured summary under 300 words. Include file paths mentioned.",
 		Messages:   []api.Message{{Role: "user", Content: summaryInput.String()}},
 		MaxTokens:  600,
@@ -1515,4 +1536,113 @@ func (e *Engine) WirePlanExecutor() {
 			"using available tools (read, write, bash, etc.) instead of " +
 			"sub-agents. Follow the todowrite plan sequentially.", nil
 	}
+}
+
+// fingerprintToolCalls creates a stable, compact fingerprint from a set of
+// tool calls for loop detection. It joins tool names and key argument values.
+func (e *Engine) fingerprintToolCalls(toolCalls []api.ToolCall) string {
+	if len(toolCalls) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		// Include the tool name and the first non-empty value from well-known keys
+		key := tc.Name
+		for _, k := range []string{"filePath", "command", "pattern", "query", "url", "name", "title", "message"} {
+			if v, ok := tc.Input[k].(string); ok && v != "" {
+				key += ":" + v
+				break
+			}
+		}
+		parts = append(parts, key)
+	}
+	// Sort to make the fingerprint order-independent
+	sort.Strings(parts)
+	return strings.Join(parts, "|")
+}
+
+// countRecent counts how many times the fingerprint appears in the last window
+// entries of the loop history.
+func (e *Engine) countRecent(fp string, window int) int {
+	start := len(e.loopHistory) - window
+	if start < 0 {
+		start = 0
+	}
+	count := 0
+	for _, h := range e.loopHistory[start:] {
+		if h == fp {
+			count++
+		}
+	}
+	return count
+}
+
+// compressHistory compresses the middle portion of the message history when
+// it grows too large. It keeps the first N messages (system + early context)
+// and the last M messages (recent conversation), replacing the middle with a
+// summary message. This prevents hitting context limits in long conversations.
+func (e *Engine) compressHistory() {
+	const maxMessages = 100    // threshold before compression
+	const keepFirst = 8        // keep first N messages
+	const keepLast = 30        // keep last M messages
+
+	if len(e.messages) <= maxMessages {
+		return
+	}
+
+	// Partition: [head ... middle ... tail]
+	head := e.messages[:keepFirst]
+	middle := e.messages[keepFirst : len(e.messages)-keepLast]
+	tail := e.messages[len(e.messages)-keepLast:]
+
+	// Build a concise summary of the middle section
+	var summary strings.Builder
+	summary.WriteString("[会话摘要] 以下是你与用户之前对话的摘要（共 ")
+	summary.WriteString(fmt.Sprintf("%d 条消息", len(middle)))
+	summary.WriteString("）：\n")
+
+	userCount := 0
+	toolCount := 0
+	for _, msg := range middle {
+		switch msg.Role {
+		case "user":
+			if userCount < 5 && len(msg.Content) > 0 {
+				summary.WriteString("- 用户: ")
+				s := truncate(msg.Content, 200)
+				summary.WriteString(s)
+				summary.WriteString("\n")
+			}
+			userCount++
+		case "assistant":
+			if len(msg.Content) > 0 {
+				s := truncate(msg.Content, 200)
+				if s != "" {
+					summary.WriteString("- 助手: ")
+					summary.WriteString(s)
+					summary.WriteString("\n")
+				}
+			}
+			if len(msg.ToolCalls) > 0 {
+				toolCount += len(msg.ToolCalls)
+			}
+		}
+	}
+	if userCount > 5 {
+		summary.WriteString(fmt.Sprintf("... 还有 %d 条用户消息\n", userCount-5))
+	}
+	if toolCount > 0 {
+		summary.WriteString(fmt.Sprintf("期间调用了 %d 次工具\n", toolCount))
+	}
+
+	// Rebuild: head + summary + tail
+	compressed := make([]api.Message, 0, len(head)+1+len(tail))
+	compressed = append(compressed, head...)
+	compressed = append(compressed, api.Message{
+		Role:    "user",
+		Content: summary.String(),
+	})
+	compressed = append(compressed, tail...)
+
+	e.messages = compressed
+	log.Debugf("compressed history: %d -> %d messages", len(head)+len(middle)+len(tail), len(compressed))
 }
