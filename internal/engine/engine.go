@@ -1,4 +1,4 @@
-package engine
+﻿package engine
 
 import (
 	"context"
@@ -114,7 +114,7 @@ type Engine struct {
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
-	// app appears to hang ("һֱ����Ӧ"), we can name exactly which stage is stuck.
+	// app appears to hang ("一直锟斤拷锟斤拷应"), we can name exactly which stage is stuck.
 	actMu  sync.Mutex
 	acts   map[uint64]*activity
 	actSeq uint64
@@ -316,17 +316,105 @@ func (e *Engine) SystemPrompt() string {
 		return e.systemPrompt
 	}
 	var sb strings.Builder
-	sb.WriteString(`You are an AI coding assistant. You MUST use tools to complete user tasks. Never describe what you would do �� actually DO it.
+		sb.WriteString(`# Identity & Core Directive
 
-RULES:
-1. Use tools for ALL file ops, command execution, code search, web access.
-2. Single-step tasks: use the tool immediately, no explanation needed.
-3. Multi-step tasks: use todowrite to track progress.
-4. Be concise. Use tools to act, not to describe actions.
-5. For git, tests, builds �� use bash. For files �� write/read/edit.
-6. Use webfetch for URLs. Use grep/glob for searching code.
-7. For creating or fully rewriting files (especially large ones like HTML/CSS/JS): use write with the COMPLETE content in ONE call. Do NOT use many small edit calls for new files.
-8. Each tool call response is ONE file operation. Do NOT attempt to write multiple large files in a single response �� write them one at a time across iterations.
+You are Cove, an AI coding assistant. Your core job: **use tools to complete tasks — never describe what you would do, actually DO it.**
+
+- Every file operation, command execution, code search, web access MUST go through tools
+- Single-step tasks: use the tool immediately, no explanation
+- Multi-step tasks (3+ steps): use todowrite to decompose and track progress
+- Every step must produce **verifiable real output**
+
+---
+
+# Task Completion — What "Done" Really Means
+
+## Rule 1: Deliverable = Real Tool Output, Not a Description
+
+When the user asks you to build, run, or verify something, the deliverable is a **working artifact backed by real tool output** — not a description of one.
+
+**Do NOT stop** after any of these:
+- Writing a stub/empty file and declaring "done"
+- Running one command without checking its output
+- Writing a plan or step list and saying "completed"
+- Modifying code without running/verifying it
+
+**Keep working** until you have:
+- Actually run the code and checked the output
+- Verified file content is correct
+- Passed tests (if applicable)
+- Built successfully (if applicable)
+- **Then** report real execution results
+
+## Rule 2: NEVER Fabricate Results
+
+If a tool, installation, or network call fails and blocks a path:
+- **Report the blocker honestly**, describe what error occurred
+- **Try alternatives** (different package manager, different approach, ask the user)
+- **NEVER** substitute plausible-looking fabricated output (made-up data, invented file contents, synthesised API responses) for results you couldn't actually produce
+
+Reporting a real blocker is ALWAYS better than fabricating — it saves hours of debugging.
+
+## Rule 3: Self-Check Before Declaring Done
+
+Before announcing task completion, verify:
+1. Are all required files actually modified?
+2. Does the code actually compile/run?
+3. Are there any unhandled errors?
+4. Can the result be reproduced?
+
+---
+
+# Tool Usage Protocol
+
+## Tool Selection
+- **File operations** → write (new/rewrite) / read (view) / edit (modify)
+- **Commands/build/test/git** → bash
+- **Code search** → grep / glob
+- **Web access** → webfetch / websearch
+- **Browser** → browser
+- **Task management** → todowrite + execute_plan (3+ step tasks)
+- **Sub-agents** → agent (independent sub-tasks)
+
+## Concurrency Rules
+- **Independent reads can be parallel**: batch multiple reads, searches, web fetches in one turn
+- **File writes must be serial**: one file at a time, complete content in ONE write call
+- **Dependent operations must be serial**: read-analyze-modify sequence
+
+## File Operation Rules
+- New/rewrite files: use write with **COMPLETE content in ONE call**, not many small edits
+- Modify existing files: use edit for precise replacements
+- Large files (200+ lines): read first, then use edit for targeted changes
+
+---
+
+# Multi-Step Task Management
+
+For tasks with 3+ steps:
+1. Use todowrite to define tasks with dependency annotations: [depends:task-1,task-2 Description]
+2. Use execute_plan to auto-execute respecting dependencies
+3. Update todowrite status as each step completes
+4. Verify the overall result after all steps
+
+For independent sub-tasks (parallel exploration, isolated tests), use agent sub-agents.
+
+---
+
+# Error Resilience
+
+- If 3 consecutive tool failures occur, **change strategy** — don't repeat the same failing approach
+- If response is truncated (max_tokens), continue working when prompted
+- If loop detected, change your approach immediately
+- Max 200 iterations per turn — plan efficiently
+
+---
+
+# Output Style
+
+- **Concise**: deliver results directly, no filler
+- **Action**: use tools, don't describe what you'll do
+- **Transparent**: report real execution results and errors encountered
+- **Bilingual**: respond in the user's language
 
 Available tools:`)
 	for _, t := range e.registry.All() {
@@ -340,8 +428,7 @@ Available tools:`)
 		}
 	}
 
-	sb.WriteString("\n\nBe concise. Use tools, not talk.")
-
+	
 	if e.memStore != nil {
 		if mp := e.memStore.BuildPrompt(); mp != "" {
 			sb.WriteString(mp)
@@ -460,8 +547,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	if e.safetyChecker != nil {
 		if result := e.safetyChecker.Scan(userMessage.Content, "user_input"); result != nil {
 			if blocking := result.BlockingFinding(); blocking != nil {
-				e.engineOutput(fmt.Sprintf("  \x1b[31m⚠ safety: %s\x1b[0m", blocking.Message))
-				// Warn but don't block — user input is from the actual user
+				e.engineOutput(fmt.Sprintf("  \x1b[31m鈿?safety: %s\x1b[0m", blocking.Message))
+				// Warn but don't block 鈥?user input is from the actual user
 				log.Warnf("safety finding in user input: %s", blocking.Message)
 			}
 		}
@@ -495,13 +582,13 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			injected := false
 			for si := len(e.messages) - 1; si >= 0; si-- {
 				if e.messages[si].Role == "tool" {
-					e.messages[si].Content += "\n\n[用户指引] " + steer
+					e.messages[si].Content += "\n\n[鐢ㄦ埛鎸囧紩] " + steer
 					injected = true
 					break
 				}
 			}
 			if !injected {
-				// No tool message yet �� put it back
+				// No tool message yet 锟斤拷 put it back
 				e.Steer(steer)
 			}
 		}
@@ -534,13 +621,13 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
 		var walker *repl.WalkingIndicator
 		if iter > 0 && !e.config.Debug {
-			walker = repl.NewWalkingIndicator("˼����...")
+			walker = repl.NewWalkingIndicator("思锟斤拷锟斤拷...")
 			walker.Start()
 		}
 
 		if useStream {
 			firstDelta := true
-			modelAct := e.beginActivity("����ģ�� " + e.fallback.CurrentModel())
+			modelAct := e.beginActivity("锟斤拷锟斤拷模锟斤拷 " + e.fallback.CurrentModel())
 			resp, _, err = e.fallback.TryChatStream(ctx, func(p api.Provider) api.ChatRequest { return req }, func(ev api.StreamEvent) {
 				e.progressActivity(modelAct)
 				if firstDelta && walker != nil {
@@ -557,7 +644,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			})
 			e.endActivity(modelAct)
 		} else {
-			modelAct := e.beginActivity("����ģ�� " + e.fallback.CurrentModel())
+			modelAct := e.beginActivity("锟斤拷锟斤拷模锟斤拷 " + e.fallback.CurrentModel())
 			resp, _, err = e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
 			e.endActivity(modelAct)
 		}
@@ -570,7 +657,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.messages = prevMessages
 			e.saveSession()
 			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
-				fmt.Sprintf("ģ�͵���ʧ��: %s", err.Error()))
+				fmt.Sprintf("模锟酵碉拷锟斤拷失锟斤拷: %s", err.Error()))
 			return "", fmt.Errorf("api: %w", err)
 		}
 
@@ -646,7 +733,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
 				log.Warnf("loop detected: %s", loopFp)
-				e.messages = append(e.messages, newSyntheticUserMsg("[system: 检测到重复循环 — 模型连续多次调用相同的工具和参数。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助]"))
+				e.messages = append(e.messages, newSyntheticUserMsg("[system: 妫€娴嬪埌閲嶅寰幆 鈥?妯″瀷杩炵画澶氭璋冪敤鐩稿悓鐨勫伐鍏峰拰鍙傛暟銆傝灏濊瘯瀹屽叏涓嶅悓鐨勬柟娉曪紝濡傛灉鍗′綇浜嗗彲浠ュ悜鐢ㄦ埛瀵绘眰甯姪]"))
 				e.loopHistory = nil // reset after injecting guidance
 			}
 		}
@@ -725,7 +812,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if isErr {
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
-					fmt.Sprintf("���� %s ʧ��: %s", r.Name, summarizeResult(r.Content)))
+					fmt.Sprintf("锟斤拷锟斤拷 %s 失锟斤拷: %s", r.Name, summarizeResult(r.Content)))
 			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
@@ -769,7 +856,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		e.totalTokens = countTokens(e.messages)
 		// Compression is handled by checkAndCompress at iteration start (line ~465).
 		// Record iteration for stagnation detection (Layer 3).
-		// L3 is log-only — no file activity doesn't mean the model is stuck
+		// L3 is log-only 鈥?no file activity doesn't mean the model is stuck
 		// (research, reading, search are legitimate non-file workflows).
 		if e.loopDetector != nil {
 			if lr := e.loopDetector.RecordIteration(); lr.Detected {
@@ -778,7 +865,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					e.engineOutput("? " + lr.Reason)
 					return "", fmt.Errorf("loop detection: %s", lr.Reason)
 				}
-				// L3 is a weak signal — log only, don't inject guidance.
+				// L3 is a weak signal 鈥?log only, don't inject guidance.
 				// The model may be doing legitimate research/reading.
 			}
 		}
@@ -798,14 +885,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	if e.safetyChecker != nil {
 		result := e.safetyChecker.ScanToolCall(tc.Name, tc.Input)
 		if blocking := result.BlockingFinding(); blocking != nil {
-			e.engineOutput(fmt.Sprintf("  \x1b[31m✗ blocked: %s\x1b[0m", blocking.Message))
+			e.engineOutput(fmt.Sprintf("  \x1b[31m鉁?blocked: %s\x1b[0m", blocking.Message))
 			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message)
 		}
 	}
 
 	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
 	// or MCP call that ignores ctx) is attributable by the stall monitor.
-	toolAct := e.beginActivity("ִ�й��� " + tc.Name)
+	toolAct := e.beginActivity("执锟叫癸拷锟斤拷 " + tc.Name)
 	defer e.endActivity(toolAct)
 
 	// Fire pre-tool-use hooks
@@ -1128,7 +1215,7 @@ func (e *Engine) compactIfNeeded(ctx context.Context) {
 		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
 	}
 	
-	// Use model_fast for compression summaries — much cheaper than the main model.
+	// Use model_fast for compression summaries 鈥?much cheaper than the main model.
 	// Falls back to the main model if model_fast is not configured.
 	tryChat := func(ctx context.Context, req api.ChatRequest) (*api.ChatResponse, error) {
 		if e.config.ModelFast != "" {
@@ -1208,11 +1295,11 @@ func isSyntheticUserMessage(content string) bool {
 	syntheticPrefixes := []string{
 		"[system:",                     // circuit breaker
 		"[Conversation Summary]",       // AI compression
-		"[系统检测到重复操作循环]",        // loop guidance (Chinese)
+		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",        // loop guidance (Chinese)
 		"[Context truncated",           // truncation notice
-		"[用户指引]",                    // steer guidance
+		"[鐢ㄦ埛鎸囧紩]",                    // steer guidance
 		"[Continue the task",           // compression continuation
-		"[会话摘要]",                    // old compression (Chinese)
+		"[浼氳瘽鎽樿]",                    // old compression (Chinese)
 	}
 	for _, p := range syntheticPrefixes {
 		if strings.HasPrefix(c, p) {
@@ -1243,11 +1330,11 @@ func looksSynthetic(m api.Message) bool {
 	knownPrefixes := []string{
 		"[system:",
 		"[Conversation Summary]",
-		"[系统检测到重复操作循环]",
+		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",
 		"[Context truncated",
-		"[用户指引]",
+		"[鐢ㄦ埛鎸囧紩]",
 		"[Continue the task",
-		"[会话摘要]",
+		"[浼氳瘽鎽樿]",
 		"run slow tool",
 		"do something",
 		"slow response",
@@ -1482,7 +1569,7 @@ func (e *Engine) runTurnEndPipeline() {
 			summary := diff.Summary()
 			log.Debugf("session changes: %s", summary)
 			if len(diff.AddedFiles) > 0 || len(diff.AddedTools) > 0 {
-				e.engineOutput(fmt.Sprintf("  \x1b[2m📊 %s\x1b[0m", summary))
+				e.engineOutput(fmt.Sprintf("  \x1b[2m馃搳 %s\x1b[0m", summary))
 			}
 		}
 		e.sessionView = currentView
