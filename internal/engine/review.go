@@ -110,10 +110,7 @@ func buildReviewSnapshot(msgs []api.Message) string {
 
 	var sb strings.Builder
 	for _, m := range msgs {
-		content := m.Content
-		if len(content) > 200 {
-			content = content[:200] + "..."
-		}
+		content := clipRunes(m.Content, 200)
 		switch m.Role {
 		case "user":
 			sb.WriteString("用户: " + content + "\n")
@@ -123,19 +120,11 @@ func buildReviewSnapshot(msgs []api.Message) string {
 				if path, ok := tc.Input["filePath"].(string); ok {
 					sb.WriteString("  → " + tc.Name + "(" + path + ")\n")
 				} else if cmd, ok := tc.Input["command"].(string); ok {
-					c := cmd
-					if len(c) > 80 {
-						c = c[:80] + "..."
-					}
-					sb.WriteString("  → bash(" + c + ")\n")
+					sb.WriteString("  → bash(" + clipRunes(cmd, 80) + ")\n")
 				}
 			}
 		case "tool":
-			r := content
-			if len(r) > 80 {
-				r = r[:80] + "..."
-			}
-			sb.WriteString("  结果: " + r + "\n")
+			sb.WriteString("  结果: " + clipRunes(content, 80) + "\n")
 		}
 	}
 	return sb.String()

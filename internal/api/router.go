@@ -39,6 +39,19 @@ func NewModelRouter(defaultModel, fastModel string) *ModelRouter {
 	return mr
 }
 
+// SetModels updates the default (premium) and fast models. Call this whenever
+// the active model/provider changes (e.g. /model, /provider) so routing tracks
+// the current configuration instead of the construction-time values. Passing an
+// empty fastModel leaves the existing fast model unchanged.
+func (mr *ModelRouter) SetModels(defaultModel, fastModel string) {
+	if defaultModel != "" {
+		mr.defaultModel = defaultModel
+	}
+	if fastModel != "" {
+		mr.fastModel = fastModel
+	}
+}
+
 // SetOverride sets a user-specified model override (e.g. from /model command).
 func (mr *ModelRouter) SetOverride(model string) { mr.override = model }
 

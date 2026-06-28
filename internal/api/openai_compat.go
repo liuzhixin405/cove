@@ -178,14 +178,18 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
+	key := p.activeKey()
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
+	httpReq.Header.Set("Authorization", "Bearer "+key)
 
 	httpResp, err := p.client.Do(httpReq)
 	if err != nil {
 		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
 	defer httpResp.Body.Close()
+
+	// Update key-pool health so multi-key rotation fails over.
+	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode >= 500 {
@@ -396,8 +400,9 @@ type oaiStreamChunk struct {
 }
 
 type oaiStreamChoice struct {
-	Delta oaiStreamDelta `json:"delta"`
-	Index int            `json:"index"`
+	Delta        oaiStreamDelta `json:"delta"`
+	Index        int            `json:"index"`
+	FinishReason string         `json:"finish_reason,omitempty"`
 }
 
 type oaiStreamDelta struct {
@@ -458,6 +463,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output; we therefore never retry after streaming begins.
+	var streamKey string
 	httpResp, err := retryConnectHTTP(
 		streamCtx,
 		defaultRetry,
@@ -466,8 +472,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			if reqErr != nil {
 				return nil, reqErr
 			}
+			streamKey = p.activeKey()
 			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("Authorization", "Bearer "+p.activeKey())
+			httpReq.Header.Set("Authorization", "Bearer "+streamKey)
 			return sc.Do(httpReq)
 		},
 		func(statusCode int) bool { return statusCode >= 500 || statusCode == 429 },
@@ -476,6 +483,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, err
 	}
 	defer httpResp.Body.Close()
+	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
@@ -496,6 +504,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		ArgsBuf strings.Builder
 	}
 	tcMap := make(map[int]*tcAccum)
+	lastFinish := "" // finish_reason from the most recent chunk that reported one
 
 	for scanner.Scan() {
 		// Stop promptly if the caller cancelled (e.g. user pressed Ctrl+C).
@@ -517,6 +526,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			continue
 		}
 		if len(chunk.Choices) > 0 {
+			if fr := chunk.Choices[0].FinishReason; fr != "" {
+				lastFinish = fr
+			}
 			d := chunk.Choices[0].Delta
 			if d.Content != "" {
 				fullContent.WriteString(d.Content)
@@ -582,10 +594,25 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}
 
-	// Detect actual stop reason from last chunk's finish_reason
+	// Derive the stop reason from the stream's finish_reason. OpenAI sends
+	// "stop" | "length" | "tool_calls" | "content_filter". Map to the same
+	// vocabulary the engine checks (it treats "length"/"max_tokens" with no
+	// tool calls as a truncation that needs continuation).
 	stopReason := "stop"
-	if len(toolCalls) == 0 && len(tcMap) > 0 {
-		// Had tool calls started but none completed = truncation
+	switch lastFinish {
+	case "length":
+		stopReason = "length"
+	case "tool_calls":
+		stopReason = "tool_use"
+	case "content_filter":
+		stopReason = "content_filter"
+	case "stop", "":
+		stopReason = "stop"
+	default:
+		stopReason = lastFinish
+	}
+	if stopReason == "stop" && len(toolCalls) == 0 && len(tcMap) > 0 {
+		// Tool calls started streaming but none completed → truncated mid-call.
 		stopReason = "length"
 	}
 

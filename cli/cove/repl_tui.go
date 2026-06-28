@@ -273,9 +273,19 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		})
 		items := make([]tui.HistoryItem, 0, len(recs))
 		for _, r := range recs {
+			// Skip sessions with no genuine user input — they only contain
+			// engine-injected synthetic prompts (loop guidance, circuit-breaker
+			// hints, compaction summaries) and were polluting the Ctrl+R list with
+			// records the user never actually started.
+			if r.UserTurns == 0 {
+				continue
+			}
 			title := r.Title
 			if title == "New session" || title == "" {
 				title = sessionPreview(r)
+			}
+			if strings.TrimSpace(title) == "" {
+				continue
 			}
 			items = append(items, tui.HistoryItem{
 				ID:       r.ID,
