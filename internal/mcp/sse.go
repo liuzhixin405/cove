@@ -108,7 +108,14 @@ func (t *sseTransport) Send(ctx context.Context, msg any) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	// A non-2xx here (expired/invalid session, server error) means the message
+	// was not delivered. Surface it instead of returning nil, otherwise the
+	// caller blocks waiting for a response that will never arrive.
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("sse send: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	return nil
 }
 

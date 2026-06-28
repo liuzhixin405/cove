@@ -165,7 +165,12 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 
 	select {
-	case resp := <-ch:
+	case resp, ok := <-ch:
+		// Close() closes pending channels on shutdown; a closed channel yields a
+		// nil *Response. Guard against it instead of dereferencing resp.Error.
+		if !ok || resp == nil {
+			return fmt.Errorf("mcp: connection closed before response")
+		}
 		if resp.Error != nil {
 			return fmt.Errorf("mcp error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
@@ -231,7 +236,11 @@ func (c *Client) receiveLoop() {
 
 		var base struct {
 			JSONRPC
-			ID     int             `json:"id,omitempty"`
+			// Pointer so we can tell "no id" (notification) from "id: 0". With a
+			// plain int+omitempty, a response with id 0 and a notification were
+			// indistinguishable, so id-0 responses were dropped and id-0 server
+			// requests were misrouted as notifications.
+			ID     *int            `json:"id"`
 			Method string          `json:"method,omitempty"`
 			Result json.RawMessage `json:"result,omitempty"`
 			Error  *Error          `json:"error,omitempty"`
@@ -242,7 +251,8 @@ func (c *Client) receiveLoop() {
 			continue
 		}
 
-		if base.Method != "" && base.ID == 0 {
+		// Notification: a method with no id.
+		if base.Method != "" && base.ID == nil {
 			notif := &Notification{
 				JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
 				Method:  base.Method,
@@ -255,16 +265,28 @@ func (c *Client) receiveLoop() {
 			continue
 		}
 
+		// Server-initiated request (method + id): this client doesn't implement
+		// server→client requests (sampling/roots). Ignore rather than misroute it
+		// into the pending-response table.
+		if base.Method != "" {
+			continue
+		}
+
+		// Otherwise it's a response to one of our requests; it must carry an id.
+		if base.ID == nil {
+			continue
+		}
+
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
 			return
 		}
-		ch, ok := c.pending[base.ID]
+		ch, ok := c.pending[*base.ID]
 		if ok {
 			ch <- &Response{
 				JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
-				ID:      base.ID,
+				ID:      *base.ID,
 				Result:  base.Result,
 				Error:   base.Error,
 			}

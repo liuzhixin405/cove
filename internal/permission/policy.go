@@ -47,10 +47,19 @@ func (r *PolicyRule) Match(toolName string, params map[string]any) bool {
 	return true
 }
 
-// PolicyEngine evaluates permission rules for tool invocations.
+// PolicyStorage persists policy rules. *FilePolicyStorage implements it.
+type PolicyStorage interface {
+	Load() ([]PolicyRule, error)
+	Save(rules []PolicyRule) error
+}
+
+// PolicyEngine evaluates permission rules for tool invocations. It is the single
+// authoritative store for permission rules; when a PolicyStorage is attached,
+// rule mutations are persisted so choices like "始终允许" survive restarts.
 type PolicyEngine struct {
-	mu    sync.RWMutex
-	rules []PolicyRule
+	mu      sync.RWMutex
+	rules   []PolicyRule
+	storage PolicyStorage
 }
 
 // NewPolicyEngine creates an empty policy engine.
@@ -58,6 +67,24 @@ func NewPolicyEngine() *PolicyEngine {
 	return &PolicyEngine{
 		rules: make([]PolicyRule, 0),
 	}
+}
+
+// SetStorage attaches a persistent backing store. Subsequent AddRule/RemoveRule
+// calls write the full rule set through it (best-effort).
+func (pe *PolicyEngine) SetStorage(s PolicyStorage) {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+	pe.storage = s
+}
+
+// persist writes the current rule set to storage. Caller must hold pe.mu.
+func (pe *PolicyEngine) persistLocked() {
+	if pe.storage == nil {
+		return
+	}
+	snapshot := make([]PolicyRule, len(pe.rules))
+	copy(snapshot, pe.rules)
+	_ = pe.storage.Save(snapshot) // best-effort; rules still apply in-memory if save fails
 }
 
 // Evaluate checks all rules and returns the first matching action.
@@ -93,12 +120,14 @@ func (pe *PolicyEngine) AddRule(rule PolicyRule) error {
 		if existing.ID == rule.ID {
 			pe.rules[i] = rule
 			pe.sortRules()
+			pe.persistLocked()
 			return nil
 		}
 	}
 
 	pe.rules = append(pe.rules, rule)
 	pe.sortRules()
+	pe.persistLocked()
 	return nil
 }
 
@@ -110,6 +139,7 @@ func (pe *PolicyEngine) RemoveRule(ruleID string) error {
 	for i, rule := range pe.rules {
 		if rule.ID == ruleID {
 			pe.rules = append(pe.rules[:i], pe.rules[i+1:]...)
+			pe.persistLocked()
 			return nil
 		}
 	}

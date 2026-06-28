@@ -41,8 +41,17 @@ type LoopDetector struct {
 
 	// Layer 1b: fuzzy (tool-name-only) fingerprint ring buffer
 	toolOnlyHistory []string // tool names only, no params
-	toolOnlyWindow  int      // max history size (default 10)
-	toolOnlyThresh  int      // break threshold (default 6)
+	toolOnlyWindow  int      // max history size (default 12)
+	toolOnlyThresh  int      // break threshold (default 10)
+
+	// Layer 1b progress detection: track output diversity per tool pattern.
+	// If the same tool is called repeatedly but produces DIFFERENT outputs,
+	// it's making progress and should NOT be flagged as a loop.
+	// Map: toolOnlyPattern -> []outputHash (ring buffer, window = toolOnlyWindow)
+	toolOutputs map[string][]string
+
+	// Tracks the most recent tool pattern (set by RecordToolCalls, read by RecordOutput).
+	lastToolOnlyPattern string
 
 	// Layer 2: output content hash sliding window
 	outHashes  []string        // most recent N hashes
@@ -95,6 +104,7 @@ func NewLoopDetector() *LoopDetector {
 		stallCount:      0,
 		stallThresh:     60, // only flag after 60 iterations without file activity
 		isFastModel:     false,
+		toolOutputs:     make(map[string][]string),
 	}
 }
 
@@ -225,6 +235,10 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 			ld.toolOnlyHistory = ld.toolOnlyHistory[1:]
 		}
 
+		// Save the current tool pattern so RecordOutput can correlate
+		// output diversity later for progress detection.
+		ld.lastToolOnlyPattern = toolOnly
+
 		toolCnt := ld.countToolOnly(toolOnly, ld.toolOnlyWindow)
 		if toolCnt >= ld.toolOnlyThresh {
 			ld.breakCount++
@@ -247,12 +261,44 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 
 // RecordOutput records a tool-call output string. Only the first 512 bytes
 // are hashed so giant file contents don't mask genuine output-level loops.
+//
+// Additionally performs Layer 1b progress detection: if the same tool pattern
+// produces DIFFERENT outputs each time, it's making progress — retroactively
+// clear the Layer 1b history to prevent false positives.
 func (ld *LoopDetector) RecordOutput(output string) LoopResult {
 	if len(output) == 0 {
 		return LoopResult{}
 	}
 	h := hashPrefix(output, 512)
 
+	// --- Layer 1b progress detection ---
+	// Track output diversity per tool pattern.
+	// If one tool pattern produces ≥2 unique output hashes in the window,
+	// it's making progress -> clear that pattern from Layer 1b history.
+	if ld.lastToolOnlyPattern != "" {
+		ld.toolOutputs[ld.lastToolOnlyPattern] = append(
+			ld.toolOutputs[ld.lastToolOnlyPattern], h,
+		)
+		// Trim to window size
+		outs := ld.toolOutputs[ld.lastToolOnlyPattern]
+		if len(outs) > ld.toolOnlyWindow {
+			ld.toolOutputs[ld.lastToolOnlyPattern] = outs[len(outs)-ld.toolOnlyWindow:]
+		}
+		// Check diversity: if ≥4 unique hashes in window, it's PROGRESS.
+		// 2-3 unique outputs could still be a loop (e.g. alternating results);
+		// 4+ unique outputs indicates genuine multi-step work.
+		unique := make(map[string]bool, len(outs))
+		for _, o := range outs {
+			unique[o] = true
+		}
+		if len(unique) >= 4 {
+			// Outputs are diverse -> retroactively clear this pattern
+			// from Layer 1b history to prevent false positive.
+			ld.clearToolOnlyFromHistory(ld.lastToolOnlyPattern)
+		}
+	}
+
+	// --- Layer 2: output content hash detection ---
 	ld.outHashes = append(ld.outHashes, h)
 	ld.outCounts[h]++
 	if len(ld.outHashes) > ld.outWindow {
@@ -326,12 +372,27 @@ func (ld *LoopDetector) ResetFileTracking() {
 	ld.filesWritten = make(map[string]bool)
 }
 
+// clearToolOnlyFromHistory removes ALL occurrences of the given tool pattern
+// from the Layer 1b history. Used by progress detection: when outputs are
+// diverse, we retroactively clear that tool pattern to prevent false positives.
+func (ld *LoopDetector) clearToolOnlyFromHistory(pattern string) {
+	filtered := make([]string, 0, len(ld.toolOnlyHistory))
+	for _, h := range ld.toolOnlyHistory {
+		if h != pattern {
+			filtered = append(filtered, h)
+		}
+	}
+	ld.toolOnlyHistory = filtered
+}
+
 // ResetFingerprintHistory clears only the tool-call fingerprint history
 // (both exact and tool-only) without resetting the entire detector.
 // Used after injecting loop guidance so the model starts fresh.
 func (ld *LoopDetector) ResetFingerprintHistory() {
 	ld.fpHistory = ld.fpHistory[:0]
 	ld.toolOnlyHistory = ld.toolOnlyHistory[:0]
+	ld.toolOutputs = make(map[string][]string)
+	ld.lastToolOnlyPattern = ""
 }
 
 // Reset clears all accumulated history. Call on each new user turn.
@@ -344,6 +405,8 @@ func (ld *LoopDetector) Reset() {
 	ld.filesCreated = make(map[string]bool)
 	ld.filesWritten = make(map[string]bool)
 	ld.stallCount = 0
+	ld.toolOutputs = make(map[string][]string)
+	ld.lastToolOnlyPattern = ""
 }
 
 // countFP returns how many times fp appears in the most recent 'window' entries.

@@ -133,8 +133,9 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
+	key := p.activeKey()
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", p.activeKey())
+	httpReq.Header.Set("x-api-key", key)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 
@@ -143,6 +144,10 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
 	defer httpResp.Body.Close()
+
+	// Update the key pool's health for this key (rate-limited / dead / ok) so
+	// multi-key rotation actually fails over.
+	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode >= 500 {
@@ -338,6 +343,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	// Retry the connection-establishment phase only. Once the body starts
 	// streaming, deltas have already been delivered to the handler so retrying
 	// would duplicate output.
+	var streamKey string
 	httpResp, err := retryConnectHTTP(
 		streamCtx,
 		defaultRetry,
@@ -346,8 +352,9 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 			if reqErr != nil {
 				return nil, reqErr
 			}
+			streamKey = p.activeKey()
 			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("x-api-key", p.activeKey())
+			httpReq.Header.Set("x-api-key", streamKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
 			httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
 			return sc.Do(httpReq)
@@ -358,6 +365,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		return nil, err
 	}
 	defer httpResp.Body.Close()
+	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, fmt.Errorf("API error %d: %s", httpResp.StatusCode, truncate(string(body), 500))

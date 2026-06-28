@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"encoding/json"
@@ -45,6 +45,9 @@ type Config struct {
 	Verbose        bool                       `json:"verbose"`
 	SystemPrompt   string                     `json:"system_prompt,omitempty"`
 	MCPServers     map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
+	// Telemetry enables local, opt-in usage recording (~/.cove/telemetry.json).
+	// Off by default; can also be enabled with COVE_TELEMETRY=1.
+	Telemetry bool `json:"telemetry,omitempty"`
 }
 
 type MCPServerConfig struct {
@@ -141,7 +144,11 @@ func applyDefaults(cfg *Config) {
 		cfg.Model = DefaultModelForProvider(cfg.Provider.Name)
 	}
 	if cfg.ModelFast == "" || strings.EqualFold(cfg.ModelFast, "auto") {
-		cfg.ModelFast = "deepseek-v4-flash"
+		// No fast model configured → reuse the main model. Routing a "simple"
+		// task to the same model is a no-op, which is correct and provider-safe.
+		// (Previously this hardcoded deepseek-v4-flash for every provider, which
+		// broke routing whenever the active provider wasn't deepseek.)
+		cfg.ModelFast = cfg.Model
 	}
 	if cfg.PermissionMode == "" {
 		cfg.PermissionMode = "default"

@@ -124,7 +124,11 @@ func matchRule(r Rule, toolName string, input map[string]any) bool {
 	if r.ToolPattern != "*" && r.ToolPattern != toolName {
 		return false
 	}
-	if r.ArgPattern != "" && input != nil {
+	// An arg-restricted rule only matches when some string argument contains the
+	// pattern. A nil/empty input must NOT match (previously it fell through to
+	// `return true`, so an allow rule with an ArgPattern auto-allowed any call
+	// whose Input was nil — an argument-scoping bypass).
+	if r.ArgPattern != "" {
 		for _, v := range input {
 			if s, ok := v.(string); ok && strings.Contains(s, r.ArgPattern) {
 				return true

@@ -119,9 +119,13 @@ func (t *streamableHTTPTransport) readStream(body io.ReadCloser) {
 
 			if strings.HasPrefix(event, "data: ") {
 				payload := strings.TrimPrefix(event, "data: ")
+				// Block until the message is consumed (backpressure) rather than
+				// dropping it; dropping a JSON-RPC response would hang the caller.
+				// Unblock on transport shutdown.
 				select {
 				case t.msgChan <- json.RawMessage(payload):
-				default:
+				case <-t.ctx.Done():
+					return
 				}
 			}
 		}
@@ -146,20 +150,23 @@ func (t *streamableHTTPTransport) Send(ctx context.Context, msg any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
 		return fmt.Errorf("streamablehttp: POST %d: %s", resp.StatusCode, string(body))
 	}
 
-	// If the response is a streaming response, read events from it
+	// If the response is itself a stream, hand the body to a reader goroutine
+	// which owns and closes it. We must NOT close it here (a deferred close
+	// would race the goroutine's reads and truncate the streamed response).
 	ct := resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "text/event-stream") {
 		go t.readStreamFromResponse(resp.Body)
 		return nil
 	}
 
+	resp.Body.Close()
 	return nil
 }
 
@@ -190,7 +197,8 @@ func (t *streamableHTTPTransport) readStreamFromResponse(body io.ReadCloser) {
 				payload := strings.TrimPrefix(event, "data: ")
 				select {
 				case t.msgChan <- json.RawMessage(payload):
-				default:
+				case <-t.ctx.Done():
+					return
 				}
 			}
 		}

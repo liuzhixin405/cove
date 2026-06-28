@@ -72,7 +72,7 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 	// ── Pass 2: scan from 0 to cutoffIdx, count prunable ──
 	prunable := 0
 	for i := 0; i < cutoffIdx; i++ {
-		if history[i].Role == "tool" && !m.isExempt(history[i].Name) && len(history[i].Content) > 100 {
+		if m.maskable(history[i]) {
 			prunable += len(history[i].Content) / 4
 		}
 	}
@@ -94,7 +94,7 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 	copy(newHistory, history)
 
 	for i := 0; i < cutoffIdx; i++ {
-		if newHistory[i].Role != "tool" || m.isExempt(newHistory[i].Name) || len(newHistory[i].Content) <= 100 {
+		if !m.maskable(newHistory[i]) {
 			continue
 		}
 
@@ -108,8 +108,8 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 		}
 
 		tokensSaved += len(newHistory[i].Content) / 4
-		newHistory[i].Content = fmt.Sprintf("[toolu_vrtx_01Masked%s...] %d tokens masked to %s",
-			strings.ReplaceAll(name, "_", " "), len(history[i].Content)/4, filePath)
+		newHistory[i].Content = fmt.Sprintf("%s%s...] %d tokens masked to %s",
+			maskedPrefix, strings.ReplaceAll(name, "_", " "), len(history[i].Content)/4, filePath)
 		maskedCount++
 	}
 
@@ -127,6 +127,19 @@ func (m *ToolOutputMasker) msgTokens(msg api.Message) int {
 		t += len(tc.Name) + 50
 	}
 	return t / 4
+}
+
+// maskedPrefix marks a tool message whose output has already been masked to disk.
+const maskedPrefix = "[toolu_vrtx_01Masked"
+
+// maskable reports whether a message is a non-exempt tool output large enough to
+// mask, and not already masked (re-masking would replace a real file reference
+// with a pointer to the placeholder, breaking the chain and inflating savings).
+func (m *ToolOutputMasker) maskable(msg api.Message) bool {
+	return msg.Role == "tool" &&
+		!m.isExempt(msg.Name) &&
+		len(msg.Content) > 100 &&
+		!strings.HasPrefix(msg.Content, maskedPrefix)
 }
 
 // isExempt checks whether a tool name should never be masked.

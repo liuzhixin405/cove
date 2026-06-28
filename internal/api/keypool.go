@@ -1,7 +1,10 @@
 package api
 
 import (
+	"fmt"
+	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -113,6 +116,43 @@ func (p *KeyPool) MarkDead(key string, reason string) {
 			break
 		}
 	}
+}
+
+// MarkOutcome updates a key's health from an HTTP status code. This is what
+// actually wires the pool's failover: without it every key stays KeyOK forever
+// and rotation keeps handing out dead/rate-limited keys.
+//
+// Safe to call on a nil pool or empty key (no-op), so callers don't need to
+// branch on whether multi-key pooling is configured. 5xx and other statuses
+// leave the key untouched (not the key's fault).
+func (p *KeyPool) MarkOutcome(key string, status int, retryAfter time.Duration) {
+	if p == nil || key == "" {
+		return
+	}
+	switch {
+	case status == 429:
+		if retryAfter <= 0 {
+			retryAfter = 60 * time.Second
+		}
+		p.MarkRateLimited(key, retryAfter)
+	case status == 401 || status == 403:
+		p.MarkDead(key, fmt.Sprintf("auth error %d", status))
+	case status >= 200 && status < 300:
+		p.MarkSuccess(key)
+	}
+}
+
+// ParseRetryAfter reads an integer-seconds Retry-After header. Returns 0 when
+// absent or in HTTP-date form (callers fall back to a default cooldown).
+func ParseRetryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 // MarkSuccess resets error state for a key.

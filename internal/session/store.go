@@ -176,6 +176,13 @@ func countGenuineUserTurns(messages []struct {
 		if m.Synthetic {
 			continue
 		}
+		// Older sessions (saved before the Synthetic flag, or via a code path that
+		// forgot to set it) store engine-injected prompts under Role=="user" with a
+		// "[system:" / summary prefix. Exclude those too so the genuine-turn count —
+		// and the Ctrl+R history filter that depends on it — isn't fooled.
+		if looksSyntheticContent(m.Content) {
+			continue
+		}
 		n++
 	}
 	return n

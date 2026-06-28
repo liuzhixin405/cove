@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/api"
@@ -99,20 +100,25 @@ func (cc *ChatCompressor) Compress(
 		keepCount = len(messages) - 2
 	}
 
+	// IMPORTANT: the system prompt is supplied separately via ChatRequest.SystemBase;
+	// messages[0] is the first *user* turn, NOT a system message. So we must not keep
+	// messages[0] as a pseudo-system anchor — doing so left the original first user
+	// message in place AND prepended a summary user message, producing two consecutive
+	// user turns (which the model API rejects with a 400, breaking every long chat).
+	//
+	// Anchor the kept tail on an assistant turn so the rebuilt sequence stays valid:
+	//   [user(summary)] → [assistant ...] → [tool result ...] → ...
+	// Landing on a "tool" message would orphan a tool_result (its tool_use was
+	// dropped); landing on a "user" message would put two user turns back-to-back.
 	splitIdx := len(messages) - keepCount
-	// Never split inside an assistant→tool pair
-	for splitIdx > 1 && splitIdx < len(messages) {
-		if messages[splitIdx].Role == "tool" {
-			splitIdx--
-		} else {
-			break
-		}
+	for splitIdx > 0 && splitIdx < len(messages) && messages[splitIdx].Role != "assistant" {
+		splitIdx--
 	}
-	if splitIdx <= 1 {
-		return &CompressResult{}, messages // nothing worth summarizing
+	if splitIdx <= 0 {
+		return &CompressResult{}, messages // no clean assistant boundary — nothing safe to summarize
 	}
 
-	history := messages[1:splitIdx]
+	history := messages[:splitIdx]
 	if len(history) < 4 {
 		return &CompressResult{}, messages
 	}
@@ -120,27 +126,25 @@ func (cc *ChatCompressor) Compress(
 	summary, err := cc.generateSummary(ctx, history, tryChat)
 	if err != nil {
 		log.Warnf("compressor: summary generation failed, falling back to truncation: %v", err)
-		// Fallback: simple truncation
-		result := &CompressResult{
-			Compressed:   true,
-			OldCount:     len(messages),
-			NewCount:     len(history) + keepCount,
-			TokenSavings: 0,
-		}
-		truncated := make([]api.Message, 0, 2+keepCount)
-		truncated = append(truncated, messages[0]) // system
+		// Fallback: simple truncation. Same invariant — a single user message then
+		// the assistant-anchored tail; no leftover messages[0].
+		truncated := make([]api.Message, 0, 1+keepCount)
 		truncated = append(truncated, api.Message{
 			Role:    "user",
 			Content: "[Context truncated due to length. Continue the task.]",
 		})
 		truncated = append(truncated, messages[splitIdx:]...)
-		result.NewCount = len(truncated)
-		return result, truncated
+		return &CompressResult{
+			Compressed:   true,
+			OldCount:     len(messages),
+			NewCount:     len(truncated),
+			TokenSavings: 0,
+		}, truncated
 	}
 
-	// Build compressed message list
-	compressed := make([]api.Message, 0, 2+keepCount)
-	compressed = append(compressed, messages[0]) // system / first message
+	// Build compressed message list: a single summary user turn followed by the
+	// assistant-anchored tail.
+	compressed := make([]api.Message, 0, 1+keepCount)
 	compressed = append(compressed, api.Message{
 		Role:    "user",
 		Content: "[Conversation Summary]\n" + summary + "\n\n[Continue the task from where you left off.]",
@@ -172,7 +176,7 @@ func (cc *ChatCompressor) trimOldToolResults(messages []api.Message, keepCount i
 	}
 	for i := 0; i < cutoff; i++ {
 		if messages[i].Role == "tool" && len(messages[i].Content) > 300 {
-			messages[i].Content = messages[i].Content[:100] + "..."
+			messages[i].Content = clipRunes(messages[i].Content, 100)
 		}
 	}
 }
@@ -195,11 +199,9 @@ func (cc *ChatCompressor) generateSummary(
 		summaryInput.WriteString(fmt.Sprintf("[%s] ", m.Role))
 		content := m.Content
 		if m.Role == "tool" {
-			if len(content) > 100 {
-				content = content[:100] + "..."
-			}
-		} else if len(content) > 250 {
-			content = content[:250] + "..."
+			content = clipRunes(content, 100)
+		} else {
+			content = clipRunes(content, 250)
 		}
 		summaryInput.WriteString(content)
 		if len(m.ToolCalls) > 0 {
@@ -207,10 +209,7 @@ func (cc *ChatCompressor) generateSummary(
 				if path, ok := tc.Input["filePath"].(string); ok {
 					summaryInput.WriteString(fmt.Sprintf(" → %s(%s)", tc.Name, path))
 				} else if cmd, ok := tc.Input["command"].(string); ok {
-					if len(cmd) > 60 {
-						cmd = cmd[:60] + "..."
-					}
-					summaryInput.WriteString(fmt.Sprintf(" → bash(%s)", cmd))
+					summaryInput.WriteString(fmt.Sprintf(" → bash(%s)", clipRunes(cmd, 60)))
 				} else {
 					summaryInput.WriteString(fmt.Sprintf(" → %s()", tc.Name))
 				}
@@ -230,6 +229,30 @@ func (cc *ChatCompressor) generateSummary(
 		return "", err
 	}
 	return resp.Content, nil
+}
+
+// toolTargetPath extracts the file path a write/edit tool call targets, honoring
+// the same key aliases the tools accept (filePath, file_path, path, filepath,
+// file) and normalizing the result so two spellings of the same path compare
+// equal. Returns "" if no path key is present.
+func toolTargetPath(input map[string]any) string {
+	for _, k := range []string{"filePath", "file_path", "path", "filepath", "file"} {
+		if v, ok := input[k].(string); ok && v != "" {
+			return filepath.Clean(v)
+		}
+	}
+	return ""
+}
+
+// clipRunes truncates s to at most n runes (not bytes), appending "..." if it
+// was shortened. Byte-slicing (s[:n]) would cut multi-byte UTF-8 sequences mid
+// character and corrupt Chinese/emoji text, which this codebase produces heavily.
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
 
 // countTokens is declared in engine.go (1 token ≈ 4 chars)
