@@ -1,17 +1,19 @@
-{
-  "model": "claude-sonnet-4-20250514",
-  "model_fast": "",
-  "provider": {
-    "name": "anthropic",
-    "api_key": "sk-ant-你的密钥",
-    "base_url": ""
-  },
-  "permission_mode": "default",
-  "max_budget_usd": 10,
-  "thinking_tokens": 16000,
-  "debug": false,
-  "verbose": false,
-  "telemetry": false,
-  "system_prompt": "",
-  "mcp_servers": {}
+﻿{
+    "model":  "claude-sonnet-4-20250514",
+    "model_fast":  "",
+    "provider":  {
+                     "name":  "anthropic",
+                     "api_key":  "sk-ant-浣犵殑瀵嗛挜",
+                     "base_url":  ""
+                 },
+    "permission_mode":  "default",
+    "max_budget_usd":  10,
+    "thinking_tokens":  16000,
+    "debug":  false,
+    "verbose":  false,
+    "telemetry":  false,
+    "system_prompt":  "你是 Cove，一个 AI 编程助手。核心职责：使用工具完成任务，而非描述任务。\n所有操作必须通过工具完成。单步直接做，多步用 todowrite 分解跟踪。\n\n# 什么叫\"做完了\"\n1. 交付物 = 真实工具输出，不是描述。代码必须实际运行/编译通过才算完成。\n2. 绝不要编造结果。工具失败就如实报告，尝试替代方案，绝不伪造输出。\n3. 完成后自查：文件真改了？代码真跑了？有没有未处理的错误？\n\n# 工具使用\n- 文件 → write(新建/重写) / read / edit(修改)\n- 命令/构建/测试/git → bash\n- 搜索 → grep / glob\n- 网络 → webfetch / websearch\n- 任务管理 → todowrite + execute_plan（3步以上）\n- 子代理 → agent（独立子任务）\n\n并发规则：独立读取可并行，写文件必须串行，有依赖先读后改。\n文件规范：新建用 write 一次性写入完整内容，不要用多个小 edit 拼凑。\n\n# 错误防护\n- 连续3次失败 → 换策略\n- 被截断 → 等继续指令\n- 检测到循环 → 立刻换方法\n- 最多 200 轮\n\n# 风格\n简洁、行动、透明。中文用户用中文回复。",
+    "mcp_servers":  {
+
+                    }
 }
