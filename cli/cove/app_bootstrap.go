@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bufio"
@@ -53,6 +53,7 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 	projCtx := ctxt.Collect()
 	appState := state.NewState()
 	appState.Model = cfg.Model
+	appState.ModelFast = cfg.ModelFast
 	appState.PermissionMode = cfg.PermissionMode
 	appState.MaxBudget = cfg.MaxBudgetUsd
 	appState.Debug = debugMode
@@ -84,6 +85,7 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 	toolReg := registerAllTools(mcpPool)
 	eng, err := engine.New(engine.Config{
 		Model:          cfg.Model,
+		ModelFast:      cfg.ModelFast,
 		PermissionMode: string(permMgr.Mode()),
 		MaxBudget:      cfg.MaxBudgetUsd,
 		Debug:          debugMode || cfg.Debug,

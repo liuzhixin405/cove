@@ -1,8 +1,9 @@
-package state
+﻿package state
 
 type AppState struct {
 	SessionID      string
 	Model          string
+	ModelFast      string
 	PermissionMode string
 	BudgetUsed     float64
 	MaxBudget      float64

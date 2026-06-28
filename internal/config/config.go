@@ -1,4 +1,4 @@
-package config
+﻿package config
 
 import (
 	"encoding/json"
@@ -36,6 +36,7 @@ func maskKey(key string) string {
 
 type Config struct {
 	Model          string                     `json:"model"`
+	ModelFast      string                     `json:"model_fast,omitempty"`
 	Provider       ProviderConfig             `json:"provider"`
 	PermissionMode string                     `json:"permission_mode"`
 	MaxBudgetUsd   float64                    `json:"max_budget_usd"`
@@ -116,6 +117,9 @@ func loadProjectOverride(cfg *Config) error {
 	if override.Model != "" {
 		cfg.Model = override.Model
 	}
+	if override.ModelFast != "" {
+		cfg.ModelFast = override.ModelFast
+	}
 	if override.PermissionMode != "" {
 		cfg.PermissionMode = override.PermissionMode
 	}
@@ -135,6 +139,9 @@ func applyDefaults(cfg *Config) {
 	normalizeConfig(cfg)
 	if cfg.Model == "" || strings.EqualFold(cfg.Model, "auto") {
 		cfg.Model = DefaultModelForProvider(cfg.Provider.Name)
+	}
+	if cfg.ModelFast == "" || strings.EqualFold(cfg.ModelFast, "auto") {
+		cfg.ModelFast = "deepseek-v4-flash"
 	}
 	if cfg.PermissionMode == "" {
 		cfg.PermissionMode = "default"

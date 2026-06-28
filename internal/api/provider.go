@@ -33,6 +33,7 @@ type Message struct {
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
 	Name             string        `json:"name,omitempty"`
 	CacheControl     string        `json:"cache_control,omitempty"` // Anthropic prompt caching
+	Synthetic        bool          `json:"synthetic,omitempty"`     // engine-injected (not from real user)
 }
 
 type ToolDef struct {
