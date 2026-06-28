@@ -53,12 +53,15 @@ func (e *Engine) backgroundReview() {
 
 如果没有值得记住的，只输出 NONE。`
 
-		resp, err := e.provider.Chat(ctx, api.ChatRequest{
-			Model:      e.config.Model,
-			SystemBase: prompt,
-			Messages:   []api.Message{{Role: "user", Content: snapshot}},
-			MaxTokens:  300,
-		})
+		compactReviewReq := func(p api.Provider) api.ChatRequest {
+			return api.ChatRequest{
+				Model:      e.config.Model,
+				SystemBase: prompt,
+				Messages:   []api.Message{{Role: "user", Content: snapshot}},
+				MaxTokens:  300,
+			}
+		}
+		resp, _, err := e.fallback.TryChat(ctx, compactReviewReq)
 		if err != nil {
 			log.Warnf("background review failed: %v", err)
 			return

@@ -28,6 +28,8 @@ import (
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plan"
 	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove/internal/repomap"
+	"github.com/liuzhixin405/cove/internal/safety"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
 	"github.com/liuzhixin405/cove/internal/token"
@@ -43,6 +45,7 @@ const maxParallelTools = 8
 
 type Config struct {
 	Model          string
+	ModelFast      string
 	PermissionMode string
 	MaxBudget      float64
 	Debug          bool
@@ -52,10 +55,12 @@ type Config struct {
 	SkillManager   *skills.Manager
 	HookManager    *hooks.Manager
 	Classifier     *permission.Classifier
+	LoopDetectionDisabled bool
 }
 
 type Engine struct {
-	provider              api.Provider
+	fallback              *api.ModelFallback
+	modelRouter           *api.ModelRouter
 	registry              *tool.Registry
 	messages              []api.Message
 	config                Config
@@ -79,10 +84,16 @@ type Engine struct {
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
 	lastSaveTime          time.Time
-	currentModel          string     // currently active model (starts as config.Model, may change on fallback)
-	fallbackActive        bool       // true if we have already switched to the fallback model
 	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
-	loopHistory          []string   // recent tool-call fingerprints for loop detection
+	loopHistory          []string       // recent tool-call fingerprints for loop detection
+	loopDetector         *LoopDetector // enhanced 2-layer loop detection (P0)
+	compressor           *ChatCompressor // AI-powered conversation compression (P0-3)
+	masker               *ToolOutputMasker // tool output masking to save context (P1)
+	nextSpeaker          *NextSpeaker      // predicts when to yield to user (P1)
+	safetyChecker        *safety.Checker   // security scan before tool execution (P1)
+	policyEngine         *permission.PolicyEngine // rule-based permission policies (P2)
+	sessionView          *session.SessionView     // snapshot for change tracking (P2)
+	enhancedRepoMap      *repomap.EnhancedGenerator // incremental repo map (P2)
 	iterCount             int        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex // lock for interactive permission prompts
 	// OnEngineOutput, if set, receives engine diagnostic lines
@@ -103,7 +114,7 @@ type Engine struct {
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
-	// app appears to hang ("一直无响应"), we can name exactly which stage is stuck.
+	// app appears to hang ("һֱ����Ӧ"), we can name exactly which stage is stuck.
 	actMu  sync.Mutex
 	acts   map[uint64]*activity
 	actSeq uint64
@@ -126,8 +137,12 @@ func New(config Config) (*Engine, error) {
 		return nil, fmt.Errorf("failed to init session store: %w", err)
 	}
 
+	// Create model router for dual-model switching
+	modelRouter := api.NewModelRouter(config.Model, config.ModelFast)
+
 	e := &Engine{
-		provider:    prov,
+		fallback:    api.NewModelFallback([]api.Provider{prov}),
+		modelRouter: modelRouter,
 		registry:    reg,
 		messages:    make([]api.Message, 0),
 		config:      config,
@@ -149,11 +164,39 @@ func New(config Config) (*Engine, error) {
 		fileHistory: make(map[string]bool),
 	}
 
+	if !config.LoopDetectionDisabled {
+		// Use model-aware thresholds: fast (flash) models get more sensitive
+		// because they're more prone to getting stuck in repetitive loops.
+		// Detect fast models by checking if the configured model name contains
+		// fast/flash/mini/lite indicators, rather than comparing ModelFast==Model
+		// (which breaks when model and model_fast are different).
+		isFast := isFastModelName(config.Model)
+		e.loopDetector = NewLoopDetectorWithModel(isFast)
+	}
+	e.compressor = NewChatCompressor()
+	e.masker = NewToolOutputMasker()
+	e.nextSpeaker = NewNextSpeaker()
+	e.safetyChecker = safety.New()
+	e.policyEngine = permission.NewPolicyEngine()
+
+	// Load permission policies from disk if available
+	if home, err := os.UserHomeDir(); err == nil {
+		policyStore, err := permission.NewFilePolicyStorage(filepath.Join(home, ".cove", "policies.json"))
+		if err == nil {
+			if rules, err := policyStore.Load(); err == nil && len(rules) > 0 {
+				e.policyEngine.LoadRules(rules)
+			}
+		}
+	}
+
 	if config.SkillManager != nil {
 		for _, s := range config.SkillManager.All() {
 			e.runtime.SkillPrompts[s.Name] = s.Prompt
 		}
 	}
+
+	// Initialize session view for change tracking
+	e.sessionView = session.NewSessionView(e.messages, 0)
 
 	if store != nil {
 		e.session = &session.Record{
@@ -169,8 +212,10 @@ func New(config Config) (*Engine, error) {
 	if cwd != "" {
 		e.sessionNotes = notes.New(cwd)
 		e.sessionNotes.Load()
+		e.enhancedRepoMap = repomap.NewEnhancedGenerator(cwd)
 	} else {
 		e.sessionNotes = notes.NewGlobal()
+		e.enhancedRepoMap = repomap.NewEnhancedGenerator(".")
 	}
 
 	// Initialize guardrails (tool loop detection)
@@ -199,7 +244,7 @@ func New(config Config) (*Engine, error) {
 
 	// Fire session start hooks
 	if e.hookMgr != nil {
-		e.hookMgr.Fire(context.Background(), hooks.SessionStart, nil)
+		e.hookMgr.FireLegacy(context.Background(), hooks.SessionStart, nil)
 	}
 
 	return e, nil
@@ -213,7 +258,9 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 	if err := prov.Validate(); err != nil {
 		return err
 	}
-	e.provider = prov
+	if prov != nil {
+		e.fallback = api.NewModelFallback([]api.Provider{prov})
+	}
 	e.config.Provider = cfg
 	e.config.Model = model
 	if e.session != nil {
@@ -224,8 +271,11 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
-func (e *Engine) ProviderName() string       { return e.provider.DisplayName() }
-func (e *Engine) Provider() api.Provider     { return e.provider }
+func (e *Engine) ProviderName() string       { return e.fallback.Current().DisplayName() }
+func (e *Engine) Provider() api.Provider     { return e.fallback.Current() }
+// SetProvider replaces the current provider chain with a single-provider fallback.
+// Used primarily by tests to inject mock providers.
+func (e *Engine) SetProvider(p api.Provider) { e.fallback = api.NewModelFallback([]api.Provider{p}) }
 func (e *Engine) SetPermissionMode(mode permission.Mode) {
 	if permission.ValidMode(mode) {
 		e.perm.SetMode(mode)
@@ -266,17 +316,17 @@ func (e *Engine) SystemPrompt() string {
 		return e.systemPrompt
 	}
 	var sb strings.Builder
-	sb.WriteString(`You are an AI coding assistant. You MUST use tools to complete user tasks. Never describe what you would do — actually DO it.
+	sb.WriteString(`You are an AI coding assistant. You MUST use tools to complete user tasks. Never describe what you would do �� actually DO it.
 
 RULES:
 1. Use tools for ALL file ops, command execution, code search, web access.
 2. Single-step tasks: use the tool immediately, no explanation needed.
 3. Multi-step tasks: use todowrite to track progress.
 4. Be concise. Use tools to act, not to describe actions.
-5. For git, tests, builds — use bash. For files — write/read/edit.
+5. For git, tests, builds �� use bash. For files �� write/read/edit.
 6. Use webfetch for URLs. Use grep/glob for searching code.
 7. For creating or fully rewriting files (especially large ones like HTML/CSS/JS): use write with the COMPLETE content in ONE call. Do NOT use many small edit calls for new files.
-8. Each tool call response is ONE file operation. Do NOT attempt to write multiple large files in a single response — write them one at a time across iterations.
+8. Each tool call response is ONE file operation. Do NOT attempt to write multiple large files in a single response �� write them one at a time across iterations.
 
 Available tools:`)
 	for _, t := range e.registry.All() {
@@ -323,7 +373,12 @@ Available tools:`)
 		if e.projCtx.FileTree != "" {
 			sb.WriteString(fmt.Sprintf("\nProject structure:\n%s", e.projCtx.FileTree))
 		}
-		if e.projCtx.RepoMap != "" {
+		// Use enhanced incremental repo map when available
+		if e.enhancedRepoMap != nil {
+			if mapText, _ := e.enhancedRepoMap.GenerateIncremental(200); mapText != "" {
+				sb.WriteString(fmt.Sprintf("\n<repo_map>\n%s\n</repo_map>\n", mapText))
+			}
+		} else if e.projCtx.RepoMap != "" {
 			sb.WriteString(fmt.Sprintf("\nRepository Micro-Map (Defined API structures/schemas):\n%s", e.projCtx.RepoMap))
 		}
 	}
@@ -338,7 +393,7 @@ func (e *Engine) Run(ctx context.Context, userMessage string) (string, error) {
 }
 
 func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta func(delta string)) (string, error) {
-	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Content: userMessage}, onDelta, nil)
+	return e.RunMessageWithStream(ctx, api.Message{Role: "user", Synthetic: true, Content: userMessage}, onDelta, nil)
 }
 
 // Steer injects user guidance into the running agent loop without interrupting.
@@ -394,6 +449,32 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	sp := e.SystemPrompt()
 	toolDefs := e.buildAPIToolDefs()
 
+	// Reset loop detector at the start of each turn
+	if e.loopDetector != nil {
+		e.loopDetector.Reset()
+	}
+	// Snapshot session for change tracking this turn
+	e.sessionView = session.NewSessionView(e.messages, e.totalTokens)
+
+	// Scan user input for safety issues (injection, secrets)
+	if e.safetyChecker != nil {
+		if result := e.safetyChecker.Scan(userMessage.Content, "user_input"); result != nil {
+			if blocking := result.BlockingFinding(); blocking != nil {
+				e.engineOutput(fmt.Sprintf("  \x1b[31m⚠ safety: %s\x1b[0m", blocking.Message))
+				// Warn but don't block — user input is from the actual user
+				log.Warnf("safety finding in user input: %s", blocking.Message)
+			}
+		}
+	}
+
+	// Route the user message to determine which model to use
+	routedModel := e.config.Model // default fallback
+	if e.modelRouter != nil {
+		decision := e.modelRouter.Route(ctx, userMessage.Content)
+		routedModel = decision.Model
+		log.Debugf("model routing: %s (source=%s, reason=%s)", decision.Model, decision.Source, decision.Reason)
+	}
+
 	for iter := 0; iter < MaxIterations; iter++ {
 		e.iterCount = iter + 1
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
@@ -420,22 +501,26 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				}
 			}
 			if !injected {
-				// No tool message yet — put it back
+				// No tool message yet �� put it back
 				e.Steer(steer)
 			}
 		}
 
 		// Compress message history if approaching context limits
-		e.compressHistory()
+		e.checkAndCompress(ctx)
 
 		// Apply prompt cache breakpoints for Anthropic
 		reqMessages := e.messages
-		if e.provider.Name() == "anthropic" {
+		if e.fallback.Current().Name() == "anthropic" {
 			reqMessages = api.InjectCacheBreakpoints(e.messages)
 		}
 
+		modelName := routedModel
+		if modelName == "" {
+			modelName = e.fallback.CurrentModel()
+		}
 		req := api.ChatRequest{
-			Model:      e.currentModel,
+			Model:      modelName,
 			Messages:   reqMessages,
 			SystemBase: sp,
 			Tools:      toolDefs,
@@ -449,14 +534,14 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
 		var walker *repl.WalkingIndicator
 		if iter > 0 && !e.config.Debug {
-			walker = repl.NewWalkingIndicator("思考中...")
+			walker = repl.NewWalkingIndicator("˼����...")
 			walker.Start()
 		}
 
 		if useStream {
 			firstDelta := true
-			modelAct := e.beginActivity("调用模型 " + e.currentModel)
-			resp, err = e.provider.ChatStream(ctx, req, func(ev api.StreamEvent) {
+			modelAct := e.beginActivity("����ģ�� " + e.fallback.CurrentModel())
+			resp, _, err = e.fallback.TryChatStream(ctx, func(p api.Provider) api.ChatRequest { return req }, func(ev api.StreamEvent) {
 				e.progressActivity(modelAct)
 				if firstDelta && walker != nil {
 					walker.Stop()
@@ -472,8 +557,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			})
 			e.endActivity(modelAct)
 		} else {
-			modelAct := e.beginActivity("调用模型 " + e.currentModel)
-			resp, err = e.provider.Chat(ctx, req)
+			modelAct := e.beginActivity("����ģ�� " + e.fallback.CurrentModel())
+			resp, _, err = e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
 			e.endActivity(modelAct)
 		}
 
@@ -485,7 +570,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.messages = prevMessages
 			e.saveSession()
 			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
-				fmt.Sprintf("模型调用失败: %s", err.Error()))
+				fmt.Sprintf("ģ�͵���ʧ��: %s", err.Error()))
 			return "", fmt.Errorf("api: %w", err)
 		}
 
@@ -504,7 +589,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			if resp.Content != "" {
 				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
 			}
-			e.messages = append(e.messages, api.Message{Role: "user", Content: "[system: your previous response was truncated due to length. Please continue, writing one file at a time.]"})
+			e.messages = append(e.messages, newSyntheticUserMsg("[system: your previous response was truncated due to length. Please continue, writing one file at a time.]"))
 			continue
 		}
 
@@ -521,18 +606,49 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		assistantMsg := api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: resp.ToolCalls}
 		e.messages = append(e.messages, assistantMsg)
 
-		// Loop detection: track tool-call fingerprints to break repetitive cycles
-		// that waste tokens. If the same pattern appears 3+ times in 5 consecutive
-		// iterations, inject a guidance message asking the model to change approach.
-		loopFp := e.fingerprintToolCalls(resp.ToolCalls)
-		e.loopHistory = append(e.loopHistory, loopFp)
-		if len(e.loopHistory) > 10 {
-			e.loopHistory = e.loopHistory[1:]
+		// Next-speaker prediction: check if the model signals task completion
+		// Also enforces max iterations as a safety net
+		if e.nextSpeaker != nil {
+			if e.iterCount >= MaxIterations-5 {
+				e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, MaxIterations))
+			}
+			if len(resp.ToolCalls) == 0 && !e.nextSpeaker.ShouldContinue(e.messages) {
+				e.engineOutput("  \x1b[2m(model indicates task complete)\x1b[0m")
+				break
+			}
 		}
-		if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
-			log.Warnf("loop detected: %s", loopFp)
-			e.messages = append(e.messages, api.Message{Role: "user", Content: "[system: 检测到重复循环 — 你最近多次调用了相同的工具和参数组合。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助。]"})
-			e.loopHistory = nil // reset after injecting guidance
+
+		// Loop detection (enhanced 3-layer, P0-1).
+		// Layer 1a: exact tool-call fingerprint in sliding window (14/10 for non-fast, 12/8 for fast).
+		// Layer 1b: fuzzy tool+param pattern in sliding window (12/9 for non-fast, 10/7 for fast).
+		// Layer 2: output content hash in sliding window (40/8 for non-fast, 30/8 for fast).
+		// Layer 3: stagnation detection after N iterations without file activity.
+		loopFp := e.fingerprintToolCalls(resp.ToolCalls)
+		if e.loopDetector != nil {
+			if lr := e.loopDetector.RecordToolCalls(loopFp); lr.Detected {
+				log.Warnf("loop detected (layer %d): %s", lr.Layer, lr.Reason)
+				if lr.Fatal {
+					e.engineOutput("? " + lr.Reason)
+					return "", fmt.Errorf("loop detection: %s", lr.Reason)
+				}
+				// Non-fatal: inject guidance asking the model to change approach
+				e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
+				// Reset fingerprint history so the model gets a fresh start
+				// after seeing the guidance, preventing old history from
+				// immediately triggering another detection.
+				e.loopDetector.ResetFingerprintHistory()
+			}
+		} else {
+			// Fallback: simple loop detection (kept for backward compatibility)
+			e.loopHistory = append(e.loopHistory, loopFp)
+			if len(e.loopHistory) > 10 {
+				e.loopHistory = e.loopHistory[1:]
+			}
+			if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
+				log.Warnf("loop detected: %s", loopFp)
+				e.messages = append(e.messages, newSyntheticUserMsg("[system: 检测到重复循环 — 模型连续多次调用相同的工具和参数。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助]"))
+				e.loopHistory = nil // reset after injecting guidance
+			}
 		}
 
 		type toolResult struct {
@@ -589,7 +705,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			for i, tc := range resp.ToolCalls {
 				if !e.config.Debug {
 					// Show tool start
-					e.engineOutput(fmt.Sprintf("\r  \x1b[2m⏳ [%s]...\x1b[0m", tc.Name))
+					e.engineOutput(fmt.Sprintf("\r  \x1b[2m? [%s]...\x1b[0m", tc.Name))
 				}
 				res := e.executeTool(ctx, tc)
 				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
@@ -609,11 +725,25 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if isErr {
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
-					fmt.Sprintf("工具 %s 失败: %s", r.Name, summarizeResult(r.Content)))
+					fmt.Sprintf("���� %s ʧ��: %s", r.Name, summarizeResult(r.Content)))
 			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
 			})
+			// Feed loop detector with tool output (Layer 2: content hash)
+			if e.loopDetector != nil && !isErr {
+				if lr := e.loopDetector.RecordOutput(r.Content); lr.Detected {
+					log.Warnf("loop detected (layer 2): %s", lr.Reason)
+					if lr.Fatal {
+						e.engineOutput("? " + lr.Reason)
+						return "", fmt.Errorf("loop detection: %s", lr.Reason)
+					}
+					// Non-fatal: inject guidance asking the model to change approach
+					e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
+					// Reset fingerprint history so the model gets a fresh start
+					e.loopDetector.ResetFingerprintHistory()
+				}
+			}
 		}
 
 		// Circuit breaker: if tools keep failing, hint the model to change approach
@@ -636,12 +766,21 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		} else {
 			e.consecutiveErrors = 0
 		}
-
 		e.totalTokens = countTokens(e.messages)
-		if e.totalTokens > CompactTokenThreshold && iter > 5 && len(e.messages) > 16 {
-			compactAct := e.beginActivity("压缩上下文")
-			e.Compact(ctx)
-			e.endActivity(compactAct)
+		// Compression is handled by checkAndCompress at iteration start (line ~465).
+		// Record iteration for stagnation detection (Layer 3).
+		// L3 is log-only — no file activity doesn't mean the model is stuck
+		// (research, reading, search are legitimate non-file workflows).
+		if e.loopDetector != nil {
+			if lr := e.loopDetector.RecordIteration(); lr.Detected {
+				log.Warnf("stagnation (layer 3): %s", lr.Reason)
+				if lr.Fatal {
+					e.engineOutput("? " + lr.Reason)
+					return "", fmt.Errorf("loop detection: %s", lr.Reason)
+				}
+				// L3 is a weak signal — log only, don't inject guidance.
+				// The model may be doing legitimate research/reading.
+			}
 		}
 	}
 
@@ -655,14 +794,23 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
 	}
 
+	// Run safety checks before executing the tool
+	if e.safetyChecker != nil {
+		result := e.safetyChecker.ScanToolCall(tc.Name, tc.Input)
+		if blocking := result.BlockingFinding(); blocking != nil {
+			e.engineOutput(fmt.Sprintf("  \x1b[31m✗ blocked: %s\x1b[0m", blocking.Message))
+			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message)
+		}
+	}
+
 	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
 	// or MCP call that ignores ctx) is attributable by the stall monitor.
-	toolAct := e.beginActivity("执行工具 " + tc.Name)
+	toolAct := e.beginActivity("ִ�й��� " + tc.Name)
 	defer e.endActivity(toolAct)
 
 	// Fire pre-tool-use hooks
 	if e.hookMgr != nil {
-		e.hookMgr.Fire(ctx, hooks.PreToolUse, hooks.ToolUseInfo{
+		e.hookMgr.FireLegacy(ctx, hooks.PreToolUse, hooks.ToolUseInfo{
 			ToolName: tc.Name,
 			Input:    tc.Input,
 		})
@@ -739,7 +887,16 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 			reason = "permission denied"
 		}
 		if decision == permission.DAsk {
-			if e.PermissionPrompt != nil {
+			// Policy engine override: check rules before interactive prompt
+			if e.policyEngine != nil {
+				action := e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode)
+				if action == permission.ActionAllow {
+					decision = permission.DAllow // skip interactive prompt
+				} else if action == permission.ActionDeny {
+					return fmt.Sprintf("Error: denied by policy for %s", tc.Name)
+				}
+			}
+			if decision == permission.DAsk && e.PermissionPrompt != nil {
 				if e.OnPermissionPause != nil {
 					e.OnPermissionPause()
 				}
@@ -751,12 +908,12 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 				if e.OnPermissionDone != nil {
 					e.OnPermissionDone()
 				}
-				if !approved {
+					if !approved {
+						return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
+					}
+				} else {
 					return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
 				}
-			} else {
-				return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
-			}
 		} else {
 			return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 		}
@@ -792,7 +949,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 	}
 	// Fire post-tool-use hooks
 	if e.hookMgr != nil {
-		e.hookMgr.Fire(ctx, hooks.PostToolUse, hooks.ToolUseInfo{
+		e.hookMgr.FireLegacy(ctx, hooks.PostToolUse, hooks.ToolUseInfo{
 			ToolName: tc.Name,
 			Input:    tc.Input,
 			Result:   output,
@@ -903,6 +1060,10 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 			if e.sessionNotes != nil {
 				e.sessionNotes.AddTask(fmt.Sprintf("File: %s", filepath.Base(path)))
 			}
+			// Notify loop detector of file activity (Layer 3 stagnation tracking)
+			if e.loopDetector != nil {
+				e.loopDetector.RecordFileActivity(path, tc.Name == "write")
+			}
 		}
 	case "bash":
 		if e.projCtx == nil {
@@ -921,7 +1082,6 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 		}
 	}
 }
-
 func resolvePath(p, cwd string) (string, bool) {
 	if filepath.IsAbs(p) {
 		return filepath.Clean(p), true
@@ -935,139 +1095,55 @@ func resolvePath(p, cwd string) (string, bool) {
 	return "", false
 }
 
+// Compact compresses the message history on demand (e.g. via /compact command).
+// Delegates to the ChatCompressor's two-layer pipeline.
 func (e *Engine) Compact(ctx context.Context) {
-	log.Debugf("agent compacting: %d tokens, %d msgs", e.totalTokens, len(e.messages))
+	e.compactIfNeeded(ctx)
+}
+
+// checkAndCompress runs the compressor at the start of each iteration as a lightweight guard.
+func (e *Engine) checkAndCompress(ctx context.Context) {
+	// Mask old tool outputs before compression to reduce tokens
+	if e.masker != nil {
+		_, maskedMsgs := e.masker.Mask(e.messages, nil)
+		e.messages = maskedMsgs
+		e.totalTokens = countTokens(e.messages)
+	}
+
+	if e.compressor == nil {
+		return
+	}
+	if !e.compressor.NeedsCompression(e.totalTokens, CompactTokenThreshold) {
+		return
+	}
+	e.compactIfNeeded(ctx)
+}
+
+// compactIfNeeded runs the full two-layer compression pipeline.
+func (e *Engine) compactIfNeeded(ctx context.Context) {
+	if e.compressor == nil {
+		return
+	}
 	if e.sessionNotes != nil {
 		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
 	}
-	if len(e.messages) < 12 {
-		return
-	}
-
-	// Layer 1: Trim old tool results to 1-line summaries (cheap, no API call)
-	e.trimOldToolResults()
-
-	// Recount after trimming
-	e.totalTokens = countTokens(e.messages)
-	if e.totalTokens <= CompactTokenThreshold {
-		log.Debugf("compact: trimming alone sufficient (%d tokens)", e.totalTokens)
-		return
-	}
-
-	// Layer 2: LLM summary of middle conversation
-	// Strategy: keep the first user message + last 6 messages intact.
-	// Summarize everything in between.
-	// Ensure we don't split assistant+tool pairs.
-	keepTail := 6
-	if keepTail > len(e.messages)-2 {
-		keepTail = len(e.messages) - 2
-	}
-
-	// Find a safe split point — never split inside an assistant→tool pair
-	splitIdx := len(e.messages) - keepTail
-	for splitIdx > 1 && splitIdx < len(e.messages) {
-		if e.messages[splitIdx].Role == "tool" {
-			splitIdx-- // include the preceding assistant msg
-		} else {
-			break
+	
+	// Use model_fast for compression summaries — much cheaper than the main model.
+	// Falls back to the main model if model_fast is not configured.
+	tryChat := func(ctx context.Context, req api.ChatRequest) (*api.ChatResponse, error) {
+		if e.config.ModelFast != "" {
+			req.Model = e.config.ModelFast
 		}
+		resp, _, err := e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
+		return resp, err
 	}
-	if splitIdx <= 1 {
-		return // nothing worth compacting
-	}
-
-	history := e.messages[1:splitIdx]
-	if len(history) < 4 {
-		return
-	}
-
-	// Build a more structured summary request
-	var summaryInput strings.Builder
-	summaryInput.WriteString("Summarize this conversation history concisely. Structure:\n")
-	summaryInput.WriteString("- Key decisions made\n- Files created/modified (paths)\n- Current task status\n- Errors encountered and resolutions\n- Important context for continuing\n\n")
-
-	for _, m := range history {
-		summaryInput.WriteString(fmt.Sprintf("[%s] ", m.Role))
-		content := m.Content
-		// For tool results, keep file paths but truncate output aggressively
-		if m.Role == "tool" {
-			if len(content) > 100 {
-				content = content[:100] + "..."
-			}
-		} else if len(content) > 250 {
-			content = content[:250] + "..."
-		}
-		summaryInput.WriteString(content)
-		if len(m.ToolCalls) > 0 {
-			for _, tc := range m.ToolCalls {
-				if path, ok := tc.Input["filePath"].(string); ok {
-					summaryInput.WriteString(fmt.Sprintf(" → %s(%s)", tc.Name, path))
-				} else if cmd, ok := tc.Input["command"].(string); ok {
-					if len(cmd) > 60 {
-						cmd = cmd[:60] + "..."
-					}
-					summaryInput.WriteString(fmt.Sprintf(" → bash(%s)", cmd))
-				} else {
-					summaryInput.WriteString(fmt.Sprintf(" → %s()", tc.Name))
-				}
-			}
-		}
-		summaryInput.WriteString("\n")
-	}
-
-	compactResp, err := e.provider.Chat(ctx, api.ChatRequest{
-		Model:      e.currentModel,
-		SystemBase: "You are a conversation summarizer. Be concise and factual. Output a structured summary under 300 words. Include file paths mentioned.",
-		Messages:   []api.Message{{Role: "user", Content: summaryInput.String()}},
-		MaxTokens:  600,
-	})
-	if err != nil {
-		log.Warnf("compact failed: %v", err)
-		return
-	}
-
-	// Rebuild message list: [first_user] + [summary] + [recent_tail]
-	newMsgs := make([]api.Message, 0, 2+keepTail)
-	newMsgs = append(newMsgs, e.messages[0]) // first user message
-	newMsgs = append(newMsgs, api.Message{
-		Role:    "user",
-		Content: "[Context Summary]\n" + compactResp.Content + "\n\n[Continue the task from where you left off.]",
-	})
-	newMsgs = append(newMsgs, e.messages[splitIdx:]...) // recent messages preserved intact
-
-	oldTokens := e.totalTokens
-	oldMsgs := len(e.messages)
-	e.messages = newMsgs
-	e.totalTokens = countTokens(e.messages)
-	log.Debugf("agent compacted: %d tokens/%d msgs -> %d tokens/%d msgs (kept tail %d)",
-		oldTokens, oldMsgs, e.totalTokens, len(e.messages), keepTail)
-}
-
-// trimOldToolResults replaces verbose tool results in old messages with 1-line summaries.
-// Preserves the last 6 messages intact. This is a cheap pre-processing step.
-func (e *Engine) trimOldToolResults() {
-	if len(e.messages) <= 8 {
-		return
-	}
-	// Only trim messages before the last 6
-	cutoff := len(e.messages) - 6
-	for i := 0; i < cutoff; i++ {
-		m := &e.messages[i]
-		if m.Role != "tool" {
-			continue
-		}
-		if len(m.Content) <= 200 {
-			continue // already short
-		}
-		// Generate a 1-line summary: [tool_name] first_line... (N chars)
-		firstLine := m.Content
-		if idx := strings.IndexByte(firstLine, '\n'); idx > 0 {
-			firstLine = firstLine[:idx]
-		}
-		if len(firstLine) > 80 {
-			firstLine = firstLine[:80] + "..."
-		}
-		m.Content = fmt.Sprintf("[%s] %s (%d chars原始输出已压缩)", m.Name, firstLine, len(m.Content))
+	
+	result, newMsgs := e.compressor.Compress(ctx, e.messages, e.totalTokens, CompactTokenThreshold, tryChat)
+	if result.Compressed {
+		e.messages = newMsgs
+		e.totalTokens = countTokens(e.messages)
+		log.Debugf("agent compacted: %d tokens/%d msgs -> %d tokens/%d msgs",
+			result.OldCount, result.NewCount, e.totalTokens, len(e.messages))
 	}
 }
 
@@ -1110,8 +1186,8 @@ func (e *Engine) saveSession() {
 	e.session.TokensOut = e.costTracker.TotalOutput
 	e.session.Cost = e.costTracker.TotalCost
 	e.session.UpdatedAt = now
-	// Auto-set title from user intent and repair low-signal legacy titles.
-	if len(e.messages) > 0 && (e.session.Title == "New session" || e.session.Title == "" || isLowSignalSessionTitle(e.session.Title)) {
+	// Auto-set title from first real user message
+	if len(e.messages) > 0 && (e.session.Title == "New session" || e.session.Title == "") {
 		if title := pickSessionTitle(e.messages); title != "" {
 			e.session.Title = title
 		}
@@ -1119,94 +1195,82 @@ func (e *Engine) saveSession() {
 	e.store.Save(e.session)
 }
 
-func pickSessionTitle(messages []api.Message) string {
-	fallback := ""
-	for _, m := range messages {
-		if m.Role != "user" {
-			continue
-		}
-		text := strings.TrimSpace(m.Content)
-		if text == "" {
-			continue
-		}
-		if len(text) > 60 {
-			text = text[:60] + "..."
-		}
-		if !isLowSignalSessionTitle(text) {
-			return text
-		}
-		if fallback == "" {
-			fallback = text
-		}
-	}
-	return fallback
-}
-
-func isLowSignalSessionTitle(s string) bool {
-	v := strings.TrimSpace(strings.ToLower(s))
-	if v == "" {
+// isSyntheticUserMessage returns true if a user-role message was injected
+// by the engine (loop guidance, compression summary, circuit breaker, etc.)
+// rather than authored by the actual user. These should never be used as
+// session titles or history previews.
+func isSyntheticUserMessage(content string) bool {
+	c := strings.TrimSpace(content)
+	if c == "" {
 		return true
 	}
-	if len([]rune(v)) <= 2 {
-		return true
+	// Engine-injected prefixes
+	syntheticPrefixes := []string{
+		"[system:",                     // circuit breaker
+		"[Conversation Summary]",       // AI compression
+		"[系统检测到重复操作循环]",        // loop guidance (Chinese)
+		"[Context truncated",           // truncation notice
+		"[用户指引]",                    // steer guidance
+		"[Continue the task",           // compression continuation
+		"[会话摘要]",                    // old compression (Chinese)
 	}
-	// Pre-clean punctuation and emojis to prevent bypasses like "??" or "!!"
-	v = strings.TrimFunc(v, func(r rune) bool {
-		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r >= 0x4e00)
-	})
-	if v == "" {
-		return true
-	}
-	// Direct exact match noises
-	noise := map[string]bool{
-		"write":             true,
-		"write a file":      true,
-		"read":              true,
-		"read file":         true,
-		"grep":              true,
-		"continue":          true,
-		"继续":                true,
-		"hi":                true,
-		"hello":             true,
-		"你好":                true,
-		"?":                 true,
-		"list":              true,
-		"ls":                true,
-		"l":                 true,
-		"bash":              true,
-		"show":              true,
-		"cat":               true,
-		"run slow tool":     true,
-		"do something":      true,
-		"do something slow": true,
-	}
-	if noise[v] {
-		return true
-	}
-	if strings.HasPrefix(v, "/") {
-		return true
-	}
-	// Filter out command line tools & exact low-value verbs
-	fields := strings.Fields(v)
-	if len(fields) > 0 {
-		first := fields[0]
-
-		// If the title starts with a common tool verb, discard it
-		commonTools := map[string]bool{
-			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
-			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
-			"go": true, "python": true, "python3": true, "pip": true, "npm": true, "node": true,
-			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
-			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
-			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
-			"run": true, "do": true, "exec": true, "execute": true, "test": true,
-			"write": true, "read": true,
-		}
-		if commonTools[first] {
+	for _, p := range syntheticPrefixes {
+		if strings.HasPrefix(c, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// newSyntheticUserMsg creates a user-role message marked as engine-injected,
+// ensuring it won't be used as a session title or history preview.
+func newSyntheticUserMsg(content string) api.Message {
+	return api.Message{Role: "user", Content: content, Synthetic: true}
+}
+
+// pickSessionTitle returns the first real (non-synthetic) user message
+// as the session title, truncated to 60 chars. Returns "" if no valid message found.
+// looksSynthetic checks if a user message is engine-injected.
+// Primary check: Synthetic flag (new messages).
+// Fallback: content prefix matching (old sessions from before Synthetic was added).
+func looksSynthetic(m api.Message) bool {
+	if m.Synthetic {
+		return true
+	}
+	// Backward-compatible: old sessions don't have Synthetic flag.
+	// Check content for known engine-injected prefixes.
+	c := strings.TrimSpace(m.Content)
+	knownPrefixes := []string{
+		"[system:",
+		"[Conversation Summary]",
+		"[系统检测到重复操作循环]",
+		"[Context truncated",
+		"[用户指引]",
+		"[Continue the task",
+		"[会话摘要]",
+		"run slow tool",
+		"do something",
+		"slow response",
+	}
+	for _, p := range knownPrefixes {
+		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func pickSessionTitle(messages []api.Message) string {
+	for _, m := range messages {
+		if m.Role == "user" && !looksSynthetic(m) && strings.TrimSpace(m.Content) != "" {
+			text := strings.TrimSpace(m.Content)
+			if len(text) > 60 {
+				text = text[:60] + "..."
+			}
+			return text
+		}
+	}
+	return ""
 }
 
 // SaveSession exports session persistence for the REPL to call on exit.
@@ -1404,13 +1468,25 @@ func formatToolLine(name, summary string, isError bool) string {
 		green = "\x1b[32m"
 	)
 	if isError {
-		return fmt.Sprintf("  %s✗%s %s[%s]%s %s%s%s", red, reset, red, name, reset, red, summary, reset)
+		return fmt.Sprintf("  %s?%s %s[%s]%s %s%s%s", red, reset, red, name, reset, red, summary, reset)
 	}
-	return fmt.Sprintf("  %s✓%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
+	return fmt.Sprintf("  %s?%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
 }
 
 // runTurnEndPipeline executes quiet post-turn persistence only.
 func (e *Engine) runTurnEndPipeline() {
+	// Capture session diff for change tracking
+	if e.sessionView != nil {
+		currentView := session.NewSessionView(e.messages, e.totalTokens)
+		if diff := session.Diff(e.sessionView, currentView); diff.HasChanges() {
+			summary := diff.Summary()
+			log.Debugf("session changes: %s", summary)
+			if len(diff.AddedFiles) > 0 || len(diff.AddedTools) > 0 {
+				e.engineOutput(fmt.Sprintf("  \x1b[2m📊 %s\x1b[0m", summary))
+			}
+		}
+		e.sessionView = currentView
+	}
 	// Flush session notes (sync, fast I/O)
 	if e.sessionNotes != nil {
 		e.sessionNotes.Flush()
@@ -1514,8 +1590,8 @@ func (e *Engine) WirePlanExecutor() {
 		return
 	}
 
-	if e.provider != nil {
-		d := delegate.NewDelegator(e.provider, e.config.Model, e.registry.All())
+	if e.fallback != nil && e.fallback.Current() != nil {
+		d := delegate.NewDelegator(e.fallback.Current(), e.fallback.CurrentModel(), e.registry.All())
 		pe := plan.NewPlanExecutor(d, e.runtime)
 		e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
 			pl, err := plan.FromRuntime("plan", e.runtime)
@@ -1561,6 +1637,19 @@ func (e *Engine) fingerprintToolCalls(toolCalls []api.ToolCall) string {
 	return strings.Join(parts, "|")
 }
 
+// isFastModelName checks if a model name indicates a fast/flash/cheap model
+// that is more prone to repetitive loops and needs tighter detection thresholds.
+func isFastModelName(model string) bool {
+	model = strings.ToLower(model)
+	fastIndicators := []string{"flash", "mini", "lite", "tiny", "fast", "haiku", "nano"}
+	for _, ind := range fastIndicators {
+		if strings.Contains(model, ind) {
+			return true
+		}
+	}
+	return false
+}
+
 // countRecent counts how many times the fingerprint appears in the last window
 // entries of the loop history.
 func (e *Engine) countRecent(fp string, window int) int {
@@ -1577,72 +1666,3 @@ func (e *Engine) countRecent(fp string, window int) int {
 	return count
 }
 
-// compressHistory compresses the middle portion of the message history when
-// it grows too large. It keeps the first N messages (system + early context)
-// and the last M messages (recent conversation), replacing the middle with a
-// summary message. This prevents hitting context limits in long conversations.
-func (e *Engine) compressHistory() {
-	const maxMessages = 100    // threshold before compression
-	const keepFirst = 8        // keep first N messages
-	const keepLast = 30        // keep last M messages
-
-	if len(e.messages) <= maxMessages {
-		return
-	}
-
-	// Partition: [head ... middle ... tail]
-	head := e.messages[:keepFirst]
-	middle := e.messages[keepFirst : len(e.messages)-keepLast]
-	tail := e.messages[len(e.messages)-keepLast:]
-
-	// Build a concise summary of the middle section
-	var summary strings.Builder
-	summary.WriteString("[会话摘要] 以下是你与用户之前对话的摘要（共 ")
-	summary.WriteString(fmt.Sprintf("%d 条消息", len(middle)))
-	summary.WriteString("）：\n")
-
-	userCount := 0
-	toolCount := 0
-	for _, msg := range middle {
-		switch msg.Role {
-		case "user":
-			if userCount < 5 && len(msg.Content) > 0 {
-				summary.WriteString("- 用户: ")
-				s := truncate(msg.Content, 200)
-				summary.WriteString(s)
-				summary.WriteString("\n")
-			}
-			userCount++
-		case "assistant":
-			if len(msg.Content) > 0 {
-				s := truncate(msg.Content, 200)
-				if s != "" {
-					summary.WriteString("- 助手: ")
-					summary.WriteString(s)
-					summary.WriteString("\n")
-				}
-			}
-			if len(msg.ToolCalls) > 0 {
-				toolCount += len(msg.ToolCalls)
-			}
-		}
-	}
-	if userCount > 5 {
-		summary.WriteString(fmt.Sprintf("... 还有 %d 条用户消息\n", userCount-5))
-	}
-	if toolCount > 0 {
-		summary.WriteString(fmt.Sprintf("期间调用了 %d 次工具\n", toolCount))
-	}
-
-	// Rebuild: head + summary + tail
-	compressed := make([]api.Message, 0, len(head)+1+len(tail))
-	compressed = append(compressed, head...)
-	compressed = append(compressed, api.Message{
-		Role:    "user",
-		Content: summary.String(),
-	})
-	compressed = append(compressed, tail...)
-
-	e.messages = compressed
-	log.Debugf("compressed history: %d -> %d messages", len(head)+len(middle)+len(tail), len(compressed))
-}

@@ -88,8 +88,9 @@ func (s *Store) List() ([]Record, error) {
 			UpdatedAt time.Time `json:"updated_at"`
 			Title     string    `json:"title"`
 			Messages  []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role      string `json:"role"`
+				Content   string `json:"content"`
+				Synthetic bool   `json:"synthetic,omitempty"`
 			} `json:"messages"`
 			Model     string  `json:"model"`
 			TokensIn  int     `json:"tokens_in"`
@@ -127,26 +128,34 @@ func (s *Store) path(id string) string {
 }
 
 func firstUserPreview(messages []struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Synthetic bool   `json:"synthetic,omitempty"`
 }) string {
-	var fallback string
 	for _, m := range messages {
-		if m.Role != "user" || m.Content == "" {
-			continue
-		}
-		text := compactPreview(m.Content, 50)
-		if text == "" {
-			continue
-		}
-		if !isLowSignalHistoryText(text) {
-			return text
-		}
-		if fallback == "" {
-			fallback = text
+		if m.Role == "user" && !m.Synthetic && strings.TrimSpace(m.Content) != "" {
+			if !looksSyntheticContent(m.Content) {
+				return compactPreview(m.Content, 50)
+			}
 		}
 	}
-	return fallback
+	return ""
+}
+
+func looksSyntheticContent(c string) bool {
+	c = strings.TrimSpace(c)
+	knownPrefixes := []string{
+		"[system:", "[Conversation Summary]",
+		"[系统检测到重复操作循环]", "[Context truncated",
+		"[用户指引]", "[Continue the task", "[会话摘要]",
+		"run slow tool", "do something", "slow response",
+	}
+	for _, p := range knownPrefixes {
+		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // countGenuineUserTurns counts only real user-authored turns, excluding the
@@ -155,15 +164,16 @@ func firstUserPreview(messages []struct {
 // prefixed with "[system:"). The raw message count is misleading because it
 // also includes assistant replies and tool-result messages.
 func countGenuineUserTurns(messages []struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Synthetic bool   `json:"synthetic,omitempty"`
 }) int {
 	n := 0
 	for _, m := range messages {
 		if m.Role != "user" {
 			continue
 		}
-		if strings.HasPrefix(strings.TrimSpace(m.Content), "[system:") {
+		if m.Synthetic {
 			continue
 		}
 		n++
@@ -172,8 +182,9 @@ func countGenuineUserTurns(messages []struct {
 }
 
 func countToolMessages(messages []struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Synthetic bool   `json:"synthetic,omitempty"`
 }) int {
 	n := 0
 	for _, m := range messages {
@@ -182,73 +193,6 @@ func countToolMessages(messages []struct {
 		}
 	}
 	return n
-}
-
-func isLowSignalHistoryText(s string) bool {
-	v := strings.TrimSpace(strings.ToLower(s))
-	if v == "" {
-		return true
-	}
-	if len([]rune(v)) <= 2 {
-		return true
-	}
-	// Pre-clean punctuation and emojis to prevent bypasses like "??" or "!!"
-	v = strings.TrimFunc(v, func(r rune) bool {
-		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r >= 0x4e00)
-	})
-	if v == "" {
-		return true
-	}
-	// Direct exact match noises
-	noise := map[string]bool{
-		"write":             true,
-		"write a file":      true,
-		"read":              true,
-		"read file":         true,
-		"grep":              true,
-		"继续":                true,
-		"continue":          true,
-		"你好":                true,
-		"hi":                true,
-		"hello":             true,
-		"?":                 true,
-		"list":              true,
-		"ls":                true,
-		"l":                 true,
-		"bash":              true,
-		"show":              true,
-		"cat":               true,
-		"run slow tool":     true,
-		"do something":      true,
-		"do something slow": true,
-	}
-	if noise[v] {
-		return true
-	}
-	if strings.HasPrefix(v, "/") {
-		return true
-	}
-	// Filter out command line tools & exact low-value verbs
-	fields := strings.Fields(v)
-	if len(fields) > 0 {
-		first := fields[0]
-
-		// If the title starts with a common tool verb, discard it
-		commonTools := map[string]bool{
-			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
-			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
-			"go": true, "python": true, "python3": true, "pip": true, "npm": true, "node": true,
-			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
-			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
-			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
-			"run": true, "do": true, "exec": true, "execute": true, "test": true,
-			"write": true, "read": true,
-		}
-		if commonTools[first] {
-			return true
-		}
-	}
-	return false
 }
 
 func compactPreview(s string, maxLen int) string {

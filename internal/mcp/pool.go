@@ -50,11 +50,11 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 		} else {
 			err = fmt.Errorf("sse type requires 'url' in config")
 		}
-	case "http":
+	case "http", "streamablehttp":
 		if cfg.URL != "" {
-			transport, err = NewSSETransport(cfg.URL)
+			transport, err = NewStreamableHTTPTransport(cfg.URL)
 		} else {
-			err = fmt.Errorf("http type requires 'url' in config")
+			err = fmt.Errorf("%s type requires 'url' in config", cfg.Type)
 		}
 	default:
 		transport, err = NewSTDIOTransport(name, cfg)

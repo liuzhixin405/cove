@@ -1,0 +1,16 @@
+﻿{
+  "model": "deepseek-v4-pro",
+  "model_fast": "deepseek-v4-flash",
+  "provider": {
+    "name": "deepseek",
+    "api_key": "sk-你的密钥",
+    "base_url": "https://api.deepseek.com/v1"
+  },
+  "permission_mode": "default",
+  "max_budget_usd": 10,
+  "thinking_tokens": 16000,
+  "debug": false,
+  "verbose": false,
+  "system_prompt": "You are a helpful assistant.",
+  "mcp_servers": {}
+}

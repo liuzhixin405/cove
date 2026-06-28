@@ -178,7 +178,7 @@ func newTestEngine(provider *mockProvider, tools ...tool.Tool) *Engine {
 		panic(fmt.Sprintf("newTestEngine failed: %v", err))
 	}
 	// Inject our mock provider
-	eng.provider = provider
+	eng.SetProvider(provider)
 	return eng
 }
 
@@ -990,7 +990,7 @@ func TestSteerE2E(t *testing.T) {
 
 	// Override provider to use our mock server
 	// The openAICompatProvider uses the baseURL from ProviderConfig
-	prov := eng.provider
+	prov := eng.Provider()
 	_ = prov // keep reference
 
 	t.Log("")

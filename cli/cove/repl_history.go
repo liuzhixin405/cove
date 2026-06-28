@@ -203,8 +203,11 @@ func handleHistory(eng *engine.Engine) {
 		}
 		date := r.UpdatedAt.Format("01-02 15:04")
 		title := r.Title
-		if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+		if title == "New session" || title == "" {
 			title = sessionPreview(r)
+		}
+		if title == "" {
+			title = r.UpdatedAt.Format("01-02 15:04")
 		}
 		if len(title) > 50 {
 			title = title[:50] + "..."
@@ -228,12 +231,12 @@ func sessionPreview(r session.Record) string {
 	}
 	fallback := ""
 	for _, m := range r.Messages {
-		if m.Role == "user" && m.Content != "" {
+		if m.Role == "user" && m.Content != "" && !m.Synthetic {
 			content := strings.ReplaceAll(m.Content, "\n", " ")
 			if len(content) > 50 {
 				content = content[:50] + "..."
 			}
-			if !isLowSignalHistoryTitle(content) {
+			if !false {
 				return content
 			}
 			if fallback == "" {
@@ -241,10 +244,8 @@ func sessionPreview(r session.Record) string {
 			}
 		}
 	}
-	if fallback != "" {
-		return fallback
-	}
-	return "(空)"
+	// Don't use low-signal message as preview
+	return ""
 }
 
 func handleHistoryResume(input string, eng *engine.Engine) {
@@ -282,7 +283,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 
 	eng.LoadMessages(r.Messages)
 	title := r.Title
-	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+	if title == "New session" || title == "" {
 		title = sessionPreview(*r)
 	}
 
@@ -386,7 +387,7 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 	}
 
 	title := r.Title
-	if title == "" || title == "New session" || isLowSignalHistoryTitle(title) {
+	if title == "" || title == "New session" {
 		title = sessionPreview(*r)
 	}
 
@@ -474,7 +475,7 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 
 	eng.LoadMessages(best.rec.Messages)
 	title := best.rec.Title
-	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+	if title == "New session" || title == "" {
 		title = sessionPreview(*best.rec)
 	}
 	userTurns := countUserTurns(best.rec.Messages)
@@ -587,72 +588,6 @@ func isTrivialResumePrompt(s string) bool {
 	}
 	if strings.HasPrefix(v, "/history") || strings.HasPrefix(v, "/resume") {
 		return true
-	}
-	return false
-}
-
-func isLowSignalHistoryTitle(s string) bool {
-	v := strings.TrimSpace(strings.ToLower(s))
-	if v == "" {
-		return true
-	}
-	if len([]rune(v)) <= 2 {
-		return true
-	}
-	// Pre-clean punctuation and emojis to prevent bypasses like "??" or "!!"
-	v = strings.TrimFunc(v, func(r rune) bool {
-		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r >= 0x4e00)
-	})
-	if v == "" {
-		return true
-	}
-	// Direct exact match noises
-	noise := map[string]bool{
-		"write":             true,
-		"write a file":      true,
-		"read":              true,
-		"read file":         true,
-		"grep":              true,
-		"continue":          true,
-		"继续":                true,
-		"hi":                true,
-		"hello":             true,
-		"你好":                true,
-		"?":                 true,
-		"list":              true,
-		"ls":                true,
-		"l":                 true,
-		"bash":              true,
-		"show":              true,
-		"cat":               true,
-		"run slow tool":     true,
-		"do something":      true,
-		"do something slow": true,
-	}
-	if noise[v] {
-		return true
-	}
-	if strings.HasPrefix(v, "/") {
-		return true
-	}
-	// Check if this is just a short CLI command (single word or basic tool path)
-	fields := strings.Fields(v)
-	if len(fields) > 0 {
-		first := fields[0]
-		// Ban common command line / tool invocations
-		commonTools := map[string]bool{
-			"cd": true, "pwd": true, "git": true, "grep": true, "find": true, "wc": true,
-			"cat": true, "nano": true, "vim": true, "vi": true, "curl": true, "wget": true,
-			"go": true, "python": true, "python3": true, "pip": true, "npm": true, "node": true,
-			"yarn": true, "pnpm": true, "make": true, "docker": true, "powershell": true,
-			"cmd": true, "dir": true, "ls": true, "rm": true, "cp": true, "mv": true,
-			"mkdir": true, "touch": true, "ssh": true, "scp": true, "rsync": true,
-			"run": true, "do": true, "exec": true, "execute": true, "test": true,
-			"write": true, "read": true,
-		}
-		if commonTools[first] {
-			return true
-		}
 	}
 	return false
 }

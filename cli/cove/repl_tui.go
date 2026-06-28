@@ -183,7 +183,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			}
 			eng.LoadMessages(r.Messages)
 			title := r.Title
-			if title == "" || title == "New session" || isLowSignalHistoryTitle(title) {
+			if title == "" || title == "New session" {
 				title = sessionPreview(*r)
 			}
 
@@ -274,7 +274,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		items := make([]tui.HistoryItem, 0, len(recs))
 		for _, r := range recs {
 			title := r.Title
-			if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+			if title == "New session" || title == "" {
 				title = sessionPreview(r)
 			}
 			items = append(items, tui.HistoryItem{
@@ -741,7 +741,7 @@ func tuiResumeMostRelevant(eng *engine.Engine) string {
 
 	eng.LoadMessages(best.rec.Messages)
 	title := best.rec.Title
-	if title == "New session" || title == "" || isLowSignalHistoryTitle(title) {
+	if title == "New session" || title == "" {
 		title = sessionPreview(*best.rec)
 	}
 	userTurns := countUserTurns(best.rec.Messages)

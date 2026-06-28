@@ -191,11 +191,21 @@ Configuration is read from three tiers (lowest to highest priority):
 2. **User Config** — `~/.cove/config.json`
 3. **Project Config** — `.cove.json` in project root
 
+#### Model Routing (Dual-Model)
+
+cove supports intelligent dual-model routing. When you send a message, the system evaluates its complexity:
+
+- **Complex tasks** (containing keywords like `refactor`, `architecture`, `debug`, `重构`, `架构` etc., or messages longer than 500 chars) → uses the **primary model** (`model`)
+- **Simple/short tasks** → uses the **fast model** (`model_fast`) for speed and cost savings
+
+If `model` is empty or `"auto"`, it auto-resolves to the provider's default premium model. If `model_fast` is empty or `"auto"`, it defaults to `"deepseek-v4-flash"`.
+
 Example `~/.cove/config.json`:
 
 ```json
 {
   "model": "deepseek-v4-pro",
+  "model_fast": "deepseek-v4-flash",
   "provider": {
     "name": "deepseek",
     "api_key": "sk-***"
@@ -203,6 +213,9 @@ Example `~/.cove/config.json`:
   "permission_mode": "default",
   "max_budget_usd": 10,
   "thinking_tokens": 16000,
+  "debug": false,
+  "verbose": false,
+  "system_prompt": "",
   "mcp_servers": {
     "filesystem": {
       "command": "npx",
