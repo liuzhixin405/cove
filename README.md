@@ -198,23 +198,45 @@ cove supports intelligent dual-model routing. When you send a message, the syste
 - **Complex tasks** (containing keywords like `refactor`, `architecture`, `debug`, `重构`, `架构` etc., or messages longer than 500 chars) → uses the **primary model** (`model`)
 - **Simple/short tasks** → uses the **fast model** (`model_fast`) for speed and cost savings
 
-If `model` is empty or `"auto"`, it auto-resolves to the provider's default premium model. If `model_fast` is empty or `"auto"`, it defaults to `"deepseek-v4-flash"`.
+If `model` is empty or `"auto"`, it auto-resolves to the provider's default premium model. If `model_fast` is empty or `"auto"`, it reuses the main model (safe no-op).
+
+#### Model Fallback (Automatic)
+
+When the primary provider is unavailable (rate limited, down, or auth error), cove automatically falls back to other configured providers (set via environment variables).
+
+#### Policy Engine (Persistent Permissions)
+
+Permission decisions can be persisted as rules in `~/.cove/policy.json`:
+- `always_allow` — auto-approve matching tools
+- `always_deny` — auto-reject matching tools
+- `ask` — always prompt user
+
+Supports wildcard tool patterns (e.g. `"mcp_*_*"`), parameter conditions, and optional expiration.
+
+#### Other Built-in Safeguards
+
+- **3-Layer Loop Detection** — fingerprint match, output hash match, stagnation detection (60 rounds no file changes)
+- **AI Context Compression** — auto-triggers at 50% token limit, writes AI summaries of old messages
+- **Tool Output Masking** — trims large old tool outputs to save tokens
+- **Safety Filters** — blocks dangerous commands (`rm -rf`, `dd`, `mkfs`), path traversal, and API key leakage
 
 Example `~/.cove/config.json`:
 
 ```json
 {
-  "model": "deepseek-v4-pro",
-  "model_fast": "deepseek-v4-flash",
+  "model": "claude-sonnet-4-20250514",
+  "model_fast": "",
   "provider": {
-    "name": "deepseek",
-    "api_key": "sk-***"
+    "name": "anthropic",
+    "api_key": "sk-ant-***",
+    "base_url": ""
   },
   "permission_mode": "default",
   "max_budget_usd": 10,
   "thinking_tokens": 16000,
   "debug": false,
   "verbose": false,
+  "telemetry": false,
   "system_prompt": "",
   "mcp_servers": {
     "filesystem": {
@@ -224,7 +246,6 @@ Example `~/.cove/config.json`:
     }
   }
 }
-```
 
 ### 🤖 Agent Tools
 
