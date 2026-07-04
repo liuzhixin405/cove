@@ -201,42 +201,6 @@ func SummarizeRuntime(events []RuntimeEvent) []RuntimeSummary {
 	return out
 }
 
-// StartupScan represents the result of scanning the persisted runtime log at
-// startup: a digest of unresolved problems from previous sessions, ready to be
-// shown as a "需要修复" reminder.
-type StartupScan struct {
-	Total     int              // total events in the log
-	Since     time.Time        // timestamp of the earliest event
-	Summaries []RuntimeSummary // aggregated, fix-annotated problems
-}
-
-// HasProblems reports whether the scan found any warning-or-worse problems.
-func (s *StartupScan) HasProblems() bool {
-	for _, sum := range s.Summaries {
-		if sum.Severity >= SevWarning {
-			return true
-		}
-	}
-	return false
-}
-
-// ScanRuntimeLogOnStartup loads the persisted runtime log (from previous runs)
-// and summarizes it. This powers the per-startup "扫描日志 → 提醒修复" cycle:
-// problems accumulate in errors.log until the user fixes them and archives the
-// log via ArchiveRuntimeLog, which starts a fresh cycle.
-func ScanRuntimeLogOnStartup() *StartupScan {
-	events := LoadRuntimeLog()
-	if len(events) == 0 {
-		return &StartupScan{}
-	}
-	scan := &StartupScan{
-		Total:     len(events),
-		Since:     events[0].Time,
-		Summaries: SummarizeRuntime(events),
-	}
-	return scan
-}
-
 // runtimeArchiveDir returns the directory where archived logs are stored.
 func runtimeArchiveDir() string {
 	p := runtimeLogPath()

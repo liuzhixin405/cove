@@ -38,12 +38,6 @@ type Rule struct {
 	ArgPattern  string
 }
 
-type Policy struct {
-	Allow []Rule `json:"allow,omitempty"`
-	Deny  []Rule `json:"deny,omitempty"`
-	Ask   []Rule `json:"ask,omitempty"`
-}
-
 type Manager struct {
 	mode            Mode
 	allow           []Rule
@@ -59,11 +53,6 @@ func NewManager(mode Mode) *Manager {
 func (m *Manager) SetMode(mode Mode)         { m.mode = mode }
 func (m *Manager) Mode() Mode                { return m.mode }
 func (m *Manager) SetBypassAvailable(v bool) { m.bypassAvailable = v }
-func (m *Manager) SetPolicy(p Policy) {
-	m.allow = p.Allow
-	m.deny = p.Deny
-	m.ask = p.Ask
-}
 
 func (m *Manager) AddRule(decision Decision, rule Rule) {
 	rule.Decision = decision
@@ -74,14 +63,6 @@ func (m *Manager) AddRule(decision Decision, rule Rule) {
 		m.deny = append(m.deny, rule)
 	case DAsk:
 		m.ask = append(m.ask, rule)
-	}
-}
-
-func (m *Manager) Policy() Policy {
-	return Policy{
-		Allow: append([]Rule(nil), m.allow...),
-		Deny:  append([]Rule(nil), m.deny...),
-		Ask:   append([]Rule(nil), m.ask...),
 	}
 }
 

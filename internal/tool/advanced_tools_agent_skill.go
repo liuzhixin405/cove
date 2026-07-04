@@ -22,19 +22,24 @@ func NewSkillTool() Tool {
 func (t *SkillTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	name, _ := input["name"].(string)
 	if tctx.Runtime != nil {
-		if tctx.Runtime.SkillPrompts != nil {
-			if prompt, ok := tctx.Runtime.SkillPrompts[name]; ok {
-				return Result{Data: fmt.Sprintf("[Skill: %s]\n\n%s\n\nFollow these instructions to complete the task.", name, prompt)}, nil
-			}
-		}
+		// Check SkillManager first: it holds the full skills.Skill struct
+		// (Steps, AllowedTools), which RenderInvocation renders as an explicit
+		// checklist/constraint. The flat SkillPrompts map (checked second)
+		// only ever stores the bare prompt string, so it can't carry that
+		// structure — it exists as a fallback for skills only registered
+		// there. See skills.Skill.RenderInvocation and
+		// docs/中等模型平替优化建议.md §Skills工作流化.
 		if mgr, ok := tctx.Runtime.SkillManager.(interface {
 			Get(string) (skills.Skill, bool)
 		}); ok {
 			if skill, found := mgr.Get(name); found {
-				return Result{Data: fmt.Sprintf("[Skill: %s]\n\n%s\n\nFollow these instructions to complete the task.", name, skill.Prompt)}, nil
+				return Result{Data: skill.RenderInvocation()}, nil
 			}
 		}
 		if tctx.Runtime.SkillPrompts != nil {
+			if prompt, ok := tctx.Runtime.SkillPrompts[name]; ok {
+				return Result{Data: fmt.Sprintf("[Skill: %s]\n\n%s\n\nFollow these instructions to complete the task.", name, prompt)}, nil
+			}
 			return Result{Data: fmt.Sprintf("Skill '%s' activated. Available skills: %v", name, tctx.Runtime.SkillPrompts)}, nil
 		}
 	}

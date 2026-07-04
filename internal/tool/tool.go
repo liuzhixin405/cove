@@ -140,8 +140,6 @@ func (b *baseTool) CheckPermissions(input Input, tctx Context) PermissionDecisio
 	return PermissionDecision{Decision: Deny, Reason: "not implemented"}
 }
 
-func NewTool(d Def) *baseTool { return &baseTool{def: d} }
-
 func Decision(d PermissionResult, reason string) PermissionDecision {
 	return PermissionDecision{Decision: d, Reason: reason}
 }

@@ -53,11 +53,11 @@ type chatRunner interface {
 }
 
 var (
-	Version = "6.2.1"
+	Version = "7.1.0"
 
 	BuildTime = "pro"
 
-	GitCommit = "unknown"
+	GitCommit = "go go go!"
 
 	resumeMode = false
 
@@ -202,36 +202,11 @@ func main() {
 	cmdReg := registerAllCommands()
 
 	// Disable background API features if --no-auto flag is set
-
 	if noAuto {
-
 		eng.SetAutoExtract(false)
-
 	}
 
 	// Set up interactive permission prompt for the REPL
-
-	configurePermissionPrompt(eng)
-
-	if cfg.SystemPrompt != "" {
-
-		eng.SetSystemOverride(cfg.SystemPrompt)
-
-	}
-
-	if resumeMode && resumeID != "" {
-
-		store := eng.Store()
-
-		if r, err := store.Load(resumeID); err == nil {
-
-			eng.LoadMessages(r.Messages)
-
-			repl.PrintSafe("已恢复会话: %s (%d 条消息)\n", r.Title, len(r.Messages))
-
-		}
-
-	}
 
 	// Startup diagnostic: quick check for critical issues
 
@@ -260,25 +235,34 @@ func main() {
 		// Build the slash-command catalog for the palette and a runner that
 		// executes a command line and returns its rendered output.
 		var tuiCommands []tui.CommandItem
+		seenTUICommands := make(map[string]bool)
+		addTUICommand := func(name, desc string) {
+			k := strings.ToLower(strings.TrimSpace(name))
+			if k == "" || seenTUICommands[k] {
+				return
+			}
+			seenTUICommands[k] = true
+			tuiCommands = append(tuiCommands, tui.CommandItem{Name: name, Desc: desc})
+		}
 		for _, c := range cmdReg.All() {
-			tuiCommands = append(tuiCommands, tui.CommandItem{Name: c.Name(), Desc: c.Description()})
+			addTUICommand(c.Name(), c.Description())
 		}
 		// Add missing built-in commands to the palette.
-		tuiCommands = append(tuiCommands,
-			tui.CommandItem{Name: "help", Desc: "显示帮助信息"},
-			tui.CommandItem{Name: "model", Desc: "设置模型"},
-			tui.CommandItem{Name: "provider", Desc: "设置提供商"},
-			tui.CommandItem{Name: "api-key", Desc: "保存 API 密钥"},
-			tui.CommandItem{Name: "base-url", Desc: "设置自定义接口地址"},
-			tui.CommandItem{Name: "mode", Desc: "设置权限模式 (default|plan|auto|bypass)"},
-			tui.CommandItem{Name: "budget", Desc: "设置每会话预算上限($)"},
-			tui.CommandItem{Name: "stop", Desc: "取消当前运行的任务"},
-			tui.CommandItem{Name: "cancel", Desc: "取消当前运行的任务"},
-			tui.CommandItem{Name: "tasks", Desc: "查看运行中的任务"},
-			tui.CommandItem{Name: "compact", Desc: "压缩对话历史"},
-			tui.CommandItem{Name: "exit", Desc: "退出程序"},
-			tui.CommandItem{Name: "quit", Desc: "退出程序"},
-		)
+		addTUICommand("help", "显示帮助信息")
+		addTUICommand("history", "查看和继续历史会话")
+		addTUICommand("history clean", "清洗历史会话噪音并备份")
+		addTUICommand("model", "设置模型")
+		addTUICommand("provider", "设置提供商")
+		addTUICommand("api-key", "保存 API 密钥")
+		addTUICommand("base-url", "设置自定义接口地址")
+		addTUICommand("mode", "设置权限模式 (default|plan|auto|bypass)")
+		addTUICommand("budget", "设置每会话预算上限($)")
+		addTUICommand("stop", "取消当前运行的任务")
+		addTUICommand("cancel", "取消当前运行的任务")
+		addTUICommand("tasks", "查看运行中的任务")
+		addTUICommand("compact", "压缩对话历史")
+		addTUICommand("exit", "退出程序")
+		addTUICommand("quit", "退出程序")
 		runCommand := func(line string) string {
 			parts := strings.Fields(line)
 			if len(parts) == 0 {
@@ -304,7 +288,6 @@ func main() {
 				MCPPool:           mcpPool,
 				ProjectContext:    projCtx,
 				AppState:          appState,
-				Provider:          eng.Provider(),
 			})
 			if err != nil {
 				return "错误: " + err.Error()
@@ -326,12 +309,6 @@ func main() {
 	}
 
 	runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
-
-}
-
-func printBanner(cfg *config.Config, s *state.AppState, pc *ctxt.ProjectContext, pm *permission.Manager, eng *engine.Engine) {
-
-	fmt.Print(repl.Banner(Version, cfg.Model, eng.ProviderName(), string(pm.Mode()), pc.Cwd, pc.GitBranch, "", len(eng.Registry().All()), pc.IsGitRepo))
 
 }
 
@@ -460,6 +437,15 @@ func isPositiveNumber(input string) bool {
 }
 
 func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string, cfg *config.Config) {
+	trimmedPrompt := strings.TrimSpace(prompt)
+	if strings.HasPrefix(trimmedPrompt, "/") {
+		if strings.EqualFold(trimmedPrompt, "/history clean") {
+			handleHistoryClean()
+			return
+		}
+		fmt.Fprintln(os.Stderr, "Error: -p 模式不执行 slash 命令（避免命令文本被当作对话写入历史）。请使用交互模式执行该命令。")
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -596,8 +582,6 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 		ProjectContext: projCtx,
 
 		AppState: appState,
-
-		Provider: eng.Provider(),
 	})
 
 	if err != nil {

@@ -53,8 +53,12 @@ func TestCompressor_ProducesValidSequence(t *testing.T) {
 	tokens := countTokens(msgs)
 	tokenLimit := tokens // threshold is 50% of the limit, so this forces compression
 
+	// Long enough, and mentions the file the conversation actually touched
+	// (a.go), so it passes validateSummaryQuality's coverage check — a
+	// generic one-liner like "Summary of prior work." would now be
+	// correctly rejected by that check and fall back to truncation instead.
 	stub := func(context.Context, api.ChatRequest) (*api.ChatResponse, error) {
-		return &api.ChatResponse{Content: "Summary of prior work."}, nil
+		return &api.ChatResponse{Content: "The user asked to refactor the auth module. The assistant repeatedly read a.go and inspected its contents across several steps. No errors were encountered; the task is still in progress."}, nil
 	}
 
 	result, out := cc.Compress(context.Background(), msgs, tokens, tokenLimit, stub)
@@ -95,6 +99,33 @@ func TestCompressor_FallbackTruncationValid(t *testing.T) {
 	assertValidSequence(t, out)
 	if out[0].Role != "user" || !strings.Contains(out[0].Content, "truncated") {
 		t.Fatalf("fallback should lead with a single truncation user turn, got %q", out[0].Content)
+	}
+}
+
+// TestCompressor_RejectsLowQualitySummary is the direct regression test for
+// §2.4: a shallow/generic summary that never mentions any file the
+// conversation actually touched must be rejected and fall back to plain
+// truncation, rather than silently becoming the new (unreliable) history.
+func TestCompressor_RejectsLowQualitySummary(t *testing.T) {
+	cc := NewChatCompressor()
+	msgs := buildConversation()
+	tokens := countTokens(msgs)
+	tokenLimit := tokens
+
+	stub := func(context.Context, api.ChatRequest) (*api.ChatResponse, error) {
+		return &api.ChatResponse{Content: "Summary of prior work."}, nil // too generic, mentions no files
+	}
+
+	result, out := cc.Compress(context.Background(), msgs, tokens, tokenLimit, stub)
+	if !result.Compressed {
+		t.Fatalf("expected fallback truncation to still mark Compressed")
+	}
+	assertValidSequence(t, out)
+	if strings.Contains(out[0].Content, "Conversation Summary") {
+		t.Fatalf("low-quality summary should have been rejected in favor of truncation, got %q", out[0].Content)
+	}
+	if !strings.Contains(out[0].Content, "truncated") {
+		t.Fatalf("expected truncation fallback message, got %q", out[0].Content)
 	}
 }
 

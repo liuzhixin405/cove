@@ -5,14 +5,6 @@ import (
 	"time"
 )
 
-// Phase represents the current stage of the dream task.
-type Phase string
-
-const (
-	PhaseStarting Phase = "starting"
-	PhaseUpdating Phase = "updating"
-)
-
 // Status represents the current state of the dream task.
 type Status string
 
@@ -20,7 +12,6 @@ const (
 	StatusRunning   Status = "running"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
-	StatusKilled    Status = "killed"
 )
 
 // Turn represents a single assistant turn from the dream agent.
@@ -34,7 +25,6 @@ type Task struct {
 	mu               sync.Mutex
 	ID               string
 	Status           Status
-	Phase            Phase
 	SessionsReviewed int
 	FilesTouched     []string
 	Turns            []Turn
@@ -59,7 +49,6 @@ func NewTask(sessionsReviewed int, priorMtime time.Time, cancelFunc func()) *Tas
 	t := &Task{
 		ID:               generateID(),
 		Status:           StatusRunning,
-		Phase:            PhaseStarting,
 		SessionsReviewed: sessionsReviewed,
 		FilesTouched:     make([]string, 0),
 		Turns:            make([]Turn, 0),
@@ -69,13 +58,6 @@ func NewTask(sessionsReviewed int, priorMtime time.Time, cancelFunc func()) *Tas
 	}
 	activeTasks[t.ID] = t
 	return t
-}
-
-// GetTask returns a dream task by ID.
-func GetTask(id string) *Task {
-	taskMu.Lock()
-	defer taskMu.Unlock()
-	return activeTasks[id]
 }
 
 // ActiveTask returns the currently running dream task, if any.
@@ -113,7 +95,6 @@ func (t *Task) AddTurn(turn Turn, touchedPaths []string) {
 	}
 
 	if len(newPaths) > 0 {
-		t.Phase = PhaseUpdating
 		t.FilesTouched = append(t.FilesTouched, newPaths...)
 	}
 
@@ -140,24 +121,6 @@ func (t *Task) Fail() {
 	t.Status = StatusFailed
 	t.EndTime = time.Now()
 	t.CancelFunc = nil
-}
-
-// Kill aborts the dream and rolls back the lock.
-func (t *Task) Kill() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.Status != StatusRunning {
-		return
-	}
-	if t.CancelFunc != nil {
-		t.CancelFunc()
-	}
-	t.Status = StatusKilled
-	t.EndTime = time.Now()
-	t.CancelFunc = nil
-
-	// Rollback lock asynchronously
-	go RollbackConsolidationLock(t.PriorMtime)
 }
 
 // generateID creates a unique dream task ID.

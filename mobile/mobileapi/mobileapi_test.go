@@ -156,25 +156,6 @@ func TestParseToolCallChunks(t *testing.T) {
 	t.Logf("Parsed args: x=%v, y=%v", parsed["x"], parsed["y"])
 }
 
-func TestJsonEscape(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"hello", "hello"},
-		{"hello\nworld", "hello\\nworld"},
-		{"hello \"world\"", "hello \\\"world\\\""},
-		{"back\\slash", "back\\\\slash"},
-	}
-	
-	for _, tt := range tests {
-		result := jsonEscape(tt.input)
-		if result != tt.expected {
-			t.Errorf("jsonEscape(%q) = %q, want %q", tt.input, result, tt.expected)
-		}
-	}
-}
-
 // buildTestMessages 复制 ChatStream 中的消息构建逻辑用于测试
 func buildTestMessages(req ChatRequest) []map[string]interface{} {
 	var messages []map[string]interface{}

@@ -214,12 +214,17 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		content = extractOAIMsgText(msg.Content)
 		reasoningContent := msg.ReasoningContent
 		for _, tc := range msg.ToolCalls {
-			var input map[string]any
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
-				continue // skip malformed tool calls
-			}
-			if input == nil {
-				input = map[string]any{}
+			input, ok := RepairToolArguments(tc.Function.Arguments)
+			if !ok {
+				toolCalls = append(toolCalls, ToolCall{
+					ID:   tc.ID,
+					Name: tc.Function.Name,
+					Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
+						"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
+						len(tc.Function.Arguments), truncate(tc.Function.Arguments, 120))},
+					ParseError: true,
+				})
+				continue
 			}
 			toolCalls = append(toolCalls, ToolCall{
 				ID: tc.ID, Name: tc.Function.Name, Input: input,
@@ -580,16 +585,21 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	sort.Ints(indices)
 	for _, idx := range indices {
 		acc := tcMap[idx]
-		var input map[string]any
 		rawArgs := acc.ArgsBuf.String()
 		if rawArgs == "" {
-			continue // truncated tool call, skip
+			continue // nothing arrived at all for this call, nothing to repair or report
 		}
-		if err := json.Unmarshal([]byte(rawArgs), &input); err != nil {
-			continue // incomplete JSON from truncation, skip
-		}
-		if input == nil {
-			input = map[string]any{}
+		input, ok := RepairToolArguments(rawArgs)
+		if !ok {
+			toolCalls = append(toolCalls, ToolCall{
+				ID:   acc.ID,
+				Name: acc.Name,
+				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
+					"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
+					len(rawArgs), truncate(rawArgs, 120))},
+				ParseError: true,
+			})
+			continue
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}

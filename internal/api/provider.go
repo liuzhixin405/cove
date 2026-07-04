@@ -14,6 +14,14 @@ type ToolCall struct {
 	ID    string         `json:"id"`
 	Name  string         `json:"name"`
 	Input map[string]any `json:"input"`
+	// ParseError is set when the provider returned tool-call arguments that
+	// could not be parsed as JSON even after best-effort repair (see
+	// tool_repair.go). When true, Input contains a single "_cove_parse_error"
+	// key with a human-readable diagnostic instead of the model's real
+	// arguments. Engine.executeTool checks this flag and returns a tool-result
+	// error asking the model to resend the call with valid JSON, instead of
+	// dispatching garbage input to the real tool.
+	ParseError bool `json:"parse_error,omitempty"`
 }
 
 type MessagePart struct {

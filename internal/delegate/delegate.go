@@ -181,19 +181,3 @@ func (d *Delegator) Delegate(ctx context.Context, taskID, task, systemPrompt str
 
 	return sa.Run(subCtx, task, systemPrompt)
 }
-
-// Cancel interrupts a running sub-agent.
-func (d *Delegator) Cancel(taskID string) {
-	d.mu.Lock()
-	if cancel, ok := d.active[taskID]; ok {
-		cancel()
-	}
-	d.mu.Unlock()
-}
-
-// ActiveCount returns the number of running sub-agents.
-func (d *Delegator) ActiveCount() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.active)
-}

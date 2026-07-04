@@ -5,7 +5,6 @@ import (
 )
 
 const CurrentVersion = 1
-const VersionKey = "_config_version"
 
 type migrateRule struct {
 	Version int
@@ -39,8 +38,4 @@ func Migrate(cfg *Config, fromVersion int) error {
 		}
 	}
 	return Save(cfg)
-}
-
-func NeedsMigration(currentVersion int) bool {
-	return currentVersion < CurrentVersion
 }

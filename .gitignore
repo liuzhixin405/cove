@@ -46,3 +46,6 @@ NUL
 
 # Documentation
 *.md
+
+# Archived docs (excluded from commit)
+/docs/archive/

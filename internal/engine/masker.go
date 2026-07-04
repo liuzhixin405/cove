@@ -46,9 +46,6 @@ func NewToolOutputMasker() *ToolOutputMasker {
 	}
 }
 
-// Disable turns off masking.
-func (m *ToolOutputMasker) Disable() { m.enabled = false }
-
 // Mask runs the Hybrid Backward Scanned FIFO algorithm on the message history.
 // It scans from the end, protects the most recent ~protectionThreshold tokens,
 // then masks older tool outputs that exceed minPrunableThreshold.

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -12,6 +14,26 @@ type RoutingDecision struct {
 	Reason string `json:"reason"`
 }
 
+// BudgetSignal lets the scoring strategy factor remaining budget into its
+// decision without ModelRouter importing internal/cost directly (keeping
+// the api package's dependency graph shallow). Engine wires this in via
+// SetBudgetSignal; if never set, budget simply doesn't affect scoring.
+type BudgetSignal interface {
+	// RemainingBudgetRatio returns remaining budget / max budget, in [0,1].
+	// Implementations with no configured budget (unlimited) should return 1.
+	RemainingBudgetRatio() float64
+}
+
+// FailureRateSignal lets the scoring strategy factor in how often recent
+// fast-model-routed turns have needed to give up (verification failures,
+// tool-failure circuit breaker) rather than completing cleanly. If never
+// set via SetFailureRateSignal, failure rate simply doesn't affect scoring.
+type FailureRateSignal interface {
+	// RecentFastModelFailureRate returns the fraction (0..1) of recent
+	// fast-model-routed turns that ended in a give-up/failure state.
+	RecentFastModelFailureRate() float64
+}
+
 // ModelRouter selects the best model for a given user message using
 // a chain of routing strategies. The first strategy that returns
 // a non-nil decision wins.
@@ -20,6 +42,8 @@ type ModelRouter struct {
 	defaultModel string // 高级模型，用于复杂任务（如 deepseek-v4-pro）
 	fastModel    string // 快速模型，用于简单任务（如 deepseek-v4-flash）
 	override     string // user-specified override (e.g. /model gpt-4o)
+	budget       BudgetSignal
+	failureRate  FailureRateSignal
 }
 
 // RoutingStrategy evaluates a user message and decides whether to route.
@@ -29,7 +53,7 @@ type RoutingStrategy interface {
 }
 
 // NewModelRouter creates a router with the standard strategy chain:
-// override → fallback → complexity classifier → default.
+// override → scoring classifier → default.
 func NewModelRouter(defaultModel, fastModel string) *ModelRouter {
 	mr := &ModelRouter{defaultModel: defaultModel, fastModel: fastModel}
 	mr.strategies = []RoutingStrategy{
@@ -58,8 +82,15 @@ func (mr *ModelRouter) SetOverride(model string) { mr.override = model }
 // ClearOverride removes the user override.
 func (mr *ModelRouter) ClearOverride() { mr.override = "" }
 
-// Override returns the current user override, if any.
-func (mr *ModelRouter) Override() string { return mr.override }
+// SetBudgetSignal wires in a source of remaining-budget information for the
+// scoring strategy. Optional — nil (the default) means budget pressure does
+// not affect routing.
+func (mr *ModelRouter) SetBudgetSignal(b BudgetSignal) { mr.budget = b }
+
+// SetFailureRateSignal wires in a source of recent fast-model failure-rate
+// information for the scoring strategy. Optional — nil (the default) means
+// failure history does not affect routing.
+func (mr *ModelRouter) SetFailureRateSignal(f FailureRateSignal) { mr.failureRate = f }
 
 // Route evaluates the full strategy chain.
 func (mr *ModelRouter) Route(ctx context.Context, userMessage string) *RoutingDecision {
@@ -91,50 +122,147 @@ func (s *overrideStrategy) Route(_ context.Context, _ string, _ string) *Routing
 	return nil
 }
 
-// complexityClassifier evaluates message complexity to select cheap vs premium models.
+// ──── Multi-factor scoring classifier ────
+//
+// This replaces the old "first matching rule wins" classifier with a
+// weighted score combining several independent, individually-weak signals.
+// This is the concrete, minimal implementation of the "路由升级为多特征打分"
+// item from docs/核心优化项清单.md's EDCL proposal: no full evidence ledger
+// yet, just multiple factors instead of one keyword match, with the exact
+// contribution of each factor always written into RoutingDecision.Reason so
+// a decision can be understood (and, later, audited) after the fact.
+//
+// Weights are deliberately set so that a single strong signal (an explicit
+// complexity keyword) is, by itself, still enough to cross the premium
+// threshold — matching the previous behavior for that case — while weaker
+// signals only tip the balance in combination with each other.
+const (
+	weightComplexKeyword = 0.45
+	weightMessageLength  = 0.20
+	weightFileScope      = 0.15
+	weightFailureRate    = 0.10
+	weightBudget         = 0.10 // subtracted when budget is tight, not added
+
+	// scoreThreshold is the minimum combined score to route to the premium
+	// (default) model instead of the fast model.
+	scoreThreshold = 0.40
+
+	// hardLengthCeiling: regardless of other signals, a message this long
+	// always needs the premium model's deeper context handling.
+	hardLengthCeiling = 2000
+)
+
 type complexityClassifier struct {
 	router *ModelRouter
 }
 
 func (c *complexityClassifier) Name() string { return "classifier" }
 
+var complexKeywords = []string{
+	"refactor", "architecture", "design", "migrate", "rewrite",
+	"debug", "optimize", "performance", "security audit",
+	"重构", "架构", "设计", "迁移", "重写",
+}
+
+// filePathPattern is a deliberately loose heuristic for "the user named
+// specific files/paths in this message" — used as a cheap, best-effort
+// proxy for change scope before the model has actually looked at anything.
+// It is not meant to be a precise path parser.
+var filePathPattern = regexp.MustCompile(`[\w./\\-]+\.(go|py|js|ts|tsx|jsx|java|rs|c|cpp|h|hpp|rb|php|json|yaml|yml|md|sql)\b`)
+
 func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ string) *RoutingDecision {
 	msg := strings.ToLower(userMessage)
-	length := len(userMessage)
 
-	// Complex tasks → premium model (defaultModel)
-	complexKeywords := []string{
-		"refactor", "architecture", "design", "migrate", "rewrite",
-		"debug", "optimize", "performance", "security audit",
-		"重构", "架构", "设计", "迁移", "重写",
-	}
+	var reasons []string
+	score := 0.0
+
+	// Signal 1: explicit complexity keyword (binary).
+	matchedKeyword := ""
 	for _, kw := range complexKeywords {
 		if strings.Contains(msg, kw) {
-			return &RoutingDecision{
-				Model:  c.router.defaultModel,
-				Source: "classifier",
-				Reason: "classified as complex task (keyword: " + kw + ")",
-			}
+			matchedKeyword = kw
+			break
 		}
 	}
+	if matchedKeyword != "" {
+		score += weightComplexKeyword
+		reasons = append(reasons, fmt.Sprintf("keyword(%q)=+%.2f", matchedKeyword, weightComplexKeyword))
+	}
 
-	// Very long messages → premium model (needs deep context understanding)
-	if length > 500 {
+	// Signal 2: message length, graduated rather than a hard cutoff (a
+	// message just over the old 500-char cutoff no longer forces premium
+	// by itself; a genuinely long one still contributes strongly).
+	length := len(userMessage)
+	if length >= hardLengthCeiling {
 		return &RoutingDecision{
 			Model:  c.router.defaultModel,
 			Source: "classifier",
-			Reason: "long message, using default model",
+			Reason: fmt.Sprintf("message length %d >= hard ceiling %d, forcing premium model", length, hardLengthCeiling),
+		}
+	}
+	lengthScore := float64(length) / 1000.0
+	if lengthScore > 1 {
+		lengthScore = 1
+	}
+	if lengthScore > 0 {
+		contrib := lengthScore * weightMessageLength
+		score += contrib
+		reasons = append(reasons, fmt.Sprintf("length(%d)=+%.2f", length, contrib))
+	}
+
+	// Signal 3: explicit file/path mentions, as a cheap proxy for change
+	// scope (we can't know the real diff size before the model acts).
+	if matches := filePathPattern.FindAllString(userMessage, -1); len(matches) > 0 {
+		fileScore := float64(len(matches)) / 3.0
+		if fileScore > 1 {
+			fileScore = 1
+		}
+		contrib := fileScore * weightFileScope
+		score += contrib
+		reasons = append(reasons, fmt.Sprintf("file_mentions(%d)=+%.2f", len(matches), contrib))
+	}
+
+	// Signal 4: recent fast-model failure rate on this project/session.
+	if c.router.failureRate != nil {
+		rate := c.router.failureRate.RecentFastModelFailureRate()
+		if rate > 0 {
+			contrib := rate * weightFailureRate
+			score += contrib
+			reasons = append(reasons, fmt.Sprintf("recent_failure_rate(%.2f)=+%.2f", rate, contrib))
 		}
 	}
 
-	// Simple tasks → fast/cheap model
+	// Signal 5: budget pressure. Tight budget makes the router *less* eager
+	// to upgrade — it subtracts from the score rather than adding to it.
+	if c.router.budget != nil {
+		remaining := c.router.budget.RemainingBudgetRatio()
+		if remaining < 1 {
+			penalty := (1 - remaining) * weightBudget
+			score -= penalty
+			reasons = append(reasons, fmt.Sprintf("budget_remaining(%.2f)=-%.2f", remaining, penalty))
+		}
+	}
+
+	reasonStr := strings.Join(reasons, ", ")
+	if reasonStr == "" {
+		reasonStr = "no signals present"
+	}
+
+	if score >= scoreThreshold {
+		return &RoutingDecision{
+			Model:  c.router.defaultModel,
+			Source: "classifier",
+			Reason: fmt.Sprintf("score=%.2f >= %.2f [%s] -> premium model", score, scoreThreshold, reasonStr),
+		}
+	}
+
 	if c.router.fastModel != "" {
 		return &RoutingDecision{
 			Model:  c.router.fastModel,
 			Source: "classifier",
-			Reason: "classified as simple task, using fast model",
+			Reason: fmt.Sprintf("score=%.2f < %.2f [%s] -> fast model", score, scoreThreshold, reasonStr),
 		}
 	}
 
-	return nil // fallback to default
+	return nil // no fast model configured, fall back to default
 }

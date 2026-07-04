@@ -215,7 +215,20 @@ func isStopword(s string) bool {
 	case "the", "and", "for", "are", "but", "not", "you", "all", "can",
 		"had", "her", "was", "one", "our", "out", "has", "have", "been",
 		"some", "than", "its", "his", "when", "will", "each", "about",
-		"this", "that", "with", "from", "they", "what", "which":
+		"this", "that", "with", "from", "they", "what", "which",
+		// Expanded coverage (docs/中等模型平替优化建议.md §2.2): the original
+		// list missed several very common function words, which meant they
+		// still consumed a "real" term slot in every BM25 query/document
+		// without ever discriminating between documents. Deliberately does
+		// NOT add code-relevant words like "function"/"class"/"struct" —
+		// those are genuinely informative for a codebase-memory index.
+		"were", "who", "why", "how", "let", "just", "into",
+		"then", "them", "there", "these", "those", "over", "under",
+		"such", "same", "only", "also", "very", "more", "most", "much",
+		"here", "where", "while", "because", "before", "after", "again",
+		"other", "would", "could", "should", "does", "did", "doing",
+		"being", "having", "yourself", "yours", "your", "himself",
+		"herself", "itself", "themselves", "ourselves":
 		return true
 	}
 	return false

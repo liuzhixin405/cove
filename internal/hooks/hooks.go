@@ -17,18 +17,10 @@ import (
 type HookEvent string
 
 const (
-	BeforeTool          HookEvent = "BeforeTool"
-	AfterTool           HookEvent = "AfterTool"
-	BeforeAgent         HookEvent = "BeforeAgent"
-	AfterAgent          HookEvent = "AfterAgent"
-	BeforeModel         HookEvent = "BeforeModel"
-	AfterModel          HookEvent = "AfterModel"
-	SessionStart        HookEvent = "SessionStart"
-	SessionEnd          HookEvent = "SessionEnd"
-	PreCompress         HookEvent = "PreCompress"
-	PostCompress        HookEvent = "PostCompress"
-	BeforeToolSelection HookEvent = "BeforeToolSelection"
-	Notification        HookEvent = "Notification"
+	BeforeTool   HookEvent = "BeforeTool"
+	AfterTool    HookEvent = "AfterTool"
+	SessionStart HookEvent = "SessionStart"
+	SessionEnd   HookEvent = "SessionEnd"
 )
 
 // HookType distinguishes between in-process Go callbacks and external commands.
@@ -79,37 +71,6 @@ func NewManager() *Manager {
 	}
 }
 
-// Register adds a hook configuration for a specific event.
-func (m *Manager) Register(cfg HookConfig) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.hooks[cfg.Event] = append(m.hooks[cfg.Event], cfg)
-}
-
-// RegisterFunc is a convenience wrapper for registering a runtime hook.
-func (m *Manager) RegisterFunc(event HookEvent, matcher string, sequential bool, fn func(HookInput) (HookOutput, error)) {
-	m.Register(HookConfig{
-		Event:      event,
-		Matcher:    matcher,
-		Type:       HookRuntime,
-		RuntimeFn:  fn,
-		Timeout:    30 * time.Second,
-		Sequential: sequential,
-	})
-}
-
-// RegisterCommand registers an external command hook.
-func (m *Manager) RegisterCommand(event HookEvent, matcher string, sequential bool, command string, timeout time.Duration) {
-	m.Register(HookConfig{
-		Event:      event,
-		Matcher:    matcher,
-		Type:       HookCommand,
-		Command:    command,
-		Timeout:    timeout,
-		Sequential: sequential,
-	})
-}
-
 // Fire synchronously runs all sequential hooks matching the given event + target.
 // Returns aggregated HookOutput (all must Continue=true for the action to proceed).
 func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, input HookInput) HookOutput {
@@ -157,21 +118,6 @@ func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, inpu
 	}
 
 	return output
-}
-
-// FireAsync runs non-sequential hooks asynchronously. Use for events where
-// blocking isn't required (e.g., Notification, SessionEnd).
-func (m *Manager) FireAsync(event HookEvent, target string, input HookInput) {
-	m.mu.RLock()
-	hooks := m.copyHooks(event)
-	m.mu.RUnlock()
-
-	for _, h := range hooks {
-		if !m.matches(h, target) {
-			continue
-		}
-		go m.executeHook(context.Background(), h, input)
-	}
 }
 
 // executeHook runs a single hook and returns its output.
@@ -256,36 +202,11 @@ type ToolUseInfo struct {
 	ToolID   string
 }
 
-type Callback func(ctx context.Context, event Event, data any) error
-
-// RegisterLegacy adds a legacy-style callback.
-// Deprecated: use Register() or RegisterFunc() instead.
-func (m *Manager) RegisterLegacy(cb Callback) {
-	m.RegisterFunc(Notification, "", false, func(input HookInput) (HookOutput, error) {
-		event := Event(input.Event)
-		if err := cb(context.Background(), event, nil); err != nil {
-			return HookOutput{Continue: true}, err
-		}
-		return HookOutput{Continue: true}, nil
-	})
-}
-
-// Event is the legacy event type for backward compatibility.
-type Event = HookEvent
-
 // Legacy event constants for backward compatibility.
 const (
-	PreToolUse   HookEvent = BeforeTool
-	PostToolUse  HookEvent = AfterTool
-	SessionStartEv HookEvent = SessionStart
-	SessionEndEv   HookEvent = SessionEnd
-	PreCompactEv   HookEvent = PreCompress
-	PostCompactEv  HookEvent = PostCompress
+	PreToolUse  HookEvent = BeforeTool
+	PostToolUse HookEvent = AfterTool
 )
-
-func Override(result string) error {
-	return fmt.Errorf("override:%s:blocked", result)
-}
 
 // ============================================================================
 // Backward compatibility: legacy API used by engine.go
@@ -293,12 +214,6 @@ func Override(result string) error {
 
 // FireLegacy is the old 3-argument Fire(ctx, event, data) for backward compat.
 func (m *Manager) FireLegacy(ctx context.Context, event HookEvent, data any) {
-	switch event {
-	case BeforeTool, AfterTool:
-	default:
-		// Treat unknown events as Notification
-	}
-
 	var target string
 	input := HookInput{Event: event}
 
@@ -309,38 +224,4 @@ func (m *Manager) FireLegacy(ctx context.Context, event HookEvent, data any) {
 	}
 
 	m.Fire(ctx, event, target, input)
-}
-
-// ToolResultOverride is the legacy result override type.
-type ToolResultOverride struct {
-	Override bool
-	Result   string
-	Reason   string
-}
-
-// HookError is the legacy hook error type.
-type HookError struct {
-	Hook string
-	Err  error
-}
-
-func (e *HookError) Error() string { return fmt.Sprintf("hook %s: %v", e.Hook, e.Err) }
-
-// PreToolUseHook is the legacy pre-tool hook that supports result overrides.
-// Kept for backward compatibility.
-func (m *Manager) PreToolUseHook(ctx context.Context, info ToolUseInfo) (*ToolResultOverride, error) {
-	input := HookInput{
-		Event:     BeforeTool,
-		ToolName:  info.ToolName,
-		ToolInput: info.Input,
-	}
-	output := m.Fire(ctx, BeforeTool, info.ToolName, input)
-	if !output.Continue {
-		return &ToolResultOverride{
-			Override: true,
-			Result:   output.Message,
-			Reason:   output.Message,
-		}, nil
-	}
-	return nil, nil
 }

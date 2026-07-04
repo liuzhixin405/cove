@@ -729,6 +729,42 @@ func TestEngineAutoPermissionMode(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// TEST: Guardrail preflight warning must reach the model (§2.5), not just
+// a debug log — regression test for the fix in executeTool.
+// ===========================================================================
+
+func TestExecuteTool_SurfacesGuardrailWarningToModel(t *testing.T) {
+	failTool := &mockTool{name: "flaky", readOnly: true, safe: true, err: fmt.Errorf("boom")}
+	eng := newTestEngine(&mockProvider{}, failTool)
+
+	tc := api.ToolCall{ID: "t1", Name: "flaky", Input: map[string]any{"input": "x"}}
+	ctx := context.Background()
+
+	// guardrail.Tracker warns once the same (tool, args) signature has
+	// failed >= 2 times already, so the first two identical failures
+	// should NOT carry a warning yet.
+	for i := 0; i < 2; i++ {
+		out := eng.executeTool(ctx, tc)
+		if !strings.Contains(out, "boom") {
+			t.Fatalf("call %d: expected failure output, got %q", i, out)
+		}
+		if strings.Contains(out, "[guardrail:") {
+			t.Fatalf("call %d: did not expect a guardrail warning yet, got %q", i, out)
+		}
+	}
+
+	// Third identical call: the guardrail's preflight check now fires a
+	// Warn decision. That must be visible in the tool result the model
+	// sees, not just logged at debug level.
+	out := eng.executeTool(ctx, tc)
+	if !strings.Contains(out, "[guardrail:") {
+		t.Fatalf("expected guardrail warning to be surfaced in tool output, got %q", out)
+	}
+	if !strings.Contains(out, "boom") {
+		t.Fatalf("expected the real failure output to still be present alongside the warning, got %q", out)
+	}
+}
 
 // ===========================================================================
 // VISUAL DEMO: Steer flow — user guides AI mid-task (matches Hermes /steer)

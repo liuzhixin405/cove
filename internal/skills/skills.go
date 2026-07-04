@@ -23,14 +23,23 @@ type Skill struct {
 	Conditional  bool     `json:"conditional,omitempty"`
 	Paths        []string `json:"paths,omitempty"`
 	AllowedTools []string `json:"allowed_tools,omitempty"`
-	Builtin      bool     `json:"-"`
-	FilePath     string   `json:"-"`
-	Directory    string   `json:"-"`
+	// Steps, if declared in frontmatter, is an explicit ordered checklist
+	// for this skill (e.g. "Read the target file, Apply the fix, Run
+	// tests, Verify output"). When present, SkillTool renders it as a
+	// numbered checklist ahead of the skill's free-form prompt body, so a
+	// skill can act as a lightweight structured workflow — a predetermined
+	// sequence the model follows and checks off — rather than relying on
+	// the model to re-derive the same steps from prose every time. This is
+	// optional and purely additive: skills without "steps:" behave exactly
+	// as before.
+	Steps     []string `json:"steps,omitempty"`
+	Builtin   bool     `json:"-"`
+	FilePath  string   `json:"-"`
+	Directory string   `json:"-"`
 }
 
 type Manager struct {
 	skills map[string]Skill
-	dirs   []string
 	mu     sync.RWMutex
 }
 
@@ -39,6 +48,7 @@ type frontmatter struct {
 	Description  string
 	Paths        []string
 	AllowedTools []string
+	Steps        []string
 	Body         string
 }
 
@@ -47,7 +57,6 @@ func NewManager() *Manager { return &Manager{skills: make(map[string]Skill)} }
 func (m *Manager) AddDirectory(dir string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.dirs = append(m.dirs, dir)
 	m.scanDir(dir)
 }
 
@@ -103,6 +112,7 @@ func parseSkill(name, content, path string) Skill {
 		skill.Conditional = len(fm.Paths) > 0
 		skill.Paths = fm.Paths
 		skill.AllowedTools = fm.AllowedTools
+		skill.Steps = fm.Steps
 	}
 	return skill
 }
@@ -142,9 +152,40 @@ func parseFrontmatter(content string) *frontmatter {
 			for _, t := range strings.Split(v, ",") {
 				fm.AllowedTools = append(fm.AllowedTools, strings.TrimSpace(t))
 			}
+		case "steps":
+			for _, step := range strings.Split(v, ",") {
+				if s := strings.TrimSpace(step); s != "" {
+					fm.Steps = append(fm.Steps, s)
+				}
+			}
 		}
 	}
 	return fm
+}
+
+// RenderInvocation builds the text handed back to the model when this
+// skill is invoked via the "skill" tool: an explicit numbered checklist
+// (if Steps is declared), an explicit tool-allowlist directive (if
+// AllowedTools is declared), followed by the skill's free-form prompt
+// body. Skills without Steps/AllowedTools render exactly as before
+// (just the prompt body plus the trailing instruction line), so this is
+// purely additive for skills that opt in.
+func (s Skill) RenderInvocation() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[Skill: %s]\n\n", s.Name))
+	if len(s.Steps) > 0 {
+		sb.WriteString("Follow these steps in order. Do not skip ahead or reorder them — treat each one as a checkpoint to complete (and verify) before starting the next:\n")
+		for i, step := range s.Steps {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, step))
+		}
+		sb.WriteString("\n")
+	}
+	if len(s.AllowedTools) > 0 {
+		sb.WriteString(fmt.Sprintf("While executing this skill, only use these tools: %s. If the task genuinely requires a different tool, explain why before using it.\n\n", strings.Join(s.AllowedTools, ", ")))
+	}
+	sb.WriteString(s.Prompt)
+	sb.WriteString("\n\nFollow these instructions to complete the task.")
+	return sb.String()
 }
 
 func (m *Manager) Register(skill Skill) {

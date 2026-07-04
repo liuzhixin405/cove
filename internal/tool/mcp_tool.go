@@ -9,8 +9,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/mcp"
 )
 
-type MCPTool struct{ baseTool }
-
 type mcpPoolView interface {
 	AllTools() []mcp.ToolRef
 	AllServers() []*mcp.ManagedServer

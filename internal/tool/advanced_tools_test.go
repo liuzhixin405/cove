@@ -202,6 +202,54 @@ func TestSkillToolFallsBackToRuntimeSkillManager(t *testing.T) {
 	}
 }
 
+// TestSkillToolPrefersSkillManagerOverSkillPrompts locks in the lookup
+// order fixed in this change: SkillManager (which can carry Steps/
+// AllowedTools) must win over the flat SkillPrompts map when a skill of
+// the same name is reachable through both, otherwise structured skills
+// would silently degrade to their bare-prompt form whenever engine.go
+// also happens to have populated SkillPrompts for the same name.
+func TestSkillToolPrefersSkillManagerOverSkillPrompts(t *testing.T) {
+	tsk := NewSkillTool()
+	rt := &Runtime{
+		SkillPrompts: map[string]string{"multi": "stub prompt from flat map"},
+		SkillManager: &fakeRuntimeSkillManager{skills: map[string]skills.Skill{
+			"multi": {Name: "multi", Prompt: "rich prompt body", Steps: []string{"Read the file", "Apply the fix"}},
+		}},
+	}
+
+	result, _ := tsk.Call(context.Background(), Input{"name": "multi"}, Context{Runtime: rt})
+	if result.IsError {
+		t.Fatalf("skill call failed: %s", result.Data)
+	}
+	if strings.Contains(result.Data, "stub prompt from flat map") {
+		t.Fatalf("expected SkillManager entry to win, got flat-map fallback: %q", result.Data)
+	}
+	if !strings.Contains(result.Data, "rich prompt body") {
+		t.Fatalf("expected SkillManager prompt body, got %q", result.Data)
+	}
+	if !strings.Contains(result.Data, "1. Read the file") || !strings.Contains(result.Data, "2. Apply the fix") {
+		t.Fatalf("expected numbered steps checklist, got %q", result.Data)
+	}
+}
+
+// TestSkillToolRendersAllowedToolsDirective checks that a declared
+// AllowedTools list surfaces as an explicit constraint in the tool
+// result, not just silently stored on the struct.
+func TestSkillToolRendersAllowedToolsDirective(t *testing.T) {
+	tsk := NewSkillTool()
+	rt := &Runtime{SkillManager: &fakeRuntimeSkillManager{skills: map[string]skills.Skill{
+		"scoped": {Name: "scoped", Prompt: "do the scoped thing", AllowedTools: []string{"read", "edit"}},
+	}}}
+
+	result, _ := tsk.Call(context.Background(), Input{"name": "scoped"}, Context{Runtime: rt})
+	if result.IsError {
+		t.Fatalf("skill call failed: %s", result.Data)
+	}
+	if !strings.Contains(result.Data, "only use these tools: read, edit") {
+		t.Fatalf("expected allowed-tools directive, got %q", result.Data)
+	}
+}
+
 func TestTaskCreateListUpdate(t *testing.T) {
 	rt := &Runtime{Tasks: make(map[string]*TaskRecord)}
 	ctx := Context{Runtime: rt}

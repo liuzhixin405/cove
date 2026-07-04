@@ -65,7 +65,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 	// a literal 0x03 byte and is handled as ErrInterrupt below. But while a task
 
-	// runs, the main loop blocks in tasks.WaitIdle() with the terminal restored
+	// runs, the main loop blocks in tasks.WaitIdleUntil() with the terminal restored
 
 	// to cooked mode, so Ctrl+C is delivered as a SIGINT signal instead. Without
 

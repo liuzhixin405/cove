@@ -319,6 +319,17 @@ type anthropicDelta struct {
 
 func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error) {
 	msgs := p.convertMessages(req.Messages)
+	// Mirrors Chat(): req.System is per-turn/volatile content (e.g. model-tier
+	// guidance) that must NOT be folded into the cached SystemBase block, so
+	// it's injected as a prepended synthetic user message instead. This was
+	// previously only wired up in the non-streaming Chat() path — ChatStream
+	// silently dropped req.System entirely, which matters since streaming is
+	// the path actually used by the REPL.
+	if req.System != "" && len(msgs) > 0 {
+		msgs = append([]anthropicMsg{{Role: "user", Content: []anthropicContentBlock{
+			{Type: "text", Text: req.System},
+		}}}, msgs...)
+	}
 	body := anthropicReq{
 		Model:     req.Model,
 		MaxTokens: req.MaxTokens,
@@ -447,20 +458,25 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	sort.Ints(indices)
 	for _, idx := range indices {
 		acc := tcAccum[idx]
-		var input map[string]any
 		rawJSON := acc.JSONBuf.String()
 		if rawJSON == "" {
 			// Empty JSON buffer means this tool call was truncated (likely max_tokens hit)
 			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: empty input (response likely truncated, stop=%s)\n", acc.Name, stopReason)
 			continue
 		}
-		if err := json.Unmarshal([]byte(rawJSON), &input); err != nil {
-			// Incomplete JSON from truncated response - skip this tool call
-			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: failed to parse input JSON: %v (stop=%s, raw: %s)\n", acc.Name, err, stopReason, truncate(rawJSON, 200))
+		input, ok := RepairToolArguments(rawJSON)
+		if !ok {
+			// Incomplete/malformed JSON even after best-effort repair (tool_repair.go).
+			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: failed to parse input JSON even after repair (stop=%s, raw: %s)\n", acc.Name, stopReason, truncate(rawJSON, 200))
+			toolCalls = append(toolCalls, ToolCall{
+				ID:   acc.ID,
+				Name: acc.Name,
+				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
+					"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
+					len(rawJSON), truncate(rawJSON, 120))},
+				ParseError: true,
+			})
 			continue
-		}
-		if input == nil {
-			input = map[string]any{}
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}

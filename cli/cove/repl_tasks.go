@@ -230,14 +230,6 @@ func (r *replTaskRunner) Enqueue(msg api.Message) (int, bool) {
 	return 0, false
 }
 
-func (r *replTaskRunner) WaitIdle() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for r.running {
-		r.cond.Wait()
-	}
-}
-
 func (r *replTaskRunner) WaitIdleUntil(deadline time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

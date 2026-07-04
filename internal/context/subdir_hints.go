@@ -119,14 +119,3 @@ func (h *SubdirHints) checkDir(dir string) string {
 	}
 	return strings.Join(newHints, "\n")
 }
-
-// AllLoaded returns all discovered hint file paths.
-func (h *SubdirHints) AllLoaded() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	var paths []string
-	for p := range h.loaded {
-		paths = append(paths, p)
-	}
-	return paths
-}

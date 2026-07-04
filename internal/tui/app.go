@@ -49,9 +49,6 @@ func (a *App) Reasoning(s string) { a.program.Send(streamReasoningMsg(s)) }
 // EngineLine appends a diagnostic line from the engine (tool start/finish, etc).
 func (a *App) EngineLine(s string) { a.program.Send(engineLineMsg(s)) }
 
-// EndStream marks the end of an assistant response.
-func (a *App) EndStream() { a.program.Send(streamEndMsg{}) }
-
 // EndStreamAlign marks the end of an assistant response and provides the
 // ground-truth final text. If any streaming deltas were dropped by the
 // message channel, the UI model fills the gap to prevent truncation.

@@ -25,7 +25,6 @@ type Runner struct {
 	currentSession string
 	memoryRoot     string
 	sessionsDir    string
-	onFilesTouched func(paths []string) // callback when dream modifies files
 }
 
 // NewRunner creates an auto-dream runner. Call ExecuteAutoDream after each turn.
@@ -38,11 +37,6 @@ func NewRunner(provider api.Provider, model string, sessionID string) *Runner {
 		memoryRoot:     filepath.Join(home, ".cove", "memory"),
 		sessionsDir:    filepath.Join(home, ".cove", "sessions"),
 	}
-}
-
-// SetOnFilesTouched sets a callback that fires when dream modifies memory files.
-func (r *Runner) SetOnFilesTouched(fn func(paths []string)) {
-	r.onFilesTouched = fn
 }
 
 // ExecuteAutoDream checks all gates and runs the dream if conditions are met.
@@ -183,9 +177,6 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		// No tool calls — dream is done
 		if len(resp.ToolCalls) == 0 {
 			task.Complete()
-			if r.onFilesTouched != nil && len(task.FilesTouched) > 0 {
-				r.onFilesTouched(task.FilesTouched)
-			}
 			log.Debugf("[autoDream] completed — %d files touched", len(task.FilesTouched))
 			return
 		}
@@ -210,9 +201,6 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 	}
 
 	task.Complete()
-	if r.onFilesTouched != nil && len(task.FilesTouched) > 0 {
-		r.onFilesTouched(task.FilesTouched)
-	}
 	log.Debugf("[autoDream] completed (max iterations) — %d files touched", len(task.FilesTouched))
 }
 

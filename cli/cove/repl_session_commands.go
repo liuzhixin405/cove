@@ -28,6 +28,11 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 		return true
 	case strings.HasPrefix(input, "/history "):
 		histID := strings.TrimSpace(strings.TrimPrefix(input, "/history "))
+		if strings.EqualFold(histID, "clean") {
+			handleHistoryClean()
+			*historyPickPending = false
+			return true
+		}
 		if strings.HasPrefix(strings.ToLower(histID), "detail ") {
 			handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng)
 			*historyPickPending = false

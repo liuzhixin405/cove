@@ -141,12 +141,6 @@ func (p *Pool) DisconnectAll() {
 	}
 }
 
-func (p *Pool) Server(name string) *ManagedServer {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.servers[name]
-}
-
 func (p *Pool) AllServers() []*ManagedServer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -217,12 +211,6 @@ func (ms *ManagedServer) Close() {
 		ms.Client.Close()
 	}
 	// Note: transport is already closed by Client.Close(), no double-close
-}
-
-func ConnectFromConfig(ctx context.Context, servers map[string]ServerConfig) *Pool {
-	pool := NewPool()
-	pool.LoadFromConfig(ctx, servers)
-	return pool
 }
 
 // LoadFromConfig connects to all servers defined in the config map.

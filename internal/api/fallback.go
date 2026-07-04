@@ -81,34 +81,6 @@ func NewModelFallback(providers []Provider) *ModelFallback {
 	return mf
 }
 
-// NewModelFallbackWithModels creates a fallback chain from provider+model pairs.
-func NewModelFallbackWithModels(pairs []struct {
-	Provider Provider
-	Model    string
-}) *ModelFallback {
-	if len(pairs) == 0 {
-		panic("ModelFallback requires at least one provider")
-	}
-	mf := &ModelFallback{
-		cooldownDur: 60 * time.Second,
-		maxFails:    3,
-	}
-	for _, pair := range pairs {
-		mf.providers = append(mf.providers, &ProviderWithStatus{
-			Provider: pair.Provider,
-			Status:   ProviderOK,
-			Model:    pair.Model,
-		})
-	}
-	return mf
-}
-
-// SetCooldown overrides the default cooldown (60s).
-func (mf *ModelFallback) SetCooldown(d time.Duration) { mf.cooldownDur = d }
-
-// SetMaxFails overrides the max consecutive failures before marking unavailable.
-func (mf *ModelFallback) SetMaxFails(n int) { mf.maxFails = n }
-
 // Current returns the currently active provider (without trying it).
 func (mf *ModelFallback) Current() Provider {
 	mf.mu.Lock()
@@ -215,32 +187,6 @@ func (mf *ModelFallback) try(
 	}
 	mf.mu.Unlock()
 	return nil, nil, fmt.Errorf("all %d providers failed: %s", len(mf.providers), strings.Join(msgs, "; "))
-}
-
-// Status returns health info for all providers (for UI display).
-func (mf *ModelFallback) Status() []ProviderStatusInfo {
-	mf.mu.Lock()
-	defer mf.mu.Unlock()
-	var out []ProviderStatusInfo
-	for _, pw := range mf.providers {
-		out = append(out, ProviderStatusInfo{
-			Name:   pw.Provider.Name(),
-			Model:  pw.Model,
-			Status: pw.Status,
-		})
-	}
-	return out
-}
-
-// Restore resets all providers back to OK status (e.g. after user intervention).
-func (mf *ModelFallback) Restore() {
-	mf.mu.Lock()
-	defer mf.mu.Unlock()
-	for _, pw := range mf.providers {
-		pw.Status = ProviderOK
-		pw.FailCount = 0
-		pw.LastError = nil
-	}
 }
 
 func isRateLimit(err error) bool {

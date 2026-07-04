@@ -39,15 +39,6 @@ func NewChatCompressor() *ChatCompressor {
 	}
 }
 
-// SetThreshold overrides the trigger threshold (0.0–1.0).
-func (cc *ChatCompressor) SetThreshold(t float64) { cc.tokenThreshold = t }
-
-// SetKeepFraction overrides how many recent messages to preserve.
-func (cc *ChatCompressor) SetKeepFraction(f float64) { cc.keepFraction = f }
-
-// Disable turns off compression entirely.
-func (cc *ChatCompressor) Disable() { cc.enabled = false }
-
 // NeedsCompression returns true if the given token count exceeds the threshold.
 func (cc *ChatCompressor) NeedsCompression(tokenCount, tokenLimit int) bool {
 	if !cc.enabled || tokenLimit <= 0 {
@@ -124,6 +115,19 @@ func (cc *ChatCompressor) Compress(
 	}
 
 	summary, err := cc.generateSummary(ctx, history, tryChat)
+	if err == nil {
+		if ok, reason := validateSummaryQuality(summary, history); !ok {
+			// The summary itself looks unreliable (too short/long, or it
+			// dropped every file the conversation actually touched) — this
+			// matters more for fast/mid-tier models, which are more likely
+			// to produce a shallow or hallucinated summary under a tight
+			// token budget. Treat it the same as a hard failure: better to
+			// fall back to plain truncation (which loses detail but can't
+			// silently misinform the model) than to keep a bad summary.
+			log.Warnf("compressor: rejecting low-quality summary, falling back to truncation: %s", reason)
+			err = fmt.Errorf("summary failed quality check: %s", reason)
+		}
+	}
 	if err != nil {
 		log.Warnf("compressor: summary generation failed, falling back to truncation: %v", err)
 		// Fallback: simple truncation. Same invariant — a single user message then
@@ -229,6 +233,60 @@ func (cc *ChatCompressor) generateSummary(
 		return "", err
 	}
 	return resp.Content, nil
+}
+
+// validateSummaryQuality does a lightweight sanity check on a Layer-2
+// compression summary before it's allowed to replace real conversation
+// history. This is a cheap heuristic, not a semantic correctness check —
+// it exists because a bad summary is worse than no summary: it silently
+// causes "amnesia" for the rest of the session instead of visibly failing.
+// Fast/mid-tier models are more likely than top-tier ones to produce a
+// shallow or hallucinated summary under a tight token budget, which is
+// exactly the failure mode this guards against.
+func validateSummaryQuality(summary string, history []api.Message) (ok bool, reason string) {
+	trimmed := strings.TrimSpace(summary)
+	if len(trimmed) < 40 {
+		return false, fmt.Sprintf("summary too short (%d chars)", len(trimmed))
+	}
+	if len(trimmed) > 6000 {
+		return false, fmt.Sprintf("summary suspiciously long (%d chars), likely malformed", len(trimmed))
+	}
+
+	paths := distinctToolPaths(history)
+	if len(paths) > 0 {
+		lowerSummary := strings.ToLower(trimmed)
+		covered := 0
+		for _, p := range paths {
+			if strings.Contains(lowerSummary, strings.ToLower(filepath.Base(p))) {
+				covered++
+			}
+		}
+		if covered == 0 {
+			return false, fmt.Sprintf("summary mentions none of the %d file(s) touched in this history", len(paths))
+		}
+		coverage := float64(covered) / float64(len(paths))
+		if len(paths) >= 3 && coverage < 0.3 {
+			return false, fmt.Sprintf("summary covers only %.0f%% of %d files touched in history", coverage*100, len(paths))
+		}
+	}
+
+	return true, ""
+}
+
+// distinctToolPaths collects the distinct file paths referenced by tool
+// calls anywhere in history, in first-seen order.
+func distinctToolPaths(history []api.Message) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	for _, m := range history {
+		for _, tc := range m.ToolCalls {
+			if p := toolTargetPath(tc.Input); p != "" && !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
 }
 
 // toolTargetPath extracts the file path a write/edit tool call targets, honoring

@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +35,34 @@ type Store struct {
 	cacheTTL    time.Duration
 	promptCache string
 	promptDirty bool
+
+	// Optional semantic search (opt-in; nil by default = pure BM25, the
+	// original and still fully-supported behavior). See
+	// EnableRemoteEmbeddings and docs/中等模型平替优化建议.md §2.2 — this
+	// deliberately does NOT require any locally-installed model.
+	embedProvider     EmbeddingProvider
+	embedCache        map[string][]float32 // content-hash -> embedding vector
+	embedBackoffUntil time.Time
+}
+
+// embedBackoffDuration bounds how often a failing/unreachable embeddings
+// endpoint is retried: one slow failure costs one call, not every
+// subsequent prompt build until the user notices and fixes their config.
+const embedBackoffDuration = 5 * time.Minute
+
+// EnableRemoteEmbeddings opts the store into blending BM25 keyword search
+// with real semantic similarity from the given EmbeddingProvider (typically
+// a RemoteAPIEmbeddingProvider — see embed.go). Call this only when the
+// user has explicitly configured an embeddings endpoint; leaving it unset
+// keeps the original pure-BM25 behavior with zero extra network calls or
+// cost. Passing nil disables it again.
+func (s *Store) EnableRemoteEmbeddings(provider EmbeddingProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.embedProvider = provider
+	if provider != nil && s.embedCache == nil {
+		s.embedCache = make(map[string][]float32)
+	}
 }
 
 func NewStore() *Store {
@@ -48,6 +78,98 @@ func NewStore() *Store {
 
 func (s *Store) AddDir(dir string) {
 	s.dirs = append(s.dirs, dir)
+}
+
+// contentHash keys the embedding cache by content, so editing a memory
+// file naturally invalidates its old cached vector without any explicit
+// cache-invalidation bookkeeping.
+func contentHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:16])
+}
+
+// vectorScoreWeight is how much a perfect (cosine similarity 1.0) semantic
+// match can add on top of the existing BM25+recency score. It is additive
+// rather than a full re-normalized blend deliberately: BM25 scores are
+// unbounded and query-dependent, so mixing them with a 0-1 cosine score via
+// fixed weights would require normalizing BM25 first (another source of
+// bugs); adding a bounded bonus preserves BM25's existing ranking behavior
+// exactly when semantic search is unavailable (bonus is simply 0) and only
+// nudges results when it is.
+const vectorScoreWeight = 0.5
+
+// vectorScores returns cosine similarity between query and each entry in
+// entries (by slice index), using the configured EmbeddingProvider. It
+// returns nil — not an error — whenever semantic search isn't usable for
+// this call (disabled, backing off after a recent failure, or the API call
+// itself failed just now), so callers can unconditionally add
+// vectorScoreWeight*score without a separate enabled/disabled branch.
+func (s *Store) vectorScores(ctx context.Context, query string, entries []Entry) map[int]float64 {
+	s.mu.Lock()
+	provider := s.embedProvider
+	backoff := s.embedBackoffUntil
+	s.mu.Unlock()
+
+	if provider == nil || len(entries) == 0 {
+		return nil
+	}
+	if time.Now().Before(backoff) {
+		return nil
+	}
+
+	type pendingEntry struct {
+		idx  int
+		hash string
+	}
+	hashes := make([]string, len(entries))
+	var toEmbed []pendingEntry
+
+	s.mu.Lock()
+	for i, e := range entries {
+		h := contentHash(e.Content)
+		hashes[i] = h
+		if _, ok := s.embedCache[h]; !ok {
+			toEmbed = append(toEmbed, pendingEntry{idx: i, hash: h})
+		}
+	}
+	s.mu.Unlock()
+
+	// Batch the query plus any not-yet-cached entries into one API call.
+	inputs := make([]string, 0, 1+len(toEmbed))
+	inputs = append(inputs, query)
+	for _, p := range toEmbed {
+		inputs = append(inputs, entries[p.idx].Content)
+	}
+
+	vecs, err := provider.Embed(ctx, inputs)
+	if err != nil || len(vecs) == 0 || vecs[0] == nil {
+		s.mu.Lock()
+		s.embedBackoffUntil = time.Now().Add(embedBackoffDuration)
+		s.mu.Unlock()
+		return nil
+	}
+	queryVec := vecs[0]
+
+	s.mu.Lock()
+	for i, p := range toEmbed {
+		if 1+i < len(vecs) && vecs[1+i] != nil {
+			s.embedCache[p.hash] = vecs[1+i]
+		}
+	}
+	// Simplest possible bound on unbounded growth (renamed/deleted memory
+	// files leave stale entries behind): reset rather than partial-evict.
+	if len(s.embedCache) > 2000 {
+		s.embedCache = make(map[string][]float32)
+	}
+	scores := make(map[int]float64, len(entries))
+	for i, h := range hashes {
+		if v, ok := s.embedCache[h]; ok {
+			scores[i] = cosineSimilarity(queryVec, v)
+		}
+	}
+	s.mu.Unlock()
+
+	return scores
 }
 
 func (s *Store) All() []Entry {
@@ -112,84 +234,6 @@ func (s *Store) loadCLAUDEMD(dir string, entries *[]Entry, seen *map[string]bool
 		Content: string(data),
 		Project: true,
 	})
-}
-
-// BuildPromptFor generates a prompt snippet with only memories relevant to
-// the user's message, using BM25 keyword search (no embeddings required).
-func (s *Store) BuildPromptFor(ctx context.Context, userMessage string) string {
-	entries := s.All()
-	if len(entries) == 0 {
-		return ""
-	}
-
-	// Initialize BM25 index if needed
-	s.mu.Lock()
-	if s.bm25 == nil {
-		s.bm25 = NewBM25(1.2, 0.75)
-	}
-	bm25 := s.bm25
-	s.mu.Unlock()
-
-	// Re-index with current entries
-	now := time.Now()
-	bm25.Clear()
-	for i, e := range entries {
-		bm25.Index(i, e.Content, now)
-	}
-
-	// Search for relevant memories
-	results := bm25.Search(userMessage, 5)
-	if len(results) == 0 {
-		// No relevant memories found; include INDEX.md summary
-		return s.buildIndexPrompt()
-	}
-
-	// Blend BM25 score with recency (48h decay)
-	var blended []scoredAndEntry
-	for _, r := range results {
-		blended = append(blended, scoredAndEntry{
-			entry: entries[r.ID],
-			score: r.CombinedScore(now, 48),
-		})
-	}
-	sort.Slice(blended, func(i, j int) bool {
-		return blended[i].score > blended[j].score
-	})
-
-	// Build prompt with top results, deduplicated by memory name
-	seen := make(map[string]bool)
-	var sb strings.Builder
-	sb.WriteString("\n\n<user_memories>\n")
-	for _, b := range blended {
-		if seen[b.entry.Name] {
-			continue
-		}
-		seen[b.entry.Name] = true
-		sb.WriteString("<memory>\n")
-		sb.WriteString("<name>" + b.entry.Name + "</name>\n")
-		sb.WriteString("<content>\n")
-		sb.WriteString(b.entry.Content)
-		sb.WriteString("\n</content>\n")
-		sb.WriteString("</memory>\n")
-	}
-	sb.WriteString("</user_memories>\n")
-	return sb.String()
-}
-
-type scoredAndEntry struct {
-	entry Entry
-	score float64
-}
-
-// buildIndexPrompt builds a prompt containing only the INDEX.md content.
-func (s *Store) buildIndexPrompt() string {
-	entries := s.All()
-	for _, e := range entries {
-		if strings.EqualFold(e.Name, "INDEX.md") {
-			return "\n\n<user_memories>\n<memory>\n<name>" + e.Name + "</name>\n<content>\n" + e.Content + "\n</content>\n</memory>\n</user_memories>\n"
-		}
-	}
-	return ""
 }
 
 func (s *Store) BuildPrompt() string {
@@ -262,6 +306,12 @@ func (s *Store) Search(query string, topK int) []EntryMatch {
 	}
 
 	scored := bm25.Search(query, topK*2)
+	// Optional semantic re-ranking bonus (nil map when disabled/unavailable
+	// — see vectorScores' doc comment), computed once over the BM25
+	// candidate set rather than the full corpus, since embedding every
+	// memory entry on every search would be wasteful.
+	vecScores := s.vectorScores(context.Background(), query, entries)
+
 	seen := make(map[string]bool)
 	var results []EntryMatch
 	for _, r := range scored {
@@ -273,14 +323,20 @@ func (s *Store) Search(query string, topK int) []EntryMatch {
 			continue
 		}
 		seen[e.Name] = true
-		results = append(results, EntryMatch{Entry: e, Score: r.CombinedScore(now, 48)})
-		if len(results) >= topK {
-			break
+		score := r.CombinedScore(now, 48)
+		if vecScores != nil {
+			if v, ok := vecScores[r.ID]; ok {
+				score += vectorScoreWeight * v
+			}
 		}
+		results = append(results, EntryMatch{Entry: e, Score: score})
 	}
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Score > results[j].Score
 	})
+	if len(results) > topK {
+		results = results[:topK]
+	}
 	return results
 }
 

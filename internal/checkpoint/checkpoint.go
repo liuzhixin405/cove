@@ -19,7 +19,6 @@ type Manager struct {
 	refName  string // refs/cove/<hash(workdir)>
 	workDir  string
 	count    int
-	lastCP   time.Time
 }
 
 // New creates a checkpoint manager for the given working directory.
@@ -121,7 +120,6 @@ func (m *Manager) Create(label string) (string, error) {
 	}
 
 	m.count++
-	m.lastCP = time.Now()
 	return hash, nil
 }
 

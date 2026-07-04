@@ -1,8 +1,6 @@
 package cost
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -54,18 +52,3 @@ func TestTrackerSummaryShowsSmallNonZeroCost(t *testing.T) {
 	}
 }
 
-func TestCostHistoryRecordsLoadErrorForInvalidJSON(t *testing.T) {
-	dir := t.TempDir()
-	h := &CostHistory{path: filepath.Join(dir, "cost_history.json")}
-	if err := os.WriteFile(h.path, []byte(`{"records":`), 0o600); err != nil {
-		t.Fatalf("write history: %v", err)
-	}
-
-	h.load()
-	if h.LoadError == nil {
-		t.Fatal("expected load error for invalid JSON")
-	}
-	if len(h.Records) != 0 {
-		t.Fatalf("expected no records after invalid JSON, got %#v", h.Records)
-	}
-}

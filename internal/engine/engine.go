@@ -44,18 +44,23 @@ const CompactTokenThreshold = 64000
 const maxParallelTools = 8
 
 type Config struct {
-	Model          string
-	ModelFast      string
-	PermissionMode string
-	MaxBudget      float64
-	Debug          bool
-	Tools          []tool.Tool
-	Provider       api.ProviderConfig
-	MemoryStore    *memory.Store
-	SkillManager   *skills.Manager
-	HookManager    *hooks.Manager
-	Classifier     *permission.Classifier
+	Model                 string
+	ModelFast             string
+	PermissionMode        string
+	MaxBudget             float64
+	Debug                 bool
+	Tools                 []tool.Tool
+	Provider              api.ProviderConfig
+	MemoryStore           *memory.Store
+	SkillManager          *skills.Manager
+	HookManager           *hooks.Manager
+	Classifier            *permission.Classifier
 	LoopDetectionDisabled bool
+	// DoneVerifyCommands, if non-empty, are shell commands (e.g. "go build
+	// ./...", "go test ./...") run before accepting a model's "no more tool
+	// calls" response as actually complete. See verify_gate.go. Off by
+	// default (nil slice = no-op).
+	DoneVerifyCommands []string
 }
 
 type Engine struct {
@@ -84,18 +89,18 @@ type Engine struct {
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
 	lastSaveTime          time.Time
-	consecutiveErrors     int        // track consecutive tool failures for circuit breaking
-	loopHistory          []string       // recent tool-call fingerprints for loop detection
-	loopDetector         *LoopDetector // enhanced 2-layer loop detection (P0)
-	compressor           *ChatCompressor // AI-powered conversation compression (P0-3)
-	masker               *ToolOutputMasker // tool output masking to save context (P1)
-	nextSpeaker          *NextSpeaker      // predicts when to yield to user (P1)
-	safetyChecker        *safety.Checker   // security scan before tool execution (P1)
-	policyEngine         *permission.PolicyEngine // rule-based permission policies (P2)
-	sessionView          *session.SessionView     // snapshot for change tracking (P2)
-	enhancedRepoMap      *repomap.EnhancedGenerator // incremental repo map (P2)
-	iterCount             int        // track how many tool/LLM loops have run
-	promptMu              sync.Mutex // lock for interactive permission prompts
+	consecutiveErrors     int                        // track consecutive tool failures for circuit breaking
+	loopHistory           []string                   // recent tool-call fingerprints for loop detection
+	loopDetector          *LoopDetector              // enhanced 2-layer loop detection (P0)
+	compressor            *ChatCompressor            // AI-powered conversation compression (P0-3)
+	masker                *ToolOutputMasker          // tool output masking to save context (P1)
+	nextSpeaker           *NextSpeaker               // predicts when to yield to user (P1)
+	safetyChecker         *safety.Checker            // security scan before tool execution (P1)
+	policyEngine          *permission.PolicyEngine   // rule-based permission policies (P2)
+	sessionView           *session.SessionView       // snapshot for change tracking (P2)
+	enhancedRepoMap       *repomap.EnhancedGenerator // incremental repo map (P2)
+	iterCount             int                        // track how many tool/LLM loops have run
+	promptMu              sync.Mutex                 // lock for interactive permission prompts
 	// OnEngineOutput, if set, receives engine diagnostic lines
 	// (tool progress, spinner, etc.) instead of writing to stderr.
 	OnEngineOutput     func(line string)
@@ -111,6 +116,9 @@ type Engine struct {
 	dreamRunner        *dream.Runner
 	cpMgr              *checkpoint.Manager
 	lastReviewMsgCount int
+	verifyGate         *VerifyGate             // completion verification gate (P0-0, minimal EDCL)
+	verifyAttempts     int                     // how many times the gate has rejected completion this turn
+	fastOutcomes       *fastModelOutcomeWindow // recent fast-model success/failure, feeds router scoring
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
@@ -139,20 +147,24 @@ func New(config Config) (*Engine, error) {
 
 	// Create model router for dual-model switching
 	modelRouter := api.NewModelRouter(config.Model, config.ModelFast)
+	modelRouter.SetBudgetSignal(costBudgetSignal{tracker: tracker})
+	fastOutcomes := newFastModelOutcomeWindow(20)
+	modelRouter.SetFailureRateSignal(fastOutcomes)
 
 	e := &Engine{
-		fallback:    api.NewModelFallback([]api.Provider{prov}),
-		modelRouter: modelRouter,
-		registry:    reg,
-		messages:    make([]api.Message, 0),
-		config:      config,
-		costTracker: tracker,
-		perm:        perm,
-		store:       store,
-		memStore:    config.MemoryStore,
-		skillMgr:    config.SkillManager,
-		hookMgr:     config.HookManager,
-		classifier:  config.Classifier,
+		fallback:     api.NewModelFallback([]api.Provider{prov}),
+		modelRouter:  modelRouter,
+		registry:     reg,
+		messages:     make([]api.Message, 0),
+		config:       config,
+		costTracker:  tracker,
+		fastOutcomes: fastOutcomes,
+		perm:         perm,
+		store:        store,
+		memStore:     config.MemoryStore,
+		skillMgr:     config.SkillManager,
+		hookMgr:      config.HookManager,
+		classifier:   config.Classifier,
 		runtime: &tool.Runtime{
 			Tasks:         make(map[string]*tool.TaskRecord),
 			Teams:         make(map[string]*tool.TeamRecord),
@@ -178,6 +190,11 @@ func New(config Config) (*Engine, error) {
 	e.nextSpeaker = NewNextSpeaker()
 	e.safetyChecker = safety.New()
 	e.policyEngine = permission.NewPolicyEngine()
+
+	if len(config.DoneVerifyCommands) > 0 {
+		verifyCwd, _ := os.Getwd()
+		e.verifyGate = NewVerifyGate(config.DoneVerifyCommands, verifyCwd)
+	}
 
 	// Load permission policies from disk if available
 	if home, err := os.UserHomeDir(); err == nil {
@@ -229,11 +246,22 @@ func New(config Config) (*Engine, error) {
 	// Initialize rate limit tracker
 	e.rateLimits = api.NewRateLimitTracker()
 
+	// Background memory bookkeeping (extraction + consolidation) is exactly
+	// the kind of low-stakes, high-frequency task that should default to
+	// the cheap model rather than the premium one — same reasoning as
+	// compressor.go's compaction summaries. Previously both of these always
+	// used config.Model (premium), which was a needless cost multiplier
+	// with zero quality benefit for "summarize what happened" work.
+	backgroundModel := config.ModelFast
+	if backgroundModel == "" {
+		backgroundModel = config.Model
+	}
+
 	// Initialize extract runner (auto memory extraction)
-	e.extractRunner = extract.NewRunner(prov, config.Model)
+	e.extractRunner = extract.NewRunner(prov, backgroundModel)
 
 	// Initialize dream runner (periodic memory consolidation)
-	e.dreamRunner = dream.NewRunner(prov, config.Model, e.session.ID)
+	e.dreamRunner = dream.NewRunner(prov, backgroundModel, e.session.ID)
 
 	// Initialize checkpoint manager (git-based file snapshots)
 	if cpMgr, err := checkpoint.New(cwd); err == nil {
@@ -273,6 +301,7 @@ func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
 func (e *Engine) ProviderName() string       { return e.fallback.Current().DisplayName() }
 func (e *Engine) Provider() api.Provider     { return e.fallback.Current() }
+
 // SetProvider replaces the current provider chain with a single-provider fallback.
 // Used primarily by tests to inject mock providers.
 func (e *Engine) SetProvider(p api.Provider) { e.fallback = api.NewModelFallback([]api.Provider{p}) }
@@ -294,18 +323,8 @@ func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission
 	e.perm.AddRule(decision, rule)
 }
 
-func (e *Engine) Registry() *tool.Registry          { return e.registry }
-func (e *Engine) Runtime() *tool.Runtime            { return e.runtime }
-func (e *Engine) RateLimits() *api.RateLimitTracker { return e.rateLimits }
-func (e *Engine) FileHistory() []string {
-	e.fileMu.Lock()
-	defer e.fileMu.Unlock()
-	var files []string
-	for f := range e.fileHistory {
-		files = append(files, f)
-	}
-	return files
-}
+func (e *Engine) Registry() *tool.Registry { return e.registry }
+func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
 
 func (e *Engine) SystemPrompt() string {
 	if e.systemOverride != "" {
@@ -316,7 +335,7 @@ func (e *Engine) SystemPrompt() string {
 		return e.systemPrompt
 	}
 	var sb strings.Builder
-		sb.WriteString(`# Identity & Core Directive
+	sb.WriteString(`# Identity & Core Directive
 
 You are Cove, an AI coding assistant. Your core job: **use tools to complete tasks — never describe what you would do, actually DO it.**
 
@@ -422,26 +441,11 @@ Available tools:`)
 		sb.WriteString(fmt.Sprintf("\n- %s: %s", d.Name, d.Description))
 	}
 
-	if e.skillMgr != nil {
-		if sp := e.skillMgr.BuildPrompt(); sp != "" {
-			sb.WriteString(sp)
-		}
-	}
-
-	
-	if e.memStore != nil {
-		if mp := e.memStore.BuildPrompt(); mp != "" {
-			sb.WriteString(mp)
-		}
-	}
-
-	// Inject session notes for context continuity
-	if e.sessionNotes != nil {
-		if nc := e.sessionNotes.Content(); nc != "" {
-			sb.WriteString(nc)
-		}
-	}
-
+	// Core project info (working directory, platform, shell, git
+	// branch/status/log) is small, fixed-size, and essential on every
+	// turn, so it's written directly rather than competing for the
+	// shared budget below — it must never be what gets truncated just
+	// because memory or repo-map content happens to be large.
 	if e.projCtx != nil {
 		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
 			e.projCtx.Cwd, e.projCtx.Platform, e.projCtx.Shell))
@@ -457,18 +461,49 @@ Available tools:`)
 				sb.WriteString(fmt.Sprintf("\nRecent commits:\n%s", e.projCtx.GitLog))
 			}
 		}
-		if e.projCtx.FileTree != "" {
-			sb.WriteString(fmt.Sprintf("\nProject structure:\n%s", e.projCtx.FileTree))
+	}
+
+	// Everything below is optional, potentially large, and was previously
+	// appended unconditionally in full — a large memory store could
+	// silently crowd out the repo map, or vice versa, with no ordering or
+	// ceiling. It now competes for a single model-aware token budget via
+	// contextBudgeter instead: matched skills / retrieved memories are
+	// "relevant" (already scoped to the task) and go first, the repo map
+	// and file tree are "on-demand" (the model can re-derive them with a
+	// tool call), and session notes are pure overflow. See
+	// internal/engine/context_budget.go.
+	budgeter := newContextBudgeter(api.StaticContextBudget(e.config.Model))
+
+	if e.skillMgr != nil {
+		if sp := e.skillMgr.BuildPrompt(); sp != "" {
+			budgeter.add(layerRelevant, sp)
 		}
+	}
+	if e.memStore != nil {
+		if mp := e.memStore.BuildPrompt(); mp != "" {
+			budgeter.add(layerRelevant, mp)
+		}
+	}
+	if e.projCtx != nil {
 		// Use enhanced incremental repo map when available
 		if e.enhancedRepoMap != nil {
 			if mapText, _ := e.enhancedRepoMap.GenerateIncremental(200); mapText != "" {
-				sb.WriteString(fmt.Sprintf("\n<repo_map>\n%s\n</repo_map>\n", mapText))
+				budgeter.add(layerOnDemand, fmt.Sprintf("\n<repo_map>\n%s\n</repo_map>\n", mapText))
 			}
 		} else if e.projCtx.RepoMap != "" {
-			sb.WriteString(fmt.Sprintf("\nRepository Micro-Map (Defined API structures/schemas):\n%s", e.projCtx.RepoMap))
+			budgeter.add(layerOnDemand, fmt.Sprintf("\nRepository Micro-Map (Defined API structures/schemas):\n%s", e.projCtx.RepoMap))
+		}
+		if e.projCtx.FileTree != "" {
+			budgeter.add(layerOnDemand, fmt.Sprintf("\nProject structure:\n%s", e.projCtx.FileTree))
 		}
 	}
+	// Inject session notes for context continuity
+	if e.sessionNotes != nil {
+		if nc := e.sessionNotes.Content(); nc != "" {
+			budgeter.add(layerOverflow, nc)
+		}
+	}
+	sb.WriteString(budgeter.Render())
 
 	e.systemPrompt = sb.String()
 	return e.systemPrompt
@@ -540,6 +575,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	if e.loopDetector != nil {
 		e.loopDetector.Reset()
 	}
+	// Reset the verify-gate retry counter at the start of each turn so a
+	// prior turn's rejections don't eat into this turn's retry budget.
+	e.verifyAttempts = 0
 	// Snapshot session for change tracking this turn
 	e.sessionView = session.NewSessionView(e.messages, e.totalTokens)
 
@@ -561,6 +599,17 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		routedModel = decision.Model
 		log.Debugf("model routing: %s (source=%s, reason=%s)", decision.Model, decision.Source, decision.Reason)
 	}
+	// Extra behavioral guidance, computed once per user message and
+	// appended to every iteration's request this turn via
+	// ChatRequest.System. Empty when neither condition applies, so this
+	// adds zero prompt tokens for the common case.
+	//   - weakModelGuidance (model_tier_prompt.go): only for fast/mid-tier
+	//     models, since top-tier models already decompose/self-verify well.
+	//   - taskDecompositionGuidance (task_decomposition_prompt.go): only
+	//     when the message itself looks like a multi-step task, regardless
+	//     of which model was routed — a suggestion to plan first, never a
+	//     hard gate.
+	turnGuidance := weakModelGuidance(routedModel) + taskDecompositionGuidance(userMessage.Content)
 
 	for iter := 0; iter < MaxIterations; iter++ {
 		e.iterCount = iter + 1
@@ -582,7 +631,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			injected := false
 			for si := len(e.messages) - 1; si >= 0; si-- {
 				if e.messages[si].Role == "tool" {
-					e.messages[si].Content += "\n\n[鐢ㄦ埛鎸囧紩] " + steer
+					e.messages[si].Content += "\n\n[用户指引] " + steer
 					injected = true
 					break
 				}
@@ -593,8 +642,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 		}
 
-		// Compress message history if approaching context limits
-		e.checkAndCompress(ctx)
+		// Compress message history if approaching context limits. The
+		// threshold is model-aware (internal/api/model_context.go) rather
+		// than a single global constant, since mid-tier/fast models both
+		// tend to have smaller context windows and make less effective use
+		// of whatever window they do have.
+		e.checkAndCompress(ctx, routedModel)
 
 		// Apply prompt cache breakpoints for Anthropic
 		reqMessages := e.messages
@@ -610,6 +663,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			Model:      modelName,
 			Messages:   reqMessages,
 			SystemBase: sp,
+			System:     turnGuidance,
 			Tools:      toolDefs,
 			MaxTokens:  64000,
 		}
@@ -681,6 +735,35 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			// Completion verification gate (minimal EDCL "done contract"): if
+			// the user configured done_verify_commands, don't accept the
+			// model's self-reported "done" (no more tool calls) until those
+			// commands actually pass. This matters far more for mid-tier
+			// models than top-tier ones, since "I'm done" self-reports are
+			// exactly the kind of claim they get wrong more often — this
+			// turns that claim into something checked instead of trusted.
+			gaveUpUnresolved := false
+			if e.verifyGate.Enabled() {
+				results, passed := e.verifyGate.Run(ctx)
+				if !passed {
+					if e.verifyAttempts < e.verifyGate.MaxRetries() {
+						e.verifyAttempts++
+						e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
+						e.engineOutput(fmt.Sprintf("  \x1b[33m! verify_gate rejected completion (attempt %d/%d)\x1b[0m", e.verifyAttempts, e.verifyGate.MaxRetries()))
+						e.messages = append(e.messages, newSyntheticUserMsg(Summary(results)))
+						continue
+					}
+					e.engineOutput("  \x1b[31m! verify_gate: still failing after max retries, returning control to user\x1b[0m")
+					gaveUpUnresolved = true
+				}
+			}
+			// Feed the router's failure-rate signal (api.FailureRateSignal):
+			// a clean pass/no-gate counts as success, exhausting verify
+			// retries counts as failure, for whichever model this turn used.
+			if isFastModelName(routedModel) {
+				e.fastOutcomes.Record(gaveUpUnresolved)
+			}
+
 			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent})
 			e.saveSession()
 			// Turn-end pipeline (all run in background)
@@ -849,6 +932,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					Content: "[system: The last 3+ tool calls all failed. Please try a different approach or ask the user for clarification. Do not repeat the same failing pattern.]",
 				})
 				e.consecutiveErrors = 0
+				// Feed the router's failure-rate signal: this turn visibly
+				// struggled on the currently-routed model.
+				if isFastModelName(routedModel) {
+					e.fastOutcomes.Record(true)
+				}
 			}
 		} else {
 			e.consecutiveErrors = 0
@@ -875,7 +963,22 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	return "", fmt.Errorf("max iterations (%d) reached, cost: %s", MaxIterations, e.costTracker.Summary())
 }
 
-func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
+func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string) {
+	// If the provider layer could not parse this call's arguments as JSON
+	// even after best-effort repair (internal/api/tool_repair.go), don't
+	// dispatch garbage input to the real tool. Return a normal "Error: ..."
+	// tool result so the model sees exactly what went wrong and can resend
+	// the call with valid JSON on its next turn — this reuses the existing
+	// error/retry/circuit-breaker plumbing below instead of silently
+	// dropping the model's intent.
+	if tc.ParseError {
+		msg, _ := tc.Input["_cove_parse_error"].(string)
+		if msg == "" {
+			msg = "tool call arguments could not be parsed as JSON"
+		}
+		return fmt.Sprintf("Error: %s. Please resend this tool call with valid JSON arguments (check quote escaping, and avoid truncating long string fields).", msg)
+	}
+
 	t, ok := e.registry.Find(tc.Name)
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
@@ -902,16 +1005,37 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 			Input:    tc.Input,
 		})
 	}
-	// Guardrail check before execution
+	// Guardrail check before execution. guardrailWarning, if set, is spliced
+	// onto whatever this call ultimately returns (success or error) by the
+	// deferred closure below — every return statement below this point goes
+	// through it automatically via the named return value. Previously this
+	// only reached log.Debugf(), i.e. it was invisible to the model, which
+	// defeated the point of a *preflight* warning: the model never actually
+	// saw "you're repeating a failing/redundant pattern" until the harder
+	// circuit breakers (Block, or loop detection) kicked in later.
+	//
+	// Note: this must not mutate e.messages directly (unlike the loop
+	// detector's guidance injection elsewhere) — executeTool can run
+	// concurrently across goroutines for concurrency-safe tool calls (see
+	// the parallel dispatch path above), and e.messages is not
+	// synchronized for concurrent writes. Prepending to this call's own
+	// return value is safe because each goroutine only ever touches its
+	// own result slot.
+	var guardrailWarning string
 	if e.guardrails != nil {
 		decision := e.guardrails.BeforeCall(tc.Name, tc.Input)
 		switch decision.Action {
 		case guardrail.Block:
 			return fmt.Sprintf("Error: %s", decision.Message)
 		case guardrail.Warn:
-			// Inject warning but proceed
+			guardrailWarning = decision.Message
 			log.Debugf("guardrail warn: %s %s", tc.Name, decision.Message)
 		}
+	}
+	if guardrailWarning != "" {
+		defer func() {
+			toolOutput = fmt.Sprintf("[guardrail: %s]\n%s", guardrailWarning, toolOutput)
+		}()
 	}
 
 	cwd := ""
@@ -995,12 +1119,12 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) string {
 				if e.OnPermissionDone != nil {
 					e.OnPermissionDone()
 				}
-					if !approved {
-						return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
-					}
-				} else {
+				if !approved {
 					return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
 				}
+			} else {
+				return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
+			}
 		} else {
 			return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
 		}
@@ -1102,19 +1226,6 @@ func isTransientError(err error) bool {
 	return false
 }
 
-func shortPath(input map[string]any) string {
-	if p, ok := input["filePath"].(string); ok {
-		return filepath.Base(p)
-	}
-	if cmd, ok := input["command"].(string); ok {
-		if len(cmd) > 40 {
-			return cmd[:40] + "..."
-		}
-		return cmd
-	}
-	return ""
-}
-
 func toolPermissionMode(mode permission.Mode) string {
 	switch mode {
 	case permission.Bypass, permission.Plan:
@@ -1185,11 +1296,14 @@ func resolvePath(p, cwd string) (string, bool) {
 // Compact compresses the message history on demand (e.g. via /compact command).
 // Delegates to the ChatCompressor's two-layer pipeline.
 func (e *Engine) Compact(ctx context.Context) {
-	e.compactIfNeeded(ctx)
+	e.compactIfNeeded(ctx, compactionThreshold(e.config.Model))
 }
 
-// checkAndCompress runs the compressor at the start of each iteration as a lightweight guard.
-func (e *Engine) checkAndCompress(ctx context.Context) {
+// checkAndCompress runs the compressor at the start of each iteration as a
+// lightweight guard. model is the model actually routed for this turn
+// (internal/api/model_context.go derives a model-specific threshold from
+// it); pass "" to fall back to the legacy fixed CompactTokenThreshold.
+func (e *Engine) checkAndCompress(ctx context.Context, model string) {
 	// Mask old tool outputs before compression to reduce tokens
 	if e.masker != nil {
 		_, maskedMsgs := e.masker.Mask(e.messages, nil)
@@ -1200,21 +1314,33 @@ func (e *Engine) checkAndCompress(ctx context.Context) {
 	if e.compressor == nil {
 		return
 	}
-	if !e.compressor.NeedsCompression(e.totalTokens, CompactTokenThreshold) {
+	threshold := compactionThreshold(model)
+	if !e.compressor.NeedsCompression(e.totalTokens, threshold) {
 		return
 	}
-	e.compactIfNeeded(ctx)
+	e.compactIfNeeded(ctx, threshold)
 }
 
-// compactIfNeeded runs the full two-layer compression pipeline.
-func (e *Engine) compactIfNeeded(ctx context.Context) {
+// compactionThreshold resolves the model-aware compaction budget, falling
+// back to the legacy fixed constant when no model is known (e.g. routing
+// disabled or called from a context without a routing decision).
+func compactionThreshold(model string) int {
+	if model == "" {
+		return CompactTokenThreshold
+	}
+	return api.EffectiveCompactionBudget(model)
+}
+
+// compactIfNeeded runs the full two-layer compression pipeline against the
+// given (model-aware) token threshold.
+func (e *Engine) compactIfNeeded(ctx context.Context, threshold int) {
 	if e.compressor == nil {
 		return
 	}
 	if e.sessionNotes != nil {
 		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
 	}
-	
+
 	// Use model_fast for compression summaries 鈥?much cheaper than the main model.
 	// Falls back to the main model if model_fast is not configured.
 	tryChat := func(ctx context.Context, req api.ChatRequest) (*api.ChatResponse, error) {
@@ -1224,8 +1350,8 @@ func (e *Engine) compactIfNeeded(ctx context.Context) {
 		resp, _, err := e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
 		return resp, err
 	}
-	
-	result, newMsgs := e.compressor.Compress(ctx, e.messages, e.totalTokens, CompactTokenThreshold, tryChat)
+
+	result, newMsgs := e.compressor.Compress(ctx, e.messages, e.totalTokens, threshold, tryChat)
 	if result.Compressed {
 		e.messages = newMsgs
 		e.totalTokens = countTokens(e.messages)
@@ -1293,13 +1419,13 @@ func isSyntheticUserMessage(content string) bool {
 	}
 	// Engine-injected prefixes
 	syntheticPrefixes := []string{
-		"[system:",                     // circuit breaker
-		"[Conversation Summary]",       // AI compression
-		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",        // loop guidance (Chinese)
-		"[Context truncated",           // truncation notice
-		"[鐢ㄦ埛鎸囧紩]",                    // steer guidance
-		"[Continue the task",           // compression continuation
-		"[浼氳瘽鎽樿]",                    // old compression (Chinese)
+		"[system:",               // circuit breaker
+		"[Conversation Summary]", // AI compression
+		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]", // loop guidance (Chinese)
+		"[Context truncated", // truncation notice
+		"[用户指引]",             // steer guidance
+		"[Continue the task", // compression continuation
+		"[浼氳瘽鎽樿]",           // old compression (Chinese)
 	}
 	for _, p := range syntheticPrefixes {
 		if strings.HasPrefix(c, p) {
@@ -1332,7 +1458,7 @@ func looksSynthetic(m api.Message) bool {
 		"[Conversation Summary]",
 		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",
 		"[Context truncated",
-		"[鐢ㄦ埛鎸囧紩]",
+		"[用户指引]",
 		"[Continue the task",
 		"[浼氳瘽鎽樿]",
 		"run slow tool",
@@ -1523,26 +1649,6 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-3] + "..."
-}
-func truncateTitle(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
-}
-
-func formatMessages(msgs []api.Message) string {
-	var sb strings.Builder
-	for _, m := range msgs {
-		sb.WriteString(m.Role + ": ")
-		content := m.Content
-		if len(content) > 300 {
-			content = content[:297] + "..."
-		}
-		sb.WriteString(content)
-		sb.WriteString("\n")
-	}
-	return sb.String()
 }
 
 // ANSI formatting for tool output lines
@@ -1752,4 +1858,3 @@ func (e *Engine) countRecent(fp string, window int) int {
 	}
 	return count
 }
-

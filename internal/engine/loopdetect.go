@@ -366,12 +366,6 @@ func (ld *LoopDetector) RecordIteration() LoopResult {
 	return LoopResult{}
 }
 
-// ResetFileTracking resets file activity tracking (called periodically).
-func (ld *LoopDetector) ResetFileTracking() {
-	ld.filesCreated = make(map[string]bool)
-	ld.filesWritten = make(map[string]bool)
-}
-
 // clearToolOnlyFromHistory removes ALL occurrences of the given tool pattern
 // from the Layer 1b history. Used by progress detection: when outputs are
 // diverse, we retroactively clear that tool pattern to prevent false positives.

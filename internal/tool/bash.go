@@ -13,8 +13,6 @@ import (
 	"unicode/utf8"
 )
 
-type BashTool struct{}
-
 func NewBashTool() Tool {
 	def := Def{
 		Name: "bash", Description: "Execute shell commands. Use for terminal operations like git, npm, go, docker, tests.",

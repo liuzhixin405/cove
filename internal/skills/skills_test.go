@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -107,4 +109,75 @@ func skillNames(skills []Skill) []string {
 		names = append(names, s.Name)
 	}
 	return names
+}
+
+func TestParseFrontmatter_StepsCommaSeparated(t *testing.T) {
+	content := "---\nname: deploy\ndescription: Deploy the service\nsteps: Run tests, Build image, Push image, Roll out\n---\nBody text here.\n"
+	fm := parseFrontmatter(content)
+	if fm == nil {
+		t.Fatal("expected non-nil frontmatter")
+	}
+	want := []string{"Run tests", "Build image", "Push image", "Roll out"}
+	if len(fm.Steps) != len(want) {
+		t.Fatalf("expected %d steps, got %d (%v)", len(want), len(fm.Steps), fm.Steps)
+	}
+	for i, s := range want {
+		if fm.Steps[i] != s {
+			t.Errorf("step %d: expected %q, got %q", i, s, fm.Steps[i])
+		}
+	}
+}
+
+func TestParseFrontmatter_StepsAbsentLeavesNilSlice(t *testing.T) {
+	content := "---\nname: simple\ndescription: No steps here\n---\nJust do it.\n"
+	fm := parseFrontmatter(content)
+	if fm == nil {
+		t.Fatal("expected non-nil frontmatter")
+	}
+	if len(fm.Steps) != 0 {
+		t.Fatalf("expected no steps, got %v", fm.Steps)
+	}
+}
+
+func TestParseSkill_PropagatesStepsToSkill(t *testing.T) {
+	content := "---\nname: release\ndescription: Cut a release\nsteps: Tag version, Build artifacts\nallowed_tools: bash, write\n---\nRelease workflow body.\n"
+	sk := parseSkill("release", content, "/tmp/release/SKILL.md")
+	if len(sk.Steps) != 2 || sk.Steps[0] != "Tag version" || sk.Steps[1] != "Build artifacts" {
+		t.Fatalf("expected Steps propagated from frontmatter, got %v", sk.Steps)
+	}
+	if len(sk.AllowedTools) != 2 {
+		t.Fatalf("expected AllowedTools still parsed alongside Steps, got %v", sk.AllowedTools)
+	}
+}
+
+func TestSkill_RenderInvocation_NoStepsMatchesLegacyShape(t *testing.T) {
+	sk := Skill{Name: "plain", Prompt: "Just follow this prose."}
+	got := sk.RenderInvocation()
+	want := "[Skill: plain]\n\nJust follow this prose.\n\nFollow these instructions to complete the task."
+	if got != want {
+		t.Fatalf("expected legacy-shaped output for a skill with no Steps/AllowedTools.\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestSkill_RenderInvocation_StepsRenderedAsNumberedChecklist(t *testing.T) {
+	sk := Skill{Name: "checklist", Prompt: "body", Steps: []string{"First step", "Second step", "Third step"}}
+	got := sk.RenderInvocation()
+	for i, step := range sk.Steps {
+		numbered := strconv.Itoa(i+1) + ". " + step
+		if !strings.Contains(got, numbered) {
+			t.Fatalf("expected %q in rendered output, got %q", numbered, got)
+		}
+	}
+	// Steps must appear before the free-form prompt body.
+	if strings.Index(got, "First step") > strings.Index(got, "body") {
+		t.Fatalf("expected steps checklist to precede prompt body, got %q", got)
+	}
+}
+
+func TestSkill_RenderInvocation_AllowedToolsRenderedAsConstraint(t *testing.T) {
+	sk := Skill{Name: "scoped", Prompt: "body", AllowedTools: []string{"read", "grep"}}
+	got := sk.RenderInvocation()
+	if !strings.Contains(got, "only use these tools: read, grep") {
+		t.Fatalf("expected allowed-tools constraint sentence, got %q", got)
+	}
 }

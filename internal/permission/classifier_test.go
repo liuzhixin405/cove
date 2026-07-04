@@ -38,6 +38,34 @@ func TestClassifier(t *testing.T) {
 	}
 }
 
+func TestClassifierStructuralRiskHeuristics(t *testing.T) {
+	c := NewClassifier()
+
+	tests := []struct {
+		name     string
+		cmd      string
+		expected CmdCategory
+	}{
+		{"ifs obfuscated rm bypasses keyword scan", "rm${IFS}-rf${IFS}/tmp/x", CatDangerous},
+		{"ifs obfuscation lowercase variant", "rm$ifs-rf$ifs/tmp/x", CatDangerous},
+		{"decode-then-pipe-to-bash without curl/wget", "echo cGF5bG9hZA== | base64 -d | bash", CatDangerous},
+		{"pipe into python interpreter", "printf '%s' payload | python3", CatDangerous},
+		{"pipe into powershell", "echo payload | powershell", CatDangerous},
+		{"brace expansion forces manual review", "echo ${SOME_VAR}", CatUnknown},
+		{"plain pipe between safe read-only commands stays unknown, not silently safe", "cat file.go | wc -l", CatUnknown},
+		{"logical OR is not mistaken for a pipe stage", "go build ./... || echo failed", CatUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.Classify(tt.cmd)
+			if result != tt.expected {
+				t.Errorf("Classify(%q) = %v, want %v", tt.cmd, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestShouldAutoApprove(t *testing.T) {
 	c := NewClassifier()
 	if !c.ShouldAutoApprove("git status") {

@@ -152,9 +152,8 @@ type CostRecord struct {
 
 // CostHistory manages persistent cost records across sessions.
 type CostHistory struct {
-	path      string
-	LoadError error        `json:"-"`
-	Records   []CostRecord `json:"records"`
+	path    string
+	Records []CostRecord `json:"records"`
 }
 
 // NewCostHistory loads or creates a cost history file.
@@ -175,7 +174,6 @@ func (h *CostHistory) load() {
 		return
 	}
 	if err := json.Unmarshal(data, &h.Records); err != nil {
-		h.LoadError = err
 		h.Records = nil
 	}
 }

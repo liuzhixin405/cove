@@ -1,10 +1,15 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"strings"
+	"time"
 )
 
 // EmbeddingProvider returns vector embeddings for given texts.
@@ -14,67 +19,116 @@ type EmbeddingProvider interface {
 	Dim() int
 }
 
-// APIEmbeddingProvider uses pseudo-embeddings (character n-gram based).
-// provider and model are stored for future integration with real embedding APIs.
-type APIEmbeddingProvider struct {
-	dim int
+// RemoteAPIEmbeddingProvider calls a real OpenAI-compatible /embeddings
+// endpoint. It is designed to reuse the base URL and API key the user
+// already configured for chat completions — no separate account, no local
+// model download — so enabling it is just pointing at an existing,
+// already-cheap embeddings endpoint (most OpenAI-compatible providers,
+// including DeepSeek/GLM/Qwen-family ones, price embeddings far below their
+// chat models). See docs/中等模型平替优化建议.md §2.2 for the reasoning
+// behind not requiring a locally-installed model.
+//
+// Every failure mode (unreachable endpoint, non-200 response, malformed
+// body) is returned as a plain Go error rather than panicking or silently
+// substituting garbage data — Store treats any such error as "vector search
+// unavailable this round, fall back to BM25 only" (see store.go).
+type RemoteAPIEmbeddingProvider struct {
+	baseURL string
+	apiKey  string
+	model   string
+	dim     int // best-known embedding dimension; updated from the first real response
+	client  *http.Client
 }
 
-// NewAPIEmbeddingProvider creates a provider that uses pseudo-embeddings
-// (character n-gram based) rather than calling the LLM's embedding API.
-// This avoids additional API costs for the memory layer.
-func NewAPIEmbeddingProvider(dim int) *APIEmbeddingProvider {
-	if dim <= 0 {
-		dim = 384
+// NewRemoteAPIEmbeddingProvider creates a provider that calls
+// baseURL+"/embeddings" using the given API key and model. If model is
+// empty, "text-embedding-3-small" is used (widely supported by OpenAI and
+// most OpenAI-compatible providers).
+func NewRemoteAPIEmbeddingProvider(baseURL, apiKey, model string) *RemoteAPIEmbeddingProvider {
+	if model == "" {
+		model = "text-embedding-3-small"
 	}
-	return &APIEmbeddingProvider{dim: dim}
+	return &RemoteAPIEmbeddingProvider{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		apiKey:  apiKey,
+		model:   model,
+		dim:     1536, // placeholder until the first real response updates it
+		client:  &http.Client{Timeout: 20 * time.Second},
+	}
 }
 
-func (p *APIEmbeddingProvider) Dim() int { return p.dim }
+func (p *RemoteAPIEmbeddingProvider) Dim() int { return p.dim }
 
-func (p *APIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	results := make([][]float32, len(texts))
-	for i, text := range texts {
-		results[i] = pseudoEmbedding(text, p.dim)
-	}
-	return results, nil
+type remoteEmbedRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
 }
 
-// pseudoEmbedding creates a deterministic pseudo-embedding from text.
-// This is a fallback when real embeddings are unavailable.
-// It's based on character n-grams hashed to float32 values.
-func pseudoEmbedding(text string, dim int) []float32 {
-	vec := make([]float32, dim)
+type remoteEmbedResponse struct {
+	Data []struct {
+		Embedding []float32 `json:"embedding"`
+		Index     int       `json:"index"`
+	} `json:"data"`
+}
 
-	// Simple bag-of-character-ngrams approach
-	lower := strings.ToLower(text)
-	for i := 0; i < len(lower)-2; i++ {
-		trigram := lower[i : i+3]
-		hash := hashTrigram(trigram)
-		idx := int(hash % uint32(dim))
-		vec[idx] += 1.0
+func (p *RemoteAPIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if p.apiKey == "" {
+		return nil, fmt.Errorf("remote embeddings: no API key configured")
 	}
 
-	// Normalize
-	var sum float64
-	for _, v := range vec {
-		sum += float64(v * v)
+	body, err := json.Marshal(remoteEmbedRequest{Model: p.model, Input: texts})
+	if err != nil {
+		return nil, fmt.Errorf("remote embeddings: marshal request: %w", err)
 	}
-	if sum > 0 {
-		norm := float32(math.Sqrt(sum))
-		for i := range vec {
-			vec[i] /= norm
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("remote embeddings: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	httpResp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("remote embeddings: request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
+	if httpResp.StatusCode != 200 {
+		msg := string(raw)
+		if len(msg) > 300 {
+			msg = msg[:300]
+		}
+		return nil, fmt.Errorf("remote embeddings: API error %d: %s", httpResp.StatusCode, msg)
+	}
+
+	var parsed remoteEmbedResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("remote embeddings: decode response: %w", err)
+	}
+	if len(parsed.Data) == 0 {
+		return nil, fmt.Errorf("remote embeddings: API returned no embeddings")
+	}
+
+	out := make([][]float32, len(texts))
+	for _, d := range parsed.Data {
+		if d.Index >= 0 && d.Index < len(out) {
+			out[d.Index] = d.Embedding
 		}
 	}
-	return vec
-}
-
-func hashTrigram(s string) uint32 {
-	var h uint32
-	for _, c := range []byte(s) {
-		h = h*31 + uint32(c)
+	for _, v := range out {
+		if v == nil {
+			return nil, fmt.Errorf("remote embeddings: API response missing an embedding for one or more inputs")
+		}
 	}
-	return h
+	if len(parsed.Data[0].Embedding) > 0 {
+		p.dim = len(parsed.Data[0].Embedding)
+	}
+	return out, nil
 }
 
 // cosineSimilarity returns the cosine similarity between two vectors.
@@ -94,145 +148,4 @@ func cosineSimilarity(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
-}
-
-// SearchResult is a single match from the vector store.
-type SearchResult struct {
-	MemoryName  string
-	ChunkIndex  int
-	ChunkText   string
-	Score       float64
-}
-
-// VectorStore is an in-memory vector index for memory chunks.
-// It uses brute-force cosine similarity (suitable for ≤1000 chunks).
-type VectorStore struct {
-	dim      int
-	entries  []vectorEntry
-}
-
-type vectorEntry struct {
-	memoryName string
-	chunkIndex int
-	chunkText  string
-	embedding  []float32
-}
-
-// NewVectorStore creates an empty vector store.
-func NewVectorStore(dim int) *VectorStore {
-	return &VectorStore{
-		dim:     dim,
-		entries: make([]vectorEntry, 0),
-	}
-}
-
-// Clear removes all entries.
-func (vs *VectorStore) Clear() {
-	vs.entries = nil
-}
-
-// Add stores a chunk with its embedding.
-func (vs *VectorStore) Add(memoryName string, chunkIndex int, chunkText string, embedding []float32) {
-	vs.entries = append(vs.entries, vectorEntry{
-		memoryName: memoryName,
-		chunkIndex: chunkIndex,
-		chunkText:  chunkText,
-		embedding:  embedding,
-	})
-}
-
-// Search finds the top-K most similar chunks to the query embedding.
-func (vs *VectorStore) Search(queryVec []float32, topK int) []SearchResult {
-	type scored struct {
-		entry vectorEntry
-		score float64
-	}
-
-	var all []scored
-	for _, e := range vs.entries {
-		sim := cosineSimilarity(queryVec, e.embedding)
-		all = append(all, scored{entry: e, score: sim})
-	}
-
-	// Simple partial sort: keep top K
-	results := make([]SearchResult, 0, topK)
-	for _, s := range all {
-		if len(results) < topK {
-			results = append(results, SearchResult{
-				MemoryName: s.entry.memoryName,
-				ChunkIndex: s.entry.chunkIndex,
-				ChunkText:  s.entry.chunkText,
-				Score:      s.score,
-			})
-			// bubble up if needed (simple insertion sort for tiny K)
-			for j := len(results) - 1; j > 0 && results[j].Score > results[j-1].Score; j-- {
-				results[j], results[j-1] = results[j-1], results[j]
-			}
-		} else if s.score > results[topK-1].Score {
-			// Replace lowest
-			results[topK-1] = SearchResult{
-				MemoryName: s.entry.memoryName,
-				ChunkIndex: s.entry.chunkIndex,
-				ChunkText:  s.entry.chunkText,
-				Score:      s.score,
-			}
-			for j := topK - 1; j > 0 && results[j].Score > results[j-1].Score; j-- {
-				results[j], results[j-1] = results[j-1], results[j]
-			}
-		}
-	}
-
-	// Filter out low-relevance results
-	var filtered []SearchResult
-	for _, r := range results {
-		if r.Score > 0.3 {
-			filtered = append(filtered, r)
-		}
-	}
-
-	return filtered
-}
-
-// Export persists the vector store to JSON (for future SQLite persistence).
-func (vs *VectorStore) Export() ([]byte, error) {
-	type entry struct {
-		MemoryName string    `json:"memory_name"`
-		ChunkIndex int       `json:"chunk_index"`
-		ChunkText  string    `json:"chunk_text"`
-		Embedding  []float32 `json:"embedding"`
-	}
-	var entries []entry
-	for _, e := range vs.entries {
-		entries = append(entries, entry{
-			MemoryName: e.memoryName,
-			ChunkIndex: e.chunkIndex,
-			ChunkText:  e.chunkText,
-			Embedding:  e.embedding,
-		})
-	}
-	return json.Marshal(entries)
-}
-
-// Import loads the vector store from JSON.
-func (vs *VectorStore) Import(data []byte) error {
-	type entry struct {
-		MemoryName string    `json:"memory_name"`
-		ChunkIndex int       `json:"chunk_index"`
-		ChunkText  string    `json:"chunk_text"`
-		Embedding  []float32 `json:"embedding"`
-	}
-	var entries []entry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return err
-	}
-	vs.entries = nil
-	for _, e := range entries {
-		vs.entries = append(vs.entries, vectorEntry{
-			memoryName: e.MemoryName,
-			chunkIndex: e.ChunkIndex,
-			chunkText:  e.ChunkText,
-			embedding:  e.Embedding,
-		})
-	}
-	return nil
 }

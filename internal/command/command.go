@@ -82,7 +82,6 @@ type Input struct {
 	MCPPool           MCPPool
 	ProjectContext    *ctxt.ProjectContext
 	AppState          *state.AppState
-	Provider          api.Provider
 }
 
 type Output struct {

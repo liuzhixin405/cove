@@ -12,7 +12,6 @@ const (
 	CatGit                   // git 操作，需区分读/写
 	CatBuild                 // 构建/测试，需看具体命令
 	CatInstall               // 包管理器安装
-	CatFileWrite             // 写文件
 	CatDangerous             // rm -rf, fork bomb, etc.
 )
 
@@ -81,16 +80,85 @@ func (c *Classifier) isDangerous(cmd string) bool {
 		"format c:", "format d:",
 		"del /f /s", "rd /s /q",
 	}
+	lower := strings.ToLower(cmd)
 	for _, d := range dangerous {
-		if strings.Contains(strings.ToLower(cmd), d) {
+		if strings.Contains(lower, d) {
+			return true
+		}
+	}
+	// Structural checks below catch risk patterns that a pure keyword scan
+	// misses — they look at how the command is built, not just what
+	// substrings appear in it.
+	if c.pipesIntoInterpreter(cmd) {
+		return true
+	}
+	if c.hasIFSObfuscation(cmd) {
+		return true
+	}
+	return false
+}
+
+// pipesIntoInterpreter reports whether any stage of a pipe chain feeds
+// into a shell/scripting interpreter. The keyword list above only catches
+// this when the *source* is literally curl/wget ("curl | sh"), but the
+// same risk exists for any source: "echo <payload> | base64 -d | bash" or
+// "printf ... | xxd -r -p | python3" smuggle an arbitrary decoded command
+// into an interpreter without ever mentioning curl, wget, eval, or exec.
+func (c *Classifier) pipesIntoInterpreter(cmd string) bool {
+	if !strings.Contains(cmd, "|") {
+		return false
+	}
+	interpreters := map[string]bool{
+		"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true,
+		"csh": true, "tcsh": true, "fish": true, "python": true, "python3": true,
+		"perl": true, "ruby": true, "node": true, "php": true,
+		"powershell": true, "pwsh": true,
+	}
+	for _, stage := range splitPipeStages(cmd) {
+		stage = strings.TrimSpace(stage)
+		if stage == "" {
+			continue
+		}
+		base := strings.ToLower(strings.TrimSuffix(c.baseCmd(stage), ".exe"))
+		if interpreters[base] {
 			return true
 		}
 	}
 	return false
 }
 
+// splitPipeStages splits cmd on single "|" pipe boundaries while treating
+// "||" (logical OR, unrelated to piping) as a single token so it isn't
+// mistaken for two pipe stages.
+func splitPipeStages(cmd string) []string {
+	const orPlaceholder = "\x00OR\x00"
+	normalized := strings.ReplaceAll(cmd, "||", orPlaceholder)
+	stages := strings.Split(normalized, "|")
+	for i, s := range stages {
+		stages[i] = strings.ReplaceAll(s, orPlaceholder, "||")
+	}
+	return stages
+}
+
+// hasIFSObfuscation reports whether cmd references the shell IFS
+// (internal field separator) variable — a well-known technique for
+// evading substring-based keyword filters. "rm${IFS}-rf${IFS}/" contains
+// no literal "rm " substring (IFS substitutes for the space that the
+// isDangerous keyword scan looks for), so without this check the command
+// above would sail through undetected.
+func (c *Classifier) hasIFSObfuscation(cmd string) bool {
+	lower := strings.ToLower(cmd)
+	return strings.Contains(lower, "$ifs") || strings.Contains(lower, "${ifs")
+}
+
 func (c *Classifier) hasShellControlOperator(cmd string) bool {
-	operators := []string{"&&", "||", ";", "|", "`", "$(", " >", "<"}
+	// "${" is included alongside the classic "$(" / backtick substitution
+	// markers: brace parameter expansion can also be used to construct or
+	// hide command content that a keyword scan wouldn't recognize (beyond
+	// the specific $IFS case already escalated to CatDangerous above), so
+	// it's treated the same as other substitution syntax — forced to
+	// CatUnknown for manual review rather than silently classified.
+	operators := []string{"&&", "||", ";", "|", "`", "$(", "${", " >", "<"}
 	for _, op := range operators {
 		if strings.Contains(cmd, op) {
 			return true

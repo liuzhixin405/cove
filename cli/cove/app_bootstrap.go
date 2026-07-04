@@ -69,6 +69,25 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 	skillMgr := skills.NewManager()
 	skills.LoadAll(skillMgr, projCtx.Cwd)
 	memStore := memory.NewStore()
+	if cfg.MemoryEmbedding != nil {
+		// Reuse the main chat provider's base URL/API key when the embedding
+		// config doesn't override them — enabling this should not require a
+		// second account. See internal/memory/embed.go and
+		// docs/中等模型平替优化建议.md §2.2.
+		embedBaseURL := cfg.MemoryEmbedding.BaseURL
+		if embedBaseURL == "" {
+			embedBaseURL = pc.BaseURL
+		}
+		embedAPIKey := cfg.MemoryEmbedding.APIKey
+		if embedAPIKey == "" {
+			embedAPIKey = pc.APIKey
+		}
+		if embedBaseURL != "" && embedAPIKey != "" {
+			memStore.EnableRemoteEmbeddings(memory.NewRemoteAPIEmbeddingProvider(embedBaseURL, embedAPIKey, cfg.MemoryEmbedding.Model))
+		} else {
+			log.Warnf("memory_embedding configured but no base_url/api_key resolved (from config or provider) — semantic memory search stays disabled")
+		}
+	}
 
 	pluginMgr := plugin.NewManager()
 	pluginMgr.Init()
@@ -93,10 +112,11 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 		Provider: api.ProviderConfig{
 			Name: pc.Name, APIKey: pc.APIKey, APIKeys: pc.APIKeys, BaseURL: pc.BaseURL,
 		},
-		MemoryStore:  memStore,
-		SkillManager: skillMgr,
-		HookManager:  hookMgr,
-		Classifier:   classifier,
+		MemoryStore:        memStore,
+		SkillManager:       skillMgr,
+		HookManager:        hookMgr,
+		Classifier:         classifier,
+		DoneVerifyCommands: cfg.DoneVerifyCommands,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("engine start error: %w", err)

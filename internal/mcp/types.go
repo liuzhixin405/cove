@@ -123,22 +123,6 @@ type ReadResourceResult struct {
 	Contents []ContentBlock `json:"contents"`
 }
 
-type Prompt struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description,omitempty"`
-	Arguments   []PromptArgument `json:"arguments,omitempty"`
-}
-
-type PromptArgument struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Required    bool   `json:"required,omitempty"`
-}
-
-type ListPromptsResult struct {
-	Prompts []Prompt `json:"prompts"`
-}
-
 type ServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args,omitempty"`

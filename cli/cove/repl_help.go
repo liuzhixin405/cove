@@ -56,6 +56,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 	fmt.Println("  /undo               回退到上一个检查点")
 	fmt.Println("  /checkpoints        列出所有检查点")
 	fmt.Println("  /history            查看和继续历史会话")
+	fmt.Println("  /history clean      清洗历史会话噪音并自动备份")
 	fmt.Println("  /resume [id]        恢复已保存的会话")
 	fmt.Println("  /memory             管理持久化记忆")
 	fmt.Println("\n后台任务:")

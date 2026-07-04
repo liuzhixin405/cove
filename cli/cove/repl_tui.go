@@ -183,7 +183,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			}
 			eng.LoadMessages(r.Messages)
 			title := r.Title
-			if title == "" || title == "New session" {
+			if title == "" || title == "New session" || looksSyntheticHistoryText(title) {
 				title = sessionPreview(*r)
 			}
 
@@ -205,7 +205,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 				msg := r.Messages[i]
 				switch strings.ToLower(msg.Role) {
 				case "user":
-					if !strings.HasPrefix(strings.TrimSpace(msg.Content), "[system:") {
+					if !msg.Synthetic && !looksSyntheticHistoryText(msg.Content) {
 						app.EngineLine(fmt.Sprintf("[用户 (User)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
 					} else {
 						app.EngineLine(fmt.Sprintf("[内置微调状态 (System)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
@@ -281,7 +281,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 				continue
 			}
 			title := r.Title
-			if title == "New session" || title == "" {
+			if title == "New session" || title == "" || looksSyntheticHistoryText(title) {
 				title = sessionPreview(r)
 			}
 			if strings.TrimSpace(title) == "" {
@@ -503,6 +503,7 @@ func handleTUISlashCommand(
 		sb.WriteString("\n会话:\n")
 		sb.WriteString("  /compact            压缩对话历史\n")
 		sb.WriteString("  /history            查看和继续历史会话\n")
+		sb.WriteString("  /history clean      清洗历史会话噪音并自动备份\n")
 		sb.WriteString("  /resume [id]        恢复已保存的会话\n")
 		sb.WriteString("  /memory             管理持久化记忆\n")
 		sb.WriteString("  /export             导出对话到文件\n")
@@ -554,6 +555,39 @@ func handleTUISlashCommand(
 		defer cancel()
 		eng.Compact(ctx)
 		return true, "上下文窗口已压缩。"
+
+	case "history":
+		if len(args) > 0 && strings.EqualFold(args[0], "clean") {
+			handleHistoryClean()
+			tuiRefreshHistoryOverlay(app, eng)
+			return true, "历史清洗已执行。"
+		}
+		store := eng.Store()
+		if store == nil {
+			return true, "会话存储不可用"
+		}
+		records := listHistoryRecords(store)
+		if len(records) == 0 {
+			return true, "暂无可恢复历史。"
+		}
+		limit := len(records)
+		if limit > 20 {
+			limit = 20
+		}
+		var sb strings.Builder
+		sb.WriteString("\n历史记录:\n\n")
+		for i, r := range records[:limit] {
+			title := effectiveHistoryTitle(r)
+			if title == "" {
+				title = r.UpdatedAt.Format("01-02 15:04")
+			}
+			if len(title) > 50 {
+				title = title[:50] + "..."
+			}
+			sb.WriteString(fmt.Sprintf("  %2d. [%s] %s\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title))
+		}
+		sb.WriteString("\n提示: 通过 Ctrl+R 可交互搜索并恢复历史会话。\n")
+		return true, sb.String()
 
 	case "cost":
 		// Show current session cost + historical cost (matching REPL behavior).
@@ -684,6 +718,28 @@ func roLabel(readOnly bool) string {
 	}
 	return " "
 }
+
+func tuiRefreshHistoryOverlay(app *tui.App, eng *engine.Engine) {
+	store := eng.Store()
+	if store == nil {
+		return
+	}
+	recs := listHistoryRecords(store)
+	items := make([]tui.HistoryItem, 0, len(recs))
+	for _, r := range recs {
+		title := effectiveHistoryTitle(r)
+		if strings.TrimSpace(title) == "" {
+			continue
+		}
+		items = append(items, tui.HistoryItem{
+			ID:       r.ID,
+			Title:    title,
+			Subtitle: fmt.Sprintf("%s · %d 条", r.UpdatedAt.Format("01-02 15:04"), r.MessageCount),
+		})
+	}
+	app.SetHistory(items)
+}
+
 // resolves what the engine should actually do next and returns the effective
 // user message plus whether to proceed. When it loads recovery context into the
 // engine it surfaces a notice through the transcript (app.EngineLine), since the
@@ -751,7 +807,7 @@ func tuiResumeMostRelevant(eng *engine.Engine) string {
 
 	eng.LoadMessages(best.rec.Messages)
 	title := best.rec.Title
-	if title == "New session" || title == "" {
+	if title == "New session" || title == "" || looksSyntheticHistoryText(title) {
 		title = sessionPreview(*best.rec)
 	}
 	userTurns := countUserTurns(best.rec.Messages)

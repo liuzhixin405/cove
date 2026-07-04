@@ -48,6 +48,29 @@ type Config struct {
 	// Telemetry enables local, opt-in usage recording (~/.cove/telemetry.json).
 	// Off by default; can also be enabled with COVE_TELEMETRY=1.
 	Telemetry bool `json:"telemetry,omitempty"`
+	// DoneVerifyCommands, if set, are shell commands (e.g. "go build ./...")
+	// run before the engine accepts a model's "no more tool calls" response
+	// as actually complete; see internal/engine/verify_gate.go. Off by
+	// default — an empty/absent list disables the gate entirely.
+	DoneVerifyCommands []string `json:"done_verify_commands,omitempty"`
+	// MemoryEmbedding, if set, opts the memory store into blending BM25
+	// keyword search with real semantic similarity from a remote embeddings
+	// API (see internal/memory/embed.go's RemoteAPIEmbeddingProvider and
+	// docs/中等模型平替优化建议.md §2.2). Off by default — nil means pure
+	// BM25 with zero extra network calls or cost, exactly like before this
+	// field existed.
+	MemoryEmbedding *MemoryEmbeddingConfig `json:"memory_embedding,omitempty"`
+}
+
+// MemoryEmbeddingConfig configures the optional remote embeddings endpoint
+// used for semantic memory search. BaseURL/APIKey default to the main
+// provider's values when empty, so in the common case a user who wants
+// this only needs to add `"memory_embedding": {}` (or set a model name) —
+// no separate account or key, reusing what's already configured for chat.
+type MemoryEmbeddingConfig struct {
+	BaseURL string `json:"base_url,omitempty"`
+	APIKey  string `json:"api_key,omitempty"`
+	Model   string `json:"model,omitempty"`
 }
 
 type MCPServerConfig struct {
@@ -56,10 +79,6 @@ type MCPServerConfig struct {
 	Env     map[string]string `json:"env,omitempty"`
 	Type    string            `json:"type,omitempty"`
 	URL     string            `json:"url,omitempty"`
-}
-type Migration struct {
-	Version int    `json:"_version"`
-	Applied string `json:"_applied"`
 }
 
 func DefaultConfig() *Config {
@@ -134,6 +153,12 @@ func loadProjectOverride(cfg *Config) error {
 	}
 	if len(override.MCPServers) > 0 {
 		cfg.MCPServers = override.MCPServers
+	}
+	if len(override.DoneVerifyCommands) > 0 {
+		cfg.DoneVerifyCommands = override.DoneVerifyCommands
+	}
+	if override.MemoryEmbedding != nil {
+		cfg.MemoryEmbedding = override.MemoryEmbedding
 	}
 	return nil
 }

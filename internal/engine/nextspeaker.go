@@ -72,10 +72,6 @@ func (ns *NextSpeaker) CheckForTermination(messages []api.Message) bool {
 	return false
 }
 
-func containsSubstring(s, substr string) bool {
-	return strings.Contains(s, substr)
-}
-
 func searchInString(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }

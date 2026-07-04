@@ -201,8 +201,7 @@ func (c *Client) Notifications() <-chan *Notification {
 	return c.notifyCh
 }
 
-func (c *Client) ServerCapabilities() ServerCaps { return c.serverCaps }
-func (c *Client) ServerInfo() Implementation     { return c.serverInfo }
+func (c *Client) ServerInfo() Implementation { return c.serverInfo }
 
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -333,17 +332,6 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (*ReadResourceRes
 		return nil, err
 	}
 	return &result, nil
-}
-
-func (c *Client) ListPrompts(ctx context.Context) ([]Prompt, error) {
-	if c.serverCaps.Prompts == nil {
-		return nil, fmt.Errorf("server does not support prompts")
-	}
-	var result ListPromptsResult
-	if err := c.Call(ctx, "prompts/list", nil, &result); err != nil {
-		return nil, err
-	}
-	return result.Prompts, nil
 }
 
 func ToolName(server, tool string) string {

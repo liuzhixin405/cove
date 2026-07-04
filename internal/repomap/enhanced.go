@@ -1,7 +1,6 @@
 package repomap
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,14 +44,30 @@ func truncateList(items []string, max int) []string {
 	return result
 }
 
-// EnhancedGenerator wraps the base RepoMap with incremental updates and caching.
-// It tracks file modification times to avoid re-scanning unchanged files.
+// EnhancedGenerator wraps the base RepoMap Generator with incremental change
+// detection and full-output caching, so unchanged turns are free and changed
+// turns still get the real AST-derived, reference-ranked map instead of a
+// flat alphabetical file list.
+//
+// Historically this type's own buildMap() reimplemented output generation
+// from scratch using only a sorted file-path list — no symbol extraction, no
+// reference ranking — and because Engine always constructs an
+// EnhancedGenerator (see internal/engine/engine.go), that flat version
+// silently and unconditionally shadowed the real repomap.Generator output
+// every single turn; repomap.Generator's richer result was computed once at
+// session start (internal/context/context.go's Collect()) and then never
+// actually used. gen (a *Generator) now does the real parsing/ranking work,
+// reusing its own file-level parseCache so unchanged files aren't
+// re-parsed; EnhancedGenerator's job is purely the higher-level
+// "did anything change at all, and if not, skip regeneration entirely"
+// decision plus surfacing a change summary.
 type EnhancedGenerator struct {
-	root      string
-	mu        sync.RWMutex
+	root       string
+	mu         sync.RWMutex
 	fileMTimes map[string]time.Time // path -> last known mtime
 	cache      string               // cached repo map output
 	cacheValid bool
+	gen        *Generator // real AST parsing + reference-count ranking
 }
 
 // NewEnhancedGenerator creates an enhanced repo map generator.
@@ -60,6 +75,7 @@ func NewEnhancedGenerator(root string) *EnhancedGenerator {
 	return &EnhancedGenerator{
 		root:       root,
 		fileMTimes: make(map[string]time.Time),
+		gen:        NewGenerator(root),
 	}
 }
 
@@ -72,14 +88,25 @@ func (eg *EnhancedGenerator) GenerateIncremental(maxFiles int) (string, *DiffRes
 	current := eg.scanFiles()
 	diff := eg.computeDiff(current)
 
-	// If no changes and cache is valid, return cached result
+	// If no changes and cache is valid, return cached result — the common
+	// case, and the reason this type exists: skip re-parsing/re-ranking
+	// entirely rather than just skipping the final formatting step.
 	if eg.cacheValid && !diffHasChanges(diff) {
 		return eg.cache, &DiffResult{}
 	}
 
-	// Regenerate: build a new map from the file list
+	wasValidBefore := eg.cacheValid
 	eg.fileMTimes = current
-	mapText := eg.buildMap(current, maxFiles)
+
+	mapText := FormatFileMaps(eg.gen.BuildRanked(maxFiles))
+
+	// Surface what changed since the last time the model saw this map,
+	// rather than discarding that information (the one genuine advantage
+	// the old flat-listing implementation had).
+	if wasValidBefore && diffHasChanges(diff) {
+		mapText += "\nChanges since last check: " + diff.Summary() + "\n"
+	}
+
 	eg.cache = mapText
 	eg.cacheValid = true
 
@@ -139,30 +166,6 @@ func (eg *EnhancedGenerator) computeDiff(current map[string]time.Time) *DiffResu
 	sort.Strings(dr.Modified)
 	sort.Strings(dr.Removed)
 	return dr
-}
-
-// buildMap constructs a simple repo map from the file list.
-func (eg *EnhancedGenerator) buildMap(files map[string]time.Time, maxFiles int) string {
-	var sorted []string
-	for f := range files {
-		sorted = append(sorted, f)
-	}
-	sort.Strings(sorted)
-
-	if len(sorted) > maxFiles {
-		sorted = sorted[:maxFiles]
-	}
-
-	var sb strings.Builder
-	sb.WriteString("Repository structure:\n")
-	for _, f := range sorted {
-		sb.WriteString("  ")
-		sb.WriteString(f)
-		sb.WriteString("\n")
-	}
-	sb.WriteString(fmt.Sprintf("\n(%d files total)", len(files)))
-
-	return sb.String()
 }
 
 func isSourceFile(ext string) bool {

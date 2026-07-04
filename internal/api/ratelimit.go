@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -22,57 +21,6 @@ type RateLimitInfo struct {
 // HasData returns true if any rate limit info was parsed.
 func (r *RateLimitInfo) HasData() bool {
 	return r.RequestsLimit > 0 || r.TokensLimit > 0
-}
-
-// Format returns a human-readable rate limit summary.
-func (r *RateLimitInfo) Format() string {
-	if !r.HasData() {
-		return ""
-	}
-	var parts []string
-	if r.RequestsLimit > 0 {
-		parts = append(parts, formatBucket("请求", r.RequestsRemaining, r.RequestsLimit, r.RequestsReset))
-	}
-	if r.TokensLimit > 0 {
-		parts = append(parts, formatBucket("Token", r.TokensRemaining, r.TokensLimit, r.TokensReset))
-	}
-	return strings.Join(parts, " | ")
-}
-
-func formatBucket(name string, remaining, limit int, reset time.Duration) string {
-	pct := 0
-	if limit > 0 {
-		pct = remaining * 100 / limit
-	}
-	remainStr := formatCount(remaining)
-	limitStr := formatCount(limit)
-	resetStr := ""
-	if reset > 0 {
-		resetStr = " 重置:" + formatDuration(reset)
-	}
-	return name + ":" + remainStr + "/" + limitStr + "(" + strconv.Itoa(pct) + "%)" + resetStr
-}
-
-func formatCount(n int) string {
-	if n >= 1_000_000 {
-		return strconv.FormatFloat(float64(n)/1_000_000, 'f', 1, 64) + "M"
-	}
-	if n >= 1_000 {
-		return strconv.FormatFloat(float64(n)/1_000, 'f', 1, 64) + "K"
-	}
-	return strconv.Itoa(n)
-}
-
-func formatDuration(d time.Duration) string {
-	if d < time.Minute {
-		return strconv.Itoa(int(d.Seconds())) + "s"
-	}
-	m := int(d.Minutes())
-	s := int(d.Seconds()) - m*60
-	if s == 0 {
-		return strconv.Itoa(m) + "m"
-	}
-	return strconv.Itoa(m) + "m" + strconv.Itoa(s) + "s"
 }
 
 // RateLimitTracker manages rate limit state across API calls.
@@ -114,13 +62,6 @@ func (t *RateLimitTracker) Update(headers http.Header) {
 		t.info = info
 		t.mu.Unlock()
 	}
-}
-
-// Current returns the latest rate limit info.
-func (t *RateLimitTracker) Current() RateLimitInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.info
 }
 
 func headerInt(h http.Header, key string) int {

@@ -29,7 +29,6 @@ type CheckResult struct {
 type Report struct {
 	Results   []CheckResult
 	AutoFixed int
-	RunAt     time.Time
 	Duration  time.Duration
 }
 
@@ -134,7 +133,7 @@ func NewChecker(cfg *config.Config) *Checker {
 // RunAll executes all diagnostic checks and returns a report.
 func (c *Checker) RunAll(ctx context.Context) *Report {
 	start := time.Now()
-	report := &Report{RunAt: start}
+	report := &Report{}
 
 	checks := []func(context.Context) CheckResult{
 		c.checkConfigExists,
@@ -163,7 +162,7 @@ func (c *Checker) RunAll(ctx context.Context) *Report {
 // RunQuick runs only fast checks (no network) suitable for startup.
 func (c *Checker) RunQuick() *Report {
 	start := time.Now()
-	report := &Report{RunAt: start}
+	report := &Report{}
 
 	checks := []func(context.Context) CheckResult{
 		c.checkConfigExists,

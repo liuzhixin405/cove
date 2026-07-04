@@ -135,11 +135,6 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 	return p
 }
 
-type oaiMsg struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content,omitempty"`
-}
-
 type oaiStreamChoice struct {
 	Delta struct {
 		Content   string        `json:"content"`
@@ -163,18 +158,6 @@ type oaiToolCall struct {
 	ID       string              `json:"id"`
 	Type     string              `json:"type"`
 	Function oaiToolCallFunction `json:"function"`
-}
-
-type oaiResponseChoice struct {
-	Index        int        `json:"index"`
-	Message      oaiRespMsg `json:"message"`
-	FinishReason string     `json:"finish_reason"`
-}
-
-type oaiRespMsg struct {
-	Role      string        `json:"role"`
-	Content   string        `json:"content"`
-	ToolCalls []oaiToolCall `json:"tool_calls,omitempty"`
 }
 
 type oaiError struct {
@@ -394,13 +377,3 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onE
 	return ChatResponse{}, fmt.Errorf("Anthropic provider not yet supported on mobile")
 }
 
-// ---------- Helpers ----------
-
-func jsonEscape(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "\\r")
-	s = strings.ReplaceAll(s, "\t", "\\t")
-	return s
-}

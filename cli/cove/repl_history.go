@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -178,7 +179,7 @@ func handleHistory(eng *engine.Engine) {
 		repl.PrintSafe("会话存储不可用\n")
 		return
 	}
-	records, _ := store.List()
+	records := listHistoryRecords(store)
 	draft, _ := loadInterruptedDraft()
 	if len(records) == 0 && draft == nil {
 		repl.PrintSafe("暂无历史。退出时会自动保存会话。\n")
@@ -202,10 +203,7 @@ func handleHistory(eng *engine.Engine) {
 			turns = countUserTurns(r.Messages)
 		}
 		date := r.UpdatedAt.Format("01-02 15:04")
-		title := r.Title
-		if title == "New session" || title == "" {
-			title = sessionPreview(r)
-		}
+		title := effectiveHistoryTitle(r)
 		if title == "" {
 			title = r.UpdatedAt.Format("01-02 15:04")
 		}
@@ -220,28 +218,173 @@ func handleHistory(eng *engine.Engine) {
 	repl.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
 	repl.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
 	repl.PrintSafe("  查看详情: /history detail <编号>\n\n")
+	repl.PrintSafe("  清洗历史: /history clean\n\n")
 	if draft != nil {
 		repl.PrintSafe("  中断详情: /history detail interrupted\n\n")
 	}
 }
 
+type historyCleanStats struct {
+	Scanned       int
+	Modified      int
+	ParseFailed   int
+	BackupFailed  int
+	WriteFailed   int
+	TitlesFixed   int
+	SyntheticFlag int
+}
+
+func sessionsDirPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".cove", "sessions"), nil
+}
+
+func handleHistoryClean() {
+	dir, err := sessionsDirPath()
+	if err != nil {
+		repl.PrintSafe("历史清洗失败: %v\n", err)
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		repl.PrintSafe("历史清洗失败: %v\n", err)
+		return
+	}
+
+	stamp := time.Now().Format("20060102-150405")
+	stats := historyCleanStats{}
+
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		stats.Scanned++
+		path := filepath.Join(dir, e.Name())
+
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			stats.ParseFailed++
+			continue
+		}
+
+		var rec session.Record
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			stats.ParseFailed++
+			continue
+		}
+
+		changed := false
+
+		// Repair older sessions where injected user prompts were not marked as synthetic.
+		for i := range rec.Messages {
+			m := &rec.Messages[i]
+			if m.Role == "user" && !m.Synthetic && looksSyntheticHistoryText(m.Content) {
+				m.Synthetic = true
+				stats.SyntheticFlag++
+				changed = true
+			}
+		}
+
+		oldTitle := strings.TrimSpace(rec.Title)
+		if oldTitle == "New session" || oldTitle == "" || looksSyntheticHistoryText(oldTitle) || isLowSignalResumeInput(oldTitle) {
+			newTitle := deriveCleanTitle(rec.Messages)
+			if newTitle != "" && newTitle != rec.Title {
+				rec.Title = newTitle
+				stats.TitlesFixed++
+				changed = true
+			}
+		}
+
+		if !changed {
+			continue
+		}
+
+		backupPath := path + ".bak." + stamp
+		if err := os.WriteFile(backupPath, raw, 0600); err != nil {
+			stats.BackupFailed++
+			continue
+		}
+
+		newRaw, err := json.MarshalIndent(&rec, "", "  ")
+		if err != nil {
+			stats.WriteFailed++
+			continue
+		}
+		if err := writeFileAtomic(path, newRaw, 0600); err != nil {
+			stats.WriteFailed++
+			continue
+		}
+		stats.Modified++
+	}
+
+	repl.PrintSafe("历史清洗完成。\n")
+	repl.PrintSafe("  扫描文件: %d\n", stats.Scanned)
+	repl.PrintSafe("  修改文件: %d\n", stats.Modified)
+	repl.PrintSafe("  标题修复: %d\n", stats.TitlesFixed)
+	repl.PrintSafe("  Synthetic修复: %d\n", stats.SyntheticFlag)
+	repl.PrintSafe("  解析失败: %d\n", stats.ParseFailed)
+	repl.PrintSafe("  备份失败: %d\n", stats.BackupFailed)
+	repl.PrintSafe("  写回失败: %d\n", stats.WriteFailed)
+	repl.PrintSafe("  备份后缀: .bak.%s\n", stamp)
+}
+
+func deriveCleanTitle(msgs []api.Message) string {
+	for _, m := range msgs {
+		if m.Role != "user" || m.Synthetic {
+			continue
+		}
+		text := strings.TrimSpace(m.Content)
+		if text == "" || looksSyntheticHistoryText(text) || isLowSignalResumeInput(text) {
+			continue
+		}
+		return compactRunes(strings.ReplaceAll(text, "\n", " "), 60)
+	}
+
+	// Fallback: choose the longest non-synthetic user text if all are low-signal.
+	type cand struct {
+		text string
+		len  int
+	}
+	var cands []cand
+	for _, m := range msgs {
+		if m.Role != "user" || m.Synthetic {
+			continue
+		}
+		text := strings.TrimSpace(m.Content)
+		if text == "" || looksSyntheticHistoryText(text) {
+			continue
+		}
+		cands = append(cands, cand{text: text, len: len([]rune(text))})
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].len > cands[j].len })
+	return compactRunes(strings.ReplaceAll(cands[0].text, "\n", " "), 60)
+}
+
+func compactRunes(s string, max int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= max {
+		return string(r)
+	}
+	return string(r[:max]) + "..."
+}
+
 func sessionPreview(r session.Record) string {
-	if r.Preview != "" {
+	if r.Preview != "" && !looksSyntheticHistoryText(r.Preview) {
 		return r.Preview
 	}
-	fallback := ""
 	for _, m := range r.Messages {
-		if m.Role == "user" && m.Content != "" && !m.Synthetic {
+		if m.Role == "user" && m.Content != "" && !m.Synthetic && !looksSyntheticHistoryText(m.Content) {
 			content := strings.ReplaceAll(m.Content, "\n", " ")
 			if len(content) > 50 {
 				content = content[:50] + "..."
 			}
-			if !false {
-				return content
-			}
-			if fallback == "" {
-				fallback = content
-			}
+			return content
 		}
 	}
 	// Don't use low-signal message as preview
@@ -255,7 +398,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 		return
 	}
 
-	records, _ := store.List()
+	records := listHistoryRecords(store)
 	var idx int
 	var r *session.Record
 	var err error
@@ -282,10 +425,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	}
 
 	eng.LoadMessages(r.Messages)
-	title := r.Title
-	if title == "New session" || title == "" {
-		title = sessionPreview(*r)
-	}
+	title := effectiveHistoryTitle(*r)
 
 	// Dynamic interactive feedback: print last 4 messages on main console instead of a dry summary!
 	repl.PrintSafe("\n==================================================\n")
@@ -342,10 +482,6 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	repl.PrintSafe("%s历史会话与运行上下文已被完整恢复。您可以直接继续向 Cove 提问了：%s\n\n", repl.Green, repl.Reset)
 }
 
-func mtimeStr(s string) string {
-	return s
-}
-
 func handleHistoryDetail(input string, eng *engine.Engine) {
 	if strings.TrimSpace(input) == "" {
 		repl.PrintSafe("用法: /history detail <编号|session-id>\n")
@@ -372,7 +508,7 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 	}
 
 	resolve := func(sel string) (*session.Record, error) {
-		records, _ := store.List()
+		records := listHistoryRecords(store)
 		var idx int
 		if _, err := fmt.Sscanf(sel, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
 			return store.Load(records[idx-1].ID)
@@ -386,10 +522,7 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 		return
 	}
 
-	title := r.Title
-	if title == "" || title == "New session" {
-		title = sessionPreview(*r)
-	}
+	title := effectiveHistoryTitle(*r)
 
 	repl.PrintSafe("\n  会话详情\n")
 	repl.PrintSafe("  ID: %s\n", r.ID)
@@ -474,13 +607,38 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	}
 
 	eng.LoadMessages(best.rec.Messages)
-	title := best.rec.Title
-	if title == "New session" || title == "" {
-		title = sessionPreview(*best.rec)
-	}
+	title := effectiveHistoryTitle(*best.rec)
 	userTurns := countUserTurns(best.rec.Messages)
 	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
 	return true
+}
+
+func listHistoryRecords(store *session.Store) []session.Record {
+	records, _ := store.List()
+	out := make([]session.Record, 0, len(records))
+	for _, r := range records {
+		if r.UserTurns == 0 {
+			continue
+		}
+		title := effectiveHistoryTitle(r)
+		if title == "" {
+			continue
+		}
+		// Hide low-signal one-liners in /history by default.
+		if isLowSignalResumeInput(title) && r.UserTurns <= 1 {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func effectiveHistoryTitle(r session.Record) string {
+	title := strings.TrimSpace(r.Title)
+	if title == "New session" || title == "" || looksSyntheticHistoryText(title) {
+		title = strings.TrimSpace(sessionPreview(r))
+	}
+	return title
 }
 
 // countUserTurns reports how many *genuine* user-authored turns a session
@@ -497,12 +655,36 @@ func countUserTurns(msgs []api.Message) int {
 		if m.Role != "user" {
 			continue
 		}
-		if strings.HasPrefix(strings.TrimSpace(m.Content), "[system:") {
+		if m.Synthetic || looksSyntheticHistoryText(m.Content) {
 			continue
 		}
 		n++
 	}
 	return n
+}
+
+func looksSyntheticHistoryText(s string) bool {
+	c := strings.TrimSpace(s)
+	if c == "" {
+		return true
+	}
+	knownPrefixes := []string{
+		"[system:", "[Conversation Summary]",
+		"[系统检测到重复操作循环]", "[Context truncated",
+		"[用户指引]", "[Continue the task", "[会话摘要]",
+		// Backward compatibility for older mojibake markers produced by
+		// previous encoding regressions.
+		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",
+		"[鐢ㄦ埛鎸囧紩]",
+		"[浼氳瘽鎽樿]",
+		"run slow tool", "do something", "slow response",
+	}
+	for _, p := range knownPrefixes {
+		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // resumeAndContinue loads the most relevant past session AND then actually
