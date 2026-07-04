@@ -109,21 +109,22 @@ const (
 // A system turn (system==true) carries standalone engine output (resume notices,
 // command results) and has no foldable thinking.
 type turn struct {
-	user      string          // user input ("" for system/assistant-only turns)
-	reasoning strings.Builder // streamed thinking; display/fold only
+	user         string          // user input ("" for system/assistant-only turns)
+	reasoning    strings.Builder // streamed thinking; display/fold only
 	answer       strings.Builder // streamed answer + interleaved engine/tool lines
 	streamedText strings.Builder // ONLY text deltas (no engine lines); used for end-of-stream alignment
 	expanded     bool            // user clicked the thinking header open
-	system    bool            // standalone engine output, not foldable
+	system       bool            // standalone engine output, not foldable
 }
 
 // Model is the root Bubble Tea model holding all UI state.
 type Model struct {
-	vp     viewport.Model
-	ta     textarea.Model
-	width  int
-	height int
-	ready  bool
+	vp       viewport.Model
+	ta       textarea.Model
+	width    int
+	height   int
+	ready    bool
+	copyMode bool
 
 	// turns is the structured conversation transcript. It is re-rendered into
 	// the viewport on every change (refreshViewport).
@@ -308,6 +309,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport(true)
 
 	case tea.KeyPressMsg:
+		if msg.String() == "f6" {
+			m.copyMode = !m.copyMode
+			m.refreshViewport(false)
+			return m, nil
+		}
 		if m.overlay != overlayNone {
 			return m.updateOverlay(msg)
 		}
@@ -488,6 +494,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A tool needs interactive confirmation. Show the permission overlay and
 		// stash the reply channel; the worker goroutine is blocked until the user
 		// answers (see App.RequestPermission).
+		m.copyMode = false // force full interaction mode for permission prompt
 		m.overlay = overlayPermission
 		m.permTool = msg.tool
 		m.permDesc = msg.desc
@@ -754,11 +761,13 @@ func (m *Model) View() tea.View {
 	bottomBar := m.renderBottomBar()
 
 	var v tea.View
-	v.AltScreen = true
+	v.AltScreen = !m.copyMode
 	// Enable mouse so the conversation body responds to the scroll wheel
 	// (handled as tea.MouseWheelMsg in Update). Cell-motion mode is the most
 	// widely supported and still delivers wheel events.
-	v.MouseMode = tea.MouseModeCellMotion
+	if !m.copyMode {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 
 	if m.overlay != overlayNone {
 		oH := m.height - 5 // status + transient + bottom + rule + input

@@ -143,7 +143,10 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+R 历史 · / 命令 · Ctrl+C 退出 "
+	right := "Ctrl+R 历史 · / 命令 · F6 切换复制模式 · Ctrl+C 退出 "
+	if m.copyMode {
+		right = "复制模式(可原生拖拽复制) · F6 恢复交互模式 "
+	}
 
 	w := m.width
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
