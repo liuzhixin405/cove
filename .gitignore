@@ -1,4 +1,4 @@
-# Build output
+﻿# Build output
 /dist/
 /cove.exe
 /cove
@@ -41,11 +41,9 @@ go.work.sum
 coverage.txt
 *.test
 
+# Temporary / generated
+/session_notes.md
+/testout.txt
 
-NUL
-
-# Documentation
-*.md
-
-# Archived docs (excluded from commit)
+# Archive docs (excluded from main tree)
 /docs/archive/
