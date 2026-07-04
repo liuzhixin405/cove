@@ -154,14 +154,14 @@ type WalkingIndicator struct {
 	message string
 }
 
-// Compact walking frames: a tiny figure with animated footstep trail
+// Compact walking frames in pure ASCII to avoid terminal mojibake.
 var walkFrames = []string{
-	"⟩ ∙   ∙   ∙",
-	"⟩  ∙   ∙   ",
-	"⟩   ∙   ∙  ",
-	"⟩    ∙   ∙ ",
-	"⟩ ∙   ∙   ∙",
-	"⟩  ∙   ∙   ",
+	"> .   .   .",
+	">  .   .   ",
+	">   .   .  ",
+	">    .   . ",
+	"> .   .   .",
+	">  .   .   ",
 }
 
 func NewWalkingIndicator(message string) *WalkingIndicator {

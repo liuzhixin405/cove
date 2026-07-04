@@ -18,7 +18,7 @@ import (
 )
 
 // ===========================================================================
-// Mock Provider 鈥?simulates API responses for integration testing
+// Mock Provider - simulates API responses for integration testing
 // ===========================================================================
 
 type mockProvider struct {
@@ -104,7 +104,7 @@ func (m *mockProvider) ChatStream(ctx context.Context, req api.ChatRequest, hand
 }
 
 // ===========================================================================
-// Mock Tool 鈥?controllable tool for testing permission/execution paths
+// Mock Tool - controllable tool for testing permission/execution paths
 // ===========================================================================
 
 type mockTool struct {
@@ -183,7 +183,7 @@ func newTestEngine(provider *mockProvider, tools ...tool.Tool) *Engine {
 }
 
 // ===========================================================================
-// TEST: Basic message flow 鈥?send message, get response
+// TEST: Basic message flow - send message, get response
 // ===========================================================================
 
 func TestEngineBasicMessageFlow(t *testing.T) {
@@ -214,7 +214,7 @@ func TestEngineBasicMessageFlow(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Context cancellation 鈥?Ctrl+C during API call
+// TEST: Context cancellation - Ctrl+C during API call
 // ===========================================================================
 
 func TestEngineContextCancellation(t *testing.T) {
@@ -241,7 +241,7 @@ func TestEngineContextCancellation(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Tool execution 鈥?model requests tool, tool runs, result returned
+// TEST: Tool execution - model requests tool, tool runs, result returned
 // ===========================================================================
 
 func TestEngineToolExecution(t *testing.T) {
@@ -322,7 +322,7 @@ func TestSummarizeResultPreservesGlobPathLine(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Permission denied 鈥?tool requires permission, user denies
+// TEST: Permission denied - tool requires permission, user denies
 // ===========================================================================
 
 func TestEnginePermissionDenied(t *testing.T) {
@@ -358,7 +358,7 @@ func TestEnginePermissionDenied(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Permission prompt not set 鈥?should not hang, should deny gracefully
+// TEST: Permission prompt not set - should not hang, should deny gracefully
 // ===========================================================================
 
 func TestEnginePermissionPromptNil(t *testing.T) {
@@ -373,7 +373,7 @@ func TestEnginePermissionPromptNil(t *testing.T) {
 	eng := newTestEngine(prov, writeTool)
 	eng.config.PermissionMode = "default"
 	eng.perm.SetMode(permission.Default)
-	eng.PermissionPrompt = nil // NOT SET 鈥?this should not hang
+	eng.PermissionPrompt = nil // NOT SET - this should not hang
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -383,7 +383,7 @@ func TestEnginePermissionPromptNil(t *testing.T) {
 	}, nil, nil)
 
 	if err != nil {
-		// Should not timeout 鈥?if it does, there's a hang
+		// Should not timeout - if it does, there's a hang
 		if errors.Is(err, context.DeadlineExceeded) {
 			t.Fatal("HANG DETECTED: engine blocked waiting for permission prompt that was never set")
 		}
@@ -395,7 +395,7 @@ func TestEnginePermissionPromptNil(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Tool panic recovery 鈥?goroutine panic should not crash process
+// TEST: Tool panic recovery - goroutine panic should not crash process
 // ===========================================================================
 
 func TestEngineToolPanicRecovery(t *testing.T) {
@@ -404,7 +404,7 @@ func TestEngineToolPanicRecovery(t *testing.T) {
 
 	prov := &mockProvider{
 		responses: []mockResponse{
-			// Model requests two tools in parallel 鈥?one panics
+			// Model requests two tools in parallel - one panics
 			{toolCalls: []api.ToolCall{
 				{ID: "tc1", Name: "read", Input: map[string]any{"input": "crash.txt"}},
 				{ID: "tc2", Name: "list", Input: map[string]any{"input": "."}},
@@ -430,7 +430,7 @@ func TestEngineToolPanicRecovery(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: API error 鈥?should return error, not hang
+// TEST: API error - should return error, not hang
 // ===========================================================================
 
 func TestEngineAPIError(t *testing.T) {
@@ -457,7 +457,7 @@ func TestEngineAPIError(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Multiple iterations 鈥?model calls tools across multiple turns
+// TEST: Multiple iterations - model calls tools across multiple turns
 // ===========================================================================
 
 func TestEngineMultipleIterations(t *testing.T) {
@@ -490,7 +490,7 @@ func TestEngineMultipleIterations(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Context cancel mid-iteration 鈥?should stop cleanly
+// TEST: Context cancel mid-iteration - should stop cleanly
 // ===========================================================================
 
 func TestEngineCancelMidIteration(t *testing.T) {
@@ -513,18 +513,18 @@ func TestEngineCancelMidIteration(t *testing.T) {
 
 	// Should return without hanging
 	if err == nil {
-		// Tool might have been cancelled 鈥?either error or short-circuit is OK
+		// Tool might have been cancelled - either error or short-circuit is OK
 		return
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		// This is expected 鈥?clean cancellation
+		// This is expected - clean cancellation
 		return
 	}
 	t.Fatalf("unexpected error type: %v", err)
 }
 
 // ===========================================================================
-// TEST: Empty tool call list 鈥?should not crash
+// TEST: Empty tool call list - should not crash
 // ===========================================================================
 
 func TestEngineEmptyToolCalls(t *testing.T) {
@@ -548,7 +548,7 @@ func TestEngineEmptyToolCalls(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Permission allowed 鈥?tool should execute
+// TEST: Permission allowed - tool should execute
 // ===========================================================================
 
 func TestEnginePermissionAllowed(t *testing.T) {
@@ -581,7 +581,7 @@ func TestEnginePermissionAllowed(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Diagnostic system 鈥?QuickCheck should work with real config
+// TEST: Diagnostic system - QuickCheck should work with real config
 // ===========================================================================
 
 func TestDiagnosticIntegration(t *testing.T) {
@@ -630,7 +630,7 @@ func TestEngineStreamDeltas(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Unknown tool name from model 鈥?should not crash
+// TEST: Unknown tool name from model - should not crash
 // ===========================================================================
 
 func TestEngineUnknownToolName(t *testing.T) {
@@ -653,7 +653,7 @@ func TestEngineUnknownToolName(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Concurrent parallel tools 鈥?both should complete
+// TEST: Concurrent parallel tools - both should complete
 // ===========================================================================
 
 func TestEngineParallelToolExecution(t *testing.T) {
@@ -691,7 +691,7 @@ func TestEngineParallelToolExecution(t *testing.T) {
 }
 
 // ===========================================================================
-// TEST: Auto-permission mode 鈥?should not ask, should allow all
+// TEST: Auto-permission mode - should not ask, should allow all
 // ===========================================================================
 
 func TestEngineAutoPermissionMode(t *testing.T) {
@@ -704,7 +704,7 @@ func TestEngineAutoPermissionMode(t *testing.T) {
 		},
 	}
 	eng := newTestEngine(prov, writeTool)
-	// Auto mode 鈥?should bypass permission prompt entirely
+	// Auto mode - should bypass permission prompt entirely
 	eng.config.PermissionMode = "auto"
 	eng.perm.SetMode(permission.Bypass)
 	promptCalled := false
@@ -771,7 +771,6 @@ func TestExecuteTool_SurfacesGuardrailWarningToModel(t *testing.T) {
 // ===========================================================================
 // Run with: go test -v -run TestSteerFlowDemo ./internal/engine/
 
-
 func TestSteerFlowDemo(t *testing.T) {
 	t.Log("")
 	t.Log("╔══════════════════════════════════════════════════════════╗")
@@ -805,8 +804,8 @@ func TestSteerFlowDemo(t *testing.T) {
 	}
 
 	eng := newTestEngine(prov, shellTool)
-	eng.extractRunner = nil // disable background extract to avoid real HTTP calls in tests
-	eng.dreamRunner = nil   // disable background dream to avoid real HTTP calls in tests
+	eng.extractRunner = nil             // disable background extract to avoid real HTTP calls in tests
+	eng.dreamRunner = nil               // disable background dream to avoid real HTTP calls in tests
 	eng.perm.SetMode(permission.Bypass) // bypass permission for demo test
 
 	// ── Step 2: Start task in background ──
@@ -915,7 +914,6 @@ func (s *steerableMockTool) Call(ctx context.Context, input tool.Input, tc tool.
 	return result, err
 }
 
-
 // ===========================================================================
 // E2E DEMO: Real HTTP server — tests full network stack, not just mock structs
 // ===========================================================================
@@ -1010,9 +1008,9 @@ func TestSteerE2E(t *testing.T) {
 		PermissionMode: "auto",
 		MaxBudget:      100,
 		Provider: api.ProviderConfig{
-			Name:      "openai",
-			APIKey:    "sk-test",
-			BaseURL:   server.URL + "/v1", // unused by mock but needed for provider init
+			Name:    "openai",
+			APIKey:  "sk-test",
+			BaseURL: server.URL + "/v1", // unused by mock but needed for provider init
 		},
 	}
 	cfg.Tools = []tool.Tool{shellTool}

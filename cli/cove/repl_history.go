@@ -672,11 +672,6 @@ func looksSyntheticHistoryText(s string) bool {
 		"[system:", "[Conversation Summary]",
 		"[系统检测到重复操作循环]", "[Context truncated",
 		"[用户指引]", "[Continue the task", "[会话摘要]",
-		// Backward compatibility for older mojibake markers produced by
-		// previous encoding regressions.
-		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",
-		"[鐢ㄦ埛鎸囧紩]",
-		"[浼氳瘽鎽樿]",
 		"run slow tool", "do something", "slow response",
 	}
 	for _, p := range knownPrefixes {

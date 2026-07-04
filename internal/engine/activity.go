@@ -100,14 +100,14 @@ func (e *Engine) runStallMonitor(stop <-chan struct{}) {
 			e.actMu.Unlock()
 			for _, s := range stuckList {
 				e.engineOutput(fmt.Sprintf(
-					"\r\x1b[K\x1b[33m⚠ 仍在「%s」，已 %s 无新进展（可能卡住，按 Ctrl+C 可中断）\x1b[0m\n",
+					"\r\x1b[K\x1b[33m! still in '%s', no progress for %s (possibly stuck, press Ctrl+C to interrupt)\x1b[0m\n",
 					s.label, s.idle.Round(time.Second)))
 				// Record once to the runtime log. We deliberately do NOT also call
 				// log.Warnf here: the live stderr line above already shows it, and
 				// log.Warnf would be mirrored into the same log via the sink,
 				// producing a duplicate entry.
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatEngine,
-					fmt.Sprintf("阶段「%s」停滞 %s 无进展", s.label, s.idle.Round(time.Second)))
+					fmt.Sprintf("stage '%s' stalled with no progress for %s", s.label, s.idle.Round(time.Second)))
 			}
 		}
 	}

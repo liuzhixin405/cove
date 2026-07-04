@@ -122,7 +122,7 @@ type Engine struct {
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
-	// app appears to hang ("一直锟斤拷锟斤拷应"), we can name exactly which stage is stuck.
+	// app appears to hang ("一直无响应"), we can name exactly which stage is stuck.
 	actMu  sync.Mutex
 	acts   map[uint64]*activity
 	actSeq uint64
@@ -585,8 +585,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	if e.safetyChecker != nil {
 		if result := e.safetyChecker.Scan(userMessage.Content, "user_input"); result != nil {
 			if blocking := result.BlockingFinding(); blocking != nil {
-				e.engineOutput(fmt.Sprintf("  \x1b[31m鈿?safety: %s\x1b[0m", blocking.Message))
-				// Warn but don't block 鈥?user input is from the actual user
+				e.engineOutput(fmt.Sprintf("  \x1b[31m! safety: %s\x1b[0m", blocking.Message))
+				// Warn but don't block -- user input is from the actual user
 				log.Warnf("safety finding in user input: %s", blocking.Message)
 			}
 		}
@@ -637,7 +637,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				}
 			}
 			if !injected {
-				// No tool message yet 锟斤拷 put it back
+				// No tool message yet, put it back.
 				e.Steer(steer)
 			}
 		}
@@ -675,13 +675,13 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
 		var walker *repl.WalkingIndicator
 		if iter > 0 && !e.config.Debug {
-			walker = repl.NewWalkingIndicator("思锟斤拷锟斤拷...")
+			walker = repl.NewWalkingIndicator("thinking...")
 			walker.Start()
 		}
 
 		if useStream {
 			firstDelta := true
-			modelAct := e.beginActivity("锟斤拷锟斤拷模锟斤拷 " + e.fallback.CurrentModel())
+			modelAct := e.beginActivity("call model " + e.fallback.CurrentModel())
 			resp, _, err = e.fallback.TryChatStream(ctx, func(p api.Provider) api.ChatRequest { return req }, func(ev api.StreamEvent) {
 				e.progressActivity(modelAct)
 				if firstDelta && walker != nil {
@@ -698,7 +698,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			})
 			e.endActivity(modelAct)
 		} else {
-			modelAct := e.beginActivity("锟斤拷锟斤拷模锟斤拷 " + e.fallback.CurrentModel())
+			modelAct := e.beginActivity("call model " + e.fallback.CurrentModel())
 			resp, _, err = e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
 			e.endActivity(modelAct)
 		}
@@ -711,7 +711,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.messages = prevMessages
 			e.saveSession()
 			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
-				fmt.Sprintf("模锟酵碉拷锟斤拷失锟斤拷: %s", err.Error()))
+				fmt.Sprintf("模型调用失败: %s", err.Error()))
 			return "", fmt.Errorf("api: %w", err)
 		}
 
@@ -816,7 +816,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
 				log.Warnf("loop detected: %s", loopFp)
-				e.messages = append(e.messages, newSyntheticUserMsg("[system: 妫€娴嬪埌閲嶅寰幆 鈥?妯″瀷杩炵画澶氭璋冪敤鐩稿悓鐨勫伐鍏峰拰鍙傛暟銆傝灏濊瘯瀹屽叏涓嶅悓鐨勬柟娉曪紝濡傛灉鍗′綇浜嗗彲浠ュ悜鐢ㄦ埛瀵绘眰甯姪]"))
+				e.messages = append(e.messages, newSyntheticUserMsg("[system: 检测到重复循环 - 模型连续多次调用相同的工具和参数。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助。]"))
 				e.loopHistory = nil // reset after injecting guidance
 			}
 		}
@@ -895,7 +895,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if isErr {
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
-					fmt.Sprintf("锟斤拷锟斤拷 %s 失锟斤拷: %s", r.Name, summarizeResult(r.Content)))
+					fmt.Sprintf("工具 %s 失败: %s", r.Name, summarizeResult(r.Content)))
 			}
 			e.messages = append(e.messages, api.Message{
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
@@ -944,7 +944,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		e.totalTokens = countTokens(e.messages)
 		// Compression is handled by checkAndCompress at iteration start (line ~465).
 		// Record iteration for stagnation detection (Layer 3).
-		// L3 is log-only 鈥?no file activity doesn't mean the model is stuck
+		// L3 is log-only -- no file activity doesn't mean the model is stuck
 		// (research, reading, search are legitimate non-file workflows).
 		if e.loopDetector != nil {
 			if lr := e.loopDetector.RecordIteration(); lr.Detected {
@@ -953,7 +953,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					e.engineOutput("? " + lr.Reason)
 					return "", fmt.Errorf("loop detection: %s", lr.Reason)
 				}
-				// L3 is a weak signal 鈥?log only, don't inject guidance.
+				// L3 is a weak signal -- log only, don't inject guidance.
 				// The model may be doing legitimate research/reading.
 			}
 		}
@@ -988,14 +988,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if e.safetyChecker != nil {
 		result := e.safetyChecker.ScanToolCall(tc.Name, tc.Input)
 		if blocking := result.BlockingFinding(); blocking != nil {
-			e.engineOutput(fmt.Sprintf("  \x1b[31m鉁?blocked: %s\x1b[0m", blocking.Message))
+			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", blocking.Message))
 			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message)
 		}
 	}
 
 	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
 	// or MCP call that ignores ctx) is attributable by the stall monitor.
-	toolAct := e.beginActivity("执锟叫癸拷锟斤拷 " + tc.Name)
+	toolAct := e.beginActivity("run tool " + tc.Name)
 	defer e.endActivity(toolAct)
 
 	// Fire pre-tool-use hooks
@@ -1341,7 +1341,7 @@ func (e *Engine) compactIfNeeded(ctx context.Context, threshold int) {
 		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
 	}
 
-	// Use model_fast for compression summaries 鈥?much cheaper than the main model.
+	// Use model_fast for compression summaries -- much cheaper than the main model.
 	// Falls back to the main model if model_fast is not configured.
 	tryChat := func(ctx context.Context, req api.ChatRequest) (*api.ChatResponse, error) {
 		if e.config.ModelFast != "" {
@@ -1421,11 +1421,9 @@ func isSyntheticUserMessage(content string) bool {
 	syntheticPrefixes := []string{
 		"[system:",               // circuit breaker
 		"[Conversation Summary]", // AI compression
-		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]", // loop guidance (Chinese)
-		"[Context truncated", // truncation notice
-		"[用户指引]",             // steer guidance
-		"[Continue the task", // compression continuation
-		"[浼氳瘽鎽樿]",           // old compression (Chinese)
+		"[Context truncated",     // truncation notice
+		"[用户指引]",                 // steer guidance
+		"[Continue the task",     // compression continuation
 	}
 	for _, p := range syntheticPrefixes {
 		if strings.HasPrefix(c, p) {
@@ -1456,11 +1454,9 @@ func looksSynthetic(m api.Message) bool {
 	knownPrefixes := []string{
 		"[system:",
 		"[Conversation Summary]",
-		"[绯荤粺妫€娴嬪埌閲嶅鎿嶄綔寰幆]",
 		"[Context truncated",
 		"[用户指引]",
 		"[Continue the task",
-		"[浼氳瘽鎽樿]",
 		"run slow tool",
 		"do something",
 		"slow response",
@@ -1675,7 +1671,7 @@ func (e *Engine) runTurnEndPipeline() {
 			summary := diff.Summary()
 			log.Debugf("session changes: %s", summary)
 			if len(diff.AddedFiles) > 0 || len(diff.AddedTools) > 0 {
-				e.engineOutput(fmt.Sprintf("  \x1b[2m馃搳 %s\x1b[0m", summary))
+				e.engineOutput(fmt.Sprintf("  \x1b[2msession: %s\x1b[0m", summary))
 			}
 		}
 		e.sessionView = currentView
