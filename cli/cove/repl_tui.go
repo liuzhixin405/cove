@@ -30,6 +30,28 @@ import (
 // disabled (--no-tui or COVE_TUI=0) or when stdin/stdout is not a terminal
 // (piped/redirected), where the classic line REPL is more robust. --tui or
 // COVE_TUI=1 force it on even in those cases.
+// cleanANSI strips ANSI escape sequences from a string for TUI rendering.
+func cleanANSI(s string) string {
+	// Remove ANSI color/style codes and carriage returns from engine output
+	result := s
+	// Carriage returns and clear-line sequences
+	result = strings.ReplaceAll(result, "\r", "")
+	result = strings.ReplaceAll(result, "\x1b[K", "")
+	// Remove ANSI escape sequences (ESC[...m)
+	for {
+		i := strings.Index(result, "\x1b[")
+		if i < 0 {
+			break
+		}
+		j := strings.IndexByte(result[i:], 'm')
+		if j < 0 {
+			break
+		}
+		result = result[:i] + result[i+j+1:]
+	}
+	return result
+}
+
 func useTUI() bool {
 	if noTUI || os.Getenv("COVE_TUI") == "0" {
 		return false
@@ -395,7 +417,8 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 
 			start := time.Now()
 			eng.OnToolProgress = func(name string, _ string) { app.SetActivity("执行 " + name) }
-			eng.OnEngineOutput = func(line string) { app.EngineLine(line) }
+			eng.OnEngineOutput = func(line string) { app.EngineLine(cleanANSI(line)) }
+			eng.OnToolStart = func(name string) { app.SetActivity("⚙ 执行 " + name) }
 
 			app.BeginStream("")
 			running.Store(true)

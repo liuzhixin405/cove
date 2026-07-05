@@ -150,6 +150,10 @@ type Model struct {
 
 	gitExpanded bool
 
+	// mouseEnabled toggles between mouse mode (click/scroll) and selection mode
+	// (native text drag-selection). F4/F2/F3 toggle.
+	mouseEnabled bool
+
 	// overlay is the modal layer drawn over the conversation body
 	// (overlayNone when hidden). search/overlayIdx drive it.
 	overlay    int
@@ -207,6 +211,7 @@ func New(modelName string, onSubmit, onResume func(string), onInterrupt func(), 
 		curTurn:     -1,
 		streamTurn:  -1,
 		gitExpanded: false,
+		mouseEnabled: false,
 	}
 }
 
@@ -312,15 +317,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateOverlay(msg)
 		}
 		switch msg.String() {
-		case "ctrl+c":
-			// While a task is running, Ctrl+C cancels it (mirrors the classic
-			// REPL) instead of quitting. Press it again when idle to exit.
+		case "ctrl+c", "ctrl+shift+c":
+			// Ctrl+C cancels a running task. When idle, does NOT quit - lets the
+			// terminal handle copy. Use Ctrl+Q to quit. F4 toggles mouse mode.
 			if (m.task.Running || m.streaming) && m.onInterrupt != nil {
 				m.onInterrupt()
 				return m, nil
 			}
+			return m, nil
+		case "ctrl+q":
 			m.quitting = true
 			return m, tea.Quit
+		case "f2", "f3", "f4":
+			m.mouseEnabled = !m.mouseEnabled
+			return m, nil
 		case "ctrl+r":
 			m.openHistory()
 			return m, nil
@@ -556,7 +566,7 @@ func (m *Model) updateOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.updatePermission(msg)
 	}
 	switch msg.String() {
-	case "esc", "ctrl+c":
+	case "esc", "ctrl+c", "ctrl+shift+c", "f2", "f3", "f4":
 		m.closeOverlay()
 		return m, nil
 	case "up":
@@ -595,10 +605,9 @@ func (m *Model) resolvePermission(d PermDecision) {
 // allows and asks the caller to remember the rule.
 func (m *Model) updatePermission(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c":
+	case "ctrl+c", "ctrl+shift+c":
 		m.resolvePermission(PermDeny)
-		m.quitting = true
-		return m, tea.Quit
+		return m, nil
 	case "esc":
 		m.resolvePermission(PermDeny)
 		return m, nil
@@ -755,10 +764,13 @@ func (m *Model) View() tea.View {
 
 	var v tea.View
 	v.AltScreen = true
-	// Enable mouse so the conversation body responds to the scroll wheel
-	// (handled as tea.MouseWheelMsg in Update). Cell-motion mode is the most
-	// widely supported and still delivers wheel events.
-	v.MouseMode = tea.MouseModeCellMotion
+	// Mouse mode is off by default for native text selection.
+	// Press F4 to toggle mouse capture (for click-to-fold, scroll wheel).
+	if m.mouseEnabled {
+		v.MouseMode = tea.MouseModeCellMotion
+	} else {
+		v.MouseMode = tea.MouseModeNone
+	}
 
 	if m.overlay != overlayNone {
 		oH := m.height - 5 // status + transient + bottom + rule + input

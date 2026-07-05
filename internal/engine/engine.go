@@ -1,4 +1,4 @@
-﻿package engine
+package engine
 
 import (
 	"context"
@@ -103,11 +103,13 @@ type Engine struct {
 	promptMu              sync.Mutex                 // lock for interactive permission prompts
 	// OnEngineOutput, if set, receives engine diagnostic lines
 	// (tool progress, spinner, etc.) instead of writing to stderr.
-	OnEngineOutput     func(line string)
-	PermissionPrompt   func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause  func()                       // called before permission prompt to pause spinners
-	OnPermissionDone   func()                       // called after permission decision to resume
-	OnToolProgress     func(toolName, chunk string) // live output chunks from long-running tools
+	OnEngineOutput    func(line string)
+	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
+	OnPermissionPause func()                       // called before permission prompt to pause spinners
+	OnPermissionDone  func()                       // called after permission decision to resume
+	OnToolProgress    func(toolName, chunk string) // live output chunks from long-running tools
+	// OnToolStart, if set, is called before each tool execution with the tool name.
+	OnToolStart        func(toolName string)
 	sessionNotes       *notes.SessionNotes
 	guardrails         *guardrail.Tracker
 	subdirHints        *ctxt.SubdirHints
@@ -862,10 +864,16 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: fmt.Sprintf("Error: tool panicked: %v", r)}
 							}
 						}()
+						if e.OnToolStart != nil {
+							e.OnToolStart(tcall.Name)
+						}
 						res := e.executeTool(ctx, tcall)
 						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: res}
 					}(i, tc)
 				} else {
+					if e.OnToolStart != nil {
+						e.OnToolStart(tc.Name)
+					}
 					res := e.executeTool(ctx, tc)
 					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
 				}
@@ -876,6 +884,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				if !e.config.Debug {
 					// Show tool start
 					e.engineOutput(fmt.Sprintf("\r  \x1b[2m? [%s]...\x1b[0m", tc.Name))
+				}
+				if e.OnToolStart != nil {
+					e.OnToolStart(tc.Name)
 				}
 				res := e.executeTool(ctx, tc)
 				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
