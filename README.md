@@ -1,6 +1,6 @@
-<div align="center">
+﻿<div align="center">
 
-# 🤖 cove
+# 馃 cove
 
 **Go-powered AI Coding Assistant for the Terminal**
 
@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[English](#english) | [中文](#chinese)
+[English](#english) | [涓枃](#chinese)
 
 </div>
 
@@ -22,25 +22,26 @@
 
 cove is a pure CLI AI programming assistant, implemented as a single-file Go binary. It runs in your terminal, supports multiple AI providers, and is designed for local development, scripting, and portable distribution.
 
-### ✨ Features
+### 鉁?Features
 
-- 🎯 **Single Binary** — Zero dependencies, just download and run
-- 🌐 **Multi-Provider** — Anthropic, OpenAI, DeepSeek + 10+ OpenAI-compatible endpoints
-- 🖥️ **Cross-Platform** — Windows, macOS (Intel & Apple Silicon), Linux
-- 🎨 **Interactive REPL** — 25+ slash commands, async task queue, session management
-- 🔧 **Agent Tools** — File ops, shell, grep, glob, web fetch/search, headless browser, PowerShell
-- 🧠 **Self-Learning** — Auto memory extraction, skill creation, cross-session consolidation (Dream)
-- 📋 **Plan Executor** — Declarative multi-step task plans with dependency DAG + parallel sub-agent execution
-- 👥 **Multi-Agent & Teams** — Spawn sub-agents, create teams with message passing, cron scheduling
-- 📚 **Skill System** — 23 built-in skills + custom skills, conditional auto-loading by file type
-- 🎭 **Permission Modes** — default | plan | auto | bypass with intelligent classifier
-- 🛡️ **Guardrails** — Tool loop detection, rapid-failure circuit breaker, idempotent result detection
-- 💰 **Cost Tracking** — Real-time token counting, cost estimation, budget caps, rate-limit awareness
-- 🔄 **Checkpoints** — Auto Git snapshots before write/edit, undo support
-- 🩺 **Diagnostic System** — 30+ error codes, startup checks, hot-fixable without restart
-- 📱 **CovePhone** — Android mobile app with native Go AI engine
+- 馃幆 **Single Binary** 鈥?Zero dependencies, just download and run
+- 馃寪 **Multi-Provider** 鈥?Anthropic, OpenAI, DeepSeek + 10+ OpenAI-compatible endpoints
+- 馃枼锔?**Cross-Platform** 鈥?Windows, macOS (Intel & Apple Silicon), Linux
+- 馃帹 **Interactive REPL** 鈥?25+ slash commands, async task queue, session management
+- 馃敡 **Agent Tools** 鈥?File ops, shell, grep, glob, web fetch/search, headless browser, PowerShell
+- 馃 **Self-Learning** 鈥?Auto memory extraction, skill creation, cross-session consolidation (Dream)
+- 馃搵 **Plan Executor** 鈥?Declarative multi-step task plans with dependency DAG + parallel sub-agent execution
+- 馃懃 **Multi-Agent & Teams** 鈥?Spawn sub-agents, create teams with message passing, cron scheduling
+- 馃摎 **Skill System** 鈥?23 built-in skills + custom skills, conditional auto-loading by file type
+- 馃幁 **Permission Modes** 鈥?default | plan | auto | bypass with intelligent classifier
+- 馃洝锔?**Guardrails** 鈥?Tool loop detection, rapid-failure circuit breaker, idempotent result detection
+- 馃挵 **Cost Tracking** 鈥?Real-time token counting, cost estimation, budget caps, rate-limit awareness
+- 馃攧 **Checkpoints** 鈥?Auto Git snapshots before write/edit, undo support
+- 馃┖ **Diagnostic System** 鈥?30+ error codes, startup checks, hot-fixable without restart
+- 馃尪 **TUI Theme System** 鈥?5 built-in themes (Catppuccin, Dracula, Gruvbox, OneDark, TokyoNight), hot-switchable
+- 馃摫 **CovePhone — Android mobile app with native Go AI engine
 
-### 📥 Installation
+### 馃摜 Installation
 
 #### Download Pre-built Binary
 
@@ -87,20 +88,20 @@ python scripts/release_build.py v2.0.0
 
 Artifacts are output to `dist/v2.0.0/`.
 
-### 📱 CovePhone (Android)
+### 馃摫 CovePhone (Android)
 
 CovePhone is an **Android companion app** for cove, bringing AI assistant capabilities to your mobile device.
 
-- 🧠 **Native Go Engine** — Real AI engine (not mock) powered by `cove-core.aar`, a Go module compiled via `gomobile`
-- 💬 **Full Chat UI** — Message list with thinking display, smooth scrolling, batch-rendered thinking blocks
-- ⚙️ **Settings & Config** — API key, model selection, provider choice, persistent via SharedPreferences
-- 🔌 **DeepSeek API** — Connects to DeepSeek (or other compatible providers) directly from your phone
+- 馃 **Native Go Engine** 鈥?Real AI engine (not mock) powered by `cove-core.aar`, a Go module compiled via `gomobile`
+- 馃挰 **Full Chat UI** 鈥?Message list with thinking display, smooth scrolling, batch-rendered thinking blocks
+- 鈿欙笍 **Settings & Config** 鈥?API key, model selection, provider choice, persistent via SharedPreferences
+- 馃攲 **DeepSeek API** 鈥?Connects to DeepSeek (or other compatible providers) directly from your phone
 
 **Download:** [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (Android, ~47MB)
 
-**Source:** [`mobile/`](mobile/) — Lightweight Go engine for mobile.
+**Source:** [`mobile/`](mobile/) 鈥?Lightweight Go engine for mobile.
 
-### 🚀 Quick Start
+### 馃殌 Quick Start
 
 ```bash
 # Interactive REPL
@@ -128,7 +129,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
 ```
 
-### 🌍 Supported Providers
+### 馃實 Supported Providers
 
 
 | Provider            | Type       | Environment Variable                 |
@@ -136,10 +137,10 @@ export OPENAI_API_KEY="sk-..."
 | **Anthropic**       | Native     | `ANTHROPIC_API_KEY`                  |
 | **OpenAI**          | Native     | `OPENAI_API_KEY`                     |
 | **DeepSeek**        | Native     | `DEEPSEEK_API_KEY`                   |
-| **GLM (智谱)**      | Compatible | `GLM_API_KEY` / `ZHIPU_API_KEY`      |
-| **Kimi (月之暗面)** | Compatible | `KIMI_API_KEY` / `MOONSHOT_API_KEY`  |
-| **Qwen (通义千问)** | Compatible | `QWEN_API_KEY` / `DASHSCOPE_API_KEY` |
-| **Doubao (豆包)**   | Compatible | `DOUBAO_API_KEY` / `ARK_API_KEY`     |
+| **GLM (鏅鸿氨)**      | Compatible | `GLM_API_KEY` / `ZHIPU_API_KEY`      |
+| **Kimi (鏈堜箣鏆楅潰)** | Compatible | `KIMI_API_KEY` / `MOONSHOT_API_KEY`  |
+| **Qwen (閫氫箟鍗冮棶)** | Compatible | `QWEN_API_KEY` / `DASHSCOPE_API_KEY` |
+| **Doubao (璞嗗寘)**   | Compatible | `DOUBAO_API_KEY` / `ARK_API_KEY`     |
 | **OpenRouter**      | Compatible | `OPENROUTER_API_KEY`                 |
 | **SiliconFlow**     | Compatible | `SILICONFLOW_API_KEY`                |
 | **Groq**            | Compatible | `GROQ_API_KEY`                       |
@@ -149,7 +150,7 @@ export OPENAI_API_KEY="sk-..."
 | **Mistral**         | Compatible | `MISTRAL_API_KEY`                    |
 | **Custom**          | Compatible | `LLM_API_KEY` + `LLM_BASE_URL`       |
 
-### ⌨️ REPL Commands
+### 鈱笍 REPL Commands
 
 
 | Command              | Description                                                |
@@ -187,20 +188,20 @@ export OPENAI_API_KEY="sk-..."
 | `/help`              | Show help                                                  |
 | `/exit`              | Exit REPL                                                  |
 
-### ⚙️ Configuration
+### 鈿欙笍 Configuration
 
 Configuration is read from three tiers (lowest to highest priority):
 
-1. **Environment Variables** — `LLM_API_KEY`, `LLM_BASE_URL`, provider-specific keys
-2. **User Config** — `~/.cove/config.json`
-3. **Project Config** — `.cove.json` in project root
+1. **Environment Variables** 鈥?`LLM_API_KEY`, `LLM_BASE_URL`, provider-specific keys
+2. **User Config** 鈥?`~/.cove/config.json`
+3. **Project Config** 鈥?`.cove.json` in project root
 
 #### Model Routing (Dual-Model)
 
 cove supports intelligent dual-model routing. When you send a message, the system evaluates its complexity:
 
-- **Complex tasks** (containing keywords like `refactor`, `architecture`, `debug`, `重构`, `架构` etc., or messages longer than 500 chars) → uses the **primary model** (`model`)
-- **Simple/short tasks** → uses the **fast model** (`model_fast`) for speed and cost savings
+- **Complex tasks** (containing keywords like `refactor`, `architecture`, `debug`, `閲嶆瀯`, `鏋舵瀯` etc., or messages longer than 500 chars) 鈫?uses the **primary model** (`model`)
+- **Simple/short tasks** 鈫?uses the **fast model** (`model_fast`) for speed and cost savings
 
 If `model` is empty or `"auto"`, it auto-resolves to the provider's default premium model. If `model_fast` is empty or `"auto"`, it reuses the main model (safe no-op).
 
@@ -212,18 +213,18 @@ When the primary provider is unavailable (rate limited, down, or auth error), co
 
 Permission decisions can be persisted as rules in `~/.cove/policy.json`:
 
-- `always_allow` — auto-approve matching tools
-- `always_deny` — auto-reject matching tools
-- `ask` — always prompt user
+- `always_allow` 鈥?auto-approve matching tools
+- `always_deny` 鈥?auto-reject matching tools
+- `ask` 鈥?always prompt user
 
 Supports wildcard tool patterns (e.g. `"mcp_*_*"`), parameter conditions, and optional expiration.
 
 #### Other Built-in Safeguards
 
-- **3-Layer Loop Detection** — fingerprint match, output hash match, stagnation detection (60 rounds no file changes)
-- **AI Context Compression** — auto-triggers at 50% token limit, writes AI summaries of old messages
-- **Tool Output Masking** — trims large old tool outputs to save tokens
-- **Safety Filters** — blocks dangerous commands (`rm -rf`, `dd`, `mkfs`), path traversal, and API key leakage
+- **3-Layer Loop Detection** 鈥?fingerprint match, output hash match, stagnation detection (60 rounds no file changes)
+- **AI Context Compression** 鈥?auto-triggers at 50% token limit, writes AI summaries of old messages
+- **Tool Output Masking** 鈥?trims large old tool outputs to save tokens
+- **Safety Filters** 鈥?blocks dangerous commands (`rm -rf`, `dd`, `mkfs`), path traversal, and API key leakage
 
 Example `~/.cove/config.json`:
 
@@ -249,111 +250,103 @@ Example `~/.cove/config.json`:
     "base_url": "https://api.deepseek.com/v1",
     "name": "deepseek"
   },
-  "system_prompt": "你是 Cove，一个 AI 编程助手。核心职责：使用工具完成任务，而非描述任务。所有操作必须通过工具完成。单步直接做，多步用 todowrite 分解跟踪。# 什么叫 做完了 1. 交付物 = 真实工具输出，不是描述。代码必须实际运行/编译通过才算完成。2. 绝不要编造结果。工具失败就如实报告，尝试替代方案，绝不伪造输出。3. 完成后自查：文件真改了？代码真跑了？有没有未处理的错误？# 工具使用- 文件 → write(新建/重写) / read / edit(修改)- 命令/构建/测试/git → bash- 搜索 → grep / glob- 网络 → webfetch / websearch- 任务管理 → todowrite + execute_plan（3步以上）- 子代理 → agent（独立子任务）并发规则：独立读取可并行，写文件必须串行，有依赖先读后改。文件规范：新建用 write 一次性写入完整内容，不要用多个小 edit 拼凑。# 错误防护- 连续3次失败 → 换策略- 被截断 → 等继续指令- 检测到循环 → 立刻换方法- 最多 200 轮# 风格简洁、行动、透明。中文用户用中文回复。",
+  "system_prompt": "浣犳槸 Cove锛屼竴涓?AI 缂栫▼鍔╂墜銆傛牳蹇冭亴璐ｏ細浣跨敤宸ュ叿瀹屾垚浠诲姟锛岃€岄潪鎻忚堪浠诲姟銆傛墍鏈夋搷浣滃繀椤婚€氳繃宸ュ叿瀹屾垚銆傚崟姝ョ洿鎺ュ仛锛屽姝ョ敤 todowrite 鍒嗚В璺熻釜銆? 浠€涔堝彨 鍋氬畬浜?1. 浜や粯鐗?= 鐪熷疄宸ュ叿杈撳嚭锛屼笉鏄弿杩般€備唬鐮佸繀椤诲疄闄呰繍琛?缂栬瘧閫氳繃鎵嶇畻瀹屾垚銆?. 缁濅笉瑕佺紪閫犵粨鏋溿€傚伐鍏峰け璐ュ氨濡傚疄鎶ュ憡锛屽皾璇曟浛浠ｆ柟妗堬紝缁濅笉浼€犺緭鍑恒€?. 瀹屾垚鍚庤嚜鏌ワ細鏂囦欢鐪熸敼浜嗭紵浠ｇ爜鐪熻窇浜嗭紵鏈夋病鏈夋湭澶勭悊鐨勯敊璇紵# 宸ュ叿浣跨敤- 鏂囦欢 鈫?write(鏂板缓/閲嶅啓) / read / edit(淇敼)- 鍛戒护/鏋勫缓/娴嬭瘯/git 鈫?bash- 鎼滅储 鈫?grep / glob- 缃戠粶 鈫?webfetch / websearch- 浠诲姟绠＄悊 鈫?todowrite + execute_plan锛?姝ヤ互涓婏級- 瀛愪唬鐞?鈫?agent锛堢嫭绔嬪瓙浠诲姟锛夊苟鍙戣鍒欙細鐙珛璇诲彇鍙苟琛岋紝鍐欐枃浠跺繀椤讳覆琛岋紝鏈変緷璧栧厛璇诲悗鏀广€傛枃浠惰鑼冿細鏂板缓鐢?write 涓€娆℃€у啓鍏ュ畬鏁村唴瀹癸紝涓嶈鐢ㄥ涓皬 edit 鎷煎噾銆? 閿欒闃叉姢- 杩炵画3娆″け璐?鈫?鎹㈢瓥鐣? 琚埅鏂?鈫?绛夌户缁寚浠? 妫€娴嬪埌寰幆 鈫?绔嬪埢鎹㈡柟娉? 鏈€澶?200 杞? 椋庢牸绠€娲併€佽鍔ㄣ€侀€忔槑銆備腑鏂囩敤鎴风敤涓枃鍥炲銆?,
   "telemetry": true,
   "thinking_tokens": 16000,
   "verbose": false
 }
 
 
-### 🤖 Agent Tools
+### 馃 Agent Tools
 
 | Tool | Description | Read-Only |
 |------|-------------|-----------|
-| `read` | Read files or list directories | ✓ |
+| `read` | Read files or list directories | 鉁?|
 | `write` | Create or overwrite files | |
 | `edit` | Exact string replacements in files | |
-| `glob` | Find files by glob pattern | ✓ |
-| `grep` | Regex search in files | ✓ |
+| `glob` | Find files by glob pattern | 鉁?|
+| `grep` | Regex search in files | 鉁?|
 | `bash` | Execute bash commands | |
 | `powershell` | Execute PowerShell commands | |
-| `webfetch` | HTTP fetch → Markdown | ✓ |
-| `websearch` | DuckDuckGo web search | ✓ |
-| `browser` | Headless Chrome: navigate + screenshot | ✓ |
+| `webfetch` | HTTP fetch 鈫?Markdown | 鉁?|
+| `websearch` | DuckDuckGo web search | 鉁?|
+| `browser` | Headless Chrome: navigate + screenshot | 鉁?|
 | `todowrite` | Structured task list management | |
 | `execute_plan` | Execute task plans with sub-agents | |
-| `plan_mode` | Enter read-only plan mode | ✓ |
-| `task` / `task_list` / `task_update` | Background task CRUD | ✓ |
+| `plan_mode` | Enter read-only plan mode | 鉁?|
+| `task` / `task_list` / `task_update` | Background task CRUD | 鉁?|
 | `agent` | Spawn sub-agent for complex tasks | |
 | `team_create` / `team_delete` | Manage agent teams | |
 | `send_message` | Message passing between tasks/teams | |
 | `cron` | Schedule recurring tasks | |
-| `question` | Ask user multiple-choice questions | ✓ |
-| `skill` / `skill_view` / `skills_list` | Skill discovery & execution | ✓ |
+| `question` | Ask user multiple-choice questions | 鉁?|
+| `skill` / `skill_view` / `skills_list` | Skill discovery & execution | 鉁?|
 | `mcp` / `mcp_resources` | MCP tool & resource access | varies |
-| `sleep` | Pause execution | ✓ |
-| `brief` | Generate session summary | ✓ |
+| `sleep` | Pause execution | 鉁?|
+| `brief` | Generate session summary | 鉁?|
 | `worktree` / `exit_worktree` | Git worktree management | |
 
-### 📂 Project Structure
+### 馃搨 Project Structure
 
 ```text
 cove/
-├── .github/            # GitHub CI/CD, templates
-│   └── workflows/      # CI & Release workflows
-├── agent/              # Go source code
-│   ├── cmd/cove/    # Entry point
-│   └── internal/       # 25+ internal packages
-├── mobile/             # Go engine for Android (CovePhone)
-├── dist/               # Release artifacts
-├── scripts/            # Build & test scripts
-├── CHANGELOG.md        # Release history
-├── CONTRIBUTING.md     # Contribution guide
-├── LICENSE             # MIT License
-└── README.md           # This file
+鈹溾攢鈹€ .github/            # GitHub CI/CD, templates
+鈹?  鈹斺攢鈹€ workflows/      # CI & Release workflows
+鈹溾攢鈹€ agent/              # Go source code
+鈹?  鈹溾攢鈹€ cmd/cove/    # Entry point
+鈹?  鈹斺攢鈹€ internal/       # 25+ internal packages
+鈹溾攢鈹€ mobile/             # Go engine for Android (CovePhone)
+鈹溾攢鈹€ dist/               # Release artifacts
+鈹溾攢鈹€ scripts/            # Build & test scripts
+鈹溾攢鈹€ CHANGELOG.md        # Release history
+鈹溾攢鈹€ CONTRIBUTING.md     # Contribution guide
+鈹溾攢鈹€ LICENSE             # MIT License
+鈹斺攢鈹€ README.md           # This file
 ```
 
-### 🤝 Contributing
+### 馃 Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-### 📄 License
+### 馃搫 License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT 鈥?see [LICENSE](LICENSE) for details.
 
 ---
 
 <a name="chinese"></a>
 
-## 中文
+## 涓枃
 
-cove 是一个纯 CLI 的 AI 编程助手，以单文件 Go 二进制形式发布。它运行在终端中，支持多种 AI 提供商，专为本地开发、脚本调用和便携分发而设计。
+cove 鏄竴涓函 CLI 鐨?AI 缂栫▼鍔╂墜锛屼互鍗曟枃浠?Go 浜岃繘鍒跺舰寮忓彂甯冦€傚畠杩愯鍦ㄧ粓绔腑锛屾敮鎸佸绉?AI 鎻愪緵鍟嗭紝涓撲负鏈湴寮€鍙戙€佽剼鏈皟鐢ㄥ拰渚挎惡鍒嗗彂鑰岃璁°€?
+### 鉁?鐗规€?
+- 馃幆 **鍗曟枃浠朵簩杩涘埗** 鈥?闆朵緷璧栵紝涓嬭浇鍗崇敤
+- 馃寪 **澶氭彁渚涘晢** 鈥?Anthropic銆丱penAI銆丏eepSeek 鍙?10+ 涓吋瀹规帴鍙?- 馃枼锔?**璺ㄥ钩鍙?* 鈥?Windows銆乵acOS (Intel & Apple Silicon)銆丩inux
+- 馃帹 **浜や簰寮?REPL** 鈥?25+ 涓枩鏉犲懡浠わ紝寮傛浠诲姟闃熷垪锛屼細璇濈鐞?- 馃敡 **鐏垫椿宸ュ叿闆?* 鈥?鏂囦欢鎿嶄綔銆乻hell/PowerShell銆佷唬鐮佹悳绱€佺綉椤垫姄鍙?鎼滅储銆乭eadless 娴忚鍣?- 馃 **鑷涔犵郴缁?* 鈥?鑷姩璁板繂鎻愬彇銆佹妧鑳藉垱寤恒€佽法浼氳瘽鏁村悎 (Dream)
+- 馃搵 **璁″垝鎵ц鍣?* 鈥?澹版槑寮忓姝ラ浠诲姟璁″垝锛屼緷璧?DAG + 骞惰瀛愭櫤鑳戒綋鎵ц
+- 馃懃 **澶氭櫤鑳戒綋涓庡洟闃?* 鈥?瀛愭櫤鑳戒綋鐢熸垚銆佸洟闃熷垱寤轰笌娑堟伅浼犻€掋€乧ron 瀹氭椂璋冨害
+- 馃攲 **MCP 鏀寔** 鈥?Model Context Protocol 鏈嶅姟鍣ㄩ泦鎴?(stdio + SSE + Streamable HTTP)
+- 馃幁 **鏉冮檺妯″紡** 鈥?default | plan | auto | bypass锛屾櫤鑳藉垎绫诲櫒
+- 馃洝锔?**鎶ゆ爮淇濇姢** 鈥?宸ュ叿寰幆妫€娴嬨€佸揩閫熷け璐ユ柇璺櫒銆佸箓绛夌粨鏋滄娴?- 馃攧 **妫€鏌ョ偣** 鈥?鍐欏叆鍓嶈嚜鍔?Git 蹇収锛屾敮鎸佹挙娑堝洖閫€
+- 馃┖ **璇婃柇绯荤粺** 鈥?30+ 閿欒鐮侊紝鍚姩妫€鏌ワ紝鐑慨澶嶆棤闇€閲嶅惎
+- 馃摝 **鎻掍欢涓庢妧鑳?* 鈥?鍙墿灞曟灦鏋勶紝鍐呯疆 23+ 鎶€鑳斤紝鏀寔鑷畾涔?- 馃挵 **璐圭敤杩借釜** 鈥?瀹炴椂 token 璁℃暟銆佹垚鏈及绠椼€侀绠椾笂闄愩€侀€熺巼闄愬埗鎰熺煡
+- 馃摫 **CovePhone** 鈥?Android 鎵嬫満 AI 鍔╂墜搴旂敤
+- 馃尪 **TUI 主题系统** 鈥?5 套内置主题（Catppuccin、Dracula、Gruvbox、OneDark、TokyoNight），支持热切换
 
-### ✨ 特性
+### 馃摜 瀹夎
 
-- 🎯 **单文件二进制** — 零依赖，下载即用
-- 🌐 **多提供商** — Anthropic、OpenAI、DeepSeek 及 10+ 个兼容接口
-- 🖥️ **跨平台** — Windows、macOS (Intel & Apple Silicon)、Linux
-- 🎨 **交互式 REPL** — 25+ 个斜杠命令，异步任务队列，会话管理
-- 🔧 **灵活工具集** — 文件操作、shell/PowerShell、代码搜索、网页抓取/搜索、headless 浏览器
-- 🧠 **自学习系统** — 自动记忆提取、技能创建、跨会话整合 (Dream)
-- 📋 **计划执行器** — 声明式多步骤任务计划，依赖 DAG + 并行子智能体执行
-- 👥 **多智能体与团队** — 子智能体生成、团队创建与消息传递、cron 定时调度
-- 🔌 **MCP 支持** — Model Context Protocol 服务器集成 (stdio + SSE + Streamable HTTP)
-- 🎭 **权限模式** — default | plan | auto | bypass，智能分类器
-- 🛡️ **护栏保护** — 工具循环检测、快速失败断路器、幂等结果检测
-- 🔄 **检查点** — 写入前自动 Git 快照，支持撤消回退
-- 🩺 **诊断系统** — 30+ 错误码，启动检查，热修复无需重启
-- 📦 **插件与技能** — 可扩展架构，内置 23+ 技能，支持自定义
-- 💰 **费用追踪** — 实时 token 计数、成本估算、预算上限、速率限制感知
-- 📱 **CovePhone** — Android 手机 AI 助手应用
+#### 涓嬭浇棰勭紪璇戜簩杩涘埗
 
-### 📥 安装
+鍓嶅線 [Releases](https://github.com/liuzhixin405/cove/releases) 涓嬭浇瀵瑰簲骞冲彴鐨勫帇缂╁寘锛?
 
-#### 下载预编译二进制
-
-前往 [Releases](https://github.com/liuzhixin405/cove/releases) 下载对应平台的压缩包：
-
-
-| 平台                  | 文件                          |
+| 骞冲彴                  | 鏂囦欢                          |
 | --------------------- | ----------------------------- |
 | Windows (amd64)       | `cove-v*-windows-amd64.zip`   |
 | macOS (Intel)         | `cove-v*-darwin-amd64.tar.gz` |
 | macOS (Apple Silicon) | `cove-v*-darwin-arm64.tar.gz` |
 | Linux (amd64)         | `cove-v*-linux-amd64.tar.gz`  |
 
-解压运行：
-
+瑙ｅ帇杩愯锛?
 ```bash
 # macOS / Linux
 tar -xzf cove-v*-linux-amd64.tar.gz
@@ -364,10 +357,8 @@ Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
 .\cove.exe
 ```
 
-建议将程序目录添加到 `PATH` 以便全局使用。
-
-#### 从源码构建
-
+寤鸿灏嗙▼搴忕洰褰曟坊鍔犲埌 `PATH` 浠ヤ究鍏ㄥ眬浣跨敤銆?
+#### 浠庢簮鐮佹瀯寤?
 ```bash
 git clone https://github.com/liuzhixin405/cove.git
 cd cove/agent
@@ -375,53 +366,44 @@ go build -o cove ./cmd/cove
 ./cove --version
 ```
 
-需要 Go 1.24+。
+闇€瑕?Go 1.24+銆?
+### 馃摫 CovePhone (Android)
 
-### 📱 CovePhone (Android)
+CovePhone 鏄?cove 鐨?**Android 鎵嬫満浼翠荆搴旂敤**锛屽皢 AI 鍔╂墜鑳藉姏甯﹀埌浣犵殑鎵嬫満涓娿€?
+- 馃 **鍘熺敓 Go 寮曟搸** 鈥?鍩轰簬 `cove-core.aar`锛堥€氳繃 `gomobile` 缂栬瘧鐨?Go 妯″潡锛夌殑鐪熷疄 AI 寮曟搸
+- 馃挰 **瀹屾暣鑱婂ぉ鐣岄潰** 鈥?娑堟伅鍒楄〃甯︽€濊€冭繃绋嬫樉绀猴紝骞虫粦婊氬姩锛屾壒閲忔覆鏌撶殑 thinking 鍧?- 鈿欙笍 **璁剧疆涓庨厤缃?* 鈥?API key銆佹ā鍨嬮€夋嫨銆佹彁渚涘晢閫夋嫨锛岄€氳繃 SharedPreferences 鎸佷箙鍖?- 馃攲 **DeepSeek API** 鈥?鐩存帴浠庢墜鏈鸿繛鎺?DeepSeek锛堟垨鍏朵粬鍏煎鎻愪緵鍟嗭級
 
-CovePhone 是 cove 的 **Android 手机伴侣应用**，将 AI 助手能力带到你的手机上。
+**涓嬭浇:** [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (Android, ~47MB)
 
-- 🧠 **原生 Go 引擎** — 基于 `cove-core.aar`（通过 `gomobile` 编译的 Go 模块）的真实 AI 引擎
-- 💬 **完整聊天界面** — 消息列表带思考过程显示，平滑滚动，批量渲染的 thinking 块
-- ⚙️ **设置与配置** — API key、模型选择、提供商选择，通过 SharedPreferences 持久化
-- 🔌 **DeepSeek API** — 直接从手机连接 DeepSeek（或其他兼容提供商）
-
-**下载:** [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (Android, ~47MB)
-
-**源码:** [`mobile/`](mobile/) — 移动端轻量 Go 引擎。
-
-### 🚀 快速开始
-
+**婧愮爜:** [`mobile/`](mobile/) 鈥?绉诲姩绔交閲?Go 寮曟搸銆?
+### 馃殌 蹇€熷紑濮?
 ```bash
-# 交互式 REPL
+# 浜や簰寮?REPL
 cove
 
-# 单次查询
-cove -p "创建一个贪吃蛇 HTML 游戏"
+# 鍗曟鏌ヨ
+cove -p "鍒涘缓涓€涓椽鍚冭泧 HTML 娓告垙"
 
-# 查看版本
+# 鏌ョ湅鐗堟湰
 cove --version
 
-# 系统诊断
+# 绯荤粺璇婃柇
 cove --doctor
 ```
 
-首次运行时，cove 会引导你配置 API key。也可以直接设置：
-
+棣栨杩愯鏃讹紝cove 浼氬紩瀵间綘閰嶇疆 API key銆備篃鍙互鐩存帴璁剧疆锛?
 ```bash
-# 在 REPL 中
-/api-key sk-your-key-here
+# 鍦?REPL 涓?/api-key sk-your-key-here
 
-# 或通过环境变量
+# 鎴栭€氳繃鐜鍙橀噺
 export DEEPSEEK_API_KEY="sk-..."
 ```
 
-### 📄 许可证
+### 馃搫 璁稿彲璇?
+MIT 鈥?璇﹁ [LICENSE](LICENSE)銆?
+### 猸?Star History
 
-MIT — 详见 [LICENSE](LICENSE)。
-
-### ⭐ Star History
-
-如果这个项目对你有帮助，请给我们一个 Star ⭐！
+濡傛灉杩欎釜椤圭洰瀵逛綘鏈夊府鍔╋紝璇风粰鎴戜滑涓€涓?Star 猸愶紒
 
 [![Star History Chart](https://api.star-history.com/svg?repos=cove/cove&type=Date)](https://star-history.com/#cove/cove&Date)
+

@@ -1,495 +1,316 @@
-# Cove Agent 完整开发指南
+﻿# Cove Agent 瀹屾暣寮€鍙戞寚鍗?
+> **閫傜敤璇昏€?*: 鏂版墜寮€鍙戣€呫€傛湰鏂囨。灏嗗甫浣犱粠闆跺紑濮嬬悊瑙ｆ暣涓?Cove Agent 椤圭洰鐨勬灦鏋勩€佽璁＄悊蹇靛拰瀹炵幇缁嗚妭锛岃瀹屽嵆鍙笂鎵嬪紑鍙戙€?
+---
 
-> **适用读者**: 新手开发者。本文档将带你从零开始理解整个 Cove Agent 项目的架构、设计理念和实现细节，读完即可上手开发。
+## 鐩綍
+
+1. [椤圭洰姒傝堪](#1-椤圭洰姒傝堪)
+2. [鎶€鏈爤涓庝緷璧朷(#2-鎶€鏈爤涓庝緷璧?
+3. [鐩綍缁撴瀯鎬昏](#3-鐩綍缁撴瀯鎬昏)
+4. [鏍稿績鏋舵瀯璁捐](#4-鏍稿績鏋舵瀯璁捐)
+5. [妯″潡璇﹁В](#5-妯″潡璇﹁В)
+   - [5.1 CLI 鍏ュ彛灞俔(#51-cli-鍏ュ彛灞?
+   - [5.2 Engine 寮曟搸灞俔(#52-engine-寮曟搸灞?
+   - [5.3 API 灞俔(#53-api-灞?
+   - [5.4 Tool 宸ュ叿绯荤粺](#54-tool-宸ュ叿绯荤粺)
+   - [5.5 Permission 鏉冮檺绯荤粺](#55-permission-鏉冮檺绯荤粺)
+   - [5.6 Plan 璁″垝绯荤粺](#56-plan-璁″垝绯荤粺)
+   - [5.7 Memory 璁板繂绯荤粺](#57-memory-璁板繂绯荤粺)
+   - [5.8 Skills 鎶€鑳界郴缁焆(#58-skills-鎶€鑳界郴缁?
+   - [5.9 Session 浼氳瘽绠＄悊](#59-session-浼氳瘽绠＄悊)
+   - [5.10 MCP 闆嗘垚](#510-mcp-闆嗘垚)
+   - [5.11 Browser 娴忚鍣╙(#511-browser-娴忚鍣?
+   - [5.12 REPL 浜や簰灞俔(#512-repl-浜や簰灞?
+   - [5.13 Context 涓婁笅鏂囩鐞哴(#513-context-涓婁笅鏂囩鐞?
+   - [5.14 杈呭姪妯″潡](#514-杈呭姪妯″潡)
+6. [鏍稿績鏁版嵁娴乚(#6-鏍稿績鏁版嵁娴?
+7. [鍏抽敭璁捐妯″紡](#7-鍏抽敭璁捐妯″紡)
+8. [濡備綍杩愯涓庢瀯寤篯(#8-濡備綍杩愯涓庢瀯寤?
+9. [濡備綍鎵╁睍绯荤粺](#9-濡備綍鎵╁睍绯荤粺)
+10. [娴嬭瘯绛栫暐](#10-娴嬭瘯绛栫暐)
 
 ---
 
-## 目录
+## 1. 椤圭洰姒傝堪
 
-1. [项目概述](#1-项目概述)
-2. [技术栈与依赖](#2-技术栈与依赖)
-3. [目录结构总览](#3-目录结构总览)
-4. [核心架构设计](#4-核心架构设计)
-5. [模块详解](#5-模块详解)
-   - [5.1 CLI 入口层](#51-cli-入口层)
-   - [5.2 Engine 引擎层](#52-engine-引擎层)
-   - [5.3 API 层](#53-api-层)
-   - [5.4 Tool 工具系统](#54-tool-工具系统)
-   - [5.5 Permission 权限系统](#55-permission-权限系统)
-   - [5.6 Plan 计划系统](#56-plan-计划系统)
-   - [5.7 Memory 记忆系统](#57-memory-记忆系统)
-   - [5.8 Skills 技能系统](#58-skills-技能系统)
-   - [5.9 Session 会话管理](#59-session-会话管理)
-   - [5.10 MCP 集成](#510-mcp-集成)
-   - [5.11 Browser 浏览器](#511-browser-浏览器)
-   - [5.12 REPL 交互层](#512-repl-交互层)
-   - [5.13 Context 上下文管理](#513-context-上下文管理)
-   - [5.14 辅助模块](#514-辅助模块)
-6. [核心数据流](#6-核心数据流)
-7. [关键设计模式](#7-关键设计模式)
-8. [如何运行与构建](#8-如何运行与构建)
-9. [如何扩展系统](#9-如何扩展系统)
-10. [测试策略](#10-测试策略)
+Cove 鏄竴涓敤 **Go 璇█** 缂栧啓鐨?**AI 缂栫▼鍔╂墜锛圕oding Agent锛?*锛岃繍琛屽湪缁堢锛圕LI锛変腑銆傚畠鐨勬牳蹇冭兘鍔涙槸锛?
+- 涓?LLM锛堝ぇ璇█妯″瀷锛夊璇濓紝鎺ユ敹鐢ㄦ埛鐨勮嚜鐒惰瑷€缂栫▼浠诲姟
+- 璋冪敤 **宸ュ叿锛圱ools锛?* 鏉ヨ鍐欐枃浠躲€佹墽琛屽懡浠ゃ€佹悳绱唬鐮佺瓑
+- 閫氳繃 **璁″垝锛圥lan锛?* 绯荤粺灏嗗鏉備换鍔℃媶瑙ｄ负鍙墽琛屾楠?- 閫氳繃 **鏉冮檺锛圥ermission锛?* 绯荤粺瀹夊叏鍦版帶鍒跺嵄闄╂搷浣?- 閫氳繃 **璁板繂锛圡emory锛?* 鍜?**鎶€鑳斤紙Skills锛?* 绯荤粺浠庡璇濅腑瀛︿範
+- 鏀寔 **MCP 鍗忚** 鎵╁睍澶栭儴宸ュ叿
+- 鏀寔 **澶?Agent 鍗忎綔**锛堝瓙浠ｇ悊銆佸洟闃燂級
 
+**鏍稿績璁捐鐞嗗康**: 鍗曡繘绋嬨€佷簨浠堕┍鍔ㄣ€佹潈闄愬彲鎺с€佹笎杩涘紡瀛︿範銆?
 ---
 
-## 1. 项目概述
-
-Cove 是一个用 **Go 语言** 编写的 **AI 编程助手（Coding Agent）**，运行在终端（CLI）中。它的核心能力是：
-
-- 与 LLM（大语言模型）对话，接收用户的自然语言编程任务
-- 调用 **工具（Tools）** 来读写文件、执行命令、搜索代码等
-- 通过 **计划（Plan）** 系统将复杂任务拆解为可执行步骤
-- 通过 **权限（Permission）** 系统安全地控制危险操作
-- 通过 **记忆（Memory）** 和 **技能（Skills）** 系统从对话中学习
-- 支持 **MCP 协议** 扩展外部工具
-- 支持 **多 Agent 协作**（子代理、团队）
-
-**核心设计理念**: 单进程、事件驱动、权限可控、渐进式学习。
-
----
-
-## 2. 技术栈与依赖
-
+## 2. 鎶€鏈爤涓庝緷璧?
 ```
-语言:          Go 1.22+
-HTTP 客户端:   net/http（标准库）
-终端 UI:       ANSI 转义序列 + 自定义 readline
-数据存储:      内存 + JSON 文件持久化（未来可能扩展 SQLite）
-AI API:        Anthropic API（主）/ OpenAI 兼容 API
-测试:          Go 标准 testing 包
-```
+璇█:          Go 1.22+
+HTTP 瀹㈡埛绔?   net/http锛堟爣鍑嗗簱锛?缁堢 UI:       ANSI 杞箟搴忓垪 + 鑷畾涔?readline
+鏁版嵁瀛樺偍:      鍐呭瓨 + JSON 鏂囦欢鎸佷箙鍖栵紙鏈潵鍙兘鎵╁睍 SQLite锛?AI API:        Anthropic API锛堜富锛? OpenAI 鍏煎 API
+娴嬭瘯:          Go 鏍囧噯 testing 鍖?```
 
-**核心依赖（来自 go.mod）**:
-- `github.com/liuzhixin405/cove` — 模块根路径
-- Go 标准库为主，外部依赖极少（设计原则：最小依赖）
+**鏍稿績渚濊禆锛堟潵鑷?go.mod锛?*:
+- `github.com/liuzhixin405/cove` 鈥?妯″潡鏍硅矾寰?- Go 鏍囧噯搴撲负涓伙紝澶栭儴渚濊禆鏋佸皯锛堣璁″師鍒欙細鏈€灏忎緷璧栵級
 
 ---
 
-## 3. 目录结构总览
+## 3. 鐩綍缁撴瀯鎬昏
 
 ```
 cove/agent/
-├── go.mod                          # Go 模块定义
-├── go.sum                          # 依赖校验
-├── README.md                       # 项目说明
-├── CHANGELOG.md                    # 版本变更日志
-├── DEVELOPMENT_GUIDE.md            # 本文档
-│
-├── cli/                            # 命令行入口
-│   └── cove/
-│       ├── main.go                 # 程序入口（949行，核心启动逻辑）
-│       ├── app_bootstrap.go        # 应用启动引导（196行）
-│       ├── repl_tui.go             # runTUI() + useTUI() + 队列桥接（853行）
-│       ├── repl_loop.go            # runREPL() fallback 模式（623行）
-│       ├── chat_interaction.go     # 单次交互处理（151行）
-│       └── registry.go             # 工具注册（102行）
-│
-├── internal/                       # 内部包（核心实现）
-│   ├── tui/                        # ★ 全屏 TUI（当前默认交互模式）
-│   │   ├── tui.go                  # Bubble Tea 模型（814行）
-│   │   ├── app.go                  # 程序包装器 + Bridge Helpers（79行）
-│   │   └── styles.go               # 样式 & 布局渲染（363行）
-│   │
-│   ├── api/                        # AI API 抽象层
-│   │   ├── provider.go             # 统一 Provider 接口
-│   │   ├── provider_catalog.go     # 内置 Provider 目录
-│   │   ├── anthropic.go            # Anthropic API 实现
-│   │   ├── openai_compat.go        # OpenAI 兼容 API 实现
-│   │   ├── keypool.go              # API Key 池（轮转、故障转移）
-│   │   ├── ratelimit.go            # 速率限制追踪
-│   │   ├── retry.go                # 指数退避重试
-│   │   └── prompt_cache.go         # Prompt 缓存策略
-│   │
-│   ├── engine/                     # 核心引擎
-│   │   ├── engine.go               # 引擎主逻辑（1518行）
-│   │   ├── activity.go             # 活动追踪 & 卡顿检测
-│   │   ├── review.go               # 后台对话回顾 & 自动学习
-│   │   └── engine_test.go          # 引擎测试（1076行）
-│   │
-│   ├── tool/                       # 工具系统
-│   │   ├── tool.go                 # 工具接口定义
-│   │   ├── registry.go             # 工具注册表
-│   │   ├── bash.go                 # Shell 命令执行
-│   │   ├── read.go                 # 文件读取
-│   │   ├── write.go                # 文件写入
-│   │   ├── edit.go                 # 文件精确编辑
-│   │   ├── grep.go                 # 内容搜索（ripgrep）
-│   │   ├── glob.go                 # 文件名匹配搜索
-│   │   ├── webfetch.go             # 网页抓取
-│   │   ├── powershell.go           # PowerShell 执行（Windows）
-│   │   ├── advanced_tools_task_core.go    # 高级工具：任务、Agent 子进程
-│   │   ├── advanced_tools_agent_skill.go  # 高级工具：技能调用
-│   │   └── advanced_tools_plan_worktree.go # 高级工具：计划、工作树
-│   │
-│   ├── plan/                       # 计划系统
-│   │   ├── plan.go                 # 计划数据结构 & 解析
-│   │   └── executor.go             # 计划执行器
-│   │
-│   ├── permission/                 # 权限系统
-│   │   ├── permission.go           # 权限模式 & 决策
-│   │   └── classifier.go           # 工具分类器（自动判断危险等级）
-│   │
-│   ├── session/                    # 会话持久化
-│   │   ├── store.go                # 会话存储（文件 + JSON）
-│   │   └── store_test.go           # 存储测试
-│   │
-│   ├── memory/                     # 记忆系统
-│   │   ├── store.go                # 记忆存储（BM25 + 向量）
-│   │   ├── bm25.go                 # BM25 关键词检索
-│   │   └── embed.go                # 伪嵌入 & 向量存储
-│   │
-│   ├── skills/                     # 技能系统
-│   │   ├── skills.go               # 技能注册 & 加载
-│   │   └── skills_test.go          # 技能测试
-│   │
-│   ├── mcp/                        # MCP 协议集成
-│   │   ├── pool.go                 # MCP 连接池
-│   │   └── client.go               # MCP 客户端
-│   │
-│   ├── browser/                    # 网页浏览器
-│   │   └── browser.go              # HTTP 抓取 + HTML→文本转换
-│   │
-│   ├── repl/                       # 终端交互
-│   │   ├── color.go                # ANSI 颜色工具
-│   │   └── readline.go             # 自定义行编辑器
-│   │
-│   ├── context/                    # 项目上下文
-│   │   └── context.go              # 项目文件分析
-│   │
-│   ├── repomap/                    # 仓库地图
-│   │   └── repomap.go              # 代码库结构分析
-│   │
-│   ├── config/                     # 配置管理
-│   │   └── config.go               # 配置加载 & 验证
-│   │
-│   ├── log/                        # 日志系统
-│   │   └── logger.go               # 分级日志 + 错误汇流
-│   │
-│   ├── cost/                       # 成本追踪
-│   │   └── tracker.go              # Token 费用计算
-│   │
-│   ├── token/                      # Token 估算
-│   │   └── token.go                # 简单 Token 计数
-│   │
-│   ├── diagnostic/                 # 诊断系统
-│   │   ├── checker.go              # 系统健康检查
-│   │   ├── recorder.go             # 运行时事件记录
-│   │   ├── errors.go               # 错误定义
-│   │   └── diagnostic_test.go      # 诊断测试
-│   │
-│   ├── checkpoint/                 # 检查点系统
-│   │   └── checkpoint.go           # 文件修改前自动备份
-│   │
-│   ├── notes/                      # 笔记系统
-│   │   └── notes.go                # 会话笔记管理
-│   │
-│   ├── onboarding/                 # 新手引导
-│   │   └── onboarding.go           # 首次使用引导流程
-│   │
-│   ├── state/                      # 状态定义
-│   │   └── state.go                # 应用状态枚举
-│   │
-│   ├── plugin/                     # 插件系统
-│   │   └── plugin.go               # 插件加载 & 管理
-│   │
-│   ├── hooks/                      # 钩子系统
-│   │   └── hooks.go                # 生命周期钩子
-│   │
-│   ├── guardrail/                  # 安全护栏
-│   │   └── guardrail.go            # 输入/输出安全检查
-│   │
-│   ├── delegate/                   # 代理机制
-│   │   └── delegate.go             # 任务委托
-│   │
-│   ├── extract/                    # 内容提取
-│   │   └── extract.go              # 从对话中提取结构化数据
-│   │
-│   └── dream/                      # 梦想（反思）系统
-│       └── dream.go                # Agent 自我反思
-│
-├── testdata/                       # 测试数据
-│   └── ...
-│
-└── scripts/                        # 辅助脚本
-    └── ...
+鈹溾攢鈹€ go.mod                          # Go 妯″潡瀹氫箟
+鈹溾攢鈹€ go.sum                          # 渚濊禆鏍￠獙
+鈹溾攢鈹€ README.md                       # 椤圭洰璇存槑
+鈹溾攢鈹€ CHANGELOG.md                    # 鐗堟湰鍙樻洿鏃ュ織
+鈹溾攢鈹€ DEVELOPMENT_GUIDE.md            # 鏈枃妗?鈹?鈹溾攢鈹€ cli/                            # 鍛戒护琛屽叆鍙?鈹?  鈹斺攢鈹€ cove/
+鈹?      鈹溾攢鈹€ main.go                 # 绋嬪簭鍏ュ彛锛?49琛岋紝鏍稿績鍚姩閫昏緫锛?鈹?      鈹溾攢鈹€ app_bootstrap.go        # 搴旂敤鍚姩寮曞锛?96琛岋級
+鈹?      鈹溾攢鈹€ repl_tui.go             # runTUI() + useTUI() + 闃熷垪妗ユ帴锛?53琛岋級
+鈹?      鈹溾攢鈹€ repl_loop.go            # runREPL() fallback 妯″紡锛?23琛岋級
+鈹?      鈹溾攢鈹€ chat_interaction.go     # 鍗曟浜や簰澶勭悊锛?51琛岋級
+鈹?      鈹斺攢鈹€ registry.go             # 宸ュ叿娉ㄥ唽锛?02琛岋級
+鈹?鈹溾攢鈹€ internal/                       # 鍐呴儴鍖咃紙鏍稿績瀹炵幇锛?鈹?  鈹溾攢鈹€ tui/                        # 鈽?鍏ㄥ睆 TUI锛堝綋鍓嶉粯璁や氦浜掓ā寮忥級
+鈹?  鈹?  鈹溾攢鈹€ tui.go                  # Bubble Tea 妯″瀷锛?14琛岋級
+鈹?  鈹?  鈹溾攢鈹€ app.go                  # 绋嬪簭鍖呰鍣?+ Bridge Helpers锛?9琛岋級
+鈹?  鈹?  鈹斺攢鈹€ styles.go               # 鏍峰紡 & 甯冨眬娓叉煋锛?63琛岋級
+鈹?  鈹?  鈹斺攢鈹€ theme/                  # 主题系统（5套内置主题，20+语义化颜色令牌）
+鈹?  鈹?鈹?  鈹溾攢鈹€ api/                        # AI API 鎶借薄灞?鈹?  鈹?  鈹溾攢鈹€ provider.go             # 缁熶竴 Provider 鎺ュ彛
+鈹?  鈹?  鈹溾攢鈹€ provider_catalog.go     # 鍐呯疆 Provider 鐩綍
+鈹?  鈹?  鈹溾攢鈹€ anthropic.go            # Anthropic API 瀹炵幇
+鈹?  鈹?  鈹溾攢鈹€ openai_compat.go        # OpenAI 鍏煎 API 瀹炵幇
+鈹?  鈹?  鈹溾攢鈹€ keypool.go              # API Key 姹狅紙杞浆銆佹晠闅滆浆绉伙級
+鈹?  鈹?  鈹溾攢鈹€ ratelimit.go            # 閫熺巼闄愬埗杩借釜
+鈹?  鈹?  鈹溾攢鈹€ retry.go                # 鎸囨暟閫€閬块噸璇?鈹?  鈹?  鈹斺攢鈹€ prompt_cache.go         # Prompt 缂撳瓨绛栫暐
+鈹?  鈹?鈹?  鈹溾攢鈹€ engine/                     # 鏍稿績寮曟搸
+鈹?  鈹?  鈹溾攢鈹€ engine.go               # 寮曟搸涓婚€昏緫锛?518琛岋級
+鈹?  鈹?  鈹溾攢鈹€ activity.go             # 娲诲姩杩借釜 & 鍗￠】妫€娴?鈹?  鈹?  鈹溾攢鈹€ review.go               # 鍚庡彴瀵硅瘽鍥為【 & 鑷姩瀛︿範
+鈹?  鈹?  鈹斺攢鈹€ engine_test.go          # 寮曟搸娴嬭瘯锛?076琛岋級
+鈹?  鈹?鈹?  鈹溾攢鈹€ tool/                       # 宸ュ叿绯荤粺
+鈹?  鈹?  鈹溾攢鈹€ tool.go                 # 宸ュ叿鎺ュ彛瀹氫箟
+鈹?  鈹?  鈹溾攢鈹€ registry.go             # 宸ュ叿娉ㄥ唽琛?鈹?  鈹?  鈹溾攢鈹€ bash.go                 # Shell 鍛戒护鎵ц
+鈹?  鈹?  鈹溾攢鈹€ read.go                 # 鏂囦欢璇诲彇
+鈹?  鈹?  鈹溾攢鈹€ write.go                # 鏂囦欢鍐欏叆
+鈹?  鈹?  鈹溾攢鈹€ edit.go                 # 鏂囦欢绮剧‘缂栬緫
+鈹?  鈹?  鈹溾攢鈹€ grep.go                 # 鍐呭鎼滅储锛坮ipgrep锛?鈹?  鈹?  鈹溾攢鈹€ glob.go                 # 鏂囦欢鍚嶅尮閰嶆悳绱?鈹?  鈹?  鈹溾攢鈹€ webfetch.go             # 缃戦〉鎶撳彇
+鈹?  鈹?  鈹溾攢鈹€ powershell.go           # PowerShell 鎵ц锛圵indows锛?鈹?  鈹?  鈹溾攢鈹€ advanced_tools_task_core.go    # 楂樼骇宸ュ叿锛氫换鍔°€丄gent 瀛愯繘绋?鈹?  鈹?  鈹溾攢鈹€ advanced_tools_agent_skill.go  # 楂樼骇宸ュ叿锛氭妧鑳借皟鐢?鈹?  鈹?  鈹斺攢鈹€ advanced_tools_plan_worktree.go # 楂樼骇宸ュ叿锛氳鍒掋€佸伐浣滄爲
+鈹?  鈹?鈹?  鈹溾攢鈹€ plan/                       # 璁″垝绯荤粺
+鈹?  鈹?  鈹溾攢鈹€ plan.go                 # 璁″垝鏁版嵁缁撴瀯 & 瑙ｆ瀽
+鈹?  鈹?  鈹斺攢鈹€ executor.go             # 璁″垝鎵ц鍣?鈹?  鈹?鈹?  鈹溾攢鈹€ permission/                 # 鏉冮檺绯荤粺
+鈹?  鈹?  鈹溾攢鈹€ permission.go           # 鏉冮檺妯″紡 & 鍐崇瓥
+鈹?  鈹?  鈹斺攢鈹€ classifier.go           # 宸ュ叿鍒嗙被鍣紙鑷姩鍒ゆ柇鍗遍櫓绛夌骇锛?鈹?  鈹?鈹?  鈹溾攢鈹€ session/                    # 浼氳瘽鎸佷箙鍖?鈹?  鈹?  鈹溾攢鈹€ store.go                # 浼氳瘽瀛樺偍锛堟枃浠?+ JSON锛?鈹?  鈹?  鈹斺攢鈹€ store_test.go           # 瀛樺偍娴嬭瘯
+鈹?  鈹?鈹?  鈹溾攢鈹€ memory/                     # 璁板繂绯荤粺
+鈹?  鈹?  鈹溾攢鈹€ store.go                # 璁板繂瀛樺偍锛圔M25 + 鍚戦噺锛?鈹?  鈹?  鈹溾攢鈹€ bm25.go                 # BM25 鍏抽敭璇嶆绱?鈹?  鈹?  鈹斺攢鈹€ embed.go                # 浼祵鍏?& 鍚戦噺瀛樺偍
+鈹?  鈹?鈹?  鈹溾攢鈹€ skills/                     # 鎶€鑳界郴缁?鈹?  鈹?  鈹溾攢鈹€ skills.go               # 鎶€鑳芥敞鍐?& 鍔犺浇
+鈹?  鈹?  鈹斺攢鈹€ skills_test.go          # 鎶€鑳芥祴璇?鈹?  鈹?鈹?  鈹溾攢鈹€ mcp/                        # MCP 鍗忚闆嗘垚
+鈹?  鈹?  鈹溾攢鈹€ pool.go                 # MCP 杩炴帴姹?鈹?  鈹?  鈹斺攢鈹€ client.go               # MCP 瀹㈡埛绔?鈹?  鈹?鈹?  鈹溾攢鈹€ browser/                    # 缃戦〉娴忚鍣?鈹?  鈹?  鈹斺攢鈹€ browser.go              # HTTP 鎶撳彇 + HTML鈫掓枃鏈浆鎹?鈹?  鈹?鈹?  鈹溾攢鈹€ repl/                       # 缁堢浜や簰
+鈹?  鈹?  鈹溾攢鈹€ color.go                # ANSI 棰滆壊宸ュ叿
+鈹?  鈹?  鈹斺攢鈹€ readline.go             # 鑷畾涔夎缂栬緫鍣?鈹?  鈹?鈹?  鈹溾攢鈹€ context/                    # 椤圭洰涓婁笅鏂?鈹?  鈹?  鈹斺攢鈹€ context.go              # 椤圭洰鏂囦欢鍒嗘瀽
+鈹?  鈹?鈹?  鈹溾攢鈹€ repomap/                    # 浠撳簱鍦板浘
+鈹?  鈹?  鈹斺攢鈹€ repomap.go              # 浠ｇ爜搴撶粨鏋勫垎鏋?鈹?  鈹?鈹?  鈹溾攢鈹€ config/                     # 閰嶇疆绠＄悊
+鈹?  鈹?  鈹斺攢鈹€ config.go               # 閰嶇疆鍔犺浇 & 楠岃瘉
+鈹?  鈹?鈹?  鈹溾攢鈹€ log/                        # 鏃ュ織绯荤粺
+鈹?  鈹?  鈹斺攢鈹€ logger.go               # 鍒嗙骇鏃ュ織 + 閿欒姹囨祦
+鈹?  鈹?鈹?  鈹溾攢鈹€ cost/                       # 鎴愭湰杩借釜
+鈹?  鈹?  鈹斺攢鈹€ tracker.go              # Token 璐圭敤璁＄畻
+鈹?  鈹?鈹?  鈹溾攢鈹€ token/                      # Token 浼扮畻
+鈹?  鈹?  鈹斺攢鈹€ token.go                # 绠€鍗?Token 璁℃暟
+鈹?  鈹?鈹?  鈹溾攢鈹€ diagnostic/                 # 璇婃柇绯荤粺
+鈹?  鈹?  鈹溾攢鈹€ checker.go              # 绯荤粺鍋ュ悍妫€鏌?鈹?  鈹?  鈹溾攢鈹€ recorder.go             # 杩愯鏃朵簨浠惰褰?鈹?  鈹?  鈹溾攢鈹€ errors.go               # 閿欒瀹氫箟
+鈹?  鈹?  鈹斺攢鈹€ diagnostic_test.go      # 璇婃柇娴嬭瘯
+鈹?  鈹?鈹?  鈹溾攢鈹€ checkpoint/                 # 妫€鏌ョ偣绯荤粺
+鈹?  鈹?  鈹斺攢鈹€ checkpoint.go           # 鏂囦欢淇敼鍓嶈嚜鍔ㄥ浠?鈹?  鈹?鈹?  鈹溾攢鈹€ notes/                      # 绗旇绯荤粺
+鈹?  鈹?  鈹斺攢鈹€ notes.go                # 浼氳瘽绗旇绠＄悊
+鈹?  鈹?鈹?  鈹溾攢鈹€ onboarding/                 # 鏂版墜寮曞
+鈹?  鈹?  鈹斺攢鈹€ onboarding.go           # 棣栨浣跨敤寮曞娴佺▼
+鈹?  鈹?鈹?  鈹溾攢鈹€ state/                      # 鐘舵€佸畾涔?鈹?  鈹?  鈹斺攢鈹€ state.go                # 搴旂敤鐘舵€佹灇涓?鈹?  鈹?鈹?  鈹溾攢鈹€ plugin/                     # 鎻掍欢绯荤粺
+鈹?  鈹?  鈹斺攢鈹€ plugin.go               # 鎻掍欢鍔犺浇 & 绠＄悊
+鈹?  鈹?鈹?  鈹溾攢鈹€ hooks/                      # 閽╁瓙绯荤粺
+鈹?  鈹?  鈹斺攢鈹€ hooks.go                # 鐢熷懡鍛ㄦ湡閽╁瓙
+鈹?  鈹?鈹?  鈹溾攢鈹€ guardrail/                  # 瀹夊叏鎶ゆ爮
+鈹?  鈹?  鈹斺攢鈹€ guardrail.go            # 杈撳叆/杈撳嚭瀹夊叏妫€鏌?鈹?  鈹?鈹?  鈹溾攢鈹€ delegate/                   # 浠ｇ悊鏈哄埗
+鈹?  鈹?  鈹斺攢鈹€ delegate.go             # 浠诲姟濮旀墭
+鈹?  鈹?鈹?  鈹溾攢鈹€ extract/                    # 鍐呭鎻愬彇
+鈹?  鈹?  鈹斺攢鈹€ extract.go              # 浠庡璇濅腑鎻愬彇缁撴瀯鍖栨暟鎹?鈹?  鈹?鈹?  鈹斺攢鈹€ dream/                      # 姊︽兂锛堝弽鎬濓級绯荤粺
+鈹?      鈹斺攢鈹€ dream.go                # Agent 鑷垜鍙嶆€?鈹?鈹溾攢鈹€ testdata/                       # 娴嬭瘯鏁版嵁
+鈹?  鈹斺攢鈹€ ...
+鈹?鈹斺攢鈹€ scripts/                        # 杈呭姪鑴氭湰
+    鈹斺攢鈹€ ...
 ```
 
 ---
 
-## 4. 核心架构设计
+## 4. 鏍稿績鏋舵瀯璁捐
 
-### 4.1 整体架构图
-
+### 4.1 鏁翠綋鏋舵瀯鍥?
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    CLI Entry (main.go)                    │
-│  - 解析参数、加载配置、初始化所有子系统                      │
-│  - 调用 useTUI() 判断交互模式                              │
-└───────┬───────────────────────────────┬─────────────────┘
-        │ TUI (默认)                     │ REPL (fallback)
-        ▼                               ▼
-┌───────────────────┐   ┌─────────────────────────────────┐
-│ runTUI()          │   │ runREPL()                       │
-│ (repl_tui.go)     │   │ (repl_loop.go)                  │
-│ - Bubble Tea 全屏 │   │ - 行式 ANSI 转义序列             │
-│ - 结构化 turn     │   │ - readline 自定义编辑器          │
-│ - 覆盖层/鼠标     │   │ - 仅管道/--no-tui/              │
-│ - Bridge Helpers  │   │   COVE_TUI=0 时触发             │
-└───────┬───────────┘   └────────┬────────────────────────┘
-        │                        │
-        └────────┬───────────────┘
-                 │
-┌────────────────▼────────────────────────────────────────┐
-│                  Engine (engine.go)                       │
-│  - 核心编排器：管理消息历史，调用 AI，执行工具               │
-│  - 通过回调 onDelta/onReasoning/onEngineOutput 推送输出    │
-│  - TUI 通过 App.Send* bridge, REPL 直接 fmt.Print         │
-└───────┬───────┬───────┬───────┬─────────┬──────────────┘
-        │       │       │       │         │
-   ┌────▼──┐ ┌─▼──┐ ┌──▼──┐ ┌─▼───┐ ┌───▼──────┐
-   │ API   │ │Tool│ │Plan │ │Perm │ │ Memory/  │
-   │ Layer │ │Sys │ │Exec │ │Check│ │ Skills   │
-   └───────┘ └────┘ └─────┘ └─────┘ └──────────┘
-```
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                   CLI Entry (main.go)                    鈹?鈹? - 瑙ｆ瀽鍙傛暟銆佸姞杞介厤缃€佸垵濮嬪寲鎵€鏈夊瓙绯荤粺                      鈹?鈹? - 璋冪敤 useTUI() 鍒ゆ柇浜や簰妯″紡                              鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?        鈹?TUI (榛樿)                     鈹?REPL (fallback)
+        鈻?                              鈻?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?runTUI()          鈹?  鈹?runREPL()                       鈹?鈹?(repl_tui.go)     鈹?  鈹?(repl_loop.go)                  鈹?鈹?- Bubble Tea 鍏ㄥ睆 鈹?  鈹?- 琛屽紡 ANSI 杞箟搴忓垪             鈹?鈹?- 缁撴瀯鍖?turn     鈹?  鈹?- readline 鑷畾涔夌紪杈戝櫒          鈹?鈹?- 瑕嗙洊灞?榧犳爣     鈹?  鈹?- 浠呯閬?--no-tui/              鈹?鈹?- Bridge Helpers  鈹?  鈹?  COVE_TUI=0 鏃惰Е鍙?            鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?        鈹?                       鈹?        鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?                 鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈻尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                 Engine (engine.go)                       鈹?鈹? - 鏍稿績缂栨帓鍣細绠＄悊娑堟伅鍘嗗彶锛岃皟鐢?AI锛屾墽琛屽伐鍏?              鈹?鈹? - 閫氳繃鍥炶皟 onDelta/onReasoning/onEngineOutput 鎺ㄩ€佽緭鍑?   鈹?鈹? - TUI 閫氳繃 App.Send* bridge, REPL 鐩存帴 fmt.Print         鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?        鈹?      鈹?      鈹?      鈹?        鈹?   鈹屸攢鈹€鈹€鈹€鈻尖攢鈹€鈹?鈹屸攢鈻尖攢鈹€鈹?鈹屸攢鈹€鈻尖攢鈹€鈹?鈹屸攢鈻尖攢鈹€鈹€鈹?鈹屸攢鈹€鈹€鈻尖攢鈹€鈹€鈹€鈹€鈹€鈹?   鈹?API   鈹?鈹俆ool鈹?鈹侾lan 鈹?鈹侾erm 鈹?鈹?Memory/  鈹?   鈹?Layer 鈹?鈹係ys 鈹?鈹侲xec 鈹?鈹侰heck鈹?鈹?Skills   鈹?   鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?```
 
-### 4.2 核心设计原则
+### 4.2 鏍稿績璁捐鍘熷垯
 
-1. **单一入口**: 整个程序只有一个 `main.go`，所有初始化在 `app_bootstrap.go` 中完成
-2. **接口抽象**: API Provider、Tool、Memory 等核心组件都定义了接口，便于扩展
-3. **关注分离**: 每个 `internal/` 子包职责单一，通过 Engine 协调
-4. **安全第一**: 权限系统对所有写操作进行拦截，默认需要用户确认
-5. **优雅降级**: 当某个子系统不可用时（如 MCP 服务器未启动），不影响核心功能
-
+1. **鍗曚竴鍏ュ彛**: 鏁翠釜绋嬪簭鍙湁涓€涓?`main.go`锛屾墍鏈夊垵濮嬪寲鍦?`app_bootstrap.go` 涓畬鎴?2. **鎺ュ彛鎶借薄**: API Provider銆乀ool銆丮emory 绛夋牳蹇冪粍浠堕兘瀹氫箟浜嗘帴鍙ｏ紝渚夸簬鎵╁睍
+3. **鍏虫敞鍒嗙**: 姣忎釜 `internal/` 瀛愬寘鑱岃矗鍗曚竴锛岄€氳繃 Engine 鍗忚皟
+4. **瀹夊叏绗竴**: 鏉冮檺绯荤粺瀵规墍鏈夊啓鎿嶄綔杩涜鎷︽埅锛岄粯璁ら渶瑕佺敤鎴风‘璁?5. **浼橀泤闄嶇骇**: 褰撴煇涓瓙绯荤粺涓嶅彲鐢ㄦ椂锛堝 MCP 鏈嶅姟鍣ㄦ湭鍚姩锛夛紝涓嶅奖鍝嶆牳蹇冨姛鑳?
 ---
 
-## 5. 模块详解
+## 5. 妯″潡璇﹁В
 
-### 5.1 CLI 入口层
+### 5.1 CLI 鍏ュ彛灞?
+#### 5.1.1 main.go - 绋嬪簭鍏ュ彛
 
-#### 5.1.1 main.go - 程序入口
+**鏂囦欢**: `cli/cove/main.go`锛?49 琛岋級
 
-**文件**: `cli/cove/main.go`（949 行）
-
-**核心流程**:
+**鏍稿績娴佺▼**:
 
 ```go
 func main() {
-    // 1. 解析命令行参数
-    // 2. 加载配置文件（~/.cove/config.json 或环境变量）
-    // 3. 创建 API Provider（Anthropic 或 OpenAI 兼容）
-    // 4. 初始化 Engine（引擎是核心编排器）
-    // 5. 注册内置工具（bash, read, write, edit, grep, glob, webfetch, ...）
-    // 6. 初始化 MCP 连接池（如果有配置 MCP 服务器）
-    // 7. 加载 Memory、Skills、Session
-    // 8. 设置权限模式
-    // 9. 启动 REPL 交互循环
-    // 10. 应用退出时保存状态
-}
+    // 1. 瑙ｆ瀽鍛戒护琛屽弬鏁?    // 2. 鍔犺浇閰嶇疆鏂囦欢锛垀/.cove/config.json 鎴栫幆澧冨彉閲忥級
+    // 3. 鍒涘缓 API Provider锛圓nthropic 鎴?OpenAI 鍏煎锛?    // 4. 鍒濆鍖?Engine锛堝紩鎿庢槸鏍稿績缂栨帓鍣級
+    // 5. 娉ㄥ唽鍐呯疆宸ュ叿锛坆ash, read, write, edit, grep, glob, webfetch, ...锛?    // 6. 鍒濆鍖?MCP 杩炴帴姹狅紙濡傛灉鏈夐厤缃?MCP 鏈嶅姟鍣級
+    // 7. 鍔犺浇 Memory銆丼kills銆丼ession
+    // 8. 璁剧疆鏉冮檺妯″紡
+    // 9. 鍚姩 REPL 浜や簰寰幆
+    // 10. 搴旂敤閫€鍑烘椂淇濆瓨鐘舵€?}
 ```
 
-**关键启动步骤**:
+**鍏抽敭鍚姩姝ラ**:
 
-1. **配置解析**: 从 `~/.cove/config.json` 读取，优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
-2. **Provider 创建**: 根据 `provider.name` 选择 Anthropic 或 OpenAI 兼容，支持多 Key 轮转
-3. **Engine 初始化**: `engine.New(cfg)` 创建核心引擎实例
-4. **工具注册**: 通过 `registry.go` 将所有内置工具注册到 Engine
-5. **MCP 启动**: 异步连接所有配置的 MCP 服务器，将其工具注册到 Engine
-6. **REPL 启动**: 进入无限循环，读用户输入 → Engine 处理 → 输出响应
+1. **閰嶇疆瑙ｆ瀽**: 浠?`~/.cove/config.json` 璇诲彇锛屼紭鍏堢骇锛氬懡浠よ鍙傛暟 > 鐜鍙橀噺 > 閰嶇疆鏂囦欢 > 榛樿鍊?2. **Provider 鍒涘缓**: 鏍规嵁 `provider.name` 閫夋嫨 Anthropic 鎴?OpenAI 鍏煎锛屾敮鎸佸 Key 杞浆
+3. **Engine 鍒濆鍖?*: `engine.New(cfg)` 鍒涘缓鏍稿績寮曟搸瀹炰緥
+4. **宸ュ叿娉ㄥ唽**: 閫氳繃 `registry.go` 灏嗘墍鏈夊唴缃伐鍏锋敞鍐屽埌 Engine
+5. **MCP 鍚姩**: 寮傛杩炴帴鎵€鏈夐厤缃殑 MCP 鏈嶅姟鍣紝灏嗗叾宸ュ叿娉ㄥ唽鍒?Engine
+6. **REPL 鍚姩**: 杩涘叆鏃犻檺寰幆锛岃鐢ㄦ埛杈撳叆 鈫?Engine 澶勭悊 鈫?杈撳嚭鍝嶅簲
 
-#### 5.1.2 app_bootstrap.go - 启动引导
+#### 5.1.2 app_bootstrap.go - 鍚姩寮曞
 
-**文件**: `cli/cove/app_bootstrap.go`（196 行）
+**鏂囦欢**: `cli/cove/app_bootstrap.go`锛?96 琛岋級
 
-负责将 `main.go` 中的初始化逻辑模块化：
+璐熻矗灏?`main.go` 涓殑鍒濆鍖栭€昏緫妯″潡鍖栵細
 
-- `bootstrapConfig()`: 加载并验证配置
-- `bootstrapAPI()`: 创建 API Provider（含 Key 池）
-- `bootstrapTools()`: 注册所有工具
-- `bootstrapMCP()`: 初始化 MCP 连接
-- `bootstrapMemory()`: 加载记忆系统
-- `bootstrapSkills()`: 加载技能系统
+- `bootstrapConfig()`: 鍔犺浇骞堕獙璇侀厤缃?- `bootstrapAPI()`: 鍒涘缓 API Provider锛堝惈 Key 姹狅級
+- `bootstrapTools()`: 娉ㄥ唽鎵€鏈夊伐鍏?- `bootstrapMCP()`: 鍒濆鍖?MCP 杩炴帴
+- `bootstrapMemory()`: 鍔犺浇璁板繂绯荤粺
+- `bootstrapSkills()`: 鍔犺浇鎶€鑳界郴缁?
+#### 5.1.3 repl_loop.go - REPL 涓诲惊鐜?
+**鏂囦欢**: `cli/cove/repl_loop.go`锛?23 琛岋級
 
-#### 5.1.3 repl_loop.go - REPL 主循环
+**鏍稿績鑱岃矗**:
+- 鏄剧ず鎻愮ず绗?`> `
+- 鏀寔澶氳杈撳叆锛堜互 `\` 缁撳熬缁锛?- 澶勭悊鐗规畩鍛戒护锛坄/help`, `/exit`, `/clear`, `/undo` 绛夛級
+- 璋冪敤 `chat_interaction.go` 澶勭悊鍗曟瀵硅瘽
+- 绠＄悊涓婁笅鏂囩獥鍙ｏ紙鑷姩鍘嬬缉杩囬暱鍘嗗彶锛?- 澶勭悊 Ctrl+C 涓柇
 
-**文件**: `cli/cove/repl_loop.go`（623 行）
-
-**核心职责**:
-- 显示提示符 `> `
-- 支持多行输入（以 `\` 结尾续行）
-- 处理特殊命令（`/help`, `/exit`, `/clear`, `/undo` 等）
-- 调用 `chat_interaction.go` 处理单次对话
-- 管理上下文窗口（自动压缩过长历史）
-- 处理 Ctrl+C 中断
-
-**关键常量**:
+**鍏抽敭甯搁噺**:
 ```go
-const maxContextMessages = 200  // 最大消息数
-const maxContextTokens  = 90000 // 最大 Token 数
-```
+const maxContextMessages = 200  // 鏈€澶ф秷鎭暟
+const maxContextTokens  = 90000 // 鏈€澶?Token 鏁?```
 
-**上下文窗口管理策略**:
-当消息历史超过限制时，保留 `system` 消息 + 最早的 5 条 + 最近的 N 条，中间部分压缩为摘要。
+**涓婁笅鏂囩獥鍙ｇ鐞嗙瓥鐣?*:
+褰撴秷鎭巻鍙茶秴杩囬檺鍒舵椂锛屼繚鐣?`system` 娑堟伅 + 鏈€鏃╃殑 5 鏉?+ 鏈€杩戠殑 N 鏉★紝涓棿閮ㄥ垎鍘嬬缉涓烘憳瑕併€?
+#### 5.1.4 chat_interaction.go - 鍗曟浜や簰
 
-#### 5.1.4 chat_interaction.go - 单次交互
+**鏂囦欢**: `cli/cove/chat_interaction.go`锛?51 琛岋級
 
-**文件**: `cli/cove/chat_interaction.go`（151 行）
-
-封装单次用户消息的处理流程：
+灏佽鍗曟鐢ㄦ埛娑堟伅鐨勫鐞嗘祦绋嬶細
 
 ```go
 func chatInteraction(eng *engine.Engine, userInput string, ...) {
-    // 1. 构建用户消息
-    // 2. 调用 eng.RunMessageWithStream() 流式获取响应
-    // 3. 实时输出 delta（AI 逐字输出效果）
-    // 4. 处理工具调用、权限请求
-    // 5. 返回最终响应文本
-}
+    // 1. 鏋勫缓鐢ㄦ埛娑堟伅
+    // 2. 璋冪敤 eng.RunMessageWithStream() 娴佸紡鑾峰彇鍝嶅簲
+    // 3. 瀹炴椂杈撳嚭 delta锛圓I 閫愬瓧杈撳嚭鏁堟灉锛?    // 4. 澶勭悊宸ュ叿璋冪敤銆佹潈闄愯姹?    // 5. 杩斿洖鏈€缁堝搷搴旀枃鏈?}
 ```
 
 ---
 
-### 5.2 Engine 引擎层
+### 5.2 Engine 寮曟搸灞?
+**鏂囦欢**: `internal/engine/engine.go`锛?518 琛岋級
 
-**文件**: `internal/engine/engine.go`（1518 行）
-
-Engine 是项目最核心的模块，是所有子系统的**编排中心**。
-
-#### 5.2.1 Engine 结构体
-
+Engine 鏄」鐩渶鏍稿績鐨勬ā鍧楋紝鏄墍鏈夊瓙绯荤粺鐨?*缂栨帓涓績**銆?
+#### 5.2.1 Engine 缁撴瀯浣?
 ```go
 type Engine struct {
-    config    Config          // 引擎配置
-    provider  api.Provider    // AI Provider 接口
-    messages  []api.Message   // 当前对话历史
-    tools     []tool.Tool     // 已注册工具列表
-    toolReg   *tool.Registry   // 工具注册表
-
-    // 权限
+    config    Config          // 寮曟搸閰嶇疆
+    provider  api.Provider    // AI Provider 鎺ュ彛
+    messages  []api.Message   // 褰撳墠瀵硅瘽鍘嗗彶
+    tools     []tool.Tool     // 宸叉敞鍐屽伐鍏峰垪琛?    toolReg   *tool.Registry   // 宸ュ叿娉ㄥ唽琛?
+    // 鏉冮檺
     perm      *permission.Checker
     PermissionPrompt func(toolName string, input map[string]any, reason string) bool
 
-    // 计划系统
+    // 璁″垝绯荤粺
     plan      *plan.Plan
     planExec  *plan.Executor
 
-    // 记忆 & 技能
-    memStore  *memory.Store
+    // 璁板繂 & 鎶€鑳?    memStore  *memory.Store
     skillMgr  *skills.Manager
 
-    // 会话
+    // 浼氳瘽
     sessionStore *session.Store
 
     // MCP
     mcpPool   *mcp.Pool
 
-    // 成本追踪
+    // 鎴愭湰杩借釜
     costTracker *cost.Tracker
 
-    // 活动监控（卡顿检测）
+    // 娲诲姩鐩戞帶锛堝崱椤挎娴嬶級
     acts      map[uint64]*activity
     actMu     sync.Mutex
     actSeq    uint64
-    // ... 更多字段
+    // ... 鏇村瀛楁
 }
 ```
 
-#### 5.2.2 核心方法: RunMessageWithStream
+#### 5.2.2 鏍稿績鏂规硶: RunMessageWithStream
 
-这是 Engine 最重要的方法，处理一条用户消息的完整生命周期：
-
+杩欐槸 Engine 鏈€閲嶈鐨勬柟娉曪紝澶勭悊涓€鏉＄敤鎴锋秷鎭殑瀹屾暣鐢熷懡鍛ㄦ湡锛?
 ```go
 func (e *Engine) RunMessageWithStream(
     ctx context.Context,
     msg api.Message,
-    onDelta func(string),       // 流式输出回调
-    interrupt <-chan struct{},    // 中断信号
+    onDelta func(string),       // 娴佸紡杈撳嚭鍥炶皟
+    interrupt <-chan struct{},    // 涓柇淇″彿
 ) (reply string, err error)
 ```
 
-**完整处理流程**:
+**瀹屾暣澶勭悊娴佺▼**:
 
 ```
-用户消息
-  │
-  ▼
-┌─────────────────────────────────────────┐
-│ 1. 添加用户消息到 e.messages              │
-├─────────────────────────────────────────┤
-│ 2. 注入系统提示（System Prompt）          │
-│    - 角色定义 + 可用工具列表               │
-│    - 记忆上下文 + 技能列表                 │
-│    - 项目上下文 + 仓库地图                 │
-├─────────────────────────────────────────┤
-│ 3. 调用 Provider.ChatStream()            │
-│    - 流式获取 AI 响应                      │
-│    - 通过 onDelta 回调实时输出             │
-│    - 监控 interrupt 通道                  │
-├─────────────────────────────────────────┤
-│ 4. 解析 AI 响应                           │
-│    ├─ 纯文本响应 → 收集到 reply            │
-│    ├─ 工具调用请求 → 进入工具执行循环       │
-│    └─ 停止原因 → 退出循环                  │
-├─────────────────────────────────────────┤
-│ 5. 【工具执行循环】                        │
-│    a. 权限检查（Permission）               │
-│    b. 并行执行所有工具调用                  │
-│    c. 收集结果，格式化后添加到消息历史       │
-│    d. 再次调用 Provider（继续对话）         │
-│    e. 检查预算、步数限制                   │
-│    f. 循环直到 AI 不再请求工具              │
-├─────────────────────────────────────────┤
-│ 6. 后处理                                 │
-│    - 更新成本                              │
-│    - 触发后台回顾（review.go）             │
-│    - 保存会话                              │
-│    - 返回最终响应                          │
-└─────────────────────────────────────────┘
+鐢ㄦ埛娑堟伅
+  鈹?  鈻?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?1. 娣诲姞鐢ㄦ埛娑堟伅鍒?e.messages              鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?2. 娉ㄥ叆绯荤粺鎻愮ず锛圫ystem Prompt锛?         鈹?鈹?   - 瑙掕壊瀹氫箟 + 鍙敤宸ュ叿鍒楄〃               鈹?鈹?   - 璁板繂涓婁笅鏂?+ 鎶€鑳藉垪琛?                鈹?鈹?   - 椤圭洰涓婁笅鏂?+ 浠撳簱鍦板浘                 鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?3. 璋冪敤 Provider.ChatStream()            鈹?鈹?   - 娴佸紡鑾峰彇 AI 鍝嶅簲                      鈹?鈹?   - 閫氳繃 onDelta 鍥炶皟瀹炴椂杈撳嚭             鈹?鈹?   - 鐩戞帶 interrupt 閫氶亾                  鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?4. 瑙ｆ瀽 AI 鍝嶅簲                           鈹?鈹?   鈹溾攢 绾枃鏈搷搴?鈫?鏀堕泦鍒?reply            鈹?鈹?   鈹溾攢 宸ュ叿璋冪敤璇锋眰 鈫?杩涘叆宸ュ叿鎵ц寰幆       鈹?鈹?   鈹斺攢 鍋滄鍘熷洜 鈫?閫€鍑哄惊鐜?                 鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?5. 銆愬伐鍏锋墽琛屽惊鐜€?                       鈹?鈹?   a. 鏉冮檺妫€鏌ワ紙Permission锛?              鈹?鈹?   b. 骞惰鎵ц鎵€鏈夊伐鍏疯皟鐢?                 鈹?鈹?   c. 鏀堕泦缁撴灉锛屾牸寮忓寲鍚庢坊鍔犲埌娑堟伅鍘嗗彶       鈹?鈹?   d. 鍐嶆璋冪敤 Provider锛堢户缁璇濓級         鈹?鈹?   e. 妫€鏌ラ绠椼€佹鏁伴檺鍒?                  鈹?鈹?   f. 寰幆鐩村埌 AI 涓嶅啀璇锋眰宸ュ叿              鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?6. 鍚庡鐞?                                鈹?鈹?   - 鏇存柊鎴愭湰                              鈹?鈹?   - 瑙﹀彂鍚庡彴鍥為【锛坮eview.go锛?            鈹?鈹?   - 淇濆瓨浼氳瘽                              鈹?鈹?   - 杩斿洖鏈€缁堝搷搴?                         鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?```
+
+#### 5.2.3 绯荤粺鎻愮ず鏋勫缓
+
+Engine 鍦ㄦ瘡娆¤皟鐢?AI 鍓嶆瀯寤虹郴缁熸彁绀猴紙System Prompt锛夛紝鍖呭惈锛?
+```
+浣犳槸 Cove锛屼竴涓?AI 缂栫▼鍔╂墜銆?浣犲彲浠ヤ娇鐢ㄤ互涓嬪伐鍏凤細
+  - bash: 鎵ц Shell 鍛戒护
+  - read: 璇诲彇鏂囦欢
+  - write: 鍐欏叆鏂囦欢
+  - ...锛堝伐鍏峰垪琛級
+
+褰撳墠椤圭洰涓婁笅鏂囷細[椤圭洰鏂囦欢鏍戞憳瑕乚
+鐩稿叧璁板繂锛歔浠?Memory 妫€绱㈢殑鐩稿叧璁板繂]
+鍙敤鎶€鑳斤細[宸叉敞鍐屾妧鑳藉垪琛╙
+瀹夊叏瑙勫垯锛歔鎶ゆ爮瑙勫垯]
 ```
 
-#### 5.2.3 系统提示构建
+#### 5.2.4 娲诲姩鐩戞帶锛坅ctivity.go锛?
+`activity.go` 瀹炵幇浜?*鍗￠】妫€娴?*鏈哄埗锛?
+- 姣忎釜鎿嶄綔闃舵锛圓PI 璋冪敤銆佸伐鍏锋墽琛岋級閮借娉ㄥ唽涓轰竴涓?`activity`
+- 鍚庡彴 goroutine 姣?5 绉掓壂鎻忔墍鏈夋椿鍔?- 濡傛灉鏌愪釜娲诲姩 **30 绉掓棤杩涘睍**锛岃緭鍑洪粍鑹茶鍛?`鈿?浠嶅湪銆寈x銆嶏紝宸?xx 鏃犳柊杩涘睍`
+- 鐢ㄦ埛鐪嬪埌鍚庡彲浠ユ寜 Ctrl+C 涓柇
 
-Engine 在每次调用 AI 前构建系统提示（System Prompt），包含：
-
-```
-你是 Cove，一个 AI 编程助手。
-你可以使用以下工具：
-  - bash: 执行 Shell 命令
-  - read: 读取文件
-  - write: 写入文件
-  - ...（工具列表）
-
-当前项目上下文：[项目文件树摘要]
-相关记忆：[从 Memory 检索的相关记忆]
-可用技能：[已注册技能列表]
-安全规则：[护栏规则]
-```
-
-#### 5.2.4 活动监控（activity.go）
-
-`activity.go` 实现了**卡顿检测**机制：
-
-- 每个操作阶段（API 调用、工具执行）都被注册为一个 `activity`
-- 后台 goroutine 每 5 秒扫描所有活动
-- 如果某个活动 **30 秒无进展**，输出黄色警告 `⚠ 仍在「xx」，已 xx 无新进展`
-- 用户看到后可以按 Ctrl+C 中断
-
-#### 5.2.5 后台回顾（review.go）
-
-每次对话回合结束后自动触发（异步，30 秒超时）：
-
-1. 截取最近 10 条消息作为快照
-2. 发送给 AI 分析："是否有值得记住的内容？"
-3. AI 返回 `MEMORY: xxx` → 存入 Memory
-4. AI 返回 `SKILL: name | steps` → 注册新技能
-5. 用户看到 `🧠 记住了: xxx` 或 `📚 学会了: xxx`
+#### 5.2.5 鍚庡彴鍥為【锛坮eview.go锛?
+姣忔瀵硅瘽鍥炲悎缁撴潫鍚庤嚜鍔ㄨЕ鍙戯紙寮傛锛?0 绉掕秴鏃讹級锛?
+1. 鎴彇鏈€杩?10 鏉℃秷鎭綔涓哄揩鐓?2. 鍙戦€佺粰 AI 鍒嗘瀽锛?鏄惁鏈夊€煎緱璁颁綇鐨勫唴瀹癸紵"
+3. AI 杩斿洖 `MEMORY: xxx` 鈫?瀛樺叆 Memory
+4. AI 杩斿洖 `SKILL: name | steps` 鈫?娉ㄥ唽鏂版妧鑳?5. 鐢ㄦ埛鐪嬪埌 `馃 璁颁綇浜? xxx` 鎴?`馃摎 瀛︿細浜? xxx`
 
 ---
 
-### 5.3 API 层
-
-#### 5.3.1 Provider 接口（provider.go）
-
+### 5.3 API 灞?
+#### 5.3.1 Provider 鎺ュ彛锛坧rovider.go锛?
 ```go
 type Provider interface {
     Name() string
@@ -501,9 +322,9 @@ type Provider interface {
 
 type ChatRequest struct {
     Model      string
-    SystemBase string    // 系统提示
-    Messages   []Message // 对话历史
-    Tools      []ToolDef // 可用工具定义
+    SystemBase string    // 绯荤粺鎻愮ず
+    Messages   []Message // 瀵硅瘽鍘嗗彶
+    Tools      []ToolDef // 鍙敤宸ュ叿瀹氫箟
     MaxTokens  int
     Temperature float64
 }
@@ -524,71 +345,61 @@ type Message struct {
 }
 ```
 
-#### 5.3.2 Anthropic 实现（anthropic.go）
+#### 5.3.2 Anthropic 瀹炵幇锛坅nthropic.go锛?
+**鏂囦欢**: `internal/api/anthropic.go`锛?73 琛岋級
 
-**文件**: `internal/api/anthropic.go`（473 行）
+瀹炵幇 Anthropic Messages API 鐨勮皟鐢細
 
-实现 Anthropic Messages API 的调用：
+- **绔偣**: `https://api.anthropic.com/v1/messages`
+- **璁よ瘉**: `x-api-key` 澶?+ Anthropic 鐗堟湰澶?- **娴佸紡**: Server-Sent Events (SSE) 瑙ｆ瀽
+- **宸ュ叿**: 灏?ToolDef 杞崲涓?Anthropic `tool_use` 鏍煎紡
+- **缂撳瓨**: 鏀寔 `ephemeral` cache_control
+- **閫熺巼闄愬埗**: 瑙ｆ瀽 `anthropic-ratelimit-*` 鍝嶅簲澶?
+**鍏抽敭澶勭悊**:
+- 娑堟伅鏍煎紡杞崲锛欳ove 鍐呴儴鏍煎紡 鈫?Anthropic API 鏍煎紡
+- 娴佸紡浜嬩欢瑙ｆ瀽锛歚content_block_start/delta/stop`
+- 閿欒澶勭悊锛氬尯鍒?4xx/5xx锛岄噸璇曠瓥鐣ョ敱 retry.go 澶勭悊
 
-- **端点**: `https://api.anthropic.com/v1/messages`
-- **认证**: `x-api-key` 头 + Anthropic 版本头
-- **流式**: Server-Sent Events (SSE) 解析
-- **工具**: 将 ToolDef 转换为 Anthropic `tool_use` 格式
-- **缓存**: 支持 `ephemeral` cache_control
-- **速率限制**: 解析 `anthropic-ratelimit-*` 响应头
+#### 5.3.3 OpenAI 鍏煎瀹炵幇锛坥penai_compat.go锛?
+**鏂囦欢**: `internal/api/openai_compat.go`锛?68 琛岋級
 
-**关键处理**:
-- 消息格式转换：Cove 内部格式 ↔ Anthropic API 格式
-- 流式事件解析：`content_block_start/delta/stop`
-- 错误处理：区分 4xx/5xx，重试策略由 retry.go 处理
+鏀寔鎵€鏈?OpenAI Chat Completions API 鍏煎鐨?Provider锛?
+- **绔偣**: `{base_url}/v1/chat/completions`
+- **璁よ瘉**: `Authorization: Bearer {key}`
+- **娴佸紡**: SSE `data: [DONE]`
+- **宸ュ叿**: 杞崲涓?OpenAI `function_call` 鏍煎紡
 
-#### 5.3.3 OpenAI 兼容实现（openai_compat.go）
-
-**文件**: `internal/api/openai_compat.go`（668 行）
-
-支持所有 OpenAI Chat Completions API 兼容的 Provider：
-
-- **端点**: `{base_url}/v1/chat/completions`
-- **认证**: `Authorization: Bearer {key}`
-- **流式**: SSE `data: [DONE]`
-- **工具**: 转换为 OpenAI `function_call` 格式
-
-支持的环境变量配置：
+鏀寔鐨勭幆澧冨彉閲忛厤缃細
 - `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`（自定义端点，如 Azure、本地模型）
-- `OPENAI_MODEL`（默认 gpt-4o）
+- `OPENAI_BASE_URL`锛堣嚜瀹氫箟绔偣锛屽 Azure銆佹湰鍦版ā鍨嬶級
+- `OPENAI_MODEL`锛堥粯璁?gpt-4o锛?
+#### 5.3.4 API Key 姹狅紙keypool.go锛?
+**鏂囦欢**: `internal/api/keypool.go`锛?72 琛岋級
 
-#### 5.3.4 API Key 池（keypool.go）
-
-**文件**: `internal/api/keypool.go`（172 行）
-
-管理多个 API Key，实现自动故障转移：
+绠＄悊澶氫釜 API Key锛屽疄鐜拌嚜鍔ㄦ晠闅滆浆绉伙細
 
 ```go
 type KeyPool struct {
-    keys    []*PoolKey      // Key 列表
-    current int             // 当前轮转位置
+    keys    []*PoolKey      // Key 鍒楄〃
+    current int             // 褰撳墠杞浆浣嶇疆
 }
 
 type PoolKey struct {
     Key       string         // API Key
     Status    KeyStatus      // OK / Exhausted / Dead
-    CoolUntil time.Time      // 冷却到何时
-}
+    CoolUntil time.Time      // 鍐峰嵈鍒颁綍鏃?}
 ```
 
-**状态机**:
-- `KeyOK` → 可用
-- `KeyExhausted` → 被限流，冷却后可恢复
-- `KeyDead` → 认证失败，永久不可用
+**鐘舵€佹満**:
+- `KeyOK` 鈫?鍙敤
+- `KeyExhausted` 鈫?琚檺娴侊紝鍐峰嵈鍚庡彲鎭㈠
+- `KeyDead` 鈫?璁よ瘉澶辫触锛屾案涔呬笉鍙敤
 
-**轮转策略**: Round-robin，跳过 Exhausted（除非全部不可用）
+**杞浆绛栫暐**: Round-robin锛岃烦杩?Exhausted锛堥櫎闈炲叏閮ㄤ笉鍙敤锛?
+#### 5.3.5 閲嶈瘯鏈哄埗锛坮etry.go锛?
+**鏂囦欢**: `internal/api/retry.go`锛?9 琛岋級
 
-#### 5.3.5 重试机制（retry.go）
-
-**文件**: `internal/api/retry.go`（69 行）
-
-指数退避重试：
+鎸囨暟閫€閬块噸璇曪細
 
 ```go
 func retryWithBackoff[T any](ctx context.Context, cfg retryConfig, operation func() (T, error)) (T, error) {
@@ -597,108 +408,90 @@ func retryWithBackoff[T any](ctx context.Context, cfg retryConfig, operation fun
         if err == nil { return result, nil }
         if attempt == cfg.MaxRetries || !isRetryable(err) { return zero, err }
         delay := time.Duration(1<<attempt) * cfg.BaseDelay  // 1s, 2s, 4s, 8s...
-        // 等待 delay 或 ctx 取消
+        // 绛夊緟 delay 鎴?ctx 鍙栨秷
     }
 }
 ```
 
-**可重试错误**: 网络超时、5xx、429（Rate Limit）
-**不可重试错误**: 4xx（除 429）、认证错误
-
-#### 5.3.6 速率限制追踪（ratelimit.go）
-
-解析 API 响应头中的速率限制信息，实时显示：
+**鍙噸璇曢敊璇?*: 缃戠粶瓒呮椂銆?xx銆?29锛圧ate Limit锛?**涓嶅彲閲嶈瘯閿欒**: 4xx锛堥櫎 429锛夈€佽璇侀敊璇?
+#### 5.3.6 閫熺巼闄愬埗杩借釜锛坮atelimit.go锛?
+瑙ｆ瀽 API 鍝嶅簲澶翠腑鐨勯€熺巼闄愬埗淇℃伅锛屽疄鏃舵樉绀猴細
 
 ```
-请求:150/200(75%) 重置:1m30s | Token:45K/100K(45%) 重置:2m
+璇锋眰:150/200(75%) 閲嶇疆:1m30s | Token:45K/100K(45%) 閲嶇疆:2m
 ```
 
 ---
 
-### 5.4 Tool 工具系统
+### 5.4 Tool 宸ュ叿绯荤粺
 
-#### 5.4.1 工具接口（tool.go）
-
+#### 5.4.1 宸ュ叿鎺ュ彛锛坱ool.go锛?
 ```go
 type Tool interface {
-    Def() Def                              // 返回工具定义（名称、描述、参数 Schema）
-    Validate(input Input) string           // 验证输入参数，返回错误信息或空
-    CheckPermissions(input Input, tctx Context) PermissionDecision  // 权限检查
-    Call(ctx context.Context, input Input, tctx Context) (Result, error)  // 执行
+    Def() Def                              // 杩斿洖宸ュ叿瀹氫箟锛堝悕绉般€佹弿杩般€佸弬鏁?Schema锛?    Validate(input Input) string           // 楠岃瘉杈撳叆鍙傛暟锛岃繑鍥為敊璇俊鎭垨绌?    CheckPermissions(input Input, tctx Context) PermissionDecision  // 鏉冮檺妫€鏌?    Call(ctx context.Context, input Input, tctx Context) (Result, error)  // 鎵ц
 }
 
 type Def struct {
-    Name              string          // 工具名称（如 "bash", "read"）
-    Description       string          // 描述（给 AI 看的）
-    InputSchema       json.RawMessage // JSON Schema 参数定义
-    IsReadOnly        bool            // 是否只读
-    IsConcurrencySafe bool            // 是否并发安全
-    UserFacingName    string          // 面向用户的名称
-}
+    Name              string          // 宸ュ叿鍚嶇О锛堝 "bash", "read"锛?    Description       string          // 鎻忚堪锛堢粰 AI 鐪嬬殑锛?    InputSchema       json.RawMessage // JSON Schema 鍙傛暟瀹氫箟
+    IsReadOnly        bool            // 鏄惁鍙
+    IsConcurrencySafe bool            // 鏄惁骞跺彂瀹夊叏
+    UserFacingName    string          // 闈㈠悜鐢ㄦ埛鐨勫悕绉?}
 ```
 
-#### 5.4.2 内置工具一览
-
-| 工具名 | 文件 | 功能 | 只读 |
+#### 5.4.2 鍐呯疆宸ュ叿涓€瑙?
+| 宸ュ叿鍚?| 鏂囦欢 | 鍔熻兘 | 鍙 |
 |--------|------|------|------|
-| `bash` | bash.go | 执行 Shell 命令（Linux/macOS） | ❌ |
-| `powershell` | powershell.go | 执行 PowerShell 命令（Windows） | ❌ |
-| `read` | read.go | 读取文件内容 | ✅ |
-| `write` | write.go | 写入文件（覆盖） | ❌ |
-| `edit` | edit.go | 精确字符串替换编辑 | ❌ |
-| `grep` | grep.go | 正则搜索（底层调用 ripgrep） | ✅ |
-| `glob` | glob.go | 文件名 glob 匹配搜索 | ✅ |
-| `webfetch` | webfetch.go | HTTP 抓取网页内容 | ✅ |
-| `browser` | webfetch.go | Headless 浏览器渲染 | ✅ |
-| `question` | advanced_tools_*.go | 向用户提问 | ✅ |
-| `todowrite` | advanced_tools_*.go | 创建/管理任务列表 | ✅ |
-| `execute_plan` | advanced_tools_plan_worktree.go | 执行计划任务 | ❌ |
-| `plan_mode` | advanced_tools_plan_worktree.go | 进入计划模式 | ✅ |
-| `exit_plan_mode` | advanced_tools_plan_worktree.go | 退出计划模式 | ✅ |
-| `worktree` | advanced_tools_plan_worktree.go | 创建 Git 工作树 | ❌ |
-| `task` | advanced_tools_task_core.go | 创建后台任务 | ❌ |
-| `agent` | advanced_tools_agent_skill.go | 启动子 Agent | ❌ |
-| `skill` | advanced_tools_agent_skill.go | 调用技能 | ✅ |
-| `sleep` | advanced_tools_task_core.go | 暂停等待 | ✅ |
-| `send_message` | advanced_tools_task_core.go | 发送消息 | ✅ |
+| `bash` | bash.go | 鎵ц Shell 鍛戒护锛圠inux/macOS锛?| 鉂?|
+| `powershell` | powershell.go | 鎵ц PowerShell 鍛戒护锛圵indows锛?| 鉂?|
+| `read` | read.go | 璇诲彇鏂囦欢鍐呭 | 鉁?|
+| `write` | write.go | 鍐欏叆鏂囦欢锛堣鐩栵級 | 鉂?|
+| `edit` | edit.go | 绮剧‘瀛楃涓叉浛鎹㈢紪杈?| 鉂?|
+| `grep` | grep.go | 姝ｅ垯鎼滅储锛堝簳灞傝皟鐢?ripgrep锛?| 鉁?|
+| `glob` | glob.go | 鏂囦欢鍚?glob 鍖归厤鎼滅储 | 鉁?|
+| `webfetch` | webfetch.go | HTTP 鎶撳彇缃戦〉鍐呭 | 鉁?|
+| `browser` | webfetch.go | Headless 娴忚鍣ㄦ覆鏌?| 鉁?|
+| `question` | advanced_tools_*.go | 鍚戠敤鎴锋彁闂?| 鉁?|
+| `todowrite` | advanced_tools_*.go | 鍒涘缓/绠＄悊浠诲姟鍒楄〃 | 鉁?|
+| `execute_plan` | advanced_tools_plan_worktree.go | 鎵ц璁″垝浠诲姟 | 鉂?|
+| `plan_mode` | advanced_tools_plan_worktree.go | 杩涘叆璁″垝妯″紡 | 鉁?|
+| `exit_plan_mode` | advanced_tools_plan_worktree.go | 閫€鍑鸿鍒掓ā寮?| 鉁?|
+| `worktree` | advanced_tools_plan_worktree.go | 鍒涘缓 Git 宸ヤ綔鏍?| 鉂?|
+| `task` | advanced_tools_task_core.go | 鍒涘缓鍚庡彴浠诲姟 | 鉂?|
+| `agent` | advanced_tools_agent_skill.go | 鍚姩瀛?Agent | 鉂?|
+| `skill` | advanced_tools_agent_skill.go | 璋冪敤鎶€鑳?| 鉁?|
+| `sleep` | advanced_tools_task_core.go | 鏆傚仠绛夊緟 | 鉁?|
+| `send_message` | advanced_tools_task_core.go | 鍙戦€佹秷鎭?| 鉁?|
 
-#### 5.4.3 工具注册表（registry.go）
-
+#### 5.4.3 宸ュ叿娉ㄥ唽琛紙registry.go锛?
 ```go
 type Registry struct {
     tools    map[string]Tool
-    toolList []Tool       // 保持插入顺序
+    toolList []Tool       // 淇濇寔鎻掑叆椤哄簭
 }
 
-func (r *Registry) Register(t Tool)      // 注册工具
-func (r *Registry) Get(name string) Tool // 按名查找
-func (r *Registry) All() []Tool          // 所有工具（供 AI 选择）
-func (r *Registry) Defs() []Def          // 所有工具定义
-```
+func (r *Registry) Register(t Tool)      // 娉ㄥ唽宸ュ叿
+func (r *Registry) Get(name string) Tool // 鎸夊悕鏌ユ壘
+func (r *Registry) All() []Tool          // 鎵€鏈夊伐鍏凤紙渚?AI 閫夋嫨锛?func (r *Registry) Defs() []Def          // 鎵€鏈夊伐鍏峰畾涔?```
 
-#### 5.4.4 高级工具详解
+#### 5.4.4 楂樼骇宸ュ叿璇﹁В
 
-**Task 系统** (`advanced_tools_task_core.go`):
-- `task`: 创建后台独立任务（异步 goroutine）
-- `task_list`: 列出所有后台任务
-- `task_update`: 更新任务状态
-- `task_stop`: 停止运行中的任务
+**Task 绯荤粺** (`advanced_tools_task_core.go`):
+- `task`: 鍒涘缓鍚庡彴鐙珛浠诲姟锛堝紓姝?goroutine锛?- `task_list`: 鍒楀嚭鎵€鏈夊悗鍙颁换鍔?- `task_update`: 鏇存柊浠诲姟鐘舵€?- `task_stop`: 鍋滄杩愯涓殑浠诲姟
 
-**Agent/Skill 系统** (`advanced_tools_agent_skill.go`):
-- `agent`: 创建子代理处理复杂多步骤任务
-- `skill`: 执行预定义的技能工作流
+**Agent/Skill 绯荤粺** (`advanced_tools_agent_skill.go`):
+- `agent`: 鍒涘缓瀛愪唬鐞嗗鐞嗗鏉傚姝ラ浠诲姟
+- `skill`: 鎵ц棰勫畾涔夌殑鎶€鑳藉伐浣滄祦
 
-**Plan/Worktree 系统** (`advanced_tools_plan_worktree.go`):
-- `plan_mode`: 进入只读计划模式
-- `execute_plan`: 执行计划中的所有待处理任务
-- `worktree`: 创建 Git 工作树用于隔离修改
+**Plan/Worktree 绯荤粺** (`advanced_tools_plan_worktree.go`):
+- `plan_mode`: 杩涘叆鍙璁″垝妯″紡
+- `execute_plan`: 鎵ц璁″垝涓殑鎵€鏈夊緟澶勭悊浠诲姟
+- `worktree`: 鍒涘缓 Git 宸ヤ綔鏍戠敤浜庨殧绂讳慨鏀?
+#### 5.4.5 宸ュ叿鎵ц鏈哄埗锛圗ngine 涓級
 
-#### 5.4.5 工具执行机制（Engine 中）
-
-工具调用在 Engine 中是**并行执行**的：
+宸ュ叿璋冪敤鍦?Engine 涓槸**骞惰鎵ц**鐨勶細
 
 ```go
-// engine.go 中简化逻辑
+// engine.go 涓畝鍖栭€昏緫
 func (e *Engine) executeToolCalls(toolCalls []api.ToolCall) []tool.Result {
     var wg sync.WaitGroup
     results := make([]tool.Result, len(toolCalls))
@@ -707,11 +500,10 @@ func (e *Engine) executeToolCalls(toolCalls []api.ToolCall) []tool.Result {
         wg.Add(1)
         go func(idx int, call api.ToolCall) {
             defer wg.Done()
-            defer func() { recover() }()  // panic 恢复
+            defer func() { recover() }()  // panic 鎭㈠
             
-            // 1. 权限检查
-            // 2. 参数验证
-            // 3. 执行工具
+            // 1. 鏉冮檺妫€鏌?            // 2. 鍙傛暟楠岃瘉
+            // 3. 鎵ц宸ュ叿
             results[idx] = tool.Call(ctx, input, tctx)
         }(i, tc)
     }
@@ -723,21 +515,19 @@ func (e *Engine) executeToolCalls(toolCalls []api.ToolCall) []tool.Result {
 
 ---
 
-### 5.5 Permission 权限系统
+### 5.5 Permission 鏉冮檺绯荤粺
 
-#### 5.5.1 权限模式（permission.go）
-
+#### 5.5.1 鏉冮檺妯″紡锛坧ermission.go锛?
 ```go
 type Mode int
 const (
-    Default  Mode = iota  // 默认：写操作需确认
-    Auto                  // 自动：全部允许
-    Strict                // 严格：全部需确认
-    Yolo                  // 极宽松：仅危险操作需确认
+    Default  Mode = iota  // 榛樿锛氬啓鎿嶄綔闇€纭
+    Auto                  // 鑷姩锛氬叏閮ㄥ厑璁?    Strict                // 涓ユ牸锛氬叏閮ㄩ渶纭
+    Yolo                  // 鏋佸鏉撅細浠呭嵄闄╂搷浣滈渶纭
 )
 ```
 
-#### 5.5.2 权限决策
+#### 5.5.2 鏉冮檺鍐崇瓥
 
 ```go
 type PermissionDecision struct {
@@ -746,42 +536,35 @@ type PermissionDecision struct {
 }
 ```
 
-#### 5.5.3 工具分类器（classifier.go）
+#### 5.5.3 宸ュ叿鍒嗙被鍣紙classifier.go锛?
+鑷姩灏嗗伐鍏峰垎涓轰笁绫伙細
 
-自动将工具分为三类：
-
-1. **只读安全**（`read`, `grep`, `glob`）→ 永远允许
-2. **低风险写**（`write`, `edit`）→ Default 模式需确认
-3. **高风险**（`bash`, `powershell`）→ 有命令分析规则
-
-命令分析器检查 Shell 命令是否包含危险操作：
-- `rm -rf /`
+1. **鍙瀹夊叏**锛坄read`, `grep`, `glob`锛夆啋 姘歌繙鍏佽
+2. **浣庨闄╁啓**锛坄write`, `edit`锛夆啋 Default 妯″紡闇€纭
+3. **楂橀闄?*锛坄bash`, `powershell`锛夆啋 鏈夊懡浠ゅ垎鏋愯鍒?
+鍛戒护鍒嗘瀽鍣ㄦ鏌?Shell 鍛戒护鏄惁鍖呭惈鍗遍櫓鎿嶄綔锛?- `rm -rf /`
 - `curl ... | bash`
-- 修改系统文件
-- 网络监听等
+- 淇敼绯荤粺鏂囦欢
+- 缃戠粶鐩戝惉绛?
+#### 5.5.4 鏉冮檺閽╁瓙
 
-#### 5.5.4 权限钩子
-
-Engine 暴露 `PermissionPrompt` 函数指针：
-
+Engine 鏆撮湶 `PermissionPrompt` 鍑芥暟鎸囬拡锛?
 ```go
 eng.PermissionPrompt = func(toolName string, input map[string]any, reason string) bool {
-    // 显示给用户，询问是否允许
-    // 返回 true = 允许，false = 拒绝
+    // 鏄剧ず缁欑敤鎴凤紝璇㈤棶鏄惁鍏佽
+    // 杩斿洖 true = 鍏佽锛宖alse = 鎷掔粷
 }
 ```
 
-在 CLI 中，这个钩子会：
-1. 格式化工具调用信息
-2. 显示 `⚠ 允许执行 bash: "rm file.txt"? [y/N]`
-3. 等待用户输入
+鍦?CLI 涓紝杩欎釜閽╁瓙浼氾細
+1. 鏍煎紡鍖栧伐鍏疯皟鐢ㄤ俊鎭?2. 鏄剧ず `鈿?鍏佽鎵ц bash: "rm file.txt"? [y/N]`
+3. 绛夊緟鐢ㄦ埛杈撳叆
 
 ---
 
-### 5.6 Plan 计划系统
+### 5.6 Plan 璁″垝绯荤粺
 
-#### 5.6.1 Plan 数据结构（plan.go）
-
+#### 5.6.1 Plan 鏁版嵁缁撴瀯锛坧lan.go锛?
 ```go
 type Plan struct {
     ID      string
@@ -794,45 +577,36 @@ type Step struct {
     ID          string
     Description string
     Status      StepStatus   // pending / in_progress / done / failed
-    DependsOn   []string     // 依赖的其他步骤 ID
+    DependsOn   []string     // 渚濊禆鐨勫叾浠栨楠?ID
     Result      string
 }
 ```
 
-#### 5.6.2 计划执行器（executor.go）
-
+#### 5.6.2 璁″垝鎵ц鍣紙executor.go锛?
 ```go
 type Executor struct {
     plan     *Plan
     engine   *Engine
-    maxAgents int            // 最大并发数
+    maxAgents int            // 鏈€澶у苟鍙戞暟
 }
 
 func (e *Executor) Execute(ctx context.Context, parallel bool) error {
-    // 1. 拓扑排序步骤（处理依赖关系）
-    // 2. 按依赖分组并行执行
-    // 3. 每个步骤创建一个子 Agent 或直接执行工具
-    // 4. 收集结果，更新步骤状态
-}
+    // 1. 鎷撴墤鎺掑簭姝ラ锛堝鐞嗕緷璧栧叧绯伙級
+    // 2. 鎸変緷璧栧垎缁勫苟琛屾墽琛?    // 3. 姣忎釜姝ラ鍒涘缓涓€涓瓙 Agent 鎴栫洿鎺ユ墽琛屽伐鍏?    // 4. 鏀堕泦缁撴灉锛屾洿鏂版楠ょ姸鎬?}
 ```
 
-**并行执行策略**:
-- `parallel=true`: 无依赖关系的步骤同时执行
-- `parallel=false`: 顺序执行
+**骞惰鎵ц绛栫暐**:
+- `parallel=true`: 鏃犱緷璧栧叧绯荤殑姝ラ鍚屾椂鎵ц
+- `parallel=false`: 椤哄簭鎵ц
 
 ---
 
-### 5.7 Memory 记忆系统
+### 5.7 Memory 璁板繂绯荤粺
 
-#### 5.7.1 记忆存储（store.go）
-
+#### 5.7.1 璁板繂瀛樺偍锛坰tore.go锛?
 ```go
 type Store struct {
-    bm25     *BM25               // 关键词检索
-    vecStore *VectorStore        // 向量检索
-    embedder EmbeddingProvider   // 嵌入提供者
-    entries  []MemoryEntry       // 元数据
-}
+    bm25     *BM25               // 鍏抽敭璇嶆绱?    vecStore *VectorStore        // 鍚戦噺妫€绱?    embedder EmbeddingProvider   // 宓屽叆鎻愪緵鑰?    entries  []MemoryEntry       // 鍏冩暟鎹?}
 
 type MemoryEntry struct {
     ID       int
@@ -842,117 +616,92 @@ type MemoryEntry struct {
 }
 ```
 
-#### 5.7.2 检索策略
-
-**混合检索（Hybrid Search）**:
+#### 5.7.2 妫€绱㈢瓥鐣?
+**娣峰悎妫€绱紙Hybrid Search锛?*:
 
 ```go
 func (s *Store) Search(query string, topK int) []ScoredDoc {
-    // 1. BM25 关键词检索（快速、精确匹配）
+    // 1. BM25 鍏抽敭璇嶆绱紙蹇€熴€佺簿纭尮閰嶏級
     bm25Results := s.bm25.Search(query, topK*2)
     
-    // 2. 向量语义检索（语义相似度）
+    // 2. 鍚戦噺璇箟妫€绱紙璇箟鐩镐技搴︼級
     queryVec := s.embedder.Embed(query)
     vecResults := s.vecStore.Search(queryVec, topK*2)
     
-    // 3. 融合排序（BM25 0.7 + 向量 0.3）
-    // 4. 考虑时效性衰减
-    // 5. 返回 Top-K
+    // 3. 铻嶅悎鎺掑簭锛圔M25 0.7 + 鍚戦噺 0.3锛?    // 4. 鑰冭檻鏃舵晥鎬ц“鍑?    // 5. 杩斿洖 Top-K
 }
 ```
 
-#### 5.7.3 BM25 实现（bm25.go）
+#### 5.7.3 BM25 瀹炵幇锛坆m25.go锛?
+缁忓吀鐨?BM25 淇℃伅妫€绱㈢畻娉曪細
 
-经典的 BM25 信息检索算法：
+- `k1=1.2`: 璇嶉楗卞拰鍙傛暟
+- `b=0.75`: 鏂囨。闀垮害褰掍竴鍖栧弬鏁?- 鍒嗚瘝锛氬皬鍐欏寲 + 瀛楁瘝鏁板瓧淇濈暀 + 鍋滅敤璇嶈繃婊?- IDF 璁＄畻锛歚log(1 + (N-df+0.5)/(df+0.5))`
 
-- `k1=1.2`: 词频饱和参数
-- `b=0.75`: 文档长度归一化参数
-- 分词：小写化 + 字母数字保留 + 停用词过滤
-- IDF 计算：`log(1 + (N-df+0.5)/(df+0.5))`
-
-#### 5.7.4 伪嵌入（embed.go）
-
-为降低成本，使用**字符三元组哈希**生成伪嵌入向量：
+#### 5.7.4 浼祵鍏ワ紙embed.go锛?
+涓洪檷浣庢垚鏈紝浣跨敤**瀛楃涓夊厓缁勫搱甯?*鐢熸垚浼祵鍏ュ悜閲忥細
 
 ```go
 func pseudoEmbedding(text string, dim int) []float32 {
-    // 1. 提取所有字符三元组（trigram）
-    // 2. 哈希到 [0, dim) 范围
-    // 3. 累加计数
-    // 4. L2 归一化
-}
+    // 1. 鎻愬彇鎵€鏈夊瓧绗︿笁鍏冪粍锛坱rigram锛?    // 2. 鍝堝笇鍒?[0, dim) 鑼冨洿
+    // 3. 绱姞璁℃暟
+    // 4. L2 褰掍竴鍖?}
 ```
 
-这是一个 economical 的替代方案，适用于记忆条目 < 1000 的场景。
-
+杩欐槸涓€涓?economical 鐨勬浛浠ｆ柟妗堬紝閫傜敤浜庤蹇嗘潯鐩?< 1000 鐨勫満鏅€?
 ---
 
-### 5.8 Skills 技能系统
-
-#### 5.8.1 技能定义（skills.go）
-
+### 5.8 Skills 鎶€鑳界郴缁?
+#### 5.8.1 鎶€鑳藉畾涔夛紙skills.go锛?
 ```go
 type Skill struct {
-    Name        string   // 技能名称
-    Description string   // 描述
-    Prompt      string   // 技能提示词（给 AI 的执行指南）
-    Tools       []string // 需要的工具列表
+    Name        string   // 鎶€鑳藉悕绉?    Description string   // 鎻忚堪
+    Prompt      string   // 鎶€鑳芥彁绀鸿瘝锛堢粰 AI 鐨勬墽琛屾寚鍗楋級
+    Tools       []string // 闇€瑕佺殑宸ュ叿鍒楄〃
 }
 ```
 
-#### 5.8.2 技能管理器
+#### 5.8.2 鎶€鑳界鐞嗗櫒
 
 ```go
 type Manager struct {
     skills      map[string]Skill
-    builtinDir  string   // 内置技能目录
-    userDir     string   // 用户自定义技能目录
-    loader      *Loader  // 文件系统加载器
-}
+    builtinDir  string   // 鍐呯疆鎶€鑳界洰褰?    userDir     string   // 鐢ㄦ埛鑷畾涔夋妧鑳界洰褰?    loader      *Loader  // 鏂囦欢绯荤粺鍔犺浇鍣?}
 
-func (m *Manager) Register(skill Skill)      // 注册技能
-func (m *Manager) Execute(name string, args map[string]any) // 执行技能
-func (m *Manager) ListForAI() string          // 格式化给 AI 看
-```
+func (m *Manager) Register(skill Skill)      // 娉ㄥ唽鎶€鑳?func (m *Manager) Execute(name string, args map[string]any) // 鎵ц鎶€鑳?func (m *Manager) ListForAI() string          // 鏍煎紡鍖栫粰 AI 鐪?```
 
-#### 5.8.3 技能目录结构
-
+#### 5.8.3 鎶€鑳界洰褰曠粨鏋?
 ```
 skills/
-├── builtin/               # 内置技能
-│   ├── code-review/
-│   │   └── SKILL.md       # 技能定义文件
-│   ├── refactor/
-│   │   └── SKILL.md
-│   └── ...
-└── user/                  # 用户自定义
-    └── my-skill/
-        └── SKILL.md
+鈹溾攢鈹€ builtin/               # 鍐呯疆鎶€鑳?鈹?  鈹溾攢鈹€ code-review/
+鈹?  鈹?  鈹斺攢鈹€ SKILL.md       # 鎶€鑳藉畾涔夋枃浠?鈹?  鈹溾攢鈹€ refactor/
+鈹?  鈹?  鈹斺攢鈹€ SKILL.md
+鈹?  鈹斺攢鈹€ ...
+鈹斺攢鈹€ user/                  # 鐢ㄦ埛鑷畾涔?    鈹斺攢鈹€ my-skill/
+        鈹斺攢鈹€ SKILL.md
 ```
 
-`SKILL.md` 格式：
-```markdown
+`SKILL.md` 鏍煎紡锛?```markdown
 # skill-name
-简短描述
+绠€鐭弿杩?
+## 鎵ц姝ラ
+1. 绗竴姝?..
+2. 绗簩姝?..
 
-## 执行步骤
-1. 第一步...
-2. 第二步...
-
-## 需要的工具
+## 闇€瑕佺殑宸ュ叿
 - read
 - write
 ```
 
 ---
 
-### 5.9 Session 会话管理
+### 5.9 Session 浼氳瘽绠＄悊
 
-**文件**: `internal/session/store.go`（284 行）
+**鏂囦欢**: `internal/session/store.go`锛?84 琛岋級
 
 ```go
 type Store struct {
-    dir     string           // 会话文件目录
+    dir     string           // 浼氳瘽鏂囦欢鐩綍
     current *Session
 }
 
@@ -960,175 +709,149 @@ type Session struct {
     ID        string
     Created   time.Time
     Updated   time.Time
-    Messages  []api.Message   // 完整对话历史
-    Summary   string          // 会话摘要
+    Messages  []api.Message   // 瀹屾暣瀵硅瘽鍘嗗彶
+    Summary   string          // 浼氳瘽鎽樿
 }
 ```
 
-**持久化策略**:
-- 存储为 JSON 文件：`~/.cove/sessions/{id}.json`
-- 每次对话回合后自动保存
-- 启动时可恢复上次会话
+**鎸佷箙鍖栫瓥鐣?*:
+- 瀛樺偍涓?JSON 鏂囦欢锛歚~/.cove/sessions/{id}.json`
+- 姣忔瀵硅瘽鍥炲悎鍚庤嚜鍔ㄤ繚瀛?- 鍚姩鏃跺彲鎭㈠涓婃浼氳瘽
 
 ---
 
-### 5.10 MCP 集成
+### 5.10 MCP 闆嗘垚
 
-Model Context Protocol (MCP) 是 Anthropic 提出的开放协议，允许外部工具服务器提供工具。
-
-#### 5.10.1 MCP 连接池（pool.go）
-
+Model Context Protocol (MCP) 鏄?Anthropic 鎻愬嚭鐨勫紑鏀惧崗璁紝鍏佽澶栭儴宸ュ叿鏈嶅姟鍣ㄦ彁渚涘伐鍏枫€?
+#### 5.10.1 MCP 杩炴帴姹狅紙pool.go锛?
 ```go
 type Pool struct {
-    servers []*Client         // MCP 客户端列表
-    tools   []tool.Tool       // 从 MCP 服务器获取的工具
+    servers []*Client         // MCP 瀹㈡埛绔垪琛?    tools   []tool.Tool       // 浠?MCP 鏈嶅姟鍣ㄨ幏鍙栫殑宸ュ叿
 }
 
 func NewPool(configs []ServerConfig) *Pool
-func (p *Pool) Connect(ctx context.Context) error   // 连接所有服务器
-func (p *Pool) Tools() []tool.Tool                   // 获取所有工具
-func (p *Pool) Close() error
+func (p *Pool) Connect(ctx context.Context) error   // 杩炴帴鎵€鏈夋湇鍔″櫒
+func (p *Pool) Tools() []tool.Tool                   // 鑾峰彇鎵€鏈夊伐鍏?func (p *Pool) Close() error
 ```
 
-#### 5.10.2 MCP 客户端（client.go）
-
+#### 5.10.2 MCP 瀹㈡埛绔紙client.go锛?
 ```go
 type Client struct {
     config   ServerConfig
-    conn     *stdio.Connection  // 通过 stdio 与子进程通信
+    conn     *stdio.Connection  // 閫氳繃 stdio 涓庡瓙杩涚▼閫氫俊
     tools    []tool.Tool
 }
 
 type ServerConfig struct {
-    Command string   // 启动命令（如 "npx", "uvx" 等）
-    Args    []string // 命令参数
-    Env     []string // 环境变量
+    Command string   // 鍚姩鍛戒护锛堝 "npx", "uvx" 绛夛級
+    Args    []string // 鍛戒护鍙傛暟
+    Env     []string // 鐜鍙橀噺
 }
 ```
 
-**通信机制**:
-- 启动子进程（通过 `os/exec`）
-- 通过 stdin/stdout 传递 JSON-RPC 消息
-- `tools/list` → 获取工具列表
-- `tools/call` → 调用工具
+**閫氫俊鏈哄埗**:
+- 鍚姩瀛愯繘绋嬶紙閫氳繃 `os/exec`锛?- 閫氳繃 stdin/stdout 浼犻€?JSON-RPC 娑堟伅
+- `tools/list` 鈫?鑾峰彇宸ュ叿鍒楄〃
+- `tools/call` 鈫?璋冪敤宸ュ叿
 
 ---
 
-### 5.11 Browser 浏览器
+### 5.11 Browser 娴忚鍣?
+**鏂囦欢**: `internal/browser/browser.go`锛?42 琛岋級
 
-**文件**: `internal/browser/browser.go`（342 行）
-
-HTTP 客户端 + HTML 转换引擎：
-
+HTTP 瀹㈡埛绔?+ HTML 杞崲寮曟搸锛?
 ```go
 type Browser struct {
     timeout        time.Duration
-    allowLocalhost bool      // 安全：默认禁止本地地址
-    maxBodySize    int64     // 默认 5MB
+    allowLocalhost bool      // 瀹夊叏锛氶粯璁ょ姝㈡湰鍦板湴鍧€
+    maxBodySize    int64     // 榛樿 5MB
 }
 ```
 
-**安全措施**:
-- SSRF 防护：禁止访问内网 IP（127.0.0.1, 10.x, 192.168.x, 172.16-31.x 等）
-- 禁止访问云元数据端点（`metadata.google.internal`）
-- 响应大小限制 5MB
-- 输出截断 100KB
+**瀹夊叏鎺柦**:
+- SSRF 闃叉姢锛氱姝㈣闂唴缃?IP锛?27.0.0.1, 10.x, 192.168.x, 172.16-31.x 绛夛級
+- 绂佹璁块棶浜戝厓鏁版嵁绔偣锛坄metadata.google.internal`锛?- 鍝嶅簲澶у皬闄愬埗 5MB
+- 杈撳嚭鎴柇 100KB
 
-**HTML 转换**:
-- `HTMLToText()`: 去除标签，保留文本
-- `HTMLToMarkdown()`: 转换为 Markdown（保留标题、链接、代码块、列表）
+**HTML 杞崲**:
+- `HTMLToText()`: 鍘婚櫎鏍囩锛屼繚鐣欐枃鏈?- `HTMLToMarkdown()`: 杞崲涓?Markdown锛堜繚鐣欐爣棰樸€侀摼鎺ャ€佷唬鐮佸潡銆佸垪琛級
 
-**Headless Chrome 支持**（可选）:
-- 需要编译标签 `-tags chromedp`
-- 提供 `FetchRendered()` 和 `Screenshot()` 方法
-- 默认不可用，优雅降级
+**Headless Chrome 鏀寔**锛堝彲閫夛級:
+- 闇€瑕佺紪璇戞爣绛?`-tags chromedp`
+- 鎻愪緵 `FetchRendered()` 鍜?`Screenshot()` 鏂规硶
+- 榛樿涓嶅彲鐢紝浼橀泤闄嶇骇
 
 ---
 
-### 5.12 TUI 全屏交互层（★ 当前默认交互模式）
+### 5.12 TUI 鍏ㄥ睆浜や簰灞傦紙鈽?褰撳墠榛樿浜や簰妯″紡锛?
+**鏂囦欢**: `internal/tui/tui.go`锛?14琛岋級+ `app.go`锛?9琛岋級+ `styles.go`锛?63琛岋級+ `cli/cove/repl_tui.go`锛?53琛岋紝TUI 鍚姩涓庢ˉ鎺ワ級
 
-**文件**: `internal/tui/tui.go`（814行）+ `app.go`（79行）+ `styles.go`（363行）+ `cli/cove/repl_tui.go`（853行，TUI 启动与桥接）
+#### 5.12.1 璁捐鍔ㄦ満
 
-#### 5.12.1 设计动机
-
-旧 REPL 使用手写 ANSI 转义序列驱动终端，依赖原地擦除/重绘（in-place erase/redraw）。这种行式模型在同时处理流式输出、异步任务、窗口大小变化和 Windows 控制台时，**无法可靠地支持分割布局**。
-
-TUI 包用 **全屏交替屏幕 + 整帧重绘（Model-Update-View）** 模型替代了旧方案，每帧重新计算完整布局。
-
-**核心依赖**: Bubble Tea v2（`charm.land/bubbletea/v2`） + Lipgloss v2（`charm.land/lipgloss/v2`） + Bubbles v2（textarea, textinput, viewport）
-
-#### 5.12.2 启用逻辑（`repl_tui.go`: `useTUI()`）
-
+鏃?REPL 浣跨敤鎵嬪啓 ANSI 杞箟搴忓垪椹卞姩缁堢锛屼緷璧栧師鍦版摝闄?閲嶇粯锛坕n-place erase/redraw锛夈€傝繖绉嶈寮忔ā鍨嬪湪鍚屾椂澶勭悊娴佸紡杈撳嚭銆佸紓姝ヤ换鍔°€佺獥鍙ｅぇ灏忓彉鍖栧拰 Windows 鎺у埗鍙版椂锛?*鏃犳硶鍙潬鍦版敮鎸佸垎鍓插竷灞€**銆?
+TUI 鍖呯敤 **鍏ㄥ睆浜ゆ浛灞忓箷 + 鏁村抚閲嶇粯锛圡odel-Update-View锛?* 妯″瀷鏇夸唬浜嗘棫鏂规锛屾瘡甯ч噸鏂拌绠楀畬鏁村竷灞€銆?
+**鏍稿績渚濊禆**: Bubble Tea v2锛坄charm.land/bubbletea/v2`锛?+ Lipgloss v2锛坄charm.land/lipgloss/v2`锛?+ Bubbles v2锛坱extarea, textinput, viewport锛?
+#### 5.12.2 鍚敤閫昏緫锛坄repl_tui.go`: `useTUI()`锛?
 ```go
 func useTUI() bool {
-    if noTUI || os.Getenv("COVE_TUI") == "0" { return false }     // 显式禁用 → REPL
-    if tuiMode || os.Getenv("COVE_TUI") == "1" { return true }    // 显式启用 → TUI
+    if noTUI || os.Getenv("COVE_TUI") == "0" { return false }     // 鏄惧紡绂佺敤 鈫?REPL
+    if tuiMode || os.Getenv("COVE_TUI") == "1" { return true }    // 鏄惧紡鍚敤 鈫?TUI
     return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
-    // 默认：stdin 和 stdout 都是终端 → TUI；管道/重定向 → REPL
+    // 榛樿锛歴tdin 鍜?stdout 閮芥槸缁堢 鈫?TUI锛涚閬?閲嶅畾鍚?鈫?REPL
 }
 ```
 
-命令行控制：`--tui` / `--no-tui`，环境变量 `COVE_TUI=0/1`
+鍛戒护琛屾帶鍒讹細`--tui` / `--no-tui`锛岀幆澧冨彉閲?`COVE_TUI=0/1`
 
-#### 5.12.3 核心数据结构
+#### 5.12.3 鏍稿績鏁版嵁缁撴瀯
 
-**`turn` — 结构化对话轮次**（每个回合不是扁平文本，而是结构化对象）:
+**`turn` 鈥?缁撴瀯鍖栧璇濊疆娆?*锛堟瘡涓洖鍚堜笉鏄墎骞虫枃鏈紝鑰屾槸缁撴瀯鍖栧璞★級:
 
 ```go
 type turn struct {
-    user      string           // 用户输入（空表示系统轮次）
-    reasoning strings.Builder  // 流式思考过程（可折叠，dim 样式渲染）
-    answer    strings.Builder  // 流式回答 + 工具/引擎诊断行
-    expanded  bool             // 用户是否点击展开了思考头部
-    system    bool             // 是否为独立引擎输出（不可折叠，不显示用户输入）
-}
+    user      string           // 鐢ㄦ埛杈撳叆锛堢┖琛ㄧず绯荤粺杞锛?    reasoning strings.Builder  // 娴佸紡鎬濊€冭繃绋嬶紙鍙姌鍙狅紝dim 鏍峰紡娓叉煋锛?    answer    strings.Builder  // 娴佸紡鍥炵瓟 + 宸ュ叿/寮曟搸璇婃柇琛?    expanded  bool             // 鐢ㄦ埛鏄惁鐐瑰嚮灞曞紑浜嗘€濊€冨ご閮?    system    bool             // 鏄惁涓虹嫭绔嬪紩鎿庤緭鍑猴紙涓嶅彲鎶樺彔锛屼笉鏄剧ず鐢ㄦ埛杈撳叆锛?}
 ```
 
-**`Model` — 根 Bubble Tea 模型**（持有全部 UI 状态）:
+**`Model` 鈥?鏍?Bubble Tea 妯″瀷**锛堟寔鏈夊叏閮?UI 鐘舵€侊級:
 
 ```go
 type Model struct {
-    vp     viewport.Model    // 对话正文滚轮视口
-    ta     textarea.Model    // 底部输入框
-    width  int
+    vp     viewport.Model    // 瀵硅瘽姝ｆ枃婊氳疆瑙嗗彛
+    ta     textarea.Model    // 搴曢儴杈撳叆妗?    width  int
     height int
     ready  bool
 
-    // 结构化对话转录
-    turns     []*turn
-    streaming bool            // 正在流式接收中
-    curTurn   int             // 当前活跃交换轮次（-1 表示无）
-    streamTurn int            // 正在接收流式增量的轮次（-1 表示无）
-    clickMap  map[int]int     // 包装行 → 轮次索引（用于鼠标点击折叠）
+    // 缁撴瀯鍖栧璇濊浆褰?    turns     []*turn
+    streaming bool            // 姝ｅ湪娴佸紡鎺ユ敹涓?    curTurn   int             // 褰撳墠娲昏穬浜ゆ崲杞锛?1 琛ㄧず鏃狅級
+    streamTurn int            // 姝ｅ湪鎺ユ敹娴佸紡澧為噺鐨勮疆娆★紙-1 琛ㄧず鏃狅級
+    clickMap  map[int]int     // 鍖呰琛?鈫?杞绱㈠紩锛堢敤浜庨紶鏍囩偣鍑绘姌鍙狅級
 
-    status   StatusInfo       // 顶部状态栏数据
-    task     TaskInfo         // 后台任务队列快照
-    history  []HistoryItem    // 历史会话列表
-    commands []CommandItem    // / 命令面板目录
-    activity string           // 当前活动提示行
-
-    // Git 面板
+    status   StatusInfo       // 椤堕儴鐘舵€佹爮鏁版嵁
+    task     TaskInfo         // 鍚庡彴浠诲姟闃熷垪蹇収
+    history  []HistoryItem    // 鍘嗗彶浼氳瘽鍒楄〃
+    commands []CommandItem    // / 鍛戒护闈㈡澘鐩綍
+    activity string           // 褰撳墠娲诲姩鎻愮ず琛?
+    // Git 闈㈡澘
     gitExpanded bool
 
-    // 模态覆盖层
+    // 妯℃€佽鐩栧眰
     overlay    int            // overlayNone / overlayHistory / overlayCommand / overlayPermission
     search     textinput.Model
     overlayIdx int
 
-    // 权限弹窗
+    // 鏉冮檺寮圭獥
     permTool  string
     permDesc  string
-    permReply chan PermDecision  // 阻塞的 worker goroutine 等待回复的通道
+    permReply chan PermDecision  // 闃诲鐨?worker goroutine 绛夊緟鍥炲鐨勯€氶亾
 
-    // 回调
-    onSubmit    func(string)     // 用户提交输入
-    onResume    func(string)     // 用户从历史恢复会话
-    onInterrupt func()           // Ctrl+C 中断当前任务
+    // 鍥炶皟
+    onSubmit    func(string)     // 鐢ㄦ埛鎻愪氦杈撳叆
+    onResume    func(string)     // 鐢ㄦ埛浠庡巻鍙叉仮澶嶄細璇?    onInterrupt func()           // Ctrl+C 涓柇褰撳墠浠诲姟
     quitting    bool
 }
 ```
 
-**`App` — UI 程序包装器**（`app.go`），暴露线程安全的 Bridge Helpers:
+**`App` 鈥?UI 绋嬪簭鍖呰鍣?*锛坄app.go`锛夛紝鏆撮湶绾跨▼瀹夊叏鐨?Bridge Helpers:
 
 ```go
 type App struct {
@@ -1136,98 +859,66 @@ type App struct {
     program *tea.Program
 }
 
-// 后台 goroutine 通过 app.Send* 推送消息到 UI goroutine
+// 鍚庡彴 goroutine 閫氳繃 app.Send* 鎺ㄩ€佹秷鎭埌 UI goroutine
 func (a *App) BeginStream(echo string)
-func (a *App) Delta(s string)             // 流式回答增量
-func (a *App) Reasoning(s string)         // 流式思考增量（dim 样式）
-func (a *App) EngineLine(s string)        // 引擎诊断行
-func (a *App) EndStream()
+func (a *App) Delta(s string)             // 娴佸紡鍥炵瓟澧為噺
+func (a *App) Reasoning(s string)         // 娴佸紡鎬濊€冨閲忥紙dim 鏍峰紡锛?func (a *App) EngineLine(s string)        // 寮曟搸璇婃柇琛?func (a *App) EndStream()
 func (a *App) SetTask(info TaskInfo)
 func (a *App) SetStatus(info StatusInfo)
 func (a *App) SetHistory(items []HistoryItem)
 func (a *App) SetActivity(s string)
-func (a *App) RequestPermission(tool, desc string) PermDecision  // 阻塞式权限弹窗
+func (a *App) RequestPermission(tool, desc string) PermDecision  // 闃诲寮忔潈闄愬脊绐?```
+
+#### 5.12.4 甯冨眬鍝插
+
 ```
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? 椤堕儴鐘舵€佹爮 (statusH=1)                     鈹? cove v6.2.1 路 model 路 provider 路 main* 路 鈴?default    杩愯涓?鈿?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? Git 闈㈡澘锛堝彲閫夛紝鏈夊彉鏇存椂鏄剧ず锛?              鈹? 鈻?宸ヤ綔鍖篬main]鍙樺姩鏂囦欢鍒楄〃 (鍏?涓?
+鈹?                                           鈹?   M file1.go
+鈹?                                           鈹?   A file2.go
+鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                                           鈹?鈹? 瀵硅瘽姝ｆ枃 (viewport, midH = h - 鍏ㄩ儴chrome) 鈹? 鈥?鐢ㄦ埛: 甯垜璇诲彇 main.go
+鈹?                                           鈹?鈹?                                           鈹? 鈻?鎬濊€冭繃绋嬶紙鐐瑰嚮灞曞紑锛?鈹?                                           鈹?鈹?                                           鈹? 濂界殑锛宮ain.go 鐨勫唴瀹规槸...
+鈹?                                           鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? 娲诲姩/鎺掗槦琛?(transientH=1锛屽缁堜繚鐣?        鈹? 鈿?鎵ц bash                                 +2 鎺掗槦
+鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? 搴曢儴鐘舵€佽 (bottomH=1)                     鈹? 1234 tokens 路 $0.005 路 3.2s    Ctrl+R 鍘嗗彶 路 / 鍛戒护 路 Ctrl+C 閫€鍑?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€    鈹?鈹? > 鐢ㄦ埛杈撳叆妗?(inputH=2)                    鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?```
 
-#### 5.12.4 布局哲学
-
-```
-┌────────────────────────────────────────────┐
-│  顶部状态栏 (statusH=1)                     │  cove v6.2.1 · model · provider · main* · ⏵ default    运行中 ⚡
-├────────────────────────────────────────────┤
-│  Git 面板（可选，有变更时显示）               │  ▾ 工作区[main]变动文件列表 (共3个)
-│                                            │    M file1.go
-│                                            │    A file2.go
-├────────────────────────────────────────────┤
-│                                            │
-│  对话正文 (viewport, midH = h - 全部chrome) │  › 用户: 帮我读取 main.go
-│                                            │
-│                                            │  ▸ 思考过程（点击展开）
-│                                            │
-│                                            │  好的，main.go 的内容是...
-│                                            │
-├────────────────────────────────────────────┤
-│  活动/排队行 (transientH=1，始终保留)        │  ⚙ 执行 bash                                 +2 排队
-├────────────────────────────────────────────┤
-│  底部状态行 (bottomH=1)                     │  1234 tokens · $0.005 · 3.2s    Ctrl+R 历史 · / 命令 · Ctrl+C 退出
-├────────────────────────────────────────────┤
-│  ──────────────────────────────────────    │
-│  > 用户输入框 (inputH=2)                    │
-└────────────────────────────────────────────┘
-```
-
-**设计原则**: 对话正文占满全宽，只有薄薄的 chrome 环绕周围——顶部状态栏、中部的 Git 面板（可变）、可选一行活动区、底部状态行 + 分割线 + 输入框。**不使用侧边栏和嵌套框架**，布局由 `layout()` 方法每帧计算。
-
-布局中的 `transientH=1` **始终保留**（即使是空行），防止触发命令时对话正文高度突变导致输入框上下跳动。
-
-#### 5.12.5 交互特性
-
-| 快捷键 | 功能 |
+**璁捐鍘熷垯**: 瀵硅瘽姝ｆ枃鍗犳弧鍏ㄥ锛屽彧鏈夎杽钖勭殑 chrome 鐜粫鍛ㄥ洿鈥斺€旈《閮ㄧ姸鎬佹爮銆佷腑閮ㄧ殑 Git 闈㈡澘锛堝彲鍙橈級銆佸彲閫変竴琛屾椿鍔ㄥ尯銆佸簳閮ㄧ姸鎬佽 + 鍒嗗壊绾?+ 杈撳叆妗嗐€?*涓嶄娇鐢ㄤ晶杈规爮鍜屽祵濂楁鏋?*锛屽竷灞€鐢?`layout()` 鏂规硶姣忓抚璁＄畻銆?
+甯冨眬涓殑 `transientH=1` **濮嬬粓淇濈暀**锛堝嵆浣挎槸绌鸿锛夛紝闃叉瑙﹀彂鍛戒护鏃跺璇濇鏂囬珮搴︾獊鍙樺鑷磋緭鍏ユ涓婁笅璺冲姩銆?
+#### 5.12.5 浜や簰鐗规€?
+| 蹇嵎閿?| 鍔熻兘 |
 |--------|------|
-| **输入** | `Enter` 提交（空行不提交），`Ctrl+J` 插入换行符 |
-| **思考折叠** | 鼠标点击 `▸ 思考过程` / `▾ 思考过程` 头部展开/折叠 |
-| **鼠标滚轮** | 滚动对话正文视口 |
-| **Ctrl+R** | 打开历史会话搜索覆盖层 |
-| **`/`**（空输入时）| 打开命令面板覆盖层（模糊过滤） |
-| **Ctrl+G** | 展开/折叠 Git 状态面板 |
-| **Ctrl+C** | 任务运行时：取消当前任务；空闲时：退出程序 |
-| **权限弹窗** | 鼠标点击按钮或键盘 `y`（允许）、`n`（拒绝）、`a`（始终允许） |
+| **杈撳叆** | `Enter` 鎻愪氦锛堢┖琛屼笉鎻愪氦锛夛紝`Ctrl+J` 鎻掑叆鎹㈣绗?|
+| **鎬濊€冩姌鍙?* | 榧犳爣鐐瑰嚮 `鈻?鎬濊€冭繃绋媊 / `鈻?鎬濊€冭繃绋媊 澶撮儴灞曞紑/鎶樺彔 |
+| **榧犳爣婊氳疆** | 婊氬姩瀵硅瘽姝ｆ枃瑙嗗彛 |
+| **Ctrl+R** | 鎵撳紑鍘嗗彶浼氳瘽鎼滅储瑕嗙洊灞?|
+| **`/`**锛堢┖杈撳叆鏃讹級| 鎵撳紑鍛戒护闈㈡澘瑕嗙洊灞傦紙妯＄硦杩囨护锛?|
+| **Ctrl+G** | 灞曞紑/鎶樺彔 Git 鐘舵€侀潰鏉?|
+| **Ctrl+C** | 浠诲姟杩愯鏃讹細鍙栨秷褰撳墠浠诲姟锛涚┖闂叉椂锛氶€€鍑虹▼搴?|
+| **鏉冮檺寮圭獥** | 榧犳爣鐐瑰嚮鎸夐挳鎴栭敭鐩?`y`锛堝厑璁革級銆乣n`锛堟嫆缁濓級銆乣a`锛堝缁堝厑璁革級 |
 
-#### 5.12.6 覆盖层系统（Overlay）
+#### 5.12.6 瑕嗙洊灞傜郴缁燂紙Overlay锛?
+涓夌妯℃€佽鐩栧眰锛岀粯鍒跺湪瀵硅瘽姝ｆ枃涔嬩笂锛?
+1. **鍘嗗彶鎼滅储**锛坄overlayHistory`锛夛細`Ctrl+R` 鎵撳紑锛屾ā绯婃悳绱細璇濇爣棰橈紝`Enter` 鎭㈠
+2. **鍛戒护闈㈡澘**锛坄overlayCommand`锛夛細`/` 鎵撳紑锛屾ā绯婃悳绱㈠懡浠ゅ悕绉板拰鎻忚堪锛宍Enter` 鎵ц
+3. **鏉冮檺纭**锛坄overlayPermission`锛夛細宸ュ叿闇€瑕佹巿鏉冩椂寮瑰嚭锛屼笁涓寜閽紙鍏佽/鎷掔粷/濮嬬粓鍏佽锛夛紝work goroutine 琚€氶亾闃诲绛夊緟鐢ㄦ埛鍐崇瓥
 
-三种模态覆盖层，绘制在对话正文之上：
-
-1. **历史搜索**（`overlayHistory`）：`Ctrl+R` 打开，模糊搜索会话标题，`Enter` 恢复
-2. **命令面板**（`overlayCommand`）：`/` 打开，模糊搜索命令名称和描述，`Enter` 执行
-3. **权限确认**（`overlayPermission`）：工具需要授权时弹出，三个按钮（允许/拒绝/始终允许），work goroutine 被通道阻塞等待用户决策
-
-覆盖层激活时，输入框失去焦点（`ta.Blur()`），搜索框获得焦点。关闭覆盖层后焦点归还输入框。
-
-#### 5.12.7 流式数据流（Engine → TUI）
-
+瑕嗙洊灞傛縺娲绘椂锛岃緭鍏ユ澶卞幓鐒︾偣锛坄ta.Blur()`锛夛紝鎼滅储妗嗚幏寰楃劍鐐广€傚叧闂鐩栧眰鍚庣劍鐐瑰綊杩樿緭鍏ユ銆?
+#### 5.12.7 娴佸紡鏁版嵁娴侊紙Engine 鈫?TUI锛?
 ```
 Engine (worker goroutine)
-    │
-    ├─ onDelta → app.Delta(s) → streamDeltaMsg → Model.Update()
-    │              └─ turns[streamTurn].answer 追加增量
-    │              └─ refreshViewport(true)  ← 重渲染 + 滚到底部
-    │
-    ├─ onReasoning → app.Reasoning(s) → streamReasoningMsg
-    │              └─ turns[streamTurn].reasoning 追加
-    │              └─ refreshViewport(true)
-    │
-    ├─ onEngineOutput → app.EngineLine(s) → engineLineMsg
-    │              └─ 追加到 streamTurn（在流中）/ curTurn（有当前轮次）/ appendSystem（系统轮次）
-    │
-    ├─ 开始流:     app.BeginStream("") → streamBeginMsg → streaming=true, 创建新 turn
-    └─ 结束流:     app.EndStream()     → streamEndMsg   → streaming=false
+    鈹?    鈹溾攢 onDelta 鈫?app.Delta(s) 鈫?streamDeltaMsg 鈫?Model.Update()
+    鈹?             鈹斺攢 turns[streamTurn].answer 杩藉姞澧為噺
+    鈹?             鈹斺攢 refreshViewport(true)  鈫?閲嶆覆鏌?+ 婊氬埌搴曢儴
+    鈹?    鈹溾攢 onReasoning 鈫?app.Reasoning(s) 鈫?streamReasoningMsg
+    鈹?             鈹斺攢 turns[streamTurn].reasoning 杩藉姞
+    鈹?             鈹斺攢 refreshViewport(true)
+    鈹?    鈹溾攢 onEngineOutput 鈫?app.EngineLine(s) 鈫?engineLineMsg
+    鈹?             鈹斺攢 杩藉姞鍒?streamTurn锛堝湪娴佷腑锛? curTurn锛堟湁褰撳墠杞锛? appendSystem锛堢郴缁熻疆娆★級
+    鈹?    鈹溾攢 寮€濮嬫祦:     app.BeginStream("") 鈫?streamBeginMsg 鈫?streaming=true, 鍒涘缓鏂?turn
+    鈹斺攢 缁撴潫娴?     app.EndStream()     鈫?streamEndMsg   鈫?streaming=false
 ```
 
-**关键设计**: 思考过程（reasoning）在**回答内容到达前**实时渲染为展开状态；一旦回答内容出现（或流结束），思考过程折叠为一行 `▸ 思考过程（点击展开）`，用户可点击再次打开。
-
-#### 5.12.8 任务队列（`tuiJobQueue`）
-
-FIFO 队列 + 条件变量阻塞，保证用户提交和引擎调用串行化：
+**鍏抽敭璁捐**: 鎬濊€冭繃绋嬶紙reasoning锛夊湪**鍥炵瓟鍐呭鍒拌揪鍓?*瀹炴椂娓叉煋涓哄睍寮€鐘舵€侊紱涓€鏃﹀洖绛斿唴瀹瑰嚭鐜帮紙鎴栨祦缁撴潫锛夛紝鎬濊€冭繃绋嬫姌鍙犱负涓€琛?`鈻?鎬濊€冭繃绋嬶紙鐐瑰嚮灞曞紑锛塦锛岀敤鎴峰彲鐐瑰嚮鍐嶆鎵撳紑銆?
+#### 5.12.8 浠诲姟闃熷垪锛坄tuiJobQueue`锛?
+FIFO 闃熷垪 + 鏉′欢鍙橀噺闃诲锛屼繚璇佺敤鎴锋彁浜ゅ拰寮曟搸璋冪敤涓茶鍖栵細
 
 ```go
 type tuiJobQueue struct {
@@ -1238,61 +929,44 @@ type tuiJobQueue struct {
 }
 ```
 
-- `push(s)`: 追加到队尾，`cond.Signal()` 唤醒 worker
-- `pushFront(s)`: 插入队首（用户中断后重新提交）
-- `pop()`: 阻塞等待，返回当前项 + 剩余队列快照（用于侧边栏）
-
-单 worker goroutine 从队列弹出并串行处理每个提交。
-
-#### 5.12.9 `runTUI()` 启动流程（`repl_tui.go:101`）
-
+- `push(s)`: 杩藉姞鍒伴槦灏撅紝`cond.Signal()` 鍞ら啋 worker
+- `pushFront(s)`: 鎻掑叆闃熼锛堢敤鎴蜂腑鏂悗閲嶆柊鎻愪氦锛?- `pop()`: 闃诲绛夊緟锛岃繑鍥炲綋鍓嶉」 + 鍓╀綑闃熷垪蹇収锛堢敤浜庝晶杈规爮锛?
+鍗?worker goroutine 浠庨槦鍒楀脊鍑哄苟涓茶澶勭悊姣忎釜鎻愪氦銆?
+#### 5.12.9 `runTUI()` 鍚姩娴佺▼锛坄repl_tui.go:101`锛?
 ```
-1. 创建 tuiJobQueue
-2. 创建 tui.App：绑定 onSubmit（入队用户输入）、onResume（恢复历史会话）、onInterrupt（取消正在运行的任务）
-3. 设置 eng.PermissionPrompt → app.RequestPermission()（阻塞式权限弹窗）
-4. 启动后台 goroutine：
-   - Git 状态刷新（每 2 秒）
-   - 历史会话列表加载（Ctrl+R 覆盖层数据源）
-5. 启动 worker goroutine：
-   - 循环 pop 队列
-   - / 命令？→ 同步执行（与引擎调用串行，避免状态竞争）
-   - 普通输入？→ 预算/API Key 预检 → eng.RunMessageWithStream() → 流式桥接
-   - 自动保存会话
-6. 启动种子 goroutine：将 banner + 诊断信息 + 草稿提示写入对话正文
-7. app.Run() 进入 Bubble Tea 事件循环（阻塞直到退出）
+1. 鍒涘缓 tuiJobQueue
+2. 鍒涘缓 tui.App锛氱粦瀹?onSubmit锛堝叆闃熺敤鎴疯緭鍏ワ級銆乷nResume锛堟仮澶嶅巻鍙蹭細璇濓級銆乷nInterrupt锛堝彇娑堟鍦ㄨ繍琛岀殑浠诲姟锛?3. 璁剧疆 eng.PermissionPrompt 鈫?app.RequestPermission()锛堥樆濉炲紡鏉冮檺寮圭獥锛?4. 鍚姩鍚庡彴 goroutine锛?   - Git 鐘舵€佸埛鏂帮紙姣?2 绉掞級
+   - 鍘嗗彶浼氳瘽鍒楄〃鍔犺浇锛圕trl+R 瑕嗙洊灞傛暟鎹簮锛?5. 鍚姩 worker goroutine锛?   - 寰幆 pop 闃熷垪
+   - / 鍛戒护锛熲啋 鍚屾鎵ц锛堜笌寮曟搸璋冪敤涓茶锛岄伩鍏嶇姸鎬佺珵浜夛級
+   - 鏅€氳緭鍏ワ紵鈫?棰勭畻/API Key 棰勬 鈫?eng.RunMessageWithStream() 鈫?娴佸紡妗ユ帴
+   - 鑷姩淇濆瓨浼氳瘽
+6. 鍚姩绉嶅瓙 goroutine锛氬皢 banner + 璇婃柇淇℃伅 + 鑽夌鎻愮ず鍐欏叆瀵硅瘽姝ｆ枃
+7. app.Run() 杩涘叆 Bubble Tea 浜嬩欢寰幆锛堥樆濉炵洿鍒伴€€鍑猴級
 ```
 
-#### 5.12.10 样式系统（`styles.go`）
-
+#### 5.12.10 鏍峰紡绯荤粺锛坄styles.go`锛?
 ```go
-statusBarStyle  // 顶部状态栏：暗色文字 + 青色背景（与 Cove Logo 同色）
-userStyle       // 用户输入：青色粗体
-dimStyle        // 次要文本/思考过程：灰色
-thinkHeaderStyle // 可点击折叠头部：灰色斜体
-activityStyle   // 活动指示行：青色
-overlayBoxStyle // 覆盖层：圆角边框 + 青色边框色
-selectedStyle   // 覆盖层选中项：白色文字 + 青色背景
-btnAllowStyle   // 权限「允许」按钮：白色 + 绿色背景
-btnDenyStyle    // 权限「拒绝」按钮：白色 + 红色背景
-btnAlwaysStyle  // 权限「始终允许」按钮：白色 + 琥珀背景
+statusBarStyle  // 椤堕儴鐘舵€佹爮锛氭殫鑹叉枃瀛?+ 闈掕壊鑳屾櫙锛堜笌 Cove Logo 鍚岃壊锛?userStyle       // 鐢ㄦ埛杈撳叆锛氶潚鑹茬矖浣?dimStyle        // 娆¤鏂囨湰/鎬濊€冭繃绋嬶細鐏拌壊
+thinkHeaderStyle // 鍙偣鍑绘姌鍙犲ご閮細鐏拌壊鏂滀綋
+activityStyle   // 娲诲姩鎸囩ず琛岋細闈掕壊
+overlayBoxStyle // 瑕嗙洊灞傦細鍦嗚杈规 + 闈掕壊杈规鑹?selectedStyle   // 瑕嗙洊灞傞€変腑椤癸細鐧借壊鏂囧瓧 + 闈掕壊鑳屾櫙
+btnAllowStyle   // 鏉冮檺銆屽厑璁搞€嶆寜閽細鐧借壊 + 缁胯壊鑳屾櫙
+btnDenyStyle    // 鏉冮檺銆屾嫆缁濄€嶆寜閽細鐧借壊 + 绾㈣壊鑳屾櫙
+btnAlwaysStyle  // 鏉冮檺銆屽缁堝厑璁搞€嶆寜閽細鐧借壊 + 鐞ョ弨鑳屾櫙
 ```
 
-光标使用**真实终端光标**（`ta.SetVirtualCursor(false)`），这使 CJK IME 能在正确位置绘制预编辑文本（拼音等）。
-
+鍏夋爣浣跨敤**鐪熷疄缁堢鍏夋爣**锛坄ta.SetVirtualCursor(false)`锛夛紝杩欎娇 CJK IME 鑳藉湪姝ｇ‘浣嶇疆缁樺埗棰勭紪杈戞枃鏈紙鎷奸煶绛夛級銆?
 ---
 
-### 5.13 REPL 交互层（★ 降级为 Fallback）
+### 5.13 REPL 浜や簰灞傦紙鈽?闄嶇骇涓?Fallback锛?
+#### 5.13.1 棰滆壊宸ュ叿锛坈olor.go锛?
+**鏂囦欢**: `internal/repl/color.go`锛?69 琛岋級
 
-#### 5.13.1 颜色工具（color.go）
-
-**文件**: `internal/repl/color.go`（269 行）
-
-> **注意**: REPL 现在是 fallback 模式（仅管道/重定向/`--no-tui` 时使用）。但 `repl.Banner()`、`repl.PrintSafe()`、`repl.PrintAbove()` 等工具函数在 TUI 模式下仍被 `main.go` 调用，用于生成 banner 文本和 plan 模式输出。
-
-ANSI 颜色和样式定义：
+> **娉ㄦ剰**: REPL 鐜板湪鏄?fallback 妯″紡锛堜粎绠￠亾/閲嶅畾鍚?`--no-tui` 鏃朵娇鐢級銆備絾 `repl.Banner()`銆乣repl.PrintSafe()`銆乣repl.PrintAbove()` 绛夊伐鍏峰嚱鏁板湪 TUI 妯″紡涓嬩粛琚?`main.go` 璋冪敤锛岀敤浜庣敓鎴?banner 鏂囨湰鍜?plan 妯″紡杈撳嚭銆?
+ANSI 棰滆壊鍜屾牱寮忓畾涔夛細
 
 ```go
-// 颜色常量
+// 棰滆壊甯搁噺
 const (
     Reset   = "\033[0m"
     Red     = "\033[31m"
@@ -1304,127 +978,98 @@ const (
     // ...
 )
 
-// 渲染函数
-func Dim(s string) string      // 灰色/暗色文本
-func Bold(s string) string     // 粗体
-func Highlight(s string) string // 高亮（青色粗体）
-func Error(s string) string    // 错误（红色）
+// 娓叉煋鍑芥暟
+func Dim(s string) string      // 鐏拌壊/鏆楄壊鏂囨湰
+func Bold(s string) string     // 绮椾綋
+func Highlight(s string) string // 楂樹寒锛堥潚鑹茬矖浣擄級
+func Error(s string) string    // 閿欒锛堢孩鑹诧級
 ```
 
-#### 5.13.2 行编辑器（readline.go）
+#### 5.13.2 琛岀紪杈戝櫒锛坮eadline.go锛?
+**鏂囦欢**: `internal/repl/readline.go`锛?29 琛岋級
 
-**文件**: `internal/repl/readline.go`（729 行）
-
-自定义终端行编辑器，支持：
-
-- **光标移动**: 左右箭头、Home/End、Ctrl+A/E
-- **编辑操作**: 退格、删除、Ctrl+W（删除词）、Ctrl+U（删除到行首）
-- **历史导航**: 上下箭头浏览历史命令
-- **多行输入**: 以 `\` 结尾自动续行
-- **自动补全**: Tab 补全文件路径和命令
-- **语法高亮**: 对特殊命令进行着色
-
+鑷畾涔夌粓绔缂栬緫鍣紝鏀寔锛?
+- **鍏夋爣绉诲姩**: 宸﹀彸绠ご銆丠ome/End銆丆trl+A/E
+- **缂栬緫鎿嶄綔**: 閫€鏍笺€佸垹闄ゃ€丆trl+W锛堝垹闄よ瘝锛夈€丆trl+U锛堝垹闄ゅ埌琛岄锛?- **鍘嗗彶瀵艰埅**: 涓婁笅绠ご娴忚鍘嗗彶鍛戒护
+- **澶氳杈撳叆**: 浠?`\` 缁撳熬鑷姩缁
+- **鑷姩琛ュ叏**: Tab 琛ュ叏鏂囦欢璺緞鍜屽懡浠?- **璇硶楂樹寒**: 瀵圭壒娈婂懡浠よ繘琛岀潃鑹?
 ---
 
-### 5.14 Context 上下文管理
+### 5.14 Context 涓婁笅鏂囩鐞?
+**鏂囦欢**: `internal/context/context.go`锛?21 琛岋級
 
-**文件**: `internal/context/context.go`（221 行）
-
-负责分析项目目录结构并生成给 AI 看的上下文：
+璐熻矗鍒嗘瀽椤圭洰鐩綍缁撴瀯骞剁敓鎴愮粰 AI 鐪嬬殑涓婁笅鏂囷細
 
 ```go
 type ProjectContext struct {
-    Root       string           // 项目根目录
-    Language   string           // 检测到的编程语言
-    FileTree   []FileEntry      // 文件树
-    Framework  string           // 检测到的框架
-}
+    Root       string           // 椤圭洰鏍圭洰褰?    Language   string           // 妫€娴嬪埌鐨勭紪绋嬭瑷€
+    FileTree   []FileEntry      // 鏂囦欢鏍?    Framework  string           // 妫€娴嬪埌鐨勬鏋?}
 
 func Analyze(dir string) (*ProjectContext, error)
-func (pc *ProjectContext) Format() string  // 格式化为 AI 可读字符串
-```
+func (pc *ProjectContext) Format() string  // 鏍煎紡鍖栦负 AI 鍙瀛楃涓?```
 
-**检测逻辑**:
-- 扫描根目录关键文件（`go.mod` → Go, `package.json` → Node.js, etc.）
-- 忽略 `.gitignore` 和 `.coveignore` 中指定的文件
-- 生成简洁的文件树
-
-**RepoMap**（`internal/repomap/repomap.go`, 397 行）:
-- 生成代码库的结构地图
-- 包含关键类/函数/模块的定位信息
-- 帮助 AI 理解项目结构
+**妫€娴嬮€昏緫**:
+- 鎵弿鏍圭洰褰曞叧閿枃浠讹紙`go.mod` 鈫?Go, `package.json` 鈫?Node.js, etc.锛?- 蹇界暐 `.gitignore` 鍜?`.coveignore` 涓寚瀹氱殑鏂囦欢
+- 鐢熸垚绠€娲佺殑鏂囦欢鏍?
+**RepoMap**锛坄internal/repomap/repomap.go`, 397 琛岋級:
+- 鐢熸垚浠ｇ爜搴撶殑缁撴瀯鍦板浘
+- 鍖呭惈鍏抽敭绫?鍑芥暟/妯″潡鐨勫畾浣嶄俊鎭?- 甯姪 AI 鐞嗚В椤圭洰缁撴瀯
 
 ---
 
-### 5.15 辅助模块
+### 5.15 杈呭姪妯″潡
 
-#### 5.15.1 日志系统（log/logger.go）
+#### 5.15.1 鏃ュ織绯荤粺锛坙og/logger.go锛?
+- 鍥涚骇鏃ュ織锛欴ebug, Info, Warn, Error
+- 杈撳嚭鍒?stderr锛堜笌 stdout 鐨?AI 杈撳嚭鍒嗙锛?- `SetSink()` 鏈哄埗锛歐arn/Error 鑷姩鍥炶皟锛堢敤浜庤瘖鏂褰曪級
 
-- 四级日志：Debug, Info, Warn, Error
-- 输出到 stderr（与 stdout 的 AI 输出分离）
-- `SetSink()` 机制：Warn/Error 自动回调（用于诊断记录）
-
-#### 5.15.2 配置管理（config/config.go）
-
+#### 5.15.2 閰嶇疆绠＄悊锛坈onfig/config.go锛?
 ```go
 type Config struct {
-    Model          string          // AI 模型名称
-    Provider       ProviderConfig  // Provider 配置
-    Tools          []tool.Tool     // 工具列表
+    Model          string          // AI 妯″瀷鍚嶇О
+    Provider       ProviderConfig  // Provider 閰嶇疆
+    Tools          []tool.Tool     // 宸ュ叿鍒楄〃
     PermissionMode string          // "default" / "auto" / "strict"
-    MaxBudget      float64         // 最大费用预算（美元）
-    MaxSteps       int             // 最大工具调用步数
-    TUI            bool            // 是否启用 TUI 模式
-    NoTUI          bool            // 是否禁用 TUI 模式
+    MaxBudget      float64         // 鏈€澶ц垂鐢ㄩ绠楋紙缇庡厓锛?    MaxSteps       int             // 鏈€澶у伐鍏疯皟鐢ㄦ鏁?    TUI            bool            // 鏄惁鍚敤 TUI 妯″紡
+    NoTUI          bool            // 鏄惁绂佺敤 TUI 妯″紡
     // ...
 }
 ```
 
-#### 5.15.3 成本追踪（cost/tracker.go）
-
-追踪 API 调用费用：
-
+#### 5.15.3 鎴愭湰杩借釜锛坈ost/tracker.go锛?
+杩借釜 API 璋冪敤璐圭敤锛?
 ```go
 type Tracker struct {
     totalCost float64
-    modelRates map[string]Rate  // 各模型价格
-}
+    modelRates map[string]Rate  // 鍚勬ā鍨嬩环鏍?}
 
 type Rate struct {
-    InputPrice  float64  // 每 1K tokens 价格
+    InputPrice  float64  // 姣?1K tokens 浠锋牸
     OutputPrice float64
 }
 ```
 
-#### 5.15.4 检查点（checkpoint/checkpoint.go）
-
-文件修改前自动备份：
+#### 5.15.4 妫€鏌ョ偣锛坈heckpoint/checkpoint.go锛?
+鏂囦欢淇敼鍓嶈嚜鍔ㄥ浠斤細
 
 ```go
 func Save(filePath string) error {
-    // 将文件复制到 ~/.cove/checkpoints/{timestamp}/{path}
+    // 灏嗘枃浠跺鍒跺埌 ~/.cove/checkpoints/{timestamp}/{path}
 }
 ```
 
-#### 5.15.5 诊断系统（diagnostic/）
-
-- `checker.go`: 系统健康检查（API 连通性、工具可用性）
-- `recorder.go`: 运行时事件记录（用于事后调试）
-- `errors.go`: 错误码定义
-
-#### 5.15.6 安全检查（guardrail/）
-
+#### 5.15.5 璇婃柇绯荤粺锛坉iagnostic/锛?
+- `checker.go`: 绯荤粺鍋ュ悍妫€鏌ワ紙API 杩為€氭€с€佸伐鍏峰彲鐢ㄦ€э級
+- `recorder.go`: 杩愯鏃朵簨浠惰褰曪紙鐢ㄤ簬浜嬪悗璋冭瘯锛?- `errors.go`: 閿欒鐮佸畾涔?
+#### 5.15.6 瀹夊叏妫€鏌ワ紙guardrail/锛?
 ```go
-func CheckInput(input string) error     // 检查用户输入
-func CheckOutput(output string) error   // 检查 AI 输出
+func CheckInput(input string) error     // 妫€鏌ョ敤鎴疯緭鍏?func CheckOutput(output string) error   // 妫€鏌?AI 杈撳嚭
 ```
 
-检测潜在的安全问题（注入、敏感信息泄露等）。
+妫€娴嬫綔鍦ㄧ殑瀹夊叏闂锛堟敞鍏ャ€佹晱鎰熶俊鎭硠闇茬瓑锛夈€?
+#### 5.15.7 鎻掍欢绯荤粺锛坧lugin/plugin.go, 514 琛岋級
 
-#### 5.15.7 插件系统（plugin/plugin.go, 514 行）
-
-支持外部插件扩展：
-
+鏀寔澶栭儴鎻掍欢鎵╁睍锛?
 ```go
 type Plugin struct {
     Name    string
@@ -1438,130 +1083,49 @@ func Load(dir string) ([]Plugin, error)
 
 ---
 
-## 6. 核心数据流
-
-### 6.1 一次完整对话的数据流
-
+## 6. 鏍稿績鏁版嵁娴?
+### 6.1 涓€娆″畬鏁村璇濈殑鏁版嵁娴?
 ```
-用户输入 "帮我读一下 main.go"
-    │
-    ▼
-┌─ REPL Loop ──────────────────────────────────────────┐
-│ 1. 读取用户输入                                        │
-│ 2. 检查是否是内置命令（/help, /exit...）                │
-│ 3. 构建 api.Message{Role: "user", Content: "帮我..."}  │
-└───────────────────┬───────────────────────────────────┘
-                    │
-                    ▼
-┌─ Engine.RunMessageWithStream ────────────────────────┐
-│                                                       │
-│ ┌─────────────────────────────────────────────┐      │
-│ │ 构建 System Prompt:                           │      │
-│ │ - 角色定义                                    │      │
-│ │ - 工具列表 (Defs)                             │      │
-│ │ - 项目上下文 (Context.Format())               │      │
-│ │ - 仓库地图 (RepoMap)                          │      │
-│ │ - 相关记忆 (Memory.Search())                  │      │
-│ │ - 可用技能 (Skills.ListForAI())              │      │
-│ └─────────────────────────────────────────────┘      │
-│                       │                               │
-│                       ▼                               │
-│ ┌─────────────────────────────────────────────┐      │
-│ │ API Call: Provider.ChatStream()              │      │
-│ │ → POST https://api.anthropic.com/v1/messages │      │
-│ │ → SSE Stream 返回                            │      │
-│ │ → 解析: content_block_delta / tool_use       │      │
-│ └─────────────────────────────────────────────┘      │
-│                       │                               │
-│            ┌──────────┴──────────┐                    │
-│            │                     │                     │
-│      返回文本             返回工具调用                  │
-│            │                     │                     │
-│            ▼                     ▼                     │
-│   onDelta(文本)        ┌──────────────────┐           │
-│   实时输出给用户         │ 权限检查           │           │
-│            │            │ ↓                 │           │
-│            │            │ PermissionPrompt  │           │
-│            │            │ ↓                 │           │
-│            │            │ 并行执行工具       │           │
-│            │            │ ↓                 │           │
-│            │            │ 收集结果           │           │
-│            │            │ ↓                 │           │
-│            │            │ 结果添加到消息历史  │           │
-│            │            │ ↓                 │           │
-│            │            │ 再次调用 AI       │──┐        │
-│            │            └──────────────────┘  │        │
-│            │                     │             │        │
-│            │                     ◄─────────────┘        │
-│            │              (循环直到 AI 停止调用工具)     │
-│            ▼                                           │
-│   最终响应文本                                          │
-│                                                       │
-└───────────────────┬───────────────────────────────────┘
-                    │
-                    ▼
-    ┌───────────────────────────────┐
-    │ 后处理:                       │
-    │ - 更新成本 Tracker            │
-    │ - 触发后台回顾 Review         │
-    │ - 保存 Session                │
-    │ - 更新 Memory/Skills          │
-    └───────────────────────────────┘
-                    │
-                    ▼
-              返回响应给 REPL
+鐢ㄦ埛杈撳叆 "甯垜璇讳竴涓?main.go"
+    鈹?    鈻?鈹屸攢 REPL Loop 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?1. 璇诲彇鐢ㄦ埛杈撳叆                                        鈹?鈹?2. 妫€鏌ユ槸鍚︽槸鍐呯疆鍛戒护锛?help, /exit...锛?               鈹?鈹?3. 鏋勫缓 api.Message{Role: "user", Content: "甯垜..."}  鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?                    鈹?                    鈻?鈹屸攢 Engine.RunMessageWithStream 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                                                      鈹?鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?     鈹?鈹?鈹?鏋勫缓 System Prompt:                           鈹?     鈹?鈹?鈹?- 瑙掕壊瀹氫箟                                    鈹?     鈹?鈹?鈹?- 宸ュ叿鍒楄〃 (Defs)                             鈹?     鈹?鈹?鈹?- 椤圭洰涓婁笅鏂?(Context.Format())               鈹?     鈹?鈹?鈹?- 浠撳簱鍦板浘 (RepoMap)                          鈹?     鈹?鈹?鈹?- 鐩稿叧璁板繂 (Memory.Search())                  鈹?     鈹?鈹?鈹?- 鍙敤鎶€鑳?(Skills.ListForAI())              鈹?     鈹?鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?     鈹?鈹?                      鈹?                              鈹?鈹?                      鈻?                              鈹?鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?     鈹?鈹?鈹?API Call: Provider.ChatStream()              鈹?     鈹?鈹?鈹?鈫?POST https://api.anthropic.com/v1/messages 鈹?     鈹?鈹?鈹?鈫?SSE Stream 杩斿洖                            鈹?     鈹?鈹?鈹?鈫?瑙ｆ瀽: content_block_delta / tool_use       鈹?     鈹?鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?     鈹?鈹?                      鈹?                              鈹?鈹?           鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?                   鈹?鈹?           鈹?                    鈹?                    鈹?鈹?     杩斿洖鏂囨湰             杩斿洖宸ュ叿璋冪敤                  鈹?鈹?           鈹?                    鈹?                    鈹?鈹?           鈻?                    鈻?                    鈹?鈹?  onDelta(鏂囨湰)        鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?          鈹?鈹?  瀹炴椂杈撳嚭缁欑敤鎴?        鈹?鏉冮檺妫€鏌?          鈹?          鈹?鈹?           鈹?           鈹?鈫?                鈹?          鈹?鈹?           鈹?           鈹?PermissionPrompt  鈹?          鈹?鈹?           鈹?           鈹?鈫?                鈹?          鈹?鈹?           鈹?           鈹?骞惰鎵ц宸ュ叿       鈹?          鈹?鈹?           鈹?           鈹?鈫?                鈹?          鈹?鈹?           鈹?           鈹?鏀堕泦缁撴灉           鈹?          鈹?鈹?           鈹?           鈹?鈫?                鈹?          鈹?鈹?           鈹?           鈹?缁撴灉娣诲姞鍒版秷鎭巻鍙? 鈹?          鈹?鈹?           鈹?           鈹?鈫?                鈹?          鈹?鈹?           鈹?           鈹?鍐嶆璋冪敤 AI       鈹傗攢鈹€鈹?       鈹?鈹?           鈹?           鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹? 鈹?       鈹?鈹?           鈹?                    鈹?            鈹?       鈹?鈹?           鈹?                    鈼勨攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?       鈹?鈹?           鈹?             (寰幆鐩村埌 AI 鍋滄璋冪敤宸ュ叿)     鈹?鈹?           鈻?                                          鈹?鈹?  鏈€缁堝搷搴旀枃鏈?                                         鈹?鈹?                                                      鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?                    鈹?                    鈻?    鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?    鈹?鍚庡鐞?                       鈹?    鈹?- 鏇存柊鎴愭湰 Tracker            鈹?    鈹?- 瑙﹀彂鍚庡彴鍥為【 Review         鈹?    鈹?- 淇濆瓨 Session                鈹?    鈹?- 鏇存柊 Memory/Skills          鈹?    鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?                    鈹?                    鈻?              杩斿洖鍝嶅簲缁?REPL
 ```
 
-### 6.2 工具执行的数据流
+### 6.2 宸ュ叿鎵ц鐨勬暟鎹祦
 
 ```
-Engine 收到 AI 的工具调用请求
-    │
-    ├─ 提取 tool_calls[] → [{name: "read", input: {filePath: "..."}}, ...]
-    │
-    ├─ 对每个 tool_call 并发执行:
-    │   │
-    │   ├─ toolReg.Get(name)  → 获取 Tool 实例
-    │   ├─ tool.Validate(input) → 参数验证
-    │   ├─ tool.CheckPermissions(input, ctx) → 权限检查
-    │   │   ├─ Allow → 直接执行
-    │   │   ├─ Deny  → 返回拒绝原因
-    │   │   └─ Ask   → 调用 PermissionPrompt（可能阻塞等待用户输入）
-    │   ├─ tool.Call(ctx, input, ctx) → 执行工具
-    │   └─ 返回 Result{Data: "..."} 或 error
-    │
-    ├─ 收集所有结果
-    │
-    ├─ 构造 tool result 消息:
-    │   api.Message{Role: "tool", ToolCallID: tc.ID, Content: result.Data}
-    │
-    ├─ 追加到 e.messages
-    │
-    └─ 再次调用 Provider.ChatStream()（将工具结果提交给 AI）
-```
+Engine 鏀跺埌 AI 鐨勫伐鍏疯皟鐢ㄨ姹?    鈹?    鈹溾攢 鎻愬彇 tool_calls[] 鈫?[{name: "read", input: {filePath: "..."}}, ...]
+    鈹?    鈹溾攢 瀵规瘡涓?tool_call 骞跺彂鎵ц:
+    鈹?  鈹?    鈹?  鈹溾攢 toolReg.Get(name)  鈫?鑾峰彇 Tool 瀹炰緥
+    鈹?  鈹溾攢 tool.Validate(input) 鈫?鍙傛暟楠岃瘉
+    鈹?  鈹溾攢 tool.CheckPermissions(input, ctx) 鈫?鏉冮檺妫€鏌?    鈹?  鈹?  鈹溾攢 Allow 鈫?鐩存帴鎵ц
+    鈹?  鈹?  鈹溾攢 Deny  鈫?杩斿洖鎷掔粷鍘熷洜
+    鈹?  鈹?  鈹斺攢 Ask   鈫?璋冪敤 PermissionPrompt锛堝彲鑳介樆濉炵瓑寰呯敤鎴疯緭鍏ワ級
+    鈹?  鈹溾攢 tool.Call(ctx, input, ctx) 鈫?鎵ц宸ュ叿
+    鈹?  鈹斺攢 杩斿洖 Result{Data: "..."} 鎴?error
+    鈹?    鈹溾攢 鏀堕泦鎵€鏈夌粨鏋?    鈹?    鈹溾攢 鏋勯€?tool result 娑堟伅:
+    鈹?  api.Message{Role: "tool", ToolCallID: tc.ID, Content: result.Data}
+    鈹?    鈹溾攢 杩藉姞鍒?e.messages
+    鈹?    鈹斺攢 鍐嶆璋冪敤 Provider.ChatStream()锛堝皢宸ュ叿缁撴灉鎻愪氦缁?AI锛?```
 
 ---
 
-## 7. 关键设计模式
+## 7. 鍏抽敭璁捐妯″紡
 
-### 7.1 接口抽象模式
+### 7.1 鎺ュ彛鎶借薄妯″紡
 
-所有可替换组件都定义接口：
+鎵€鏈夊彲鏇挎崲缁勪欢閮藉畾涔夋帴鍙ｏ細
 
 ```go
-// AI Provider 可替换
-type Provider interface { Chat(...); ChatStream(...) }
+// AI Provider 鍙浛鎹?type Provider interface { Chat(...); ChatStream(...) }
 
-// 工具可扩展
-type Tool interface { Def(); Validate(); CheckPermissions(); Call() }
+// 宸ュ叿鍙墿灞?type Tool interface { Def(); Validate(); CheckPermissions(); Call() }
 
-// 嵌入提供者可替换
+// 宓屽叆鎻愪緵鑰呭彲鏇挎崲
 type EmbeddingProvider interface { Embed(); Dim() }
 ```
 
-### 7.2 注册表模式
-
-工具通过注册表管理：
+### 7.2 娉ㄥ唽琛ㄦā寮?
+宸ュ叿閫氳繃娉ㄥ唽琛ㄧ鐞嗭細
 
 ```go
 reg := tool.NewRegistry()
@@ -1571,28 +1135,25 @@ reg.Register(&ReadTool{})
 engine.SetRegistry(reg)
 ```
 
-### 7.3 回调/钩子模式
+### 7.3 鍥炶皟/閽╁瓙妯″紡
 
-Engine 暴露钩子供外部定制：
+Engine 鏆撮湶閽╁瓙渚涘閮ㄥ畾鍒讹細
 
 ```go
 eng.PermissionPrompt = myPermissionHandler
 eng.OnDelta = myStreamHandler
 ```
 
-### 7.4 优雅降级模式
+### 7.4 浼橀泤闄嶇骇妯″紡
 
 ```go
-if e.memStore != nil {  // 记忆系统可选
-    memories := e.memStore.Search(query, 5)
-    // 注入到系统提示
-}
+if e.memStore != nil {  // 璁板繂绯荤粺鍙€?    memories := e.memStore.Search(query, 5)
+    // 娉ㄥ叆鍒扮郴缁熸彁绀?}
 ```
 
-### 7.5 Panic 恢复模式
+### 7.5 Panic 鎭㈠妯″紡
 
-所有工具执行都在 goroutine 中有 panic 恢复：
-
+鎵€鏈夊伐鍏锋墽琛岄兘鍦?goroutine 涓湁 panic 鎭㈠锛?
 ```go
 go func() {
     defer func() {
@@ -1605,29 +1166,24 @@ go func() {
 }()
 ```
 
-### 7.6 上下文传播模式
-
-所有异步操作通过 `context.Context` 传播取消信号：
-
+### 7.6 涓婁笅鏂囦紶鎾ā寮?
+鎵€鏈夊紓姝ユ搷浣滈€氳繃 `context.Context` 浼犳挱鍙栨秷淇″彿锛?
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 defer cancel()
-// 传递给所有子操作
+// 浼犻€掔粰鎵€鏈夊瓙鎿嶄綔
 ```
 
 ---
 
-## 8. 如何运行与构建
-
-### 8.1 环境要求
+## 8. 濡備綍杩愯涓庢瀯寤?
+### 8.1 鐜瑕佹眰
 
 - Go 1.22+
-- Git（用于 worktree 功能）
-- ripgrep（`rg` 命令，用于 grep 工具）
+- Git锛堢敤浜?worktree 鍔熻兘锛?- ripgrep锛坄rg` 鍛戒护锛岀敤浜?grep 宸ュ叿锛?
+### 8.2 閰嶇疆
 
-### 8.2 配置
-
-创建 `~/.cove/config.json`:
+鍒涘缓 `~/.cove/config.json`:
 
 ```json
 {
@@ -1641,47 +1197,43 @@ defer cancel()
 }
 ```
 
-或使用环境变量：
+鎴栦娇鐢ㄧ幆澧冨彉閲忥細
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-xxx"
 export COVE_MODEL="claude-sonnet-4-20250514"
 ```
 
-### 8.3 构建
+### 8.3 鏋勫缓
 
 ```bash
-# 基础构建
+# 鍩虹鏋勫缓
 cd G:\github\cove\agent
 go build -o cove.exe ./cli/cove/
 
-# 包含 Headless Chrome 支持（可选）
+# 鍖呭惈 Headless Chrome 鏀寔锛堝彲閫夛級
 go build -tags chromedp -o cove.exe ./cli/cove/
 
-# 运行
+# 杩愯
 ./cove.exe
 ```
 
-### 8.4 开发模式
-
+### 8.4 寮€鍙戞ā寮?
 ```bash
-# 直接运行（无需构建）
-go run ./cli/cove/
+# 鐩存帴杩愯锛堟棤闇€鏋勫缓锛?go run ./cli/cove/
 
-# 运行测试
+# 杩愯娴嬭瘯
 go test ./internal/...
 
-# 运行特定包测试
-go test ./internal/engine/ -v -run TestEngineBasicMessageFlow
+# 杩愯鐗瑰畾鍖呮祴璇?go test ./internal/engine/ -v -run TestEngineBasicMessageFlow
 ```
 
 ---
 
-## 9. 如何扩展系统
+## 9. 濡備綍鎵╁睍绯荤粺
 
-### 9.1 添加新工具
-
+### 9.1 娣诲姞鏂板伐鍏?
 ```go
-// 1. 创建新文件 internal/tool/my_tool.go
+// 1. 鍒涘缓鏂版枃浠?internal/tool/my_tool.go
 package tool
 
 type MyTool struct{}
@@ -1689,11 +1241,11 @@ type MyTool struct{}
 func (t *MyTool) Def() Def {
     return Def{
         Name:        "my_tool",
-        Description: "我的自定义工具",
+        Description: "鎴戠殑鑷畾涔夊伐鍏?,
         InputSchema: json.RawMessage(`{
             "type": "object",
             "properties": {
-                "input": {"type": "string", "description": "输入参数"}
+                "input": {"type": "string", "description": "杈撳叆鍙傛暟"}
             },
             "required": ["input"]
         }`),
@@ -1708,32 +1260,28 @@ func (t *MyTool) CheckPermissions(input Input, tctx Context) PermissionDecision 
 }
 
 func (t *MyTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-    // 实现逻辑
-    return Result{Data: "结果"}, nil
+    // 瀹炵幇閫昏緫
+    return Result{Data: "缁撴灉"}, nil
 }
 
-// 2. 在 registry.go 中注册
-// reg.Register(&MyTool{})
+// 2. 鍦?registry.go 涓敞鍐?// reg.Register(&MyTool{})
 ```
 
-### 9.2 添加新 AI Provider
+### 9.2 娣诲姞鏂?AI Provider
 
 ```go
-// 1. 创建 internal/api/my_provider.go
+// 1. 鍒涘缓 internal/api/my_provider.go
 type MyProvider struct { ... }
 
 func (p *MyProvider) Name() string { return "my_provider" }
 func (p *MyProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) { ... }
 func (p *MyProvider) ChatStream(ctx context.Context, req ChatRequest, h StreamHandler) (*ChatResponse, error) { ... }
 
-// 2. 在 provider_catalog.go 中添加
-// catalog["my_provider"] = func(cfg) Provider { return NewMyProvider(cfg) }
+// 2. 鍦?provider_catalog.go 涓坊鍔?// catalog["my_provider"] = func(cfg) Provider { return NewMyProvider(cfg) }
 ```
 
-### 9.3 添加 MCP 服务器
-
-在配置文件中添加：
-
+### 9.3 娣诲姞 MCP 鏈嶅姟鍣?
+鍦ㄩ厤缃枃浠朵腑娣诲姞锛?
 ```json
 {
     "mcp_servers": [
@@ -1747,89 +1295,86 @@ func (p *MyProvider) ChatStream(ctx context.Context, req ChatRequest, h StreamHa
 
 ---
 
-## 10. 测试策略
+## 10. 娴嬭瘯绛栫暐
 
-### 10.1 单元测试
+### 10.1 鍗曞厓娴嬭瘯
 
-- **Engine 测试** (`engine_test.go`, 1076 行): 使用 Mock Provider 和 Mock Tool 进行集成测试
-- **Skill 测试** (`skills_test.go`): 测试技能加载和注册
-- **Session 测试** (`store_test.go`): 测试会话持久化
-- **Diagnostic 测试** (`diagnostic_test.go`): 测试诊断功能
+- **Engine 娴嬭瘯** (`engine_test.go`, 1076 琛?: 浣跨敤 Mock Provider 鍜?Mock Tool 杩涜闆嗘垚娴嬭瘯
+- **Skill 娴嬭瘯** (`skills_test.go`): 娴嬭瘯鎶€鑳藉姞杞藉拰娉ㄥ唽
+- **Session 娴嬭瘯** (`store_test.go`): 娴嬭瘯浼氳瘽鎸佷箙鍖?- **Diagnostic 娴嬭瘯** (`diagnostic_test.go`): 娴嬭瘯璇婃柇鍔熻兘
 
-### 10.2 Mock 策略
+### 10.2 Mock 绛栫暐
 
 ```go
-// Mock Provider - 模拟 AI 响应
+// Mock Provider - 妯℃嫙 AI 鍝嶅簲
 type mockProvider struct {
-    responses []mockResponse  // 预设的响应队列
-}
+    responses []mockResponse  // 棰勮鐨勫搷搴旈槦鍒?}
 
-// Mock Tool - 可控的工具行为
-type mockTool struct {
+// Mock Tool - 鍙帶鐨勫伐鍏疯涓?type mockTool struct {
     name     string
     readOnly bool
     result   string
     err      error
-    panicMsg string  // 测试 panic 恢复
-    delay    time.Duration  // 模拟慢速工具
-}
+    panicMsg string  // 娴嬭瘯 panic 鎭㈠
+    delay    time.Duration  // 妯℃嫙鎱㈤€熷伐鍏?}
 ```
 
-### 10.3 关键测试场景
+### 10.3 鍏抽敭娴嬭瘯鍦烘櫙
 
-| 测试用例 | 测试内容 |
+| 娴嬭瘯鐢ㄤ緥 | 娴嬭瘯鍐呭 |
 |----------|----------|
-| `TestEngineBasicMessageFlow` | 基本消息流程 |
-| `TestEngineToolExecution` | 工具调用执行 |
-| `TestEnginePermissionDenied` | 权限拒绝 |
-| `TestEngineToolPanicRecovery` | 工具 Panic 恢复 |
-| `TestEngineMultipleIterations` | 多轮工具调用 |
-| `TestEngineAPIError` | API 错误处理 |
-| `TestEngineContextCancellation` | 上下文取消 |
-| `TestEnginePermissionPromptNil` | 权限钩子未设置 |
+| `TestEngineBasicMessageFlow` | 鍩烘湰娑堟伅娴佺▼ |
+| `TestEngineToolExecution` | 宸ュ叿璋冪敤鎵ц |
+| `TestEnginePermissionDenied` | 鏉冮檺鎷掔粷 |
+| `TestEngineToolPanicRecovery` | 宸ュ叿 Panic 鎭㈠ |
+| `TestEngineMultipleIterations` | 澶氳疆宸ュ叿璋冪敤 |
+| `TestEngineAPIError` | API 閿欒澶勭悊 |
+| `TestEngineContextCancellation` | 涓婁笅鏂囧彇娑?|
+| `TestEnginePermissionPromptNil` | 鏉冮檺閽╁瓙鏈缃?|
 
-### 10.4 运行测试
+### 10.4 杩愯娴嬭瘯
 
 ```bash
-# 全部测试
+# 鍏ㄩ儴娴嬭瘯
 go test ./...
 
-# 指定测试
+# 鎸囧畾娴嬭瘯
 go test ./internal/engine/ -v -run "TestEngine"
 
-# 带覆盖率
+# 甯﹁鐩栫巼
 go test ./... -coverprofile=coverage.out
 go tool cover -html=coverage.out
 ```
 
 ---
 
-## 附录 A: 关键常量
+## 闄勫綍 A: 鍏抽敭甯搁噺
 
-| 常量 | 值 | 说明 |
+| 甯搁噺 | 鍊?| 璇存槑 |
 |------|-----|------|
-| `maxContextMessages` | 200 | 最大上下文消息数 |
-| `maxContextTokens` | 90000 | 最大上下文 Token 数 |
-| `stallThreshold` | 30s | 卡顿检测阈值 |
-| `maxBodySize` | 5MB | 网页抓取最大体积 |
-| `outputLimit` | 100KB | 网页输出截断 |
-| `defaultDim` | 384 | 向量嵌入维度 |
-| `reviewInterval` | 4 messages | 后台回顾触发间隔 |
-| `reviewTimeout` | 30s | 后台回顾超时 |
+| `maxContextMessages` | 200 | 鏈€澶т笂涓嬫枃娑堟伅鏁?|
+| `maxContextTokens` | 90000 | 鏈€澶т笂涓嬫枃 Token 鏁?|
+| `stallThreshold` | 30s | 鍗￠】妫€娴嬮槇鍊?|
+| `maxBodySize` | 5MB | 缃戦〉鎶撳彇鏈€澶т綋绉?|
+| `outputLimit` | 100KB | 缃戦〉杈撳嚭鎴柇 |
+| `defaultDim` | 384 | 鍚戦噺宓屽叆缁村害 |
+| `reviewInterval` | 4 messages | 鍚庡彴鍥為【瑙﹀彂闂撮殧 |
+| `reviewTimeout` | 30s | 鍚庡彴鍥為【瓒呮椂 |
 
-## 附录 B: 环境变量
+## 闄勫綍 B: 鐜鍙橀噺
 
-| 变量 | 说明 |
+| 鍙橀噺 | 璇存槑 |
 |------|------|
 | `ANTHROPIC_API_KEY` | Anthropic API Key |
 | `OPENAI_API_KEY` | OpenAI API Key |
-| `OPENAI_BASE_URL` | OpenAI 兼容端点 |
-| `OPENAI_MODEL` | OpenAI 模型名称 |
-| `COVE_MODEL` | 覆盖模型选择 |
-| `COVE_PROVIDER` | 覆盖 Provider 选择 |
+| `OPENAI_BASE_URL` | OpenAI 鍏煎绔偣 |
+| `OPENAI_MODEL` | OpenAI 妯″瀷鍚嶇О |
+| `COVE_MODEL` | 瑕嗙洊妯″瀷閫夋嫨 |
+| `COVE_PROVIDER` | 瑕嗙洊 Provider 閫夋嫨 |
 
 ---
 
-> **文档版本**: 1.0  
-> **最后更新**: 2025  
-> **适用代码版本**: cove/agent (G:\github\cove\agent)
+> **鏂囨。鐗堟湰**: 1.0  
+> **鏈€鍚庢洿鏂?*: 2025  
+> **閫傜敤浠ｇ爜鐗堟湰**: cove/agent (G:\github\cove\agent)
+

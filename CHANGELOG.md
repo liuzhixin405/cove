@@ -1,4 +1,47 @@
-﻿## [7.1.1] - 2026-07-04
+﻿## [8.0.0] - 2026-07-18
+
+### Added
+
+#### TUI 主题系统 (Theme System)
+- 全新主题系统 `internal/tui/theme/`，支持 5 套内置主题：
+  - **Catppuccin** (Mocha) — 暖色调舒适主题
+  - **Dracula** — 经典暗色高对比主题
+  - **Gruvbox** — 复古暖色主题
+  - **OneDark** — Atom 编辑器经典主题
+  - **TokyoNight** — 夜间蓝紫色调主题
+- 主题接口：`theme.go` 定义 `Theme` 接口，包含 20+ 语义化颜色令牌（text、accent、success、warning、error、border 等）
+- 按需自由切换：TUI 内通过快捷键或命令切换主题
+
+#### MCP 客户端重构 (Client Refactor)
+- `internal/mcp/client.go` 全面重构：连接生命周期管理、超时控制、停止信号通道
+- 改进的 goroutine 安全管理：`stopCh` 机制确保 `Receive()` 调用可被取消
+- 更健壮的错误处理和重连逻辑
+
+#### 循环检测增强 (LoopDetector)
+- Layer 1b 模糊匹配增强：区分工具参数变化，减少误报
+- Layer 2 输出循环检测修复：从仅日志升级为主动注入引导+硬中止
+- Layer 3 停滞检测激活：`RecordIteration()` 和 `RecordFileActivity()` 现在被正确调用
+- 新增 Layer 1b 工具输出进度检测：相同模式下产出 ≥4 种不同输出时重置循环计数
+
+#### 引擎改进 (Engine)
+- `OnToolStart` 回调：工具执行前通知，配合 `OnToolProgress` 提供完整生命周期回调
+- 流式输出 ANSI 清理：TUI 显示工具输出时自动去除 ANSI 转义码
+- CompressHistory 中文乱码修复
+
+### Changed
+- **TUI 视图层重构**：tui.go 重写 640+ 行，视图布局全面优化
+- **styles.go**：重构为基于主题令牌的样式系统（253 行 → 256 行，+256/-57）
+- 引擎中的循环检测配置同步更新（fpWindow = 10）
+
+### Fixed
+- 修复 compressHistory() 中文乱码（锟斤拷问题）
+- 修复 MCP client 上下文取消未正确处理的问题
+- 修复 TUI tool start 时缺少回调通知
+
+### Chore
+- `internal/tui/tui_smoke_test.go` 测试覆盖扩展（+267 行）
+
+## [7.1.1] - 2026-07-04
 
 ### Chore
 
@@ -7,13 +50,69 @@
 - **测试脚本迁移**: test_e2e_steer.py 移入 scripts/
 - **.gitignore 优化**: 移除 blanket *.md 规则，改用精确忽略
 
-# Changelog
+## [7.0.6] - 2026-07-17
 
-All notable changes to cove will be documented in this file.
+### Added
+- **TUI F6 复制模式切换**：按下 F6 可在 TUI 中选择/复制文本（原生拖拽选择）
+- Shift+Wheel 支持：按住 Shift 滚动鼠标滚轮时正常滚动视口
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [7.0.5] - 2026-07-04
 
+### Fixed
+- **中文乱码修复**：修复多文件中的锟斤拷（mojibake）显示问题
+- 清理旧的回退兼容代码（repl_history.go）
+
+### Changed
+- Activity 提示从中文改为英文
+- Review 输出改为纯英文
+
+## [7.0.4] - 2026-07-03
+
+### Changed
+- **文档重组**：将 COVE_COMPLETE_GUIDE.md、DEVELOPMENT_DESIGN.md、DEVELOPMENT_GUIDE.md 移入 docs/guide/
+- 清理根目录临时文件（session_notes.md, testout.txt）
+
+### Fixed
+- 修复 test_e2e_steer.py 路径问题，移至 scripts/
+
+## [7.0.3] - 2026-07-01
+
+### Changed
+- **精简系统提示词**：精简 system_prompt 长度，将参考配置写入 config.example.json
+- 减少不必要的上下文占用
+
+## [7.0.2] - 2026-06-30
+
+### Added
+- **极致系统提示词优化**：任务完成标准、防编造规则、工具调用规范、双语支持
+- 更严格的完成任务验证要求
+
+## [7.0.1] - 2026-06-28
+
+### Chore
+- **文档归档**：将未使用的优化文档移入 docs/archive/
+- 添加 .gitignore 规则忽略 archive 目录
+
+## [7.0.0] - 2026-06-25
+
+### Added
+- **P0-P2 共 14 项完整优化实现**，基于设计文档 (DEVELOPMENT_DESIGN.md)
+- 循环检测（3-Layer LoopDetector）
+- 模型故障转移（ModelFallback）
+- 对话压缩（ChatCompressor）
+- 工具输出掩码（ToolOutputMasker）
+- NextSpeaker、PolicyEngine、MCP Streamable HTTP
+- SessionDiff、Telemetry、Safety、Enhanced RepoMap
+
+### Changed
+- Engine 重构：集成 ModelFallback、ModelRouter、LoopDetector 统一编排
+- Config 扩展：新增 ModelFast、循环检测相关配置
+
+### Documentation
+- 详细设计文档 DEVELOPMENT_DESIGN.md（1208 行）
+- 开发指南 DEVELOPMENT_GUIDE.md（1584 行）
+- 完整开发手册 COVE_COMPLETE_GUIDE.md（1780 行）
+- 配置模板 config.example.json
 ## [6.3.1] - 2026-06-20
 
 ### Added
@@ -171,4 +270,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session save/resume, Memory persistence
 - MCP (Model Context Protocol) server support
 - Plugin system, Skills system
+
 
