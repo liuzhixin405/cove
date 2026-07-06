@@ -1,4 +1,4 @@
-package engine
+﻿package engine
 
 import (
 	"context"
@@ -64,6 +64,9 @@ type Config struct {
 }
 
 type Engine struct {
+	// fallback wraps the single AI provider. The struct is called "ModelFallback"
+	// but multi-provider failover is not used -- the engine always initializes it
+	// with exactly one provider (multi-provider fallback is user-rejected).
 	fallback              *api.ModelFallback
 	modelRouter           *api.ModelRouter
 	registry              *tool.Registry

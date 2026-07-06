@@ -54,10 +54,10 @@ type LoopDetector struct {
 	lastToolOnlyPattern string
 
 	// Layer 2: output content hash sliding window
-	outHashes  []string        // most recent N hashes
-	outCounts  map[string]int  // hash -> count within window
-	outWindow  int             // window size (default 40)
-	outThresh  int             // break threshold (default 8)
+	outHashes []string       // most recent N hashes
+	outCounts map[string]int // hash -> count within window
+	outWindow int            // window size (default 40)
+	outThresh int            // break threshold (default 8)
 
 	// Guard: track how many times we've broken a loop in this turn.
 	// On the Nth break we escalate (hard stop).
@@ -121,7 +121,7 @@ func NewLoopDetectorWithModel(isFastModel bool) *LoopDetector {
 		ld.toolOnlyWindow = 10
 		ld.toolOnlyThresh = 8
 		ld.outWindow = 30
-		ld.outThresh = 8 // 8/30
+		ld.outThresh = 8    // 8/30
 		ld.stallThresh = 50 // more tolerant for flash models
 	}
 	return ld
@@ -267,6 +267,11 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 // clear the Layer 1b history to prevent false positives.
 func (ld *LoopDetector) RecordOutput(output string) LoopResult {
 	if len(output) == 0 {
+		return LoopResult{}
+	}
+	// "No changes" style outputs are common in idempotent workflows and should
+	// not be treated as loop evidence.
+	if isNoChangeOutput(output) {
 		return LoopResult{}
 	}
 	h := hashPrefix(output, 512)
@@ -439,6 +444,31 @@ func hashPrefix(s string, maxLen int) string {
 	}
 	sum := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("%x", sum[:8])
+}
+
+func isNoChangeOutput(output string) bool {
+	s := strings.ToLower(strings.TrimSpace(output))
+	if s == "" {
+		return false
+	}
+	markers := []string{
+		"no changes",
+		"no change",
+		"unchanged",
+		"already up to date",
+		"already up-to-date",
+		"already contains the exact content",
+		"new content is the same as old content",
+		"内容未改变",
+		"无改动",
+		"没有变化",
+	}
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // injectLoopGuidance builds the message inserted into the conversation when

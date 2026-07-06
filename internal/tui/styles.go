@@ -5,55 +5,59 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/liuzhixin405/cove/internal/tui/theme"
 )
 
+// Package-level styles are applied with theme colors at init time.
+// applyTheme() is called whenever the theme changes to rebuild these.
 var (
-	accent = lipgloss.Color("14")  // ANSI Bright Cyan (Maps exactly to \x1b[96m, which is the exact color of the Cove Logo)
-	subtle = lipgloss.Color("240") // grey
-	good   = lipgloss.Color("70")  // green
-	warn   = lipgloss.Color("214") // amber
+	dimStyle          lipgloss.Style
+	userStyle         lipgloss.Style
+	warnStyle         lipgloss.Style
+	thinkHeaderStyle  lipgloss.Style
+	mainAreaStyle     = lipgloss.NewStyle().Padding(0, 1)
+	bottomBarStyle    lipgloss.Style
+	activityStyle     lipgloss.Style
+	overlayBoxStyle   lipgloss.Style
+	overlayTitleStyle lipgloss.Style
+	selectedStyle     lipgloss.Style
+	statusBarStyle    lipgloss.Style
+	// btnAllowStyle/btnDenyStyle/btnAlwaysStyle removed — buttons are
+	// rendered inline with theme colors in renderPermission().
+)
 
-	dimStyle  = lipgloss.NewStyle().Foreground(subtle)
+// applyTheme rebuilds all color-dependent styles with the current theme.
+func applyTheme() {
+	t := theme.Current()
+	accent := lipgloss.Color(t.Primary)
+	subtle := lipgloss.Color(t.TextMuted)
+	warn := lipgloss.Color(t.Warning)
+
+	dimStyle = lipgloss.NewStyle().Foreground(subtle)
 	userStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	warnStyle = lipgloss.NewStyle().Foreground(warn).Bold(true)
-	// thinkHeaderStyle marks the clickable fold/unfold line for a turn's thinking.
 	thinkHeaderStyle = lipgloss.NewStyle().Foreground(subtle).Italic(true)
-
-	mainAreaStyle = lipgloss.NewStyle().Padding(0, 1)
-
 	bottomBarStyle = lipgloss.NewStyle().Foreground(subtle)
-
 	activityStyle = lipgloss.NewStyle().Foreground(accent)
 
 	overlayBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(accent).
-			Padding(0, 1)
-
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(0, 1)
 	overlayTitleStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
-
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(accent)
-
+	selectedStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(t.SelectedFG)).
+		Background(lipgloss.Color(t.SelectedBG))
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("232")). // Muted dark text for superb contrast on light cyan bar
-			Background(accent).                // Soft Cyan palette (matching BrightCyan logo)
-			Bold(true)
+		Foreground(lipgloss.Color(t.SelectedFG)).
+		Background(accent).
+		Bold(true)
 
-	btnAllowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("231")).
-			Background(good).
-			Bold(true)
+}
 
-	btnDenyStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("196")). // Red background
-			Bold(true)
-
-	btnAlwaysStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("231")).
-			Background(warn).
-			Bold(true)
-)
+func init() {
+	applyTheme()
+}
 
 func (m *Model) renderStatusBar() string {
 	model := m.status.Model
@@ -80,9 +84,9 @@ func (m *Model) renderStatusBar() string {
 
 	centerText := " " + strings.Join(centerParts, " · ") + " "
 
-	state := "就绪"
+	state := "Ready"
 	if m.task.Running {
-		state = "运行中 ⚡"
+		state = "Busy"
 	}
 	right := " " + state + " "
 
@@ -143,7 +147,7 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+R 历史 · / 命令 · Ctrl+C 退出 "
+	right := "Ctrl+S Sessions · Ctrl+K Commands · ? Help · Esc Cancel · Ctrl+C Quit "
 
 	w := m.width
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
@@ -171,7 +175,7 @@ func (m *Model) renderTransient() string {
 	case m.activity != "":
 		left = "⚙ " + m.activity
 	case m.task.Running:
-		left = "⚙ 处理中…"
+		left = "⚙ Running..."
 	}
 	if m.task.Elapsed != "" && (m.activity != "" || m.task.Running) {
 		left += "  " + m.task.Elapsed
@@ -179,7 +183,7 @@ func (m *Model) renderTransient() string {
 
 	right := ""
 	if len(m.task.Queued) > 0 {
-		right = fmt.Sprintf("+%d 排队", len(m.task.Queued))
+		right = fmt.Sprintf("+%d queued", len(m.task.Queued))
 	}
 
 	w := m.width
@@ -195,7 +199,14 @@ func (m *Model) renderTransient() string {
 // over the conversation body.
 func (m *Model) renderOverlay(height int) string {
 	var b strings.Builder
-	innerW := m.width - 4
+	boxW := m.width - 2
+	if boxW > 88 {
+		boxW = 88
+	}
+	if boxW < 28 {
+		boxW = 28
+	}
+	innerW := boxW - 2
 	if innerW < 4 {
 		innerW = 4
 	}
@@ -207,8 +218,8 @@ func (m *Model) renderOverlay(height int) string {
 	var title, hint string
 	var labels []string
 	if m.overlay == overlayCommand {
-		title = "命令面板"
-		hint = "↑/↓ 选择 · Enter 执行 · Esc 关闭"
+		title = "Commands"
+		hint = "Up/Down navigate · Enter run · Esc close"
 		for _, c := range m.filteredCommands() {
 			label := "/" + c.Name
 			if c.Desc != "" {
@@ -217,14 +228,14 @@ func (m *Model) renderOverlay(height int) string {
 			labels = append(labels, label)
 		}
 	} else {
-		title = "历史会话"
-		hint = "↑/↓ 选择 · Enter 恢复 · Esc 关闭"
-		for _, h := range m.filteredHistory() {
+		title = "Sessions"
+		hint = "Up/Down navigate · Number+Enter resume · Esc close"
+		for i, h := range m.filteredHistory() {
 			t := h.Title
 			if t == "" {
-				t = "(未命名)"
+				t = "(untitled)"
 			}
-			labels = append(labels, t)
+			labels = append(labels, fmt.Sprintf("%2d. %s", i+1, t))
 		}
 	}
 
@@ -233,7 +244,7 @@ func (m *Model) renderOverlay(height int) string {
 
 	rowsShown := 0
 	if len(labels) == 0 {
-		b.WriteString(dimStyle.Render("（无匹配项）") + "\n")
+		b.WriteString(dimStyle.Render("(no matches)") + "\n")
 		rowsShown = 1
 	} else {
 		start := 0
@@ -258,14 +269,70 @@ func (m *Model) renderOverlay(height int) string {
 	}
 
 	content := b.String() + "\n" + dimStyle.Render(hint)
-	return overlayBoxStyle.Width(m.width - 2).MaxHeight(height).Render(content)
+	return overlayBoxStyle.Width(boxW).MaxHeight(height).Render(content)
 }
 
 // renderPermission renders the interactive permission-confirmation overlay. The
 // row region is padded to a constant height (matching renderOverlay) so the box
 // is always exactly `height` lines and never shifts the input box.
+func (m *Model) renderQuitDialog() string {
+	t := theme.Current()
+	w := m.width - 4
+	if w > 64 {
+		w = 64
+	}
+	if w < 20 {
+		w = 20
+	}
+
+	question := "Quit cove?"
+	yesStr := " Yes (Y) "
+	noStr := " No (N) "
+
+	yesStyle := lipgloss.NewStyle().Padding(0, 2)
+	noStyle := lipgloss.NewStyle().Padding(0, 2)
+
+	if m.quitSelectedNo {
+		noStyle = noStyle.
+			Background(lipgloss.Color(t.Primary)).
+			Foreground(lipgloss.Color(t.SelectedFG)).
+			Bold(true)
+		yesStyle = yesStyle.
+			Foreground(lipgloss.Color(t.TextMuted))
+	} else {
+		yesStyle = yesStyle.
+			Background(lipgloss.Color(t.Primary)).
+			Foreground(lipgloss.Color(t.SelectedFG)).
+			Bold(true)
+		noStyle = noStyle.
+			Foreground(lipgloss.Color(t.TextMuted))
+	}
+
+	yesBtn := yesStyle.Render(yesStr)
+	noBtn := noStyle.Render(noStr)
+	buttons := lipgloss.JoinHorizontal(lipgloss.Left, yesBtn, "  ", noBtn)
+
+	content := lipgloss.JoinVertical(lipgloss.Center,
+		question,
+		"",
+		buttons,
+	)
+
+	return overlayBoxStyle.
+		Width(w).
+		Render(content)
+}
+
 func (m *Model) renderPermission(height int) string {
-	innerW := m.width - 4
+	t := theme.Current()
+	boxW := m.width - 2
+	if boxW > 88 {
+		boxW = 88
+	}
+	if boxW < 28 {
+		boxW = 28
+	}
+	innerW := boxW - 2
 	if innerW < 4 {
 		innerW = 4
 	}
@@ -275,14 +342,14 @@ func (m *Model) renderPermission(height int) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(overlayTitleStyle.Render("权限确认") + "\n\n")
+	b.WriteString(overlayTitleStyle.Render("Permission") + "\n\n")
 
 	tool := m.permTool
 	if tool == "" {
 		tool = "?"
 	}
 	rows := []string{
-		"工具 " + warnStyle.Render(tool) + " 请求执行：",
+		"Tool " + warnStyle.Render(tool) + " requests:",
 	}
 	if d := strings.TrimSpace(m.permDesc); d != "" {
 		rows = append(rows, "  "+truncate(d, innerW-2))
@@ -300,13 +367,71 @@ func (m *Model) renderPermission(height int) string {
 		b.WriteString("\n")
 	}
 
-	allowBtn := btnAllowStyle.Render(" 允许 (y) ")
-	denyBtn := btnDenyStyle.Render(" 拒绝 (n) ")
-	alwaysBtn := btnAlwaysStyle.Render(" 始终允许 (a) ")
-	buttonsLine := allowBtn + "  " + denyBtn + "  " + alwaysBtn + "  " + dimStyle.Render("(或按 Esc/n 拒绝)")
+	// Style buttons based on selected option (like opencode)
+	primary := lipgloss.Color(t.Primary)
+	selectedFG := lipgloss.Color(t.SelectedFG)
+	muted := lipgloss.Color(t.TextMuted)
+	errColor := lipgloss.Color(t.Error)
+
+	baseBtn := lipgloss.NewStyle().Padding(0, 1)
+	allowStyle := baseBtn
+	sessionStyle := baseBtn
+	denyStyle := baseBtn
+
+	switch m.permSelected {
+	case 0:
+		allowStyle = allowStyle.Background(primary).Foreground(selectedFG).Bold(true)
+		sessionStyle = sessionStyle.Foreground(muted)
+		denyStyle = denyStyle.Foreground(muted)
+	case 1:
+		allowStyle = allowStyle.Foreground(muted)
+		sessionStyle = sessionStyle.Background(primary).Foreground(selectedFG).Bold(true)
+		denyStyle = denyStyle.Foreground(muted)
+	case 2:
+		allowStyle = allowStyle.Foreground(muted)
+		sessionStyle = sessionStyle.Foreground(muted)
+		denyStyle = denyStyle.Background(errColor).Foreground(selectedFG).Bold(true)
+	}
+
+	allowBtn := allowStyle.Render(" Allow ")
+	sessionBtn := sessionStyle.Render(" Always ")
+	denyBtn := denyStyle.Render(" Deny ")
+	buttonsLine := allowBtn + "  " + sessionBtn + "  " + denyBtn + "  " + dimStyle.Render("Left/Right switch · Enter confirm")
 
 	content := b.String() + "\n" + buttonsLine
-	return overlayBoxStyle.Width(m.width - 2).MaxHeight(height).Render(content)
+	return overlayBoxStyle.Width(boxW).MaxHeight(height).Render(content)
+}
+
+func (m *Model) renderHelp(height int) string {
+	boxW := m.width - 2
+	if boxW > 76 {
+		boxW = 76
+	}
+	if boxW < 28 {
+		boxW = 28
+	}
+	var b strings.Builder
+	b.WriteString(overlayTitleStyle.Render("Help") + "\n\n")
+	b.WriteString("  Session / Commands\n")
+	b.WriteString("    Ctrl+S   Sessions\n")
+	b.WriteString("    Ctrl+K   Commands\n")
+	b.WriteString("    Ctrl+O   Model\n")
+	b.WriteString("    Ctrl+F   Attachments\n")
+	b.WriteString("    Ctrl+L   Tasks/Logs\n")
+	b.WriteString("\n")
+	b.WriteString("  Chat\n")
+	b.WriteString("    Enter    Send message\n")
+	b.WriteString("    \\ + Enter New line\n")
+	b.WriteString("    PgUp/Dn  Scroll\n")
+	b.WriteString("    Alt+T    Toggle reasoning\n")
+	b.WriteString("\n")
+	b.WriteString("  System\n")
+	b.WriteString("    Ctrl+T   Theme\n")
+	b.WriteString("    Esc      Cancel running task\n")
+	b.WriteString("    Ctrl+C   Quit confirm\n")
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("Esc / Enter / ? close help"))
+	return overlayBoxStyle.Width(boxW).MaxHeight(height).Render(b.String())
 }
 
 func (m *Model) renderGitPanel() string {
@@ -327,6 +452,7 @@ func (m *Model) renderGitPanel() string {
 		return ""
 	}
 
+	t := theme.Current()
 	w := m.width
 	branchInfo := ""
 	if m.status.Git != "" {
@@ -334,17 +460,20 @@ func (m *Model) renderGitPanel() string {
 		branchInfo = " [" + strings.TrimSuffix(m.status.Git, "*") + "]"
 	}
 
+	warnFG := lipgloss.Color(t.Warning)
+	subtleFG := lipgloss.Color(t.TextMuted)
+
 	if !m.gitExpanded {
-		text := fmt.Sprintf("  ▸ 工作区%s有 %d 个文件变更 (按 Ctrl+G 或点击此处展开变动详情)", branchInfo, len(files))
-		return lipgloss.NewStyle().Foreground(warn).Bold(true).Width(w).Render(text)
+		text := fmt.Sprintf("  ▸ Workspace%s has %d changed files (Ctrl+G to expand)", branchInfo, len(files))
+		return lipgloss.NewStyle().Foreground(warnFG).Bold(true).Width(w).Render(text)
 	}
 
 	var sb strings.Builder
-	header := fmt.Sprintf("  ▾ 工作区%s变动文件列表 (共 %d 个，按 Ctrl+G 或点击此处折叠隐藏)：", branchInfo, len(files))
-	sb.WriteString(lipgloss.NewStyle().Foreground(warn).Bold(true).Render(header) + "\n")
+	header := fmt.Sprintf("  ▾ Workspace%s changed files (%d total, Ctrl+G to collapse):", branchInfo, len(files))
+	sb.WriteString(lipgloss.NewStyle().Foreground(warnFG).Bold(true).Render(header) + "\n")
 
 	for _, f := range files {
-		sb.WriteString("    " + lipgloss.NewStyle().Foreground(subtle).Render(f) + "\n")
+		sb.WriteString("    " + lipgloss.NewStyle().Foreground(subtleFG).Render(f) + "\n")
 	}
 
 	return strings.TrimSuffix(sb.String(), "\n")

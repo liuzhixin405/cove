@@ -25,7 +25,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/tui"
 )
 
-// useTUI reports whether the full-screen Bubble Tea UI should be used. The TUI
+// useTUI reports whether the Bubble Tea UI should be used. The TUI
 // is now the DEFAULT for interactive sessions. It is skipped when explicitly
 // disabled (--no-tui or COVE_TUI=0) or when stdin/stdout is not a terminal
 // (piped/redirected), where the classic line REPL is more robust. --tui or
@@ -113,7 +113,7 @@ func (q *tuiJobQueue) pop() (cur string, rest []string, ok bool) {
 // runTUI launches the experimental full-screen Bubble Tea UI. It wires the
 // engine's streaming output into the conversation body, keeps the status bars
 // (model/provider/git/permission/cost) in sync, shows transient tool/queue
-// activity, offers a Ctrl+R history overlay to restore past sessions and a "/"
+// activity, offers a Ctrl+S history overlay to restore past sessions and a Ctrl+K
 // command palette to run slash commands. Attachments and interactive permission
 // prompts are not yet covered; those remain available in the classic REPL.
 //
@@ -297,7 +297,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		for _, r := range recs {
 			// Skip sessions with no genuine user input — they only contain
 			// engine-injected synthetic prompts (loop guidance, circuit-breaker
-			// hints, compaction summaries) and were polluting the Ctrl+R list with
+			// hints, compaction summaries) and were polluting the Ctrl+S list with
 			// records the user never actually started.
 			if r.UserTurns == 0 {
 				continue
@@ -468,7 +468,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
 			age := time.Since(draft.UpdatedAt).Truncate(time.Second)
 			intro.WriteString(fmt.Sprintf("\n\n您有一个未完成的片段草稿（创建于 %v 前）。输入「继续」恢复，或直接输入新指令忽略。", age))
-			intro.WriteString("\n\x1b[2m提示: 使用 Ctrl+R 可查看全部可恢复的历史会话\x1b[0m")
+			intro.WriteString("\n\x1b[2m提示: 使用 Ctrl+S 可查看全部可恢复的历史会话\x1b[0m")
 		}
 		if s := strings.TrimSpace(intro.String()); s != "" {
 			app.EngineLine(intro.String() + "\n")
@@ -553,10 +553,19 @@ func handleTUISlashCommand(
 			}
 		}
 		sb.WriteString("\n快捷键:\n")
-		sb.WriteString("  Ctrl+R    打开历史会话搜索\n")
-		sb.WriteString("  Ctrl+G    切换 Git 状态面板\n")
-		sb.WriteString("  Ctrl+C    取消当前任务 / 退出\n")
-		sb.WriteString("  /         打开命令面板\n")
+		sb.WriteString("  Ctrl+S    Sessions\n")
+		sb.WriteString("  Ctrl+K    Commands\n")
+		sb.WriteString("  Ctrl+O    Model\n")
+		sb.WriteString("  Ctrl+F    Attachments\n")
+		sb.WriteString("  Ctrl+H/?  Help\n")
+		sb.WriteString("  Ctrl+G    Git panel\n")
+		sb.WriteString("  Esc       Cancel task\n")
+		sb.WriteString("  Ctrl+C    Quit confirm\n")
+		sb.WriteString("  PgUp/Dn   Scroll chat\n")
+		sb.WriteString("  Wheel     Scroll chat\n")
+		sb.WriteString("  Alt+T     Toggle reasoning\n")
+		sb.WriteString("  Ctrl+T    Switch theme\n")
+		sb.WriteString("  Enter     Send (\\ + Enter for newline)\n")
 		sb.WriteString("\n")
 		return true, sb.String()
 
@@ -570,7 +579,7 @@ func handleTUISlashCommand(
 
 	case "tasks":
 		// Show what's in the queue.
-		return true, "当前执行中，使用 Ctrl+C 中断。所有输入按顺序处理。"
+		return true, "当前执行中，使用 Esc 中断。所有输入按顺序处理。"
 
 	case "compact":
 		// Compact the conversation history.
@@ -609,7 +618,7 @@ func handleTUISlashCommand(
 			}
 			sb.WriteString(fmt.Sprintf("  %2d. [%s] %s\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title))
 		}
-		sb.WriteString("\n提示: 通过 Ctrl+R 可交互搜索并恢复历史会话。\n")
+		sb.WriteString("\n提示: 通过 Ctrl+S 可交互搜索并恢复历史会话。\n")
 		return true, sb.String()
 
 	case "cost":

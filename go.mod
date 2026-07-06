@@ -2,7 +2,7 @@ module github.com/liuzhixin405/cove
 
 go 1.25.0
 
-require golang.org/x/term v0.29.0
+require golang.org/x/term v0.31.0
 
 require (
 	charm.land/bubbles/v2 v2.1.0
@@ -10,6 +10,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.4
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/chromedp/chromedp v0.11.2
+	github.com/yuin/goldmark v1.7.8
 	golang.org/x/sys v0.45.0
 )
 

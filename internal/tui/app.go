@@ -15,7 +15,7 @@ type App struct {
 // NewApp builds an App. onSubmit is called on the UI goroutine when the user
 // submits an input line; the caller typically forwards it to the task runner.
 // onResume is called with a session ID when the user picks a history entry.
-// onInterrupt is called when the user presses Ctrl+C while a task is running.
+// onInterrupt is called when the user requests cancel from the main view (Esc).
 // commands is the static catalog shown in the / command palette.
 func NewApp(modelName string, onSubmit, onResume func(string), onInterrupt func(), commands []CommandItem) *App {
 	m := New(modelName, onSubmit, onResume, onInterrupt, commands)

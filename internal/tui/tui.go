@@ -1,4 +1,4 @@
-// Package tui implements a full-screen, Bubble Tea based terminal UI for cove.
+﻿// Package tui implements a full-screen, Bubble Tea based terminal UI for cove.
 //
 // Design rationale (see /memories/repo/tui-architecture.md): the legacy
 // interactive layer (internal/repl) drives the terminal with hand-written ANSI
@@ -14,6 +14,8 @@
 package tui
 
 import (
+	"os"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/textarea"
@@ -21,7 +23,175 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/liuzhixin405/cove/internal/tui/theme"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
+
+// renderMarkdown renders markdown text s to ANSI-styled terminal output using
+// goldmark with simple inline styling (bold, italic, code, links, headers).
+// Returns s unchanged on any error.
+func renderMarkdown(s string) string {
+	md := goldmark.New()
+	reader := text.NewReader([]byte(s))
+	root := md.Parser().Parse(reader)
+	if root == nil {
+		return s
+	}
+	var out strings.Builder
+	renderNode(&out, root, []byte(s), 0)
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func renderNode(w *strings.Builder, node ast.Node, source []byte, depth int) {
+	th := theme.Current()
+	switch n := node.(type) {
+	case *ast.Document:
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth)
+		}
+	case *ast.Paragraph:
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth)
+		}
+		w.WriteString("\n\n")
+
+	case *ast.Heading:
+		level := n.Level
+		var prefix string
+		switch level {
+		case 1:
+			prefix = "█ "
+		case 2:
+			prefix = "▌ "
+		default:
+			prefix = "▪ "
+		}
+		w.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(th.Primary)).Render(prefix))
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth+1)
+		}
+		w.WriteString("\n\n")
+
+	case *ast.Text:
+		val := string(n.Segment.Value(source))
+		if n.SoftLineBreak() {
+			val += "\n"
+		}
+		w.WriteString(val)
+
+	case *ast.String:
+		w.WriteString(string(n.Value))
+
+	case *ast.CodeSpan:
+		var code strings.Builder
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			if text, ok := child.(*ast.Text); ok {
+				code.WriteString(string(text.Segment.Value(source)))
+			}
+		}
+		w.WriteString(lipgloss.NewStyle().Background(lipgloss.Color(th.CodeBG)).Foreground(lipgloss.Color(th.CodeAccent)).Render(code.String()))
+
+	case *ast.FencedCodeBlock:
+		w.WriteString("\n")
+		lines := n.Lines()
+		for i := 0; i < lines.Len(); i++ {
+			line := lines.At(i)
+			code := string(line.Value(source))
+			w.WriteString(lipgloss.NewStyle().
+				Background(lipgloss.Color(th.CodeBG)).
+				Foreground(lipgloss.Color(th.CodeFG)).
+				PaddingLeft(2).
+				Render(code))
+		}
+		w.WriteString("\n\n")
+
+	case *ast.List:
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth+1)
+		}
+
+	case *ast.ListItem:
+		prefix := "  "
+		for i := 0; i < depth; i++ {
+			prefix += "  "
+		}
+		if parentList, ok := n.Parent().(*ast.List); ok {
+			if !parentList.IsOrdered() {
+				prefix += "• "
+			} else {
+				prefix += "  "
+			}
+		}
+		w.WriteString(prefix)
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth+1)
+		}
+		w.WriteString("\n")
+
+	case *ast.Blockquote:
+		w.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Blockquote)).Italic(true).Render("│ "))
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth+1)
+		}
+
+	case *ast.Emphasis:
+		tag := 1
+		if n.Attributes() != nil {
+			if v, ok := n.AttributeString("level"); ok {
+				if l, ok := v.(int); ok && l > 1 {
+					tag = l
+				}
+			}
+		}
+		style := lipgloss.NewStyle()
+		if tag >= 2 {
+			style = style.Bold(true)
+		} else {
+			style = style.Italic(true)
+		}
+		var inner strings.Builder
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(&inner, child, source, depth+1)
+		}
+		w.WriteString(style.Render(inner.String()))
+
+	case *ast.Link:
+		dest := string(n.Destination)
+		var label strings.Builder
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(&label, child, source, depth+1)
+		}
+		if label.Len() > 0 {
+			w.WriteString(label.String())
+			w.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Link)).Underline(true).Render(" (" + dest + ")"))
+		} else {
+			w.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Link)).Underline(true).Render(dest))
+		}
+
+	case *ast.AutoLink:
+		url := string(n.URL(source))
+		w.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Link)).Underline(true).Render(url))
+
+	case *ast.Image:
+		alt := string(n.Text(source))
+		if alt != "" {
+			w.WriteString("[图: " + alt + "]")
+		} else {
+			w.WriteString("[图]")
+		}
+
+	case *ast.ThematicBreak:
+		w.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Border)).Render(strings.Repeat("─", 40)) + "\n")
+
+	default:
+		// Fallback: render children only
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			renderNode(w, child, source, depth+1)
+		}
+	}
+}
 
 // TaskInfo is a render-only snapshot of the async task runner state. The caller
 // converts its own task snapshot into this struct to avoid a dependency cycle.
@@ -98,24 +268,34 @@ const (
 	overlayNone = iota
 	overlayHistory
 	overlayCommand
+	overlayHelp
 	overlayPermission
 )
 
 // turn is one structured exchange in the conversation transcript. Keeping turns
 // structured (rather than a flat text stream) is what lets each turn's thinking
-// be folded independently and toggled by a mouse click.
+// be folded independently and toggled by Alt+T.
 //
 // A turn is normally a user message plus the assistant's reasoning + answer.
 // A system turn (system==true) carries standalone engine output (resume notices,
 // command results) and has no foldable thinking.
 type turn struct {
-	user      string          // user input ("" for system/assistant-only turns)
-	reasoning strings.Builder // streamed thinking; display/fold only
+	user         string          // user input ("" for system/assistant-only turns)
+	reasoning    strings.Builder // streamed thinking; display/fold only
 	answer       strings.Builder // streamed answer + interleaved engine/tool lines
 	streamedText strings.Builder // ONLY text deltas (no engine lines); used for end-of-stream alignment
-	expanded     bool            // user clicked the thinking header open
-	system    bool            // standalone engine output, not foldable
+	expanded     bool            // true = show thinking (toggled by Alt+T)
+	system       bool            // standalone engine output, not foldable
 }
+
+// clickRegion maps a viewport content line range to a conversation turn, so
+// mouse clicks on the thinking header toggle the fold state of that turn.
+type clickRegion struct {
+	startLine int
+	endLine   int
+	turnIdx   int
+}
+
 
 // Model is the root Bubble Tea model holding all UI state.
 type Model struct {
@@ -133,9 +313,6 @@ type Model struct {
 	// turn currently receiving streamed deltas (-1 when not streaming).
 	curTurn    int
 	streamTurn int
-	// clickMap maps a wrapped viewport row to the turn index whose thinking
-	// header sits on that row, so a mouse click can toggle the right fold.
-	clickMap map[int]int
 
 	status  StatusInfo
 	task    TaskInfo
@@ -150,10 +327,9 @@ type Model struct {
 
 	gitExpanded bool
 
-	// mouseEnabled toggles between mouse mode (click/scroll) and selection mode
-	// (native text drag-selection). F4/F2/F3 toggle.
-	mouseEnabled bool
-
+	// Mouse mode: captures click/release/wheel so the app can toggle thinking
+	// headers and scroll inside the conversation body. Native text selection
+	// still works in most terminals by holding Shift while clicking/dragging.
 	// overlay is the modal layer drawn over the conversation body
 	// (overlayNone when hidden). search/overlayIdx drive it.
 	overlay    int
@@ -162,21 +338,33 @@ type Model struct {
 
 	// permission-prompt overlay state. permReply is the channel the blocked
 	// worker goroutine waits on; it is non-nil only while a prompt is showing.
-	permTool  string
-	permDesc  string
-	permReply chan PermDecision
+	permTool     string
+	permDesc     string
+	permReply    chan PermDecision
+	permSelected int // 0=Allow, 1=AllowAlways, 2=Deny
+
+	showQuit       bool
+	quitSelectedNo bool // true = "No" selected (default, safe)
 
 	onSubmit    func(string)
 	onResume    func(string)
 	onInterrupt func()
 	quitting    bool
+	// clickRegions tracks where each turn's thinking header is rendered in the viewport
+	// content, enabling mouse-click toggling of the fold state.
+	clickRegions []clickRegion
+	// scrolledUp is set when the user manually scrolls the viewport with PgUp/Dn or arrows.
+	// When true, stream deltas do NOT auto-scroll to the bottom, preserving the user's
+	// reading position. Reset on new message submit or PgDn to bottom.
+	scrolledUp bool
+
 }
 
 // New constructs a Model. onSubmit is invoked (on the UI goroutine) whenever the
 // user submits a line from the input box. onResume is invoked with a session ID
 // when the user picks an entry from the history overlay. onInterrupt is invoked
-// when the user presses Ctrl+C while a task is running (to cancel it instead of
-// quitting). commands is the static catalog shown in the / command palette.
+// when the user requests to interrupt a running task (Esc in the main view).
+// commands is the static catalog shown in the command palette.
 func New(modelName string, onSubmit, onResume func(string), onInterrupt func(), commands []CommandItem) *Model {
 	ta := textarea.New()
 	ta.Placeholder = "输入指令…"
@@ -198,20 +386,21 @@ func New(modelName string, onSubmit, onResume func(string), onInterrupt func(), 
 	si.SetVirtualCursor(false)
 
 	vp := viewport.New(viewport.WithWidth(10), viewport.WithHeight(10))
+	vp.FillHeight = true
 
 	return &Model{
-		ta:          ta,
-		vp:          vp,
-		search:      si,
-		status:      StatusInfo{Model: modelName},
-		commands:    commands,
-		onSubmit:    onSubmit,
-		onResume:    onResume,
-		onInterrupt: onInterrupt,
-		curTurn:     -1,
-		streamTurn:  -1,
-		gitExpanded: false,
-		mouseEnabled: false,
+		ta:             ta,
+		vp:             vp,
+		search:         si,
+		status:         StatusInfo{Model: modelName},
+		commands:       commands,
+		onSubmit:       onSubmit,
+		onResume:       onResume,
+		onInterrupt:    onInterrupt,
+		curTurn:        -1,
+		streamTurn:     -1,
+		gitExpanded:    false,
+		quitSelectedNo: true,
 	}
 }
 
@@ -234,10 +423,7 @@ func (m *Model) appendSystem(s string) {
 	m.refreshViewport(true)
 }
 
-// refreshViewport re-renders the structured transcript into the viewport and
-// rebuilds clickMap (wrapped-row -> turn index for thinking headers). Each
-// logical line is wrapped independently so the cumulative wrapped-row count
-// stays accurate for hit-testing mouse clicks.
+// refreshViewport re-renders the structured transcript into the viewport.
 func (m *Model) refreshViewport(stick bool) {
 	if !m.ready {
 		return
@@ -247,48 +433,56 @@ func (m *Model) refreshViewport(stick bool) {
 		w = 1
 	}
 	wrap := lipgloss.NewStyle().Width(w)
-	m.clickMap = make(map[int]int)
 
 	var b strings.Builder
-	row := 0
+
+	// contentLine tracks the current line number within the built content.
+	// Used to build clickRegions for mouse click -> thinking fold toggle.
+	contentLine := 0
+
 	write := func(s string) {
 		r := wrap.Render(s)
 		if b.Len() > 0 {
 			b.WriteByte('\n')
+			contentLine++
 		}
 		b.WriteString(r)
-		row += lipgloss.Height(r)
 	}
+
+	m.clickRegions = m.clickRegions[:0]
 
 	for ti, t := range m.turns {
 		if ti > 0 {
-			write("") // blank line between turns
+			write("")
 		}
 		if t.system {
 			write(strings.TrimRight(t.answer.String(), "\n"))
 			continue
 		}
 		if t.user != "" {
-			write(userStyle.Render("› " + t.user))
+			write(userStyle.Render("\u203a " + t.user))
 		}
 		reasoning := strings.TrimRight(t.reasoning.String(), "\n")
 		answer := strings.TrimRight(t.answer.String(), "\n")
 		if reasoning != "" {
-			// While streaming and before any answer has arrived, show the live
-			// thinking. Once the answer appears (or the stream ends) it folds back
-			// to a one-line header the user can click to re-open.
 			live := ti == m.streamTurn && m.streaming && answer == ""
 			expanded := t.expanded || live
-			m.clickMap[row] = ti // header occupies this row
+
+			regionStart := contentLine
 			if expanded {
-				write(thinkHeaderStyle.Render("▾ 思考过程"))
+				write(thinkHeaderStyle.Render("\u25be \u601d\u8003\u8fc7\u7a0b"))
 				write(dimStyle.Render(reasoning))
 				if answer != "" {
-					write("") // blank line separating thinking from the answer
+					write("")
 				}
 			} else {
-				write(thinkHeaderStyle.Render("▸ 思考过程（点击展开）"))
+				write(thinkHeaderStyle.Render("\u25b8 \u601d\u8003\u8fc7\u7a0b (Alt+T\u5c55\u5f00)"))
 			}
+			m.clickRegions = append(m.clickRegions, clickRegion{
+				startLine: regionStart,
+				endLine:   contentLine,
+				turnIdx:   ti,
+			})
 		}
 		if answer != "" {
 			write(answer)
@@ -296,11 +490,12 @@ func (m *Model) refreshViewport(stick bool) {
 	}
 
 	m.vp.SetContent(b.String())
-	if stick {
+	// Only auto-scroll when the user hasn't manually scrolled up.
+	// This preserves the user's reading position when new stream content arrives.
+	if stick && !m.scrolledUp {
 		m.vp.GotoBottom()
 	}
 }
-
 // Update implements tea.Model.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -313,26 +508,49 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport(true)
 
 	case tea.KeyPressMsg:
+		if m.showQuit {
+			return m.handleQuitDialog(msg)
+		}
+		if msg.String() == "ctrl+c" {
+			// OpenCode-style global quit shortcut.
+			m.showQuit = true
+			m.quitSelectedNo = true
+			m.ta.Blur()
+			return m, nil
+		}
 		if m.overlay != overlayNone {
 			return m.updateOverlay(msg)
 		}
 		switch msg.String() {
-		case "ctrl+c", "ctrl+shift+c":
-			// Ctrl+C cancels a running task. When idle, does NOT quit - lets the
-			// terminal handle copy. Use Ctrl+Q to quit. F4 toggles mouse mode.
+		case "ctrl+s":
+			// OpenCode: Ctrl+S switches/restores sessions.
+			m.openHistory()
+			return m, nil
+		case "ctrl+k":
+			// OpenCode: Ctrl+K command palette.
+			m.openCommandsWithQuery("")
+			return m, nil
+		case "ctrl+o":
+			// OpenCode: Ctrl+O model picker. Map to command palette filtered to model commands.
+			m.openCommandsWithQuery("model")
+			return m, nil
+		case "ctrl+f":
+			// OpenCode: Ctrl+F file picker. Map to attachment command flow.
+			m.openCommandsWithQuery("attach")
+			return m, nil
+		case "ctrl+l":
+			// OpenCode: Ctrl+L logs. Map to task/log related commands in palette.
+			m.openCommandsWithQuery("tasks")
+			return m, nil
+		case "ctrl+h", "ctrl+_", "?":
+			// OpenCode: help overlay.
+			m.openHelp()
+			return m, nil
+		case "esc":
+			// OpenCode-style cancel behavior in chat view.
 			if (m.task.Running || m.streaming) && m.onInterrupt != nil {
 				m.onInterrupt()
-				return m, nil
 			}
-			return m, nil
-		case "ctrl+q":
-			m.quitting = true
-			return m, tea.Quit
-		case "f2", "f3", "f4":
-			m.mouseEnabled = !m.mouseEnabled
-			return m, nil
-		case "ctrl+r":
-			m.openHistory()
 			return m, nil
 		case "ctrl+g":
 			status := strings.TrimSpace(m.status.GitStatus)
@@ -342,14 +560,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshViewport(true)
 			}
 			return m, nil
-		case "/":
-			// "/" on an empty input opens the command palette.
-			if strings.TrimSpace(m.ta.Value()) == "" {
-				m.openCommands()
+		case "ctrl+t":
+			// Cycle through available themes.
+			names := theme.Names()
+			for i, n := range names {
+				if n == theme.Current().Name {
+					next := names[(i+1)%len(names)]
+					if _, ok := theme.SetTheme(next); ok {
+						applyTheme()
+						m.refreshViewport(false)
+					}
+					break
+				}
+			}
+			return m, nil
+		case "alt+t":
+			// Toggle thinking fold on the last assistant turn.
+			for i := len(m.turns) - 1; i >= 0; i-- {
+				if !m.turns[i].system && m.turns[i].reasoning.Len() > 0 {
+					m.turns[i].expanded = !m.turns[i].expanded
+					m.refreshViewport(false)
+					break
+				}
+			}
+			return m, nil
+		case "enter":
+			m.scrolledUp = false
+			input := strings.TrimRight(m.ta.Value(), "\r\n")
+			if len(input) > 0 && input[len(input)-1] == '\\' {
+				// OpenCode-compatible continuation: trailing "\\" + Enter inserts
+				// a newline instead of sending the message.
+				m.ta.SetValue(input[:len(input)-1] + "\n")
 				return m, nil
 			}
-		case "enter":
-			input := strings.TrimRight(m.ta.Value(), "\r\n")
 			if strings.TrimSpace(input) != "" {
 				m.echoUser(input)
 				if m.onSubmit != nil {
@@ -362,77 +605,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Insert a literal newline into the input box.
 			m.ta.InsertRune('\n')
 			return m, nil
-		case "pgup", "pgdown", "ctrl+u", "ctrl+d":
+		case "up", "down", "pgup", "pgdown", "ctrl+u", "ctrl+d":
+			m.scrolledUp = true
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
 			return m, cmd
 		}
 
 	case tea.MouseClickMsg:
-		if m.overlay == overlayPermission && msg.Button == tea.MouseLeft {
-			oH := m.height - 5
-			if oH < 3 {
-				oH = 3
-			}
-			if msg.Y == oH-1 {
-				xOffset := 2
-				wAllow := lipgloss.Width(" 允许 (y) ")
-				wDeny := lipgloss.Width(" 拒绝 (n) ")
-				wAlways := lipgloss.Width(" 始终允许 (a) ")
-
-				allowStart := xOffset
-				allowEnd := allowStart + wAllow
-
-				denyStart := allowEnd + 2
-				denyEnd := denyStart + wDeny
-
-				alwaysStart := denyEnd + 2
-				alwaysEnd := alwaysStart + wAlways
-
-				if msg.X >= allowStart-1 && msg.X <= allowEnd+1 {
-					m.resolvePermission(PermAllow)
-					return m, nil
-				} else if msg.X >= denyStart-1 && msg.X <= denyEnd+1 {
-					m.resolvePermission(PermDeny)
-					return m, nil
-				} else if msg.X >= alwaysStart-1 && msg.X <= alwaysEnd+1 {
-					m.resolvePermission(PermAlways)
-					return m, nil
-				}
-			}
+		// Left-click on a thinking header toggles fold state.
+		// MouseClickMsg is a Mouse struct with X, Y fields directly.
+		if m.showQuit || m.overlay != overlayNone {
+			return m, nil
 		}
-
-		// A left click on a folded/expanded thinking header toggles it. The
-		// viewport body starts at screen row 1 (row 0 is the status bar); add the
-		// scroll offset to map the click to a wrapped content row.
-		if m.overlay == overlayNone && msg.Button == tea.MouseLeft {
-			gitH := m.gitPanelHeight()
-			if gitH > 0 && msg.Y >= 1 && msg.Y <= gitH {
-				m.gitExpanded = !m.gitExpanded
-				m.layout()
-				m.refreshViewport(true)
-				return m, nil
-			}
-			contentRow := (msg.Y - 1 - gitH) + m.vp.YOffset()
-			if ti, ok := m.clickMap[contentRow]; ok {
-				m.turns[ti].expanded = !m.turns[ti].expanded
-				m.refreshViewport(false)
+		// Viewport starts at terminal line 1 (after the 1-line status bar).
+		vpTop := 1
+		if msg.Y < vpTop || msg.Y >= vpTop+m.vp.Height() {
+			return m, nil
+		}
+		vpLine := msg.Y - vpTop              // 0-indexed within viewport display
+		absLine := vpLine + m.vp.YOffset()    // absolute content line
+		for _, r := range m.clickRegions {
+			if absLine >= r.startLine && absLine < r.endLine {
+				t := m.turns[r.turnIdx]
+				if !t.system {
+					t.expanded = !t.expanded
+					m.refreshViewport(false)
+				}
+				break
 			}
 		}
 		return m, nil
 
 	case tea.MouseWheelMsg:
-		// Scroll the conversation body with the mouse wheel. Overlays manage
-		// their own selection, so the wheel only drives the main viewport.
-		if m.overlay == overlayNone {
-			switch msg.Button {
-			case tea.MouseWheelUp:
-				m.vp.ScrollUp(3)
-			case tea.MouseWheelDown:
-				m.vp.ScrollDown(3)
-			}
+		if m.showQuit || m.overlay != overlayNone {
+			return m, nil
 		}
-		return m, nil
+		var cmd tea.Cmd
+		m.vp, cmd = m.vp.Update(msg)
+		return m, cmd
 
 	case streamBeginMsg:
 		m.streaming = true
@@ -450,21 +661,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.turns[m.streamTurn].answer.WriteString(string(msg))
 			m.turns[m.streamTurn].streamedText.WriteString(string(msg))
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		}
 	case streamReasoningMsg:
 		if m.streamTurn >= 0 {
 			m.turns[m.streamTurn].reasoning.WriteString(string(msg))
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		}
 	case engineLineMsg:
 		switch {
 		case m.streamTurn >= 0:
 			m.turns[m.streamTurn].answer.WriteString(string(msg))
-			m.turns[m.streamTurn].streamedText.WriteString(string(msg))
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		case m.curTurn >= 0:
 			m.turns[m.curTurn].answer.WriteString(string(msg))
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		default:
 			m.appendSystem(string(msg))
 		}
@@ -481,12 +711,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 	case taskStateMsg:
 		prev := m.transientVisible()
 		m.task = TaskInfo(msg)
 		if m.transientVisible() != prev {
 			m.layout()
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		}
 	case statusUpdateMsg:
 		m.status = StatusInfo(msg)
@@ -509,6 +749,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.transientVisible() != prev {
 			m.layout()
 			m.refreshViewport(true)
+			// Force visible-line computation so viewport scroll state is
+			// fully settled before the next View() paint. Without this,
+			// the cursor offset can briefly lag behind the grown content,
+			// making the input box look like it jumped up.
+			m.vp.VisibleLineCount()
 		}
 	}
 
@@ -525,6 +770,40 @@ func (m *Model) echoUser(input string) {
 	m.refreshViewport(true)
 }
 
+// handleQuitDialog handles key input while the quit confirmation is showing.
+func (m *Model) handleQuitDialog(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "esc":
+			m.showQuit = false
+			m.ta.Focus()
+			return m, nil
+		case "left", "right", "tab":
+			m.quitSelectedNo = !m.quitSelectedNo
+			return m, nil
+		case "enter", " ":
+			if !m.quitSelectedNo {
+				// Yes selected — quit
+				m.quitting = true
+				return m, tea.Quit
+			}
+			// No selected — dismiss
+			m.showQuit = false
+			m.ta.Focus()
+			return m, nil
+		case "y", "Y":
+			m.quitting = true
+			return m, tea.Quit
+		case "n", "N":
+			m.showQuit = false
+			m.ta.Focus()
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
 // openHistory opens the history search overlay and moves focus to its search box.
 func (m *Model) openHistory() {
 	m.overlay = overlayHistory
@@ -537,11 +816,23 @@ func (m *Model) openHistory() {
 
 // openCommands opens the slash-command palette and focuses its search box.
 func (m *Model) openCommands() {
+	m.openCommandsWithQuery("")
+}
+
+func (m *Model) openCommandsWithQuery(q string) {
 	m.overlay = overlayCommand
 	m.overlayIdx = 0
-	m.search.SetValue("")
+	m.search.SetValue(q)
 	m.search.Placeholder = "搜索命令…"
 	m.search.Focus()
+	m.ta.Blur()
+}
+
+func (m *Model) openHelp() {
+	m.overlay = overlayHelp
+	m.overlayIdx = 0
+	m.search.SetValue("")
+	m.search.Blur()
 	m.ta.Blur()
 }
 
@@ -565,8 +856,16 @@ func (m *Model) updateOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.overlay == overlayPermission {
 		return m.updatePermission(msg)
 	}
+	if m.overlay == overlayHelp {
+		switch msg.String() {
+		case "esc", "enter", " ", "?":
+			m.closeOverlay()
+			return m, nil
+		}
+		return m, nil
+	}
 	switch msg.String() {
-	case "esc", "ctrl+c", "ctrl+shift+c", "f2", "f3", "f4":
+	case "esc", "ctrl+c":
 		m.closeOverlay()
 		return m, nil
 	case "up":
@@ -580,6 +879,15 @@ func (m *Model) updateOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
+		if m.overlay == overlayHistory {
+			q := strings.TrimSpace(m.search.Value())
+			if n, err := strconv.Atoi(q); err == nil {
+				items := m.filteredHistory()
+				if n >= 1 && n <= len(items) {
+					m.overlayIdx = n - 1
+				}
+			}
+		}
 		m.activateOverlaySelection()
 		return m, nil
 	}
@@ -605,23 +913,30 @@ func (m *Model) resolvePermission(d PermDecision) {
 // allows and asks the caller to remember the rule.
 func (m *Model) updatePermission(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c", "ctrl+shift+c":
+	case "ctrl+c", "esc":
 		m.resolvePermission(PermDeny)
 		return m, nil
-	case "esc":
-		m.resolvePermission(PermDeny)
+	case "left", "right", "tab":
+		m.permSelected = (m.permSelected + 1) % 3
 		return m, nil
-	case "enter":
-		m.resolvePermission(PermAllow)
+	case "enter", " ":
+		switch m.permSelected {
+		case 0:
+			m.resolvePermission(PermAllow)
+		case 1:
+			m.resolvePermission(PermAlways)
+		case 2:
+			m.resolvePermission(PermDeny)
+		}
 		return m, nil
 	}
 	switch strings.ToLower(msg.Text) {
-	case "y":
+	case "y": // single allow
 		m.resolvePermission(PermAllow)
-	case "n":
-		m.resolvePermission(PermDeny)
-	case "a":
+	case "a": // allow always
 		m.resolvePermission(PermAlways)
+	case "n", "d": // deny
+		m.resolvePermission(PermDeny)
 	}
 	return m, nil
 }
@@ -655,6 +970,10 @@ func (m *Model) activateOverlaySelection() {
 func (m *Model) filteredHistory() []HistoryItem {
 	q := strings.ToLower(strings.TrimSpace(m.search.Value()))
 	if q == "" {
+		return m.history
+	}
+	if _, err := strconv.Atoi(q); err == nil {
+		// Numeric query is used as direct index selection mode.
 		return m.history
 	}
 	var out []HistoryItem
@@ -763,13 +1082,15 @@ func (m *Model) View() tea.View {
 	bottomBar := m.renderBottomBar()
 
 	var v tea.View
-	v.AltScreen = true
-	// Mouse mode is off by default for native text selection.
-	// Press F4 to toggle mouse capture (for click-to-fold, scroll wheel).
-	if m.mouseEnabled {
-		v.MouseMode = tea.MouseModeCellMotion
-	} else {
-		v.MouseMode = tea.MouseModeNone
+	// OpenCode-aligned fullscreen rendering path.
+	v.AltScreen = useAltScreen()
+	// Enable wheel/click reporting for reliable in-app scrolling across terminals.
+	v.MouseMode = useMouseMode()
+
+	if m.showQuit {
+		mid := m.renderCenteredOverlay(m.renderQuitDialog(), m.vp.Height())
+		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View())
+		return v
 	}
 
 	if m.overlay != overlayNone {
@@ -779,9 +1100,11 @@ func (m *Model) View() tea.View {
 		}
 		var mid string
 		if m.overlay == overlayPermission {
-			mid = m.renderPermission(oH)
+			mid = m.renderCenteredOverlay(m.renderPermission(oH), oH)
+		} else if m.overlay == overlayHelp {
+			mid = m.renderCenteredOverlay(m.renderHelp(oH), oH)
 		} else {
-			mid = m.renderOverlay(oH)
+			mid = m.renderCenteredOverlay(m.renderOverlay(oH), oH)
 		}
 		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View())
 		v.Cursor = m.overlayCursor()
@@ -804,6 +1127,17 @@ func (m *Model) View() tea.View {
 	}
 	v.Cursor = m.inputCursor()
 	return v
+}
+
+func (m *Model) renderCenteredOverlay(overlay string, areaH int) string {
+	centered := lipgloss.NewStyle().Width(m.width).Align(lipgloss.Center).Render(overlay)
+	oh := lipgloss.Height(centered)
+	if oh >= areaH {
+		return centered
+	}
+	top := (areaH - oh) / 2
+	bottom := areaH - oh - top
+	return strings.Repeat("\n", top) + centered + strings.Repeat("\n", bottom)
 }
 
 // inputCursor returns the real cursor position for the main input box. The
@@ -834,4 +1168,24 @@ func (m *Model) overlayCursor() *tea.Cursor {
 	c.X += 2
 	c.Y += 3
 	return c
+}
+
+func useAltScreen() bool {
+	v := strings.TrimSpace(os.Getenv("COVE_TUI_ALTSCREEN"))
+	if v != "" {
+		return v != "0"
+	}
+	return true
+}
+
+func useMouseMode() tea.MouseMode {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("COVE_TUI_MOUSE")))
+	if v == "1" || v == "on" || v == "cell" || v == "cellmotion" {
+		return tea.MouseModeCellMotion
+	}
+	if v == "0" || v == "off" || v == "none" {
+		return tea.MouseModeNone
+	}
+	// Default to CellMotion so click-to-fold and wheel scrolling work out of the box.
+	return tea.MouseModeCellMotion
 }

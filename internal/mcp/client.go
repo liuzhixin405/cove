@@ -103,6 +103,7 @@ type Client struct {
 	pending    map[int]chan *Response
 	notifyCh   chan *Notification
 	closed     bool
+	stopCh     chan struct{} // closed by Close() to signal receiveLoop to stop
 }
 
 func NewClient(transport Transport) *Client {
@@ -110,6 +111,7 @@ func NewClient(transport Transport) *Client {
 		transport: transport,
 		pending:   make(map[int]chan *Response),
 		notifyCh:  make(chan *Notification, 64),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -204,6 +206,13 @@ func (c *Client) Notifications() <-chan *Notification {
 func (c *Client) ServerInfo() Implementation { return c.serverInfo }
 
 func (c *Client) Close() error {
+	// Signal receiveLoop to stop (non-blocking: channel may already be closed).
+	select {
+	case <-c.stopCh:
+	default:
+		close(c.stopCh)
+	}
+
 	c.mu.Lock()
 	c.closed = true
 	for id, ch := range c.pending {
@@ -223,75 +232,103 @@ func (c *Client) receiveLoop() {
 		c.mu.Unlock()
 	}()
 
-	for {
-		raw, err := c.transport.Receive(context.Background())
-		if err != nil {
-			return
-		}
-
-		if len(raw) == 0 {
-			continue
-		}
-
-		var base struct {
-			JSONRPC
-			// Pointer so we can tell "no id" (notification) from "id: 0". With a
-			// plain int+omitempty, a response with id 0 and a notification were
-			// indistinguishable, so id-0 responses were dropped and id-0 server
-			// requests were misrouted as notifications.
-			ID     *int            `json:"id"`
-			Method string          `json:"method,omitempty"`
-			Result json.RawMessage `json:"result,omitempty"`
-			Error  *Error          `json:"error,omitempty"`
-			Params json.RawMessage `json:"params,omitempty"`
-		}
-
-		if err := json.Unmarshal(raw, &base); err != nil {
-			continue
-		}
-
-		// Notification: a method with no id.
-		if base.Method != "" && base.ID == nil {
-			notif := &Notification{
-				JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
-				Method:  base.Method,
-				Params:  base.Params,
-			}
-			select {
-			case c.notifyCh <- notif:
-			default:
-			}
-			continue
-		}
-
-		// Server-initiated request (method + id): this client doesn't implement
-		// server→client requests (sampling/roots). Ignore rather than misroute it
-		// into the pending-response table.
-		if base.Method != "" {
-			continue
-		}
-
-		// Otherwise it's a response to one of our requests; it must carry an id.
-		if base.ID == nil {
-			continue
-		}
-
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return
-		}
-		ch, ok := c.pending[*base.ID]
-		if ok {
-			ch <- &Response{
-				JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
-				ID:      *base.ID,
-				Result:  base.Result,
-				Error:   base.Error,
-			}
-		}
-		c.mu.Unlock()
+	// Wrap the blocking Receive with a cancellable select so receiveLoop
+	// can exit promptly when Close() closes stopCh, even if the transport
+	// is blocked on ReadBytes. The spawned goroutine is temporary: when
+	// the transport pipe closes (via Close()->transport.Close()->
+	// process kill), ReadBytes returns an error and the goroutine exits.
+	type readResult struct {
+		raw json.RawMessage
+		err error
 	}
+
+	for {
+		ch := make(chan readResult, 1)
+		go func() {
+			raw, err := c.transport.Receive(context.Background())
+			ch <- readResult{raw, err}
+		}()
+
+		select {
+		case <-c.stopCh:
+			return
+		case res := <-ch:
+			if res.err != nil {
+				return
+			}
+			if err := c.handleRaw(res.raw); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// handleRaw processes a single JSON-RPC message received from the transport.
+// Extracted from receiveLoop to keep the cancellation wrapper clean.
+func (c *Client) handleRaw(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var base struct {
+		JSONRPC
+		// Pointer so we can tell "no id" (notification) from "id: 0". With a
+		// plain int+omitempty, a response with id 0 and a notification were
+		// indistinguishable, so id-0 responses were dropped and id-0 server
+		// requests were misrouted as notifications.
+		ID     *int            `json:"id"`
+		Method string          `json:"method,omitempty"`
+		Result json.RawMessage `json:"result,omitempty"`
+		Error  *Error          `json:"error,omitempty"`
+		Params json.RawMessage `json:"params,omitempty"`
+	}
+
+	if err := json.Unmarshal(raw, &base); err != nil {
+		return nil
+	}
+
+	// Notification: a method with no id.
+	if base.Method != "" && base.ID == nil {
+		notif := &Notification{
+			JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
+			Method:  base.Method,
+			Params:  base.Params,
+		}
+		select {
+		case c.notifyCh <- notif:
+		default:
+		}
+		return nil
+	}
+
+	// Server-initiated request (method + id): this client doesn't implement
+	// server-to-client requests (sampling/roots). Ignore rather than misroute it
+	// into the pending-response table.
+	if base.Method != "" {
+		return nil
+	}
+
+	// Otherwise it's a response to one of our requests; it must carry an id.
+	if base.ID == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("client closed")
+	}
+	ch, ok := c.pending[*base.ID]
+	if ok {
+		ch <- &Response{
+			JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
+			ID:      *base.ID,
+			Result:  base.Result,
+			Error:   base.Error,
+		}
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
