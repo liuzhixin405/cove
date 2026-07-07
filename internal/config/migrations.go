@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"reflect"
 )
 
 const CurrentVersion = 1
@@ -30,12 +31,21 @@ func Migrate(cfg *Config, fromVersion int) error {
 	if fromVersion >= CurrentVersion {
 		return nil
 	}
+
+	before := *cfg
+	changed := false
 	for _, m := range migrateRules {
 		if m.Version > fromVersion {
 			if err := m.Apply(cfg); err != nil {
 				return fmt.Errorf("migration v%d: %w", m.Version, err)
 			}
+			if !reflect.DeepEqual(before, *cfg) {
+				changed = true
+			}
 		}
+	}
+	if !changed {
+		return nil
 	}
 	return Save(cfg)
 }

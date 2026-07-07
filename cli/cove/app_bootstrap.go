@@ -41,9 +41,13 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Warnf("config load: %v", err)
-		cfg = config.DefaultConfig()
+		if cfg == nil {
+			cfg = config.DefaultConfig()
+		}
 	}
-	config.Migrate(cfg, 0)
+	if err := config.Migrate(cfg, 0); err != nil {
+		log.Warnf("config migrate: %v", err)
+	}
 	diagnostic.AttachToLogger()
 	if debugMode {
 		log.SetLevel(log.Debug)

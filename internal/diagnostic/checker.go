@@ -191,10 +191,11 @@ func (c *Checker) checkConfigExists(_ context.Context) CheckResult {
 	cfgPath := filepath.Join(c.homeDir, ".cove", "config.json")
 
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		// Try to auto-fix by creating default config
+		// Try to auto-fix by creating a richer default config that matches the
+		// documented shape and leaves room for the user to set their provider/api key.
 		dir := filepath.Dir(cfgPath)
 		if err := os.MkdirAll(dir, 0750); err == nil {
-			defaultCfg := "{\n  \"provider\": {\n    \"name\": \"deepseek\",\n    \"base_url\": \"https://api.deepseek.com/v1\"\n  },\n  \"model\": \"auto\",\n  \"permission_mode\": \"ask\"\n}\n"
+			defaultCfg := "{\n  \"debug\": false,\n  \"max_budget_usd\": 10,\n  \"model\": \"deepseek-v4-pro\",\n  \"model_fast\": \"deepseek-v4-flash\",\n  \"permission_mode\": \"default\",\n  \"provider\": {\n    \"api_key\": \"sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n    \"base_url\": \"https://api.deepseek.com/v1\",\n    \"name\": \"deepseek\"\n  },\n  \"system_prompt\": \"你是 Cove，一个高效的 AI 编程助手。先理解任务，再用工具完成它；需要时读取、搜索、修改、执行、验证并给出真实结果，遇到问题要诚实说明。\",\n  \"telemetry\": true,\n  \"thinking_tokens\": 16000,\n  \"verbose\": false\n}\n"
 			if err := os.WriteFile(cfgPath, []byte(defaultCfg), 0640); err == nil {
 				res.Status = SevRecovered
 				res.Error = NewFixed(ErrConfigMissing, cfgPath)
