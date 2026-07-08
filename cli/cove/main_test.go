@@ -174,6 +174,20 @@ func TestRunChatInteractionStreamsAndTerminatesCleanly(t *testing.T) {
 	}
 }
 
+func TestRunChatInteractionAppendsMissingFinalSuffix(t *testing.T) {
+	runner := stubStreamingRunner{result: "hello world"}
+	out, err := runChatInteraction(context.Background(), runner, "hello")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if !strings.Contains(out, "hello world") {
+		t.Fatalf("expected final reply content to contain 'hello world', got %q", out)
+	}
+	if !strings.HasSuffix(out, "\r\n\r\n") {
+		t.Fatalf("expected trailing line break, got %q", out)
+	}
+}
+
 func TestApplyProviderConfigChangeTrimsModelAndProviderValues(t *testing.T) {
 	reloader := &stubProviderReloader{}
 	cfg := &config.Config{}

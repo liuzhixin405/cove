@@ -39,6 +39,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 	defer repl.EndOutput()
 	var totalOutput strings.Builder
 	var finalErr error
+	var reply string
 
 	maxAttempts := 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -78,7 +79,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 		if richRunner, ok := runner.(interface {
 			RunMessageWithStream(context.Context, api.Message, func(string), func(string)) (string, error)
 		}); ok {
-			_, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
+			reply, err = richRunner.RunMessageWithStream(ctx, userMsg, func(delta string) {
 				if firstDelta {
 					spinner.Stop()
 					firstDelta = false
@@ -97,7 +98,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			if len(userMsg.Parts) > 0 {
 				err = fmt.Errorf("当前运行器不支持附件消息")
 			} else {
-				_, err = runner.RunWithStream(ctx, userMsg.Content, func(delta string) {
+				reply, err = runner.RunWithStream(ctx, userMsg.Content, func(delta string) {
 					if firstDelta {
 						spinner.Stop()
 						firstDelta = false
@@ -124,6 +125,12 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 		time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
 	}
 
+	if finalErr == nil {
+		if missing := missingStreamedSuffix(reply, totalOutput.String()); missing != "" {
+			repl.StreamPrint(missing)
+			totalOutput.WriteString(missing)
+		}
+	}
 	if finalErr != nil {
 		errMsg := fmt.Sprintf("\nRequest failed: %s", finalErr.Error())
 		repl.StreamPrint(fmt.Sprintf("%s%s%s", repl.Red, errMsg, repl.Reset))
@@ -131,6 +138,25 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 	}
 	totalOutput.WriteString("\r\n\r\n")
 	return totalOutput.String(), finalErr
+}
+
+func missingStreamedSuffix(reply, streamed string) string {
+	if reply == "" || reply == streamed {
+		return ""
+	}
+	if strings.HasPrefix(reply, streamed) {
+		return reply[len(streamed):]
+	}
+	maxOverlap := len(reply)
+	if len(streamed) < maxOverlap {
+		maxOverlap = len(streamed)
+	}
+	for i := maxOverlap; i > 0; i-- {
+		if strings.HasSuffix(streamed, reply[:i]) {
+			return reply[i:]
+		}
+	}
+	return ""
 }
 
 func isBudgetExceededError(err error) bool {
