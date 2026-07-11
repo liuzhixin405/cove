@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"encoding/json"
@@ -38,6 +38,19 @@ func providerEnvHelpLine() string {
 	return "环境变量: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
 }
 
+
+func printTools(toolReg *tool.Registry, _ *plugin.Manager) {
+	fmt.Println("\n=== 可用工具 ===")
+	for _, t := range toolReg.All() {
+		d := t.Def()
+		ro := " "
+		if d.IsReadOnly {
+			ro = "R"
+		}
+		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
+	}
+	fmt.Println()
+}
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	fmt.Println("\n=== cove v" + Version + " ===")
 	fmt.Println("\n供应商 / 模型:")
@@ -63,6 +76,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 	fmt.Println("  /tasks              查看运行中/排队的任务")
 	fmt.Println("  /stop               取消当前运行的任务 (别名 /cancel)")
 	fmt.Println("\n系统:")
+	fmt.Println("  /tools              列出所有可用工具")
 	fmt.Println("  /mcp                管理 MCP 服务器")
 	fmt.Println("  /plugin             管理插件")
 	fmt.Println("  /skills             列出技能")
@@ -130,3 +144,6 @@ func missingAPIKeyMessage(provider string) string {
 		openAICompatList,
 	)
 }
+
+
+

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -353,8 +353,11 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 			repl.PrintAbove(formatTaskSnapshot(tasks.Snapshot()))
 			continue
 
-		case input == "/help":
+		case input == "/tools":
+			printTools(toolReg, pluginMgr)
+			continue
 
+		case input == "/help":
 			printHelp(cmdReg, toolReg, pluginMgr)
 
 		case input == "/":
@@ -621,3 +624,4 @@ func handleSkillInvocation(input string, eng *engine.Engine) {
 	repl.PrintSafe("\n")
 
 }
+

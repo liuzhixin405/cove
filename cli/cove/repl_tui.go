@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -508,6 +508,10 @@ func handleTUISlashCommand(
 	args := parts[1:]
 
 	switch name {
+	case "tools":
+		printTools(toolReg, pluginMgr)
+		return true, ""
+
 	case "help":
 		// Print help screen
 		var sb strings.Builder
@@ -534,6 +538,7 @@ func handleTUISlashCommand(
 		sb.WriteString("  /tasks              查看运行中/排队的任务\n")
 		sb.WriteString("  /stop               取消当前运行的任务 (别名 /cancel)\n")
 		sb.WriteString("\n系统:\n")
+		sb.WriteString("  /tools              列出所有可用工具\n")
 		sb.WriteString("  /mcp                管理 MCP 服务器\n")
 		sb.WriteString("  /plugin             管理插件\n")
 		sb.WriteString("  /skills             列出技能\n")
@@ -949,3 +954,6 @@ func tuiAttachRemove(args []string, attached *[]string) string {
 	*attached = append((*attached)[:idx-1], (*attached)[idx:]...)
 	return fmt.Sprintf("已移除附件: %s\n%s", removed, tuiAttachList(*attached))
 }
+
+
+
