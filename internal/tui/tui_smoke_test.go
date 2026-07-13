@@ -3,8 +3,10 @@ package tui
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // frameLines returns the number of rendered lines in the current View().
@@ -309,6 +311,122 @@ func TestMainViewUpDownScroll(t *testing.T) {
 	}
 }
 
+// TestScrollLockResetsAtBottom verifies that PgUp disables auto-stick and
+// PgDn back to bottom re-enables it.
+func TestScrollLockResetsAtBottom(t *testing.T) {
+	m := newSmokeModel(t, 40, 10, nil, nil)
+
+	var long strings.Builder
+	for i := 0; i < 120; i++ {
+		long.WriteString("line\n")
+	}
+	m.appendSystem(long.String())
+
+	if m.scrolledUp {
+		t.Fatal("expected auto-stick enabled at bottom initially")
+	}
+
+	pressKey(m, tea.KeyPgUp, 0)
+	if !m.scrolledUp {
+		t.Fatal("expected PgUp to disable auto-stick")
+	}
+
+	pressKey(m, tea.KeyPgDown, 0)
+	if m.scrolledUp {
+		t.Fatal("expected PgDn at bottom to re-enable auto-stick")
+	}
+}
+
+// TestMouseWheelUpdatesScrollLock verifies wheel scrolling updates auto-stick
+// state the same way as keyboard scrolling.
+func TestMouseWheelUpdatesScrollLock(t *testing.T) {
+	m := newSmokeModel(t, 40, 10, nil, nil)
+
+	var long strings.Builder
+	for i := 0; i < 120; i++ {
+		long.WriteString("line\n")
+	}
+	m.appendSystem(long.String())
+
+	if m.scrolledUp {
+		t.Fatal("expected auto-stick enabled at bottom initially")
+	}
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if !m.scrolledUp {
+		t.Fatal("expected wheel up to disable auto-stick")
+	}
+
+	for i := 0; i < 10; i++ {
+		m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	}
+
+	if m.scrolledUp {
+		t.Fatal("expected wheel down back to bottom to re-enable auto-stick")
+	}
+}
+
+// TestScrollDuringStreamingRecoversAutoStick verifies the full chain:
+// user scrolls up to read history, streaming continues without stealing focus,
+// then PgDn returns to bottom and auto-stick resumes for new deltas.
+func TestScrollDuringStreamingRecoversAutoStick(t *testing.T) {
+	m := newSmokeModel(t, 40, 10, nil, nil)
+
+	maxOffset := func() int {
+		mo := m.vp.TotalLineCount() - m.vp.Height()
+		if mo < 0 {
+			return 0
+		}
+		return mo
+	}
+
+	var long strings.Builder
+	for i := 0; i < 140; i++ {
+		long.WriteString("seed line\n")
+	}
+	m.appendSystem(long.String())
+
+	if m.scrolledUp {
+		t.Fatal("expected to start at bottom with auto-stick enabled")
+	}
+
+	pressKey(m, tea.KeyPgUp, 0)
+	if !m.scrolledUp {
+		t.Fatal("expected PgUp to disable auto-stick")
+	}
+
+	frozenOffset := m.vp.YOffset()
+	m.Update(streamBeginMsg{})
+	for i := 0; i < 30; i++ {
+		m.Update(streamDeltaMsg("stream line\n"))
+	}
+
+	if got := m.vp.YOffset(); got != frozenOffset {
+		t.Fatalf("expected viewport offset to stay frozen while manually scrolled, got=%d want=%d", got, frozenOffset)
+	}
+	if !m.scrolledUp {
+		t.Fatal("expected auto-stick to remain disabled while reading history")
+	}
+
+	for i := 0; i < 20; i++ {
+		pressKey(m, tea.KeyPgDown, 0)
+	}
+
+	if m.scrolledUp {
+		t.Fatal("expected auto-stick to be re-enabled after returning to bottom")
+	}
+	if got, want := m.vp.YOffset(), maxOffset(); got != want {
+		t.Fatalf("expected viewport at bottom after PgDn, got=%d want=%d", got, want)
+	}
+
+	m.Update(streamDeltaMsg("tail\n"))
+	if got, want := m.vp.YOffset(), maxOffset(); got != want {
+		t.Fatalf("expected new stream delta to keep sticking to bottom, got=%d want=%d", got, want)
+	}
+
+	m.Update(streamEndMsg{})
+}
+
 // TestCtrlCAndEscBehavior ensures opencode-style contract:
 // Esc cancels while running; Ctrl+C always opens quit confirmation.
 func TestCtrlCAndEscBehavior(t *testing.T) {
@@ -411,6 +529,134 @@ func TestQuestionMarkOpensHelpOverlay(t *testing.T) {
 	}
 }
 
+func TestTabCompletesSingleCommandInTUI(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	typeText(m, "/he")
+	pressKey(m, tea.KeyTab, 0)
+
+	if got, want := m.ta.Value(), "/help "; got != want {
+		t.Fatalf("expected single command completion, got %q want %q", got, want)
+	}
+}
+
+func TestTabExpandsCommonPrefixInTUI(t *testing.T) {
+	m := New("test-model", nil, nil, nil, []CommandItem{
+		{Name: "task", Desc: "task root"},
+		{Name: "tasks", Desc: "task list"},
+		{Name: "help", Desc: "help"},
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	typeText(m, "/ta")
+	pressKey(m, tea.KeyTab, 0)
+
+	if got, want := m.ta.Value(), "/task"; got != want {
+		t.Fatalf("expected common-prefix expansion, got %q want %q", got, want)
+	}
+	if m.overlay != overlayNone {
+		t.Fatalf("expected overlay to stay closed when prefix can expand, got %d", m.overlay)
+	}
+}
+
+func TestTabNoMatchOpensCommandPalette(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	typeText(m, "/zzz")
+	pressKey(m, tea.KeyTab, 0)
+
+	if m.overlay != overlayCommand {
+		t.Fatalf("expected command palette on no-match tab completion, got %d", m.overlay)
+	}
+	if got, want := m.search.Value(), "zzz"; got != want {
+		t.Fatalf("expected palette query to keep typed token, got %q want %q", got, want)
+	}
+}
+
+func TestCtrlIAlsoTriggersTabCompletion(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	typeText(m, "/he")
+	pressKey(m, 'i', tea.ModCtrl)
+
+	if got, want := m.ta.Value(), "/help "; got != want {
+		t.Fatalf("expected Ctrl+I to behave as Tab completion, got %q want %q", got, want)
+	}
+}
+
+func TestSlashInputShowsCompletionHint(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	typeText(m, "/h")
+	view := m.View().Content
+	if !strings.Contains(view, "补全:") {
+		t.Fatal("expected live completion hint while typing slash command")
+	}
+	if !strings.Contains(view, "/help") {
+		t.Fatal("expected hint to include matching /help command")
+	}
+}
+
+func TestSlashUnknownShowsNoMatchHint(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	typeText(m, "/zzzz")
+	view := m.View().Content
+	if !strings.Contains(view, "无匹配") {
+		t.Fatal("expected no-match hint for unknown slash command")
+	}
+}
+
+func TestNarrowViewIsValidUTF8(t *testing.T) {
+	m := newSmokeModel(t, 18, 10, nil, nil)
+	m.Update(statusUpdateMsg(StatusInfo{
+		Version:  "6.2.1",
+		Model:    "gpt-5.3-codex",
+		Provider: "openai",
+		PermMode: "default",
+		TokensIn: 39800,
+		Budget:   10,
+	}))
+	v := m.View().Content
+	if !utf8.ValidString(v) {
+		t.Fatal("expected rendered view to be valid UTF-8 on narrow width")
+	}
+}
+
+func TestReportedLayoutScenario_NoGarbleNoOverflow(t *testing.T) {
+	m := newSmokeModel(t, 96, 12, nil, nil)
+	m.Update(statusUpdateMsg(StatusInfo{
+		Version:  "6.2.1",
+		Model:    "gpt-5.3-codex",
+		Provider: "openai",
+		PermMode: "default",
+		TokensIn: 39800,
+		Budget:   10,
+	}))
+	m.Update(activityMsg(".   .   . thinking..."))
+
+	v := m.View().Content
+	if !utf8.ValidString(v) {
+		t.Fatal("expected rendered frame to remain valid UTF-8 in reported scenario")
+	}
+
+	for i, line := range strings.Split(v, "\n") {
+		if w := ansi.StringWidth(line); w > m.width {
+			t.Fatalf("line %d overflowed viewport width: got %d > %d; line=%q", i+1, w, m.width, line)
+		}
+	}
+}
+
+func TestTransientLineIdleIsBlank(t *testing.T) {
+	m := newSmokeModel(t, 96, 12, nil, nil)
+	m.Update(statusUpdateMsg(StatusInfo{
+		Version:  "7.1.0",
+		Model:    "gpt-5.3-codex",
+		Provider: "openai",
+		PermMode: "default",
+	}))
+
+	line := stripANSI(m.renderTransient())
+	if strings.TrimSpace(line) != "" {
+		t.Fatalf("expected idle transient line to be blank, got %q", line)
+	}
+}
+
 func TestQuitDialogEnterDismissesDefaultNo(t *testing.T) {
 	m := newSmokeModel(t, 80, 24, nil, nil)
 	pressKey(m, 'c', tea.ModCtrl)
@@ -423,5 +669,71 @@ func TestQuitDialogEnterDismissesDefaultNo(t *testing.T) {
 	}
 	if m.quitting {
 		t.Fatal("should not quit when default No is selected")
+	}
+}
+
+func TestCtrlYCopiesCurrentSession(t *testing.T) {
+	t.Setenv("COVE_TUI_MOUSE", "")
+	m := newSmokeModel(t, 40, 10, nil, nil)
+	if m.currentMouseMode() != tea.MouseModeCellMotion {
+		t.Fatalf("expected mouse capture by default, got %v", m.currentMouseMode())
+	}
+	m.appendSystem("\n[系统] startup\n")
+	m.echoUser("hello")
+	m.Update(streamBeginMsg{})
+	m.Update(streamDeltaMsg("world"))
+	m.Update(streamEndMsg{})
+	pressKey(m, 'y', tea.ModCtrl)
+	if !m.mouseCapture || m.currentMouseMode() != tea.MouseModeCellMotion {
+		t.Fatal("expected Ctrl+Y to keep mouse capture unchanged")
+	}
+	if !strings.Contains(m.copyNotice, "[复制]") {
+		t.Fatalf("expected Ctrl+Y to set a copy notice, got %q", m.copyNotice)
+	}
+}
+
+func TestF6CopiesVisibleScreenAndKeepsMouseMode(t *testing.T) {
+	t.Setenv("COVE_TUI_MOUSE", "")
+	m := newSmokeModel(t, 40, 10, nil, nil)
+	m.echoUser("u1")
+	m.Update(streamBeginMsg{})
+	m.Update(streamDeltaMsg("a1\na2\na3\na4\na5\na6\na7\na8"))
+	m.Update(streamEndMsg{})
+	m.vp.GotoBottom()
+	pressKey(m, tea.KeyF6, 0)
+	if !m.mouseCapture || m.currentMouseMode() != tea.MouseModeCellMotion {
+		t.Fatal("expected F6 to keep mouse capture unchanged")
+	}
+	if !strings.Contains(m.copyNotice, "[复制]") {
+		t.Fatalf("expected F6 to set a copy notice, got %q", m.copyNotice)
+	}
+}
+
+func TestF7CopiesAllAndKeepsMouseMode(t *testing.T) {
+	t.Setenv("COVE_TUI_MOUSE", "")
+	m := newSmokeModel(t, 40, 10, nil, nil)
+	m.appendSystem("\n[系统] startup\n")
+	m.echoUser("hello")
+	m.Update(streamBeginMsg{})
+	m.Update(streamDeltaMsg("world"))
+	m.Update(streamEndMsg{})
+	pressKey(m, tea.KeyF7, 0)
+	if !m.mouseCapture || m.currentMouseMode() != tea.MouseModeCellMotion {
+		t.Fatal("expected F7 to keep mouse capture unchanged")
+	}
+	if !strings.Contains(m.copyNotice, "[复制]") {
+		t.Fatalf("expected F7 to set a copy notice, got %q", m.copyNotice)
+	}
+}
+
+func TestF7KeepsMouseModeWhenNoTranscript(t *testing.T) {
+	t.Setenv("COVE_TUI_MOUSE", "")
+	m := newSmokeModel(t, 40, 10, nil, nil)
+	pressKey(m, tea.KeyF7, 0)
+	if !m.mouseCapture || m.currentMouseMode() != tea.MouseModeCellMotion {
+		t.Fatal("expected F7 to keep mouse capture on empty transcript")
+	}
+	if !strings.Contains(m.copyNotice, "当前无可复制内容") {
+		t.Fatalf("expected F7 empty-transcript notice, got %q", m.copyNotice)
 	}
 }

@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"encoding/json"
@@ -40,7 +40,7 @@ func providerEnvHelpLine() string {
 
 
 func printTools(toolReg *tool.Registry, _ *plugin.Manager) {
-	fmt.Println("\n=== 可用工具 ===")
+	fmt.Println("\n=== 可用的工具 ===")
 	for _, t := range toolReg.All() {
 		d := t.Def()
 		ro := " "
@@ -51,6 +51,7 @@ func printTools(toolReg *tool.Registry, _ *plugin.Manager) {
 	}
 	fmt.Println()
 }
+
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	fmt.Println("\n=== cove v" + Version + " ===")
 	fmt.Println("\n供应商 / 模型:")
@@ -76,7 +77,6 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 	fmt.Println("  /tasks              查看运行中/排队的任务")
 	fmt.Println("  /stop               取消当前运行的任务 (别名 /cancel)")
 	fmt.Println("\n系统:")
-	fmt.Println("  /tools              列出所有可用工具")
 	fmt.Println("  /mcp                管理 MCP 服务器")
 	fmt.Println("  /plugin             管理插件")
 	fmt.Println("  /skills             列出技能")
@@ -144,6 +144,3 @@ func missingAPIKeyMessage(provider string) string {
 		openAICompatList,
 	)
 }
-
-
-

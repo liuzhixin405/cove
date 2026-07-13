@@ -3,12 +3,14 @@ package command
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
+	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/mcp"
 	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/session"
@@ -25,6 +27,10 @@ type fakeEngine struct {
 	loaded   []api.Message
 	override string
 	cost     fakeCostTracker
+	checkpts []string
+	restored string
+	restErr  error
+	rlInfo   api.RateLimitInfo
 }
 
 func (f *fakeEngine) Messages() []api.Message         { return f.msgs }
@@ -32,6 +38,12 @@ func (f *fakeEngine) LoadMessages(msgs []api.Message) { f.loaded = msgs; f.msgs 
 func (f *fakeEngine) SetSystemOverride(prompt string) { f.override = prompt }
 func (f *fakeEngine) SystemPrompt() string            { return f.override }
 func (f *fakeEngine) CostTracker() CostTrackerView    { return f.cost }
+func (f *fakeEngine) ListCheckpoints() []string       { return f.checkpts }
+func (f *fakeEngine) RestoreCheckpoint(hash string) error {
+	f.restored = hash
+	return f.restErr
+}
+func (f *fakeEngine) RateLimitInfo() api.RateLimitInfo { return f.rlInfo }
 
 type fakePluginManager struct {
 	plugins    []plugin.Entry
@@ -292,3 +304,91 @@ func TestMcpCmdReadResource(t *testing.T) {
 	}
 }
 
+func TestCheckpointsCmdListsEntries(t *testing.T) {
+	eng := &fakeEngine{checkpts: []string{"abc1234 msg1", "def5678 msg2"}}
+	cmd := NewCheckpointsCmd()
+
+	out, err := cmd.Execute(context.Background(), Input{Engine: eng})
+	if err != nil {
+		t.Fatalf("checkpoints error: %v", err)
+	}
+	if !strings.Contains(out.Message, "abc1234") || !strings.Contains(out.Message, "def5678") {
+		t.Fatalf("expected checkpoints in output, got %q", out.Message)
+	}
+}
+
+func TestUndoCmdRestoresLatestWhenNoArg(t *testing.T) {
+	eng := &fakeEngine{}
+	cmd := NewUndoCmd()
+
+	out, err := cmd.Execute(context.Background(), Input{Engine: eng})
+	if err != nil {
+		t.Fatalf("undo error: %v", err)
+	}
+	if eng.restored != "" {
+		t.Fatalf("expected empty hash for latest checkpoint restore, got %q", eng.restored)
+	}
+	if !strings.Contains(out.Message, "最近检查点") {
+		t.Fatalf("unexpected output: %q", out.Message)
+	}
+}
+
+func TestRateLimitCmdRendersSnapshot(t *testing.T) {
+	eng := &fakeEngine{rlInfo: api.RateLimitInfo{RequestsLimit: 100, RequestsRemaining: 88, TokensLimit: 100000, TokensRemaining: 92345}}
+	cmd := NewRateLimitCmd()
+
+	out, err := cmd.Execute(context.Background(), Input{Engine: eng})
+	if err != nil {
+		t.Fatalf("ratelimit error: %v", err)
+	}
+	if !strings.Contains(out.Message, "Requests: 88 / 100") || !strings.Contains(out.Message, "Tokens: 92345 / 100000") {
+		t.Fatalf("unexpected ratelimit output: %q", out.Message)
+	}
+}
+
+func TestContextCmdRefreshesGitStatus(t *testing.T) {
+	tmp := t.TempDir()
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir temp: %v", err)
+	}
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@example.com")
+	runGit(t, tmp, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	runGit(t, tmp, "add", "a.txt")
+	runGit(t, tmp, "commit", "-m", "init")
+
+	pc := ctxt.Collect()
+
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello changed\n"), 0644); err != nil {
+		t.Fatalf("rewrite file: %v", err)
+	}
+
+	out, err := NewContextCmd().Execute(context.Background(), Input{ProjectContext: pc})
+	if err != nil {
+		t.Fatalf("context execute: %v", err)
+	}
+	if strings.Contains(out.Message, "(clean)") {
+		t.Fatalf("expected refreshed dirty git status, got %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "a.txt") {
+		t.Fatalf("expected changed file in git status, got %q", out.Message)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}

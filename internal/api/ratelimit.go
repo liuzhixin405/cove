@@ -29,6 +29,13 @@ type RateLimitTracker struct {
 	info RateLimitInfo
 }
 
+// Info returns the latest parsed rate limit snapshot.
+func (t *RateLimitTracker) Info() RateLimitInfo {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.info
+}
+
 // NewRateLimitTracker creates a new rate limit tracker.
 func NewRateLimitTracker() *RateLimitTracker {
 	return &RateLimitTracker{}

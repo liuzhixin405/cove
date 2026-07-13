@@ -30,8 +30,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/permission"
 
 	"github.com/liuzhixin405/cove/internal/plugin"
-
-	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove/internal/termui"
 
 	"github.com/liuzhixin405/cove/internal/session"
 
@@ -212,7 +211,7 @@ func main() {
 
 	runStartupDiagnostics(cfg, debugMode)
 
-	bannerText := repl.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, "", len(eng.Registry().All()), projCtx.IsGitRepo)
+	bannerText := termui.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, "", len(eng.Registry().All()), projCtx.IsGitRepo)
 
 	if dumpPrompt {
 
@@ -308,7 +307,10 @@ func main() {
 
 	}
 
-	runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
+	// Non-TTY (pipes/redirects) or TUI explicitly disabled: use the headless
+	// frontend. The classic line REPL has been removed; its behavior lives in
+	// the Bubble Tea TUI (interactive) and here (non-interactive).
+	runHeadless(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
 }
 
@@ -547,7 +549,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if !ok {
 
-		repl.PrintAbove(fmt.Sprintf("未找到命令 /%s。请使用 /help 查看可用命令。\r\n", name))
+		termui.PrintAbove(fmt.Sprintf("未找到命令 /%s。请使用 /help 查看可用命令。\r\n", name))
 
 		return
 
@@ -586,7 +588,7 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if err != nil {
 
-		repl.PrintAbove(fmt.Sprintf("Error: %v\r\n", err))
+		termui.PrintAbove(fmt.Sprintf("Error: %v\r\n", err))
 
 		return
 
@@ -594,13 +596,13 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	if out.Message != "" {
 
-		repl.PrintAbove(fmt.Sprintf("[%s] %s\r\n", c.Name(), out.Message))
+		termui.PrintAbove(fmt.Sprintf("[%s] %s\r\n", c.Name(), out.Message))
 
 	}
 
 	if out.Data != "" {
 
-		repl.PrintAbove(out.Data + "\r\n")
+		termui.PrintAbove(out.Data + "\r\n")
 
 	}
 
@@ -628,7 +630,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 	if len(parts) == 1 || (len(parts) >= 2 && parts[1] == "list") {
 
-		repl.PrintSafe("\n已安装的技能 (%d):\n", len(prompts))
+		termui.PrintSafe("\n已安装的技能 (%d):\n", len(prompts))
 
 		for name, prompt := range prompts {
 
@@ -648,7 +650,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 			}
 
-			repl.PrintSafe("  %-16s %s\n", name, d)
+			termui.PrintSafe("  %-16s %s\n", name, d)
 
 		}
 
@@ -664,13 +666,13 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		if err != nil {
 
-			repl.PrintSafe("获取技能市场列表失败: %v\n", err)
+			termui.PrintSafe("获取技能市场列表失败: %v\n", err)
 
 			return
 
 		}
 
-		repl.PrintSafe("\n技能市场 (%d 个可用技能):\n", len(entries))
+		termui.PrintSafe("\n技能市场 (%d 个可用技能):\n", len(entries))
 
 		for _, e := range entries {
 
@@ -682,17 +684,17 @@ func handleSkill(input string, eng *engine.Engine) {
 
 			}
 
-			repl.PrintSafe("  %-16s %s%s\n", e.Name, truncateDesc(e.Description, 48), installed)
+			termui.PrintSafe("  %-16s %s%s\n", e.Name, truncateDesc(e.Description, 48), installed)
 
 		}
 
-		repl.PrintSafe("\n使用 /skill install <name> 安装技能\n")
+		termui.PrintSafe("\n使用 /skill install <name> 安装技能\n")
 
 	case "install":
 
 		if len(parts) < 3 {
 
-			repl.PrintSafe("Usage: /skill install <name>\n")
+			termui.PrintSafe("Usage: /skill install <name>\n")
 
 			return
 
@@ -702,7 +704,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		if _, ok := prompts[name]; ok {
 
-			repl.PrintSafe("Skill '%s' already installed\n", name)
+			termui.PrintSafe("Skill '%s' already installed\n", name)
 
 			return
 
@@ -716,7 +718,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 				skills.InstallSkill(name, "url", e.URL)
 
-				repl.PrintSafe("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
+				termui.PrintSafe("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
 
 				return
 
@@ -726,13 +728,13 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		skills.InstallSkill(name, "local", "")
 
-		repl.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
+		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 
 	case "create":
 
 		if len(parts) < 3 {
 
-			repl.PrintSafe("用法: /skill create <name>\n")
+			termui.PrintSafe("用法: /skill create <name>\n")
 
 			return
 
@@ -742,7 +744,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		skills.InstallSkill(name, "local", "")
 
-		repl.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
+		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 
 	default:
 
@@ -752,13 +754,13 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		if !ok {
 
-			repl.PrintSafe("\n未找到技能 %s。您可以使用 /skill marketplace 浏览可用技能，或自建技能。\n", name)
+			termui.PrintSafe("\n未找到技能 %s。您可以使用 /skill marketplace 浏览可用技能，或自建技能。\n", name)
 
 			return
 
 		}
 
-		repl.PrintSafe("\n[Skill %s]\n\n%s\n\n", name, prompt)
+		termui.PrintSafe("\n[Skill %s]\n\n%s\n\n", name, prompt)
 
 	}
 
@@ -839,7 +841,7 @@ func printCLIHelp() {
  cove                       启动交互式 REPL（默认全屏 TUI 界面）
 
 
- cove --no-tui              使用经典逐行 REPL（关闭全屏 TUI）
+ cove --no-tui              使用 headless 无 UI 模式（适合脚本/管道）
 
 
  cove -p <prompt>           执行单次询问并输出结果

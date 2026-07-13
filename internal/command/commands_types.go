@@ -7,6 +7,9 @@ type ConfigCmd struct{}
 type CompactCmd struct{}
 type CostCmd struct{}
 type DiffCmd struct{}
+type UndoCmd struct{}
+type CheckpointsCmd struct{}
+type RateLimitCmd struct{}
 type MemoryCmd struct{}
 type ResumeCmd struct{}
 type HistoryCmd struct{}
@@ -32,6 +35,9 @@ func NewConfigCmd() Command      { return &ConfigCmd{} }
 func NewCompactCmd() Command     { return &CompactCmd{} }
 func NewCostCmd() Command        { return &CostCmd{} }
 func NewDiffCmd() Command        { return &DiffCmd{} }
+func NewUndoCmd() Command        { return &UndoCmd{} }
+func NewCheckpointsCmd() Command { return &CheckpointsCmd{} }
+func NewRateLimitCmd() Command   { return &RateLimitCmd{} }
 func NewMemoryCmd() Command      { return &MemoryCmd{} }
 func NewResumeCmd() Command      { return &ResumeCmd{} }
 func NewHistoryCmd() Command     { return &HistoryCmd{} }

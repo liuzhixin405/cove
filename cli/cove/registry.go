@@ -76,6 +76,9 @@ func registerAllCommands() *command.Registry {
 	// Session and memory.
 	r.Register(command.NewCompactCmd())
 	r.Register(command.NewCostCmd())
+	r.Register(command.NewRateLimitCmd())
+	r.Register(command.NewUndoCmd())
+	r.Register(command.NewCheckpointsCmd())
 	r.Register(command.NewMemoryCmd())
 	r.Register(command.NewResumeCmd())
 	r.Register(command.NewHistoryCmd())

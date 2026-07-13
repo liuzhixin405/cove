@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/liuzhixin405/cove/internal/tui/theme"
 )
 
@@ -100,8 +101,8 @@ func (m *Model) renderStatusBar() string {
 	if w <= contentLen+rightLen {
 		// Terminal too narrow, just render centerText
 		bar = centerText
-		if len(bar) > w {
-			bar = bar[:w]
+		if lipgloss.Width(bar) > w {
+			bar = truncate(bar, w)
 		}
 	} else {
 		// Center alignment calculation
@@ -124,7 +125,7 @@ func (m *Model) renderStatusBar() string {
 
 		leftSpaces := strings.Repeat(" ", leftPad)
 		middleAndLeft := leftSpaces + centerText
-		rightPad := w - len(middleAndLeft) - rightLen
+		rightPad := w - lipgloss.Width(middleAndLeft) - rightLen
 		if rightPad < 0 {
 			rightPad = 0
 		}
@@ -147,12 +148,25 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+S Sessions · Ctrl+K Commands · ? Help · Esc Cancel · Ctrl+C Quit "
+	right := "Ctrl+Y 复制会话 │ F6 复制屏幕 │ F7 复制全部 │ Ctrl+K 命令 │ Ctrl+U 清空 │ ? 帮助 │ Esc 取消 │ Ctrl+C 退出 "
+	compact := "复制: Ctrl+Y会话 F6屏幕 F7全部 | Ctrl+K命令 Ctrl+U清空 ?帮助 Esc取消"
+	if PreferASCIIText() {
+		right = "Ctrl+Y Copy Session | F6 Copy Screen | F7 Copy All | Ctrl+K Cmd | Ctrl+U Clear | ? Help | Esc Cancel | Ctrl+C Quit "
+		compact = "Copy: Ctrl+Y session F6 screen F7 all | Ctrl+K cmd Ctrl+U clear ?help Esc cancel"
+	}
 
 	w := m.width
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
-		return bottomBarStyle.Width(w).Render(left)
+		// Keep shortcut hints visible even on narrow terminals.
+		available := w - 1
+		if available < 1 {
+			available = 1
+		}
+		if lipgloss.Width(compact) > available {
+			compact = truncate(compact, available)
+		}
+		return bottomBarStyle.Width(w).Render(compact)
 	}
 	return bottomBarStyle.Width(w).Render(left + strings.Repeat(" ", gap) + right)
 }
@@ -172,10 +186,14 @@ func humanCount(n int) string {
 func (m *Model) renderTransient() string {
 	left := ""
 	switch {
+	case m.copyNotice != "":
+		left = m.copyNotice
 	case m.activity != "":
 		left = "⚙ " + m.activity
 	case m.task.Running:
 		left = "⚙ Running..."
+	default:
+		left = m.slashCommandHint(4)
 	}
 	if m.task.Elapsed != "" && (m.activity != "" || m.task.Running) {
 		left += "  " + m.task.Elapsed
@@ -192,7 +210,12 @@ func (m *Model) renderTransient() string {
 	if gap < 1 {
 		gap = 1
 	}
-	return activityStyle.Render(body) + strings.Repeat(" ", gap) + dimStyle.Render(right)
+	line := activityStyle.Render(body) + strings.Repeat(" ", gap) + dimStyle.Render(right)
+	if lipgloss.Width(line) > w {
+		line = truncate(line, w)
+	}
+	// Always pad to full width so old chars from previous frames are cleared.
+	return lipgloss.NewStyle().Width(w).Render(line)
 }
 
 // renderOverlay renders the modal panel (history search or command palette)
@@ -423,6 +446,7 @@ func (m *Model) renderHelp(height int) string {
 	b.WriteString("    Enter    Send message\n")
 	b.WriteString("    \\ + Enter New line\n")
 	b.WriteString("    PgUp/Dn  Scroll\n")
+	b.WriteString("    Ctrl+U   Clear input\n")
 	b.WriteString("    Alt+T    Toggle reasoning\n")
 	b.WriteString("\n")
 	b.WriteString("  System\n")
@@ -481,12 +505,29 @@ func (m *Model) renderGitPanel() string {
 
 func truncate(s string, max int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	if max < 1 {
+	if max <= 0 {
 		return ""
 	}
-	return string(r[:max-1]) + "…"
+	if lipgloss.Width(s) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+
+	var b strings.Builder
+	cur := 0
+	limit := max - 1 // keep room for ellipsis
+	for _, r := range s {
+		rw := ansi.StringWidth(string(r))
+		if cur+rw > limit {
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return b.String() + "…"
 }

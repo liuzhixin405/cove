@@ -249,15 +249,15 @@ go build -o cove ./cli/cove
 
 | 命令 | 说明 |
 |------|------|
-| `/memory add <内容>` | 添加持久记忆 |
+| `/memory add <名称> <内容>` | 添加持久记忆 |
 | `/memory list` | 列出所有记忆 |
 
 ### 后台任务
 
 | 命令 | 说明 |
 |------|------|
-| `/tasks` | 查看运行中/排队的后台任务 |
-| `/stop` 或 `/cancel` | 取消当前运行的任务 |
+| `/tasks` | 查看运行中/排队任务（TUI）；headless 显示同步执行状态 |
+| `/stop` 或 `/cancel` | 取消当前任务（TUI）；headless 无后台任务可取消 |
 
 ### Git 集成
 
@@ -274,7 +274,12 @@ go build -o cove ./cli/cove
 | `/mcp` | MCP 服务器管理 |
 | `/plugin` | 插件管理 |
 | `/skills` | 列出可用技能 |
-| `/doctor` | 系统诊断 |
+| `/doctor` | 环境快速检查（Go/git/ripgrep） |
+| `/diagnose [quick\|errors\|archive\|codes]` | 完整系统诊断与错误分析 |
+| `/status` | 查看代理状态与会话信息 |
+| `/stats` | 查看消息数与费用统计 |
+| `/permissions` | 查看当前权限模式 |
+| `/init` | 检测项目结构并初始化 CLAUDE.md |
 | `/cd <路径>` | 切换工作目录 |
 | `/context` | 查看当前上下文 |
 | `/system <提示词>` | 设置自定义系统提示词 |
@@ -581,8 +586,8 @@ Cove 的 REPL 支持异步任务执行：
 - **主 REPL** 循环中，用户输入被转换为任务放入队列
 - 后台 goroutine 取出任务异步执行
 - 用户可以在当前任务执行时继续输入（新输入排队）
-- `/tasks` 查看运行中和排队的任务
-- `/stop` 取消当前任务
+- `/tasks` 查看运行中和排队任务（仅 TUI 维护队列）
+- `/stop` 取消当前任务（仅 TUI；headless 为同步执行）
 
 ### 任务合并
 
@@ -795,7 +800,7 @@ Cove 的会话管理具备低信噪比排除算法。当会自动为您保存的
 记忆存储在 `~/.cove/memories/` 目录。
 
 ```
-/memory add <内容>   # 添加记忆
+/memory add <名称> <内容>   # 添加记忆
 /memory list         # 列出所有记忆
 ```
 

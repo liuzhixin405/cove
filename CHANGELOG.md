@@ -1,4 +1,17 @@
-﻿## [8.0.0] - 2026-07-18
+﻿## [Unreleased]
+
+### Changed
+- **交互层统一到 Bubble Tea TUI**：移除了经典行交互循环。
+  - 交互式终端（TTY）一律使用 Bubble Tea TUI。
+  - 非交互场景（管道、重定向，以及 `--no-tui` / `COVE_TUI=0`）改用新的 **headless** 前端 `runHeadless`：逐行读取 stdin、结果写 stdout，脚本友好，无备用屏幕/原始模式。
+  - REPL 的功能已迁移，未丢失：技能调用 `/<名称>`、插件命令、`/resume`、`/export`、`/history detail`、图片自动切换视觉模型、中断时写入草稿以支持「继续」恢复、未知命令模糊建议。
+- `--no-tui` / `COVE_TUI=0` 的语义由「回退到旧行交互」改为「回退到 headless 无 UI 模式」。
+
+### Removed
+- `cli/cove` 旧行交互循环与旧任务队列实现，以及 `app_bootstrap.go` 中已失效的 `configurePermissionPrompt`。
+  - 终端样式/打印能力统一收敛到 `internal/termui`。
+
+## [8.0.0] - 2026-07-18
 
 ### Added
 

@@ -1,11 +1,9 @@
 ﻿package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
@@ -18,7 +16,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/skills"
 	"github.com/liuzhixin405/cove/internal/state"
 	"github.com/liuzhixin405/cove/internal/tool"
@@ -141,68 +138,6 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 		projCtx:   projCtx,
 		toolReg:   toolReg,
 	}, nil
-}
-
-func configurePermissionPrompt(eng *engine.Engine) {
-	eng.PermissionPrompt = func(toolName string, input map[string]any, reason string) bool {
-		desc := ""
-		switch toolName {
-		case "write", "edit":
-			if p, ok := input["filePath"].(string); ok {
-				desc = p
-			}
-		case "bash", "powershell":
-			if cmd, ok := input["command"].(string); ok {
-				if len(cmd) > 80 {
-					cmd = cmd[:80] + "..."
-				}
-				desc = cmd
-			}
-		default:
-			desc = reason
-		}
-
-		repl.PrintAbove(repl.PermissionPrompt(toolName, desc))
-		repl.PrintAbove(fmt.Sprintf("\n  %s请输入 (y)确认 / (n)拒绝 / (a)始终允许: %s", repl.Yellow, repl.Reset))
-
-		readAnswer := func() string {
-			if replInteractive {
-				ch := make(chan string, 1)
-				repl.SetPermInputCh(ch)
-				repl.BeginPromptInput()
-				line, ok := <-ch
-				repl.EndPromptInput()
-				if !ok {
-					return ""
-				}
-				return strings.TrimSpace(strings.ToLower(line))
-			}
-			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-			if err != nil {
-				return ""
-			}
-			return strings.TrimSpace(strings.ToLower(line))
-		}
-
-		answer := readAnswer()
-		if answer == "" {
-			repl.PrintAbove(fmt.Sprintf("\n  %s检测到空输入，请重新输入 (y/n/a):%s", repl.Yellow, repl.Reset))
-			answer = readAnswer()
-		}
-		if answer == "" {
-			repl.PrintAbove(fmt.Sprintf("  %s(按 y 确认，n 拒绝，a 全部接受)%s\n", repl.Dim, repl.Reset))
-			return false
-		}
-		switch answer {
-		case "y", "yes":
-			return true
-		case "a", "always":
-			eng.AddPermissionRule(permission.DAllow, permission.Rule{ToolPattern: toolName})
-			return true
-		default:
-			return false
-		}
-	}
 }
 
 func runStartupDiagnostics(cfg *config.Config, debugMode bool) {

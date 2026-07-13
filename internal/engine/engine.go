@@ -1,4 +1,4 @@
-﻿package engine
+package engine
 
 import (
 	"context"
@@ -27,11 +27,11 @@ import (
 	"github.com/liuzhixin405/cove/internal/notes"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plan"
-	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/repomap"
 	"github.com/liuzhixin405/cove/internal/safety"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
@@ -330,6 +330,24 @@ func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission
 
 func (e *Engine) Registry() *tool.Registry { return e.registry }
 func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
+func (e *Engine) ListCheckpoints() []string {
+	if e == nil || e.cpMgr == nil {
+		return nil
+	}
+	return e.cpMgr.List()
+}
+func (e *Engine) RestoreCheckpoint(commitHash string) error {
+	if e == nil || e.cpMgr == nil {
+		return fmt.Errorf("checkpoint manager unavailable")
+	}
+	return e.cpMgr.Restore(commitHash)
+}
+func (e *Engine) RateLimitInfo() api.RateLimitInfo {
+	if e == nil || e.rateLimits == nil {
+		return api.RateLimitInfo{}
+	}
+	return e.rateLimits.Info()
+}
 
 func (e *Engine) SystemPrompt() string {
 	if e.systemOverride != "" {
@@ -677,10 +695,13 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		var err error
 		useStream := onDelta != nil
 
-		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner)
-		var walker *repl.WalkingIndicator
-		if iter > 0 && !e.config.Debug {
-			walker = repl.NewWalkingIndicator("thinking...")
+		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner).
+		// When an external UI is rendering status lines (e.g. Bubble Tea TUI via
+		// OnEngineOutput), never print the legacy transient indicator directly to
+		// the terminal, or the two renderers will overwrite each other.
+		var walker *termui.WalkingIndicator
+		if e.shouldShowWalkingIndicator(iter) {
+			walker = termui.NewWalkingIndicator("thinking...")
 			walker.Start()
 		}
 
@@ -963,18 +984,22 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		if e.loopDetector != nil {
 			if lr := e.loopDetector.RecordIteration(); lr.Detected {
 				log.Warnf("stagnation (layer 3): %s", lr.Reason)
-				if lr.Fatal {
-					e.engineOutput("? " + lr.Reason)
-					return "", fmt.Errorf("loop detection: %s", lr.Reason)
-				}
-				// L3 is a weak signal -- log only, don't inject guidance.
-				// The model may be doing legitimate research/reading.
+				// L3 is advisory-only: never abort the task on this signal.
+				// The model may be doing legitimate research/reading with no writes.
+				e.engineOutput("  \x1b[2m(note) " + lr.Reason + "\x1b[0m")
 			}
 		}
 	}
 
 	e.drainPendingSteer() // discard pending steer on max iterations
 	return "", fmt.Errorf("max iterations (%d) reached, cost: %s", MaxIterations, e.costTracker.Summary())
+}
+
+func (e *Engine) shouldShowWalkingIndicator(iter int) bool {
+	if iter <= 0 || e.config.Debug {
+		return false
+	}
+	return e.OnEngineOutput == nil
 }
 
 func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string) {

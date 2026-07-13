@@ -13,7 +13,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/session"
 )
 
@@ -32,37 +32,37 @@ func handleExport(input string, eng *engine.Engine) {
 		}
 	}
 	if err := os.WriteFile(filename, []byte(sb.String()), 0644); err != nil {
-		repl.PrintSafe("导出失败: %v\n", err)
+		termui.PrintSafe("导出失败: %v\n", err)
 		return
 	}
-	repl.PrintSafe("已导出 %d 条消息到 %s\n", len(eng.Messages()), filename)
+	termui.PrintSafe("已导出 %d 条消息到 %s\n", len(eng.Messages()), filename)
 }
 
 func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("会话存储不可用\n")
+		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
 	if sessionID == "" {
 		records, _ := store.List()
 		if len(records) == 0 {
-			repl.PrintSafe("没有已保存的会话\n")
+			termui.PrintSafe("没有已保存的会话\n")
 			return
 		}
-		repl.PrintSafe("%d 个已保存的会话:\n", len(records))
+		termui.PrintSafe("%d 个已保存的会话:\n", len(records))
 		for _, r := range records {
-			repl.PrintSafe("  %s  %s  (%d tokens)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("15:04"))
+			termui.PrintSafe("  %s  %s  (%d tokens)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("15:04"))
 		}
 		return
 	}
 	r, err := store.Load(sessionID)
 	if err != nil {
-		repl.PrintSafe("会话 %s 未找到\n", sessionID)
+		termui.PrintSafe("会话 %s 未找到\n", sessionID)
 		return
 	}
 	eng.LoadMessages(r.Messages)
-	repl.PrintSafe("已恢复: %s (%d 条消息, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
+	termui.PrintSafe("已恢复: %s (%d 条消息, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
 }
 
 func autoSaveSession(eng *engine.Engine) {
@@ -176,18 +176,18 @@ func clearInterruptedDraft() error {
 func handleHistory(eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("会话存储不可用\n")
+		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
 	records := listHistoryRecords(store)
 	draft, _ := loadInterruptedDraft()
 	if len(records) == 0 && draft == nil {
-		repl.PrintSafe("暂无历史。退出时会自动保存会话。\n")
+		termui.PrintSafe("暂无历史。退出时会自动保存会话。\n")
 		return
 	}
-	repl.PrintSafe("\n  历史记录 (%d 个会话):\n\n", len(records))
+	termui.PrintSafe("\n  历史记录 (%d 个会话):\n\n", len(records))
 	if draft != nil {
-		repl.PrintSafe("  ⚠ 中断草稿 [%s] %s\n", draft.UpdatedAt.Format("01-02 15:04"), shortDesc(draft.Title))
+		termui.PrintSafe("  ⚠ 中断草稿 [%s] %s\n", draft.UpdatedAt.Format("01-02 15:04"), shortDesc(draft.Title))
 	}
 	limit := 20
 	if len(records) < limit {
@@ -210,17 +210,17 @@ func handleHistory(eng *engine.Engine) {
 		if len(title) > 50 {
 			title = title[:50] + "..."
 		}
-		repl.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
+		termui.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
 	}
 	if len(records) > limit {
-		repl.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
+		termui.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
 	}
-	repl.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
-	repl.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
-	repl.PrintSafe("  查看详情: /history detail <编号>\n\n")
-	repl.PrintSafe("  清洗历史: /history clean\n\n")
+	termui.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
+	termui.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
+	termui.PrintSafe("  查看详情: /history detail <编号>\n\n")
+	termui.PrintSafe("  清洗历史: /history clean\n\n")
 	if draft != nil {
-		repl.PrintSafe("  中断详情: /history detail interrupted\n\n")
+		termui.PrintSafe("  中断详情: /history detail interrupted\n\n")
 	}
 }
 
@@ -245,12 +245,12 @@ func sessionsDirPath() (string, error) {
 func handleHistoryClean() {
 	dir, err := sessionsDirPath()
 	if err != nil {
-		repl.PrintSafe("历史清洗失败: %v\n", err)
+		termui.PrintSafe("历史清洗失败: %v\n", err)
 		return
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		repl.PrintSafe("历史清洗失败: %v\n", err)
+		termui.PrintSafe("历史清洗失败: %v\n", err)
 		return
 	}
 
@@ -320,15 +320,15 @@ func handleHistoryClean() {
 		stats.Modified++
 	}
 
-	repl.PrintSafe("历史清洗完成。\n")
-	repl.PrintSafe("  扫描文件: %d\n", stats.Scanned)
-	repl.PrintSafe("  修改文件: %d\n", stats.Modified)
-	repl.PrintSafe("  标题修复: %d\n", stats.TitlesFixed)
-	repl.PrintSafe("  Synthetic修复: %d\n", stats.SyntheticFlag)
-	repl.PrintSafe("  解析失败: %d\n", stats.ParseFailed)
-	repl.PrintSafe("  备份失败: %d\n", stats.BackupFailed)
-	repl.PrintSafe("  写回失败: %d\n", stats.WriteFailed)
-	repl.PrintSafe("  备份后缀: .bak.%s\n", stamp)
+	termui.PrintSafe("历史清洗完成。\n")
+	termui.PrintSafe("  扫描文件: %d\n", stats.Scanned)
+	termui.PrintSafe("  修改文件: %d\n", stats.Modified)
+	termui.PrintSafe("  标题修复: %d\n", stats.TitlesFixed)
+	termui.PrintSafe("  Synthetic修复: %d\n", stats.SyntheticFlag)
+	termui.PrintSafe("  解析失败: %d\n", stats.ParseFailed)
+	termui.PrintSafe("  备份失败: %d\n", stats.BackupFailed)
+	termui.PrintSafe("  写回失败: %d\n", stats.WriteFailed)
+	termui.PrintSafe("  备份后缀: .bak.%s\n", stamp)
 }
 
 func deriveCleanTitle(msgs []api.Message) string {
@@ -394,7 +394,7 @@ func sessionPreview(r session.Record) string {
 func handleHistoryResume(input string, eng *engine.Engine) {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("会话存储不可用\n")
+		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
 
@@ -420,7 +420,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	}
 
 	if err != nil {
-		repl.PrintSafe("恢复会话失败或无效选择: %s\n输入 /history 查看可用会话。\n", input)
+		termui.PrintSafe("恢复会话失败或无效选择: %s\n输入 /history 查看可用会话。\n", input)
 		return
 	}
 
@@ -428,16 +428,16 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	title := effectiveHistoryTitle(*r)
 
 	// Dynamic interactive feedback: print last 4 messages on main console instead of a dry summary!
-	repl.PrintSafe("\n==================================================\n")
+	termui.PrintSafe("\n==================================================\n")
 	if numberIdx > 0 {
-		repl.PrintSafe("  ★ 已成功拉回历史会话 #%d: %s\n", numberIdx, title)
+		termui.PrintSafe("  ★ 已成功拉回历史会话 #%d: %s\n", numberIdx, title)
 	} else {
-		repl.PrintSafe("  ★ 已成功拉回历史会话: %s\n", title)
+		termui.PrintSafe("  ★ 已成功拉回历史会话: %s\n", title)
 	}
-	repl.PrintSafe("==================================================\n\n")
+	termui.PrintSafe("==================================================\n\n")
 
 	if len(r.Messages) == 0 {
-		repl.PrintSafe("  (该历史会话为空，现在可以输入指令开始新的对话)\n\n")
+		termui.PrintSafe("  (该历史会话为空，现在可以输入指令开始新的对话)\n\n")
 		return
 	}
 
@@ -445,7 +445,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	startIndex := 0
 	if len(r.Messages) > 4 {
 		startIndex = len(r.Messages) - 4
-		repl.PrintSafe("  ... (已隐藏前面 %d 条对话细节) ...\n\n", len(r.Messages)-4)
+		termui.PrintSafe("  ... (已隐藏前面 %d 条对话细节) ...\n\n", len(r.Messages)-4)
 	}
 
 	for i := startIndex; i < len(r.Messages); i++ {
@@ -454,20 +454,20 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 		switch strings.ToLower(msg.Role) {
 		case "user":
 			if !strings.HasPrefix(strings.TrimSpace(msg.Content), "[system:") {
-				repl.PrintSafe("%s用户 (User):%s\n  %s\n\n", repl.Yellow, repl.Reset, strings.TrimSpace(msg.Content))
+				termui.PrintSafe("%s用户 (User):%s\n  %s\n\n", termui.Yellow, termui.Reset, strings.TrimSpace(msg.Content))
 			} else {
 				// Internal state prompts in dim/italics
-				repl.PrintSafe("%s内置微调状态 (System):%s\n  %s\n\n", repl.Dim, repl.Reset, strings.TrimSpace(msg.Content))
+				termui.PrintSafe("%s内置微调状态 (System):%s\n  %s\n\n", termui.Dim, termui.Reset, strings.TrimSpace(msg.Content))
 			}
 		case "assistant":
 			if msg.Content != "" {
-				repl.PrintSafe("%s助手 (Assistant):%s\n%s\n\n", repl.Green, repl.Reset, strings.TrimSpace(msg.Content))
+				termui.PrintSafe("%s助手 (Assistant):%s\n%s\n\n", termui.Green, termui.Reset, strings.TrimSpace(msg.Content))
 			}
 			for _, tc := range msg.ToolCalls {
-				repl.PrintSafe("  %s↳ 触发核心工具: %s, 传入参数: %v%s\n", repl.Dim, tc.Name, tc.Input, repl.Reset)
+				termui.PrintSafe("  %s↳ 触发核心工具: %s, 传入参数: %v%s\n", termui.Dim, tc.Name, tc.Input, termui.Reset)
 			}
 			if len(msg.ToolCalls) > 0 {
-				repl.PrintSafe("\n")
+				termui.PrintSafe("\n")
 			}
 		case "tool":
 			// Compress raw execution content so we don't dump 100 lines of compilation logs
@@ -475,35 +475,35 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 			if len(toolContent) > 200 {
 				toolContent = toolContent[:200] + " ... [数据包已在上下文内激活]"
 			}
-			repl.PrintSafe("  %s🛠️  工具返回结果: %s%s\n\n", repl.Dim, toolContent, repl.Reset)
+			termui.PrintSafe("  %s🛠️  工具返回结果: %s%s\n\n", termui.Dim, toolContent, termui.Reset)
 		}
 	}
 
-	repl.PrintSafe("%s历史会话与运行上下文已被完整恢复。您可以直接继续向 Cove 提问了：%s\n\n", repl.Green, repl.Reset)
+	termui.PrintSafe("%s历史会话与运行上下文已被完整恢复。您可以直接继续向 Cove 提问了：%s\n\n", termui.Green, termui.Reset)
 }
 
 func handleHistoryDetail(input string, eng *engine.Engine) {
 	if strings.TrimSpace(input) == "" {
-		repl.PrintSafe("用法: /history detail <编号|session-id>\n")
+		termui.PrintSafe("用法: /history detail <编号|session-id>\n")
 		return
 	}
 	if strings.EqualFold(strings.TrimSpace(input), "interrupted") {
 		draft, _ := loadInterruptedDraft()
 		if draft == nil {
-			repl.PrintSafe("当前没有中断草稿。\n")
+			termui.PrintSafe("当前没有中断草稿。\n")
 			return
 		}
-		repl.PrintSafe("\n  中断草稿详情\n")
-		repl.PrintSafe("  更新时间: %s\n", draft.UpdatedAt.Format("2006-01-02 15:04:05"))
-		repl.PrintSafe("  标题: %s\n", draft.Title)
-		repl.PrintSafe("  错误: %s\n\n", shortDesc(draft.Error))
-		repl.PrintSafe("  用户输入:\n")
-		repl.PrintSafe("  %s\n\n", draft.UserContent)
+		termui.PrintSafe("\n  中断草稿详情\n")
+		termui.PrintSafe("  更新时间: %s\n", draft.UpdatedAt.Format("2006-01-02 15:04:05"))
+		termui.PrintSafe("  标题: %s\n", draft.Title)
+		termui.PrintSafe("  错误: %s\n\n", shortDesc(draft.Error))
+		termui.PrintSafe("  用户输入:\n")
+		termui.PrintSafe("  %s\n\n", draft.UserContent)
 		return
 	}
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("会话存储不可用\n")
+		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
 
@@ -518,20 +518,20 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 
 	r, err := resolve(strings.TrimSpace(input))
 	if err != nil {
-		repl.PrintSafe("无效选择: %s\n输入 /history 查看可用会话。\n", input)
+		termui.PrintSafe("无效选择: %s\n输入 /history 查看可用会话。\n", input)
 		return
 	}
 
 	title := effectiveHistoryTitle(*r)
 
-	repl.PrintSafe("\n  会话详情\n")
-	repl.PrintSafe("  ID: %s\n", r.ID)
-	repl.PrintSafe("  标题: %s\n", title)
-	repl.PrintSafe("  更新时间: %s\n", r.UpdatedAt.Format("2006-01-02 15:04:05"))
-	repl.PrintSafe("  消息数: %d\n\n", len(r.Messages))
+	termui.PrintSafe("\n  会话详情\n")
+	termui.PrintSafe("  ID: %s\n", r.ID)
+	termui.PrintSafe("  标题: %s\n", title)
+	termui.PrintSafe("  更新时间: %s\n", r.UpdatedAt.Format("2006-01-02 15:04:05"))
+	termui.PrintSafe("  消息数: %d\n\n", len(r.Messages))
 
 	if len(r.Messages) == 0 {
-		repl.PrintSafe("  该会话暂无消息。\n\n")
+		termui.PrintSafe("  该会话暂无消息。\n\n")
 		return
 	}
 
@@ -546,10 +546,10 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 		indices = append(indices, 0, 1, 2, total-3, total-2, total-1)
 	}
 
-	repl.PrintSafe("  消息预览:\n")
+	termui.PrintSafe("  消息预览:\n")
 	for i, idx := range indices {
 		if total > window && i == 3 {
-			repl.PrintSafe("    ...\n")
+			termui.PrintSafe("    ...\n")
 		}
 		m := r.Messages[idx]
 		role := strings.ToUpper(strings.TrimSpace(m.Role))
@@ -563,20 +563,20 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 		if strings.TrimSpace(content) == "" {
 			content = "(空)"
 		}
-		repl.PrintSafe("  [%03d] %-9s %s\n", idx+1, role, shortDesc(content))
+		termui.PrintSafe("  [%03d] %-9s %s\n", idx+1, role, shortDesc(content))
 	}
-	repl.PrintSafe("\n")
+	termui.PrintSafe("\n")
 }
 
 func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	store := eng.Store()
 	if store == nil {
-		repl.PrintSafe("会话存储不可用\n")
+		termui.PrintSafe("会话存储不可用\n")
 		return false
 	}
 	records, _ := store.List()
 	if len(records) == 0 {
-		repl.PrintSafe("暂无历史。\n")
+		termui.PrintSafe("暂无历史。\n")
 		return false
 	}
 
@@ -609,7 +609,7 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	eng.LoadMessages(best.rec.Messages)
 	title := effectiveHistoryTitle(*best.rec)
 	userTurns := countUserTurns(best.rec.Messages)
-	repl.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
+	termui.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
 	return true
 }
 
@@ -686,18 +686,6 @@ func looksSyntheticHistoryText(s string) bool {
 // drives the agent forward by enqueuing a real "继续" turn. Previously the
 // resume step only reloaded messages into context and stopped, so typing
 // "继续" appeared to do nothing — the model was never invoked.
-func resumeAndContinue(eng *engine.Engine, tasks *replTaskRunner) {
-	if !handleHistoryResumeMostRelevant(eng) {
-		return
-	}
-	if tasks == nil {
-		return
-	}
-	repl.PrintSafe("正在继续该任务…\n\n")
-	_, _ = tasks.Enqueue(api.Message{Role: "user", Content: "继续"})
-	// Don't block the main loop — the task runs in the background.
-}
-
 func scoreSessionForResume(r session.Record) int {
 	if len(r.Messages) == 0 {
 		return -100
@@ -743,7 +731,23 @@ func scoreSessionForResume(r session.Record) int {
 		}
 	}
 
-	return score
+		return score
+}
+
+// resumeAndContinue loads the most relevant past session AND then actually
+// drives the agent forward by enqueuing a real "继续" turn. Previously the
+// resume step only reloaded messages into context and stopped, so typing
+// "继续" appeared to do nothing — the model was never invoked.
+func resumeAndContinue(eng *engine.Engine, tasks *replTaskRunner) {
+	if !handleHistoryResumeMostRelevant(eng) {
+		return
+	}
+	if tasks == nil {
+		return
+	}
+	termui.PrintSafe("正在继续该任务…\n\n")
+	_, _ = tasks.Enqueue(api.Message{Role: "user", Content: "继续"})
+	// Don't block the main loop — the task runs in the background.
 }
 
 func isTrivialResumePrompt(s string) bool {

@@ -71,7 +71,8 @@ cove/
 │   ├── repl_config_commands.go  # 配置类 REPL 命令
 │   ├── repl_help.go    # 帮助和诊断信息
 │   ├── repl_history.go # 会话历史管理
-│   ├── repl_tasks.go   # 后台任务队列
+│   ├── repl_tui.go     # TUI 交互桥接
+│   ├── headless.go     # 非交互前端
 │   └── repl_session_commands.go  # 会话命令
 ├── internal/
 │   ├── agent/          # Agent 运行器和子智能体管理
@@ -88,6 +89,7 @@ cove/
 │   ├── engine/         # 核心引擎（对话循环）
 │   ├── extract/        # 自动记忆提取
 │   ├── guardrail/      # 护栏（循环检测、断路器等）
+│   ├── session/        # 会话存储与 TaskRunner 队列
 │   ├── hooks/          # 事件钩子系统
 │   ├── log/            # 日志
 │   ├── mcp/            # MCP 协议客户端

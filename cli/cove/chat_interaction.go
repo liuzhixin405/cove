@@ -9,7 +9,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove/internal/termui"
 )
 
 func isTransientRequestError(err error) bool {
@@ -35,15 +35,15 @@ func runChatInteraction(ctx context.Context, runner chatRunner, input string) (s
 }
 
 func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg api.Message) (string, error) {
-	repl.BeginOutput()
-	defer repl.EndOutput()
+	termui.BeginOutput()
+	defer termui.EndOutput()
 	var totalOutput strings.Builder
 	var finalErr error
 	var reply string
 
 	maxAttempts := 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		spinner := repl.NewSpinner("思考中...")
+		spinner := termui.NewSpinner("思考中...")
 		spinner.Start()
 		firstDelta := true
 		gotDelta := false
@@ -60,13 +60,13 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				if firstDelta {
 					spinner.Stop()
 				}
-				repl.StreamPrint(repl.Dim + chunk + repl.Reset)
+				termui.StreamPrint(termui.Dim + chunk + termui.Reset)
 			}
 			// Route engine diagnostic lines (tool start/finish, stall warnings,
 			// memory/skill extraction notices) through StreamPrint so they appear
 			// in the conversation area in TUI mode.
 			eng.OnEngineOutput = func(line string) {
-				repl.StreamPrint(line)
+				termui.StreamPrint(line)
 			}
 			defer func() {
 				eng.OnPermissionPause = nil
@@ -85,14 +85,14 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 					firstDelta = false
 				}
 				gotDelta = true
-				repl.StreamPrint(delta)
+				termui.StreamPrint(delta)
 				totalOutput.WriteString(delta)
 			}, func(reasoning string) {
 				if firstDelta {
 					spinner.Stop()
 					// Don't set firstDelta to false yet, we want next text delta to stop spinner too if reasoning stops early
 				}
-				repl.StreamPrint(repl.ReasoningStyle + reasoning + repl.Reset)
+				termui.StreamPrint(termui.ReasoningStyle + reasoning + termui.Reset)
 			})
 		} else {
 			if len(userMsg.Parts) > 0 {
@@ -104,7 +104,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 						firstDelta = false
 					}
 					gotDelta = true
-					repl.StreamPrint(delta)
+					termui.StreamPrint(delta)
 					totalOutput.WriteString(delta)
 				})
 			}
@@ -120,20 +120,20 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			break
 		}
 		note := fmt.Sprintf("\n网络波动，自动重试中 (%d/%d)...\n", attempt, maxAttempts)
-		repl.StreamPrint(fmt.Sprintf("%s%s%s", repl.Yellow, note, repl.Reset))
+		termui.StreamPrint(fmt.Sprintf("%s%s%s", termui.Yellow, note, termui.Reset))
 		totalOutput.WriteString(note)
 		time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
 	}
 
 	if finalErr == nil {
 		if missing := missingStreamedSuffix(reply, totalOutput.String()); missing != "" {
-			repl.StreamPrint(missing)
+			termui.StreamPrint(missing)
 			totalOutput.WriteString(missing)
 		}
 	}
 	if finalErr != nil {
 		errMsg := fmt.Sprintf("\nRequest failed: %s", finalErr.Error())
-		repl.StreamPrint(fmt.Sprintf("%s%s%s", repl.Red, errMsg, repl.Reset))
+		termui.StreamPrint(fmt.Sprintf("%s%s%s", termui.Red, errMsg, termui.Reset))
 		totalOutput.WriteString(errMsg)
 	}
 	totalOutput.WriteString("\r\n\r\n")

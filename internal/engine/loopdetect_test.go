@@ -302,3 +302,45 @@ func TestLoopDetector_L1bProgressDetection_SameOutput(t *testing.T) {
 		t.Fatalf("expected Layer 1, got %d", r.Layer)
 	}
 }
+
+func TestLoopDetector_L3StagnationIsAdvisoryOnly(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 3
+
+	for i := 0; i < 2; i++ {
+		r := ld.RecordIteration()
+		if r.Detected {
+			t.Fatalf("unexpected early L3 detection at iteration %d", i)
+		}
+	}
+
+	r := ld.RecordIteration()
+	if !r.Detected {
+		t.Fatal("expected L3 detection at threshold")
+	}
+	if r.Layer != 3 {
+		t.Fatalf("expected Layer 3, got %d", r.Layer)
+	}
+	if r.Fatal {
+		t.Fatal("expected L3 to be non-fatal advisory signal")
+	}
+
+	// After emitting once, stall counter should reset and not immediately re-fire.
+	r2 := ld.RecordIteration()
+	if r2.Detected {
+		t.Fatal("expected no immediate repeated L3 detection after reset")
+	}
+}
+
+func TestLoopDetector_L3NoDetectionAfterFileActivity(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 2
+	ld.RecordFileActivity("a.txt", true)
+
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection with file activity: %+v", r)
+	}
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection with file activity: %+v", r)
+	}
+}

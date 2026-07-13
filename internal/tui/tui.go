@@ -1,4 +1,4 @@
-﻿// Package tui implements a full-screen, Bubble Tea based terminal UI for cove.
+// Package tui implements a full-screen, Bubble Tea based terminal UI for cove.
 //
 // Design rationale (see /memories/repo/tui-architecture.md): the legacy
 // interactive layer (internal/repl) drives the terminal with hand-written ANSI
@@ -14,7 +14,11 @@
 package tui
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -23,6 +27,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/liuzhixin405/cove/internal/tui/scrollstate"
 	"github.com/liuzhixin405/cove/internal/tui/theme"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -261,6 +266,12 @@ type (
 	historyMsg         []HistoryItem
 	activityMsg        string
 	permRequestMsg     permRequest
+	// copyDoneMsg reports the result of an async clipboard copy back to the UI
+	// goroutine so the copy subprocess never blocks rendering.
+	copyDoneMsg struct {
+		label string
+		err   error
+	}
 )
 
 // overlay modes for the modal palette (history search / command palette).
@@ -295,7 +306,6 @@ type clickRegion struct {
 	endLine   int
 	turnIdx   int
 }
-
 
 // Model is the root Bubble Tea model holding all UI state.
 type Model struct {
@@ -357,7 +367,13 @@ type Model struct {
 	// When true, stream deltas do NOT auto-scroll to the bottom, preserving the user's
 	// reading position. Reset on new message submit or PgDn to bottom.
 	scrolledUp bool
-
+	// mouseCapture controls whether Bubble Tea captures mouse events.
+	// false means native terminal selection works without Shift.
+	mouseCapture bool
+	// copyNotice is a transient one-line status shown above the input after a
+	// copy key (Ctrl+Y/F6/F7). It is dismissed on the next key press and kept
+	// OUT of the transcript, so copying never grows the conversation.
+	copyNotice string
 }
 
 // New constructs a Model. onSubmit is invoked (on the UI goroutine) whenever the
@@ -401,6 +417,7 @@ func New(modelName string, onSubmit, onResume func(string), onInterrupt func(), 
 		streamTurn:     -1,
 		gitExpanded:    false,
 		quitSelectedNo: true,
+		mouseCapture:   defaultMouseCapture(),
 	}
 }
 
@@ -495,7 +512,15 @@ func (m *Model) refreshViewport(stick bool) {
 	if stick && !m.scrolledUp {
 		m.vp.GotoBottom()
 	}
+	m.syncScrollLock()
 }
+
+// syncScrollLock recalculates whether auto-stick should remain disabled.
+// It is true only when the user is not at the bottom of the transcript.
+func (m *Model) syncScrollLock() {
+	m.scrolledUp = scrollstate.IsUserScrolledUp(m.vp.YOffset(), m.vp.TotalLineCount(), m.vp.Height())
+}
+
 // Update implements tea.Model.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -508,6 +533,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport(true)
 
 	case tea.KeyPressMsg:
+		// Any key press dismisses a lingering copy notice.
+		m.copyNotice = ""
 		if m.showQuit {
 			return m.handleQuitDialog(msg)
 		}
@@ -520,6 +547,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.overlay != overlayNone {
 			return m.updateOverlay(msg)
+		}
+		if isTabKey(msg) {
+			if m.tabCompleteInput() {
+				return m, nil
+			}
+			return m, nil
 		}
 		switch msg.String() {
 		case "ctrl+s":
@@ -584,6 +617,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "ctrl+y":
+			text := m.exportSessionText()
+			if strings.TrimSpace(text) == "" {
+				m.copyNotice = "[复制] 当前无可复制内容"
+				return m, nil
+			}
+			m.copyNotice = "[复制] 正在复制…"
+			return m, copyCmd(text, "当前会话")
+		case "f6":
+			// Copy only the currently visible conversation viewport.
+			text := m.exportVisibleScreenText()
+			if strings.TrimSpace(text) == "" {
+				m.copyNotice = "[复制] 当前无可复制内容"
+				return m, nil
+			}
+			m.copyNotice = "[复制] 正在复制…"
+			return m, copyCmd(text, "当前屏幕内容")
+		case "f7":
+			text := m.exportTranscriptText()
+			if strings.TrimSpace(text) == "" {
+				m.copyNotice = "[复制] 当前无可复制内容"
+				return m, nil
+			}
+			m.copyNotice = "[复制] 正在复制…"
+			return m, copyCmd(text, "所有内容")
 		case "enter":
 			m.scrolledUp = false
 			input := strings.TrimRight(m.ta.Value(), "\r\n")
@@ -605,10 +663,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Insert a literal newline into the input box.
 			m.ta.InsertRune('\n')
 			return m, nil
-		case "up", "down", "pgup", "pgdown", "ctrl+u", "ctrl+d":
-			m.scrolledUp = true
+		case "ctrl+u":
+			// Clear the input box (bash/readline convention).
+			m.ta.Reset()
+			return m, nil
+		case "up", "down", "pgup", "pgdown", "ctrl+d":
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
+			m.syncScrollLock()
 			return m, cmd
 		}
 
@@ -623,8 +685,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Y < vpTop || msg.Y >= vpTop+m.vp.Height() {
 			return m, nil
 		}
-		vpLine := msg.Y - vpTop              // 0-indexed within viewport display
-		absLine := vpLine + m.vp.YOffset()    // absolute content line
+		vpLine := msg.Y - vpTop            // 0-indexed within viewport display
+		absLine := vpLine + m.vp.YOffset() // absolute content line
 		for _, r := range m.clickRegions {
 			if absLine >= r.startLine && absLine < r.endLine {
 				t := m.turns[r.turnIdx]
@@ -643,6 +705,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
+		m.syncScrollLock()
 		return m, cmd
 
 	case streamBeginMsg:
@@ -700,6 +763,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case streamEndMsg:
 		m.streaming = false
+		m.layout()
 		turnIdx := m.streamTurn
 		m.streamTurn = -1
 		m.curTurn = -1
@@ -711,11 +775,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshViewport(true)
-			// Force visible-line computation so viewport scroll state is
-			// fully settled before the next View() paint. Without this,
-			// the cursor offset can briefly lag behind the grown content,
-			// making the input box look like it jumped up.
-			m.vp.VisibleLineCount()
+		// Force visible-line computation so viewport scroll state is
+		// fully settled before the next View() paint. Without this,
+		// the cursor offset can briefly lag behind the grown content,
+		// making the input box look like it jumped up.
+		m.vp.VisibleLineCount()
 	case taskStateMsg:
 		prev := m.transientVisible()
 		m.task = TaskInfo(msg)
@@ -743,6 +807,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.permDesc = msg.desc
 		m.permReply = msg.reply
 		m.ta.Blur()
+	case copyDoneMsg:
+		if msg.err != nil {
+			m.copyNotice = "[复制] 复制失败: " + msg.err.Error()
+		} else {
+			m.copyNotice = "[复制] 已复制" + msg.label + "到系统剪贴板"
+		}
+		return m, nil
+
 	case activityMsg:
 		prev := m.transientVisible()
 		m.activity = string(msg)
@@ -1002,6 +1074,133 @@ func (m *Model) filteredCommands() []CommandItem {
 	return out
 }
 
+// tabCompleteInput restores classic REPL-style slash-command completion in the
+// main TUI input box. It completes the command token before the first space.
+// - single match: fill full command (adds a trailing space if no args yet)
+// - multi match with longer common prefix: extend current token
+// - no further extension: open command palette filtered by current token
+func (m *Model) tabCompleteInput() bool {
+	line := strings.TrimRight(m.ta.Value(), "\r\n")
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, "/") {
+		return false
+	}
+
+	leading := line[:len(line)-len(trimmed)]
+	body := trimmed[1:]
+	cmdPart := body
+	argPart := ""
+	if i := strings.IndexAny(body, " \t"); i >= 0 {
+		cmdPart = body[:i]
+		argPart = body[i:]
+	}
+	if cmdPart == "" {
+		m.openCommandsWithQuery("")
+		return true
+	}
+
+	matches := make([]CommandItem, 0, len(m.commands))
+	needle := strings.ToLower(cmdPart)
+	for _, c := range m.commands {
+		if strings.HasPrefix(strings.ToLower(c.Name), needle) {
+			matches = append(matches, c)
+		}
+	}
+	if len(matches) == 0 {
+		m.openCommandsWithQuery(cmdPart)
+		return true
+	}
+
+	if len(matches) == 1 {
+		completed := "/" + matches[0].Name + argPart
+		if strings.TrimSpace(argPart) == "" {
+			completed += " "
+		}
+		m.ta.SetValue(leading + completed)
+		return true
+	}
+
+	prefix := commonPrefixCommandNames(matches)
+	if len(prefix) > len(cmdPart) {
+		m.ta.SetValue(leading + "/" + prefix + argPart)
+		return true
+	}
+
+	m.openCommandsWithQuery(cmdPart)
+	return true
+}
+
+// slashCommandHint returns a short inline hint for slash-command completion in
+// the main input box (for example while typing "/h").
+func (m *Model) slashCommandHint(maxItems int) string {
+	line := strings.TrimRight(m.ta.Value(), "\r\n")
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, "/") {
+		return ""
+	}
+	body := strings.TrimPrefix(trimmed, "/")
+	cmdPart := body
+	if i := strings.IndexAny(body, " \t"); i >= 0 {
+		cmdPart = body[:i]
+	}
+	if cmdPart == "" {
+		return "补全: 输入命令名后按 Tab 自动补全"
+	}
+
+	needle := strings.ToLower(cmdPart)
+	matches := make([]string, 0, len(m.commands))
+	for _, c := range m.commands {
+		if strings.HasPrefix(strings.ToLower(c.Name), needle) {
+			matches = append(matches, "/"+c.Name)
+		}
+	}
+	if len(matches) == 0 {
+		return "补全: 无匹配，按 Tab 打开命令列表"
+	}
+	if len(matches) == 1 {
+		return "补全: " + matches[0] + "  (Tab 确认)"
+	}
+	if maxItems < 1 {
+		maxItems = 1
+	}
+	shown := matches
+	if len(shown) > maxItems {
+		shown = shown[:maxItems]
+	}
+	hint := "补全: " + strings.Join(shown, "  ")
+	if len(matches) > len(shown) {
+		hint += fmt.Sprintf("  +%d", len(matches)-len(shown))
+	}
+	hint += "  (Tab 自动补全)"
+	return hint
+}
+
+func commonPrefixCommandNames(items []CommandItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+	p := items[0].Name
+	for _, it := range items[1:] {
+		for !strings.HasPrefix(it.Name, p) {
+			if p == "" {
+				return ""
+			}
+			p = p[:len(p)-1]
+		}
+	}
+	return p
+}
+
+func isTabKey(msg tea.KeyPressMsg) bool {
+	if msg.String() == "tab" || msg.String() == "ctrl+i" {
+		return true
+	}
+	if msg.Text == "\t" {
+		return true
+	}
+	return msg.Code == tea.KeyTab
+}
+
 func (m *Model) gitPanelHeight() int {
 	status := strings.TrimSpace(m.status.GitStatus)
 	if status == "" || status == "(clean)" {
@@ -1085,7 +1284,7 @@ func (m *Model) View() tea.View {
 	// OpenCode-aligned fullscreen rendering path.
 	v.AltScreen = useAltScreen()
 	// Enable wheel/click reporting for reliable in-app scrolling across terminals.
-	v.MouseMode = useMouseMode()
+	v.MouseMode = m.currentMouseMode()
 
 	if m.showQuit {
 		mid := m.renderCenteredOverlay(m.renderQuitDialog(), m.vp.Height())
@@ -1175,17 +1374,144 @@ func useAltScreen() bool {
 	if v != "" {
 		return v != "0"
 	}
+	// Copy-friendly default: keep normal screen buffer so users can rely on
+	// native terminal selection behavior.
+	return false
+}
+
+// currentMouseMode returns the mouse mode for the current frame.
+func (m *Model) currentMouseMode() tea.MouseMode {
+	if m.mouseCapture {
+		return tea.MouseModeCellMotion
+	}
+	return tea.MouseModeNone
+}
+
+func defaultMouseCapture() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("COVE_TUI_MOUSE")))
+	if v == "1" || v == "on" || v == "cell" || v == "cellmotion" {
+		return true
+	}
+	if v == "0" || v == "off" || v == "none" {
+		return false
+	}
+	// Default to wheel-friendly mode: capture mouse events.
 	return true
 }
 
-func useMouseMode() tea.MouseMode {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("COVE_TUI_MOUSE")))
-	if v == "1" || v == "on" || v == "cell" || v == "cellmotion" {
-		return tea.MouseModeCellMotion
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+func stripANSI(s string) string {
+	return ansiEscapeRE.ReplaceAllString(s, "")
+}
+
+func (m *Model) exportVisibleScreenText() string {
+	view := stripANSI(m.vp.View())
+	return strings.TrimSpace(view)
+}
+
+func (m *Model) exportSessionText() string {
+	var b strings.Builder
+	for _, t := range m.turns {
+		if t.system {
+			continue
+		}
+		if u := strings.TrimSpace(t.user); u != "" {
+			b.WriteString("[USER]\n")
+			b.WriteString(u)
+			b.WriteString("\n\n")
+		}
+		if a := strings.TrimSpace(t.answer.String()); a != "" {
+			b.WriteString("[ASSISTANT]\n")
+			b.WriteString(a)
+			b.WriteString("\n\n")
+		}
 	}
-	if v == "0" || v == "off" || v == "none" {
-		return tea.MouseModeNone
+	return strings.TrimSpace(b.String())
+}
+
+func (m *Model) exportTranscriptText() string {
+	var b strings.Builder
+	for _, t := range m.turns {
+		if t.system {
+			s := strings.TrimSpace(t.answer.String())
+			if s != "" {
+				b.WriteString("[SYSTEM]\n")
+				b.WriteString(s)
+				b.WriteString("\n\n")
+			}
+			continue
+		}
+		if u := strings.TrimSpace(t.user); u != "" {
+			b.WriteString("[USER]\n")
+			b.WriteString(u)
+			b.WriteString("\n\n")
+		}
+		if r := strings.TrimSpace(t.reasoning.String()); r != "" {
+			b.WriteString("[REASONING]\n")
+			b.WriteString(r)
+			b.WriteString("\n\n")
+		}
+		if a := strings.TrimSpace(t.answer.String()); a != "" {
+			b.WriteString("[ASSISTANT]\n")
+			b.WriteString(a)
+			b.WriteString("\n\n")
+		}
 	}
-	// Default to CellMotion so click-to-fold and wheel scrolling work out of the box.
-	return tea.MouseModeCellMotion
+	return strings.TrimSpace(b.String())
+}
+
+// copyCmd copies text to the clipboard OFF the UI goroutine so a slow clipboard
+// subprocess (e.g. PowerShell on Windows) never freezes rendering. The result
+// is delivered back to Update via copyDoneMsg.
+func copyCmd(text, label string) tea.Cmd {
+	return func() tea.Msg {
+		return copyDoneMsg{label: label, err: copyToClipboard(text)}
+	}
+}
+
+func copyToClipboard(text string) error {
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("empty content")
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// clip.exe may mangle non-ASCII text depending on console code page.
+		// Use PowerShell Set-Clipboard with UTF-8 stdin to preserve CJK text.
+		cmd = exec.Command(
+			"powershell",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"[Console]::InputEncoding=[System.Text.Encoding]::UTF8; $t=[Console]::In.ReadToEnd(); Set-Clipboard -Value $t",
+		)
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	default:
+		if _, err := exec.LookPath("wl-copy"); err == nil {
+			cmd = exec.Command("wl-copy")
+		} else if _, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		} else if _, err := exec.LookPath("xsel"); err == nil {
+			cmd = exec.Command("xsel", "--clipboard", "--input")
+		} else {
+			return fmt.Errorf("clipboard tool not found")
+		}
+	}
+	cmd.Stdin = strings.NewReader(text)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if runtime.GOOS == "windows" {
+			// Fallback for environments where PowerShell is unavailable.
+			fallback := exec.Command("cmd", "/c", "clip")
+			fallback.Stdin = strings.NewReader(text)
+			if fbOut, fbErr := fallback.CombinedOutput(); fbErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%w: %s; fallback: %s", err, strings.TrimSpace(string(out)), strings.TrimSpace(string(fbOut)))
+			}
+		}
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

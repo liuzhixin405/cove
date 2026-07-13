@@ -351,17 +351,21 @@ func (ld *LoopDetector) RecordIteration() LoopResult {
 		totalWritten := len(ld.filesWritten)
 
 		if totalCreated == 0 && totalWritten == 0 {
-			ld.breakCount++
+			// Layer 3 is an advisory signal only. Read/search-heavy tasks can
+			// legitimately run many iterations without file writes, so this should
+			// never escalate to a hard stop.
 			reason := fmt.Sprintf(
 				"检测到停滞循环(L3): 连续 %d 轮迭代没有任何文件创建或修改 — 模型可能在空转",
 				ld.stallCount,
 			)
-			fatal := ld.breakCount >= ld.maxBreaks
+			// Reset after notifying so we emit at most once per stall window
+			// instead of spamming every iteration.
+			ld.stallCount = 0
 			return LoopResult{
 				Detected: true,
 				Reason:   reason,
 				Layer:    3,
-				Fatal:    fatal,
+				Fatal:    false,
 			}
 		}
 		// Reset stall count periodically so it can detect new stagnation phases

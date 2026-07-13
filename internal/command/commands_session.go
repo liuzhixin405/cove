@@ -167,13 +167,17 @@ func (c *ContextCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		collected := ctxt.Collect()
 		pc = collected
 	}
+	if pc.IsGitRepo {
+		pc.RefreshGit()
+	}
 	var sb strings.Builder
 	sb.WriteString("=== 会话上下文 ===\n")
 	sb.WriteString(fmt.Sprintf("目录: %s\n", pc.Cwd))
 	sb.WriteString(fmt.Sprintf("平台: %s\n", pc.Platform))
 	sb.WriteString(fmt.Sprintf("Shell: %s\n", pc.Shell))
 	if pc.IsGitRepo {
-		sb.WriteString(fmt.Sprintf("Git: %s (%s)\n", pc.GitBranch, pc.GitStatus))
+		branch, status := pc.GetGitInfo()
+		sb.WriteString(fmt.Sprintf("Git: %s (%s)\n", branch, status))
 	}
 	if pc.FileTree != "" {
 		sb.WriteString("\n项目结构:\n")

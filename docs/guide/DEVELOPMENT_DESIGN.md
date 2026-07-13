@@ -775,7 +775,7 @@ func (cc *ChatCompressor) generateSummary(ctx context.Context, provider Provider
 | `internal/engine/compressor.go` | **新建** | ChatCompressor 实现 |
 | `internal/engine/compressor_test.go` | **新建** | 单元测试 |
 | `internal/engine/engine.go` | **修改** | 在 RunMessageWithStream 的消息构建阶段调用 |
-| `cli/cove/repl_loop.go` | **修改** | 压缩触发提示给用户 |
+| `cli/cove/headless.go` | **修改** | 非交互模式下统一输出与压缩提示 |
 | `internal/config/config.go` | **修改** | 压缩配置项 |
 
 **Engine 集成点**（`engine.go` 中 `RunMessageWithStream` 方法，在构建 system prompt **之前**）:

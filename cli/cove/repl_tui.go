@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -62,54 +62,6 @@ func useTUI() bool {
 	return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
 }
 
-// tuiJobQueue is a small FIFO with condition-variable blocking. The UI goroutine
-// pushes user submissions; a single worker goroutine pops them serially. pop
-// also returns a snapshot of the still-queued items so the sidebar can show them.
-type tuiJobQueue struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	items  []string
-	closed bool
-}
-
-func newTUIJobQueue() *tuiJobQueue {
-	q := &tuiJobQueue{}
-	q.cond = sync.NewCond(&q.mu)
-	return q
-}
-
-func (q *tuiJobQueue) push(s string) {
-	q.mu.Lock()
-	q.items = append(q.items, s)
-	q.mu.Unlock()
-	q.cond.Signal()
-}
-
-// pushFront inserts at the front of the queue (for interrupt + immediate retry).
-func (q *tuiJobQueue) pushFront(s string) {
-	q.mu.Lock()
-	q.items = append([]string{s}, q.items...)
-	q.mu.Unlock()
-	q.cond.Signal()
-}
-
-// pop blocks until an item is available, returning the next item plus a snapshot
-// of the remaining queue. ok is false only when the queue is closed and drained.
-func (q *tuiJobQueue) pop() (cur string, rest []string, ok bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for len(q.items) == 0 && !q.closed {
-		q.cond.Wait()
-	}
-	if len(q.items) == 0 {
-		return "", nil, false
-	}
-	cur = q.items[0]
-	q.items = q.items[1:]
-	rest = append([]string(nil), q.items...)
-	return cur, rest, true
-}
-
 // runTUI launches the experimental full-screen Bubble Tea UI. It wires the
 // engine's streaming output into the conversation body, keeps the status bars
 // (model/provider/git/permission/cost) in sync, shows transient tool/queue
@@ -161,8 +113,11 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		return s
 	}
 
-	queue := newTUIJobQueue()
+	queue := session.NewTaskRunner()
 	var running atomic.Bool
+	taskSnapshot := func() (bool, []string) {
+		return running.Load(), queue.Snapshot()
+	}
 
 	// cancelCurrent cancels the context of the in-flight engine task. It is set
 	// by the worker before each run and invoked by the Ctrl+C handler so an
@@ -188,13 +143,13 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 	var app *tui.App
 	app = tui.NewApp(modelName, func(input string) {
 		if running.Load() {
-			// Agent is busy — interrupt current task and re-queue the new input
+			// Agent is busy: interrupt current task and re-queue the new input
 			// at the front so it runs immediately (matches Hermes interrupt pattern).
 			interrupt()
-			queue.pushFront(input)
+			queue.EnqueueFront(input)
 			return
 		}
-		queue.push(input)
+		queue.Enqueue(input)
 	}, func(id string) {
 		// Restore a past session picked from the history overlay in TUI mode.
 		go func() {
@@ -230,14 +185,14 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 					if !msg.Synthetic && !looksSyntheticHistoryText(msg.Content) {
 						app.EngineLine(fmt.Sprintf("[用户 (User)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
 					} else {
-						app.EngineLine(fmt.Sprintf("[内置微调状态 (System)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
+						app.EngineLine(fmt.Sprintf("[内置微调状态(System)]:\n  %s\n\n", strings.TrimSpace(msg.Content)))
 					}
 				case "assistant":
 					if msg.Content != "" {
 						app.EngineLine(fmt.Sprintf("[助手 (Assistant)]:\n%s\n\n", strings.TrimSpace(msg.Content)))
 					}
 					for _, tc := range msg.ToolCalls {
-						app.EngineLine(fmt.Sprintf("  ↳ 触发核心工具: %s, 传入参数: %v\n", tc.Name, tc.Input))
+						app.EngineLine(fmt.Sprintf("  -> 触发核心工具: %s, 传入参数: %v\n", tc.Name, tc.Input))
 					}
 					if len(msg.ToolCalls) > 0 {
 						app.EngineLine("\n")
@@ -245,9 +200,9 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 				case "tool":
 					toolContent := strings.TrimSpace(msg.Content)
 					if len(toolContent) > 200 {
-						toolContent = toolContent[:200] + " ... [数据已装载]"
+						toolContent = toolContent[:200] + " ... [数据已截断]"
 					}
-					app.EngineLine(fmt.Sprintf("  🛠️  工具返回: %s\n\n", toolContent))
+					app.EngineLine(fmt.Sprintf("  [工具返回] %s\n\n", toolContent))
 				}
 			}
 
@@ -295,7 +250,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		})
 		items := make([]tui.HistoryItem, 0, len(recs))
 		for _, r := range recs {
-			// Skip sessions with no genuine user input — they only contain
+			// Skip sessions with no genuine user input: they only contain
 			// engine-injected synthetic prompts (loop guidance, circuit-breaker
 			// hints, compaction summaries) and were polluting the Ctrl+S list with
 			// records the user never actually started.
@@ -323,7 +278,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		// persists across turns until cleared, mirroring the classic REPL.
 		var attachedFiles []string
 		for {
-			input, rest, ok := queue.pop()
+			input, rest, ok := queue.Next()
 			if !ok {
 				return
 			}
@@ -345,7 +300,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 
 				// Handle missing slash commands that the classic REPL supports
 				// but are not registered in the command registry.
-				handled, cmdOut := handleTUISlashCommand(trimmed, eng, cfg, permMgr, app, interrupt, queue, runCommand, appVersion, cmdReg, toolReg, pluginMgr)
+				handled, cmdOut := handleTUISlashCommand(trimmed, eng, cfg, permMgr, app, interrupt, runCommand, appVersion, cmdReg, toolReg, pluginMgr, taskSnapshot)
 				if handled {
 					app.SetTask(tui.TaskInfo{Running: false})
 					if strings.TrimSpace(cmdOut) != "" {
@@ -355,8 +310,41 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 					continue
 				}
 
+				// Skill invocation: bare "/<skillname>" shows the skill prompt
+				// (parity with the classic REPL's handleSkillInvocation).
+				if tuiIsSkillInvocation(trimmed, eng) {
+					app.SetTask(tui.TaskInfo{Running: false})
+					if out := tuiSkillInvocationText(trimmed, eng); strings.TrimSpace(out) != "" {
+						app.EngineLine("\n" + strings.TrimRight(out, "\n") + "\n")
+					}
+					app.SetStatus(makeStatus(""))
+					continue
+				}
+
+				// Plugin command: inject the plugin command's prompt into the
+				// engine as a normal user turn (parity with handlePluginCommand).
+				if prompt, label, ok := tuiPluginCommandPrompt(trimmed, pluginMgr); ok {
+					app.EngineLine("\n[插件命令: /" + label + "]\n")
+					queue.EnqueueFront(prompt)
+					continue
+				}
+
+				// Unknown slash command (not registered): show fuzzy suggestions
+				// instead of falling through to a doomed engine request.
+				if fields := strings.Fields(trimmed); len(fields) > 0 {
+					base := strings.TrimPrefix(fields[0], "/")
+					if base != "" && cmdReg != nil {
+						if _, known := cmdReg.Find(base); !known {
+							app.SetTask(tui.TaskInfo{Running: false})
+							app.EngineLine("\n" + strings.TrimRight(tuiUnknownCmdText(trimmed, cmdReg), "\n") + "\n")
+							app.SetStatus(makeStatus(""))
+							continue
+						}
+					}
+				}
+
 				app.SetTask(tui.TaskInfo{Running: true, Current: input, Queued: rest})
-				app.SetActivity("执行命令…")
+				app.SetActivity(tuiCommandActivityText())
 				var out string
 				if runCommand != nil {
 					out = runCommand(input)
@@ -399,7 +387,7 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			}
 
 			app.SetTask(tui.TaskInfo{Running: true, Current: input, Queued: rest})
-			app.SetActivity("思考中…")
+			app.SetActivity(tuiThinkingActivityText())
 
 			// Build the message with inline @path tokens and any mounted
 			// attachments, surfacing image/encoding warnings inline.
@@ -415,10 +403,34 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 				app.EngineLine("[附件] " + w + "\n")
 			}
 
+			// Auto-switch to a vision model when an image attachment is detected
+			// but the current model can't see it (parity with the classic REPL).
+			// Rebuild the message afterwards so the switched model receives it.
+			if shouldAutoSwitchToVision(warnings) {
+				if visionModel := preferredVisionModelForProvider(pc.Name, cfg.Model); visionModel != "" && visionModel != cfg.Model {
+					if switchErr := applyProviderConfigChange(cfg, eng, func() error {
+						cfg.Model = visionModel
+						return nil
+					}); switchErr == nil {
+						app.EngineLine("[视觉] 检测到图片附件，已自动切换到视觉模型 " + visionModel + "\n")
+						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
+						if err != nil {
+							app.EngineLine("\n[附件] 构建消息失败: " + err.Error() + "\n")
+							app.SetActivity("")
+							app.SetTask(tui.TaskInfo{Running: false})
+							continue
+						}
+						for _, w := range warnings {
+							app.EngineLine("[附件] " + w + "\n")
+						}
+					}
+				}
+			}
+
 			start := time.Now()
-			eng.OnToolProgress = func(name string, _ string) { app.SetActivity("执行 " + name) }
+			eng.OnToolProgress = func(name string, _ string) { app.SetActivity(tuiToolActivityText(name)) }
 			eng.OnEngineOutput = func(line string) { app.EngineLine(cleanANSI(line)) }
-			eng.OnToolStart = func(name string) { app.SetActivity("⚙ 执行 " + name) }
+			eng.OnToolStart = func(name string) { app.SetActivity(tuiToolActivityText(name)) }
 
 			app.BeginStream("")
 			running.Store(true)
@@ -434,11 +446,18 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			setCancel(nil)
 			running.Store(false)
 			if err != nil {
+				// Persist an interrupted/failed draft so a later "继续" can
+				// recover it (parity with the classic REPL's task runner, which
+				// was the only place that wrote drafts).
+				_ = saveInterruptedDraft(userMsg, err)
 				if ctx.Err() != nil {
 					app.EngineLine("\n[已取消] 当前任务已终止\n")
 				} else {
 					app.EngineLine("\n[错误] " + err.Error() + "\n")
 				}
+			} else {
+				// Turn completed cleanly: drop any stale interrupted draft.
+				_ = clearInterruptedDraft()
 			}
 
 			// Auto save session at the end of each turn in TUI mode as well!
@@ -491,14 +510,13 @@ func handleTUISlashCommand(
 	permMgr *permission.Manager,
 	app *tui.App,
 	interrupt func(),
-	queue *tuiJobQueue,
 	runCommand func(string) string,
 	appVersion string,
 	cmdReg *command.Registry,
 	toolReg *tool.Registry,
 	pluginMgr *plugin.Manager,
+	taskSnapshot func() (running bool, queued []string),
 ) (bool, string) {
-
 	cmdName := strings.TrimPrefix(trimmed, "/")
 	parts := strings.Fields(cmdName)
 	if len(parts) == 0 {
@@ -508,12 +526,7 @@ func handleTUISlashCommand(
 	args := parts[1:]
 
 	switch name {
-	case "tools":
-		printTools(toolReg, pluginMgr)
-		return true, ""
-
 	case "help":
-		// Print help screen
 		var sb strings.Builder
 		sb.WriteString("\n=== cove v" + appVersion + " ===\n")
 		sb.WriteString("\n供应商 / 模型:\n")
@@ -522,7 +535,7 @@ func handleTUISlashCommand(
 		sb.WriteString("  /api-key <密钥>     保存 API 密钥\n")
 		sb.WriteString("  /base-url <地址>    设置自定义接口地址\n")
 		sb.WriteString("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)\n")
-		sb.WriteString("  /budget <金额|auto> 设置每会话预算上限 ($)\n")
+		sb.WriteString("  /budget <金额|auto> 设置每会话预算上限($)\n")
 		sb.WriteString("  /cost               查看用量和费用\n")
 		sb.WriteString("  /ratelimit          查看 API 速率限制状态\n")
 		sb.WriteString("  /attach <文件...>   挂载图片或文件\n")
@@ -531,73 +544,61 @@ func handleTUISlashCommand(
 		sb.WriteString("  /compact            压缩对话历史\n")
 		sb.WriteString("  /history            查看和继续历史会话\n")
 		sb.WriteString("  /history clean      清洗历史会话噪音并自动备份\n")
-		sb.WriteString("  /resume [id]        恢复已保存的会话\n")
+		sb.WriteString("  /resume [id]        恢复已保存会话\n")
 		sb.WriteString("  /memory             管理持久化记忆\n")
 		sb.WriteString("  /export             导出对话到文件\n")
 		sb.WriteString("\n后台任务:\n")
-		sb.WriteString("  /tasks              查看运行中/排队的任务\n")
-		sb.WriteString("  /stop               取消当前运行的任务 (别名 /cancel)\n")
+		sb.WriteString("  /tasks              查看运行中/排队任务\n")
+		sb.WriteString("  /stop               取消当前任务 (别名 /cancel)\n")
 		sb.WriteString("\n系统:\n")
-		sb.WriteString("  /tools              列出所有可用工具\n")
 		sb.WriteString("  /mcp                管理 MCP 服务器\n")
 		sb.WriteString("  /plugin             管理插件\n")
 		sb.WriteString("  /skills             列出技能\n")
 		sb.WriteString("  /diagnose           运行系统诊断\n")
 		sb.WriteString("  /doctor             检查 Go、git 环境\n")
-		sb.WriteString("\n命令:\n")
 		if cmdReg != nil {
+			sb.WriteString("\n命令:\n")
 			for _, c := range cmdReg.All() {
 				sb.WriteString(fmt.Sprintf("  /%-16s %s\n", c.Name(), c.Description()))
 			}
 		}
-		sb.WriteString("\n工具:\n")
 		if toolReg != nil {
+			sb.WriteString("\n工具:\n")
 			for _, t := range toolReg.All() {
 				d := t.Def()
 				sb.WriteString(fmt.Sprintf("  [%s] %-12s %s\n", roLabel(d.IsReadOnly), d.Name, truncateDesc(d.Description, 48)))
 			}
 		}
-		sb.WriteString("\n快捷键:\n")
-		sb.WriteString("  Ctrl+S    Sessions\n")
-		sb.WriteString("  Ctrl+K    Commands\n")
-		sb.WriteString("  Ctrl+O    Model\n")
-		sb.WriteString("  Ctrl+F    Attachments\n")
-		sb.WriteString("  Ctrl+H/?  Help\n")
-		sb.WriteString("  Ctrl+G    Git panel\n")
-		sb.WriteString("  Esc       Cancel task\n")
-		sb.WriteString("  Ctrl+C    Quit confirm\n")
-		sb.WriteString("  PgUp/Dn   Scroll chat\n")
-		sb.WriteString("  Wheel     Scroll chat\n")
-		sb.WriteString("  Alt+T     Toggle reasoning\n")
-		sb.WriteString("  Ctrl+T    Switch theme\n")
-		sb.WriteString("  Enter     Send (\\ + Enter for newline)\n")
-		sb.WriteString("\n")
 		return true, sb.String()
-
 	case "exit", "quit":
 		app.Quit()
 		return true, ""
-
 	case "stop", "cancel":
 		interrupt()
 		return true, "已发送取消信号"
-
 	case "tasks":
-		// Show what's in the queue.
-		return true, "当前执行中，使用 Esc 中断。所有输入按顺序处理。"
-
+		if taskSnapshot == nil {
+			return true, "任务快照不可用"
+		}
+		running, queued := taskSnapshot()
+		return true, formatTaskSnapshotText(running, queued)
 	case "compact":
-		// Compact the conversation history.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		eng.Compact(ctx)
 		return true, "上下文窗口已压缩。"
-
+	case "resume":
+		return true, tuiResumeText(strings.Join(args, " "), eng)
+	case "export":
+		return true, tuiExportText(trimmed, eng)
 	case "history":
 		if len(args) > 0 && strings.EqualFold(args[0], "clean") {
 			handleHistoryClean()
 			tuiRefreshHistoryOverlay(app, eng)
 			return true, "历史清洗已执行。"
+		}
+		if len(args) > 0 && strings.EqualFold(args[0], "detail") {
+			return true, tuiHistoryDetailText(strings.Join(args[1:], " "), eng)
 		}
 		store := eng.Store()
 		if store == nil {
@@ -625,36 +626,29 @@ func handleTUISlashCommand(
 		}
 		sb.WriteString("\n提示: 通过 Ctrl+S 可交互搜索并恢复历史会话。\n")
 		return true, sb.String()
-
 	case "cost":
-		// Show current session cost + historical cost (matching REPL behavior).
 		var sb strings.Builder
 		if eng.CostTracker() != nil {
 			sb.WriteString("本次会话: " + eng.CostTracker().Summary() + "\n")
 		}
 		ch := cost.NewCostHistory()
 		if len(ch.Records) > 0 {
-			sb.WriteString(fmt.Sprintf("近 24小时: $%.4f | 近 7天: $%.4f | 总计: $%.4f (%d 个会话)\n",
-				ch.Last24Hours(), ch.Last7Days(), ch.TotalAllTime(), len(ch.Records)))
+			sb.WriteString(fmt.Sprintf("近 24小时: $%.4f | 近 7天: $%.4f | 总计: $%.4f (%d 个会话)\n", ch.Last24Hours(), ch.Last7Days(), ch.TotalAllTime(), len(ch.Records)))
 		}
 		return true, sb.String()
-
 	case "skills", "skill":
-		// Handle skill commands with full REPL-compatible functionality.
 		rt := eng.Runtime()
 		prompts := rt.SkillPrompts
-
 		if len(args) == 0 || args[0] == "list" {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("\n已安装的技能 (%d):\n", len(prompts)))
-			// Sort by name for consistent output.
 			names := make([]string, 0, len(prompts))
-			for name := range prompts {
-				names = append(names, name)
+			for n := range prompts {
+				names = append(names, n)
 			}
 			sort.Strings(names)
-			for _, name := range names {
-				prompt := prompts[name]
+			for _, n := range names {
+				prompt := prompts[n]
 				desc := strings.SplitN(prompt, "\n", 2)
 				d := ""
 				if len(desc) > 0 {
@@ -663,11 +657,10 @@ func handleTUISlashCommand(
 						d = d[:57] + "..."
 					}
 				}
-				sb.WriteString(fmt.Sprintf("  %-16s %s\n", name, d))
+				sb.WriteString(fmt.Sprintf("  %-16s %s\n", n, d))
 			}
 			return true, sb.String()
 		}
-
 		switch args[0] {
 		case "marketplace", "registry", "search":
 			entries, err := skills.FetchRegistry()
@@ -685,7 +678,6 @@ func handleTUISlashCommand(
 			}
 			sb.WriteString("\n使用 /skill install <name> 安装技能\n")
 			return true, sb.String()
-
 		case "install":
 			if len(args) < 2 {
 				return true, "用法: /skill install <名称>\n"
@@ -707,7 +699,6 @@ func handleTUISlashCommand(
 				skills.InstallSkill(name, "local", "")
 				return true, fmt.Sprintf("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 			}
-
 		case "create":
 			if len(args) < 2 {
 				return true, "用法: /skill create <名称>\n"
@@ -715,9 +706,7 @@ func handleTUISlashCommand(
 			name := args[1]
 			skills.InstallSkill(name, "local", "")
 			return true, fmt.Sprintf("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
-
 		default:
-			// Try to show a specific skill's prompt.
 			name := args[0]
 			prompt, ok := prompts[name]
 			if !ok {
@@ -726,27 +715,40 @@ func handleTUISlashCommand(
 			return true, fmt.Sprintf("\n[Skill %s]\n\n%s\n\n", name, prompt)
 		}
 		return true, ""
-
-	case "undo":
-		return true, "/undo 功能暂未实现（可尝试 /history 查看历史消息手动恢复）"
-
-	case "checkpoints":
-		return true, "/checkpoints 功能暂未实现"
-
-	case "ratelimit":
-		return true, "当前未集成速率限制查询功能"
-
 	case "model", "provider", "api-key", "api_key", "base-url", "base_url", "mode", "budget":
-		// Redirect to /config via runCommand so all config write/validate/save logic
-		// stays in one place (ConfigCmd.Execute).
 		configLine := "/config " + name + " " + strings.Join(args, " ")
 		if runCommand != nil {
 			return true, runCommand(configLine)
 		}
 		return true, ""
 	}
-
 	return false, ""
+}
+
+func formatTaskSnapshotText(running bool, queued []string) string {
+	var sb strings.Builder
+	sb.WriteString("任务状态:\n")
+	if running {
+		sb.WriteString("- 运行中: 是\n")
+	} else {
+		sb.WriteString("- 运行中: 否\n")
+	}
+	if len(queued) == 0 {
+		sb.WriteString("- 排队: 0\n")
+		return strings.TrimRight(sb.String(), "\n")
+	}
+	sb.WriteString(fmt.Sprintf("- 排队: %d\n", len(queued)))
+	limit := len(queued)
+	if limit > 8 {
+		limit = 8
+	}
+	for i := 0; i < limit; i++ {
+		sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, strings.TrimSpace(queued[i])))
+	}
+	if len(queued) > limit {
+		sb.WriteString(fmt.Sprintf("  ... 其余 %d 项\n", len(queued)-limit))
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func roLabel(readOnly bool) string {
@@ -871,7 +873,7 @@ func permPromptDesc(toolName string, input map[string]any, reason string) string
 	return reason
 }
 
-// tuiAttachCommand handles "/attach …" in the TUI worker, mutating the mount
+// tuiAttachCommand handles "/attach ..." in the TUI worker, mutating the mount
 // list and returning rendered text (instead of printing to stdout like the
 // classic REPL). It reuses the shared splitQuotedFields/normalizeAttachmentPath
 // helpers from attachments.go.
@@ -952,8 +954,26 @@ func tuiAttachRemove(args []string, attached *[]string) string {
 	}
 	removed := (*attached)[idx-1]
 	*attached = append((*attached)[:idx-1], (*attached)[idx:]...)
-	return fmt.Sprintf("已移除附件: %s\n%s", removed, tuiAttachList(*attached))
+	return fmt.Sprintf("已移除附件 %s\n%s", removed, tuiAttachList(*attached))
 }
 
+func tuiCommandActivityText() string {
+	if tui.PreferASCIIText() {
+		return "running command..."
+	}
+	return "执行命令…"
+}
 
+func tuiThinkingActivityText() string {
+	if tui.PreferASCIIText() {
+		return "thinking..."
+	}
+	return "思考中…"
+}
 
+func tuiToolActivityText(name string) string {
+	if tui.PreferASCIIText() {
+		return "running " + name
+	}
+	return "执行 " + name
+}
