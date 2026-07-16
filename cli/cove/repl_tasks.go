@@ -65,14 +65,6 @@ func (r *replTaskRunner) Snapshot() TaskSnapshot {
 	return snap
 }
 
-func isContinueCommand(input string) bool {
-	v := strings.TrimSpace(strings.ToLower(input))
-	if v == "继续" || v == "continue" {
-		return true
-	}
-	return strings.HasPrefix(v, "继续") || strings.HasPrefix(v, "continue ")
-}
-
 func canMergeQueuedTask(existing, incoming api.Message) bool {
 	if existing.Role != "user" || incoming.Role != "user" {
 		return false

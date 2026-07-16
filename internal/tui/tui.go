@@ -663,11 +663,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Insert a literal newline into the input box.
 			m.ta.InsertRune('\n')
 			return m, nil
-		case "ctrl+u":
-			// Clear the input box (bash/readline convention).
-			m.ta.Reset()
-			return m, nil
-		case "up", "down", "pgup", "pgdown", "ctrl+d":
+		case "up", "down", "pgup", "pgdown", "ctrl+u", "ctrl+d":
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
 			m.syncScrollLock()

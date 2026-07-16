@@ -38,20 +38,6 @@ func providerEnvHelpLine() string {
 	return "环境变量: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
 }
 
-
-func printTools(toolReg *tool.Registry, _ *plugin.Manager) {
-	fmt.Println("\n=== 可用的工具 ===")
-	for _, t := range toolReg.All() {
-		d := t.Def()
-		ro := " "
-		if d.IsReadOnly {
-			ro = "R"
-		}
-		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
-	}
-	fmt.Println()
-}
-
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	fmt.Println("\n=== cove v" + Version + " ===")
 	fmt.Println("\n供应商 / 模型:")
@@ -104,6 +90,20 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 	fmt.Println("\n" + providerEnvHelpLine())
 	fmt.Println("启动参数: -p <提示> [--image <路径>] [--file <路径>] | -d --debug | -v --version | --doctor | --config")
 	fmt.Println("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
+	fmt.Println()
+}
+
+// printTools prints the list of available tools and their descriptions.
+func printTools(toolReg *tool.Registry, pluginMgr *plugin.Manager) {
+	fmt.Println("工具:")
+	for _, t := range toolReg.All() {
+		d := t.Def()
+		ro := " "
+		if d.IsReadOnly {
+			ro = "R"
+		}
+		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
+	}
 	fmt.Println()
 }
 

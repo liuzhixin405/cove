@@ -80,7 +80,7 @@ func (m *Model) renderStatusBar() string {
 		centerParts = append(centerParts, m.status.Git)
 	}
 	if m.status.PermMode != "" {
-		centerParts = append(centerParts, "⏵ "+m.status.PermMode)
+		centerParts = append(centerParts, "▸ "+m.status.PermMode)
 	}
 
 	centerText := " " + strings.Join(centerParts, " · ") + " "
@@ -148,11 +148,11 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+Y 复制会话 │ F6 复制屏幕 │ F7 复制全部 │ Ctrl+K 命令 │ Ctrl+U 清空 │ ? 帮助 │ Esc 取消 │ Ctrl+C 退出 "
-	compact := "复制: Ctrl+Y会话 F6屏幕 F7全部 | Ctrl+K命令 Ctrl+U清空 ?帮助 Esc取消"
+	right := "Ctrl+Y 复制会话 │ F6 复制屏幕 │ F7 复制全部 │ Ctrl+K 命令 │ ? 帮助 │ Esc 取消 │ Ctrl+C 退出 "
+	compact := "复制: Ctrl+Y会话 F6屏幕 F7全部 | Ctrl+K命令 ?帮助 Esc取消"
 	if PreferASCIIText() {
-		right = "Ctrl+Y Copy Session | F6 Copy Screen | F7 Copy All | Ctrl+K Cmd | Ctrl+U Clear | ? Help | Esc Cancel | Ctrl+C Quit "
-		compact = "Copy: Ctrl+Y session F6 screen F7 all | Ctrl+K cmd Ctrl+U clear ?help Esc cancel"
+		right = "Ctrl+Y Copy Session | F6 Copy Screen | F7 Copy All | Ctrl+K Cmd | ? Help | Esc Cancel | Ctrl+C Quit "
+		compact = "Copy: Ctrl+Y session F6 screen F7 all | Ctrl+K cmd ?help Esc cancel"
 	}
 
 	w := m.width
@@ -446,7 +446,6 @@ func (m *Model) renderHelp(height int) string {
 	b.WriteString("    Enter    Send message\n")
 	b.WriteString("    \\ + Enter New line\n")
 	b.WriteString("    PgUp/Dn  Scroll\n")
-	b.WriteString("    Ctrl+U   Clear input\n")
 	b.WriteString("    Alt+T    Toggle reasoning\n")
 	b.WriteString("\n")
 	b.WriteString("  System\n")

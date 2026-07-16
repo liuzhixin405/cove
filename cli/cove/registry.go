@@ -50,6 +50,7 @@ func registerAllTools(mcpPool *mcp.Pool) *tool.Registry {
 	r.Register(tool.NewPowerShellTool())
 	r.Register(tool.NewSkillsListTool())
 	r.Register(tool.NewSkillViewTool())
+	r.Register(tool.NewDrawImageTool())
 
 	// MCP proxy tools — expose tools/resources from connected MCP servers to the
 	// agent so it can invoke external capabilities once a server is connected.

@@ -69,7 +69,7 @@ AI API:        Anthropic API（主）/ OpenAI 兼容 API
 ## 3. 目录结构总览
 
 ```
-cove/
+cove/agent/
 ├── go.mod                          # Go 模块定义
 ├── go.sum                          # 依赖校验
 ├── README.md                       # 项目说明
