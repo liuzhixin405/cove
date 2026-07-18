@@ -179,6 +179,8 @@ func newTestEngine(provider *mockProvider, tools ...tool.Tool) *Engine {
 	}
 	// Inject our mock provider
 	eng.SetProvider(provider)
+	eng.extractRunner = nil
+	eng.dreamRunner = nil
 	return eng
 }
 

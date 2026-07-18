@@ -47,6 +47,7 @@ func TestToolTargetPath_Aliases(t *testing.T) {
 
 func TestMasker_DoesNotReMaskPlaceholder(t *testing.T) {
 	m := NewToolOutputMasker()
+	m.outputDir = t.TempDir()
 	m.protectionThreshold = 10  // tiny, so almost nothing is protected
 	m.minPrunableThreshold = 10 // tiny, so masking triggers easily
 	big := strings.Repeat("x", 8000)

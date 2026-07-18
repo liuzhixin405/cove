@@ -101,10 +101,15 @@ func (m *Marketplace) loadSources() {
 	}
 }
 
-func (m *Marketplace) saveSources() {
-	os.MkdirAll(filepath.Dir(m.sourcesFile()), 0755)
-	data, _ := json.MarshalIndent(m.sources, "", "  ")
-	os.WriteFile(m.sourcesFile(), data, 0644)
+func (m *Marketplace) saveSources() error {
+	if err := os.MkdirAll(filepath.Dir(m.sourcesFile()), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m.sources, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.sourcesFile(), data, 0644)
 }
 
 // AddSource registers a new marketplace source.
@@ -124,8 +129,7 @@ func (m *Marketplace) AddSource(name, sourceType, url string) error {
 	m.sources = append(m.sources, MarketplaceSource{
 		Name: name, Type: sourceType, URL: url, Enabled: true,
 	})
-	m.saveSources()
-	return nil
+	return m.saveSources()
 }
 
 // RemoveSource removes a marketplace source.
@@ -139,8 +143,7 @@ func (m *Marketplace) RemoveSource(name string) error {
 	for i, s := range m.sources {
 		if s.Name == name {
 			m.sources = append(m.sources[:i], m.sources[i+1:]...)
-			m.saveSources()
-			return nil
+			return m.saveSources()
 		}
 	}
 	return fmt.Errorf("source %q not found", name)
@@ -169,10 +172,15 @@ func (m *Marketplace) loadCachedIndex() {
 	json.Unmarshal(data, &m.index)
 }
 
-func (m *Marketplace) saveIndex() {
-	os.MkdirAll(filepath.Dir(m.indexFile()), 0755)
-	data, _ := json.MarshalIndent(m.index, "", "  ")
-	os.WriteFile(m.indexFile(), data, 0644)
+func (m *Marketplace) saveIndex() error {
+	if err := os.MkdirAll(filepath.Dir(m.indexFile()), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m.index, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.indexFile(), data, 0644)
 }
 
 // Refresh fetches the latest index from all enabled sources.
@@ -196,7 +204,9 @@ func (m *Marketplace) Refresh() error {
 	}
 
 	m.index = allEntries
-	m.saveIndex()
+	if err := m.saveIndex(); err != nil {
+		errs = append(errs, fmt.Sprintf("cache index: %v", err))
+	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("some sources failed: %s", strings.Join(errs, "; "))
@@ -476,7 +486,9 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 			InstalledAt: time.Now().Format(time.RFC3339),
 			AutoUpdate:  true,
 		}
-		m.saveLockfile()
+		if err := m.saveLockfile(); err != nil {
+			return fmt.Errorf("save lockfile: %w", err)
+		}
 		return nil
 	}
 
@@ -525,8 +537,9 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 		InstalledAt: time.Now().Format(time.RFC3339),
 		AutoUpdate:  true,
 	}
-	m.saveLockfile()
-
+	if err := m.saveLockfile(); err != nil {
+		return fmt.Errorf("save lockfile: %w", err)
+	}
 	return nil
 }
 
@@ -558,8 +571,9 @@ func (m *Marketplace) Update(name string) error {
 	lock.Version = readManifestVersion(pluginDir)
 	lock.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.lockfile.Plugins[name] = lock
-	m.saveLockfile()
-
+	if err := m.saveLockfile(); err != nil {
+		return fmt.Errorf("save lockfile: %w", err)
+	}
 	return nil
 }
 
@@ -594,7 +608,9 @@ func (m *Marketplace) UpdateAll() (updated []string, errs []string) {
 	}
 
 	if len(updated) > 0 {
-		m.saveLockfile()
+		if err := m.saveLockfile(); err != nil {
+			errs = append(errs, fmt.Sprintf("save lockfile: %v", err))
+		}
 	}
 	return
 }
@@ -616,10 +632,15 @@ func (m *Marketplace) loadLockfile() {
 	}
 }
 
-func (m *Marketplace) saveLockfile() {
-	os.MkdirAll(filepath.Dir(m.lockfilePath()), 0755)
-	data, _ := json.MarshalIndent(m.lockfile, "", "  ")
-	os.WriteFile(m.lockfilePath(), data, 0644)
+func (m *Marketplace) saveLockfile() error {
+	if err := os.MkdirAll(filepath.Dir(m.lockfilePath()), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m.lockfile, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.lockfilePath(), data, 0644)
 }
 
 // LockInfo returns the lock entry for a plugin.
@@ -807,6 +828,9 @@ func ensureManifest(pluginDir string) {
 		Skills:      skills,
 		Commands:    commands,
 	}
-	out, _ := json.MarshalIndent(manifest, "", "  ")
-	os.WriteFile(manifestPath, out, 0644)
+	out, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(manifestPath, out, 0644)
 }

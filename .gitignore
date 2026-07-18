@@ -40,6 +40,7 @@ go.work.sum
 # Go build artifacts
 coverage.txt
 *.test
+/.gocache/
 
 # Temporary / generated
 /session_notes.md

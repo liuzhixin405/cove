@@ -54,7 +54,7 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 			}
 			return "", fmt.Errorf("path on different drive: %s (cwd is on %s)", path, volRoot)
 		}
-		// Same drive but Rel still failed — try case-insensitive prefix matching
+		// Same drive but Rel still failed; try case-insensitive prefix matching.
 		lowerRoot := strings.ToLower(filepath.Clean(root))
 		lowerPath := strings.ToLower(filepath.Clean(checkAbs))
 		if strings.HasPrefix(lowerPath, lowerRoot+string(os.PathSeparator)) || lowerPath == lowerRoot {
@@ -84,7 +84,6 @@ func nearestExistingParent(path string) string {
 		path = parent
 	}
 }
-
 
 func findGitRoot(path string) string {
 	dir := filepath.Dir(path)

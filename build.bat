@@ -1,7 +1,7 @@
 @echo off
 title Cove Quick Builder
 echo ===================================================
-echo               Cove Quick-Build Script              
+echo               Cove Quick-Build Script
 echo ===================================================
 echo.
 
@@ -26,14 +26,14 @@ go build -ldflags "-s -w -X main.Version=5.0.0 -X main.BuildTime=%BUILD_TIME% -X
 if %ERRORLEVEL% EQU 0 (
     echo.
     echo [2/2] ===================================================
-    echo       ✨ SUCCESS: cove.exe successfully compiled! ✨
+    echo       SUCCESS: cove.exe successfully compiled!
     echo       Artifact path: .\cove.exe
     echo       Git Commit:    %COMMIT%
     echo       Build Time:    %BUILD_TIME%
     echo ===================================================
 ) else (
     echo.
-    echo ❌ ERROR: Compilation failed! Please check if Go is installed and on your PATH.
+    echo ERROR: Compilation failed! Please check if Go is installed and on your PATH.
 )
 echo.
 pause

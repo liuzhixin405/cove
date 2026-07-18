@@ -51,22 +51,20 @@ type Config struct {
 	// DoneVerifyCommands, if set, are shell commands (e.g. "go build ./...")
 	// run before the engine accepts a model's "no more tool calls" response
 	// as actually complete; see internal/engine/verify_gate.go. Off by
-	// default — an empty/absent list disables the gate entirely.
+	// default; an empty/absent list disables the gate entirely.
 	DoneVerifyCommands []string `json:"done_verify_commands,omitempty"`
 	// MemoryEmbedding, if set, opts the memory store into blending BM25
 	// keyword search with real semantic similarity from a remote embeddings
-	// API (see internal/memory/embed.go's RemoteAPIEmbeddingProvider and
-	// docs/中等模型平替优化建议.md §2.2). Off by default — nil means pure
-	// BM25 with zero extra network calls or cost, exactly like before this
-	// field existed.
+	// API. Off by default; nil means pure BM25 with zero extra network calls
+	// or cost, exactly like before this field existed.
 	MemoryEmbedding *MemoryEmbeddingConfig `json:"memory_embedding,omitempty"`
 }
 
 // MemoryEmbeddingConfig configures the optional remote embeddings endpoint
 // used for semantic memory search. BaseURL/APIKey default to the main
 // provider's values when empty, so in the common case a user who wants
-// this only needs to add `"memory_embedding": {}` (or set a model name) —
-// no separate account or key, reusing what's already configured for chat.
+// this only needs to add `"memory_embedding": {}` (or set a model name);
+// no separate account or key is needed, reusing what is already configured for chat.
 type MemoryEmbeddingConfig struct {
 	BaseURL string `json:"base_url,omitempty"`
 	APIKey  string `json:"api_key,omitempty"`
@@ -169,7 +167,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Model = DefaultModelForProvider(cfg.Provider.Name)
 	}
 	if cfg.ModelFast == "" || strings.EqualFold(cfg.ModelFast, "auto") {
-		// No fast model configured → reuse the main model. Routing a "simple"
+		// No fast model configured  - reuse the main model. Routing a "simple"
 		// task to the same model is a no-op, which is correct and provider-safe.
 		// (Previously this hardcoded deepseek-v4-flash for every provider, which
 		// broke routing whenever the active provider wasn't deepseek.)
@@ -235,7 +233,7 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	// Re-marshal provider using rawProvider — no masking MarshalJSON.
+	// Re-marshal provider using rawProvider  - no masking MarshalJSON.
 	providerRaw, err := json.Marshal(rawProvider{
 		Name:    cfg.Provider.Name,
 		APIKey:  cfg.Provider.APIKey,

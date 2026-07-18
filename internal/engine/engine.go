@@ -127,7 +127,7 @@ type Engine struct {
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
-	// app appears to hang ("一直无响应"), we can name exactly which stage is stuck.
+	// app appears to hang, we can name exactly which stage is stuck.
 	actMu  sync.Mutex
 	acts   map[uint64]*activity
 	actSeq uint64
@@ -253,7 +253,7 @@ func New(config Config) (*Engine, error) {
 
 	// Background memory bookkeeping (extraction + consolidation) is exactly
 	// the kind of low-stakes, high-frequency task that should default to
-	// the cheap model rather than the premium one — same reasoning as
+	// the cheap model rather than the premium one; same reasoning as
 	// compressor.go's compaction summaries. Previously both of these always
 	// used config.Model (premium), which was a needless cost multiplier
 	// with zero quality benefit for "summarize what happened" work.
@@ -360,7 +360,7 @@ func (e *Engine) SystemPrompt() string {
 	var sb strings.Builder
 	sb.WriteString(`# Identity & Core Directive
 
-You are Cove, an AI coding assistant. Your core job: **use tools to complete tasks — never describe what you would do, actually DO it.**
+You are Cove, an AI coding assistant. Your core job: **use tools to complete tasks  - never describe what you would do, actually DO it.**
 
 - Every file operation, command execution, code search, web access MUST go through tools
 - Single-step tasks: use the tool immediately, no explanation
@@ -369,11 +369,11 @@ You are Cove, an AI coding assistant. Your core job: **use tools to complete tas
 
 ---
 
-# Task Completion — What "Done" Really Means
+# Task Completion  - What "Done" Really Means
 
 ## Rule 1: Deliverable = Real Tool Output, Not a Description
 
-When the user asks you to build, run, or verify something, the deliverable is a **working artifact backed by real tool output** — not a description of one.
+When the user asks you to build, run, or verify something, the deliverable is a **working artifact backed by real tool output**  - not a description of one.
 
 **Do NOT stop** after any of these:
 - Writing a stub/empty file and declaring "done"
@@ -395,7 +395,7 @@ If a tool, installation, or network call fails and blocks a path:
 - **Try alternatives** (different package manager, different approach, ask the user)
 - **NEVER** substitute plausible-looking fabricated output (made-up data, invented file contents, synthesised API responses) for results you couldn't actually produce
 
-Reporting a real blocker is ALWAYS better than fabricating — it saves hours of debugging.
+Reporting a real blocker is ALWAYS better than fabricating  - it saves hours of debugging.
 
 ## Rule 3: Self-Check Before Declaring Done
 
@@ -410,13 +410,13 @@ Before announcing task completion, verify:
 # Tool Usage Protocol
 
 ## Tool Selection
-- **File operations** → write (new/rewrite) / read (view) / edit (modify)
-- **Commands/build/test/git** → bash
-- **Code search** → grep / glob
-- **Web access** → webfetch / websearch
-- **Browser** → browser
-- **Task management** → todowrite + execute_plan (3+ step tasks)
-- **Sub-agents** → agent (independent sub-tasks)
+- **File operations**  - write (new/rewrite) / read (view) / edit (modify)
+- **Commands/build/test/git**  - bash
+- **Code search**  - grep / glob
+- **Web access**  - webfetch / websearch
+- **Browser**  - browser
+- **Task management**  - todowrite + execute_plan (3+ step tasks)
+- **Sub-agents**  - agent (independent sub-tasks)
 
 ## Concurrency Rules
 - **Independent reads can be parallel**: batch multiple reads, searches, web fetches in one turn
@@ -444,10 +444,10 @@ For independent sub-tasks (parallel exploration, isolated tests), use agent sub-
 
 # Error Resilience
 
-- If 3 consecutive tool failures occur, **change strategy** — don't repeat the same failing approach
+- If 3 consecutive tool failures occur, **change strategy**  - don't repeat the same failing approach
 - If response is truncated (max_tokens), continue working when prompted
 - If loop detected, change your approach immediately
-- Max 200 iterations per turn — plan efficiently
+- Max 200 iterations per turn  - plan efficiently
 
 ---
 
@@ -467,7 +467,7 @@ Available tools:`)
 	// Core project info (working directory, platform, shell, git
 	// branch/status/log) is small, fixed-size, and essential on every
 	// turn, so it's written directly rather than competing for the
-	// shared budget below — it must never be what gets truncated just
+	// shared budget below  - it must never be what gets truncated just
 	// because memory or repo-map content happens to be large.
 	if e.projCtx != nil {
 		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
@@ -487,7 +487,7 @@ Available tools:`)
 	}
 
 	// Everything below is optional, potentially large, and was previously
-	// appended unconditionally in full — a large memory store could
+	// appended unconditionally in full  - a large memory store could
 	// silently crowd out the repo map, or vice versa, with no ordering or
 	// ceiling. It now competes for a single model-aware token budget via
 	// contextBudgeter instead: matched skills / retrieved memories are
@@ -630,7 +630,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	//     models, since top-tier models already decompose/self-verify well.
 	//   - taskDecompositionGuidance (task_decomposition_prompt.go): only
 	//     when the message itself looks like a multi-step task, regardless
-	//     of which model was routed — a suggestion to plan first, never a
+	//     of which model was routed  - a suggestion to plan first, never a
 	//     hard gate.
 	turnGuidance := weakModelGuidance(routedModel) + taskDecompositionGuidance(userMessage.Content)
 
@@ -766,7 +766,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// model's self-reported "done" (no more tool calls) until those
 			// commands actually pass. This matters far more for mid-tier
 			// models than top-tier ones, since "I'm done" self-reports are
-			// exactly the kind of claim they get wrong more often — this
+			// exactly the kind of claim they get wrong more often  - this
 			// turns that claim into something checked instead of trusted.
 			gaveUpUnresolved := false
 			if e.verifyGate.Enabled() {
@@ -1007,7 +1007,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	// even after best-effort repair (internal/api/tool_repair.go), don't
 	// dispatch garbage input to the real tool. Return a normal "Error: ..."
 	// tool result so the model sees exactly what went wrong and can resend
-	// the call with valid JSON on its next turn — this reuses the existing
+	// the call with valid JSON on its next turn  - this reuses the existing
 	// error/retry/circuit-breaker plumbing below instead of silently
 	// dropping the model's intent.
 	if tc.ParseError {
@@ -1046,7 +1046,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	}
 	// Guardrail check before execution. guardrailWarning, if set, is spliced
 	// onto whatever this call ultimately returns (success or error) by the
-	// deferred closure below — every return statement below this point goes
+	// deferred closure below  - every return statement below this point goes
 	// through it automatically via the named return value. Previously this
 	// only reached log.Debugf(), i.e. it was invisible to the model, which
 	// defeated the point of a *preflight* warning: the model never actually
@@ -1054,7 +1054,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	// circuit breakers (Block, or loop detection) kicked in later.
 	//
 	// Note: this must not mutate e.messages directly (unlike the loop
-	// detector's guidance injection elsewhere) — executeTool can run
+	// detector's guidance injection elsewhere)  - executeTool can run
 	// concurrently across goroutines for concurrency-safe tool calls (see
 	// the parallel dispatch path above), and e.messages is not
 	// synchronized for concurrent writes. Prepending to this call's own
