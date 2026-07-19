@@ -3,6 +3,7 @@
 import (
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -49,6 +50,10 @@ type LoopDetector struct {
 	// it's making progress and should NOT be flagged as a loop.
 	// Map: toolOnlyPattern -> []outputHash (ring buffer, window = toolOnlyWindow)
 	toolOutputs map[string][]string
+	// Map: toolOnlyPattern -> []dirSignature (ring buffer, window = toolOnlyWindow)
+	// Helps suppress false positives when the same tool pattern is exploring
+	// genuinely different directories/subprojects.
+	toolDirs map[string][]string
 
 	// Tracks the most recent tool pattern (set by RecordToolCalls, read by RecordOutput).
 	lastToolOnlyPattern string
@@ -105,6 +110,7 @@ func NewLoopDetector() *LoopDetector {
 		stallThresh:     60, // only flag after 60 iterations without file activity
 		isFastModel:     false,
 		toolOutputs:     make(map[string][]string),
+		toolDirs:        make(map[string][]string),
 	}
 }
 
@@ -233,6 +239,15 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 		ld.toolOnlyHistory = append(ld.toolOnlyHistory, toolOnly)
 		if len(ld.toolOnlyHistory) > ld.toolOnlyWindow {
 			ld.toolOnlyHistory = ld.toolOnlyHistory[1:]
+		}
+		if dirSig := extractDirectorySignature(fp); dirSig != "" {
+			ld.recordToolDir(toolOnly, dirSig)
+			// If one repeated tool pattern is exploring >=3 distinct directories,
+			// treat it as likely-progressive work and suppress L1b for this pattern.
+			if uniqueCount(ld.toolDirs[toolOnly]) >= 3 {
+				ld.clearToolOnlyFromHistory(toolOnly)
+				return LoopResult{}
+			}
 		}
 
 		// Save the current tool pattern so RecordOutput can correlate
@@ -388,6 +403,108 @@ func (ld *LoopDetector) clearToolOnlyFromHistory(pattern string) {
 	ld.toolOnlyHistory = filtered
 }
 
+func (ld *LoopDetector) recordToolDir(pattern, dirSig string) {
+	if pattern == "" || dirSig == "" {
+		return
+	}
+	ld.toolDirs[pattern] = append(ld.toolDirs[pattern], dirSig)
+	if len(ld.toolDirs[pattern]) > ld.toolOnlyWindow {
+		ld.toolDirs[pattern] = ld.toolDirs[pattern][len(ld.toolDirs[pattern])-ld.toolOnlyWindow:]
+	}
+}
+
+func uniqueCount(items []string) int {
+	if len(items) == 0 {
+		return 0
+	}
+	uniq := make(map[string]bool, len(items))
+	for _, it := range items {
+		if it == "" {
+			continue
+		}
+		uniq[it] = true
+	}
+	return len(uniq)
+}
+
+func extractDirectorySignature(fp string) string {
+	if fp == "" {
+		return ""
+	}
+	parts := strings.Split(fp, "|")
+	dirs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		idx := strings.Index(p, ":")
+		if idx <= 0 || idx+1 >= len(p) {
+			continue
+		}
+		val := strings.TrimSpace(p[idx+1:])
+		if d := normalizeDirSig(deriveDirFromValue(val)); d != "" {
+			dirs = append(dirs, d)
+		}
+	}
+	if len(dirs) == 0 {
+		return ""
+	}
+	sort.Strings(dirs)
+	return strings.Join(dirs, "|")
+}
+
+func deriveDirFromValue(val string) string {
+	if val == "" {
+		return ""
+	}
+	v := strings.TrimSpace(val)
+	v = strings.Trim(v, `"'`)
+	l := strings.ToLower(v)
+	if rest, ok := parseDirCommand(v, l); ok {
+		for _, sep := range []string{";", "&&", "||"} {
+			if idx := strings.Index(rest, sep); idx >= 0 {
+				rest = strings.TrimSpace(rest[:idx])
+				break
+			}
+		}
+		return rest
+	}
+	if strings.Contains(v, "\\") || strings.Contains(v, "/") {
+		d := filepath.Dir(v)
+		if d == "." {
+			return ""
+		}
+		return d
+	}
+	return ""
+}
+
+func parseDirCommand(raw, lower string) (string, bool) {
+	type cmdPrefix struct {
+		low    string
+		rawLen int
+	}
+	prefixes := []cmdPrefix{
+		{low: "cd ", rawLen: len("cd ")},
+		{low: "set-location ", rawLen: len("set-location ")},
+		{low: "pushd ", rawLen: len("pushd ")},
+		{low: "sl ", rawLen: len("sl ")},
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p.low) {
+			return strings.TrimSpace(raw[p.rawLen:]), true
+		}
+	}
+	return "", false
+}
+
+func normalizeDirSig(dir string) string {
+	d := strings.TrimSpace(dir)
+	if d == "" {
+		return ""
+	}
+	d = strings.ReplaceAll(d, "\\", "/")
+	d = strings.TrimRight(d, "/")
+	return strings.ToLower(d)
+}
+
 // ResetFingerprintHistory clears only the tool-call fingerprint history
 // (both exact and tool-only) without resetting the entire detector.
 // Used after injecting loop guidance so the model starts fresh.
@@ -395,6 +512,7 @@ func (ld *LoopDetector) ResetFingerprintHistory() {
 	ld.fpHistory = ld.fpHistory[:0]
 	ld.toolOnlyHistory = ld.toolOnlyHistory[:0]
 	ld.toolOutputs = make(map[string][]string)
+	ld.toolDirs = make(map[string][]string)
 	ld.lastToolOnlyPattern = ""
 }
 
@@ -409,6 +527,7 @@ func (ld *LoopDetector) Reset() {
 	ld.filesWritten = make(map[string]bool)
 	ld.stallCount = 0
 	ld.toolOutputs = make(map[string][]string)
+	ld.toolDirs = make(map[string][]string)
 	ld.lastToolOnlyPattern = ""
 }
 

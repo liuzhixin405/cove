@@ -26,9 +26,11 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 	}
 	list = append(list,
 		cmdEntry{Name: "/model", Desc: "设置模型", Type: "config"},
+		cmdEntry{Name: "/profile", Desc: "管理配置档案 (list/switch/save/delete/show)", Type: "config", ArgHints: map[string][]string{"": {"list", "switch", "save", "delete", "show"}}},
 		cmdEntry{Name: "/provider", Desc: "设置供应商", Type: "config", ArgHints: map[string][]string{"": providerNameSuggestions()}},
 		cmdEntry{Name: "/api-key", Desc: "设置 API 密钥", Type: "config"},
 		cmdEntry{Name: "/base-url", Desc: "设置 API 地址", Type: "config"},
+		cmdEntry{Name: "/record", Desc: "录制会话事件 (status/start/stop)", Type: "config", ArgHints: map[string][]string{"": {"status", "start", "stop"}}},
 		cmdEntry{Name: "/mode", Desc: "设置权限模式 (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
 		cmdEntry{Name: "/budget", Desc: "设置预算上限 ($)", Type: "config"},
 		cmdEntry{Name: "/attach", Desc: "挂载图片或文件到后续提问", Type: "builtin", ArgHints: map[string][]string{"": {"list", "clear", "remove", "add"}}},

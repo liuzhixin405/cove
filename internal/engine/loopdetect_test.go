@@ -344,3 +344,45 @@ func TestLoopDetector_L3NoDetectionAfterFileActivity(t *testing.T) {
 		t.Fatalf("unexpected L3 detection with file activity: %+v", r)
 	}
 }
+
+func TestLoopDetector_L1bDirectoryDiversitySuppressesDetection(t *testing.T) {
+	ld := NewLoopDetector()
+	// Same tool pattern, but work is across different directories.
+	// This should be treated as exploratory progress, not a loop.
+	fps := []string{
+		"bash:cd g:/repo/service-a; go test ./...",
+		"bash:cd g:/repo/service-b; go test ./...",
+		"bash:cd g:/repo/service-c; go test ./...",
+	}
+	for i := 0; i < 20; i++ {
+		fp := fps[i%len(fps)]
+		if r := ld.RecordToolCalls(fp); r.Detected {
+			t.Fatalf("unexpected detection with directory diversity at %d: %s", i, r.Reason)
+		}
+	}
+}
+
+func TestExtractDirectorySignature(t *testing.T) {
+	fp := "bash:cd G:/repo/app; go test ./...|read:G:/repo/app/internal/engine/engine.go"
+	sig := extractDirectorySignature(fp)
+	if !strings.Contains(sig, "g:/repo/app") {
+		t.Fatalf("expected normalized dir signature to contain repo path, got %q", sig)
+	}
+}
+
+func TestDeriveDirFromValuePowerShellCommands(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "Set-Location G:/repo/service-a; git status", want: "g:/repo/service-a"},
+		{in: "pushd G:/repo/service-b; go test ./...", want: "g:/repo/service-b"},
+		{in: "sl G:/repo/service-c; ls", want: "g:/repo/service-c"},
+	}
+	for _, tc := range cases {
+		got := normalizeDirSig(deriveDirFromValue(tc.in))
+		if got != tc.want {
+			t.Fatalf("deriveDirFromValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

@@ -34,8 +34,8 @@ type appBootstrap struct {
 	toolReg   *tool.Registry
 }
 
-func bootstrapApp(debugMode bool) (*appBootstrap, error) {
-	cfg, err := config.Load()
+func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*appBootstrap, error) {
+	cfg, err := config.LoadWithProfile(profileName)
 	if err != nil {
 		log.Warnf("config load: %v", err)
 		if cfg == nil {
@@ -109,6 +109,8 @@ func bootstrapApp(debugMode bool) (*appBootstrap, error) {
 		PermissionMode: string(permMgr.Mode()),
 		MaxBudget:      cfg.MaxBudgetUsd,
 		Debug:          debugMode || cfg.Debug,
+		RecordingDir:   recordDir,
+		ReplayDir:      replayDir,
 		Tools:          toolReg.All(),
 		Provider: api.ProviderConfig{
 			Name: pc.Name, APIKey: pc.APIKey, APIKeys: pc.APIKeys, BaseURL: pc.BaseURL,

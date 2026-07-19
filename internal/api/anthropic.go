@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/api/adapter"
 )
 
 type anthropicProvider struct {
@@ -383,8 +385,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 
 	reader := bufio.NewReader(httpResp.Body)
-	var texts []string
-	var toolCalls []ToolCall
+	var streamAcc adapter.StreamAccumulator
 	type accumTC struct {
 		ID      string
 		Name    string
@@ -425,7 +426,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				case "content_block_delta":
 					if ev.Delta != nil {
 						if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
-							texts = append(texts, ev.Delta.Text)
+							streamAcc.AddDelta(ev.Delta.Text)
 							if handler != nil {
 								handler(StreamEvent{Type: "delta", Delta: ev.Delta.Text})
 							}
@@ -468,7 +469,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		if !ok {
 			// Incomplete/malformed JSON even after best-effort repair (tool_repair.go).
 			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: failed to parse input JSON even after repair (stop=%s, raw: %s)\n", acc.Name, stopReason, truncate(rawJSON, 200))
-			toolCalls = append(toolCalls, ToolCall{
+			streamAcc.AddToolCall(adapter.ToolCall{
 				ID:   acc.ID,
 				Name: acc.Name,
 				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
@@ -478,15 +479,16 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 			})
 			continue
 		}
-		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+		streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}
+	toolCalls := toAPIToolCalls(streamAcc.ToolCalls())
 
 	if stopReason == "" {
 		stopReason = "end_turn"
 	}
 
 	return &ChatResponse{
-		Content:          strings.Join(texts, ""),
+		Content:          streamAcc.Content(),
 		ToolCalls:        toolCalls,
 		Model:            req.Model,
 		InputTokens:      usage.InputTokens,

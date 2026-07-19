@@ -96,15 +96,7 @@ func (cc *ChatCompressor) Compress(
 	// messages[0] as a pseudo-system anchor — doing so left the original first user
 	// message in place AND prepended a summary user message, producing two consecutive
 	// user turns (which the model API rejects with a 400, breaking every long chat).
-	//
-	// Anchor the kept tail on an assistant turn so the rebuilt sequence stays valid:
-	//   [user(summary)] → [assistant ...] → [tool result ...] → ...
-	// Landing on a "tool" message would orphan a tool_result (its tool_use was
-	// dropped); landing on a "user" message would put two user turns back-to-back.
-	splitIdx := len(messages) - keepCount
-	for splitIdx > 0 && splitIdx < len(messages) && messages[splitIdx].Role != "assistant" {
-		splitIdx--
-	}
+	splitIdx := chooseCompressionSplitAssistant(messages, keepCount)
 	if splitIdx <= 0 {
 		return &CompressResult{}, messages // no clean assistant boundary — nothing safe to summarize
 	}
@@ -135,7 +127,7 @@ func (cc *ChatCompressor) Compress(
 		truncated := make([]api.Message, 0, 1+keepCount)
 		truncated = append(truncated, api.Message{
 			Role:    "user",
-			Content: "[Context truncated due to length. Continue the task.]",
+			Content: "<compress summary=\"context-truncated\">\n[Context truncated due to length. Continue the task.]\n</compress>",
 		})
 		truncated = append(truncated, messages[splitIdx:]...)
 		return &CompressResult{
@@ -151,7 +143,7 @@ func (cc *ChatCompressor) Compress(
 	compressed := make([]api.Message, 0, 1+keepCount)
 	compressed = append(compressed, api.Message{
 		Role:    "user",
-		Content: "[Conversation Summary]\n" + summary + "\n\n[Continue the task from where you left off.]",
+		Content: "<compress summary=\"conversation-history\">\n" + summary + "\n\n[Continue the task from where you left off.]\n</compress>",
 	})
 	compressed = append(compressed, messages[splitIdx:]...)
 

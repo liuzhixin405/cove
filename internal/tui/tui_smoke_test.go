@@ -737,3 +737,65 @@ func TestF7KeepsMouseModeWhenNoTranscript(t *testing.T) {
 		t.Fatalf("expected F7 empty-transcript notice, got %q", m.copyNotice)
 	}
 }
+
+func TestExportSessionTextPrefersCleanStreamedAnswer(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	m.echoUser("请总结")
+	m.Update(streamBeginMsg{})
+	m.Update(streamReasoningMsg("先思考..."))
+	m.Update(streamDeltaMsg("最终答案"))
+	m.Update(engineLineMsg("\n  [工具返回] read file\n"))
+	m.Update(streamEndMsg{final: "最终答案"})
+
+	got := m.exportSessionText()
+	if strings.Contains(got, "工具返回") {
+		t.Fatalf("session export should not contain tool logs, got: %q", got)
+	}
+	if strings.Contains(got, "先思考") {
+		t.Fatalf("session export should not contain reasoning, got: %q", got)
+	}
+	if !strings.Contains(got, "最终答案") {
+		t.Fatalf("session export should contain assistant final answer, got: %q", got)
+	}
+}
+
+func TestExportTranscriptTextIncludesFullContent(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	m.appendSystem("\n[系统] startup\n")
+	m.echoUser("你好")
+	m.Update(streamBeginMsg{})
+	m.Update(streamReasoningMsg("thinking..."))
+	m.Update(streamDeltaMsg("hello"))
+	m.Update(streamEndMsg{final: "hello"})
+
+	got := m.exportTranscriptText()
+	if !strings.Contains(got, "[SYSTEM]") || !strings.Contains(got, "startup") {
+		t.Fatalf("transcript export should contain system lines, got: %q", got)
+	}
+	if !strings.Contains(got, "[REASONING]") || !strings.Contains(got, "thinking") {
+		t.Fatalf("transcript export should contain reasoning lines, got: %q", got)
+	}
+	if !strings.Contains(got, "[USER]") || !strings.Contains(got, "[ASSISTANT]") {
+		t.Fatalf("transcript export should contain USER/ASSISTANT sections, got: %q", got)
+	}
+}
+
+func TestExportCurrentTurnTextReturnsLatestDialogue(t *testing.T) {
+	m := newSmokeModel(t, 80, 24, nil, nil)
+	m.echoUser("第一问")
+	m.Update(streamBeginMsg{})
+	m.Update(streamDeltaMsg("第一答"))
+	m.Update(streamEndMsg{final: "第一答"})
+	m.echoUser("第二问")
+	m.Update(streamBeginMsg{})
+	m.Update(streamDeltaMsg("第二答"))
+	m.Update(streamEndMsg{final: "第二答"})
+
+	got := m.exportCurrentTurnText()
+	if strings.Contains(got, "第一问") || strings.Contains(got, "第一答") {
+		t.Fatalf("current turn export should only include latest turn, got: %q", got)
+	}
+	if !strings.Contains(got, "第二问") || !strings.Contains(got, "第二答") {
+		t.Fatalf("current turn export should include latest turn, got: %q", got)
+	}
+}

@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -49,6 +51,8 @@ type Config struct {
 	PermissionMode        string
 	MaxBudget             float64
 	Debug                 bool
+	RecordingDir          string
+	ReplayDir             string
 	Tools                 []tool.Tool
 	Provider              api.ProviderConfig
 	MemoryStore           *memory.Store
@@ -124,6 +128,15 @@ type Engine struct {
 	verifyGate         *VerifyGate             // completion verification gate (P0-0, minimal EDCL)
 	verifyAttempts     int                     // how many times the gate has rejected completion this turn
 	fastOutcomes       *fastModelOutcomeWindow // recent fast-model success/failure, feeds router scoring
+	recordingEnabled   bool
+	recordingDir       string
+	recordingSeq       int
+	recordingReady     bool
+	recordingMu        sync.Mutex
+	replayEnabled      bool
+	replayDir          string
+	replayResponses    []api.ChatResponse
+	replayIndex        int
 
 	// Activity tracking powers the stall monitor: every blocking stage (model
 	// call, tool execution, compaction) registers an activity so that, when the
@@ -134,6 +147,11 @@ type Engine struct {
 }
 
 func New(config Config) (*Engine, error) {
+	recordDir := config.RecordingDir
+	if recordDir == "" {
+		recordDir = os.Getenv("COVE_RECORD_DIR")
+	}
+	replayDir := strings.TrimSpace(config.ReplayDir)
 	reg := tool.NewRegistry()
 	for _, t := range config.Tools {
 		reg.Register(t)
@@ -178,7 +196,25 @@ func New(config Config) (*Engine, error) {
 			SkillManager:  config.SkillManager,
 			SkillPrompts:  make(map[string]string),
 		},
-		fileHistory: make(map[string]bool),
+		fileHistory:      make(map[string]bool),
+		recordingEnabled: recordDir != "",
+		recordingDir:     recordDir,
+		replayEnabled:    replayDir != "",
+		replayDir:        replayDir,
+	}
+	if e.recordingEnabled {
+		if err := os.MkdirAll(e.recordingDir, 0o755); err != nil {
+			return nil, fmt.Errorf("init recording dir: %w", err)
+		}
+		if err := e.writeRecordingMeta(); err != nil {
+			return nil, fmt.Errorf("write recording meta: %w", err)
+		}
+		e.recordingReady = true
+	}
+	if e.replayEnabled {
+		if err := e.loadReplayResponses(); err != nil {
+			return nil, fmt.Errorf("load replay responses: %w", err)
+		}
 	}
 
 	if !config.LoopDetectionDisabled {
@@ -301,6 +337,117 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 	}
 	return nil
 }
+
+func (e *Engine) EnableRecording(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return fmt.Errorf("recording dir is empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	e.recordingMu.Lock()
+	e.recordingEnabled = true
+	e.recordingDir = dir
+	e.recordingSeq = 0
+	e.recordingReady = false
+	e.recordingMu.Unlock()
+	if err := e.writeRecordingMeta(); err != nil {
+		return err
+	}
+	e.recordingMu.Lock()
+	e.recordingReady = true
+	e.recordingMu.Unlock()
+	return nil
+}
+
+func (e *Engine) DisableRecording() {
+	e.recordingMu.Lock()
+	defer e.recordingMu.Unlock()
+	e.recordingEnabled = false
+	e.recordingReady = false
+}
+
+func (e *Engine) RecordingStatus() (bool, string) {
+	e.recordingMu.Lock()
+	defer e.recordingMu.Unlock()
+	return e.recordingEnabled, e.recordingDir
+}
+
+func (e *Engine) loadReplayResponses() error {
+	path := filepath.Join(e.replayDir, "events.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	type replayEntry struct {
+		Event   string         `json:"event"`
+		Payload map[string]any `json:"payload"`
+	}
+
+	responses := make([]api.ChatResponse, 0)
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry replayEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry.Event != "llm_response" {
+			continue
+		}
+		rawResp, ok := entry.Payload["response"]
+		if !ok {
+			continue
+		}
+		data, err := json.Marshal(rawResp)
+		if err != nil {
+			continue
+		}
+		var resp api.ChatResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			continue
+		}
+		responses = append(responses, resp)
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if len(responses) == 0 {
+		return fmt.Errorf("no replayable responses found in %s", path)
+	}
+	e.replayResponses = responses
+	e.replayIndex = 0
+	return nil
+}
+
+func (e *Engine) nextReplayResponse(useStream bool, onDelta func(string), onReasoning func(string)) (*api.ChatResponse, error) {
+	if !e.replayEnabled {
+		return nil, fmt.Errorf("replay mode is disabled")
+	}
+	if e.replayIndex >= len(e.replayResponses) {
+		return nil, io.EOF
+	}
+	resp := e.replayResponses[e.replayIndex]
+	e.replayIndex++
+	if useStream {
+		if onReasoning != nil && strings.TrimSpace(resp.ReasoningContent) != "" {
+			onReasoning(resp.ReasoningContent)
+		}
+		if onDelta != nil && strings.TrimSpace(resp.Content) != "" {
+			onDelta(resp.Content)
+		}
+	}
+	return &resp, nil
+}
+
 func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
@@ -690,6 +837,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			Tools:      toolDefs,
 			MaxTokens:  64000,
 		}
+		e.recordEvent(ctx, "llm_request", map[string]any{"model": modelName, "messages": len(reqMessages), "request": req})
 
 		var resp *api.ChatResponse
 		var err error
@@ -705,7 +853,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			walker.Start()
 		}
 
-		if useStream {
+		callbacks := streamCallbacks{onDelta: onDelta, onReasoning: onReasoning}
+		if e.replayEnabled {
+			resp, err = e.nextReplayResponse(useStream, onDelta, onReasoning)
+		} else if useStream {
 			firstDelta := true
 			modelAct := e.beginActivity("call model " + e.fallback.CurrentModel())
 			resp, _, err = e.fallback.TryChatStream(ctx, func(p api.Provider) api.ChatRequest { return req }, func(ev api.StreamEvent) {
@@ -715,12 +866,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					walker = nil
 					firstDelta = false
 				}
-				if ev.Type == "delta" && onDelta != nil {
-					onDelta(ev.Delta)
-				}
-				if ev.Type == "reasoning" && onReasoning != nil {
-					onReasoning(ev.Reasoning)
-				}
+				emitStreamEvent(callbacks, ev)
 			})
 			e.endActivity(modelAct)
 		} else {
@@ -734,6 +880,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		if err != nil {
+			e.recordEvent(ctx, "llm_error", map[string]any{"error": err.Error()})
 			e.messages = prevMessages
 			e.saveSession()
 			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
@@ -748,11 +895,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.rateLimits.Update(resp.RateLimitHeaders)
 		}
 
+		e.recordEvent(ctx, "llm_response", map[string]any{"model": modelName, "content_len": len(resp.Content), "tool_calls": len(resp.ToolCalls), "stop_reason": resp.StopReason, "response": resp})
 		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
 			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
 
 		// If response was truncated and no complete tool calls survived, ask model to continue
-		if (resp.StopReason == "max_tokens" || resp.StopReason == "length") && len(resp.ToolCalls) == 0 {
+		if (resp.StopReason == "max_tokens" || resp.StopReason == "length") && !hasToolCalls(resp) {
 			if resp.Content != "" {
 				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
 			}
@@ -760,7 +908,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			continue
 		}
 
-		if len(resp.ToolCalls) == 0 {
+		if !hasToolCalls(resp) {
 			// Completion verification gate (minimal EDCL "done contract"): if
 			// the user configured done_verify_commands, don't accept the
 			// model's self-reported "done" (no more tool calls) until those
@@ -799,7 +947,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			return resp.Content, nil
 		}
 
-		assistantMsg := api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: resp.ToolCalls}
+		assistantMsg := assistantMessageFromResponse(resp)
 		e.messages = append(e.messages, assistantMsg)
 
 		// Next-speaker prediction: check if the model signals task completion
@@ -833,6 +981,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				// after seeing the guidance, preventing old history from
 				// immediately triggering another detection.
 				e.loopDetector.ResetFingerprintHistory()
+				// Skip executing this repeated tool-call batch; ask the model
+				// to pick a new strategy on the next iteration.
+				continue
 			}
 		} else {
 			// Fallback: simple loop detection (kept for backward compatibility)
@@ -1422,6 +1573,62 @@ func (e *Engine) LoadMessages(msgs []api.Message) {
 }
 
 func (e *Engine) Messages() []api.Message { return e.messages }
+
+func (e *Engine) recordEvent(_ context.Context, eventType string, payload map[string]any) {
+	if !e.recordingEnabled || e.recordingDir == "" {
+		return
+	}
+	e.recordingMu.Lock()
+	defer e.recordingMu.Unlock()
+	if !e.recordingReady {
+		if err := e.writeRecordingMeta(); err != nil {
+			return
+		}
+		e.recordingReady = true
+	}
+	e.recordingSeq++
+	entry := map[string]any{
+		"seq":       e.recordingSeq,
+		"event":     eventType,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"payload":   payload,
+	}
+	if err := os.MkdirAll(e.recordingDir, 0o755); err != nil {
+		return
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(e.recordingDir, "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(data, '\n'))
+}
+
+func (e *Engine) writeRecordingMeta() error {
+	if !e.recordingEnabled || e.recordingDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(e.recordingDir, 0o755); err != nil {
+		return err
+	}
+	meta := map[string]any{
+		"created_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"version":    "v0.1",
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(e.recordingDir, "meta.json"), data, 0o644); err != nil {
+		return err
+	}
+	e.recordingReady = true
+	return nil
+}
 
 func (e *Engine) saveSession() {
 	if e.store == nil || e.session == nil {

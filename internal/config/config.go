@@ -34,6 +34,36 @@ func maskKey(key string) string {
 	return key[:4] + "****" + key[len(key)-4:]
 }
 
+type Profile struct {
+	Model          string          `json:"model,omitempty"`
+	ModelFast      string          `json:"model_fast,omitempty"`
+	Provider       *ProviderConfig `json:"provider,omitempty"`
+	PermissionMode string          `json:"permission_mode,omitempty"`
+	MaxBudgetUsd   float64         `json:"max_budget_usd,omitempty"`
+	ThinkingTokens int             `json:"thinking_tokens,omitempty"`
+	Debug          bool            `json:"debug,omitempty"`
+	Verbose        bool            `json:"verbose,omitempty"`
+	SystemPrompt   string          `json:"system_prompt,omitempty"`
+}
+
+// UnmarshalJSON keeps backward compatibility with older configs that used
+// profile "mode" instead of "permission_mode".
+func (p *Profile) UnmarshalJSON(data []byte) error {
+	type alias Profile
+	aux := struct {
+		alias
+		Mode string `json:"mode,omitempty"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*p = Profile(aux.alias)
+	if p.PermissionMode == "" && aux.Mode != "" {
+		p.PermissionMode = aux.Mode
+	}
+	return nil
+}
+
 type Config struct {
 	Model          string                     `json:"model"`
 	ModelFast      string                     `json:"model_fast,omitempty"`
@@ -45,6 +75,8 @@ type Config struct {
 	Verbose        bool                       `json:"verbose"`
 	SystemPrompt   string                     `json:"system_prompt,omitempty"`
 	MCPServers     map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
+	Profiles       map[string]*Profile        `json:"profiles,omitempty"`
+	ActiveProfile  string                     `json:"active_profile,omitempty"`
 	// Telemetry enables local, opt-in usage recording (~/.cove/telemetry.json).
 	// Off by default; can also be enabled with COVE_TELEMETRY=1.
 	Telemetry bool `json:"telemetry,omitempty"`
@@ -100,6 +132,10 @@ func ConfigDir() (string, error) {
 }
 
 func Load() (*Config, error) {
+	return LoadWithProfile("")
+}
+
+func LoadWithProfile(profileName string) (*Config, error) {
 	cfg := DefaultConfig()
 	dir, err := ConfigDir()
 	if err == nil {
@@ -115,6 +151,14 @@ func Load() (*Config, error) {
 	if err := loadProjectOverride(cfg); err != nil {
 		applyDefaults(cfg)
 		return cfg, err
+	}
+	if profileName == "" {
+		profileName = cfg.ActiveProfile
+	}
+	if profileName != "" {
+		if prof, ok := cfg.Profiles[profileName]; ok {
+			applyProfile(cfg, prof)
+		}
 	}
 	applyDefaults(cfg)
 	return cfg, nil
@@ -159,6 +203,39 @@ func loadProjectOverride(cfg *Config) error {
 		cfg.MemoryEmbedding = override.MemoryEmbedding
 	}
 	return nil
+}
+
+func applyProfile(cfg *Config, prof *Profile) {
+	if prof == nil {
+		return
+	}
+	if prof.Model != "" {
+		cfg.Model = prof.Model
+	}
+	if prof.ModelFast != "" {
+		cfg.ModelFast = prof.ModelFast
+	}
+	if prof.Provider != nil {
+		cfg.Provider = *prof.Provider
+	}
+	if prof.PermissionMode != "" {
+		cfg.PermissionMode = prof.PermissionMode
+	}
+	if prof.MaxBudgetUsd > 0 {
+		cfg.MaxBudgetUsd = prof.MaxBudgetUsd
+	}
+	if prof.ThinkingTokens > 0 {
+		cfg.ThinkingTokens = prof.ThinkingTokens
+	}
+	if prof.Debug {
+		cfg.Debug = true
+	}
+	if prof.Verbose {
+		cfg.Verbose = true
+	}
+	if prof.SystemPrompt != "" {
+		cfg.SystemPrompt = prof.SystemPrompt
+	}
 }
 
 func applyDefaults(cfg *Config) {
@@ -245,6 +322,54 @@ func Save(cfg *Config) error {
 	var providerVal interface{}
 	json.Unmarshal(providerRaw, &providerVal)
 	m["provider"] = providerVal
+
+	if len(cfg.Profiles) > 0 {
+		profilesRaw := make(map[string]interface{}, len(cfg.Profiles))
+		for name, prof := range cfg.Profiles {
+			profileVal := map[string]interface{}{}
+			if prof != nil {
+				if prof.Model != "" {
+					profileVal["model"] = prof.Model
+				}
+				if prof.ModelFast != "" {
+					profileVal["model_fast"] = prof.ModelFast
+				}
+				if prof.Provider != nil {
+					providerRaw, err := json.Marshal(rawProvider{
+						Name:    prof.Provider.Name,
+						APIKey:  prof.Provider.APIKey,
+						BaseURL: prof.Provider.BaseURL,
+					})
+					if err != nil {
+						return err
+					}
+					var profProviderVal interface{}
+					json.Unmarshal(providerRaw, &profProviderVal)
+					profileVal["provider"] = profProviderVal
+				}
+				if prof.PermissionMode != "" {
+					profileVal["permission_mode"] = prof.PermissionMode
+				}
+				if prof.MaxBudgetUsd > 0 {
+					profileVal["max_budget_usd"] = prof.MaxBudgetUsd
+				}
+				if prof.ThinkingTokens > 0 {
+					profileVal["thinking_tokens"] = prof.ThinkingTokens
+				}
+				if prof.Debug {
+					profileVal["debug"] = prof.Debug
+				}
+				if prof.Verbose {
+					profileVal["verbose"] = prof.Verbose
+				}
+				if prof.SystemPrompt != "" {
+					profileVal["system_prompt"] = prof.SystemPrompt
+				}
+			}
+			profilesRaw[name] = profileVal
+		}
+		m["profiles"] = profilesRaw
+	}
 
 	data, err = json.MarshalIndent(m, "", "  ")
 	if err != nil {

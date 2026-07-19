@@ -626,7 +626,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.copyNotice = "[复制] 正在复制…"
 			return m, copyCmd(text, "当前会话")
 		case "f6":
-			// Copy only the currently visible conversation viewport.
+			// Copy only what is currently visible in the viewport.
 			text := m.exportVisibleScreenText()
 			if strings.TrimSpace(text) == "" {
 				m.copyNotice = "[复制] 当前无可复制内容"
@@ -768,6 +768,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(msg.final) > len(streamed) {
 				missing := msg.final[len(streamed):]
 				m.turns[turnIdx].answer.WriteString(missing)
+				m.turns[turnIdx].streamedText.WriteString(missing)
 			}
 		}
 		m.refreshViewport(true)
@@ -1406,6 +1407,45 @@ func (m *Model) exportVisibleScreenText() string {
 	return strings.TrimSpace(view)
 }
 
+func (m *Model) assistantCopyText(t *turn) string {
+	if t == nil {
+		return ""
+	}
+	// Preferred source: streamed answer text only (excludes engine/tool diagnostics).
+	if s := strings.TrimSpace(t.streamedText.String()); s != "" {
+		return s
+	}
+	// Fallback for non-stream scenarios.
+	return strings.TrimSpace(t.answer.String())
+}
+
+func (m *Model) exportCurrentTurnText() string {
+	for i := len(m.turns) - 1; i >= 0; i-- {
+		t := m.turns[i]
+		if t == nil || t.system {
+			continue
+		}
+		u := strings.TrimSpace(t.user)
+		a := m.assistantCopyText(t)
+		if u == "" && a == "" {
+			continue
+		}
+		var b strings.Builder
+		if u != "" {
+			b.WriteString("[USER]\n")
+			b.WriteString(u)
+			b.WriteString("\n\n")
+		}
+		if a != "" {
+			b.WriteString("[ASSISTANT]\n")
+			b.WriteString(a)
+			b.WriteString("\n")
+		}
+		return strings.TrimSpace(b.String())
+	}
+	return ""
+}
+
 func (m *Model) exportSessionText() string {
 	var b strings.Builder
 	for _, t := range m.turns {
@@ -1417,7 +1457,7 @@ func (m *Model) exportSessionText() string {
 			b.WriteString(u)
 			b.WriteString("\n\n")
 		}
-		if a := strings.TrimSpace(t.answer.String()); a != "" {
+		if a := m.assistantCopyText(t); a != "" {
 			b.WriteString("[ASSISTANT]\n")
 			b.WriteString(a)
 			b.WriteString("\n\n")
@@ -1429,9 +1469,11 @@ func (m *Model) exportSessionText() string {
 func (m *Model) exportTranscriptText() string {
 	var b strings.Builder
 	for _, t := range m.turns {
+		if t == nil {
+			continue
+		}
 		if t.system {
-			s := strings.TrimSpace(t.answer.String())
-			if s != "" {
+			if s := strings.TrimSpace(t.answer.String()); s != "" {
 				b.WriteString("[SYSTEM]\n")
 				b.WriteString(s)
 				b.WriteString("\n\n")
@@ -1448,6 +1490,7 @@ func (m *Model) exportTranscriptText() string {
 			b.WriteString(r)
 			b.WriteString("\n\n")
 		}
+		// "All content" keeps raw assistant buffer, which may include tool/engine lines.
 		if a := strings.TrimSpace(t.answer.String()); a != "" {
 			b.WriteString("[ASSISTANT]\n")
 			b.WriteString(a)

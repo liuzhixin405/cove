@@ -52,7 +52,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "7.1.0"
+	Version = "9.0.5"
 
 	BuildTime = "pro"
 
@@ -69,6 +69,12 @@ var (
 	tuiMode = false
 
 	noTUI = false
+
+	profileName = ""
+
+	recordDir = ""
+
+	replayDir = ""
 )
 
 func main() {
@@ -169,6 +175,24 @@ func main() {
 
 			noTUI = true
 
+		case "--profile":
+			if i+1 < len(args) {
+				i++
+				profileName = args[i]
+			}
+
+		case "--record":
+			if i+1 < len(args) {
+				i++
+				recordDir = args[i]
+			}
+
+		case "--replay":
+			if i+1 < len(args) {
+				i++
+				replayDir = args[i]
+			}
+
 		default:
 
 			if printMode && printPrompt == "" {
@@ -181,7 +205,7 @@ func main() {
 
 	}
 
-	app, err := bootstrapApp(debugMode)
+	app, err := bootstrapApp(debugMode, profileName, recordDir, replayDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Engine start error: %v\n", err)
 		os.Exit(1)
@@ -855,6 +879,13 @@ func printCLIHelp() {
 
  cove -r <id>               恢复之前的会话记录
 
+
+
+ cove --profile <name>      使用指定 profile 启动
+
+ cove --record <dir>        开启会话录制并写入目录
+
+ cove --replay <dir>        使用录制数据回放（不调用真实 API）
 
  cove --list-sessions       列出所有会话记录
 
@@ -898,7 +929,7 @@ func printCLIHelp() {
 REPL 内置命令:
 
 
- /model, /provider, /api-key, /base-url, /mode, /budget
+ /model, /profile, /provider, /api-key, /base-url, /record, /mode, /budget
 
 
  /cost, /config, /system, /context, /compact

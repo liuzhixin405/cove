@@ -42,9 +42,11 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 	fmt.Println("\n=== cove v" + Version + " ===")
 	fmt.Println("\n供应商 / 模型:")
 	fmt.Println("  /model <名称>       设置模型")
+	fmt.Println("  /profile ...        管理 profile（list/switch/save/delete/show）")
 	fmt.Println(providerHelpLine())
 	fmt.Println("  /api-key <密钥>     保存 API 密钥")
 	fmt.Println("  /base-url <地址>    设置自定义接口地址")
+	fmt.Println("  /record ...         控制录制（status/start/stop）")
 	fmt.Println("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
 	fmt.Println("  /budget <金额|auto> 设置每会话预算上限 ($)，auto 为一键提升")
 	fmt.Println("  /cost               查看用量和费用")
@@ -88,7 +90,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
 	fmt.Println("\n" + providerEnvHelpLine())
-	fmt.Println("启动参数: -p <提示> [--image <路径>] [--file <路径>] | -d --debug | -v --version | --doctor | --config")
+	fmt.Println("启动参数: -p <提示> [--image <路径>] [--file <路径>] | --profile <name> | --record <dir> | --replay <dir> | -d --debug | -v --version | --doctor | --config")
 	fmt.Println("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
 	fmt.Println()
 }

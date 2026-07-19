@@ -69,7 +69,7 @@ func TestCompressor_ProducesValidSequence(t *testing.T) {
 
 	// The first message must be the summary (a single user turn), not the
 	// original first user message followed by a second summary user message.
-	if !strings.Contains(out[0].Content, "Conversation Summary") {
+	if !strings.Contains(out[0].Content, "<compress summary=\"conversation-history\">") {
 		t.Fatalf("first message should be the summary, got %q", out[0].Content)
 	}
 	if out[1].Role != "assistant" {
@@ -121,7 +121,7 @@ func TestCompressor_RejectsLowQualitySummary(t *testing.T) {
 		t.Fatalf("expected fallback truncation to still mark Compressed")
 	}
 	assertValidSequence(t, out)
-	if strings.Contains(out[0].Content, "Conversation Summary") {
+	if strings.Contains(out[0].Content, "<compress summary=\"conversation-history\">") {
 		t.Fatalf("low-quality summary should have been rejected in favor of truncation, got %q", out[0].Content)
 	}
 	if !strings.Contains(out[0].Content, "truncated") {

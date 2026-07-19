@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/api/adapter"
 )
 
 type openAICompatProvider struct {
@@ -495,8 +497,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, b, hadImage)
 	}
 
-	var fullContent strings.Builder
-	var fullReasoningContent strings.Builder
+	var streamAcc adapter.StreamAccumulator
 	var usage oaiUsage
 	scanner := bufio.NewScanner(httpResp.Body)
 	// Default scanner buffer is 64KB — insufficient for large tool call arguments
@@ -536,13 +537,13 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			}
 			d := chunk.Choices[0].Delta
 			if d.Content != "" {
-				fullContent.WriteString(d.Content)
+				streamAcc.AddDelta(d.Content)
 				if handler != nil {
 					handler(StreamEvent{Type: "delta", Delta: d.Content})
 				}
 			}
 			if d.ReasoningContent != "" {
-				fullReasoningContent.WriteString(d.ReasoningContent)
+				streamAcc.AddReasoning(d.ReasoningContent)
 				if handler != nil {
 					handler(StreamEvent{Type: "reasoning", Reasoning: d.ReasoningContent})
 				}
@@ -577,7 +578,6 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, fmt.Errorf("stream read error: %w", err)
 	}
 
-	var toolCalls []ToolCall
 	indices := make([]int, 0, len(tcMap))
 	for idx := range tcMap {
 		indices = append(indices, idx)
@@ -591,7 +591,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		}
 		input, ok := RepairToolArguments(rawArgs)
 		if !ok {
-			toolCalls = append(toolCalls, ToolCall{
+			streamAcc.AddToolCall(adapter.ToolCall{
 				ID:   acc.ID,
 				Name: acc.Name,
 				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
@@ -601,8 +601,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			})
 			continue
 		}
-		toolCalls = append(toolCalls, ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+		streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
 	}
+	toolCalls := toAPIToolCalls(streamAcc.ToolCalls())
 
 	// Derive the stop reason from the stream's finish_reason. OpenAI sends
 	// "stop" | "length" | "tool_calls" | "content_filter". Map to the same
@@ -627,8 +628,8 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	}
 
 	return &ChatResponse{
-		Content:               fullContent.String(),
-		ReasoningContent:      fullReasoningContent.String(),
+		Content:               streamAcc.Content(),
+		ReasoningContent:      streamAcc.Reasoning(),
 		ToolCalls:             toolCalls,
 		Model:                 req.Model,
 		InputTokens:           usage.PromptTokens,
@@ -639,6 +640,22 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		StopReason:            stopReason,
 		RateLimitHeaders:      httpResp.Header,
 	}, nil
+}
+
+func toAPIToolCalls(calls []adapter.ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, ToolCall{
+			ID:         c.ID,
+			Name:       c.Name,
+			Input:      c.Input,
+			ParseError: c.ParseError,
+		})
+	}
+	return out
 }
 
 func downgradeImagePartsForNonVision(messages []Message, model string) []Message {

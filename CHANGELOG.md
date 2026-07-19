@@ -1,15 +1,19 @@
 ﻿## [Unreleased]
 
-### Changed
-- **交互层统一到 Bubble Tea TUI**：移除了经典行交互循环。
-  - 交互式终端（TTY）一律使用 Bubble Tea TUI。
-  - 非交互场景（管道、重定向，以及 `--no-tui` / `COVE_TUI=0`）改用新的 **headless** 前端 `runHeadless`：逐行读取 stdin、结果写 stdout，脚本友好，无备用屏幕/原始模式。
-  - REPL 的功能已迁移，未丢失：技能调用 `/<名称>`、插件命令、`/resume`、`/export`、`/history detail`、图片自动切换视觉模型、中断时写入草稿以支持「继续」恢复、未知命令模糊建议。
-- `--no-tui` / `COVE_TUI=0` 的语义由「回退到旧行交互」改为「回退到 headless 无 UI 模式」。
+### Added
+- **配置档案 (Profiles)**：新增 /profile 命令（list/switch/save/delete/show）和 --profile 启动参数，支持切换命名配置切片（model/provider/budget 等）。
+- **会话录制与回放 (Record/Replay)**：新增 /record 命令（status/start/stop）、--record 和 --replay 启动参数。录制输出至 events.jsonl，回放时不调用真实 API。
+- **Provider Adapter 基础层**：internal/api/adapter/ 包提供 Message、StreamAccumulator、MergeReasoning、ToolCallsFromResponse 等归一化工具（为后续 Provider 重构铺路）。
+- **L1b 目录多样性检测**：循环检测 Layer 1b 新增目录指纹分析，同一工具模式在 ≥3 个不同目录中视为探索性工作，不再误判为循环（解决顺序 git 操作误触发问题）。
 
-### Removed
-- `cli/cove` 旧行交互循环与旧任务队列实现，以及 `app_bootstrap.go` 中已失效的 `configurePermissionPrompt`。
-  - 终端样式/打印能力统一收敛到 `internal/termui`。
+### Changed
+- **压缩语义标签**：压缩注入的上下文提示添加 <compress summary="..."> 标签，给模型清晰信号。
+- **Engine 重构**：抽取 stream_handler.go、	ool_runner.go、message_processor.go 分担 engine.go 职责；新增 uildMessageGraph() 为后续拓扑感知压缩做准备。
+- **循环检测改进**：esetFingerprintHistory() 新增目录状态清理；hasToolCalls() 零值安全性提升。
+
+### Fixed
+- 循环检测 L1b 在频繁使用 shell 命令进行 git 操作时误触发自动中止。
+- Config.Load() 在 profile 为空时的 nil map 赋值防护。
 
 ## [8.0.0] - 2026-07-18
 
