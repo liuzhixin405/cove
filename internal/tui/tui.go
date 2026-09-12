@@ -1198,25 +1198,49 @@ func isTabKey(msg tea.KeyPressMsg) bool {
 	return msg.Code == tea.KeyTab
 }
 
+// Chrome rows reserved around the conversation body, and the minimum body
+// height the layout will defend. The transient line is reserved even when blank
+// so that running a command never resizes the body.
+const (
+	statusH    = 1 // top status bar
+	bottomH    = 1 // bottom status line
+	inputH     = 2 // horizontal rule + one input line
+	transientH = 1 // activity line, always reserved
+	minBodyH   = 3
+	// chromeH is everything layout() reserves besides the body and the git panel.
+	chromeH = statusH + transientH + bottomH + inputH
+)
+
 func (m *Model) gitPanelHeight() int {
 	status := strings.TrimSpace(m.status.GitStatus)
 	if status == "" || status == "(clean)" {
 		return 0
 	}
-	if !m.gitExpanded {
-		return 1 // folding line
-	}
-	lines := strings.Split(status, "\n")
-	numFiles := 0
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			numFiles++
+
+	h := 1 // folding line
+	if m.gitExpanded {
+		numFiles := 0
+		for _, l := range strings.Split(status, "\n") {
+			if strings.TrimSpace(l) != "" {
+				numFiles++
+			}
 		}
+		if numFiles == 0 {
+			return 0
+		}
+		h = numFiles + 1 // header + one line per file
 	}
-	if numFiles == 0 {
-		return 0
+
+	// The panel yields to the conversation body. Clamping the body to a floor
+	// instead (as layout() used to) makes the frame taller than the terminal,
+	// which scrolls the entire view.
+	if max := m.height - chromeH - minBodyH; h > max {
+		h = max
 	}
-	return numFiles + 1
+	if h < 0 {
+		h = 0
+	}
+	return h
 }
 
 // layout recomputes child component sizes from the current terminal size.
@@ -1226,14 +1250,10 @@ func (m *Model) gitPanelHeight() int {
 // transient zone (tool/queue activity), a horizontal rule + input, and a bottom
 // status line. No sidebars or nested frames.
 func (m *Model) layout() {
-	const statusH = 1    // top status bar
-	const bottomH = 1    // bottom status line
-	const inputH = 2     // horizontal rule + one input line
-	const transientH = 1 // activity line is always reserved to keep layout stable
 	gitH := m.gitPanelHeight()
-	midH := m.height - statusH - transientH - bottomH - inputH - gitH
-	if midH < 3 {
-		midH = 3
+	midH := m.height - chromeH - gitH
+	if midH < 1 {
+		midH = 1
 	}
 
 	// main content area has 1 column of horizontal padding on each side.

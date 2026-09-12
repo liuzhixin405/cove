@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // readOnlyTools lists tool names that are inherently read-only / non-destructive.
@@ -73,6 +74,12 @@ type LoopDetector struct {
 	// Tracks whether we're creating/modifying files productively.
 	filesCreated map[string]bool // files created this turn
 	filesWritten map[string]bool // files written this turn
+
+	// filesTouchedWindow holds paths newly touched during the current Layer 3
+	// window; filesTouchedTurn remembers everything touched so far this turn so
+	// that re-reading the same file is not mistaken for fresh progress.
+	filesTouchedWindow map[string]bool
+	filesTouchedTurn   map[string]bool
 	stallCount   int             // consecutive iterations without new file activity
 	stallThresh  int             // iterations before stagnation detection (default 25)
 
@@ -104,8 +111,10 @@ func NewLoopDetector() *LoopDetector {
 		outWindow:       40,
 		outThresh:       8,
 		maxBreaks:       5,
-		filesCreated:    make(map[string]bool),
-		filesWritten:    make(map[string]bool),
+		filesCreated:       make(map[string]bool),
+		filesWritten:       make(map[string]bool),
+		filesTouchedWindow: make(map[string]bool),
+		filesTouchedTurn:   make(map[string]bool),
 		stallCount:      0,
 		stallThresh:     60, // only flag after 60 iterations without file activity
 		isFastModel:     false,
@@ -218,8 +227,8 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 	if cnt >= ld.fpThresh {
 		ld.breakCount++
 		reason := fmt.Sprintf(
-			"检测到工具调用循环(L1): 相同模式连续出现 %d/%d 次 — 模型可能在原地打转",
-			cnt, ld.fpWindow,
+			"检测到工具调用循环(L1): 相同模式连续出现 %d/%d 次 (%s) — 模型可能在原地打转",
+			cnt, ld.fpWindow, shortenForReason(fp),
 		)
 		fatal := ld.breakCount >= ld.maxBreaks
 		return LoopResult{
@@ -333,8 +342,8 @@ func (ld *LoopDetector) RecordOutput(output string) LoopResult {
 	if ld.outCounts[h] >= ld.outThresh {
 		ld.breakCount++
 		reason := fmt.Sprintf(
-			"检测到输出内容循环(L2): 相同工具输出出现了 %d/%d 次 — 模型可能在无意义重复",
-			ld.outCounts[h], ld.outWindow,
+			"检测到输出内容循环(L2): 相同工具输出出现了 %d/%d 次 (%s) — 模型可能在无意义重复",
+			ld.outCounts[h], ld.outWindow, shortenForReason(output),
 		)
 		fatal := ld.breakCount >= ld.maxBreaks
 		return LoopResult{
@@ -354,6 +363,22 @@ func (ld *LoopDetector) RecordFileActivity(filePath string, isCreate bool) {
 		ld.filesCreated[filePath] = true
 	}
 	ld.filesWritten[filePath] = true
+	ld.RecordFileTouch(filePath)
+}
+
+// RecordFileTouch records that the model touched a file path it had not touched
+// before during this turn. Unlike RecordFileActivity this also covers reads and
+// shell-driven work, so read-only exploration counts as progress rather than
+// looking like a stall.
+func (ld *LoopDetector) RecordFileTouch(filePath string) {
+	if filePath == "" {
+		return
+	}
+	if ld.filesTouchedTurn[filePath] {
+		return // already counted as progress earlier this turn
+	}
+	ld.filesTouchedTurn[filePath] = true
+	ld.filesTouchedWindow[filePath] = true
 }
 
 // RecordIteration records one full tool-call iteration and checks for stagnation.
@@ -362,20 +387,24 @@ func (ld *LoopDetector) RecordIteration() LoopResult {
 	ld.stallCount++
 
 	if ld.stallCount >= ld.stallThresh {
+		// Snapshot the activity recorded during this window, then clear it so the
+		// next window measures its own progress. Checking cumulative turn totals
+		// would go permanently blind after the first file write of a turn, which
+		// is exactly the case the detector most needs to catch.
 		totalCreated := len(ld.filesCreated)
 		totalWritten := len(ld.filesWritten)
+		totalTouched := len(ld.filesTouchedWindow)
+		ld.stallCount = 0
+		ld.clearFileActivity()
 
-		if totalCreated == 0 && totalWritten == 0 {
+		if totalCreated == 0 && totalWritten == 0 && totalTouched == 0 {
 			// Layer 3 is an advisory signal only. Read/search-heavy tasks can
 			// legitimately run many iterations without file writes, so this should
 			// never escalate to a hard stop.
 			reason := fmt.Sprintf(
-				"检测到停滞循环(L3): 连续 %d 轮迭代没有任何文件创建或修改 — 模型可能在空转",
-				ld.stallCount,
+				"提示(L3): 连续 %d 轮迭代没有任何新的文件读写 — 可能进展缓慢",
+				ld.stallThresh,
 			)
-			// Reset after notifying so we emit at most once per stall window
-			// instead of spamming every iteration.
-			ld.stallCount = 0
 			return LoopResult{
 				Detected: true,
 				Reason:   reason,
@@ -383,11 +412,35 @@ func (ld *LoopDetector) RecordIteration() LoopResult {
 				Fatal:    false,
 			}
 		}
-		// Reset stall count periodically so it can detect new stagnation phases
-		ld.stallCount = 0
 	}
 
 	return LoopResult{}
+}
+
+// clearFileActivity starts a fresh Layer 3 measurement window. Paths touched
+// earlier in the turn are remembered so that re-reading the same file does not
+// register as progress again.
+func (ld *LoopDetector) clearFileActivity() {
+	ld.filesCreated = make(map[string]bool)
+	ld.filesWritten = make(map[string]bool)
+	ld.filesTouchedWindow = make(map[string]bool)
+}
+
+// shortenForReason renders s as a short single-line snippet for inclusion in a
+// detector message. Detector reasons are printed into the conversation, so the
+// snippet must not carry newlines or be long enough to disturb the transcript.
+func shortenForReason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	const maxBytes = 80
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Cut on a rune boundary so the snippet stays valid UTF-8.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // clearToolOnlyFromHistory removes ALL occurrences of the given tool pattern
@@ -523,9 +576,9 @@ func (ld *LoopDetector) Reset() {
 	ld.outHashes = ld.outHashes[:0]
 	ld.outCounts = make(map[string]int, ld.outWindow)
 	ld.breakCount = 0
-	ld.filesCreated = make(map[string]bool)
-	ld.filesWritten = make(map[string]bool)
 	ld.stallCount = 0
+	ld.clearFileActivity()
+	ld.filesTouchedTurn = make(map[string]bool)
 	ld.toolOutputs = make(map[string][]string)
 	ld.toolDirs = make(map[string][]string)
 	ld.lastToolOnlyPattern = ""

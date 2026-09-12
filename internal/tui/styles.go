@@ -463,15 +463,21 @@ func (m *Model) renderGitPanel() string {
 		return ""
 	}
 
-	lines := strings.Split(status, "\n")
 	var files []string
-	for _, l := range lines {
-		trimmed := strings.TrimSpace(l)
-		if trimmed != "" {
+	for _, l := range strings.Split(status, "\n") {
+		if trimmed := strings.TrimSpace(l); trimmed != "" {
 			files = append(files, trimmed)
 		}
 	}
 	if len(files) == 0 {
+		return ""
+	}
+
+	// gitPanelHeight() is the single source of truth for this panel's height:
+	// layout() sizes the conversation body from it, so rendering a different
+	// number of lines would push the frame off the terminal.
+	h := m.gitPanelHeight()
+	if h <= 0 {
 		return ""
 	}
 
@@ -486,22 +492,35 @@ func (m *Model) renderGitPanel() string {
 	warnFG := lipgloss.Color(t.Warning)
 	subtleFG := lipgloss.Color(t.TextMuted)
 
+	// Every line is clamped to the terminal width. lipgloss.JoinVertical pads
+	// every block in the frame to the widest one, so a single over-long file
+	// path here would widen the entire frame and make the terminal wrap it.
 	if !m.gitExpanded {
 		text := fmt.Sprintf("  ▸ Workspace%s has %d changed files (Ctrl+G to expand)", branchInfo, len(files))
-		return lipgloss.NewStyle().Foreground(warnFG).Bold(true).Width(w).Render(text)
+		return lipgloss.NewStyle().Foreground(warnFG).Bold(true).Width(w).Render(truncate(text, w))
+	}
+
+	total := len(files)
+	if maxFiles := h - 1; maxFiles < len(files) {
+		files = files[:maxFiles]
 	}
 
 	var sb strings.Builder
-	header := fmt.Sprintf("  ▾ Workspace%s changed files (%d total, Ctrl+G to collapse):", branchInfo, len(files))
-	sb.WriteString(lipgloss.NewStyle().Foreground(warnFG).Bold(true).Render(header) + "\n")
-
+	header := fmt.Sprintf("  ▾ Workspace%s changed files (%d total, Ctrl+G to collapse):", branchInfo, total)
+	sb.WriteString(lipgloss.NewStyle().Foreground(warnFG).Bold(true).Render(truncate(header, w)))
 	for _, f := range files {
-		sb.WriteString("    " + lipgloss.NewStyle().Foreground(subtleFG).Render(f) + "\n")
+		sb.WriteString("\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(subtleFG).Render(truncate("    "+f, w)))
 	}
-
-	return strings.TrimSuffix(sb.String(), "\n")
+	return sb.String()
 }
 
+// truncate shortens s to at most max display columns, appending an ellipsis.
+//
+// It must never cut an ANSI escape sequence in half: an unterminated sequence
+// leaves the terminal mid-escape, so it swallows the characters that follow and
+// the cursor position diverges from what the renderer believes. ansi.Truncate
+// is both escape- and grapheme-aware, which the previous per-rune loop was not.
 func truncate(s string, max int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
 	if max <= 0 {
@@ -513,20 +532,5 @@ func truncate(s string, max int) string {
 	if max == 1 {
 		return "…"
 	}
-
-	var b strings.Builder
-	cur := 0
-	limit := max - 1 // keep room for ellipsis
-	for _, r := range s {
-		rw := ansi.StringWidth(string(r))
-		if cur+rw > limit {
-			break
-		}
-		b.WriteRune(r)
-		cur += rw
-	}
-	if b.Len() == 0 {
-		return ""
-	}
-	return b.String() + "…"
+	return ansi.Truncate(s, max, "…")
 }

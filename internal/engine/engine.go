@@ -1441,6 +1441,15 @@ func mapToolDecision(decision tool.PermissionResult) permission.Decision {
 func (e *Engine) trackFileChanges(tc api.ToolCall) {
 	e.fileMu.Lock()
 	defer e.fileMu.Unlock()
+
+	// Any path a tool names explicitly counts as progress for Layer 3, so that
+	// read-only exploration is not mistaken for an empty run.
+	if e.loopDetector != nil {
+		for _, p := range touchPathsFor(tc) {
+			e.loopDetector.RecordFileTouch(p)
+		}
+	}
+
 	switch tc.Name {
 	case "write", "edit":
 		if path, ok := tc.Input["filePath"].(string); ok {
@@ -1453,7 +1462,7 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 				e.loopDetector.RecordFileActivity(path, tc.Name == "write")
 			}
 		}
-	case "bash":
+	case "bash", "powershell":
 		if e.projCtx == nil {
 			return
 		}
@@ -1462,7 +1471,15 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 				if strings.Contains(word, ".") && !strings.HasPrefix(word, "-") {
 					if f, _ := resolvePath(word, e.projCtx.Cwd); f != "" {
 						if _, err := os.Stat(f); err == nil {
-							e.fileHistory[f] = true
+							if !e.fileHistory[f] {
+								e.fileHistory[f] = true
+								// Shell commands change files without a write/edit
+								// call (sed -i, git checkout, formatters), so feed
+								// them to Layer 3 too.
+								if e.loopDetector != nil {
+									e.loopDetector.RecordFileTouch(f)
+								}
+							}
 						}
 					}
 				}

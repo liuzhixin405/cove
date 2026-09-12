@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestLoopDetector_ToolCallRepeat(t *testing.T) {
@@ -342,6 +344,155 @@ func TestLoopDetector_L3NoDetectionAfterFileActivity(t *testing.T) {
 	}
 	if r := ld.RecordIteration(); r.Detected {
 		t.Fatalf("unexpected L3 detection with file activity: %+v", r)
+	}
+}
+
+// L3 must measure progress within the current window, not cumulatively over the
+// whole turn. A turn that wrote a file early and then stalled for a long stretch
+// must still be detected — otherwise the detector goes permanently blind for
+// every turn that writes at least one file, which is nearly all coding work.
+func TestLoopDetector_L3DetectsStallAfterEarlierFileActivity(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 2
+
+	// First window: the model writes a file, so there is real progress.
+	ld.RecordFileActivity("a.txt", true)
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection on first iteration of window: %+v", r)
+	}
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection while file activity is current: %+v", r)
+	}
+
+	// Second window: no file activity at all — this is a genuine stall.
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection on first iteration of new window: %+v", r)
+	}
+	r := ld.RecordIteration()
+	if !r.Detected {
+		t.Fatal("expected L3 to detect a stall after earlier file activity in the same turn")
+	}
+	if r.Layer != 3 {
+		t.Fatalf("expected Layer 3, got %d", r.Layer)
+	}
+	if r.Fatal {
+		t.Fatal("expected L3 to remain a non-fatal advisory signal")
+	}
+}
+
+// Exploring files the model has never touched before is progress, even when
+// nothing is written. Read-only research, code walkthroughs and shell-driven
+// work must not be reported as a stall.
+func TestLoopDetector_L3DoesNotFireWhileNewFilesAreTouched(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 3
+
+	for i := 0; i < 9; i++ {
+		ld.RecordFileTouch(fmt.Sprintf("pkg/file%d.go", i))
+		if r := ld.RecordIteration(); r.Detected {
+			t.Fatalf("unexpected L3 detection while exploring new files at iteration %d: %+v", i, r)
+		}
+	}
+}
+
+// The counterpart: once a window passes with nothing new touched and nothing
+// written, the model really is going nowhere.
+func TestLoopDetector_L3FiresWhenNothingNewIsTouched(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 3
+
+	// Window 1: the model opens a file it had not touched before — progress.
+	ld.RecordFileTouch("pkg/stuck.go")
+	ld.RecordIteration()
+	ld.RecordIteration()
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection while new file activity is current: %+v", r)
+	}
+
+	// Window 2: nothing new at all.
+	ld.RecordIteration()
+	ld.RecordIteration()
+	r := ld.RecordIteration()
+	if !r.Detected {
+		t.Fatal("expected L3 to fire once a full window has no new file activity")
+	}
+	if r.Layer != 3 || r.Fatal {
+		t.Fatalf("expected non-fatal L3, got %+v", r)
+	}
+}
+
+// A loop abort must say what actually repeated. Without it there is no way to
+// tell a real dead end from a false positive on legitimate repetitive work
+// (sequential git commands, edit-compile-fix cycles).
+func TestLoopDetector_L1ReasonNamesTheRepeatedPattern(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.fpThresh = 3
+	ld.fpWindow = 5
+
+	fp := "bash:cd g:/repo; go test ./internal/store/..."
+	var r LoopResult
+	for i := 0; i < 3; i++ {
+		r = ld.RecordToolCalls(fp)
+	}
+	if !r.Detected {
+		t.Fatal("expected L1 detection")
+	}
+	if !strings.Contains(r.Reason, "internal/store") {
+		t.Fatalf("reason should name the repeated pattern, got: %s", r.Reason)
+	}
+}
+
+func TestLoopDetector_L2ReasonNamesTheRepeatedOutput(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.outThresh = 3
+	ld.outWindow = 10
+
+	out := "FAIL github.com/x/y/internal/store/handler.go:41: undefined: LoadUser"
+	var r LoopResult
+	for i := 0; i < 3; i++ {
+		r = ld.RecordOutput(out)
+	}
+	if !r.Detected {
+		t.Fatal("expected L2 detection")
+	}
+	if !strings.Contains(r.Reason, "handler.go") {
+		t.Fatalf("reason should name the repeated output, got: %s", r.Reason)
+	}
+}
+
+// Detector reasons are printed into the conversation, so a snippet must not
+// carry newlines or be long enough to wreck the transcript layout.
+func TestShortenForReason(t *testing.T) {
+	if got := shortenForReason("a\nb\tc"); got != "a b c" {
+		t.Fatalf("shortenForReason() = %q, want %q", got, "a b c")
+	}
+
+	long := strings.Repeat("界", 200)
+	got := shortenForReason(long)
+	if !utf8.ValidString(got) {
+		t.Fatalf("shortenForReason() produced invalid UTF-8: %q", got)
+	}
+	if len([]rune(got)) > 82 {
+		t.Fatalf("shortenForReason() too long: %d runes", len([]rune(got)))
+	}
+}
+
+// Reset() runs at the start of every user turn. Turn-scoped touch memory must
+// go with it, otherwise a file the model read last turn stops counting as
+// progress this turn and L3 fires on legitimate work.
+func TestLoopDetector_ResetClearsTurnTouchMemory(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.stallThresh = 2
+
+	ld.RecordFileTouch("pkg/a.go")
+	ld.Reset()
+
+	ld.RecordFileTouch("pkg/a.go")
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("unexpected L3 detection right after Reset: %+v", r)
+	}
+	if r := ld.RecordIteration(); r.Detected {
+		t.Fatalf("Reset should clear turn-scoped touch memory, got: %+v", r)
 	}
 }
 
