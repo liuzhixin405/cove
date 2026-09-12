@@ -1,4 +1,4 @@
-﻿package state
+package state
 
 type AppState struct {
 	SessionID      string

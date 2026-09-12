@@ -23,12 +23,14 @@ func (t *TaskStopTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	if tctx.Runtime != nil {
 		tctx.Runtime.Lock()
 		tr, ok := tctx.Runtime.Tasks[id]
+		title := ""
 		if ok {
 			tr.Status = "cancelled"
+			title = tr.Title // read the record field before releasing the lock
 		}
 		tctx.Runtime.Unlock()
 		if ok {
-			return Result{Data: fmt.Sprintf("Task %s stopped: %s", id, tr.Title)}, nil
+			return Result{Data: fmt.Sprintf("Task %s stopped: %s", id, title)}, nil
 		}
 	}
 	return Result{Data: fmt.Sprintf("Task %s stopped.", id)}, nil
@@ -48,6 +50,8 @@ func NewTaskGetTool() Tool {
 func (t *TaskGetTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	id, _ := input["taskId"].(string)
 	if tctx.Runtime != nil {
+		tctx.Runtime.Lock()
+		defer tctx.Runtime.Unlock()
 		if tr, ok := tctx.Runtime.Tasks[id]; ok {
 			return Result{Data: fmt.Sprintf("Task %s:\n  Title: %s\n  Status: %s\n  Description: %s\n  Output: %s",
 				id, tr.Title, tr.Status, tr.Description, tr.Output)}, nil
@@ -70,6 +74,8 @@ func NewTaskOutputTool() Tool {
 func (t *TaskOutputTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	id, _ := input["taskId"].(string)
 	if tctx.Runtime != nil {
+		tctx.Runtime.Lock()
+		defer tctx.Runtime.Unlock()
 		if tr, ok := tctx.Runtime.Tasks[id]; ok {
 			if tr.Output == "" {
 				return Result{Data: fmt.Sprintf("Task %s has no output yet (status: %s)", id, tr.Status)}, nil

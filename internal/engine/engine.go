@@ -101,7 +101,6 @@ type Engine struct {
 	loopDetector          *LoopDetector              // enhanced 2-layer loop detection (P0)
 	compressor            *ChatCompressor            // AI-powered conversation compression (P0-3)
 	masker                *ToolOutputMasker          // tool output masking to save context (P1)
-	nextSpeaker           *NextSpeaker               // predicts when to yield to user (P1)
 	safetyChecker         *safety.Checker            // security scan before tool execution (P1)
 	policyEngine          *permission.PolicyEngine   // rule-based permission policies (P2)
 	sessionView           *session.SessionView       // snapshot for change tracking (P2)
@@ -228,7 +227,6 @@ func New(config Config) (*Engine, error) {
 	}
 	e.compressor = NewChatCompressor()
 	e.masker = NewToolOutputMasker()
-	e.nextSpeaker = NewNextSpeaker()
 	e.safetyChecker = safety.New()
 	e.policyEngine = permission.NewPolicyEngine()
 
@@ -950,16 +948,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		assistantMsg := assistantMessageFromResponse(resp)
 		e.messages = append(e.messages, assistantMsg)
 
-		// Next-speaker prediction: check if the model signals task completion
-		// Also enforces max iterations as a safety net
-		if e.nextSpeaker != nil {
-			if e.iterCount >= MaxIterations-5 {
-				e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, MaxIterations))
-			}
-			if len(resp.ToolCalls) == 0 && !e.nextSpeaker.ShouldContinue(e.messages) {
-				e.engineOutput("  \x1b[2m(model indicates task complete)\x1b[0m")
-				break
-			}
+		// Safety net: warn before the hard iteration cap, so the user knows the
+		// agent is about to stop for a reason other than task completion.
+		if e.iterCount >= MaxIterations-5 {
+			e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, MaxIterations))
 		}
 
 		// Loop detection (enhanced 3-layer, P0-1).
@@ -1009,7 +1001,14 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// Partition tool calls into concurrent-safe and serial groups.
 			// Additionally, write/edit calls targeting different files can run in parallel.
 			var wg sync.WaitGroup
-			serialFilePaths := make(map[string]bool) // track files being written to serialize conflicts
+			// claimedWritePaths holds the file paths already spoken for by a
+			// write or edit earlier in this batch. The first call to a path may
+			// be parallelized; a later call to the same path may not, and has to
+			// wait for the batch to drain. Running it in the inline branch
+			// instead would not serialize it — that branch executes immediately,
+			// racing the very goroutine it is meant to follow.
+			claimedWritePaths := make(map[string]bool)
+			var deferred []int
 			// Bound concurrency so a single response with many tool calls cannot
 			// spawn an unbounded number of goroutines.
 			sem := make(chan struct{}, maxParallelTools)
@@ -1021,10 +1020,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				// write/edit to distinct files can also be parallelized
 				if !safe && (tc.Name == "write" || tc.Name == "edit") {
 					if fp, ok := tc.Input["filePath"].(string); ok && fp != "" {
-						if !serialFilePaths[fp] {
-							serialFilePaths[fp] = true
-							safe = true // different file, safe to parallelize
+						if claimedWritePaths[fp] {
+							deferred = append(deferred, i)
+							continue
 						}
+						claimedWritePaths[fp] = true
+						safe = true // first call to this path, safe to parallelize
 					}
 				}
 
@@ -1054,6 +1055,16 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				}
 			}
 			wg.Wait()
+
+			// Same-file duplicates run only now, once nothing else is in
+			// flight, so they cannot overlap the first write to their path.
+			for _, i := range deferred {
+				tc := resp.ToolCalls[i]
+				if e.OnToolStart != nil {
+					e.OnToolStart(tc.Name)
+				}
+				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: e.executeTool(ctx, tc)}
+			}
 		} else {
 			for i, tc := range resp.ToolCalls {
 				if !e.config.Debug {
@@ -1228,10 +1239,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		}()
 	}
 
-	cwd := ""
-	if e.projCtx != nil {
-		cwd = e.projCtx.Cwd
-	}
+	cwd := e.projectCwd()
 	// Auto-checkpoint before file-mutating operations
 	if e.cpMgr != nil && (tc.Name == "write" || tc.Name == "edit") {
 		go func() {
@@ -1278,46 +1286,8 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		return fmt.Sprintf("Error: invalid %s input: %s", tc.Name, errMsg)
 	}
 
-	toolDecision := t.CheckPermissions(tc.Input, tctx)
-	decision, reason := e.perm.Check(tc.Name, tc.Input, mapToolDecision(toolDecision.Decision))
-	if decision != permission.DAllow && decision != permission.DBypass {
-		if reason == "" {
-			reason = toolDecision.Reason
-		}
-		if reason == "" {
-			reason = "permission denied"
-		}
-		if decision == permission.DAsk {
-			// Policy engine override: check rules before interactive prompt
-			if e.policyEngine != nil {
-				action := e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode)
-				if action == permission.ActionAllow {
-					decision = permission.DAllow // skip interactive prompt
-				} else if action == permission.ActionDeny {
-					return fmt.Sprintf("Error: denied by policy for %s", tc.Name)
-				}
-			}
-			if decision == permission.DAsk && e.PermissionPrompt != nil {
-				if e.OnPermissionPause != nil {
-					e.OnPermissionPause()
-				}
-				e.pauseActivity(toolAct, true) // waiting on user, not stuck
-				e.promptMu.Lock()
-				approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
-				e.promptMu.Unlock()
-				e.pauseActivity(toolAct, false)
-				if e.OnPermissionDone != nil {
-					e.OnPermissionDone()
-				}
-				if !approved {
-					return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
-				}
-			} else {
-				return fmt.Sprintf("Error: permission denied for %s: user rejected", tc.Name)
-			}
-		} else {
-			return fmt.Sprintf("Error: permission denied for %s: %s", tc.Name, reason)
-		}
+	if err := e.authorizeToolCall(tc, tctx, func(waiting bool) { e.pauseActivity(toolAct, waiting) }); err != nil {
+		return "Error: " + err.Error()
 	}
 
 	result, err := t.Call(ctx, tc.Input, tctx)
@@ -1423,6 +1393,81 @@ func toolPermissionMode(mode permission.Mode) string {
 	default:
 		return string(permission.Default)
 	}
+}
+
+// projectCwd returns the working directory tools resolve relative paths
+// against, or "" when no project context has been established.
+func (e *Engine) projectCwd() string {
+	if e.projCtx == nil {
+		return ""
+	}
+	return e.projCtx.Cwd
+}
+
+// authorizeToolCall applies the engine's permission gate to one tool call: the
+// tool's own CheckPermissions, the session's mode and rules, the policy engine,
+// and finally the interactive prompt. It returns nil when the call may run, or
+// an error describing the denial.
+//
+// Both top-level tool calls and the sub-agents that plan execution spawns go
+// through here, so a sub-agent cannot reach a tool the user has not authorized.
+//
+// setWaiting, when non-nil, is called with true while the engine is blocked on
+// the interactive prompt, so the stall monitor does not report a tool that is
+// waiting on the user as hung.
+func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaiting func(bool)) error {
+	t, ok := e.registry.Find(tc.Name)
+	if !ok {
+		return fmt.Errorf("unknown tool %q", tc.Name)
+	}
+
+	toolDecision := t.CheckPermissions(tc.Input, tctx)
+	decision, reason := e.perm.Check(tc.Name, tc.Input, mapToolDecision(toolDecision.Decision))
+	if decision == permission.DAllow || decision == permission.DBypass {
+		return nil
+	}
+	if reason == "" {
+		reason = toolDecision.Reason
+	}
+	if reason == "" {
+		reason = "permission denied"
+	}
+	if decision != permission.DAsk {
+		return fmt.Errorf("permission denied for %s: %s", tc.Name, reason)
+	}
+
+	// Policy engine override: check rules before interactive prompt
+	if e.policyEngine != nil {
+		switch e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode) {
+		case permission.ActionAllow:
+			return nil // skip interactive prompt
+		case permission.ActionDeny:
+			return fmt.Errorf("denied by policy for %s", tc.Name)
+		}
+	}
+
+	if e.PermissionPrompt == nil {
+		return fmt.Errorf("permission denied for %s: user rejected", tc.Name)
+	}
+	if e.OnPermissionPause != nil {
+		e.OnPermissionPause()
+	}
+	if setWaiting != nil {
+		setWaiting(true)
+	}
+	e.promptMu.Lock()
+	approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
+	e.promptMu.Unlock()
+	if setWaiting != nil {
+		setWaiting(false)
+	}
+	if e.OnPermissionDone != nil {
+		e.OnPermissionDone()
+	}
+	if !approved {
+		return fmt.Errorf("permission denied for %s: user rejected", tc.Name)
+	}
+	return nil
 }
 
 func mapToolDecision(decision tool.PermissionResult) permission.Decision {
@@ -2044,6 +2089,23 @@ func (e *Engine) WirePlanExecutor() {
 
 	if e.fallback != nil && e.fallback.Current() != nil {
 		d := delegate.NewDelegator(e.fallback.Current(), e.fallback.CurrentModel(), e.registry.All())
+		// Sub-agent tool calls go through the same gate as top-level ones. They
+		// used to run with no permission check and PermissionMode pinned to
+		// "auto", so a plan approved in default mode silently gave its
+		// sub-agents unchecked write access to the workspace.
+		// The session's mode and cwd are read at call time, not captured here:
+		// the user can switch modes mid-session and a stale capture would keep
+		// gating sub-agents by the mode that was active when the plan executor
+		// was wired up.
+		d.SetGate(e.projectCwd(), toolPermissionMode(e.perm.Mode()), func(ctx context.Context, tc api.ToolCall) error {
+			return e.authorizeToolCall(tc, tool.Context{
+				Cwd:              e.projectCwd(),
+				ToolUseID:        tc.ID,
+				PermissionMode:   toolPermissionMode(e.perm.Mode()),
+				IsNonInteractive: e.runtime == nil || e.runtime.AskUser == nil,
+				Runtime:          e.runtime,
+			}, nil)
+		})
 		pe := plan.NewPlanExecutor(d, e.runtime)
 		e.runtime.PlanExecuteFunc = func(parallel bool) (string, error) {
 			pl, err := plan.FromRuntime("plan", e.runtime)

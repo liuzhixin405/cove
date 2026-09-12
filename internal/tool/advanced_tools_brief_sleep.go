@@ -52,6 +52,13 @@ func (t *BriefTool) Call(ctx context.Context, input Input, tctx Context) (Result
 		}
 		return Result{Data: fmt.Sprintf("Summary for %s is unavailable without runtime context.", what)}, nil
 	}
+	// brief is declared concurrency-safe, so it runs alongside the task tools
+	// that mutate Runtime.Tasks. Every field read below has to be inside the
+	// lock; iterating the map while another goroutine writes it is a fatal
+	// error, not a recoverable panic.
+	tctx.Runtime.Lock()
+	defer tctx.Runtime.Unlock()
+
 	var sb strings.Builder
 	if what == "" {
 		what = "current session"

@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main, master]
   pull_request:
     branches: [main, master]
 
@@ -23,7 +25,25 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      # A UTF-8 BOM on line 1 of a .go file makes `go test -cover` fail to
+      # build, because the cover tool rewrites line 1 and leaves the BOM
+      # stranded mid-file ("invalid BOM in the middle of the file"). Five
+      # files carried one, which is why coverage for internal/engine could
+      # never be produced. Guard against reintroducing it.
+      - name: Check for UTF-8 BOM in Go sources
+        shell: bash
+        run: |
+          bad=$(git ls-files '*.go' | while read -r f; do
+            if [ "$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then echo "$f"; fi
+          done)
+          if [ -n "$bad" ]; then
+            echo "::error::UTF-8 BOM found - it breaks 'go test -cover':"
+            echo "$bad"
+            exit 1
+          fi
+
       - name: Run tests
+        shell: bash
         run: |
           RACE=""
           if [ "${{ matrix.os }}" != "windows-latest" ]; then

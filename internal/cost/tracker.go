@@ -75,11 +75,18 @@ func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss i
 	p, ok := Prices[model]
 	if !ok {
 		p = defaultPrice
-		for k, v := range Prices {
-			if strings.Contains(model, k) {
-				p = v
-				break
+		// Dated model names ("gpt-4o-mini-2024-07-18") contain several price
+		// keys, so the match has to be the most specific one. Taking the first
+		// hit instead would depend on Go's randomized map iteration order and
+		// bill the same request at different rates on different runs.
+		longest := ""
+		for k := range Prices {
+			if len(k) > len(longest) && strings.Contains(model, k) {
+				longest = k
 			}
+		}
+		if longest != "" {
+			p = Prices[longest]
 		}
 	}
 	if p.InputCacheHit == 0 {

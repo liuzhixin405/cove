@@ -50,7 +50,15 @@ func NewTaskListTool() Tool {
 	}}}
 }
 func (t *TaskListTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-	if tctx.Runtime == nil || len(tctx.Runtime.Tasks) == 0 {
+	if tctx.Runtime == nil {
+		return Result{Data: "No active tasks."}, nil
+	}
+	// Task tools are dispatched concurrently, so the map and every record field
+	// read below must be inside the lock. A concurrent map iteration and map
+	// write is a fatal error, not a recoverable panic.
+	tctx.Runtime.Lock()
+	defer tctx.Runtime.Unlock()
+	if len(tctx.Runtime.Tasks) == 0 {
 		return Result{Data: "No active tasks."}, nil
 	}
 	var sb strings.Builder

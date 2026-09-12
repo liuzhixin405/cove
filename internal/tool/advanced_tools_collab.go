@@ -53,11 +53,12 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 			sb.WriteString(fmt.Sprintf("  %d. [%s] %s\n", i+1, ag, tsk))
 		}
 	}
+	// Keep the lock across the summary below: it reads the same maps the loop
+	// above writes, and releasing it here would let another goroutine mutate
+	// them mid-iteration (a fatal error).
+	var planExec func(parallel bool) (string, error)
 	if tctx.Runtime != nil {
 		tctx.Runtime.Teams[name] = &TeamRecord{Name: name, Members: memberRecords, Status: "active", CreatedAt: now}
-		tctx.Runtime.Unlock()
-	}
-	if tctx.Runtime != nil {
 		if len(tctx.Runtime.Teams) > 0 {
 			sb.WriteString(fmt.Sprintf("Teams: %d\n", len(tctx.Runtime.Teams)))
 			for _, team := range tctx.Runtime.Teams {
@@ -73,10 +74,16 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 		if len(tctx.Runtime.Messages) > 0 {
 			sb.WriteString(fmt.Sprintf("Messages: %d queued\n", len(tctx.Runtime.Messages)))
 		}
+		// Capture the callback but do not call it here. It runs the plan
+		// executor, which calls plan.FromRuntime, which takes this same lock —
+		// and sync.Mutex is not reentrant, so calling it under the lock would
+		// deadlock the whole turn.
+		planExec = tctx.Runtime.PlanExecuteFunc
+		tctx.Runtime.Unlock()
 	}
 
-	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
-		result, err := tctx.Runtime.PlanExecuteFunc(true)
+	if planExec != nil {
+		result, err := planExec(true)
 		if err != nil {
 			sb.WriteString(fmt.Sprintf("\n\n[执行失败] %v", err))
 		} else {

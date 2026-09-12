@@ -1,8 +1,50 @@
 package cost
 
 import (
+	"math"
 	"testing"
 )
+
+// Dated model names are what the fuzzy price lookup exists for, and they are
+// where it breaks: "gpt-4o-mini-2024-07-18" contains both "gpt-4o-mini" and the
+// shorter "gpt-4o". Go randomizes map iteration order, so a first-match loop
+// resolves that name to a different price on different runs — billing a mini
+// call at 16x the real rate whenever the short key comes up first.
+//
+// The longest matching key is the most specific one and has to win.
+func TestAddDetailedPicksTheMostSpecificPriceKey(t *testing.T) {
+	cases := []struct {
+		model string
+		want  Price
+	}{
+		{"gpt-4o-mini-2024-07-18", Prices["gpt-4o-mini"]},
+		{"gpt-4o-2024-08-06", Prices["gpt-4o"]},
+		{"claude-3-5-sonnet-20241022", Prices["claude-3-5-sonnet"]},
+		{"deepseek-v4-flash-0731", Prices["deepseek-v4-flash"]},
+	}
+
+	// One run picks the wrong key about half the time, which would make this a
+	// coin flip rather than a test. Accumulating many runs turns a wrong pick
+	// into a visible mismatch in the total.
+	const runs = 200
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			var got float64
+			for i := 0; i < runs; i++ {
+				// 1M uncached input tokens => TotalCost is exactly p.Input.
+				tr := NewTracker(0)
+				tr.AddDetailed(tc.model, 1_000_000, 0, 0, 0)
+				got += tr.TotalCost
+			}
+			want := float64(runs) * tc.want.Input
+			if math.Abs(got-want) > 1e-6 {
+				t.Errorf("%d runs of %s totalled $%.4f, want $%.4f: the fuzzy match picked the wrong price key",
+					runs, tc.model, got, want)
+			}
+		})
+	}
+}
 
 func TestTrackerAddDetailedUsesDeepSeekCacheHitPricing(t *testing.T) {
 	tracker := NewTracker(0)
@@ -51,4 +93,3 @@ func TestTrackerSummaryShowsSmallNonZeroCost(t *testing.T) {
 		t.Fatalf("Summary() = %q", got)
 	}
 }
-

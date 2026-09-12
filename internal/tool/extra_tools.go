@@ -257,6 +257,12 @@ func NewTodoWriteTool() Tool {
 func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	todos, _ := input["todos"].([]any)
 	if tctx.Runtime != nil {
+		// todowrite is not concurrency-safe, so the engine runs it inline — but
+		// inline means "in the dispatch loop", concurrently with the tool calls
+		// already launched as goroutines from that same response. The map write
+		// below still needs the lock.
+		tctx.Runtime.Lock()
+		defer tctx.Runtime.Unlock()
 		if tctx.Runtime.Tasks == nil {
 			tctx.Runtime.Tasks = make(map[string]*TaskRecord)
 		}
