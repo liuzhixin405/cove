@@ -19,7 +19,10 @@ func TestAnthropicChatStreamParsesSSEDataFrames(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		chunks := []string{
 			"event: message_start\n",
-			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}\n\n",
+			// Anthropic reports the prompt-side counters only in message_start;
+			// message_delta carries output_tokens. Mirror that split here so the
+			// test would catch a regression that drops message_start usage.
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\n",
 			"event: content_block_start\n",
 			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
 			"event: content_block_delta\n",
@@ -27,7 +30,7 @@ func TestAnthropicChatStreamParsesSSEDataFrames(t *testing.T) {
 			"event: content_block_delta\n",
 			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
 			"event: message_delta\n",
-			"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}\n\n",
+			"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n",
 			"event: message_stop\n",
 			"data: {\"type\":\"message_stop\"}\n\n",
 		}

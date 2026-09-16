@@ -33,7 +33,7 @@ func (s Severity) String() string {
 
 // Finding represents a single safety issue detected.
 type Finding struct {
-	Rule     string   // rule name that triggered
+	Rule     string // rule name that triggered
 	Severity Severity
 	Message  string
 	Location string // tool name, file path, or "user_input"
@@ -123,7 +123,7 @@ func (c *Checker) ScanToolCall(toolName string, params map[string]any) *Result {
 // injectionCheck detects prompt injection patterns.
 type injectionCheck struct{}
 
-func (ch *injectionCheck) Name() string     { return "injection" }
+func (ch *injectionCheck) Name() string       { return "injection" }
 func (ch *injectionCheck) Severity() Severity { return SevError }
 
 var injectionPatterns = []*regexp.Regexp{
@@ -150,7 +150,7 @@ func (ch *injectionCheck) Check(input string) *Finding {
 // secretCheck detects hardcoded secrets (API keys, tokens).
 type secretCheck struct{}
 
-func (ch *secretCheck) Name() string      { return "secrets" }
+func (ch *secretCheck) Name() string       { return "secrets" }
 func (ch *secretCheck) Severity() Severity { return SevCritical }
 
 var secretPatterns = []*regexp.Regexp{
@@ -184,25 +184,75 @@ func maskSecret(s string) string {
 // dangerousCommandCheck detects potentially destructive shell commands.
 type dangerousCommandCheck struct{}
 
-func (ch *dangerousCommandCheck) Name() string      { return "dangerous_command" }
-func (ch *dangerousCommandCheck) Severity() Severity { return SevWarning }
+func (ch *dangerousCommandCheck) Name() string { return "dangerous_command" }
 
-var dangerousCommands = []string{
-	"rm -rf /", "rm -rf ~", "rm -rf .",
+// Severity reports the worst severity this check can produce; the per-finding
+// severity is set in Check (SevCritical for catastrophic, SevWarning for risky).
+func (ch *dangerousCommandCheck) Severity() Severity { return SevCritical }
+
+// catastrophicCommands are irreversible and destroy state outside the project:
+// the whole filesystem, the user's home directory, a raw device, the machine's
+// permission model. These are reported at SevCritical so the engine's
+// BlockingFinding check actually stops them.
+//
+// Every entry here used to be SevWarning, which the engine only logs — so a
+// checker whose entire purpose was to stop `rm -rf /` never stopped anything.
+var catastrophicCommands = []string{
+	"rm -rf /", "rm -rf ~", "rm -fr /", "rm -fr ~",
+	"rm -rf --no-preserve-root", "rm --no-preserve-root",
 	":(){ :|:& };:", "fork bomb",
-	"dd if=/dev/zero", "mkfs.",
-	"> /dev/sda", "chmod 777 /",
-	"git push --force origin", "git reset --hard",
+	"dd if=/dev/zero", "dd if=/dev/random", "mkfs.",
+	"> /dev/sda", "> /dev/sdb", "> /dev/nvme",
+	"chmod -r 777 /", "chmod 777 /", "chown -r / ",
+	"format c:", "del /f /s /q c:\\",
+}
+
+// riskyCommands are destructive but project-scoped and routinely legitimate.
+// They stay at SevWarning: surfaced to the user, not blocked.
+var riskyCommands = []string{
+	"git push --force origin", "git push -f origin",
+	"git reset --hard", "git clean -fdx",
+}
+
+// riskyPatterns covers the risky cases a plain substring cannot express.
+//
+// "rm -rf ." as a substring matches "rm -rf ./node_modules/.cache" — an
+// entirely routine command — so wiping the working directory has to be matched
+// with "." as the whole argument.
+var riskyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\brm\s+-[rf]{2}\s+\.(\s|$)`),
+	regexp.MustCompile(`(?i)\brm\s+-[rf]{2}\s+\./(\s|$)`),
+	regexp.MustCompile(`(?i)\brm\s+-[rf]{2}\s+\*(\s|$)`),
 }
 
 func (ch *dangerousCommandCheck) Check(input string) *Finding {
 	lower := strings.ToLower(input)
-	for _, cmd := range dangerousCommands {
+	// Catastrophic patterns are checked first: "rm -rf /" must not be reported
+	// as the milder "rm -rf ." match when a command contains both.
+	for _, cmd := range catastrophicCommands {
+		if strings.Contains(lower, strings.ToLower(cmd)) {
+			return &Finding{
+				Rule:     "dangerous_command",
+				Severity: SevCritical,
+				Message:  fmt.Sprintf("irreversible destructive command refused: %s", cmd),
+			}
+		}
+	}
+	for _, cmd := range riskyCommands {
 		if strings.Contains(lower, strings.ToLower(cmd)) {
 			return &Finding{
 				Rule:     "dangerous_command",
 				Severity: SevWarning,
 				Message:  fmt.Sprintf("potentially dangerous command: %s", cmd),
+			}
+		}
+	}
+	for _, pat := range riskyPatterns {
+		if m := pat.FindString(input); m != "" {
+			return &Finding{
+				Rule:     "dangerous_command",
+				Severity: SevWarning,
+				Message:  fmt.Sprintf("potentially dangerous command: %s", strings.TrimSpace(m)),
 			}
 		}
 	}

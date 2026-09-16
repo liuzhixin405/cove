@@ -31,34 +31,42 @@ const maxRuntimeEvents = 200
 var (
 	runtimeMu     sync.Mutex
 	runtimeEvents []RuntimeEvent
-	runtimePath   string // resolved lazily; persistent append-only log
+
+	// runtimePath is resolved lazily on first use and memoized. RecordRuntime is
+	// called from every background goroutine in the process (and from the log
+	// sink), so the memoization must be synchronized: sync.Once gives the
+	// single-initialization guarantee plus the happens-before edge that a plain
+	// `if runtimePath != ""` check lacked.
+	runtimePathOnce sync.Once
+	runtimePath     string // persistent append-only log; "-" disables persistence
 )
 
 // runtimeLogPath returns (and memoizes) the path of the persistent runtime
 // error log under the user's cove directory.
 func runtimeLogPath() string {
-	if runtimePath != "" {
-		return runtimePath
-	}
+	runtimePathOnce.Do(resolveRuntimeLogPath)
+	return runtimePath
+}
+
+func resolveRuntimeLogPath() {
 	// Never persist while running under `go test`: test fixtures deliberately
 	// trigger errors (panics, rejected permissions, unknown tools) and must not
 	// pollute the user's real ~/.cove/errors.log.
 	if testing.Testing() {
 		runtimePath = "-"
-		return runtimePath
+		return
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		runtimePath = "-" // sentinel: persistence disabled
-		return runtimePath
+		return
 	}
 	dir := filepath.Join(home, ".cove")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		runtimePath = "-" // cannot create dir: disable persistence
-		return runtimePath
+		return
 	}
 	runtimePath = filepath.Join(dir, "errors.log")
-	return runtimePath
 }
 
 // RecordRuntime captures a runtime problem: it is appended to the in-memory

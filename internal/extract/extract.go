@@ -6,17 +6,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // Runner manages automatic memory extraction after each turn.
 type Runner struct {
-	provider    api.Provider
-	model       string
-	memoryDir   string
+	provider  api.Provider
+	model     string
+	memoryDir string
+	// mu guards lastExtract and serializes the memory-file write phase.
+	// Extract runs as a background goroutine after every turn, so without it
+	// the throttle can be read stale (letting two extractions overlap) and two
+	// overlapping runs can interleave read-modify-write on the same file.
+	mu          sync.Mutex
 	lastExtract time.Time
 	OnSave      func(count int) // optional callback when memories are saved
 }
@@ -34,14 +42,26 @@ func NewRunner(provider api.Provider, model string) *Runner {
 // minExtractInterval prevents extraction from firing on every single turn.
 const minExtractInterval = 2 * time.Minute
 
+// claimSlot atomically checks the throttle and, if the interval has elapsed,
+// claims it by advancing lastExtract. Returns false when throttled.
+func (r *Runner) claimSlot() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if time.Since(r.lastExtract) < minExtractInterval {
+		return false
+	}
+	r.lastExtract = time.Now()
+	return true
+}
+
 // Extract analyzes the recent conversation and saves any important memories.
 // Should be called after each turn ends (runs as a background goroutine).
 func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
-	// Throttle: don't extract more often than every 2 minutes
-	if time.Since(r.lastExtract) < minExtractInterval {
+	// Throttle: don't extract more often than every 2 minutes. Checked and
+	// claimed under the lock so concurrent callers cannot both pass the gate.
+	if !r.claimSlot() {
 		return
 	}
-	r.lastExtract = time.Now()
 
 	// Need at least a few messages to extract from
 	if len(messages) < 4 {
@@ -75,19 +95,20 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 
 	os.MkdirAll(r.memoryDir, 0700)
 	saved := 0
+	// The read-modify-write below (dedup probe, append, rewrite) must not
+	// interleave with another extraction run touching the same files.
+	r.mu.Lock()
 	for _, m := range memories {
 		if m.Name == "" || m.Content == "" {
 			continue
 		}
 		// Validate: memory must not be too large
-		if len(m.Content) > 5000 {
-			m.Content = m.Content[:5000] + "\n... [truncated]"
-		}
+		m.Content = textutil.ClipBytes(m.Content, 5000, "\n... [truncated]")
 		path := filepath.Join(r.memoryDir, sanitizeFilename(m.Name))
 		// Deduplication: skip if >80% similar to existing memory
 		if existing, err := os.ReadFile(path); err == nil && len(existing) > 0 {
 			existingStr := string(existing)
-			if similarity(existingStr[:min(100, len(existingStr))], m.Content[:min(100, len(m.Content))]) > 0.8 {
+			if similarity(textutil.HeadRunes(existingStr, 100), textutil.HeadRunes(m.Content, 100)) > 0.8 {
 				// Merge instead of duplicate
 				m.Append = true
 			}
@@ -99,15 +120,14 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 			}
 		}
 		// Enforce per-file size limit (10KB)
-		if len(m.Content) > 10240 {
-			m.Content = m.Content[:10240] + "\n... [truncated to 10KB]"
-		}
-		if err := os.WriteFile(path, []byte(m.Content), 0644); err != nil {
+		m.Content = textutil.ClipBytes(m.Content, 10240, "\n... [truncated to 10KB]")
+		if err := fsatomic.WriteFile(path, []byte(m.Content), 0644); err != nil {
 			log.Warnf("[extractMemories] write failed: %v", err)
 			continue
 		}
 		saved++
 	}
+	r.mu.Unlock()
 	if saved > 0 {
 		log.Debugf("[extractMemories] saved %d memories", saved)
 		if r.OnSave != nil {
@@ -151,7 +171,9 @@ func buildExtractionPrompt(memDir string, messages []api.Message) string {
 		sb.WriteString("(none yet)\n")
 	} else {
 		for _, e := range entries {
-			if !e.IsDir() {
+			// Skip in-progress atomic writes; listing one would show the model
+			// a memory file that does not exist.
+			if !e.IsDir() && !fsatomic.IsTempName(e.Name()) {
 				sb.WriteString(fmt.Sprintf("- %s\n", e.Name()))
 			}
 		}
@@ -160,14 +182,9 @@ func buildExtractionPrompt(memDir string, messages []api.Message) string {
 	sb.WriteString("\n## Recent conversation:\n")
 	for _, m := range messages {
 		role := m.Role
-		content := m.Content
-		if len(content) > 500 {
-			content = content[:500] + "..."
-		}
+		content := textutil.ClipBytes(m.Content, 500, "...")
 		if role == "tool" {
-			if len(content) > 200 {
-				content = content[:200] + "..."
-			}
+			content = textutil.ClipBytes(content, 200, "...")
 		}
 		sb.WriteString(fmt.Sprintf("[%s] %s\n", role, content))
 	}

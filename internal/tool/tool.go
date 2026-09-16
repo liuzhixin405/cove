@@ -68,6 +68,39 @@ type Runtime struct {
 func (r *Runtime) Lock()   { r.mu.Lock() }
 func (r *Runtime) Unlock() { r.mu.Unlock() }
 
+// PlanMode and WorktreeDir are written by tool calls and read by others, and
+// tool calls can execute concurrently (see the engine's parallel batch). They
+// are guarded by the same mutex as the rest of Runtime, so go through these
+// accessors rather than touching the fields directly.
+
+// SetPlanMode records whether plan mode is active.
+func (r *Runtime) SetPlanMode(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.PlanMode = on
+}
+
+// IsPlanMode reports whether plan mode is active.
+func (r *Runtime) IsPlanMode() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.PlanMode
+}
+
+// SetWorktreeDir records the active worktree path ("" when none).
+func (r *Runtime) SetWorktreeDir(dir string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.WorktreeDir = dir
+}
+
+// GetWorktreeDir returns the active worktree path, or "" when none.
+func (r *Runtime) GetWorktreeDir() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.WorktreeDir
+}
+
 type LSPRunner interface {
 	Run(ctx context.Context, action string, filePath string, input Input) (string, error)
 }

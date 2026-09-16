@@ -129,7 +129,13 @@ func (m *Manager) Install(name string, url string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	pluginDir := filepath.Join(m.dir, name)
+	// The name becomes a directory that is cloned into and RemoveAll'd on
+	// failure, so it has to be a single safe path element before it is joined.
+	// "../../../.ssh" previously redirected both of those outside m.dir.
+	pluginDir, err := pluginDirFor(m.dir, name)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(pluginDir); err == nil {
 		return fmt.Errorf("plugin %s already installed", name)
 	}
@@ -458,8 +464,11 @@ func (m *Manager) MarketplaceUpdate(name string) (string, error) {
 		if err := m.marketplace.Update(name); err != nil {
 			return "", err
 		}
-		lock, _ := m.marketplace.LockInfo(name)
-		return fmt.Sprintf("✓ %s 已更新到 %s (%s)", name, lock.Version, lock.CommitSHA[:7]), nil
+		lock, ok := m.marketplace.LockInfo(name)
+		if !ok {
+			return fmt.Sprintf("✓ %s 已更新", name), nil
+		}
+		return fmt.Sprintf("✓ %s 已更新到 %s (%s)", name, lock.Version, shortSHA(lock.CommitSHA)), nil
 	}
 	// Update all
 	updated, errs := m.marketplace.UpdateAll()
@@ -473,6 +482,16 @@ func (m *Manager) MarketplaceUpdate(name string) (string, error) {
 		sb.WriteString(fmt.Sprintf("⚠ %d 个失败: %s\n", len(errs), strings.Join(errs, "; ")))
 	}
 	return sb.String(), nil
+}
+
+// shortSHA returns the first 7 characters of a commit SHA, the whole string if
+// shorter, and "" when unknown — it never slices out of range on empty/short input
+// (the former lock.CommitSHA[:7] panicked when the SHA was empty).
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // Marketplace returns the marketplace instance (for advanced usage).

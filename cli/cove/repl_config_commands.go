@@ -206,6 +206,10 @@ func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, 
 		if cfg.Profiles == nil {
 			cfg.Profiles = map[string]*config.Profile{}
 		}
+		// Snapshot the booleans into locals: pointing the profile at
+		// &cfg.Debug would alias the live config, so a later /debug toggle
+		// would silently rewrite the saved profile.
+		savedDebug, savedVerbose := cfg.Debug, cfg.Verbose
 		p := &config.Profile{
 			Model:          cfg.Model,
 			ModelFast:      cfg.ModelFast,
@@ -213,9 +217,11 @@ func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, 
 			PermissionMode: cfg.PermissionMode,
 			MaxBudgetUsd:   cfg.MaxBudgetUsd,
 			ThinkingTokens: cfg.ThinkingTokens,
-			Debug:          cfg.Debug,
-			Verbose:        cfg.Verbose,
-			SystemPrompt:   cfg.SystemPrompt,
+			// Explicit pointers so "/profile save" records the current state
+			// faithfully, including off.
+			Debug:        &savedDebug,
+			Verbose:      &savedVerbose,
+			SystemPrompt: cfg.SystemPrompt,
 		}
 		cfg.Profiles[name] = p
 		if err := config.Save(cfg); err != nil {

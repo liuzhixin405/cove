@@ -1,7 +1,6 @@
 package mobileapi
 
 import (
-	
 	"encoding/json"
 	"strings"
 	"testing"
@@ -16,13 +15,13 @@ func TestBuildMessages(t *testing.T) {
 			{Role: "user", Content: "Hello"},
 		},
 	}
-	
+
 	// 手动构造消息来验证格式
 	messages := buildTestMessages(req)
-	
+
 	data, _ := json.MarshalIndent(messages, "", "  ")
 	t.Logf("Messages JSON:\n%s", string(data))
-	
+
 	// 验证 system 消息
 	if len(messages) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(messages))
@@ -45,8 +44,8 @@ func TestBuildMessagesWithToolCalls(t *testing.T) {
 				Role: "assistant",
 				ToolCalls: []ToolCall{
 					{
-						ID:   "call_123",
-						Name: "screenshot",
+						ID:    "call_123",
+						Name:  "screenshot",
 						Input: map[string]any{},
 					},
 				},
@@ -59,16 +58,16 @@ func TestBuildMessagesWithToolCalls(t *testing.T) {
 			},
 		},
 	}
-	
+
 	messages := buildTestMessages(req)
-	
+
 	data, _ := json.MarshalIndent(messages, "", "  ")
 	t.Logf("Tool call messages JSON:\n%s", string(data))
-	
+
 	if len(messages) != 3 {
 		t.Fatalf("expected 3 messages, got %d", len(messages))
 	}
-	
+
 	// 验证 assistant 消息有 tool_calls
 	assistant := messages[1]
 	if assistant["role"] != "assistant" {
@@ -82,7 +81,7 @@ func TestBuildMessagesWithToolCalls(t *testing.T) {
 	if tc["id"] != "call_123" {
 		t.Errorf("expected call_123, got %v", tc["id"])
 	}
-	
+
 	// 验证 tool 消息有 tool_call_id
 	tool := messages[2]
 	if tool["role"] != "tool" {
@@ -116,14 +115,14 @@ func TestBuildMessagesWithTools(t *testing.T) {
 		},
 		MaxTokens: 8192,
 	}
-	
+
 	// 验证序列化
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
 	t.Logf("ChatRequest JSON:\n%s", string(data))
-	
+
 	if !strings.Contains(string(data), `"tap"`) {
 		t.Error("expected tool name 'tap' in JSON")
 	}
@@ -136,23 +135,23 @@ func TestParseToolCallChunks(t *testing.T) {
 	// 测试流式 tool call 解析（模拟分块传输）
 	accum := ""
 	chunks := []string{`{"x":`, `100,`, `"y":`, `200}`, ``}
-	
+
 	for _, chunk := range chunks {
 		accum += chunk
 	}
-	
+
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(accum), &parsed); err != nil {
 		t.Fatalf("failed to parse accumulated args '%s': %v", accum, err)
 	}
-	
+
 	if parsed["x"] != float64(100) {
 		t.Errorf("expected x=100, got %v", parsed["x"])
 	}
 	if parsed["y"] != float64(200) {
 		t.Errorf("expected y=200, got %v", parsed["y"])
 	}
-	
+
 	t.Logf("Parsed args: x=%v, y=%v", parsed["x"], parsed["y"])
 }
 

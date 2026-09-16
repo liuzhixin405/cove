@@ -43,7 +43,15 @@ func (s *Spinner) Start() {
 				return
 			default:
 				frame := spinnerFrames[i%len(spinnerFrames)]
-				PrintTransientStatus(fmt.Sprintf("  %s%s %s%s", Cyan, frame, s.message, Reset))
+				// message must be read under the lock: SetMessage writes it
+				// from the caller's goroutine, so the bare s.message read here
+				// was a data race on a string — which can tear into a
+				// mismatched pointer/length pair, not just show a stale value.
+				// (WalkingIndicator below already did this correctly.)
+				s.mu.Lock()
+				msg := s.message
+				s.mu.Unlock()
+				PrintTransientStatus(fmt.Sprintf("  %s%s %s%s", Cyan, frame, msg, Reset))
 				i++
 				time.Sleep(80 * time.Millisecond)
 			}
@@ -101,14 +109,22 @@ func (w *WalkingIndicator) Start() {
 	}
 	w.active = true
 	w.doneCh = make(chan struct{})
+	// stopCh is recreated on every Start. It is closed by Stop, and a closed
+	// channel stays closed — so reusing the one from the constructor meant the
+	// goroutine of a second Start saw an immediately-ready stopCh and exited
+	// at once (the indicator was silently dead after the first Stop), and the
+	// second Stop then panicked with "close of closed channel".
+	w.stopCh = make(chan struct{})
+	stopCh := w.stopCh
+	doneCh := w.doneCh
 	w.mu.Unlock()
 
 	go func() {
-		defer close(w.doneCh)
+		defer close(doneCh)
 		i := 0
 		for {
 			select {
-			case <-w.stopCh:
+			case <-stopCh:
 				PrintTransientStatus("")
 				return
 			default:

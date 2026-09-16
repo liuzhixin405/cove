@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/liuzhixin405/cove/internal/log"
 )
 
 // Config holds auto-dream scheduling thresholds.
@@ -26,11 +28,20 @@ func LoadConfig() Config {
 	if err != nil {
 		return cfg
 	}
-	data, err := os.ReadFile(filepath.Join(home, ".cove", "dream.json"))
+	path := filepath.Join(home, ".cove", "dream.json")
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return cfg
 	}
-	json.Unmarshal(data, &cfg)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		// A malformed file must not silently fall back to Enabled: true. cfg is
+		// partially overwritten by a failed Unmarshal, and the default has
+		// consolidation ON — so a user who had turned it off and then hit a
+		// typo in their config would have it quietly turned back on, with no
+		// message anywhere. Report it and use the pristine defaults.
+		log.Warnf("[dream] %s is not valid JSON (%v); using defaults", path, err)
+		return defaults
+	}
 	if cfg.MinHours <= 0 {
 		cfg.MinHours = defaults.MinHours
 	}

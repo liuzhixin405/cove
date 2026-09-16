@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Transport interface {
@@ -24,6 +25,11 @@ type stdioTransport struct {
 	stdout io.ReadCloser
 	mu     sync.Mutex
 	reader *bufio.Reader
+
+	// closeOnce guards the shutdown path: Close is reachable from Pool.Connect's
+	// error handling and from Client.Close, and cmd.Wait must run exactly once.
+	closeOnce sync.Once
+	waitErr   error
 }
 
 func NewStdioTransport(command string, args []string, env map[string]string) (*stdioTransport, error) {
@@ -72,6 +78,14 @@ func (t *stdioTransport) Receive(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	// ReadBytes keeps the delimiter, so the '\n' has to go before looking for a
+	// CR. Without this the last byte was always '\n', stripCR never matched,
+	// and both the CRLF handling and the empty-line case below were dead code:
+	// every message was handed on with its line terminator still attached and a
+	// blank line surfaced as "\n" instead of "{}".
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
 	line = stripCR(line)
 	if len(line) == 0 {
 		return json.RawMessage("{}"), nil
@@ -79,12 +93,38 @@ func (t *stdioTransport) Receive(ctx context.Context) (json.RawMessage, error) {
 	return json.RawMessage(line), nil
 }
 
+// stdioCloseGrace is how long a server gets to exit on its own after its stdin
+// is closed, before it is killed.
+const stdioCloseGrace = 2 * time.Second
+
+// Close shuts the child server down and reaps it.
+//
+// Closing stdin is the protocol's own shutdown signal, so a well-behaved server
+// exits by itself; only a server that ignores it gets killed. Either way the
+// process must be Wait()ed, otherwise its entry stays in the OS process table
+// as a zombie — and since every disconnect/reconnect cycle spawns a fresh
+// server, those accumulated for the lifetime of the session.
 func (t *stdioTransport) Close() error {
-	t.stdin.Close()
-	if t.cmd.Process != nil {
-		t.cmd.Process.Kill()
-	}
-	return nil
+	t.closeOnce.Do(func() {
+		t.stdin.Close()
+
+		if t.cmd.Process == nil {
+			return
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- t.cmd.Wait() }()
+
+		select {
+		case t.waitErr = <-done:
+		case <-time.After(stdioCloseGrace):
+			t.cmd.Process.Kill()
+			// Still reap: Kill only delivers the signal, Wait releases the
+			// process entry and the pipe goroutines.
+			t.waitErr = <-done
+		}
+	})
+	return t.waitErr
 }
 
 func stripCR(b []byte) []byte {
@@ -115,8 +155,18 @@ func NewClient(transport Transport) *Client {
 	}
 }
 
+// handshakeTimeout bounds the initialize round-trip. A server that accepts the
+// connection but never answers initialize would otherwise block Connect
+// forever, and with it every caller waiting on the pool.
+const handshakeTimeout = 20 * time.Second
+
 func (c *Client) Connect(ctx context.Context) error {
 	go c.receiveLoop()
+
+	// Apply a handshake deadline unless the caller already set a shorter one.
+	handshakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	ctx = handshakeCtx
 
 	params := InitializeParams{
 		ProtocolVersion: "2024-11-05",
@@ -137,6 +187,16 @@ func (c *Client) Connect(ctx context.Context) error {
 
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		// Close() has already torn down receiveLoop, so nothing will ever
+		// resolve a pending entry registered from here. Without this check the
+		// request was registered and sent anyway (many transports accept a
+		// write after Close without erroring) and the caller then sat in the
+		// select below until its context expired — forever, for a context with
+		// no deadline.
+		return fmt.Errorf("mcp: connection closed")
+	}
 	c.reqID++
 	id := c.reqID
 	ch := make(chan *Response, 1)
@@ -227,7 +287,16 @@ func (c *Client) receiveLoop() {
 	defer func() {
 		c.mu.Lock()
 		for _, ch := range c.pending {
-			ch <- &Response{Error: &Error{Code: -32000, Message: "transport closed or connection lost"}}
+			// Non-blocking: each pending channel is buffered for exactly one
+			// response. A blocking send here deadlocked the whole client — if a
+			// caller abandoned its request (context cancelled) after its
+			// response had already been buffered, this broadcast blocked on the
+			// full channel while holding c.mu, and nothing would ever drain it,
+			// so every later Call and Close hung forever.
+			select {
+			case ch <- &Response{Error: &Error{Code: -32000, Message: "transport closed or connection lost"}}:
+			default:
+			}
 		}
 		c.mu.Unlock()
 	}()
@@ -320,11 +389,20 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 	}
 	ch, ok := c.pending[*base.ID]
 	if ok {
-		ch <- &Response{
+		// Non-blocking: the channel is buffered for the single response this
+		// request expects, and a second response for the same id is a protocol
+		// violation. A blocking send here ran under c.mu, so a server that
+		// answered the same id twice (or a caller that gave up after its
+		// response was buffered) pinned the mutex permanently and froze every
+		// other Call and Close on this client.
+		select {
+		case ch <- &Response{
 			JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
 			ID:      *base.ID,
 			Result:  base.Result,
 			Error:   base.Error,
+		}:
+		default:
 		}
 	}
 	c.mu.Unlock()

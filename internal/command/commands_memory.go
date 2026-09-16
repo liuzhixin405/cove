@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 func (c *MemoryCmd) Name() string        { return "memory" }
@@ -67,7 +69,7 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			}
 			preview := strings.ReplaceAll(r.Entry.Content, "\n", " ")
 			if len(preview) > 80 {
-				preview = preview[:80] + "..."
+				preview = textutil.ClipRunes(preview, 83)
 			}
 			sb.WriteString(fmt.Sprintf("  %s%s [%.2f]: %s\n", r.Entry.Name, marker, r.Score, preview))
 		}

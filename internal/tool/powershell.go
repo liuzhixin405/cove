@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type PowerShellTool struct{ baseTool }
@@ -76,18 +78,17 @@ func (t *PowerShellTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 
 	if stdout.Len() > 0 {
-		out := stdout.String()
-		if len(out) > 30000 {
-			out = out[:30000] + fmt.Sprintf("\n... [truncated %d bytes]", stdout.Len()-30000)
-		}
+		// Clip on a rune boundary: PowerShell output on a Chinese-locale system
+		// is full of multi-byte runes, and a raw byte slice emits invalid UTF-8
+		// that the provider's JSON encoder then mangles.
+		out := textutil.ClipBytes(stdout.String(), 30000,
+			fmt.Sprintf("\n... [truncated %d bytes]", stdout.Len()-30000))
 		sb.WriteString(out)
 	}
 	if stderr.Len() > 0 {
 		sb.WriteString("\n[stderr]\n")
-		errOut := stderr.String()
-		if len(errOut) > 10000 {
-			errOut = errOut[:10000] + fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-10000)
-		}
+		errOut := textutil.ClipBytes(stderr.String(), 10000,
+			fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-10000))
 		sb.WriteString(errOut)
 	}
 

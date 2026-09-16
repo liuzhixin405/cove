@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +25,60 @@ func NewGlobTool() Tool {
 		}`),
 		IsReadOnly: true, IsConcurrencySafe: true, UserFacingName: "Glob",
 	}}}
+}
+
+// matchGlob reports whether relPath matches pattern, with `**` crossing
+// directory separators.
+//
+// filepath.Match alone cannot do this: its `*` never crosses a separator and it
+// has no notion of `**` at all, so the documented `src/**/*.ts` form silently
+// matched nothing. A leading `**/` was special-cased against the basename,
+// which is why only that one form appeared to work.
+//
+// Semantics, matching the common doublestar convention:
+//   - `**` matches zero or more path segments, so `src/**/*.ts` matches both
+//     `src/a.ts` and `src/a/b/c.ts`.
+//   - a bare `*.go` (no separator in the pattern) matches on the basename, so
+//     the shorthand people actually type keeps working.
+//   - anything else is matched segment-by-segment via filepath.Match, so `?`,
+//     `*` and character classes behave as before within a segment.
+func matchGlob(pattern, relPath string) bool {
+	pattern = filepath.ToSlash(pattern)
+	relPath = filepath.ToSlash(relPath)
+
+	if !strings.Contains(pattern, "/") {
+		ok, _ := filepath.Match(pattern, path.Base(relPath))
+		return ok
+	}
+	return matchSegments(strings.Split(pattern, "/"), strings.Split(relPath, "/"))
+}
+
+// matchSegments matches pattern segments against path segments, treating "**"
+// as "zero or more segments".
+func matchSegments(pat, segs []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			// Trailing "**" swallows whatever is left, including nothing.
+			if len(pat) == 1 {
+				return true
+			}
+			// Try consuming 0, 1, 2 … segments here.
+			for i := 0; i <= len(segs); i++ {
+				if matchSegments(pat[1:], segs[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(segs) == 0 {
+			return false
+		}
+		if ok, _ := filepath.Match(pat[0], segs[0]); !ok {
+			return false
+		}
+		pat, segs = pat[1:], segs[1:]
+	}
+	return len(segs) == 0
 }
 
 func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -53,14 +108,7 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 			}
 		}
 		rel, _ := filepath.Rel(basePath, path)
-		match, _ := filepath.Match(pattern, filepath.Base(path))
-		if !match {
-			match, _ = filepath.Match(pattern, rel)
-		}
-		if !match && strings.HasPrefix(pattern, "**/") {
-			match, _ = filepath.Match(strings.TrimPrefix(pattern, "**/"), filepath.Base(path))
-		}
-		if match {
+		if matchGlob(pattern, rel) {
 			matches = append(matches, rel)
 		}
 		return nil

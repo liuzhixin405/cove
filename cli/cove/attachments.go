@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // Image processing limits (align with upstream API best practices)
@@ -28,6 +29,12 @@ const (
 	maxRawImage    = 32 * 1024 * 1024 // 32MB raw file read limit
 	jpegQuality    = 85
 	minJPEGQuality = 20
+	// maxDecodePixels caps the decoded pixel count. The 32MB raw limit says
+	// nothing about the decoded size: a highly compressible PNG a few hundred
+	// KB on disk can declare 60000x60000, and image decoders allocate
+	// width*height*bytes-per-pixel up front — so decoding it is an instant OOM.
+	// The dimensions are read from the header and checked BEFORE decoding.
+	maxDecodePixels = 64 << 20 // 67,108,864 pixels (~256MB as RGBA)
 )
 
 var attachmentTokenRE = regexp.MustCompile(`@("[^"]+"|'[^']+'|\S+)`)
@@ -327,7 +334,11 @@ func buildTextPart(name, absPath string, data []byte, mimeType string) (api.Mess
 		body := string(data)
 		truncated := ""
 		if len(body) > textLimit {
-			body = body[:textLimit]
+			// Clip on a rune boundary. The data was just verified as valid
+			// UTF-8, and a raw body[:textLimit] then re-broke it by cutting a
+			// multi-byte rune in half — attaching any Chinese text file over
+			// 200KB shipped invalid UTF-8 to the provider.
+			body = textutil.ClipBytes(body, textLimit, "")
 			truncated = "\n[内容已截断: 仅发送前 200KB]"
 		}
 		return api.MessagePart{
@@ -387,18 +398,38 @@ func processImage(raw []byte) ([]byte, string, error) {
 }
 
 // decodeImage decodes PNG, JPEG, or GIF from raw bytes.
+//
+// The declared dimensions are checked from the header first. Decoding straight
+// away let a decompression bomb — a small file declaring enormous dimensions —
+// drive the decoder's up-front width*height allocation and take the process
+// down with it, long before processImage's maxImageDim resize ever ran.
 func decodeImage(raw []byte) (image.Image, error) {
-	// Try each format
-	if img, err := png.Decode(bytes.NewReader(raw)); err == nil {
-		return img, nil
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("unsupported image format (支持: PNG, JPEG, GIF)")
 	}
-	if img, err := jpeg.Decode(bytes.NewReader(raw)); err == nil {
-		return img, nil
+	switch format {
+	case "png", "jpeg", "gif":
+	default:
+		return nil, fmt.Errorf("unsupported image format %q (支持: PNG, JPEG, GIF)", format)
 	}
-	if img, err := gif.Decode(bytes.NewReader(raw)); err == nil {
-		return img, nil
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, fmt.Errorf("image reports invalid dimensions %dx%d", cfg.Width, cfg.Height)
 	}
-	return nil, fmt.Errorf("unsupported image format (支持: PNG, JPEG, GIF)")
+	if int64(cfg.Width)*int64(cfg.Height) > maxDecodePixels {
+		return nil, fmt.Errorf(
+			"图片过大: %dx%d (%d 像素) 超过 %d 像素上限，请先缩小尺寸",
+			cfg.Width, cfg.Height, int64(cfg.Width)*int64(cfg.Height), int64(maxDecodePixels))
+	}
+
+	switch format {
+	case "png":
+		return png.Decode(bytes.NewReader(raw))
+	case "jpeg":
+		return jpeg.Decode(bytes.NewReader(raw))
+	default:
+		return gif.Decode(bytes.NewReader(raw))
+	}
 }
 
 // resizeImage scales an image down so its longest side <= maxDim,

@@ -1,5 +1,7 @@
 package tool
 
+import "github.com/liuzhixin405/cove/internal/textutil"
+
 func ensureRuntimeMaps(rt *Runtime) {
 	if rt.Tasks == nil {
 		rt.Tasks = make(map[string]*TaskRecord)
@@ -12,9 +14,8 @@ func ensureRuntimeMaps(rt *Runtime) {
 	}
 }
 
+// truncateStr limits s to at most n runes. The former s[:n-3] both split
+// multi-byte runes and panicked outright for n < 3.
 func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-3] + "..."
+	return textutil.ClipRunes(s, n)
 }

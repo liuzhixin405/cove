@@ -1,11 +1,14 @@
 package dream
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/log"
@@ -140,15 +143,32 @@ func ListSessionsTouchedSince(since time.Time, sessionsDir string) ([]string, er
 	return ids, nil
 }
 
-// isProcessRunning checks if a process with the given PID exists.
+// isProcessRunning reports whether a process with the given PID is currently alive.
+//
+// The previous implementation was `proc.Signal(os.Signal(nil))`, which can only
+// ever fail: os.Signal is an interface, so a nil interface value fails the
+// type assertion inside Signal and an error is returned unconditionally. That
+// made this function return false for EVERY pid — so a lock held by a live
+// process was always judged stale and reclaimed, and the consolidation lock
+// provided no mutual exclusion at all. Two instances could then write
+// ~/.cove/memory concurrently and overwrite each other.
 func isProcessRunning(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
+	if pid <= 0 {
 		return false
 	}
-	// On Unix, FindProcess always succeeds; send signal 0 to check.
-	// On Windows, FindProcess fails for non-existent processes.
-	// Use a cross-platform approach: try to signal.
-	err = proc.Signal(os.Signal(nil))
-	return err == nil
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// On Windows, FindProcess opens the process handle and fails when the
+		// process does not exist, so an error here means "not running".
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		// FindProcess succeeded (a handle was opened) -> the process exists.
+		return true
+	}
+	// On Unix, FindProcess always succeeds regardless of liveness; probe with
+	// signal 0. A nil error means the process exists and is signalable; EPERM
+	// means it exists but is owned by another user (still alive -> lock valid).
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
 }

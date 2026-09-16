@@ -7,11 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/safeurl"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type WebFetchTool struct{ baseTool }
@@ -52,7 +54,7 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		url = "https://" + strings.TrimPrefix(url, "http://")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newSafeHTTPClient(30 * time.Second)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
@@ -86,9 +88,8 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	}
 
 	limit := 100000
-	if len(content) > limit {
-		content = content[:limit] + "\n... [truncated from " + strconv.Itoa(len(body)) + " bytes]"
-	}
+	content = textutil.ClipBytes(content, limit,
+		"\n... [truncated from "+strconv.Itoa(len(body))+" bytes]")
 
 	return Result{Data: "URL: " + url + "\nStatus: " + strconv.Itoa(resp.StatusCode) + "\nFormat: " + format + "\n\n" + strings.TrimSpace(content)}, nil
 }
@@ -171,39 +172,16 @@ func (t *WebFetchTool) CheckPermissions(input Input, tctx Context) PermissionDec
 	return Allowed("webfetch is read-only")
 }
 
-func isPrivateURL(rawURL string) bool {
-	if rawURL == "" {
-		return false
-	}
-	if !strings.HasPrefix(rawURL, "http") {
-		rawURL = "https://" + rawURL
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return true
-	}
-	host := parsed.Hostname()
-	if host == "localhost" || host == "metadata.google.internal" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// Try resolving
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			return false
-		}
-		ip = ips[0]
-	}
-	privateRanges := []string{
-		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
-		"192.168.0.0/16", "169.254.0.0/16", "::1/128", "fc00::/7",
-	}
-	for _, cidr := range privateRanges {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+// isPrivateURL and isPrivateIP delegate to internal/safeurl, which is the
+// single implementation of these SSRF predicates. This file used to carry its
+// own copy, byte-for-byte duplicated in internal/browser and absent entirely
+// from the skills registry fetch — the classic way a security control drifts
+// out of sync between call sites.
+func isPrivateURL(rawURL string) bool { return safeurl.IsPrivateURL(rawURL) }
+
+func isPrivateIP(ip net.IP) bool { return safeurl.IsPrivateIP(ip) }
+
+// newSafeHTTPClient returns the shared SSRF-hardened client.
+func newSafeHTTPClient(timeout time.Duration) *http.Client {
+	return safeurl.NewClient(timeout)
 }

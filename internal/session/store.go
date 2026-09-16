@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 )
 
 type Record struct {
@@ -51,8 +52,16 @@ func getSessionDir() (string, error) {
 
 func (s *Store) Save(r *Record) error {
 	r.UpdatedAt = time.Now()
-	data, _ := json.MarshalIndent(r, "", "  ")
-	return os.WriteFile(s.path(r.ID), data, 0600)
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		// The marshal error used to be discarded, and the partial output written
+		// over the existing session — losing a conversation to a single
+		// unserializable value in the record. Fail without touching the file.
+		return fmt.Errorf("marshal session %s: %w", r.ID, err)
+	}
+	// Atomic replace: a crash or a full disk mid-write would otherwise truncate
+	// the session file, and a truncated JSON record cannot be resumed at all.
+	return fsatomic.WriteFile(s.path(r.ID), data, 0600)
 }
 
 func (s *Store) Load(id string) (*Record, error) {

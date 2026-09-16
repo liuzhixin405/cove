@@ -40,6 +40,11 @@ func New(workDir string) (*Manager, error) {
 		}
 	}
 
+	// Install the exclude rules into the shadow store. See excludePatterns.
+	if err := writeStoreExcludes(storeDir); err != nil {
+		return nil, err
+	}
+
 	// Compute ref name from workdir hash
 	h := sha256.Sum256([]byte(workDir))
 	refName := "refs/cove/" + hex.EncodeToString(h[:8])
@@ -51,11 +56,37 @@ func New(workDir string) (*Manager, error) {
 	}, nil
 }
 
-// excludePatterns for git add
+// excludePatterns lists what a checkpoint must never capture.
+//
+// These are applied through the shadow store's own info/exclude file, not on
+// the `git add` command line. `git add --all --exclude=<p>` is not valid git:
+// --exclude belongs to `git ls-files`, so every Create failed outright and silently
+// fell back to the unfiltered `git add -A` in the error branch — which is why
+// node_modules/ and target/ ended up inside the checkpoints all along.
 var excludePatterns = []string{
 	"node_modules", ".git", ".venv", "__pycache__",
 	"*.exe", "*.dll", "*.so", "*.dylib",
 	"target/", "dist/", "build/", ".next/",
+}
+
+// writeStoreExcludes renders excludePatterns into <storeDir>/info/exclude,
+// which git applies to every add in this repository. The store is dedicated to
+// checkpoints, so owning that file outright is safe.
+func writeStoreExcludes(storeDir string) error {
+	dir := filepath.Join(storeDir, "info")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("checkpoint store info dir: %w", err)
+	}
+	var sb strings.Builder
+	sb.WriteString("# Managed by cove — regenerated on startup.\n")
+	for _, p := range excludePatterns {
+		sb.WriteString(p)
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "exclude"), []byte(sb.String()), 0600); err != nil {
+		return fmt.Errorf("checkpoint store excludes: %w", err)
+	}
+	return nil
 }
 
 // Create creates a new checkpoint. Returns the commit hash.
@@ -72,19 +103,10 @@ func (m *Manager) Create(label string) (string, error) {
 		"GIT_INDEX_FILE=" + indexFile,
 	}
 
-	// Build exclude args
-	var excludeArgs []string
-	for _, p := range excludePatterns {
-		excludeArgs = append(excludeArgs, "--exclude", p)
-	}
-
-	// Add all files (respecting excludes)
-	addArgs := append([]string{"add", "--all"}, excludeArgs...)
-	if err := m.gitCmd(env, addArgs...); err != nil {
-		// Fallback: add without excludes (some git versions don't support --exclude with --all)
-		if err2 := m.gitCmd(env, "add", "-A"); err2 != nil {
-			return "", fmt.Errorf("git add failed: %w", err)
-		}
+	// Add all files. The exclusions live in the store's info/exclude (written by
+	// writeStoreExcludes), so a plain --all already honors them.
+	if err := m.gitCmd(env, "add", "--all"); err != nil {
+		return "", fmt.Errorf("git add failed: %w", err)
 	}
 
 	// Commit
@@ -93,12 +115,10 @@ func (m *Manager) Create(label string) (string, error) {
 	}
 	msg := fmt.Sprintf("[cove] %s (%s)", label, time.Now().Format("15:04:05"))
 
-	commitArgs := []string{"commit", "--allow-empty", "-m", msg}
-	// Set parent if ref exists
-	if parent := m.getRef(env); parent != "" {
-		commitArgs = append(commitArgs, "--amend") // We don't actually amend; use update-ref
-	}
-
+	// (A commitArgs slice with a conditional "--amend" used to be built here and
+	// then never passed to anything — the call below always used its own fixed
+	// argument list. Removed rather than wired up: history is chained via
+	// update-ref on m.refName, amending would rewrite the previous checkpoint.)
 	if err := m.gitCmd(env, "commit", "--allow-empty", "-m", msg); err != nil {
 		// If nothing to commit, that's okay
 		if strings.Contains(err.Error(), "nothing to commit") {
@@ -144,8 +164,47 @@ func (m *Manager) Restore(commitHash string) error {
 		"GIT_WORK_TREE=" + m.workDir,
 	}
 
+	// Files that a later checkpoint captured but the target one does not contain
+	// have to be deleted, not just left in place. `checkout <hash> -- .` only
+	// writes out what the commit contains, so a file created after the target
+	// snapshot survived the rollback and the restore was never a true rollback.
+	//
+	// Scope note: only paths known to the checkpoint history are removed. A file
+	// created since the LAST checkpoint appears in no commit at all, so it is
+	// left alone — deleting it would mean running `git clean` over the user's
+	// working tree on the strength of a snapshot that never saw it.
+	tip := m.getRef([]string{"GIT_DIR=" + m.storeDir})
+	var toDelete []string
+	if tip != "" && tip != commitHash {
+		// --diff-filter=A against (target → tip) = paths added after the target.
+		out, err := m.gitOutput([]string{"GIT_DIR=" + m.storeDir},
+			"diff", "--name-only", "--diff-filter=A", commitHash, tip)
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+				if p := strings.TrimSpace(line); p != "" {
+					toDelete = append(toDelete, p)
+				}
+			}
+		}
+	}
+
 	// Checkout the files from the commit
-	return m.gitCmd(env, "checkout", commitHash, "--", ".")
+	if err := m.gitCmd(env, "checkout", commitHash, "--", "."); err != nil {
+		return err
+	}
+
+	for _, rel := range toDelete {
+		// Guard against a path escaping the working directory (a maliciously
+		// crafted commit, or a stray absolute path in the diff output).
+		full := filepath.Join(m.workDir, filepath.FromSlash(rel))
+		if !strings.HasPrefix(full, m.workDir+string(os.PathSeparator)) {
+			continue
+		}
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("restore: removing %s: %w", rel, err)
+		}
+	}
+	return nil
 }
 
 // List returns available checkpoints (most recent first).
@@ -167,6 +226,10 @@ func (m *Manager) List() []string {
 
 // Count returns how many checkpoints have been made this session.
 func (m *Manager) Count() int {
+	// count is incremented under m.mu by Create, which runs on background
+	// turn-end goroutines while the UI reads this for its status line.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.count
 }
 

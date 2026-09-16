@@ -21,6 +21,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/liuzhixin405/cove/internal/safeurl"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // ErrChromeUnavailable is returned by headless rendering when the binary was
@@ -122,7 +126,12 @@ func (b *Browser) FetchRendered(ctx context.Context, rawURL, format string) (*Fe
 	}
 	const outputLimit = 100000
 	if len(content) > outputLimit {
-		content = content[:outputLimit] + "\n... [truncated from " + strconv.Itoa(len(htmlContent)) + " bytes]"
+		// outputLimit is a BYTE budget, so content[:outputLimit] used to cut
+		// straight through a multi-byte character (100000 is not a multiple of
+		// 3, so any CJK page hit this): the result was invalid UTF-8 that shows
+		// up as U+FFFD in the TUI and can be rejected by a provider's JSON
+		// encoder. ClipBytes ends the prefix on a rune boundary.
+		content = textutil.ClipBytes(content, outputLimit, "\n... [truncated from "+strconv.Itoa(len(htmlContent))+" bytes]")
 	}
 	return &FetchResult{
 		URL:        rawURL,
@@ -158,7 +167,7 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
-	client := &http.Client{Timeout: b.timeout}
+	client := b.newHTTPClient()
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request creation failed: %w", err)
@@ -176,7 +185,10 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	content := string(body)
+	// maxBodySize is a byte budget applied by LimitReader, so a body larger than
+	// the cap is cut at an arbitrary byte — regularly inside a multi-byte
+	// character. Drop that half rune before the bytes become a string.
+	content := trimPartialTrailingRune(string(body))
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	isHTML := strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/xhtml+xml")
 
@@ -191,10 +203,11 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 		}
 	}
 
-	// Truncate if too large
+	// Truncate if too large. ClipBytes, not content[:outputLimit]: see the note
+	// in FetchRendered — a byte-indexed cut mangles the last character.
 	const outputLimit = 100000
 	if len(content) > outputLimit {
-		content = content[:outputLimit] + "\n... [truncated from " + strconv.Itoa(len(body)) + " bytes]"
+		content = textutil.ClipBytes(content, outputLimit, "\n... [truncated from "+strconv.Itoa(len(body))+" bytes]")
 	}
 
 	return &FetchResult{
@@ -203,6 +216,15 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 		Content:    strings.TrimSpace(content),
 		Format:     format,
 	}, nil
+}
+
+// newHTTPClient builds the fetch client. Unless localhost access is explicitly
+// allowed, it is the shared SSRF-hardened client from internal/safeurl.
+func (b *Browser) newHTTPClient() *http.Client {
+	if b.allowLocalhost {
+		return &http.Client{Timeout: b.timeout}
+	}
+	return safeurl.NewClient(b.timeout)
 }
 
 // validateURL checks that the URL is safe to fetch.
@@ -227,42 +249,40 @@ func (b *Browser) validateURL(rawURL string) error {
 	return nil
 }
 
-// isPrivateHost checks if a hostname resolves to a private/internal IP.
-func isPrivateHost(host string) bool {
-	if host == "localhost" || host == "metadata.google.internal" {
-		return true
-	}
+// isPrivateHost and isPrivateIP delegate to internal/safeurl, the single
+// implementation of these SSRF predicates. This file carried a byte-for-byte
+// duplicate of internal/tool's copy, and the two had already diverged (this one
+// was missing the 100.64/10 carrier-NAT and fe80::/10 ranges).
+func isPrivateHost(host string) bool { return safeurl.IsPrivateHost(host) }
 
-	ip := net.ParseIP(host)
-	if ip != nil {
-		return isPrivateIP(ip)
-	}
+func isPrivateIP(ip net.IP) bool { return safeurl.IsPrivateIP(ip) }
 
-	// Try resolving
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return false
-	}
-	for _, resolved := range ips {
-		if isPrivateIP(resolved) {
-			return true
+// trimPartialTrailingRune drops an incomplete UTF-8 sequence from the end of s,
+// which is what a byte-count cap (maxBodySize) leaves behind when it lands in
+// the middle of a multi-byte character.
+//
+// Only the tail is inspected: bytes elsewhere in the body are left alone, so a
+// response that genuinely is not UTF-8 is not silently rewritten.
+func trimPartialTrailingRune(s string) string {
+	// Only the last utf8.UTFMax-1 bytes can hold a truncated sequence.
+	for i := len(s) - 1; i >= 0 && i > len(s)-utf8.UTFMax; i-- {
+		if !utf8.RuneStart(s[i]) {
+			continue // a continuation byte: keep walking back to its lead byte
 		}
-	}
-	return false
-}
-
-func isPrivateIP(ip net.IP) bool {
-	privateRanges := []string{
-		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
-		"192.168.0.0/16", "169.254.0.0/16", "::1/128", "fc00::/7",
-	}
-	for _, cidr := range privateRanges {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network.Contains(ip) {
-			return true
+		if s[i] < utf8.RuneSelf {
+			return s // ASCII last character: nothing was cut
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		// A lead byte in [0xC2,0xF4] that fails to decode is a real multi-byte
+		// character whose continuation bytes the cap chopped off. Any other
+		// undecodable byte was never valid UTF-8 to begin with, so it is left
+		// in place rather than quietly eaten.
+		if r == utf8.RuneError && size <= 1 && s[i] >= 0xC2 && s[i] <= 0xF4 {
+			return s[:i]
+		}
+		return s
 	}
-	return false
+	return s
 }
 
 // — HTML conversion (copied from tool/webfetch.go to keep browser self-contained) —

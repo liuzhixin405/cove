@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // SessionNotes maintains an auto-updating session_notes.md file that tracks
@@ -106,20 +109,26 @@ func (s *SessionNotes) writeToDisk() error {
 		sb.WriteString("\n")
 	}
 
-	content := sb.String()
-	// Enforce max size (25KB)
-	if len(content) > 25600 {
-		content = content[:25600] + "\n... [truncated]\n"
-	}
-	return os.WriteFile(s.path, []byte(content), 0644)
+	// Enforce max size (25KB), clipping on a rune boundary: notes are largely
+	// Chinese here, so a byte-slice would cut a rune in half.
+	content := textutil.ClipBytes(sb.String(), 25600, "\n... [truncated]\n")
+	// Atomic replace: a crash mid-write would otherwise leave a half-written
+	// notes file, which Load then parses as the session's entire history.
+	return fsatomic.WriteFile(s.path, []byte(content), 0644)
 }
 
 // Load reads existing notes from disk (for resuming sessions).
+//
+// Reading the file happens outside the lock (it can block on IO), but the
+// entries slice is only touched while holding it — Load used to append to
+// s.entries with no lock at all, racing every Add/Flush from the engine's
+// background goroutines.
 func (s *SessionNotes) Load() {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return
 	}
+	var loaded []NoteEntry
 	var currentCategory string
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -151,12 +160,19 @@ func (s *SessionNotes) Load() {
 		if cat == "" {
 			cat = "task"
 		}
-		s.entries = append(s.entries, NoteEntry{
+		loaded = append(loaded, NoteEntry{
 			Timestamp: time.Now(),
 			Category:  cat,
 			Text:      text,
 		})
 	}
+
+	if len(loaded) == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.entries = append(s.entries, loaded...)
+	s.mu.Unlock()
 }
 
 // Content returns the current notes as a string for system prompt injection.

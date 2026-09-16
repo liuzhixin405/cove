@@ -55,6 +55,14 @@ func NewDrawImageTool() Tool {
 	}}}
 }
 
+// Canvas limits for the draw_image tool. The pixel cap is the binding one:
+// maxDrawPixels * 4 bytes/pixel ≈ 256 MB of RGBA, which is already far more
+// than any diagram this tool is meant to produce.
+const (
+	maxDrawDimension = 16384
+	maxDrawPixels    = 64 << 20 // 67,108,864 pixels
+)
+
 func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	outPath, _ := input["outputPath"].(string)
 	width, _ := toInt(input["width"])
@@ -65,6 +73,19 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	}
 	if width <= 0 || height <= 0 {
 		return Result{Data: "Error: width and height must be positive", IsError: true}, nil
+	}
+	// Cap the canvas. image.NewRGBA allocates width*height*4 bytes eagerly, so
+	// an LLM-supplied 100000x100000 (40 GB) killed the process outright — and on
+	// a 32-bit build the product overflows int before any of it is checked.
+	if width > maxDrawDimension || height > maxDrawDimension {
+		return Result{Data: fmt.Sprintf(
+			"Error: width and height must each be at most %d px (got %dx%d)",
+			maxDrawDimension, width, height), IsError: true}, nil
+	}
+	if int64(width)*int64(height) > maxDrawPixels {
+		return Result{Data: fmt.Sprintf(
+			"Error: canvas too large: %dx%d is %d pixels, limit is %d",
+			width, height, int64(width)*int64(height), int64(maxDrawPixels)), IsError: true}, nil
 	}
 
 	shapesRaw, ok := input["shapes"].([]any)

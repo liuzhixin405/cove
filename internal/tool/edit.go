@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type EditTool struct{ baseTool }
@@ -34,6 +36,18 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	oldS, _ := input["oldString"].(string)
 	newS, _ := input["newString"].(string)
 	all, _ := input["replaceAll"].(bool)
+
+	// Fallback: models sometimes use alternative key names. Accept the same
+	// aliases as WriteTool so the two behave identically — the engine's
+	// same-file write serialization keys off these aliases too.
+	if path == "" {
+		for _, alt := range []string{"file_path", "path", "filepath", "file"} {
+			if v, ok := input[alt].(string); ok && v != "" {
+				path = v
+				break
+			}
+		}
+	}
 
 	if path == "" {
 		return Result{Data: "Error: filePath required", IsError: true}, nil
@@ -299,8 +313,7 @@ func formatLineRanges(starts []int, n int) string {
 }
 
 func truncateForHint(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "\n... (truncated)"
+	// max is a byte budget, clipped on a rune boundary: the hint shows file
+	// content back to the model, which is frequently non-ASCII here.
+	return textutil.ClipBytes(s, max, "\n... (truncated)")
 }

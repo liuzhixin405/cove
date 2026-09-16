@@ -29,15 +29,33 @@ func NewPool() *Pool {
 	return &Pool{servers: make(map[string]*ManagedServer)}
 }
 
+// Connect brings up one server and registers it in the pool.
+//
+// The handshake, ListTools and ListResources round-trips all happen WITHOUT the
+// pool lock held. Holding p.mu across them meant one unresponsive server (a
+// hung initialize, a slow tool listing) blocked every other pool operation —
+// including reads from unrelated servers — for as long as it took to time out.
+// The lock is taken only for the two short critical sections: claiming the name
+// and publishing the finished server.
 func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	var stale *ManagedServer
 	if existing, ok := p.servers[name]; ok {
 		if existing.Connected {
+			p.mu.Unlock()
 			return nil
 		}
-		existing.Close()
+		stale = existing
+		delete(p.servers, name)
+	}
+	p.mu.Unlock()
+	// Evicting the dead server is unregistration (under the lock) plus a
+	// shutdown (outside it). Close reaps the child process and waits up to
+	// stdioCloseGrace for it to exit; running that under p.mu froze every other
+	// pool operation for seconds, which is exactly what the rest of this file
+	// takes care to avoid.
+	if stale != nil {
+		stale.Close()
 	}
 
 	var transport Transport
@@ -86,7 +104,16 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 		ms.Resources = resources
 	}
 
+	p.mu.Lock()
+	// A concurrent Connect for the same name may have won the race while this
+	// one was handshaking; keep the existing live server and discard ours.
+	if existing, ok := p.servers[name]; ok && existing.Connected {
+		p.mu.Unlock()
+		ms.Close()
+		return nil
+	}
 	p.servers[name] = ms
+	p.mu.Unlock()
 	return nil
 }
 
@@ -123,32 +150,81 @@ func validateSTDIOCommand(command string) error {
 	return nil
 }
 
+// Disconnect removes a server from the pool and shuts it down.
+//
+// The server is unregistered under the lock but closed after releasing it:
+// Close reaps the child process and waits up to stdioCloseGrace for it to
+// exit, and holding the pool lock across that would block every other pool
+// operation for seconds.
 func (p *Pool) Disconnect(name string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if s, ok := p.servers[name]; ok {
-		s.Close()
+	s, ok := p.servers[name]
+	if ok {
 		delete(p.servers, name)
+	}
+	p.mu.Unlock()
+	if ok {
+		s.Close()
 	}
 }
 
 func (p *Pool) DisconnectAll() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	doomed := make([]*ManagedServer, 0, len(p.servers))
 	for name, s := range p.servers {
-		s.Close()
+		doomed = append(doomed, s)
 		delete(p.servers, name)
 	}
+	p.mu.Unlock()
+
+	// Shut the servers down concurrently and outside the lock. Serially under
+	// the lock, N unresponsive servers would each burn the full close grace
+	// period in turn — N × stdioCloseGrace of a frozen pool on shutdown.
+	var wg sync.WaitGroup
+	for _, s := range doomed {
+		wg.Add(1)
+		go func(ms *ManagedServer) {
+			defer wg.Done()
+			ms.Close()
+		}(s)
+	}
+	wg.Wait()
 }
 
+// AllServers returns a snapshot of the pool's servers.
+//
+// The returned values are copies, not the pool's live *ManagedServer records.
+// Handing out the live pointers let callers read Connected/Tools/Resources
+// after releasing the lock, racing Close() and Connect() which write those same
+// fields. Callers only ever read the metadata, so a snapshot costs nothing.
 func (p *Pool) AllServers() []*ManagedServer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	var result []*ManagedServer
+	result := make([]*ManagedServer, 0, len(p.servers))
 	for _, s := range p.servers {
-		result = append(result, s)
+		result = append(result, s.snapshot())
 	}
 	return result
+}
+
+// snapshot returns a copy safe to read outside the pool lock. Client and
+// Transport are carried over as-is (they have their own internal locking); the
+// mutable metadata fields are copied.
+func (ms *ManagedServer) snapshot() *ManagedServer {
+	cp := &ManagedServer{
+		Name:      ms.Name,
+		Config:    ms.Config,
+		Client:    ms.Client,
+		Transport: ms.Transport,
+		Connected: ms.Connected,
+	}
+	if len(ms.Tools) > 0 {
+		cp.Tools = append([]Tool(nil), ms.Tools...)
+	}
+	if len(ms.Resources) > 0 {
+		cp.Resources = append([]Resource(nil), ms.Resources...)
+	}
+	return cp
 }
 
 func (p *Pool) AllTools() []ToolRef {

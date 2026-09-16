@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
@@ -20,6 +21,10 @@ import (
 	"github.com/liuzhixin405/cove/internal/state"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
+
+// mcpBootstrapTimeout caps the total time spent connecting configured MCP
+// servers during startup.
+const mcpBootstrapTimeout = 30 * time.Second
 
 type appBootstrap struct {
 	cfg       *config.Config
@@ -99,7 +104,12 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 		for name, sc := range cfg.MCPServers {
 			servers[name] = mcp.ServerConfig(sc)
 		}
-		mcpPool.LoadFromConfig(context.Background(), servers)
+		// Startup must stay bounded: a misconfigured or unresponsive MCP server
+		// would otherwise hang the whole launch. Servers that miss the window
+		// are logged and skipped; the user can reconnect them via /mcp.
+		mcpCtx, cancelMCP := context.WithTimeout(context.Background(), mcpBootstrapTimeout)
+		mcpPool.LoadFromConfig(mcpCtx, servers)
+		cancelMCP()
 	}
 
 	toolReg := registerAllTools(mcpPool)

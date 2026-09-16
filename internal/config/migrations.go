@@ -1,8 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"reflect"
 )
 
 const CurrentVersion = 1
@@ -32,17 +33,31 @@ func Migrate(cfg *Config, fromVersion int) error {
 		return nil
 	}
 
-	before := *cfg
+	// `before := *cfg` is a SHALLOW copy: Config holds maps and pointers
+	// (MCPServers, Profiles, MemoryEmbedding, DoneVerifyCommands), so a
+	// migration that mutates one of those in place mutates `before` too and
+	// DeepEqual then compares the post-migration value against itself —
+	// reporting "unchanged" and skipping the Save, which loses the migration.
+	// Serializing the pre-state sidesteps the aliasing entirely.
+	beforeJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("snapshot config before migration: %w", err)
+	}
+
 	changed := false
 	for _, m := range migrateRules {
 		if m.Version > fromVersion {
 			if err := m.Apply(cfg); err != nil {
 				return fmt.Errorf("migration v%d: %w", m.Version, err)
 			}
-			if !reflect.DeepEqual(before, *cfg) {
-				changed = true
-			}
 		}
+	}
+	afterJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("snapshot config after migration: %w", err)
+	}
+	if !bytes.Equal(beforeJSON, afterJSON) {
+		changed = true
 	}
 	if !changed {
 		return nil

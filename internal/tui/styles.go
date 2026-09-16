@@ -99,10 +99,17 @@ func (m *Model) renderStatusBar() string {
 
 	var bar string
 	if w <= contentLen+rightLen {
-		// Terminal too narrow, just render centerText
-		bar = centerText
-		if lipgloss.Width(bar) > w {
-			bar = truncate(bar, w)
+		// Too narrow for both. Keep the state indicator and clip the centered
+		// text instead of dropping the state: Ready/Busy is the only signal
+		// that a turn is in flight, and it used to vanish entirely on narrow
+		// terminals (the bar became centerText plus trailing padding).
+		if w <= rightLen {
+			bar = truncate(right, w)
+		} else {
+			bar = truncate(centerText, w-rightLen) + right
+			if pad := w - lipgloss.Width(bar); pad > 0 {
+				bar = strings.Repeat(" ", pad) + bar
+			}
 		}
 	} else {
 		// Center alignment calculation
@@ -148,11 +155,22 @@ func (m *Model) renderBottomBar() string {
 	if m.status.Elapsed != "" {
 		left += " · " + m.status.Elapsed
 	}
-	right := "Ctrl+Y 复制会话 │ F6 复制屏幕 │ F7 复制全部 │ Ctrl+K 命令 │ ? 帮助 │ Esc 取消 │ Ctrl+C 退出 "
-	compact := "复制: Ctrl+Y会话 F6屏幕 F7全部 | Ctrl+K命令 ?帮助 Esc取消"
+	// The mouse state is shown because it decides whether the terminal's own
+	// drag-to-select works: with capture on, selection is disabled and users
+	// have no way to tell why copying "stopped working".
+	mouseHint := "F2 鼠标:捕获"
+	if !m.mouseCapture {
+		mouseHint = "F2 鼠标:选择"
+	}
+	right := "Ctrl+Y 复制会话 │ F6 复制屏幕 │ F7 复制全部 │ " + mouseHint + " │ Ctrl+K 命令 │ ? 帮助 │ Esc 取消 │ Ctrl+C 退出 "
+	compact := "复制: Ctrl+Y会话 F6屏幕 F7全部 | " + mouseHint + " | Ctrl+K命令 ?帮助"
 	if PreferASCIIText() {
-		right = "Ctrl+Y Copy Session | F6 Copy Screen | F7 Copy All | Ctrl+K Cmd | ? Help | Esc Cancel | Ctrl+C Quit "
-		compact = "Copy: Ctrl+Y session F6 screen F7 all | Ctrl+K cmd ?help Esc cancel"
+		mouseHint = "F2 Mouse:capture"
+		if !m.mouseCapture {
+			mouseHint = "F2 Mouse:select"
+		}
+		right = "Ctrl+Y Copy Session | F6 Copy Screen | F7 Copy All | " + mouseHint + " | Ctrl+K Cmd | ? Help | Esc Cancel | Ctrl+C Quit "
+		compact = "Copy: Ctrl+Y session F6 screen F7 all | " + mouseHint + " | Ctrl+K cmd ?help"
 	}
 
 	w := m.width
@@ -445,15 +463,27 @@ func (m *Model) renderHelp(height int) string {
 	b.WriteString("  Chat\n")
 	b.WriteString("    Enter    Send message\n")
 	b.WriteString("    \\ + Enter New line\n")
+	b.WriteString("    Ctrl+J   New line\n")
 	b.WriteString("    PgUp/Dn  Scroll\n")
 	b.WriteString("    Alt+T    Toggle reasoning\n")
 	b.WriteString("\n")
+	b.WriteString("  Copy\n")
+	b.WriteString("    Ctrl+Y   Copy session (user + assistant)\n")
+	b.WriteString("    F6       Copy visible screen\n")
+	b.WriteString("    F7       Copy everything (incl. tool output)\n")
+	if m.mouseCapture {
+		b.WriteString("    F2       Mouse: capture ON — wheel scrolls, drag-select OFF\n")
+	} else {
+		b.WriteString("    F2       Mouse: capture OFF — drag-select ON, wheel OFF\n")
+	}
+	b.WriteString("\n")
 	b.WriteString("  System\n")
 	b.WriteString("    Ctrl+T   Theme\n")
+	b.WriteString("    Ctrl+G   Toggle git panel\n")
 	b.WriteString("    Esc      Cancel running task\n")
 	b.WriteString("    Ctrl+C   Quit confirm\n")
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("Esc / Enter / ? close help"))
+	b.WriteString(dimStyle.Render("Esc / Enter / ? close help  ·  \"?\" opens it only on an empty input line"))
 	return overlayBoxStyle.Width(boxW).MaxHeight(height).Render(b.String())
 }
 

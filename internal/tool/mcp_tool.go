@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/mcp"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type mcpPoolView interface {
@@ -64,6 +65,11 @@ func (t *mcpToolProxy) Call(ctx context.Context, input Input, tctx Context) (Res
 	result, err := t.pool.CallTool(ctx, serverName, toolName, args)
 	if err != nil {
 		return Result{Data: "MCP error: " + err.Error(), IsError: true}, nil
+	}
+	// A (nil, nil) return would panic on the deref below. The neighbouring
+	// readMCPResource already guarded against it; this path did not.
+	if result == nil {
+		return Result{Data: "MCP error: server returned an empty result", IsError: true}, nil
 	}
 
 	var sb strings.Builder
@@ -210,9 +216,7 @@ func (t *readMCPResource) CheckPermissions(input Input, tctx Context) Permission
 
 func (t *readMCPResource) Validate(input Input) string { return "" }
 
+// truncate clips s to at most n bytes without splitting a rune.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.ClipBytes(s, n, "...")
 }

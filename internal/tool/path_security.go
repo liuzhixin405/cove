@@ -44,14 +44,14 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 		volRoot := filepath.VolumeName(root)
 		volPath := filepath.VolumeName(checkAbs)
 		if volRoot != "" && volPath != "" && !strings.EqualFold(volRoot, volPath) {
-			// Cross-drive: check if path is under a known project root via git
-			if gitRoot := findGitRoot(checkAbs); gitRoot != "" {
-				gitLower := strings.ToLower(filepath.Clean(gitRoot))
-				pathLower := strings.ToLower(filepath.Clean(checkAbs))
-				if strings.HasPrefix(pathLower, gitLower+string(os.PathSeparator)) || pathLower == gitLower {
-					return path, nil
-				}
-			}
+			// Cross-drive is always outside the working directory.
+			//
+			// This used to fall back to "allow if the target sits inside any git
+			// repository", which defeated the sandbox entirely: with cwd on D:,
+			// C:\Users\<me>\anything-with-a-.git\ was writable. A repo somewhere
+			// else on the machine is not the cwd, and symlinks/junctions into the
+			// cwd were already resolved by EvalSymlinks above, so a legitimate
+			// in-project path can never land here.
 			return "", fmt.Errorf("path on different drive: %s (cwd is on %s)", path, volRoot)
 		}
 		// Same drive but Rel still failed; try case-insensitive prefix matching.
@@ -82,19 +82,5 @@ func nearestExistingParent(path string) string {
 			return path
 		}
 		path = parent
-	}
-}
-
-func findGitRoot(path string) string {
-	dir := filepath.Dir(path)
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
 	}
 }

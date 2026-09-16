@@ -9,6 +9,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // backgroundReview runs after each turn to auto-extract learnings into memory/skills.
@@ -131,8 +132,6 @@ func buildReviewSnapshot(msgs []api.Message) string {
 }
 
 func reviewTruncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
+	// max is a byte budget (it bounds prompt size), clipped on a rune boundary.
+	return textutil.ClipBytes(s, max, "...")
 }

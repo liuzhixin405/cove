@@ -48,3 +48,6 @@ coverage.txt
 
 # Archive docs (excluded from main tree)
 /docs/archive/
+
+# Claude Code local settings (per-user, not shared)
+/.claude/settings.local.json

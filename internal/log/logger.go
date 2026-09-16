@@ -43,8 +43,22 @@ func SetSink(fn func(level Level, msg string)) {
 	sinkMu.Unlock()
 }
 
-func SetLevel(l Level)                           { defaultLogger.level = l }
-func SetWriter(w io.Writer)                      { defaultLogger.writer = w }
+// SetLevel and SetWriter take the logger's mutex: they are called at startup
+// and from /debug while background goroutines are already logging, and the
+// fields they write are read on every log call.
+
+func SetLevel(l Level) {
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+	defaultLogger.level = l
+}
+
+func SetWriter(w io.Writer) {
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+	defaultLogger.writer = w
+}
+
 func NewLogger(level Level, w io.Writer) *Logger { return &Logger{level: level, writer: w} }
 
 func (l *Logger) log(level Level, format string, args ...any) {
@@ -58,11 +72,13 @@ func (l *Logger) log(level Level, format string, args ...any) {
 			fn(level, fmt.Sprintf(format, args...))
 		}
 	}
+	// The level check moved inside the lock: it reads l.level, which SetLevel
+	// writes, so checking it before acquiring the mutex was a data race.
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if level < l.level {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	ts := time.Now().Format("15:04:05.000")
 	fmt.Fprintf(l.writer, "[%s %s] ", ts, levelNames[level])
 	fmt.Fprintf(l.writer, format, args...)

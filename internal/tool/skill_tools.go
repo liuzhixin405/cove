@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // --- skills_list ---
@@ -38,7 +39,7 @@ func (t *SkillsListTool) Call(ctx context.Context, input Input, tctx Context) (R
 	for _, s := range all {
 		desc := s.Description
 		if len(desc) > 80 {
-			desc = desc[:77] + "..."
+			desc = textutil.ClipRunes(desc, 80)
 		}
 		sb.WriteString(fmt.Sprintf("  %-20s %s\n", s.Name, desc))
 	}

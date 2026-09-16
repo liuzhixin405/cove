@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,17 +36,56 @@ var Prices = map[string]Price{
 // cost estimate (per-million-token USD rates).
 var defaultPrice = Price{Input: 0.435, InputCacheHit: 0.003625, Output: 0.87}
 
+// Tracker accumulates token usage and spend for the session.
+//
+// Every field is behind mu and reachable only through the accessors below.
+// AddDetailed runs on the engine goroutine after each model call, while the
+// REPL/TUI status line, /cost, /status and the budget guard all read the
+// totals from their own goroutines — with plain exported fields those were
+// unsynchronized reads of a value the budget guard then acts on.
 type Tracker struct {
-	TotalInput           int
-	TotalOutput          int
-	TotalPromptCacheHit  int
-	TotalPromptCacheMiss int
-	TotalCost            float64
-	MaxBudget            float64
+	mu                   sync.Mutex
+	totalInput           int
+	totalOutput          int
+	totalPromptCacheHit  int
+	totalPromptCacheMiss int
+	totalCost            float64
+	maxBudget            float64
+}
+
+// Totals is a point-in-time snapshot of a Tracker.
+type Totals struct {
+	Input           int
+	Output          int
+	PromptCacheHit  int
+	PromptCacheMiss int
+	Cost            float64
+	MaxBudget       float64
 }
 
 func NewTracker(maxBudget float64) *Tracker {
-	return &Tracker{MaxBudget: maxBudget}
+	return &Tracker{maxBudget: maxBudget}
+}
+
+// Totals returns a consistent snapshot of every counter.
+func (t *Tracker) Totals() Totals {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return Totals{
+		Input:           t.totalInput,
+		Output:          t.totalOutput,
+		PromptCacheHit:  t.totalPromptCacheHit,
+		PromptCacheMiss: t.totalPromptCacheMiss,
+		Cost:            t.totalCost,
+		MaxBudget:       t.maxBudget,
+	}
+}
+
+// SetMaxBudget updates the spend ceiling (0 = unlimited).
+func (t *Tracker) SetMaxBudget(v float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxBudget = v
 }
 
 func (t *Tracker) Add(model string, input, output int) {
@@ -53,8 +93,10 @@ func (t *Tracker) Add(model string, input, output int) {
 }
 
 func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss int) {
-	t.TotalInput += input
-	t.TotalOutput += output
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.totalInput += input
+	t.totalOutput += output
 	if cacheHit < 0 {
 		cacheHit = 0
 	}
@@ -70,8 +112,8 @@ func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss i
 	if cacheHit+cacheMiss < input {
 		cacheMiss += input - (cacheHit + cacheMiss)
 	}
-	t.TotalPromptCacheHit += cacheHit
-	t.TotalPromptCacheMiss += cacheMiss
+	t.totalPromptCacheHit += cacheHit
+	t.totalPromptCacheMiss += cacheMiss
 	p, ok := Prices[model]
 	if !ok {
 		p = defaultPrice
@@ -92,20 +134,24 @@ func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss i
 	if p.InputCacheHit == 0 {
 		p.InputCacheHit = p.Input
 	}
-	t.TotalCost += (float64(cacheMiss)/1e6)*p.Input + (float64(cacheHit)/1e6)*p.InputCacheHit + (float64(output)/1e6)*p.Output
+	t.totalCost += (float64(cacheMiss)/1e6)*p.Input + (float64(cacheHit)/1e6)*p.InputCacheHit + (float64(output)/1e6)*p.Output
 }
 
 func (t *Tracker) OverBudget() bool {
-	if t.MaxBudget <= 0 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.maxBudget <= 0 {
 		return false
 	}
-	return t.TotalCost >= t.MaxBudget
+	return t.totalCost >= t.maxBudget
 }
 
 // SuggestedBudget returns an auto-increased budget target based on current spend.
 // The result is rounded up to 2 decimals and is always higher than TotalCost.
 func (t *Tracker) SuggestedBudget() float64 {
-	base := t.TotalCost
+	t.mu.Lock()
+	base := t.totalCost
+	t.mu.Unlock()
 	if base < 0 {
 		base = 0
 	}
@@ -118,14 +164,15 @@ func (t *Tracker) SuggestedBudget() float64 {
 }
 
 func (t *Tracker) Summary() string {
+	tot := t.Totals()
 	sb := &strings.Builder{}
-	sb.WriteString(strconv.Itoa(t.TotalInput) + " in")
-	if t.TotalPromptCacheHit > 0 || t.TotalPromptCacheMiss > 0 {
-		sb.WriteString(" (cache hit " + strconv.Itoa(t.TotalPromptCacheHit) + ", miss " + strconv.Itoa(t.TotalPromptCacheMiss) + ")")
+	sb.WriteString(strconv.Itoa(tot.Input) + " in")
+	if tot.PromptCacheHit > 0 || tot.PromptCacheMiss > 0 {
+		sb.WriteString(" (cache hit " + strconv.Itoa(tot.PromptCacheHit) + ", miss " + strconv.Itoa(tot.PromptCacheMiss) + ")")
 	}
-	sb.WriteString(" | " + strconv.Itoa(t.TotalOutput) + " out | $" + ftoa(t.TotalCost))
-	if t.MaxBudget > 0 {
-		sb.WriteString(" / $" + ftoa(t.MaxBudget))
+	sb.WriteString(" | " + strconv.Itoa(tot.Output) + " out | $" + ftoa(tot.Cost))
+	if tot.MaxBudget > 0 {
+		sb.WriteString(" / $" + ftoa(tot.MaxBudget))
 	}
 	return sb.String()
 }
@@ -196,14 +243,18 @@ func (h *CostHistory) Save() error {
 
 // Add records a new cost entry.
 func (h *CostHistory) Add(sessionID, model string, t *Tracker) {
+	if t == nil {
+		return
+	}
+	tot := t.Totals()
 	h.Records = append(h.Records, CostRecord{
 		SessionID: sessionID,
 		Model:     model,
-		Input:     t.TotalInput,
-		Output:    t.TotalOutput,
-		CacheHit:  t.TotalPromptCacheHit,
-		CacheMiss: t.TotalPromptCacheMiss,
-		Cost:      t.TotalCost,
+		Input:     tot.Input,
+		Output:    tot.Output,
+		CacheHit:  tot.PromptCacheHit,
+		CacheMiss: tot.PromptCacheMiss,
+		Cost:      tot.Cost,
 		Timestamp: time.Now(),
 	})
 	// Keep at most last 100 records

@@ -1,0 +1,354 @@
+package termui
+
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
+)
+
+func TestStyledWrapsTextInColorAndReset(t *testing.T) {
+	if got, want := Styled(Red, "boom"), "\x1b[31mboom\x1b[0m"; got != want {
+		t.Errorf("Styled(Red, %q) = %q, want %q", "boom", got, want)
+	}
+	if got, want := Styled(Bold+BrightCyan, "hi"), "\x1b[1m\x1b[96mhi\x1b[0m"; got != want {
+		t.Errorf("Styled(Bold+BrightCyan, %q) = %q, want %q", "hi", got, want)
+	}
+	// Empty text still emits the pair, so a caller cannot accidentally leave
+	// the terminal in a colored state.
+	if got, want := Styled(Green, ""), "\x1b[32m\x1b[0m"; got != want {
+		t.Errorf("Styled(Green, \"\") = %q, want %q", got, want)
+	}
+}
+
+// TestStyleConstantsAreWellFormedEscapes catches a typo'd constant (a missing
+// final "m", a stray digit) which would otherwise leak raw escape text into the
+// user's terminal instead of being consumed as a zero-width control sequence.
+func TestStyleConstantsAreWellFormedEscapes(t *testing.T) {
+	constants := map[string]string{
+		"Reset": Reset, "Bold": Bold, "Dim": Dim, "Italic": Italic, "Underline": Underline,
+		"Black": Black, "Red": Red, "Green": Green, "Yellow": Yellow, "Blue": Blue,
+		"Magenta": Magenta, "Cyan": Cyan, "White": White, "Gray": Gray,
+		"BrightRed": BrightRed, "BrightGreen": BrightGreen, "BrightYellow": BrightYellow,
+		"BrightBlue": BrightBlue, "BrightCyan": BrightCyan,
+		"ReasoningStyle": ReasoningStyle,
+	}
+	for name, code := range constants {
+		t.Run(name, func(t *testing.T) {
+			if ansi.StringWidth(code) != 0 {
+				t.Errorf("%s occupies %d display columns, want 0", name, ansi.StringWidth(code))
+			}
+			if got := ansi.Strip(Styled(code, "X")); got != "X" {
+				t.Errorf("ansi.Strip(Styled(%s, \"X\")) = %q, want %q", name, got, "X")
+			}
+			if w := ansi.StringWidth(Styled(code, "X")); w != 1 {
+				t.Errorf("Styled(%s, \"X\") width = %d, want 1", name, w)
+			}
+		})
+	}
+}
+
+func TestToolResultSuccess(t *testing.T) {
+	got := ToolResult("bash", "ok", false)
+	want := "  \x1b[2m✓\x1b[0m \x1b[36m[bash]\x1b[0m ok\x1b[0m"
+	if got != want {
+		t.Errorf("ToolResult(bash, ok, false)\ngot:  %q\nwant: %q", got, want)
+	}
+	if plain, wantPlain := ansi.Strip(got), "  ✓ [bash] ok"; plain != wantPlain {
+		t.Errorf("stripped = %q, want %q", plain, wantPlain)
+	}
+}
+
+func TestToolResultErrorUsesRedAndCross(t *testing.T) {
+	got := ToolResult("bash", "boom", true)
+	want := "  \x1b[2m✗\x1b[0m \x1b[31m[bash]\x1b[0m \x1b[31mboom\x1b[0m"
+	if got != want {
+		t.Errorf("ToolResult(bash, boom, true)\ngot:  %q\nwant: %q", got, want)
+	}
+	// The error variant must color the summary too, not just the tool name --
+	// that is the only visual difference for a summary with no icon in view.
+	if !strings.Contains(got, Red+"boom") {
+		t.Errorf("error summary not colored red: %q", got)
+	}
+	if strings.Contains(got, "✓") {
+		t.Errorf("error result still shows the success icon: %q", got)
+	}
+}
+
+func TestToolResultPreservesCJKExactly(t *testing.T) {
+	got := ToolResult("写文件", "已更新 3 行", false)
+	want := "  \x1b[2m✓\x1b[0m \x1b[36m[写文件]\x1b[0m 已更新 3 行\x1b[0m"
+	if got != want {
+		t.Errorf("ToolResult with CJK\ngot:  %q\nwant: %q", got, want)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("ToolResult produced invalid UTF-8: %q", got)
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("ToolResult mangled a multi-byte rune: %q", got)
+	}
+	if plain, wantPlain := ansi.Strip(got), "  ✓ [写文件] 已更新 3 行"; plain != wantPlain {
+		t.Errorf("stripped = %q, want %q", plain, wantPlain)
+	}
+}
+
+// TestToolResultDisplayWidthIgnoresEscapes pins that the escapes ToolResult adds
+// cost zero columns: a double-width name must advance the cursor by 2 per rune
+// and the color codes by nothing. len() on this string is 46 bytes, which is
+// what a width calculation must not use.
+func TestToolResultDisplayWidthIgnoresEscapes(t *testing.T) {
+	cases := []struct {
+		name, summary string
+		wantWidth     int
+	}{
+		// "  " + "✓" + " " + "[bash]" + " " + "ok"
+		{"bash", "ok", 2 + 1 + 1 + 6 + 1 + 2},
+		// CJK: 写文件 = 6 columns, 已更新 3 行 = 6+1+1+1+2 = 11
+		{"写文件", "已更新 3 行", 2 + 1 + 1 + (2 + 6) + 1 + 11},
+	}
+	for _, tc := range cases {
+		got := ToolResult(tc.name, tc.summary, false)
+		if w := ansi.StringWidth(got); w != tc.wantWidth {
+			t.Errorf("ansi.StringWidth(ToolResult(%q, %q)) = %d, want %d (raw %q)",
+				tc.name, tc.summary, w, tc.wantWidth, got)
+		}
+	}
+}
+
+// TestToolResultWithAlreadyStyledSummary covers a summary that arrives with its
+// own escapes: they must pass through untouched and still strip away cleanly,
+// rather than being escaped, doubled, or counted as visible width.
+func TestToolResultWithAlreadyStyledSummary(t *testing.T) {
+	summary := Green + "3 passed" + Reset
+	got := ToolResult("test", summary, false)
+
+	if !strings.Contains(got, summary) {
+		t.Errorf("pre-styled summary not passed through verbatim: %q", got)
+	}
+	if plain, want := ansi.Strip(got), "  ✓ [test] 3 passed"; plain != want {
+		t.Errorf("stripped = %q, want %q", plain, want)
+	}
+	// Compare DISPLAY WIDTH against display width, not against len(): "✓" is
+	// three bytes but occupies one column, so len() would demand 21 for a line
+	// that correctly renders in 19.
+	if w, want := ansi.StringWidth(got), ansi.StringWidth("  ✓ [test] 3 passed"); w != want {
+		t.Errorf("width = %d, want %d", w, want)
+	}
+}
+
+func TestPermissionPromptExactOutput(t *testing.T) {
+	got := PermissionPrompt("Bash", "ls -la")
+	want := "\r\x1b[K\a" +
+		"\n  \x1b[33m╭── 需要授权 ──────────────────────╮\x1b[0m\n" +
+		"  \x1b[33m│\x1b[0m  工具: \x1b[36mBash\x1b[0m\n" +
+		"  \x1b[33m│\x1b[0m  说明: ls -la\n" +
+		"  \x1b[33m╰──────────────────────────────────╯\x1b[0m\n"
+	if got != want {
+		t.Errorf("PermissionPrompt\ngot:  %q\nwant: %q", got, want)
+	}
+	// The prompt must begin by clearing the current line (the spinner lives
+	// there) and ringing the bell, or the box renders on top of spinner frames.
+	if !strings.HasPrefix(got, "\r\x1b[K\a") {
+		t.Errorf("prompt does not start with clear-line + bell: %q", got)
+	}
+}
+
+func TestPermissionPromptOmitsDescriptionLineWhenEmpty(t *testing.T) {
+	got := PermissionPrompt("Read", "")
+	if strings.Contains(got, "说明") {
+		t.Errorf("empty description should not render a 说明 line: %q", got)
+	}
+	plain := ansi.Strip(got)
+	if n := strings.Count(plain, "│"); n != 1 {
+		t.Errorf("want exactly 1 body line (the tool line), got %d: %q", n, plain)
+	}
+	if !strings.Contains(plain, "工具: Read") {
+		t.Errorf("tool line missing: %q", plain)
+	}
+}
+
+// TestPermissionPromptBoxBordersAlign is a display-width invariant: a drawn box
+// whose top and bottom rules differ by even one column is visibly crooked in
+// the terminal. Measured with ansi.StringWidth because the top rule contains
+// double-width CJK in its title and len() would be meaningless.
+func TestPermissionPromptBoxBordersAlign(t *testing.T) {
+	plain := ansi.Strip(PermissionPrompt("Bash", "ls"))
+
+	var top, bottom string
+	for _, line := range strings.Split(plain, "\n") {
+		trimmed := strings.TrimLeft(line, " \r\a")
+		switch {
+		case strings.HasPrefix(trimmed, "╭"):
+			top = trimmed
+		case strings.HasPrefix(trimmed, "╰"):
+			bottom = trimmed
+		}
+	}
+	if top == "" || bottom == "" {
+		t.Fatalf("could not find both box rules in %q", plain)
+	}
+
+	topW, bottomW := ansi.StringWidth(top), ansi.StringWidth(bottom)
+	if topW != bottomW {
+		t.Errorf("box rules are misaligned: top %q is %d columns, bottom %q is %d columns",
+			top, topW, bottom, bottomW)
+	}
+}
+
+func TestPermissionPromptClipsLongASCIIDescription(t *testing.T) {
+	desc := strings.Repeat("a", 200)
+	line := descriptionLine(t, PermissionPrompt("Bash", desc))
+
+	if n := utf8.RuneCountInString(line); n != 60 {
+		t.Errorf("clipped description is %d runes, want 60: %q", n, line)
+	}
+	if !strings.HasSuffix(line, "...") {
+		t.Errorf("clipped description should end with an ellipsis: %q", line)
+	}
+	if strings.Contains(line, strings.Repeat("a", 61)) {
+		t.Errorf("description was not clipped at all: %q", line)
+	}
+}
+
+// TestPermissionPromptKeepsChineseDescriptionValidUTF8 is the regression guard
+// for the byte-slicing bug class in this codebase: clipping a Chinese
+// description with desc[:60] cuts a 3-byte rune apart and renders as U+FFFD.
+func TestPermissionPromptKeepsChineseDescriptionValidUTF8(t *testing.T) {
+	// 108 Chinese runes = 324 bytes, well past the 60 runes the prompt allows.
+	desc := strings.Repeat("更新配置文件并运行测试以确认修复生效", 6)
+
+	out := PermissionPrompt("Edit", desc)
+	line := descriptionLine(t, out)
+
+	if !utf8.ValidString(out) {
+		t.Errorf("PermissionPrompt produced invalid UTF-8 for a Chinese description: %q", out)
+	}
+	if strings.ContainsRune(line, utf8.RuneError) {
+		t.Errorf("description was cut mid-rune (contains U+FFFD): %q", line)
+	}
+	if n := utf8.RuneCountInString(line); n > 60 {
+		t.Errorf("description is %d runes, want at most 60: %q", n, line)
+	}
+	// It really was clipped, not passed through whole.
+	if strings.Contains(out, desc) {
+		t.Errorf("a %d-rune description was not clipped", utf8.RuneCountInString(desc))
+	}
+	// Every rune that survived must be one of the originals, in order.
+	body := strings.TrimSuffix(line, "...")
+	if !strings.HasPrefix(desc, body) {
+		t.Errorf("clipped description %q is not a prefix of the original %q", body, desc)
+	}
+}
+
+func TestPermissionPromptLeavesShortDescriptionIntact(t *testing.T) {
+	// Exactly at the 60-byte guard: must not be touched.
+	desc := strings.Repeat("b", 60)
+	if line := descriptionLine(t, PermissionPrompt("Bash", desc)); line != desc {
+		t.Errorf("60-byte description was modified: got %q", line)
+	}
+	// A short Chinese description (21 runes / 63 bytes) crosses the byte guard
+	// but not the rune budget, so it must survive whole.
+	cjk := strings.Repeat("配", 21)
+	if line := descriptionLine(t, PermissionPrompt("Bash", cjk)); line != cjk {
+		t.Errorf("21-rune Chinese description was modified: got %q, want %q", line, cjk)
+	}
+}
+
+// descriptionLine pulls the text after "说明: " out of a rendered prompt.
+func descriptionLine(t *testing.T, prompt string) string {
+	t.Helper()
+	for _, line := range strings.Split(ansi.Strip(prompt), "\n") {
+		if i := strings.Index(line, "说明: "); i >= 0 {
+			return line[i+len("说明: "):]
+		}
+	}
+	t.Fatalf("no 说明 line in prompt %q", prompt)
+	return ""
+}
+
+const bannerArt = "\n" +
+	"     ______   ____  _    __  ______\n" +
+	"    / ____/  / __ \\ | |  / / / ____/\n" +
+	"   / /      / / / / | | / / / __/   \n" +
+	"  / /___  / /_/ /  | |/ / / /___   \n" +
+	"  \\____/  \\____/   |___/ /_____/   \n" +
+	"\n"
+
+func TestBannerExactPlainTextWithGit(t *testing.T) {
+	got := ansi.Strip(Banner("1.2.3", "gpt-4", "openai", "auto", "/tmp/proj", "main", "", 7, true))
+	want := bannerArt +
+		"    cove v1.2.3  •  高效、安全的本地 AI 协同编程终端\n\n" +
+		"  模型: gpt-4  │  供应商: openai  │  模式: auto\n" +
+		"  Git: main\n" +
+		"  目录: /tmp/proj\n" +
+		"  工具: 7 个\n\n" +
+		"  提示: 输入 /help 查看命令, Ctrl+C 中断\n\n"
+	if got != want {
+		t.Errorf("Banner (git)\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestBannerOmitsGitLineWhenNotARepo(t *testing.T) {
+	got := ansi.Strip(Banner("1.2.3", "gpt-4", "openai", "auto", "/tmp/proj", "main", "", 7, false))
+	want := bannerArt +
+		"    cove v1.2.3  •  高效、安全的本地 AI 协同编程终端\n\n" +
+		"  模型: gpt-4  │  供应商: openai  │  模式: auto\n" +
+		"  目录: /tmp/proj\n" +
+		"  工具: 7 个\n\n" +
+		"  提示: 输入 /help 查看命令, Ctrl+C 中断\n\n"
+	if got != want {
+		t.Errorf("Banner (no git)\ngot:  %q\nwant: %q", got, want)
+	}
+	// The branch argument must be ignored entirely, not just unlabeled.
+	if strings.Contains(got, "main") {
+		t.Errorf("branch name leaked into a non-git banner: %q", got)
+	}
+}
+
+func TestBannerColorsGitBranchGreen(t *testing.T) {
+	got := Banner("v", "m", "p", "auto", "/w", "feature/x", "", 1, true)
+	if !strings.Contains(got, Green+"feature/x"+Reset) {
+		t.Errorf("git branch is not wrapped in green: %q", got)
+	}
+}
+
+func TestBannerInterpolatesAllArguments(t *testing.T) {
+	got := ansi.Strip(Banner("9.9.9-rc1", "claude-opus", "anthropic", "plan", "/srv/工程目录", "发布/v2", "", 42, true))
+	for _, want := range []string{
+		"cove v9.9.9-rc1",
+		"模型: claude-opus",
+		"供应商: anthropic",
+		"模式: plan",
+		"Git: 发布/v2",
+		"目录: /srv/工程目录",
+		"工具: 42 个",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("banner missing %q\nfull: %q", want, got)
+		}
+	}
+}
+
+// TestBannerEmitsNoStrayEscapeBytes guards against an unterminated or
+// malformed sequence: anything ansi.Strip cannot consume would be printed as
+// literal garbage in the terminal.
+func TestBannerEmitsNoStrayEscapeBytes(t *testing.T) {
+	outputs := []string{
+		Banner("1.0", "m", "p", "auto", "/w", "main", "", 3, true),
+		Banner("1.0", "m", "p", "auto", "/w", "main", "", 3, false),
+		ToolResult("bash", "ok", false),
+		ToolResult("bash", "boom", true),
+		PermissionPrompt("Bash", "ls"),
+		PermissionPrompt("Bash", ""),
+	}
+	for _, out := range outputs {
+		plain := ansi.Strip(out)
+		if strings.ContainsRune(plain, 0x1b) {
+			t.Errorf("stripped output still contains an ESC byte: %q", plain)
+		}
+		if !utf8.ValidString(out) {
+			t.Errorf("output is not valid UTF-8: %q", out)
+		}
+	}
+}

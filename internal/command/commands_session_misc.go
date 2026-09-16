@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 func (c *CompactCmd) Name() string        { return "compact" }
@@ -104,7 +106,7 @@ func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 				if m.Role == "user" && m.Content != "" {
 					content := strings.ReplaceAll(m.Content, "\n", " ")
 					if len(content) > 50 {
-						content = content[:50] + "..."
+						content = textutil.ClipRunes(content, 53)
 					}
 					preview = content
 					break
@@ -115,7 +117,7 @@ func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			}
 		}
 		if len(title) > 50 {
-			title = title[:50] + "..."
+			title = textutil.ClipRunes(title, 53)
 		}
 		sb.WriteString(fmt.Sprintf("  %d. [%s] %s  (%d 条)\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title, msgCount))
 	}

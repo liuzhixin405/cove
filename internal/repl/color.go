@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // ANSI color codes
@@ -70,7 +72,7 @@ func PermissionPrompt(toolName, desc string) string {
 		// Truncate desc for display if too long
 		d := desc
 		if len(d) > 60 {
-			d = d[:57] + "..."
+			d = textutil.ClipRunes(d, 60)
 		}
 		sb.WriteString(fmt.Sprintf("  %s│%s  说明: %s\n", Yellow, Reset, d))
 	}
@@ -176,14 +178,23 @@ func (w *WalkingIndicator) Start() {
 	}
 	w.active = true
 	w.doneCh = make(chan struct{})
+	// stopCh is recreated on every Start. It is closed by Stop, and a closed
+	// channel stays closed — so reusing the one from the constructor meant the
+	// goroutine of a second Start saw an immediately-ready stopCh and exited
+	// at once, leaving the indicator permanently dead after the first Stop.
+	// (Callers currently build a fresh instance per turn, which is why nobody
+	// hit it, but Start/Stop/Start is the API this type advertises.)
+	w.stopCh = make(chan struct{})
+	stopCh := w.stopCh
+	doneCh := w.doneCh
 	w.mu.Unlock()
 
 	go func() {
-		defer close(w.doneCh)
+		defer close(doneCh)
 		i := 0
 		for {
 			select {
-			case <-w.stopCh:
+			case <-stopCh:
 				PrintTransientStatus("")
 				return
 			default:

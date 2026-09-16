@@ -14,6 +14,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/safepath"
+	"github.com/liuzhixin405/cove/internal/safeurl"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type Skill struct {
@@ -105,7 +109,7 @@ func parseSkill(name, content, path string) Skill {
 		desc = fm.Description
 	}
 	if len(desc) > 120 {
-		desc = desc[:117] + "..."
+		desc = textutil.ClipRunes(desc, 120)
 	}
 	skill := Skill{Name: name, Description: desc, Prompt: body, FilePath: path, Directory: filepath.Dir(path)}
 	if fm != nil {
@@ -282,10 +286,15 @@ type RegistryEntry struct {
 
 var RegistryURL = "https://raw.githubusercontent.com/liuzhixin405/cove/main/skills-registry.json"
 var fallbackJSON = `[{"name":"security-audit","description":"Security audit: scan deps, check vulnerabilities.","author":"marketplace"},{"name":"api-design","description":"REST API design: endpoints, schemas, OpenAPI.","author":"marketplace"},{"name":"dockerize","description":"Docker: Dockerfile, compose, build, push.","author":"marketplace"},{"name":"i18n","description":"Internationalization: extract strings, translations.","author":"marketplace"},{"name":"ci-cd","description":"CI/CD: Actions, pipelines, testing.","author":"marketplace"}]`
-var installHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// installHTTPClient and the registry fetch both use the shared SSRF-hardened
+// client: these are the only outbound requests the skills package makes, and
+// they were previously plain http.Clients that would follow a redirect to an
+// internal address without complaint.
+var installHTTPClient = safeurl.NewClient(10 * time.Second)
 
 func FetchRegistry() ([]RegistryEntry, error) {
-	c := &http.Client{Timeout: 10 * time.Second}
+	c := safeurl.NewClient(10 * time.Second)
 	resp, err := c.Get(RegistryURL)
 	if err == nil {
 		defer resp.Body.Close()
@@ -301,23 +310,51 @@ func FetchRegistry() ([]RegistryEntry, error) {
 }
 
 func InstallSkill(name, source, url string) error {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cove", "skills", name)
-	os.MkdirAll(dir, 0755)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return fmt.Errorf("cannot locate home directory")
+	}
+	// The name becomes a directory under ~/.cove/skills. It comes from a slash
+	// command argument or from the REMOTE skills registry, so joining it
+	// unchecked let "../../../.ssh" create that directory and write a file into
+	// it. See internal/safepath.
+	dir, err := safepath.Join("skill", filepath.Join(home, ".cove", "skills"), name)
+	if err != nil {
+		return err
+	}
 
 	var content string
 	if source == "url" && url != "" {
+		// The registry is fetched over the network, so its URLs are untrusted.
+		// Without this the fetch happily followed a registry entry pointing at
+		// http://169.254.169.254/... and wrote the cloud metadata response into
+		// a skill file — which is then injected into the model's system prompt.
+		if err := safeurl.ValidateURL(url); err != nil {
+			return fmt.Errorf("refusing to download skill %q: %w", name, err)
+		}
 		resp, err := installHTTPClient.Get(url)
 		if err != nil {
 			return fmt.Errorf("download: %w", err)
 		}
 		defer resp.Body.Close()
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
+		if err != nil {
+			return fmt.Errorf("download %s: %w", url, err)
+		}
 		content = string(data)
 	} else {
 		content = fmt.Sprintf("# %s\n\nSkill: %s\n\nInstructions to be filled by the user.\n", name, name)
 	}
-	return os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0644)
+
+	// Create the directory only once the content is in hand, so a failed
+	// download does not leave an empty skill directory behind.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644)
 }
 
 // SeedDefaultSkills ensures built-in skills are present on disk.

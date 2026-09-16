@@ -6,6 +6,7 @@ package plan
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/tool"
@@ -128,8 +129,17 @@ func topologicalSort(tasks []*Task, taskByID map[string]*Task) [][]*Task {
 	var levels [][]*Task
 
 	for len(remaining) > 0 {
+		// Collect the whole ready set BEFORE removing any of it.
+		//
+		// The previous version deleted from `remaining` inside the same range
+		// loop that tested against it, so whether a task's dependency still
+		// counted as "remaining" depended on Go's randomized map iteration
+		// order. The same graph produced a different number of levels on every
+		// run, and a task routinely landed in the same level as its own
+		// dependency — which, with Plan.Parallel, means they execute
+		// CONCURRENTLY. The dependency graph was effectively ignored.
 		var ready []*Task
-		for id, t := range remaining {
+		for _, t := range remaining {
 			allDepsSatisfied := true
 			for _, dep := range t.DependsOn {
 				if _, stillRemaining := remaining[dep]; stillRemaining {
@@ -139,13 +149,18 @@ func topologicalSort(tasks []*Task, taskByID map[string]*Task) [][]*Task {
 			}
 			if allDepsSatisfied {
 				ready = append(ready, t)
-				delete(remaining, id)
 			}
 		}
 		if len(ready) == 0 {
 			// Cycle detected
 			return nil
 		}
+		for _, t := range ready {
+			delete(remaining, t.ID)
+		}
+		// Map iteration also randomizes the order WITHIN a level. Sort so a
+		// plan's serial execution order is reproducible run to run.
+		sort.Slice(ready, func(i, j int) bool { return ready[i].ID < ready[j].ID })
 		levels = append(levels, ready)
 	}
 

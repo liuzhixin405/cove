@@ -24,7 +24,7 @@ func NewPlanModeTool() Tool {
 func (t *PlanModeTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	reason, _ := input["reason"].(string)
 	if tctx.Runtime != nil {
-		tctx.Runtime.PlanMode = true
+		tctx.Runtime.SetPlanMode(true)
 	}
 	return Result{Data: fmt.Sprintf("Plan mode active. Read-only operations only. Reason: %s", reason)}, nil
 }
@@ -43,7 +43,7 @@ func NewExitPlanModeTool() Tool {
 func (t *ExitPlanModeTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	summary, _ := input["summary"].(string)
 	if tctx.Runtime != nil {
-		tctx.Runtime.PlanMode = false
+		tctx.Runtime.SetPlanMode(false)
 	}
 	return Result{Data: fmt.Sprintf("Plan mode exited. Summary: %s", summary)}, nil
 }
@@ -73,7 +73,7 @@ func (t *EnterWorktreeTool) Call(ctx context.Context, input Input, tctx Context)
 	}
 	wtPath := cwd + "/../" + branch
 	if tctx.Runtime != nil {
-		tctx.Runtime.WorktreeDir = wtPath
+		tctx.Runtime.SetWorktreeDir(wtPath)
 	}
 	return Result{Data: fmt.Sprintf("Worktree created at %s\nGit output: %s", wtPath, string(out))}, nil
 }
@@ -90,17 +90,21 @@ func NewExitWorktreeTool() Tool {
 	}}}
 }
 func (t *ExitWorktreeTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-	if tctx.Runtime == nil || tctx.Runtime.WorktreeDir == "" {
+	if tctx.Runtime == nil {
+		return Result{Data: "No active worktree", IsError: true}, nil
+	}
+	wtPath := tctx.Runtime.GetWorktreeDir()
+	if wtPath == "" {
 		return Result{Data: "No active worktree", IsError: true}, nil
 	}
 	cwd := tctx.Cwd
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", tctx.Runtime.WorktreeDir)
+	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", wtPath)
 	cmd.Dir = cwd
 	out, _ := cmd.CombinedOutput()
-	tctx.Runtime.WorktreeDir = ""
+	tctx.Runtime.SetWorktreeDir("")
 	return Result{Data: fmt.Sprintf("Worktree removed.\n%s", string(out))}, nil
 }
 func (t *ExitWorktreeTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

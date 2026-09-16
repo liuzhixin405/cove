@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // scanThrottle: when time-gate passes but session-gate doesn't, avoid scanning every turn.
@@ -41,6 +43,16 @@ func NewRunner(provider api.Provider, model string, sessionID string) *Runner {
 
 // ExecuteAutoDream checks all gates and runs the dream if conditions are met.
 // This should be called at the end of each turn (from session end hook).
+const dreamRunTimeout = 5 * time.Minute
+
+// deriveDreamContext returns the context for the background consolidation run.
+// It is DETACHED from the parent's cancellation — the turn that triggered the
+// dream typically ends (and cancels its context) immediately — while still being
+// bounded by its own timeout so a stuck run cannot leak forever.
+func deriveDreamContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), dreamRunTimeout)
+}
+
 func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	if !IsEnabled() {
 		return
@@ -111,17 +123,24 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	log.Debugf("[autoDream] firing — %.1fh since last, %d sessions to review",
 		hoursSince, len(sessionIDs))
 
-	// Run the dream in a background goroutine
-	dreamCtx, cancel := context.WithCancel(ctx)
+	// Run the dream in a detached background goroutine. Its context must outlive
+	// the caller's (the triggering turn ends and cancels its context right away),
+	// so derive a detached, self-timed context here. cancel() runs when runDream
+	// returns to release the timer; task.CancelFunc still allows explicit early
+	// cancellation.
+	dreamCtx, cancel := deriveDreamContext(ctx)
 	task := NewTask(len(sessionIDs), priorMtime, cancel)
 
-	go r.runDream(dreamCtx, task, sessionIDs)
+	go func() {
+		defer cancel()
+		r.runDream(dreamCtx, task, sessionIDs)
+	}()
 }
 
 // runDream executes the memory consolidation agent loop.
 func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) {
 	defer func() {
-		if task.Status == StatusRunning {
+		if task.CurrentStatus() == StatusRunning {
 			task.Fail()
 			RollbackConsolidationLock(task.PriorMtime)
 		}
@@ -283,7 +302,9 @@ func (r *Runner) executeDreamWrite(tc api.ToolCall) string {
 	}
 
 	os.MkdirAll(filepath.Dir(absPath), 0700)
-	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
+	// Atomic replace: a crash mid-write would otherwise leave a half-written
+	// memory file, which is then loaded as a memory entry on every later run.
+	if err := fsatomic.WriteFile(absPath, []byte(content), 0644); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
 	return fmt.Sprintf("Written %d bytes to %s", len(content), filePath)
@@ -318,7 +339,7 @@ func (r *Runner) executeDreamEdit(tc api.ToolCall) string {
 	}
 
 	newContent := strings.Replace(content, oldStr, newStr, 1)
-	if err := os.WriteFile(absPath, []byte(newContent), 0644); err != nil {
+	if err := fsatomic.WriteFile(absPath, []byte(newContent), 0644); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
 	return fmt.Sprintf("Edited %s", filePath)
@@ -334,11 +355,10 @@ func (r *Runner) executeDreamRead(tc api.ToolCall) string {
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
-	// Truncate large files
-	content := string(data)
-	if len(content) > 30000 {
-		content = content[:30000] + "\n... [truncated]"
-	}
+	// Truncate large files on a rune boundary: memory files are largely
+	// Chinese, so a byte slice at 30000 would cut a rune in half and hand the
+	// model invalid UTF-8.
+	content := textutil.ClipBytes(string(data), 30000, "\n... [truncated]")
 	return content
 }
 
@@ -369,17 +389,31 @@ func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
 		path = r.memoryRoot
 	}
 
-	// Use a simple grep via bash. Both pattern and path are quoted to prevent
-	// shell injection from AI-generated tool input.
-	cmd := fmt.Sprintf("grep -rn %q %q", pattern, path)
-	return executeReadOnlyCommand(cmd)
+	// Native, shell-free search. AI-generated pattern/path are never passed to a
+	// shell, which eliminates the command-injection vector present in the former
+	// `sh -c "grep ..."` implementation: %q is Go's quoting, not shell escaping,
+	// so a pattern like `$(rm -rf ~)` executed inside the double quotes.
+	return grepFiles(pattern, path)
 }
 
 // isInsideMemoryDir checks if the given absolute path is inside the memory directory.
+//
+// The comparison must be on whole path segments. A plain string prefix check
+// let any sibling directory whose name merely starts with the memory root
+// through — with the root at ~/.cove/memory, the path ~/.cove/memory-evil/x
+// passed, so the dream agent's write/edit sandbox could be stepped out of by
+// naming a directory carefully.
 func isInsideMemoryDir(absPath, memRoot string) bool {
-	absMemRoot, _ := filepath.Abs(memRoot)
-	return strings.HasPrefix(strings.ToLower(filepath.Clean(absPath)),
-		strings.ToLower(filepath.Clean(absMemRoot)))
+	absMemRoot, err := filepath.Abs(memRoot)
+	if err != nil {
+		return false
+	}
+	root := strings.ToLower(filepath.Clean(absMemRoot))
+	target := strings.ToLower(filepath.Clean(absPath))
+	if target == root {
+		return true
+	}
+	return strings.HasPrefix(target, root+string(os.PathSeparator))
 }
 
 // buildDreamSystemPrompt returns a minimal system prompt for the dream agent.

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // readOnlyTools lists tool names that are inherently read-only / non-destructive.
@@ -80,8 +82,8 @@ type LoopDetector struct {
 	// that re-reading the same file is not mistaken for fresh progress.
 	filesTouchedWindow map[string]bool
 	filesTouchedTurn   map[string]bool
-	stallCount   int             // consecutive iterations without new file activity
-	stallThresh  int             // iterations before stagnation detection (default 25)
+	stallCount         int // consecutive iterations without new file activity
+	stallThresh        int // iterations before stagnation detection (default 25)
 
 	// Whether this is a "fast" (flash) model -> uses lower thresholds.
 	isFastModel bool
@@ -100,26 +102,26 @@ type LoopResult struct {
 // legitimate multi-step workflows.
 func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
-		fpHistory:       make([]string, 0, 14),
-		fpWindow:        14,
-		fpThresh:        10,
-		toolOnlyHistory: make([]string, 0, 12),
-		toolOnlyWindow:  12,
-		toolOnlyThresh:  10,
-		outHashes:       make([]string, 0, 40),
-		outCounts:       make(map[string]int, 40),
-		outWindow:       40,
-		outThresh:       8,
-		maxBreaks:       5,
+		fpHistory:          make([]string, 0, 14),
+		fpWindow:           14,
+		fpThresh:           10,
+		toolOnlyHistory:    make([]string, 0, 12),
+		toolOnlyWindow:     12,
+		toolOnlyThresh:     10,
+		outHashes:          make([]string, 0, 40),
+		outCounts:          make(map[string]int, 40),
+		outWindow:          40,
+		outThresh:          8,
+		maxBreaks:          5,
 		filesCreated:       make(map[string]bool),
 		filesWritten:       make(map[string]bool),
 		filesTouchedWindow: make(map[string]bool),
 		filesTouchedTurn:   make(map[string]bool),
-		stallCount:      0,
-		stallThresh:     60, // only flag after 60 iterations without file activity
-		isFastModel:     false,
-		toolOutputs:     make(map[string][]string),
-		toolDirs:        make(map[string][]string),
+		stallCount:         0,
+		stallThresh:        60, // only flag after 60 iterations without file activity
+		isFastModel:        false,
+		toolOutputs:        make(map[string][]string),
+		toolDirs:           make(map[string][]string),
 	}
 }
 
@@ -183,10 +185,10 @@ func extractToolPatterns(fp string) string {
 			// is the value of the first non-empty well-known key (filePath, command, etc.).
 			// We don't have the key name in the fingerprint, so use the tool name + value prefix.
 			// This still distinguishes "bash:go build" from "bash:ls -la".
-			valPrefix := p[colonIdx+1:]
-			if len(valPrefix) > 20 {
-				valPrefix = valPrefix[:20]
-			}
+			// HeadRunes, not a byte slice: a path or command containing Chinese
+			// would otherwise be cut mid-rune, and the pattern string ends up in
+			// user-visible loop-detection reasons.
+			valPrefix := textutil.HeadRunes(p[colonIdx+1:], 20)
 			patterns = append(patterns, toolName+":"+valPrefix)
 		} else {
 			patterns = append(patterns, p)
@@ -646,6 +648,11 @@ func isNoChangeOutput(output string) bool {
 	}
 	return false
 }
+
+// loopAbortToolNote is the tool_result body used to close out a tool-call batch
+// the engine declined to execute because it detected a loop. It is addressed to
+// the model, which sees it in place of the tool's real output.
+const loopAbortToolNote = "[系统未执行此工具调用：检测到重复操作循环，本轮工具调用已被中止。请改用其他方法。]"
 
 // injectLoopGuidance builds the message inserted into the conversation when
 // a non-fatal loop is detected.

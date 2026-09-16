@@ -34,18 +34,29 @@ func NewRecorder() *Recorder {
 }
 
 // Enable turns on telemetry recording.
-func (r *Recorder) Enable() { r.enabled = true }
+//
+// enabled is guarded by r.mu like every other field: Record is called from
+// background goroutines, so toggling the flag without the lock raced them.
+func (r *Recorder) Enable() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enabled = true
+}
 
 // Disable turns off telemetry recording.
-func (r *Recorder) Disable() { r.enabled = false }
+func (r *Recorder) Disable() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enabled = false
+}
 
 // Record adds a telemetry event.
 func (r *Recorder) Record(eventType string, data any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.enabled {
 		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Cap events at 1000 to prevent disk bloat
 	if len(r.events) >= 1000 {

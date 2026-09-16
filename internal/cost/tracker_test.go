@@ -35,7 +35,7 @@ func TestAddDetailedPicksTheMostSpecificPriceKey(t *testing.T) {
 				// 1M uncached input tokens => TotalCost is exactly p.Input.
 				tr := NewTracker(0)
 				tr.AddDetailed(tc.model, 1_000_000, 0, 0, 0)
-				got += tr.TotalCost
+				got += tr.Totals().Cost
 			}
 			want := float64(runs) * tc.want.Input
 			if math.Abs(got-want) > 1e-6 {
@@ -50,16 +50,16 @@ func TestTrackerAddDetailedUsesDeepSeekCacheHitPricing(t *testing.T) {
 	tracker := NewTracker(0)
 	tracker.AddDetailed("deepseek-v4-pro", 1000, 200, 600, 400)
 
-	if tracker.TotalPromptCacheHit != 600 {
-		t.Fatalf("TotalPromptCacheHit = %d, want 600", tracker.TotalPromptCacheHit)
+	if tracker.Totals().PromptCacheHit != 600 {
+		t.Fatalf("TotalPromptCacheHit = %d, want 600", tracker.Totals().PromptCacheHit)
 	}
-	if tracker.TotalPromptCacheMiss != 400 {
-		t.Fatalf("TotalPromptCacheMiss = %d, want 400", tracker.TotalPromptCacheMiss)
+	if tracker.Totals().PromptCacheMiss != 400 {
+		t.Fatalf("TotalPromptCacheMiss = %d, want 400", tracker.Totals().PromptCacheMiss)
 	}
 
 	want := (400.0/1e6)*0.14 + (600.0/1e6)*(0.14*0.1) + (200.0/1e6)*0.28
-	if diff := tracker.TotalCost - want; diff < -1e-12 || diff > 1e-12 {
-		t.Fatalf("TotalCost = %.12f, want %.12f", tracker.TotalCost, want)
+	if diff := tracker.Totals().Cost - want; diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("TotalCost = %.12f, want %.12f", tracker.Totals().Cost, want)
 	}
 }
 
@@ -67,11 +67,11 @@ func TestTrackerAddDetailedBackfillsCacheMissWhenUsageOnlyProvidesHits(t *testin
 	tracker := NewTracker(0)
 	tracker.AddDetailed("deepseek-v4-flash", 100, 5, 40, 0)
 
-	if tracker.TotalPromptCacheHit != 40 {
-		t.Fatalf("TotalPromptCacheHit = %d, want 40", tracker.TotalPromptCacheHit)
+	if tracker.Totals().PromptCacheHit != 40 {
+		t.Fatalf("TotalPromptCacheHit = %d, want 40", tracker.Totals().PromptCacheHit)
 	}
-	if tracker.TotalPromptCacheMiss != 60 {
-		t.Fatalf("TotalPromptCacheMiss = %d, want 60", tracker.TotalPromptCacheMiss)
+	if tracker.Totals().PromptCacheMiss != 60 {
+		t.Fatalf("TotalPromptCacheMiss = %d, want 60", tracker.Totals().PromptCacheMiss)
 	}
 }
 

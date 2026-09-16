@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // EmbeddingProvider returns vector embeddings for given texts.
@@ -101,7 +103,7 @@ func (p *RemoteAPIEmbeddingProvider) Embed(ctx context.Context, texts []string) 
 	if httpResp.StatusCode != 200 {
 		msg := string(raw)
 		if len(msg) > 300 {
-			msg = msg[:300]
+			msg = textutil.ClipBytes(msg, 300, "")
 		}
 		return nil, fmt.Errorf("remote embeddings: API error %d: %s", httpResp.StatusCode, msg)
 	}

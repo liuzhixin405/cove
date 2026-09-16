@@ -3,6 +3,8 @@ package termui
 import (
 	"fmt"
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 const (
@@ -59,11 +61,15 @@ func PermissionPrompt(toolName, desc string) string {
 	if desc != "" {
 		d := desc
 		if len(d) > 60 {
-			d = d[:57] + "..."
+			d = textutil.ClipRunes(d, 60)
 		}
 		sb.WriteString(fmt.Sprintf("  %s│%s  说明: %s\n", Yellow, Reset, d))
 	}
-	sb.WriteString(fmt.Sprintf("  %s╰───────────────────────────────────╯%s\n", Yellow, Reset))
+	// 34 rules, not 35: the top rule's title is CJK, so its 32 runes occupy 36
+	// display columns (每个汉字两列). An all-rule bottom row therefore needs 34
+	// rules to reach the same 36 columns; with 35 it rendered one column wider
+	// than the top and the box looked visibly crooked in the terminal.
+	sb.WriteString(fmt.Sprintf("  %s╰──────────────────────────────────╯%s\n", Yellow, Reset))
 	return sb.String()
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -169,10 +170,11 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			} else {
 				content = result.Data
 			}
-			// Truncate large results
-			if len(content) > 4000 {
-				content = content[:4000] + "\n[...truncated]"
-			}
+			// Truncate large results on a rune boundary. A byte slice at 4000
+			// lands inside a multi-byte rune for the Chinese tool output this
+			// project produces constantly, and the resulting invalid UTF-8 goes
+			// straight into the next request's JSON body.
+			content = textutil.ClipBytes(content, 4000, "\n[...truncated]")
 			messages = append(messages, api.Message{
 				Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: content,
 			})

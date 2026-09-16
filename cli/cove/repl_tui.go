@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
@@ -25,33 +26,45 @@ import (
 	"github.com/liuzhixin405/cove/internal/tui"
 )
 
+// cleanANSI strips every terminal control sequence from text destined for the
+// TUI transcript.
+//
+// The TUI renders into an alt-screen frame whose size it computes itself, so any
+// control byte that survives into the viewport is executed by the terminal
+// behind the renderer's back: a stray CR or cursor-movement sequence moves the
+// cursor, an erase sequence blanks part of a row, and from then on the terminal
+// and the renderer disagree about what is on screen. Because engine diagnostics
+// stream in continuously, that divergence accumulates — which is exactly how
+// the layout drifted apart as a task ran.
+//
+// The previous hand-rolled loop made this worse in two ways. It cut from "ESC["
+// to the next 'm' ANYWHERE in the remaining text, so a non-SGR sequence
+// (\x1b[2J, \x1b[1A, \x1b[?25l — all common in tool output) swallowed every
+// character up to the next literal 'm' in the content; and when no 'm' followed
+// at all it gave up and left the raw escape in the string. ansi.Strip parses
+// real sequences (CSI, OSC, DCS, charset switches) and removes exactly those.
+func cleanANSI(s string) string {
+	s = ansi.Strip(s)
+	// ansi.Strip leaves lone C0 control bytes, which are not escape sequences
+	// but still steer the terminal. Keep only the two that are content: \n
+	// (the renderer's own line separator) and \t.
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\t':
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // useTUI reports whether the Bubble Tea UI should be used. The TUI
 // is now the DEFAULT for interactive sessions. It is skipped when explicitly
 // disabled (--no-tui or COVE_TUI=0) or when stdin/stdout is not a terminal
 // (piped/redirected), where the classic line REPL is more robust. --tui or
 // COVE_TUI=1 force it on even in those cases.
-// cleanANSI strips ANSI escape sequences from a string for TUI rendering.
-func cleanANSI(s string) string {
-	// Remove ANSI color/style codes and carriage returns from engine output
-	result := s
-	// Carriage returns and clear-line sequences
-	result = strings.ReplaceAll(result, "\r", "")
-	result = strings.ReplaceAll(result, "\x1b[K", "")
-	// Remove ANSI escape sequences (ESC[...m)
-	for {
-		i := strings.Index(result, "\x1b[")
-		if i < 0 {
-			break
-		}
-		j := strings.IndexByte(result[i:], 'm')
-		if j < 0 {
-			break
-		}
-		result = result[:i] + result[i+j+1:]
-	}
-	return result
-}
-
 func useTUI() bool {
 	if noTUI || os.Getenv("COVE_TUI") == "0" {
 		return false
@@ -106,9 +119,13 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			Elapsed:   elapsed,
 		}
 		if ct := eng.CostTracker(); ct != nil {
-			s.TokensIn = ct.TotalInput
-			s.TokensOut = ct.TotalOutput
-			s.Cost = ct.TotalCost
+			// One snapshot: this runs on the TUI goroutine while the engine is
+			// still adding to the tracker, so reading the counters one at a time
+			// could show a token count and a cost from different states.
+			tot := ct.Totals()
+			s.TokensIn = tot.Input
+			s.TokensOut = tot.Output
+			s.Cost = tot.Cost
 		}
 		return s
 	}
@@ -228,13 +245,28 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 	// Seed the status bars (Send blocks until the program starts consuming).
 	go func() { app.SetStatus(makeStatus("")) }()
 
+	// uiDone is closed when the TUI loop returns, so the background goroutines
+	// below stop instead of running for the rest of the process's life.
+	uiDone := make(chan struct{})
+	defer close(uiDone)
+
 	// Background ticker to periodically refresh git status so manual edits
 	// made outside Cove are automatically picked up and dynamically shown in the UI.
+	//
+	// It MUST stop when the UI does. `for range ticker.C` with no exit path kept
+	// forking a `git branch` + `git status` subprocess pair every two seconds
+	// forever — including after the user quit and the program loop was gone, at
+	// which point every SetStatus was also a Send to a dead program.
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			app.SetStatus(makeStatus(""))
+		for {
+			select {
+			case <-uiDone:
+				return
+			case <-ticker.C:
+				app.SetStatus(makeStatus(""))
+			}
 		}
 	}()
 
@@ -273,7 +305,11 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 		app.SetHistory(items)
 	}()
 
+	// workerDone is closed when the worker loop exits, so the shutdown path can
+	// wait for an in-flight turn to unwind instead of racing process teardown.
+	workerDone := make(chan struct{})
 	go func() {
+		defer close(workerDone)
 		// attachedFiles is the worker-local mount list (managed by /attach). It
 		// persists across turns until cleared, mirroring the classic REPL.
 		var attachedFiles []string
@@ -439,8 +475,12 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 			reply, err := eng.RunMessageWithStream(
 				ctx,
 				userMsg,
-				func(delta string) { app.Delta(delta) },
-				func(reasoning string) { app.Reasoning(reasoning) },
+				// Streamed text goes through the same stripper as engine
+				// diagnostics. A model echoing terminal output (very common when
+				// it quotes a colored build log back at you) would otherwise
+				// inject live escapes straight into the viewport.
+				func(delta string) { app.Delta(cleanANSI(delta)) },
+				func(reasoning string) { app.Reasoning(cleanANSI(reasoning)) },
 			)
 			cancel()
 			setCancel(nil)
@@ -496,6 +536,21 @@ func runTUI(appVersion string, bannerText string, debugMode bool, eng *engine.En
 
 	if err := app.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "TUI 错误:", err)
+	}
+
+	// The UI is gone; wind the worker down before returning (which ends the
+	// process). Neither step happened before: the queue was never closed, so
+	// the worker stayed blocked in cond.Wait() forever, and an in-flight turn
+	// was never cancelled — so quitting mid-task left the engine running API
+	// calls and tool writes until the process was torn down underneath it,
+	// which can abort a write half-way.
+	interrupt()
+	queue.Close()
+	select {
+	case <-workerDone:
+	case <-time.After(3 * time.Second):
+		// The worker is wedged in something that ignores cancellation. Do not
+		// hang the exit on it; the process teardown will take it.
 	}
 }
 

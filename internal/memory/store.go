@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 const (
@@ -24,9 +27,6 @@ const (
 
 type Store struct {
 	dirs []string
-
-	// BM25 keyword search (no embedding required)
-	bm25 *BM25
 
 	// Cache to avoid repeated disk reads on every system prompt build
 	mu          sync.Mutex
@@ -156,16 +156,23 @@ func (s *Store) vectorScores(ctx context.Context, query string, entries []Entry)
 			s.embedCache[p.hash] = vecs[1+i]
 		}
 	}
-	// Simplest possible bound on unbounded growth (renamed/deleted memory
-	// files leave stale entries behind): reset rather than partial-evict.
-	if len(s.embedCache) > 2000 {
-		s.embedCache = make(map[string][]float32)
-	}
 	scores := make(map[int]float64, len(entries))
 	for i, h := range hashes {
 		if v, ok := s.embedCache[h]; ok {
 			scores[i] = cosineSimilarity(queryVec, v)
 		}
+	}
+	// Bound unbounded growth (renamed/deleted memory files leave stale entries
+	// behind) by resetting rather than partial-evicting.
+	//
+	// This now runs AFTER scoring. Resetting first threw away the vectors that
+	// had just been fetched for this very query, so the one search that
+	// happened to cross the threshold silently degraded to pure BM25 — semantic
+	// re-ranking quietly disappearing for no reason the user could observe.
+	// Everything still in flight has already been scored by this point, and the
+	// next call re-embeds what it needs.
+	if len(s.embedCache) > 2000 {
+		s.embedCache = make(map[string][]float32)
 	}
 	s.mu.Unlock()
 
@@ -187,6 +194,13 @@ func (s *Store) All() []Entry {
 		files, _ := os.ReadDir(dir)
 		for _, f := range files {
 			if f.IsDir() {
+				continue
+			}
+			// An atomic write that was interrupted leaves its in-progress file
+			// behind in this very directory. Loading it would turn a fragment
+			// of a half-written entry into a permanent memory that is injected
+			// into every system prompt.
+			if fsatomic.IsTempName(f.Name()) {
 				continue
 			}
 			path := filepath.Join(dir, f.Name())
@@ -292,15 +306,13 @@ func (s *Store) Search(query string, topK int) []EntryMatch {
 		return nil
 	}
 
-	s.mu.Lock()
-	if s.bm25 == nil {
-		s.bm25 = NewBM25(1.2, 0.75)
-	}
-	bm25 := s.bm25
-	s.mu.Unlock()
+	// The index is rebuilt from scratch on every search anyway (the former
+	// shared s.bm25 was Clear()ed each time, so it carried no state worth
+	// reusing). Keeping it call-local removes the data race where two
+	// concurrent Search calls would Clear/Index/Search the same instance.
+	bm25 := NewBM25(1.2, 0.75)
 
 	now := time.Now()
-	bm25.Clear()
 	for i, e := range entries {
 		bm25.Index(i, e.Content, now)
 	}
@@ -402,7 +414,7 @@ func (s *Store) Save(name, content string) error {
 	totalSize := 0
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || fsatomic.IsTempName(e.Name()) {
 			continue
 		}
 		info, err := e.Info()
@@ -417,7 +429,8 @@ func (s *Store) Save(name, content string) error {
 		return fmt.Errorf("total memory size would exceed limit (%d + %d > %d bytes)", totalSize, len(content), MaxTotalBytes)
 	}
 
-	err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
+	// Atomic replace so a crash cannot leave a half-written memory entry.
+	err := fsatomic.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
 	if err == nil {
 		s.invalidateCache()
 	}
@@ -433,9 +446,9 @@ func TruncateEntry(content string) string {
 		content = strings.Join(lines, "\n") + "\n... [truncated to 200 lines]"
 	}
 	// Truncate by bytes
-	if len(content) > MaxEntryBytes {
-		content = content[:MaxEntryBytes-50] + "\n... [truncated to 25KB]"
-	}
+	// Clip on a rune boundary — memory entries are mostly Chinese here, so a
+	// raw byte slice cuts a rune in half and yields invalid UTF-8.
+	content = textutil.ClipBytes(content, MaxEntryBytes-50, "\n... [truncated to 25KB]")
 	return content
 }
 

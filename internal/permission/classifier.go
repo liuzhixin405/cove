@@ -158,7 +158,7 @@ func (c *Classifier) hasShellControlOperator(cmd string) bool {
 	// the specific $IFS case already escalated to CatDangerous above), so
 	// it's treated the same as other substitution syntax — forced to
 	// CatUnknown for manual review rather than silently classified.
-	operators := []string{"&&", "||", ";", "|", "`", "$(", "${", " >", "<"}
+	operators := []string{"&&", "||", ";", "|", "`", "$(", "${", ">", "<"}
 	for _, op := range operators {
 		if strings.Contains(cmd, op) {
 			return true
@@ -261,15 +261,108 @@ func (c *Classifier) classifyDocker(cmd string) CmdCategory {
 	return CatUnknown
 }
 
+// classifyNetworking rates curl/wget invocations.
+//
+// The default is CatUnknown (ask the user), not CatSafe. The old default
+// auto-approved anything it did not specifically recognize, which covered the
+// two cases that matter most: `curl -X POST -d @secrets.json <url>` exfiltrates
+// data, and `wget <url>` (no -O) writes a file into the working directory —
+// both ran without a prompt. Only genuinely read-only fetches are auto-approved.
 func (c *Classifier) classifyNetworking(cmd string) CmdCategory {
-	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
-		if strings.Contains(cmd, "-X "+method) {
-			return CatSafe
-		}
-	}
-	if strings.Contains(cmd, " -o ") || strings.Contains(cmd, " -O ") {
+	// Short flags are matched CASE-SENSITIVELY, on tokenized arguments.
+	//
+	// Case matters: for curl, -F is a multipart form upload while -f is
+	// --fail, and -T is an upload while -t is unrelated. Lowercasing the
+	// command first (as an earlier version of this function did) conflated
+	// them, so an ordinary read-only `curl -f <url>` was escalated to a
+	// confirmation prompt. Tokenizing matters too: a substring scan for " -d "
+	// also fires on a URL or a quoted body that happens to contain it.
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
 		return CatUnknown
 	}
+	args := fields[1:]
+
+	hasArg := func(want ...string) bool {
+		for _, a := range args {
+			// Split "--data=x" / "--output=x" at the "=" so both spellings match.
+			name := a
+			if i := strings.IndexByte(name, '='); i > 0 {
+				name = name[:i]
+			}
+			for _, w := range want {
+				if name == w {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	hasArgPrefix := func(prefix string) bool {
+		for _, a := range args {
+			if strings.HasPrefix(a, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	// method returns the value of -X/--request, uppercased ("" when absent).
+	method := ""
+	for i, a := range args {
+		if (a == "-X" || a == "--request") && i+1 < len(args) {
+			method = strings.ToUpper(args[i+1])
+			break
+		}
+		if strings.HasPrefix(a, "--request=") {
+			method = strings.ToUpper(strings.TrimPrefix(a, "--request="))
+			break
+		}
+	}
+
+	// Any explicit non-read method needs confirmation.
+	switch method {
+	case "POST", "PUT", "PATCH", "DELETE":
+		return CatUnknown
+	}
+
+	// Request-body and upload flags mean data is being sent outward, whatever
+	// the method ends up being (curl infers POST from -d/-F/--data-*).
+	if hasArg("-d", "--data", "-F", "--form", "-T", "--upload-file",
+		"--post-data", "--post-file", "--data-binary", "--data-raw",
+		"--data-urlencode", "--form-string") || hasArgPrefix("--data") {
+		return CatUnknown
+	}
+	// Disabling certificate verification turns a fetch into an untrusted one.
+	if hasArg("-k", "--insecure", "--no-check-certificate") {
+		return CatUnknown
+	}
+
+	// Writing the response to disk needs confirmation. "-o -" / "-O -" targets
+	// stdout, which is still a read.
+	outputToStdout := false
+	for i, a := range args {
+		if (a == "-o" || a == "-O" || a == "--output") && i+1 < len(args) && args[i+1] == "-" {
+			outputToStdout = true
+			break
+		}
+	}
+	if !outputToStdout {
+		if hasArg("-o", "-O", "--output", "--remote-name", "--output-dir") {
+			return CatUnknown
+		}
+		// wget writes a file by default, so without an explicit stdout target
+		// it is never a pure read.
+		if base := strings.ToLower(fields[0]); strings.HasSuffix(base, "wget") ||
+			strings.HasSuffix(base, "wget.exe") {
+			return CatUnknown
+		}
+	}
+
+	switch method {
+	case "GET", "HEAD", "OPTIONS":
+		return CatSafe
+	}
+	// A plain `curl <url>` prints to stdout and is a read.
 	return CatSafe
 }
 

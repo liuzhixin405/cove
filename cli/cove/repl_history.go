@@ -13,8 +13,8 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove/internal/termui"
 )
 
 func handleExport(input string, eng *engine.Engine) {
@@ -207,9 +207,9 @@ func handleHistory(eng *engine.Engine) {
 		if title == "" {
 			title = r.UpdatedAt.Format("01-02 15:04")
 		}
-		if len(title) > 50 {
-			title = title[:50] + "..."
-		}
+		// compactRunes, not title[:50]: these titles are mostly Chinese, and a
+		// byte slice cut one mid-rune so the history list showed mojibake.
+		title = compactRunes(title, 50)
 		termui.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
 	}
 	if len(records) > limit {
@@ -380,11 +380,10 @@ func sessionPreview(r session.Record) string {
 	}
 	for _, m := range r.Messages {
 		if m.Role == "user" && m.Content != "" && !m.Synthetic && !looksSyntheticHistoryText(m.Content) {
-			content := strings.ReplaceAll(m.Content, "\n", " ")
-			if len(content) > 50 {
-				content = content[:50] + "..."
-			}
-			return content
+			// compactRunes, not a byte slice: this string is the session label
+			// in the Ctrl+S history overlay, and content[:50] cut Chinese
+			// titles mid-rune so they rendered as mojibake in the picker.
+			return compactRunes(strings.ReplaceAll(m.Content, "\n", " "), 50)
 		}
 	}
 	// Don't use low-signal message as preview
@@ -731,7 +730,7 @@ func scoreSessionForResume(r session.Record) int {
 		}
 	}
 
-		return score
+	return score
 }
 
 // resumeAndContinue loads the most relevant past session AND then actually

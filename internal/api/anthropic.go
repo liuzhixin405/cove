@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api/adapter"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type anthropicProvider struct {
@@ -95,6 +97,45 @@ type anthropicReq struct {
 type anthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Prompt-caching counters. Anthropic reports cache activity separately from
+	// input_tokens: cache_read_input_tokens are billed at a large discount and
+	// cache_creation_input_tokens at a premium, and neither is included in
+	// input_tokens. Ignoring them under-reports cost and lets MaxBudgetUsd drift.
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+// cacheHitTokens returns tokens served from the prompt cache (discounted).
+func (u anthropicUsage) cacheHitTokens() int { return u.CacheReadInputTokens }
+
+// cacheMissTokens returns non-cached prompt tokens, i.e. plain input plus the
+// tokens written into the cache this request.
+func (u anthropicUsage) cacheMissTokens() int {
+	return u.InputTokens + u.CacheCreationInputTokens
+}
+
+// totalInputTokens returns every prompt token the request was billed for.
+func (u anthropicUsage) totalInputTokens() int {
+	return u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+}
+
+// merge folds a later usage report into an earlier one. Anthropic splits usage
+// across `message_start` (prompt-side counters, final) and `message_delta`
+// (output_tokens, cumulative), so neither event alone is complete: taking only
+// message_delta leaves InputTokens at 0 and loses all cost on the input side.
+func (u *anthropicUsage) merge(next anthropicUsage) {
+	if next.InputTokens > 0 {
+		u.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens > 0 {
+		u.OutputTokens = next.OutputTokens
+	}
+	if next.CacheReadInputTokens > 0 {
+		u.CacheReadInputTokens = next.CacheReadInputTokens
+	}
+	if next.CacheCreationInputTokens > 0 {
+		u.CacheCreationInputTokens = next.CacheCreationInputTokens
+	}
 }
 
 type anthropicResp struct {
@@ -164,7 +205,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 		return nil, &RetryableError{Msg: fmt.Sprintf("rate limited, retry after %ds", delaySec)}
 	}
 	if httpResp.StatusCode != 200 {
-		return nil, fmt.Errorf("API error %d: %s", httpResp.StatusCode, truncate(string(raw), 500))
+		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(raw), 500)}
 	}
 
 	var ar anthropicResp
@@ -173,13 +214,15 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	}
 
 	return &ChatResponse{
-		Content:          p.extractContent(ar.Content),
-		ToolCalls:        p.extractToolCalls(ar.Content),
-		Model:            ar.Model,
-		InputTokens:      ar.Usage.InputTokens,
-		OutputTokens:     ar.Usage.OutputTokens,
-		StopReason:       ar.StopReason,
-		RateLimitHeaders: httpResp.Header,
+		Content:               p.extractContent(ar.Content),
+		ToolCalls:             p.extractToolCalls(ar.Content),
+		Model:                 ar.Model,
+		InputTokens:           ar.Usage.totalInputTokens(),
+		OutputTokens:          ar.Usage.OutputTokens,
+		PromptCacheHitTokens:  ar.Usage.cacheHitTokens(),
+		PromptCacheMissTokens: ar.Usage.cacheMissTokens(),
+		StopReason:            ar.StopReason,
+		RateLimitHeaders:      httpResp.Header,
 	}, nil
 }
 
@@ -288,16 +331,41 @@ func (p *anthropicProvider) convertTools(tools []ToolDef) []map[string]any {
 	return out
 }
 
+// truncate clips s to at most n bytes without splitting a rune. n is a byte
+// budget here: callers use it to bound error-response bodies, which are opaque
+// and may be any encoding.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return textutil.ClipBytes(s, n, "...")
 }
 
 type RetryableError struct{ Msg string }
 
 func (e *RetryableError) Error() string { return e.Msg }
+
+// StatusError carries the HTTP status of a failed provider call.
+//
+// Without it, fallback.go had to classify failures by substring-matching the
+// error text for "429", "500", "401" and friends — which misfires on any
+// message that merely contains those digits ("max_tokens must be under 1500",
+// "model gpt-4o-mini-2024-07-18"), wrongly cooling down or permanently
+// blacklisting a perfectly healthy provider. Providers return this type so the
+// status is read, not guessed; the substring heuristics remain only as a
+// fallback for transport-level errors that carry no status at all.
+type StatusError struct {
+	Status int
+	Msg    string
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("API error %d: %s", e.Status, e.Msg) }
+
+// statusOf returns the HTTP status carried by err, or 0 when it carries none.
+func statusOf(err error) int {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Status
+	}
+	return 0
+}
 
 func isRetryable(err error) bool {
 	_, ok := err.(*RetryableError)
@@ -310,6 +378,12 @@ type anthropicStreamBlock struct {
 	Delta        *anthropicDelta        `json:"delta,omitempty"`
 	ContentBlock *anthropicContentBlock `json:"content_block,omitempty"`
 	Usage        *anthropicUsage        `json:"usage,omitempty"`
+	// message_start nests the initial usage snapshot under "message".
+	Message *anthropicStreamMessage `json:"message,omitempty"`
+}
+
+type anthropicStreamMessage struct {
+	Usage *anthropicUsage `json:"usage,omitempty"`
 }
 
 type anthropicDelta struct {
@@ -381,7 +455,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		return nil, fmt.Errorf("API error %d: %s", httpResp.StatusCode, truncate(string(body), 500))
+		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(body), 500)}
 	}
 
 	reader := bufio.NewReader(httpResp.Body)
@@ -418,6 +492,14 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				}
 
 				switch ev.Type {
+				case "message_start":
+					// Prompt-side counters arrive here and nowhere else.
+					if ev.Message != nil && ev.Message.Usage != nil {
+						usage.merge(*ev.Message.Usage)
+					}
+					if ev.Usage != nil {
+						usage.merge(*ev.Usage)
+					}
 				case "content_block_start":
 					if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
 						acc := &accumTC{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
@@ -439,7 +521,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 					}
 				case "message_delta":
 					if ev.Usage != nil {
-						usage = *ev.Usage
+						usage.merge(*ev.Usage)
 					}
 					if ev.Delta != nil && ev.Delta.StopReason != "" {
 						stopReason = ev.Delta.StopReason
@@ -488,12 +570,14 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 
 	return &ChatResponse{
-		Content:          streamAcc.Content(),
-		ToolCalls:        toolCalls,
-		Model:            req.Model,
-		InputTokens:      usage.InputTokens,
-		OutputTokens:     usage.OutputTokens,
-		StopReason:       stopReason,
-		RateLimitHeaders: httpResp.Header,
+		Content:               streamAcc.Content(),
+		ToolCalls:             toolCalls,
+		Model:                 req.Model,
+		InputTokens:           usage.totalInputTokens(),
+		OutputTokens:          usage.OutputTokens,
+		PromptCacheHitTokens:  usage.cacheHitTokens(),
+		PromptCacheMissTokens: usage.cacheMissTokens(),
+		StopReason:            stopReason,
+		RateLimitHeaders:      httpResp.Header,
 	}, nil
 }

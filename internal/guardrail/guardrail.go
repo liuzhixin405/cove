@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -23,6 +24,18 @@ type Decision struct {
 	Message string
 }
 
+// Rapid-failure circuit-breaker thresholds, counted over a 30-second window.
+//
+// These are named constants because the previous inline numbers had drifted
+// from the documented behavior: the comment promised a block at 3 failures
+// while the code blocked at 6, and the 4-failure branch was an empty `else if`
+// that produced no warning at all — so the only signal the user ever got was
+// the block, twice as late as intended.
+const (
+	rapidFailWarn  = 3
+	rapidFailBlock = 5
+)
+
 // signature uniquely identifies a tool call by name + args hash.
 type signature struct {
 	Name     string
@@ -40,9 +53,9 @@ type Tracker struct {
 }
 
 type failureRecord struct {
-	time      time.Time
-	toolName  string
-	isError   bool
+	time     time.Time
+	toolName string
+	isError  bool
 }
 
 // New creates a new guardrail tracker.
@@ -76,7 +89,8 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Rapid-failure circuit breaker: 3+ failures in 30s → immediate block
+	// Rapid-failure circuit breaker: rapidFailBlock failures in 30s → block,
+	// rapidFailWarn → warn.
 	now := time.Now()
 	window := 30 * time.Second
 	cutoff := now.Add(-window)
@@ -95,10 +109,13 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 	}
 	t.recentFailures = kept
 
-	if recentFails >= 6 {
-		return Decision{Action: Block, Message: "短时间内连续失败过多，请暂停并检查根本原因。"}
-	} else if recentFails >= 4 {
-		// Don't warn on every single fail, but track
+	if recentFails >= rapidFailBlock {
+		return Decision{Action: Block, Message: fmt.Sprintf(
+			"短时间内连续失败 %d 次，已触发熔断。请暂停并检查根本原因。", recentFails)}
+	}
+	if recentFails >= rapidFailWarn {
+		return Decision{Action: Warn, Message: fmt.Sprintf(
+			"最近 30 秒内已失败 %d 次，接近熔断阈值 %d，建议改变思路。", recentFails, rapidFailBlock)}
 	}
 
 	sig := makeSignature(name, args)

@@ -89,9 +89,14 @@ func (t *sseTransport) listenSSE() {
 
 			if strings.HasPrefix(event, "data: ") {
 				payload := strings.TrimPrefix(event, "data: ")
+				// Block until the message is consumed (backpressure) rather than
+				// dropping it; dropping a JSON-RPC response would hang the caller
+				// until its timeout. Unblock on transport shutdown.
+				// Mirrors the streamable-HTTP transport, where this was already fixed.
 				select {
 				case t.msgChan <- json.RawMessage(payload):
-				default:
+				case <-t.ctx.Done():
+					return
 				}
 			}
 		}

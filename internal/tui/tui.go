@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,6 +26,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/liuzhixin405/cove/internal/tui/scrollstate"
 	"github.com/liuzhixin405/cove/internal/tui/theme"
 	"github.com/yuin/goldmark"
@@ -453,17 +453,27 @@ func (m *Model) refreshViewport(stick bool) {
 
 	var b strings.Builder
 
-	// contentLine tracks the current line number within the built content.
-	// Used to build clickRegions for mouse click -> thinking fold toggle.
+	// contentLine is the 0-based index of the NEXT line to be written into the
+	// content buffer. It is used to build clickRegions for the mouse
+	// click -> thinking fold toggle.
+	//
+	// It must advance by the real rendered height of each block, not by one per
+	// write: wrap.Render soft-wraps to the viewport width, so a long reasoning
+	// block or a wrapped user line occupies many lines. Counting one line per
+	// write made every region after the first point at the wrong row, and
+	// clicking a "思考过程" header toggled nothing (or the wrong turn).
 	contentLine := 0
 
-	write := func(s string) {
+	// write appends s and returns the index of the first line it occupies.
+	write := func(s string) int {
 		r := wrap.Render(s)
 		if b.Len() > 0 {
 			b.WriteByte('\n')
-			contentLine++
 		}
+		start := contentLine
 		b.WriteString(r)
+		contentLine += lipgloss.Height(r)
+		return start
 	}
 
 	m.clickRegions = m.clickRegions[:0]
@@ -485,19 +495,26 @@ func (m *Model) refreshViewport(stick bool) {
 			live := ti == m.streamTurn && m.streaming && answer == ""
 			expanded := t.expanded || live
 
-			regionStart := contentLine
+			// Only the HEADER row is clickable, and the region is exactly the
+			// lines that header occupies. Previously the region started one
+			// line early (write() bumped the counter before writing) and, when
+			// expanded, spanned the whole reasoning body \u2014 so a click anywhere
+			// in the thinking text collapsed it unexpectedly.
+			var headerStart, headerEnd int
 			if expanded {
-				write(thinkHeaderStyle.Render("\u25be \u601d\u8003\u8fc7\u7a0b"))
+				headerStart = write(thinkHeaderStyle.Render("\u25be \u601d\u8003\u8fc7\u7a0b"))
+				headerEnd = contentLine
 				write(dimStyle.Render(reasoning))
 				if answer != "" {
 					write("")
 				}
 			} else {
-				write(thinkHeaderStyle.Render("\u25b8 \u601d\u8003\u8fc7\u7a0b (Alt+T\u5c55\u5f00)"))
+				headerStart = write(thinkHeaderStyle.Render("\u25b8 \u601d\u8003\u8fc7\u7a0b (Alt+T\u5c55\u5f00)"))
+				headerEnd = contentLine
 			}
 			m.clickRegions = append(m.clickRegions, clickRegion{
-				startLine: regionStart,
-				endLine:   contentLine,
+				startLine: headerStart,
+				endLine:   headerEnd,
 				turnIdx:   ti,
 			})
 		}
@@ -538,15 +555,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showQuit {
 			return m.handleQuitDialog(msg)
 		}
+		// An active overlay gets first refusal on every key, Ctrl+C included.
+		// The global quit shortcut must NOT pre-empt it: the permission overlay
+		// maps Ctrl+C to Deny, and swallowing it here both made that binding
+		// dead code and left the blocked worker goroutine waiting on permReply
+		// forever when the user then quit.
+		if m.overlay != overlayNone {
+			return m.updateOverlay(msg)
+		}
 		if msg.String() == "ctrl+c" {
 			// OpenCode-style global quit shortcut.
 			m.showQuit = true
 			m.quitSelectedNo = true
 			m.ta.Blur()
 			return m, nil
-		}
-		if m.overlay != overlayNone {
-			return m.updateOverlay(msg)
 		}
 		if isTabKey(msg) {
 			if m.tabCompleteInput() {
@@ -575,14 +597,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// OpenCode: Ctrl+L logs. Map to task/log related commands in palette.
 			m.openCommandsWithQuery("tasks")
 			return m, nil
-		case "ctrl+h", "ctrl+_", "?":
+		case "ctrl+h", "ctrl+_":
 			// OpenCode: help overlay.
 			m.openHelp()
 			return m, nil
+		case "?":
+			// "?" is a global help shortcut ONLY on an empty input line.
+			//
+			// It used to be unconditional, which made it impossible to type a
+			// question mark anywhere in a message: every "?" opened the help
+			// overlay and was swallowed. Gating it on an empty input keeps the
+			// shortcut discoverable while letting "?" behave as a character the
+			// moment there is anything to type it into.
+			if strings.TrimSpace(m.ta.Value()) == "" {
+				m.openHelp()
+				return m, nil
+			}
+			// Fall through to the textarea so the character is inserted.
 		case "esc":
 			// OpenCode-style cancel behavior in chat view.
 			if (m.task.Running || m.streaming) && m.onInterrupt != nil {
 				m.onInterrupt()
+			}
+			return m, nil
+		case "f2", "alt+m":
+			// Toggle mouse reporting.
+			//
+			// While the app captures the mouse, the terminal routes click and
+			// drag events here instead of performing its own text selection —
+			// so the usual "drag to select, then copy" is dead, and mouse
+			// capture was on by default with no way to turn it off short of
+			// restarting with COVE_TUI_MOUSE=0. Capture buys wheel scrolling,
+			// which is worth keeping as the default, so this makes it a
+			// one-keystroke toggle instead of a startup-only decision. The
+			// bottom bar shows the current state.
+			m.mouseCapture = !m.mouseCapture
+			if m.mouseCapture {
+				m.copyNotice = "[鼠标] 已开启鼠标捕获：滚轮可滚动，终端拖选被禁用（F2 切换）"
+			} else {
+				m.copyNotice = "[鼠标] 已关闭鼠标捕获：可用鼠标拖选复制，滚轮改用 PgUp/PgDn（F2 切换）"
 			}
 			return m, nil
 		case "ctrl+g":
@@ -676,8 +729,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showQuit || m.overlay != overlayNone {
 			return m, nil
 		}
-		// Viewport starts at terminal line 1 (after the 1-line status bar).
-		vpTop := 1
+		// The viewport starts below the status bar AND the optional git panel.
+		// Hard-coding 1 here meant every click was mapped gitPanelHeight() rows
+		// too far down whenever the workspace had uncommitted changes — which
+		// is most of the time while the agent is working.
+		vpTop := statusH + m.gitPanelHeight()
 		if msg.Y < vpTop || msg.Y >= vpTop+m.vp.Height() {
 			return m, nil
 		}
@@ -855,6 +911,7 @@ func (m *Model) handleQuitDialog(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.quitSelectedNo {
 				// Yes selected — quit
 				m.quitting = true
+				m.releasePendingPermission()
 				return m, tea.Quit
 			}
 			// No selected — dismiss
@@ -863,6 +920,7 @@ func (m *Model) handleQuitDialog(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "y", "Y":
 			m.quitting = true
+			m.releasePendingPermission()
 			return m, tea.Quit
 		case "n", "N":
 			m.showQuit = false
@@ -964,6 +1022,26 @@ func (m *Model) updateOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.search, cmd = m.search.Update(msg)
 	m.overlayIdx = 0
 	return m, cmd
+}
+
+// releasePendingPermission answers any outstanding permission prompt with Deny
+// so the blocked worker goroutine can unwind. Called on the quit paths: the
+// worker waits on permReply with no timeout, so tearing down the UI without
+// answering would leak that goroutine (and whatever it holds) for the rest of
+// the process's life.
+func (m *Model) releasePendingPermission() {
+	if m.permReply == nil {
+		return
+	}
+	// Non-blocking: the channel is buffered by the requester, and if the worker
+	// has already given up there is nobody left to receive.
+	select {
+	case m.permReply <- PermDeny:
+	default:
+	}
+	m.permReply = nil
+	m.permTool = ""
+	m.permDesc = ""
 }
 
 func (m *Model) resolvePermission(d PermDecision) {
@@ -1305,7 +1383,7 @@ func (m *Model) View() tea.View {
 
 	if m.showQuit {
 		mid := m.renderCenteredOverlay(m.renderQuitDialog(), m.vp.Height())
-		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View())
+		v.Content = m.clampFrame(lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View()))
 		return v
 	}
 
@@ -1322,7 +1400,7 @@ func (m *Model) View() tea.View {
 		} else {
 			mid = m.renderCenteredOverlay(m.renderOverlay(oH), oH)
 		}
-		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View())
+		v.Content = m.clampFrame(lipgloss.JoinVertical(lipgloss.Left, statusBar, mid, transient, bottomBar, hr, m.ta.View()))
 		v.Cursor = m.overlayCursor()
 		return v
 	}
@@ -1337,12 +1415,50 @@ func (m *Model) View() tea.View {
 
 	gitPanel := m.renderGitPanel()
 	if gitPanel != "" {
-		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, gitPanel, main, transient, bottomBar, hr, m.ta.View())
+		v.Content = m.clampFrame(lipgloss.JoinVertical(lipgloss.Left, statusBar, gitPanel, main, transient, bottomBar, hr, m.ta.View()))
 	} else {
-		v.Content = lipgloss.JoinVertical(lipgloss.Left, statusBar, main, transient, bottomBar, hr, m.ta.View())
+		v.Content = m.clampFrame(lipgloss.JoinVertical(lipgloss.Left, statusBar, main, transient, bottomBar, hr, m.ta.View()))
 	}
 	v.Cursor = m.inputCursor()
 	return v
+}
+
+// clampFrame is the last line of defence for the frame's geometry.
+//
+// layout() budgets every row: the frame is exactly statusH + gitH + body +
+// transientH + bottomH + inputH == m.height rows, and each chrome block is
+// assumed to be its nominal height and no wider than m.width. A single block
+// that renders one row too many (or one column too wide, which the terminal
+// then soft-wraps into an extra row) pushes the total past m.height; the
+// terminal scrolls to make room, the alt-screen origin shifts, and every
+// subsequent frame is drawn at the wrong offset. That is not self-correcting —
+// it looks like the layout progressively falling apart as a task runs.
+//
+// Rather than trusting each renderer to be perfectly clamped, the assembled
+// frame is trimmed here: over-wide rows are truncated to m.width and, if there
+// are still too many rows, the ones from the top of the BODY are dropped (the
+// status bar stays, and the input box at the bottom stays reachable).
+func (m *Model) clampFrame(frame string) string {
+	if m.width <= 0 || m.height <= 0 {
+		return frame
+	}
+	lines := strings.Split(frame, "\n")
+	for i, l := range lines {
+		if ansi.StringWidth(l) > m.width {
+			lines[i] = ansi.Truncate(l, m.width, "")
+		}
+	}
+	if len(lines) > m.height {
+		// Keep the status bar (row 0) and the tail, which holds the transient
+		// line, bottom bar, rule and input box.
+		overflow := len(lines) - m.height
+		if overflow >= len(lines)-1 {
+			lines = lines[len(lines)-m.height:]
+		} else {
+			lines = append(lines[:1], lines[1+overflow:]...)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) renderCenteredOverlay(overlay string, areaH int) string {
@@ -1416,15 +1532,34 @@ func defaultMouseCapture() bool {
 	return true
 }
 
-var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-
+// stripANSI removes terminal escape sequences from text that is leaving the UI
+// (clipboard, export).
+//
+// It delegates to ansi.Strip rather than a local regex. The old
+// `\x1b\[[0-9;?]*[ -/]*[@-~]` pattern only matched CSI sequences, so OSC
+// (\x1b]...\x07), charset selections and lone control bytes survived into the
+// clipboard — pasting the copied text then dumped raw escapes into the target
+// editor or chat box, which is what made "copy" look broken even when it had
+// actually run.
 func stripANSI(s string) string {
-	return ansiEscapeRE.ReplaceAllString(s, "")
+	s = ansi.Strip(s)
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\t':
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func (m *Model) exportVisibleScreenText() string {
-	view := stripANSI(m.vp.View())
-	return strings.TrimSpace(view)
+	// The viewport view is fully styled, so stripping is mandatory here. It is
+	// applied to the other export paths too (see exportSessionText and
+	// exportTranscriptText): turn buffers can hold styled engine/tool lines.
+	return strings.TrimSpace(stripANSI(m.vp.View()))
 }
 
 func (m *Model) assistantCopyText(t *turn) string {
@@ -1461,7 +1596,7 @@ func (m *Model) exportCurrentTurnText() string {
 			b.WriteString(a)
 			b.WriteString("\n")
 		}
-		return strings.TrimSpace(b.String())
+		return strings.TrimSpace(stripANSI(b.String()))
 	}
 	return ""
 }
@@ -1483,7 +1618,7 @@ func (m *Model) exportSessionText() string {
 			b.WriteString("\n\n")
 		}
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(stripANSI(b.String()))
 }
 
 func (m *Model) exportTranscriptText() string {
@@ -1517,7 +1652,9 @@ func (m *Model) exportTranscriptText() string {
 			b.WriteString("\n\n")
 		}
 	}
-	return strings.TrimSpace(b.String())
+	// Stripped last: the raw answer buffer is the most likely to carry styled
+	// tool/engine lines, and this is the export that deliberately includes them.
+	return strings.TrimSpace(stripANSI(b.String()))
 }
 
 // copyCmd copies text to the clipboard OFF the UI goroutine so a slow clipboard

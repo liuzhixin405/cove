@@ -66,14 +66,20 @@ func (w *fastModelOutcomeWindow) RecentFastModelFailureRate() float64 {
 type costBudgetSignal struct{ tracker *cost.Tracker }
 
 func (c costBudgetSignal) RemainingBudgetRatio() float64 {
-	if c.tracker == nil || c.tracker.MaxBudget <= 0 {
+	if c.tracker == nil {
 		return 1
 	}
-	remaining := c.tracker.MaxBudget - c.tracker.TotalCost
+	// One snapshot, so budget and spend cannot be read from two different
+	// states mid-update (which could report a ratio above 1 or below 0).
+	tot := c.tracker.Totals()
+	if tot.MaxBudget <= 0 {
+		return 1
+	}
+	remaining := tot.MaxBudget - tot.Cost
 	if remaining < 0 {
 		remaining = 0
 	}
-	ratio := remaining / c.tracker.MaxBudget
+	ratio := remaining / tot.MaxBudget
 	if ratio > 1 {
 		ratio = 1
 	}

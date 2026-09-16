@@ -34,6 +34,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
 	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
@@ -465,7 +466,7 @@ func (e *Engine) SetPermissionMode(mode permission.Mode) {
 func (e *Engine) SetMaxBudget(maxBudget float64) {
 	e.config.MaxBudget = maxBudget
 	if e.costTracker != nil {
-		e.costTracker.MaxBudget = maxBudget
+		e.costTracker.SetMaxBudget(maxBudget)
 	}
 }
 
@@ -618,8 +619,17 @@ Available tools:`)
 		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
 			e.projCtx.Cwd, e.projCtx.Platform, e.projCtx.Shell))
 		if e.projCtx.IsGitRepo {
-			sb.WriteString(fmt.Sprintf("\nGit: %s (%s)", e.projCtx.GitBranch, e.projCtx.GitStatus))
-			if e.projCtx.GitMain != "" && e.projCtx.GitMain != e.projCtx.GitBranch {
+			// GitBranch/GitStatus are the only ProjectContext fields that are
+			// mutated after construction: the TUI refreshes them every two
+			// seconds from its own goroutine (RefreshGit takes the context's
+			// lock). Reading the fields directly from here — on the engine
+			// goroutine, while building the system prompt — is a data race on a
+			// string, which can tear into a mismatched pointer/length pair.
+			// GetGitInfo exists for exactly this and is what the rest of the
+			// codebase already uses.
+			gitBranch, gitStatus := e.projCtx.GetGitInfo()
+			sb.WriteString(fmt.Sprintf("\nGit: %s (%s)", gitBranch, gitStatus))
+			if e.projCtx.GitMain != "" && e.projCtx.GitMain != gitBranch {
 				sb.WriteString(fmt.Sprintf(" | main branch: %s", e.projCtx.GitMain))
 			}
 			if e.projCtx.GitUser != "" {
@@ -886,7 +896,15 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			return "", fmt.Errorf("api: %w", err)
 		}
 
-		e.costTracker.AddDetailed(e.config.Model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
+		// Bill against the model that actually served the request, not the
+		// configured premium one: when the router sends a turn to the fast
+		// model, charging it at the premium rate overstates the spend and makes
+		// MaxBudgetUsd trip early (and understates it in the reverse case).
+		billedModel := resp.Model
+		if billedModel == "" {
+			billedModel = modelName
+		}
+		e.costTracker.AddDetailed(billedModel, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
 
 		// Update rate limit tracking
 		if e.rateLimits != nil && resp.RateLimitHeaders != nil {
@@ -967,6 +985,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					e.engineOutput("? " + lr.Reason)
 					return "", fmt.Errorf("loop detection: %s", lr.Reason)
 				}
+				// This batch is not going to run, so every tool_use in the
+				// assistant message above still needs a tool_result before the
+				// guidance can be appended — see syntheticToolResults.
+				e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
 				// Non-fatal: inject guidance asking the model to change approach
 				e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
 				// Reset fingerprint history so the model gets a fresh start
@@ -985,8 +1007,14 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
 				log.Warnf("loop detected: %s", loopFp)
+				// Close out the pending tool calls first, then inject guidance,
+				// then skip the batch. Appending the user message inline and
+				// falling through produced assistant(tool_use) → user → tool,
+				// which the provider rejects with a 400.
+				e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
 				e.messages = append(e.messages, newSyntheticUserMsg("[system: 检测到重复循环 - 模型连续多次调用相同的工具和参数。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助。]"))
 				e.loopHistory = nil // reset after injecting guidance
+				continue
 			}
 		}
 
@@ -1017,9 +1045,16 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				t, _ := e.registry.Find(tc.Name)
 				safe := t != nil && t.Def().IsConcurrencySafe
 
-				// write/edit to distinct files can also be parallelized
+				// write/edit to distinct files can also be parallelized.
+				// The path must be read through toolTargetPath, which honors
+				// every key alias the tools themselves accept (file_path, path,
+				// filepath, file) and normalizes the spelling. Looking only at
+				// "filePath" meant a call using an alias reported no path at
+				// all, fell through as non-parallelizable, and — worse — never
+				// claimed its path, so a sibling call to the same file was not
+				// serialized against it.
 				if !safe && (tc.Name == "write" || tc.Name == "edit") {
-					if fp, ok := tc.Input["filePath"].(string); ok && fp != "" {
+					if fp := toolTargetPath(tc.Input); fp != "" {
 						if claimedWritePaths[fp] {
 							deferred = append(deferred, i)
 							continue
@@ -1079,6 +1114,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 		}
 
+		// Layer-2 guidance is collected here and appended only after every
+		// tool_result has been emitted. Appending it from inside the loop split
+		// the tool_result run (assistant → tool → user → tool), which the
+		// provider rejects for the same reason as the Layer-1 case above.
+		var pendingLoopGuidance string
+
 		for _, r := range results {
 			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
@@ -1105,12 +1146,19 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 						e.engineOutput("? " + lr.Reason)
 						return "", fmt.Errorf("loop detection: %s", lr.Reason)
 					}
-					// Non-fatal: inject guidance asking the model to change approach
-					e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
+					// Non-fatal: queue guidance asking the model to change
+					// approach; appended once the tool_result run is complete.
+					if pendingLoopGuidance == "" {
+						pendingLoopGuidance = injectLoopGuidance(lr.Reason)
+					}
 					// Reset fingerprint history so the model gets a fresh start
 					e.loopDetector.ResetFingerprintHistory()
 				}
 			}
+		}
+
+		if pendingLoopGuidance != "" {
+			e.messages = append(e.messages, newSyntheticUserMsg(pendingLoopGuidance))
 		}
 
 		// Circuit breaker: if tools keep failing, hint the model to change approach
@@ -1703,9 +1751,10 @@ func (e *Engine) saveSession() {
 	}
 	e.lastSaveTime = now
 	e.session.Messages = e.messages
-	e.session.TokensIn = e.costTracker.TotalInput
-	e.session.TokensOut = e.costTracker.TotalOutput
-	e.session.Cost = e.costTracker.TotalCost
+	costTotals := e.costTracker.Totals()
+	e.session.TokensIn = costTotals.Input
+	e.session.TokensOut = costTotals.Output
+	e.session.Cost = costTotals.Cost
 	e.session.UpdatedAt = now
 	// Auto-set title from first real user message
 	if len(e.messages) > 0 && (e.session.Title == "New session" || e.session.Title == "") {
@@ -1782,7 +1831,7 @@ func pickSessionTitle(messages []api.Message) string {
 		if m.Role == "user" && !looksSynthetic(m) && strings.TrimSpace(m.Content) != "" {
 			text := strings.TrimSpace(m.Content)
 			if len(text) > 60 {
-				text = text[:60] + "..."
+				text = textutil.ClipRunes(text, 63)
 			}
 			return text
 		}
@@ -1858,7 +1907,9 @@ func summarizeResult(result string) string {
 		return kept
 	}
 
-	return s[:77] + "..."
+	// Rune-safe: this summary line is full of Chinese, so a byte slice at 77
+	// would land inside a rune and emit U+FFFD in the TUI.
+	return textutil.ClipRunes(s, 80)
 }
 
 func preservePathSummary(s, marker string) (string, bool) {
@@ -1876,7 +1927,7 @@ func preservePathSummary(s, marker string) (string, bool) {
 
 	head := s[:idx+len(marker)]
 	if len(head) > 40 {
-		head = head[:37] + "..."
+		head = textutil.ClipRunes(head, 40)
 	}
 	return head + pathPart, true
 }
@@ -1907,10 +1958,10 @@ func preservePathTokenLine(s string) (string, bool) {
 	suffix := strings.TrimSpace(s[idx+len(best):])
 
 	if len(prefix) > 40 {
-		prefix = prefix[:37] + "..."
+		prefix = textutil.ClipRunes(prefix, 40)
 	}
 	if len(suffix) > 24 {
-		suffix = suffix[:21] + "..."
+		suffix = textutil.ClipRunes(suffix, 24)
 	}
 
 	if prefix == "" && suffix == "" {
@@ -1949,10 +2000,7 @@ func looksLikePath(s string) bool {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-3] + "..."
+	return textutil.ClipRunes(s, n)
 }
 
 // ANSI formatting for tool output lines
@@ -2014,9 +2062,10 @@ func (e *Engine) runTurnEndPipeline() {
 					log.Warnf("[autoDream] panic: %v", r)
 				}
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			e.dreamRunner.ExecuteAutoDream(ctx)
+			// The 5-minute bound is owned by ExecuteAutoDream's detached context,
+			// not here: this goroutine returns as soon as the dream is spawned, so
+			// cancelling a context here would abort the dream immediately.
+			e.dreamRunner.ExecuteAutoDream(context.Background())
 		}()
 	}
 }

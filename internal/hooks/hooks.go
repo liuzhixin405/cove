@@ -28,7 +28,7 @@ type HookType int
 
 const (
 	HookRuntime HookType = iota // Go function callback
-	HookCommand                  // external command via stdin/stdout
+	HookCommand                 // external command via stdin/stdout
 )
 
 // HookConfig defines a single hook: when it fires, how it runs.
@@ -41,6 +41,10 @@ type HookConfig struct {
 	Timeout    time.Duration                       // max execution time (0 = no limit)
 	Sequential bool                                // true = must complete before continuing; false = fire-and-forget
 }
+
+// defaultAsyncHookTimeout bounds an async hook that declares no Timeout of its
+// own, so a hung hook process cannot outlive the session.
+const defaultAsyncHookTimeout = 60 * time.Second
 
 // HookInput is the data passed to a hook when it fires.
 type HookInput struct {
@@ -85,9 +89,35 @@ func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, inpu
 			continue
 		}
 
-		// Non-sequential hooks run async (fire-and-forget)
+		// Non-sequential hooks run async (fire-and-forget).
+		//
+		// "Fire-and-forget" is about not waiting for the result, not about
+		// running forever: the hook's own Timeout must still apply, and the
+		// spawned process must still be cancellable. Using a bare
+		// context.Background() discarded h.Timeout entirely, so a hook command
+		// that hung kept its goroutine and its child process alive for the rest
+		// of the session.
+		//
+		// The caller's ctx is deliberately NOT the parent — it is the turn's
+		// context and is cancelled as soon as the turn ends, which would kill
+		// every async hook the moment it was fired.
 		if !h.Sequential {
-			go m.executeHook(context.Background(), h, input)
+			go func(h HookConfig) {
+				// context.Background(), NOT the caller's ctx: deriving from ctx
+				// makes the async hook die the instant the turn ends, which is
+				// the opposite of fire-and-forget. The bound comes from the
+				// hook's own Timeout, with a default so a hung hook still
+				// cannot outlive the session.
+				timeout := h.Timeout
+				if timeout <= 0 {
+					timeout = defaultAsyncHookTimeout
+				}
+				asyncCtx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+				if _, err := m.executeHook(asyncCtx, h, input); err != nil {
+					log.Warnf("async hook %s error: %v", h.Event, err)
+				}
+			}(h)
 			continue
 		}
 

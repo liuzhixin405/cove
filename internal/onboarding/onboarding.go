@@ -1,7 +1,9 @@
 package onboarding
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,7 +24,7 @@ func Check(projectDir string) *State {
 	s := &State{ProjectDir: projectDir}
 	s.HasClaudeMD = fileExists(filepath.Join(projectDir, "CLAUDE.md")) ||
 		fileExists(filepath.Join(projectDir, ".claude", "CLAUDE.md"))
-	s.HasGit = dirExists(filepath.Join(projectDir, ".git"))
+	s.HasGit = gitExists(filepath.Join(projectDir, ".git"))
 	s.HasPackageJSON = fileExists(filepath.Join(projectDir, "package.json"))
 	s.HasGoMod = fileExists(filepath.Join(projectDir, "go.mod"))
 	s.Language = detectLanguage(projectDir)
@@ -71,9 +73,35 @@ func (s *State) InitProject() (string, error) {
 	content := s.GenerateClaudeMD()
 	path := filepath.Join(s.ProjectDir, "CLAUDE.md")
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// Create exclusively rather than with os.WriteFile, which truncates.
+	// Two ways the old truncating write destroyed a user's file:
+	//   1. InitProject did not record that it had created the guide, so a
+	//      second call on the same State (a retried /init, or any caller that
+	//      keeps the State around) saw HasClaudeMD still false and rewrote
+	//      CLAUDE.md over the user's own conventions.
+	//   2. Check() and InitProject() are separate steps, so the file can
+	//      appear in between (another cove window, a git pull) and was
+	//      silently clobbered.
+	// O_EXCL makes the filesystem the single source of truth; an existing file
+	// yields the documented ("", nil) "already exists" result.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			s.HasClaudeMD = true
+			return "", nil
+		}
 		return "", fmt.Errorf("failed to create CLAUDE.md: %w", err)
 	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return "", fmt.Errorf("failed to create CLAUDE.md: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("failed to create CLAUDE.md: %w", err)
+	}
+
+	// Record the creation so a repeat call takes the no-op path above.
+	s.HasClaudeMD = true
 	return path, nil
 }
 
@@ -128,7 +156,11 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func dirExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
+// gitExists reports whether path is a git administrative entry. Checking only
+// for a directory missed every linked worktree and submodule, where ".git" is
+// a *file* containing "gitdir: <path>" — so /init reported "no git" and left
+// "Version Control: Git" out of the generated guide for those checkouts.
+func gitExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

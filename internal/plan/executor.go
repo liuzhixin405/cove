@@ -74,6 +74,32 @@ func (pe *PlanExecutor) Execute(ctx context.Context, plan *Plan) *ExecutionResul
 	allSuccess := true
 
 	for _, level := range levels {
+		// Mark tasks whose dependencies failed (or were themselves skipped)
+		// BEFORE the level runs, and drop them from the runnable set.
+		//
+		// This used to be done after the level completed, which never worked:
+		// the next level's runTask sets Status = "running" as its first
+		// statement, overwriting "skipped", so the downstream task executed
+		// anyway — with an empty depOutputs, i.e. without the very context it
+		// declared a dependency on. Filtering up front also propagates the skip
+		// transitively, since a task skipped here blocks its own dependents.
+		runnable := make([]*Task, 0, len(level))
+		for _, t := range level {
+			if blocker := blockingDep(t, taskByID); blocker != "" {
+				t.Status = "skipped"
+				t.Error = fmt.Sprintf("dependency %q did not succeed", blocker)
+				pe.markRuntimeStatus(t.ID, "skipped")
+				completed[t.ID] = true
+				allSuccess = false
+				continue
+			}
+			runnable = append(runnable, t)
+		}
+		level = runnable
+		if len(level) == 0 {
+			continue
+		}
+
 		if plan.Parallel && len(level) > 1 {
 			// Execute level concurrently
 			var wg sync.WaitGroup
@@ -115,23 +141,6 @@ func (pe *PlanExecutor) Execute(ctx context.Context, plan *Plan) *ExecutionResul
 			}
 		}
 
-		// If any task failed, mark downstream tasks as skipped
-		if !allSuccess {
-			for dep := range completed {
-				for _, t := range plan.Tasks {
-					if t.Status == "pending" {
-						for _, d := range t.DependsOn {
-							if d == dep && completed[dep] &&
-								taskByID[dep].Status == "failed" {
-								t.Status = "skipped"
-								t.Error = fmt.Sprintf("dependency %q failed", dep)
-								break
-							}
-						}
-					}
-				}
-			}
-		}
 	}
 
 	return &ExecutionResult{
@@ -141,8 +150,43 @@ func (pe *PlanExecutor) Execute(ctx context.Context, plan *Plan) *ExecutionResul
 	}
 }
 
+// blockingDep returns the ID of the first dependency of task that did not
+// succeed ("failed" or "skipped"), or "" when every dependency is clear. An
+// unknown dependency ID is treated as clear — topologicalSort has already
+// validated the graph, and a task should not be silently dropped over a typo
+// that the planner accepted.
+func blockingDep(task *Task, taskByID map[string]*Task) string {
+	for _, depID := range task.DependsOn {
+		dep, ok := taskByID[depID]
+		if !ok {
+			continue
+		}
+		if dep.Status == "failed" || dep.Status == "skipped" {
+			return depID
+		}
+	}
+	return ""
+}
+
+// markRuntimeStatus mirrors a task's status into the shared runtime state.
+func (pe *PlanExecutor) markRuntimeStatus(taskID, status string) {
+	if pe.runtime == nil {
+		return
+	}
+	pe.runtime.Lock()
+	defer pe.runtime.Unlock()
+	if tr, ok := pe.runtime.Tasks[taskID]; ok {
+		tr.Status = status
+	}
+}
+
 // runTask executes a single task via delegate.SubAgent, with supervisor retry.
 func (pe *PlanExecutor) runTask(ctx context.Context, task *Task, completed map[string]bool) (success bool) {
+	// A task already ruled out (a dependency failed) must never be revived
+	// here; Execute filters those out, and this is the backstop.
+	if task.Status == "skipped" {
+		return false
+	}
 	task.Status = "running"
 
 	// Update the runtime task state

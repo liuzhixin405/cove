@@ -107,6 +107,29 @@ func DetectProvider(model string, cfg ProviderConfig) Provider {
 	return newOpenAICompatProvider(cfg)
 }
 
+// maxStreamToolCalls bounds how many tool calls one streamed response may
+// declare, so a bogus index cannot drive an unbounded slice growth.
+const maxStreamToolCalls = 256
+
+// streamHTTPClient is shared by every streaming request.
+//
+// It deliberately has no Client.Timeout (that would cap the whole stream — see
+// ChatStream) and instead bounds only the phases that can legitimately hang
+// before data starts flowing. Sharing one client also restores connection
+// keep-alive: a fresh http.Client per call opened a new TLS connection for
+// every turn, which on a mobile network is the slowest part of the request.
+var streamHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   4,
+		ForceAttemptHTTP2:     true,
+	},
+}
+
 // ---------- OpenAI Compatible Provider ----------
 
 type openAICompatProvider struct {
@@ -171,6 +194,13 @@ type oaiErrorBody struct {
 }
 
 func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, onEvent func(StreamEvent)) (ChatResponse, error) {
+	// onEvent is optional. This is a mobile-binding entry point, so a caller
+	// that only wants the final response passes nil — which used to panic on
+	// the first delta. Substitute a no-op instead of guarding every call site.
+	if onEvent == nil {
+		onEvent = func(StreamEvent) {}
+	}
+
 	// Build messages as generic maps to support tool_calls and tool_call_id fields
 	var messages []map[string]interface{}
 
@@ -264,8 +294,15 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	client := &http.Client{Timeout: 120 * time.Second}
-	httpResp, err := client.Do(httpReq)
+	// No client-level Timeout on a streaming request.
+	//
+	// http.Client.Timeout covers reading the ENTIRE body, so a 120s timeout
+	// severed any generation that streamed for longer than two minutes — a long
+	// answer simply died mid-sentence. internal/api keeps a separate
+	// timeout-free client for exactly this; mobile was still using one client
+	// for both. Cancellation still works: the request carries ctx, and the
+	// header phase is bounded by ResponseHeaderTimeout below.
+	httpResp, err := streamHTTPClient.Do(httpReq)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("http request: %w", err)
 	}
@@ -313,6 +350,14 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			}
 			// Handle tool calls from streaming chunks
 			for _, tc := range choice.Delta.ToolCalls {
+				// tc.Index comes straight from the provider's JSON. A negative
+				// value skips the grow branch below and then indexes the slice
+				// with it — resp.ToolCalls[-1] panics, taking the whole mobile
+				// process down on one malformed chunk. An absurd value would
+				// also make the grow loop allocate without bound.
+				if tc.Index < 0 || tc.Index > maxStreamToolCalls {
+					continue
+				}
 				// Use index to match chunks for the same tool call (streaming args)
 				if tc.Index >= len(resp.ToolCalls) {
 					// New tool call - extend slice
@@ -376,4 +421,3 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onEvent func(StreamEvent)) (ChatResponse, error) {
 	return ChatResponse{}, fmt.Errorf("Anthropic provider not yet supported on mobile")
 }
-

@@ -41,9 +41,13 @@ type Profile struct {
 	PermissionMode string          `json:"permission_mode,omitempty"`
 	MaxBudgetUsd   float64         `json:"max_budget_usd,omitempty"`
 	ThinkingTokens int             `json:"thinking_tokens,omitempty"`
-	Debug          bool            `json:"debug,omitempty"`
-	Verbose        bool            `json:"verbose,omitempty"`
-	SystemPrompt   string          `json:"system_prompt,omitempty"`
+	// Debug and Verbose are pointers so "absent" is distinguishable from
+	// "false". As plain bools, applyProfile could only ever turn them ON
+	// (`if prof.Debug { cfg.Debug = true }`), so a profile written specifically
+	// to quieten a noisy global config — "debug": false — did nothing at all.
+	Debug        *bool  `json:"debug,omitempty"`
+	Verbose      *bool  `json:"verbose,omitempty"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
 }
 
 // UnmarshalJSON keeps backward compatibility with older configs that used
@@ -202,6 +206,21 @@ func loadProjectOverride(cfg *Config) error {
 	if override.MemoryEmbedding != nil {
 		cfg.MemoryEmbedding = override.MemoryEmbedding
 	}
+	// Provider and ThinkingTokens were silently dropped here, so a project that
+	// pinned its own endpoint or thinking budget in .cove.json was ignored with
+	// no message — the user's setting simply had no effect.
+	if override.Provider.Name != "" {
+		cfg.Provider.Name = override.Provider.Name
+	}
+	if override.Provider.APIKey != "" {
+		cfg.Provider.APIKey = override.Provider.APIKey
+	}
+	if override.Provider.BaseURL != "" {
+		cfg.Provider.BaseURL = override.Provider.BaseURL
+	}
+	if override.ThinkingTokens > 0 {
+		cfg.ThinkingTokens = override.ThinkingTokens
+	}
 	return nil
 }
 
@@ -227,11 +246,11 @@ func applyProfile(cfg *Config, prof *Profile) {
 	if prof.ThinkingTokens > 0 {
 		cfg.ThinkingTokens = prof.ThinkingTokens
 	}
-	if prof.Debug {
-		cfg.Debug = true
+	if prof.Debug != nil {
+		cfg.Debug = *prof.Debug
 	}
-	if prof.Verbose {
-		cfg.Verbose = true
+	if prof.Verbose != nil {
+		cfg.Verbose = *prof.Verbose
 	}
 	if prof.SystemPrompt != "" {
 		cfg.SystemPrompt = prof.SystemPrompt
@@ -356,11 +375,13 @@ func Save(cfg *Config) error {
 				if prof.ThinkingTokens > 0 {
 					profileVal["thinking_tokens"] = prof.ThinkingTokens
 				}
-				if prof.Debug {
-					profileVal["debug"] = prof.Debug
+				// Round-trip an explicit false as well, so saving does not
+				// quietly discard a profile that deliberately turns these off.
+				if prof.Debug != nil {
+					profileVal["debug"] = *prof.Debug
 				}
-				if prof.Verbose {
-					profileVal["verbose"] = prof.Verbose
+				if prof.Verbose != nil {
+					profileVal["verbose"] = *prof.Verbose
 				}
 				if prof.SystemPrompt != "" {
 					profileVal["system_prompt"] = prof.SystemPrompt

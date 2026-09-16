@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // RoutingDecision is the result of model routing.
@@ -38,12 +39,52 @@ type FailureRateSignal interface {
 // a chain of routing strategies. The first strategy that returns
 // a non-nil decision wins.
 type ModelRouter struct {
-	strategies   []RoutingStrategy
+	strategies []RoutingStrategy
+
+	// mu guards every mutable field below. The setters are driven by the UI
+	// goroutine (/model, /provider) while Route runs on the engine goroutine,
+	// and background turn-end work reads them too, so unsynchronized access is
+	// a genuine race. Read them through the accessors, never directly — the
+	// strategies live in this file and do exactly that.
+	mu           sync.RWMutex
 	defaultModel string // 高级模型，用于复杂任务（如 deepseek-v4-pro）
 	fastModel    string // 快速模型，用于简单任务（如 deepseek-v4-flash）
 	override     string // user-specified override (e.g. /model gpt-4o)
 	budget       BudgetSignal
 	failureRate  FailureRateSignal
+}
+
+// DefaultModel returns the configured premium model.
+func (mr *ModelRouter) DefaultModel() string {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.defaultModel
+}
+
+// FastModel returns the configured fast model ("" when none).
+func (mr *ModelRouter) FastModel() string {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.fastModel
+}
+
+// Override returns the user-specified model override ("" when none).
+func (mr *ModelRouter) Override() string {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.override
+}
+
+func (mr *ModelRouter) budgetSignal() BudgetSignal {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.budget
+}
+
+func (mr *ModelRouter) failureRateSignal() FailureRateSignal {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.failureRate
 }
 
 // RoutingStrategy evaluates a user message and decides whether to route.
@@ -68,6 +109,8 @@ func NewModelRouter(defaultModel, fastModel string) *ModelRouter {
 // the current configuration instead of the construction-time values. Passing an
 // empty fastModel leaves the existing fast model unchanged.
 func (mr *ModelRouter) SetModels(defaultModel, fastModel string) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
 	if defaultModel != "" {
 		mr.defaultModel = defaultModel
 	}
@@ -77,29 +120,48 @@ func (mr *ModelRouter) SetModels(defaultModel, fastModel string) {
 }
 
 // SetOverride sets a user-specified model override (e.g. from /model command).
-func (mr *ModelRouter) SetOverride(model string) { mr.override = model }
+func (mr *ModelRouter) SetOverride(model string) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.override = model
+}
 
 // ClearOverride removes the user override.
-func (mr *ModelRouter) ClearOverride() { mr.override = "" }
+func (mr *ModelRouter) ClearOverride() {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.override = ""
+}
 
 // SetBudgetSignal wires in a source of remaining-budget information for the
 // scoring strategy. Optional — nil (the default) means budget pressure does
 // not affect routing.
-func (mr *ModelRouter) SetBudgetSignal(b BudgetSignal) { mr.budget = b }
+func (mr *ModelRouter) SetBudgetSignal(b BudgetSignal) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.budget = b
+}
 
 // SetFailureRateSignal wires in a source of recent fast-model failure-rate
 // information for the scoring strategy. Optional — nil (the default) means
 // failure history does not affect routing.
-func (mr *ModelRouter) SetFailureRateSignal(f FailureRateSignal) { mr.failureRate = f }
+func (mr *ModelRouter) SetFailureRateSignal(f FailureRateSignal) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.failureRate = f
+}
 
 // Route evaluates the full strategy chain.
 func (mr *ModelRouter) Route(ctx context.Context, userMessage string) *RoutingDecision {
+	// Snapshot once so every strategy in this chain sees the same default,
+	// even if SetModels lands mid-evaluation.
+	defaultModel := mr.DefaultModel()
 	for _, s := range mr.strategies {
-		if decision := s.Route(ctx, userMessage, mr.defaultModel); decision != nil {
+		if decision := s.Route(ctx, userMessage, defaultModel); decision != nil {
 			return decision
 		}
 	}
-	return &RoutingDecision{Model: mr.defaultModel, Source: "default", Reason: "no strategy matched"}
+	return &RoutingDecision{Model: defaultModel, Source: "default", Reason: "no strategy matched"}
 }
 
 // ──── Strategies ────
@@ -112,9 +174,9 @@ type overrideStrategy struct {
 func (s *overrideStrategy) Name() string { return "override" }
 
 func (s *overrideStrategy) Route(_ context.Context, _ string, _ string) *RoutingDecision {
-	if s.router.override != "" {
+	if override := s.router.Override(); override != "" {
 		return &RoutingDecision{
-			Model:  s.router.override,
+			Model:  override,
 			Source: "override",
 			Reason: "user-specified model",
 		}
@@ -195,7 +257,7 @@ func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ st
 	length := len(userMessage)
 	if length >= hardLengthCeiling {
 		return &RoutingDecision{
-			Model:  c.router.defaultModel,
+			Model:  c.router.DefaultModel(),
 			Source: "classifier",
 			Reason: fmt.Sprintf("message length %d >= hard ceiling %d, forcing premium model", length, hardLengthCeiling),
 		}
@@ -223,8 +285,8 @@ func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ st
 	}
 
 	// Signal 4: recent fast-model failure rate on this project/session.
-	if c.router.failureRate != nil {
-		rate := c.router.failureRate.RecentFastModelFailureRate()
+	if fr := c.router.failureRateSignal(); fr != nil {
+		rate := fr.RecentFastModelFailureRate()
 		if rate > 0 {
 			contrib := rate * weightFailureRate
 			score += contrib
@@ -234,8 +296,8 @@ func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ st
 
 	// Signal 5: budget pressure. Tight budget makes the router *less* eager
 	// to upgrade — it subtracts from the score rather than adding to it.
-	if c.router.budget != nil {
-		remaining := c.router.budget.RemainingBudgetRatio()
+	if b := c.router.budgetSignal(); b != nil {
+		remaining := b.RemainingBudgetRatio()
 		if remaining < 1 {
 			penalty := (1 - remaining) * weightBudget
 			score -= penalty
@@ -250,15 +312,15 @@ func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ st
 
 	if score >= scoreThreshold {
 		return &RoutingDecision{
-			Model:  c.router.defaultModel,
+			Model:  c.router.DefaultModel(),
 			Source: "classifier",
 			Reason: fmt.Sprintf("score=%.2f >= %.2f [%s] -> premium model", score, scoreThreshold, reasonStr),
 		}
 	}
 
-	if c.router.fastModel != "" {
+	if fast := c.router.FastModel(); fast != "" {
 		return &RoutingDecision{
-			Model:  c.router.fastModel,
+			Model:  fast,
 			Source: "classifier",
 			Reason: fmt.Sprintf("score=%.2f < %.2f [%s] -> fast model", score, scoreThreshold, reasonStr),
 		}

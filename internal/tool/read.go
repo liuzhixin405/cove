@@ -139,6 +139,20 @@ func (t *ReadTool) readFileStream(path string, offset, limit int) (Result, error
 		}
 	}
 
+	// Scanner errors were previously dropped, so a line longer than the 1MB
+	// buffer (minified JS, a single-line JSON blob) or a mid-read IO failure
+	// silently returned a partial file that looked complete. Surfacing it is
+	// essential: a model that edits based on truncated content corrupts the file.
+	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return Result{Data: fmt.Sprintf(
+				"Error: %s contains a line longer than the 1MB read limit (stopped at line %d). "+
+					"Use bash with head/cut, or grep, to inspect it.", path, totalLines+1),
+				IsError: true}, nil
+		}
+		return Result{Data: fmt.Sprintf("Error: reading %s failed after line %d: %v", path, totalLines, err), IsError: true}, nil
+	}
+
 	if collected == 0 {
 		sb.WriteString("(no lines in range)\n")
 	}

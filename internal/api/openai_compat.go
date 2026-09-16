@@ -710,10 +710,10 @@ func formatOpenAICompatAPIError(status int, raw []byte, hadImage bool) error {
 		lower := strings.ToLower(msg)
 		if strings.Contains(msg, "unknown variant `image_url`") ||
 			(strings.Contains(lower, "image_url") && strings.Contains(lower, "expected `text`")) {
-			return fmt.Errorf("API error %d: 当前接口不支持图片输入(image_url)。请移除附件或切换支持视觉的模型/端点。原始错误: %s", status, truncate(msg, 300))
+			return &StatusError{Status: status, Msg: fmt.Sprintf("当前接口不支持图片输入(image_url)。请移除附件或切换支持视觉的模型/端点。原始错误: %s", truncate(msg, 300))}
 		}
 	}
-	return fmt.Errorf("API error %d: %s", status, truncate(msg, 500))
+	return &StatusError{Status: status, Msg: truncate(msg, 500)}
 }
 
 func isReasonerModel(model string) bool {

@@ -301,6 +301,12 @@ func (m *Marketplace) fetchClaudePluginsRepo(repoDir, sourceURL string) ([]Marke
 			if name == "" {
 				name = sub.Name()
 			}
+			// Drop entries whose name could not be used as a directory. Doing
+			// it here keeps a hostile index entry out of the index (and out of
+			// the lockfile) entirely, rather than only failing at install.
+			if err := ValidatePluginName(name); err != nil {
+				continue
+			}
 			version := cp.Version
 			if version == "" {
 				version = "latest"
@@ -336,7 +342,17 @@ func (m *Marketplace) fetchFileSource(path string) ([]MarketplaceEntry, error) {
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, fmt.Errorf("parse registry: %w", err)
 	}
-	return entries, nil
+	// registry.json comes from the cloned marketplace repo, so its names are
+	// remote input. Filter here so a hostile entry never reaches the index,
+	// the lockfile, or a path join.
+	kept := entries[:0]
+	for _, e := range entries {
+		if err := ValidatePluginName(e.Name); err != nil {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept, nil
 }
 
 func (m *Marketplace) fetchDirectorySource(dir string) ([]MarketplaceEntry, error) {
@@ -356,6 +372,9 @@ func (m *Marketplace) fetchDirectorySource(dir string) ([]MarketplaceEntry, erro
 		}
 		var manifest Manifest
 		if err := json.Unmarshal(data, &manifest); err != nil {
+			continue
+		}
+		if err := ValidatePluginName(manifest.Name); err != nil {
 			continue
 		}
 		result = append(result, MarketplaceEntry{
@@ -458,7 +477,14 @@ func (m *Marketplace) InstallFromGit(url string) error {
 }
 
 func (m *Marketplace) installFromSource(name, source, version string) error {
-	pluginDir := filepath.Join(m.dir, name)
+	// name reaches here from the marketplace index, which is built by reading
+	// manifest "name" fields out of a CLONED REMOTE REPOSITORY. It is joined
+	// into a path that is then git-cloned into and RemoveAll'd on failure, so
+	// an entry naming itself "../../../.ssh" redirected both outside m.dir.
+	pluginDir, err := pluginDirFor(m.dir, name)
+	if err != nil {
+		return err
+	}
 
 	// Check already installed
 	if _, err := os.Stat(pluginDir); err == nil {
@@ -555,7 +581,12 @@ func (m *Marketplace) Update(name string) error {
 		return fmt.Errorf("plugin %q not tracked (was it installed via marketplace?)", name)
 	}
 
-	pluginDir := filepath.Join(m.dir, name)
+	// The lockfile was written from index data, so the name is no more
+	// trustworthy here than at install time.
+	pluginDir, err := pluginDirFor(m.dir, name)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(pluginDir, ".git")); err != nil {
 		return fmt.Errorf("plugin %q is not a git repo, cannot update", name)
 	}
@@ -586,7 +617,11 @@ func (m *Marketplace) UpdateAll() (updated []string, errs []string) {
 		if !lock.AutoUpdate {
 			continue
 		}
-		pluginDir := filepath.Join(m.dir, name)
+		pluginDir, err := pluginDirFor(m.dir, name)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
 		if _, err := os.Stat(filepath.Join(pluginDir, ".git")); err != nil {
 			continue
 		}
@@ -719,6 +754,18 @@ func readManifestVersion(dir string) string {
 	return m.Version
 }
 
+// copyDir copies a plugin directory tree out of the marketplace cache.
+//
+// Symlinks are SKIPPED, not dereferenced. filepath.Walk reports them via Lstat,
+// so info.IsDir() is false and the previous os.ReadFile(path) followed the link
+// and copied the *target's* content into the plugin directory. A marketplace
+// repo — remote, untrusted content — could therefore ship a symlink named
+// like an ordinary plugin file and have ~/.ssh/id_rsa or ~/.aws/credentials
+// copied into a directory whose files are read back into model prompts.
+//
+// File modes are also normalized: info.Mode() on a symlink carries the
+// ModeSymlink bit, and passing it to WriteFile left the permission bits as
+// 0777 (world-writable) after masking.
 func copyDir(src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -729,14 +776,27 @@ func copyDir(src, dst string) error {
 			return err
 		}
 		target := filepath.Join(dst, rel)
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
+			return os.MkdirAll(target, 0o755)
+		}
+		// Anything that is not a regular file (device, socket, fifo) has no
+		// business in a plugin and must not be read.
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(target, data, info.Mode())
+		perm := os.FileMode(0o644)
+		if info.Mode().Perm()&0o111 != 0 {
+			perm = 0o755 // preserve the executable bit for hook scripts
+		}
+		return os.WriteFile(target, data, perm)
 	})
 }
 

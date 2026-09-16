@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestBuildUserMessageParsesInlineAttachments(t *testing.T) {
@@ -257,5 +260,76 @@ func TestResizeImage(t *testing.T) {
 	bounds2 := resized2.Bounds()
 	if bounds2.Dx() != 52 || bounds2.Dy() != 1568 {
 		t.Errorf("expected 52x1568, got %dx%d", bounds2.Dx(), bounds2.Dy())
+	}
+}
+
+// TestBuildTextPartKeepsValidUTF8 is the regression test for truncating an
+// attached text file on a byte boundary: the data is validated as UTF-8 and
+// then a raw body[:limit] cut a multi-byte rune in half, shipping invalid
+// UTF-8 to the provider.
+func TestBuildTextPartKeepsValidUTF8(t *testing.T) {
+	// Well over the 200KB text limit, all multi-byte runes, and sized so the
+	// limit lands mid-rune (200*1024 is not a multiple of 3).
+	data := []byte(strings.Repeat("配", 120*1024))
+	if !utf8.Valid(data) {
+		t.Fatal("fixture is not valid UTF-8")
+	}
+
+	part, _, _, err := buildTextPart("big.md", "/tmp/big.md", data, "text/markdown")
+	if err != nil {
+		t.Fatalf("buildTextPart: %v", err)
+	}
+	if !utf8.ValidString(part.Text) {
+		t.Fatal("attachment text is not valid UTF-8 after truncation")
+	}
+	if !strings.Contains(part.Text, "内容已截断") {
+		t.Fatal("truncation notice missing")
+	}
+}
+
+// TestDecodeImageRejectsDeclaredBomb covers the header check added so a small
+// file declaring enormous dimensions is refused instead of driving the
+// decoder's up-front width*height allocation.
+func TestDecodeImageRejectsDeclaredBomb(t *testing.T) {
+	// Build a real PNG, then rewrite IHDR to declare 60000x60000 (3.6e9 pixels)
+	// and fix the chunk CRC so the header parses. The pixel data stays tiny —
+	// which is exactly the shape of a decompression bomb.
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatalf("encode fixture: %v", err)
+	}
+	raw := buf.Bytes()
+
+	// Layout: 8-byte signature, then IHDR (4 len + 4 type + 13 data + 4 CRC).
+	const ihdrType = 8 + 4 // offset of the "IHDR" type field
+	const ihdrData = ihdrType + 4
+	binary.BigEndian.PutUint32(raw[ihdrData+0:], 60000) // width
+	binary.BigEndian.PutUint32(raw[ihdrData+4:], 60000) // height
+	crc := crc32.ChecksumIEEE(raw[ihdrType : ihdrData+13])
+	binary.BigEndian.PutUint32(raw[ihdrData+13:], crc)
+
+	_, err := decodeImage(raw)
+	if err == nil {
+		t.Fatal("decodeImage accepted a 60000x60000 declaration")
+	}
+	if !strings.Contains(err.Error(), "图片过大") {
+		t.Fatalf("expected a size refusal, got: %v", err)
+	}
+}
+
+// TestDecodeImageAcceptsSmallPNG guards against the header check rejecting
+// ordinary images.
+func TestDecodeImageAcceptsSmallPNG(t *testing.T) {
+	var buf bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode fixture: %v", err)
+	}
+	got, err := decodeImage(buf.Bytes())
+	if err != nil {
+		t.Fatalf("decodeImage rejected a valid 8x8 PNG: %v", err)
+	}
+	if got.Bounds().Dx() != 8 || got.Bounds().Dy() != 8 {
+		t.Fatalf("decoded bounds = %v, want 8x8", got.Bounds())
 	}
 }
