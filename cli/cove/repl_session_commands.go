@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/engine"
@@ -44,7 +43,7 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 	case input == "/compact":
 		withInterrupt(func(ctx context.Context) {
 			eng.Compact(ctx)
-			fmt.Println("上下文窗口已压缩。")
+			outln("上下文窗口已压缩。")
 		})
 		return true
 	default:

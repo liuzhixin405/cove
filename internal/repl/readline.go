@@ -727,3 +727,32 @@ func (lr *LineReader) fallbackRead() (string, error) {
 	}
 	return strings.TrimSpace(line), nil
 }
+
+// ---------------------------------------------------------------------------
+// The termui.Console protocol
+// ---------------------------------------------------------------------------
+
+// This package and internal/termui both grew the same console protocol —
+// erase the input line, print, redraw — but only this one knows whether there
+// is an input line on screen. So the ~140 call sites that go through termui
+// printed on top of the prompt while the editor's own writes did the right
+// thing.
+//
+// These methods let termui delegate to the editor instead. They are the same
+// package-level functions above, exposed as a value termui can hold without
+// importing this package (it declares the interface, we satisfy it).
+
+// PrintAbove implements termui.Console.
+func (lr *LineReader) PrintAbove(s string) { PrintAbove(s) }
+
+// StreamPrint implements termui.Console.
+func (lr *LineReader) StreamPrint(s string) { StreamPrint(s) }
+
+// Transient implements termui.Console.
+func (lr *LineReader) Transient(s string) { PrintTransientStatus(s) }
+
+// BeginOutput implements termui.Console.
+func (lr *LineReader) BeginOutput() { BeginOutput() }
+
+// EndOutput implements termui.Console.
+func (lr *LineReader) EndOutput() { EndOutput() }

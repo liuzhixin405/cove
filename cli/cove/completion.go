@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -246,13 +245,13 @@ func providerNameSuggestions() []string {
 }
 
 func showQuickCommands(commands []cmdEntry) {
-	fmt.Println("\n可用命令:")
+	outln("\n可用命令:")
 	for _, c := range commands {
 		if c.Type == "cmd" || c.Type == "config" || c.Type == "builtin" {
-			fmt.Printf("  %-16s %s\n", c.Name, c.Desc)
+			outf("  %-16s %s\n", c.Name, c.Desc)
 		}
 	}
-	fmt.Println()
+	outln()
 }
 
 func handleUnknownCmd(input string, cmdReg *command.Registry) bool {
@@ -264,13 +263,13 @@ func handleUnknownCmd(input string, cmdReg *command.Registry) bool {
 	}
 	suggestions := fuzzyMatch(name, cmdReg)
 	if len(suggestions) > 0 {
-		fmt.Printf("未知命令: /%s\n你是不是想输入?\n", name)
+		outf("未知命令: /%s\n你是不是想输入?\n", name)
 		for _, s := range suggestions {
-			fmt.Printf("  /%s\n", s)
+			outf("  /%s\n", s)
 		}
 		return true
 	}
-	fmt.Printf("未知命令: /%s。输入 /help 查看可用命令。\n", name)
+	outf("未知命令: /%s。输入 /help 查看可用命令。\n", name)
 	return true
 }
 

@@ -102,8 +102,12 @@ func RecordRuntime(sev Severity, cat Category, message string) {
 // persisted to the runtime error log. Call once at startup. This ensures
 // background-task failures (which previously only used log.*f to a possibly
 // silent stderr) are captured in the file for later troubleshooting.
+// It uses AddSink, not SetSink: a front end registers its own sink to DISPLAY
+// warnings, and with the old single-slot SetSink whichever ran last silently
+// disabled the other — wiring the UI would have quietly stopped error
+// persistence.
 func AttachToLogger() {
-	log.SetSink(func(level log.Level, msg string) {
+	log.AddSink(func(level log.Level, msg string) {
 		sev := SevWarning
 		if level >= log.Error {
 			sev = SevError

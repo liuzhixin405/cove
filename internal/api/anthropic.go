@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api/adapter"
+	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -544,13 +544,15 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		rawJSON := acc.JSONBuf.String()
 		if rawJSON == "" {
 			// Empty JSON buffer means this tool call was truncated (likely max_tokens hit)
-			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: empty input (response likely truncated, stop=%s)\n", acc.Name, stopReason)
+			// log, not os.Stderr: this is library code, and a direct terminal
+			// write from here corrupts a front end that manages its own frame.
+			log.Warnf("tool %s: empty input (response likely truncated, stop=%s)", acc.Name, stopReason)
 			continue
 		}
 		input, ok := RepairToolArguments(rawJSON)
 		if !ok {
 			// Incomplete/malformed JSON even after best-effort repair (tool_repair.go).
-			fmt.Fprintf(os.Stderr, "\n  [warn] tool %s: failed to parse input JSON even after repair (stop=%s, raw: %s)\n", acc.Name, stopReason, truncate(rawJSON, 200))
+			log.Warnf("tool %s: failed to parse input JSON even after repair (stop=%s, raw: %s)", acc.Name, stopReason, truncate(rawJSON, 200))
 			streamAcc.AddToolCall(adapter.ToolCall{
 				ID:   acc.ID,
 				Name: acc.Name,

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // restoreDefaults snapshots and restores the package-level default logger state
@@ -22,7 +23,8 @@ func restoreDefaults(t *testing.T) {
 	defaultLogger.mu.Unlock()
 
 	sinkMu.RLock()
-	oldSink := sink
+	oldSinks := make([]func(Level, string), len(sinks))
+	copy(oldSinks, sinks)
 	sinkMu.RUnlock()
 
 	t.Cleanup(func() {
@@ -32,7 +34,7 @@ func restoreDefaults(t *testing.T) {
 		defaultLogger.mu.Unlock()
 
 		sinkMu.Lock()
-		sink = oldSink
+		sinks = oldSinks
 		sinkMu.Unlock()
 	})
 }
@@ -370,5 +372,121 @@ func TestLevelConstantsAreOrdered(t *testing.T) {
 	}
 	if got := fmt.Sprint(levelNames[Debug], levelNames[Info], levelNames[Warn], levelNames[Error]); got != "DEBUGINFOWARNERROR" {
 		t.Fatalf("level names = %q", got)
+	}
+}
+
+// TestAddSinkDoesNotDisplaceOthers is the regression test for the single-slot
+// sink. internal/diagnostic registers a sink to PERSIST warnings and a front
+// end registers one to DISPLAY them; with SetSink, whichever ran second
+// silently disabled the first — so wiring the UI would have quietly stopped
+// error persistence with nothing to indicate it.
+func TestAddSinkDoesNotDisplaceOthers(t *testing.T) {
+	restoreDefaults(t)
+	ClearSinks()
+	SetWriter(io.Discard)
+
+	var mu sync.Mutex
+	var persisted, displayed []string
+
+	AddSink(func(_ Level, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		persisted = append(persisted, msg)
+	})
+	AddSink(func(_ Level, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		displayed = append(displayed, msg)
+	})
+
+	Warnf("disk %s", "full")
+	Errorf("boom")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(persisted) != 2 {
+		t.Errorf("first sink received %d entries, want 2: %v", len(persisted), persisted)
+	}
+	if len(displayed) != 2 {
+		t.Errorf("second sink received %d entries, want 2: %v", len(displayed), displayed)
+	}
+	if len(persisted) > 0 && persisted[0] != "disk full" {
+		t.Errorf("sink got %q, want the formatted message", persisted[0])
+	}
+}
+
+// TestSetSinkReplacesAll pins the documented difference from AddSink.
+func TestSetSinkReplacesAll(t *testing.T) {
+	restoreDefaults(t)
+	ClearSinks()
+	SetWriter(io.Discard)
+
+	var mu sync.Mutex
+	var first, second int
+	AddSink(func(Level, string) { mu.Lock(); first++; mu.Unlock() })
+	SetSink(func(Level, string) { mu.Lock(); second++; mu.Unlock() })
+
+	Warnf("x")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if first != 0 {
+		t.Errorf("SetSink did not replace the earlier sink (first=%d)", first)
+	}
+	if second != 1 {
+		t.Errorf("replacement sink received %d entries, want 1", second)
+	}
+}
+
+// TestSinkMayItselfLog pins the re-entrancy contract: a sink is allowed to
+// log. The dispatch snapshots the sink list and releases sinkMu BEFORE
+// invoking any sink, and takes the logger mutex only afterwards, so a
+// re-entrant Warnf from inside a sink must simply return.
+func TestSinkMayItselfLog(t *testing.T) {
+	restoreDefaults(t)
+	ClearSinks()
+	SetWriter(io.Discard)
+
+	// A plain depth guard, not sync.Once: calling once.Do from inside the
+	// function once.Do is running deadlocks by design, which would test the
+	// standard library rather than this package.
+	var mu sync.Mutex
+	depth, reentered := 0, false
+
+	AddSink(func(Level, string) {
+		mu.Lock()
+		depth++
+		d := depth
+		mu.Unlock()
+
+		if d == 1 {
+			Warnf("from inside the sink")
+		} else {
+			mu.Lock()
+			reentered = true
+			mu.Unlock()
+		}
+
+		mu.Lock()
+		depth--
+		mu.Unlock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		Warnf("trigger")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("logging from inside a sink deadlocked")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !reentered {
+		t.Error("the re-entrant log never reached the sink again")
 	}
 }

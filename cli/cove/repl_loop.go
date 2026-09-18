@@ -14,6 +14,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/mcp"
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/permission"
@@ -21,16 +22,23 @@ import (
 	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/skills"
 	"github.com/liuzhixin405/cove/internal/state"
+	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
 // replInteractive 为 true 时表示处于交互式 REPL，主循环会经 TakePermInputCh
-// 转发权限确认输入；-p 一次性模式为 false，权限回退到直接读 stdin。
+// 转发权限确认输入。默认 false：-p 一次性模式不安装授权处理器，需要授权的
+// 工具由引擎以 fail-closed 方式拒绝（见 Engine.authorizeTool）。
 var replInteractive bool
 
 func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
 
 	replInteractive = true
+
+	// The loop below relays answer lines to a waiting prompt via
+	// repl.TakePermInputCh, so tools that need approval can ask instead of being
+	// denied by the engine's "no interactive approval handler" path.
+	installPermissionPrompt(eng)
 
 	allCommands := buildCommandList(cmdReg, toolReg)
 
@@ -50,6 +58,15 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 	})
 
+	// Everything that writes to the terminal now goes through the editor, so
+	// output lands above the input line instead of on top of it. That covers
+	// the ~140 termui call sites, internal/log (whose default writer is
+	// os.Stderr, i.e. straight at the cursor) and the engine's own diagnostics.
+	termui.SetConsole(reader)
+	defer termui.SetConsole(nil)
+	log.SetWriter(replLogWriter{})
+	defer log.SetWriter(os.Stderr)
+
 	var attachedFiles []string
 
 	historyPickPending := false
@@ -57,7 +74,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 	tasks := newREPLTaskRunner(eng)
 
 	// Print the banner directly to the terminal (inline rendering).
-	fmt.Print(bannerText)
+	outp(bannerText)
 
 	// Ctrl+C while a task is running:
 
@@ -440,7 +457,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			if err != nil {
 
-				fmt.Printf("警告: 构建用户消息时出错: %v\n", err)
+				outf("警告: 构建用户消息时出错: %v\n", err)
 
 				continue
 
@@ -460,13 +477,13 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 					}); err == nil {
 
-						fmt.Printf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
+						outf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
 						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
 
 						if err != nil {
 
-							fmt.Printf("警告: 构建用户消息时出错: %v\n", err)
+							outf("警告: 构建用户消息时出错: %v\n", err)
 
 							continue
 
@@ -625,3 +642,16 @@ func handleSkillInvocation(input string, eng *engine.Engine) {
 
 }
 
+// replLogWriter routes internal/log through the editor.
+//
+// The logger's default writer is os.Stderr, which in a raw-mode terminal lands
+// at the cursor — i.e. on the input line the user is typing into. One Warnf
+// from a background goroutine was enough to scramble it.
+type replLogWriter struct{}
+
+func (replLogWriter) Write(p []byte) (int, error) {
+	if s := strings.TrimRight(string(p), "\r\n"); strings.TrimSpace(s) != "" {
+		repl.PrintAbove(s + "\r\n")
+	}
+	return len(p), nil
+}

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/log"
 )
 
 // MarketplaceEntry describes a plugin available in a marketplace.
@@ -243,19 +245,28 @@ type claudePluginJSON struct {
 func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry, error) {
 	repoDir := filepath.Join(m.cacheDir, sanitizeName(src.Name))
 
+	// git's output is CAPTURED, never inherited.
+	//
+	// cmd.Stderr = os.Stderr hands the child process the real terminal, which
+	// no front end can intercept: `git clone --progress` writes a live meter
+	// built from carriage returns and erase sequences, straight past whatever
+	// the UI thinks is on screen. The output goes to the log instead, and the
+	// front end decides what to do with it.
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
 		// Pull latest
 		cmd := exec.Command("git", "-C", repoDir, "pull", "--ff-only")
-		cmd.Stderr = os.Stderr
-		cmd.Run() // best-effort
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Debugf("marketplace pull %s: %v: %s", src.Name, err, strings.TrimSpace(string(out)))
+		}
 	} else {
 		// Clone
 		os.MkdirAll(filepath.Dir(repoDir), 0755)
-		fmt.Fprintf(os.Stderr, "正在克隆 marketplace 源: %s ...\n", src.Name)
-		cmd := exec.Command("git", "clone", "--depth=1", "--progress", src.URL, repoDir)
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("git clone %s failed: %w", src.URL, err)
+		log.Infof("正在克隆 marketplace 源: %s ...", src.Name)
+		// --progress is dropped along with the inherited terminal: it only
+		// draws a meter for a tty, and there is no tty to draw it on now.
+		cmd := exec.Command("git", "clone", "--depth=1", src.URL, repoDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("git clone %s failed: %s: %w", src.URL, strings.TrimSpace(string(out)), err)
 		}
 	}
 

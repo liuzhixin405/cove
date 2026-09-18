@@ -59,10 +59,10 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 		if strings.HasPrefix(input, "/") {
 			switch {
 			case input == "/tasks":
-				fmt.Println("headless 模式按行同步执行，不维护后台任务队列。")
+				outln("headless 模式按行同步执行，不维护后台任务队列。")
 				continue
 			case input == "/stop" || input == "/cancel":
-				fmt.Println("headless 模式当前没有可取消的后台任务。")
+				outln("headless 模式当前没有可取消的后台任务。")
 				continue
 			case input == "/attach" || strings.HasPrefix(input, "/attach "):
 				cwd, _ := os.Getwd()
@@ -84,12 +84,12 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 			}
 
 			// Skill invocation: bare "/<skillname>".
-			if tuiIsSkillInvocation(input, eng) {
-				fmt.Println(tuiSkillInvocationText(input, eng))
+			if skillInvocationRequested(input, eng) {
+				outln(skillInvocationText(input, eng))
 				continue
 			}
 			// Plugin command: run its prompt body as an engine turn.
-			if prompt, label, ok := tuiPluginCommandPrompt(input, pluginMgr); ok {
+			if prompt, label, ok := pluginCommandPrompt(input, pluginMgr); ok {
 				fmt.Fprintf(os.Stderr, "[插件命令: /%s]\n", label)
 				runHeadlessTurn(eng, api.Message{Role: "user", Content: prompt})
 				continue
@@ -177,7 +177,7 @@ func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) {
 		}
 		return
 	}
-	fmt.Println(resp)
+	outln(resp)
 	if eng.HasMessages() {
 		eng.SaveSession()
 	}

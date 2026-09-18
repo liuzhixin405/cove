@@ -52,7 +52,14 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			eng.OnPermissionPause = func() {
 				spinner.Stop()
 			}
-			eng.OnPermissionDone = nil
+			// Bring the indicator back once the prompt is answered, but only
+			// while nothing has been streamed yet: once the model has started
+			// talking, an animated spinner would overwrite the reply.
+			eng.OnPermissionDone = func() {
+				if firstDelta {
+					spinner.Start()
+				}
+			}
 			// Surface live output from long-running tools (bash/powershell) so the
 			// user can tell what a slow command is actually doing instead of only
 			// seeing the stall warning.
@@ -70,6 +77,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			}
 			defer func() {
 				eng.OnPermissionPause = nil
+				eng.OnPermissionDone = nil
 				eng.OnToolProgress = nil
 				eng.OnEngineOutput = nil
 			}()

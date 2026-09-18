@@ -109,3 +109,29 @@ func TestAuthorizeToolCallAutoModeDoesNotPrompt(t *testing.T) {
 		t.Fatalf("auto mode denied a write: %v", err)
 	}
 }
+
+// Nothing in cli/cove ever assigns Engine.PermissionPrompt, so every gated tool
+// in a real run reaches this branch. The error must name the missing handler
+// instead of reporting a rejection the user was never asked about.
+func TestAuthorizeToolCallWithoutPromptNamesTheMissingHandler(t *testing.T) {
+	writeTool := &mockTool{name: "write", readOnly: false, result: "written"}
+	eng := newTestEngine(&mockProvider{}, writeTool)
+	eng.config.PermissionMode = "default"
+	eng.perm.SetMode(permission.Default)
+	eng.PermissionPrompt = nil
+
+	tc := api.ToolCall{ID: "tc1", Name: "write", Input: map[string]any{"filePath": "a.go"}}
+	err := eng.authorizeToolCall(tc, tool.Context{}, nil)
+	if err == nil {
+		t.Fatal("a write was authorized with no interactive approval handler installed")
+	}
+	if !strings.Contains(err.Error(), "no interactive approval handler") {
+		t.Errorf("error = %v, want it to name the missing handler", err)
+	}
+	if strings.Contains(err.Error(), "user rejected") {
+		t.Errorf("error = %v, must not blame a rejection the user never saw", err)
+	}
+	if !strings.Contains(err.Error(), "write operation") {
+		t.Errorf("error = %v, want it to carry the tool's own reason", err)
+	}
+}

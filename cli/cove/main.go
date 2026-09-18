@@ -37,8 +37,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/skills"
 
 	"github.com/liuzhixin405/cove/internal/state"
-
-	"github.com/liuzhixin405/cove/internal/tui"
 )
 
 type providerReloader interface {
@@ -52,7 +50,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "9.0.8"
+	Version = "9.0.7"
 
 	BuildTime = "pro"
 
@@ -93,7 +91,7 @@ func main() {
 
 		case "-v", "--version":
 
-			fmt.Printf("cove %s (built %s, commit %s)\n", Version, BuildTime, GitCommit)
+			outf("cove %s (built %s, commit %s)\n", Version, BuildTime, GitCommit)
 
 			return
 
@@ -239,7 +237,7 @@ func main() {
 
 	if dumpPrompt {
 
-		fmt.Println(eng.SystemPrompt())
+		outln(eng.SystemPrompt())
 
 		return
 
@@ -253,79 +251,11 @@ func main() {
 
 	}
 
-	if useTUI() {
+	if useInteractiveShell() {
 
-		// Build the slash-command catalog for the palette and a runner that
-		// executes a command line and returns its rendered output.
-		var tuiCommands []tui.CommandItem
-		seenTUICommands := make(map[string]bool)
-		addTUICommand := func(name, desc string) {
-			k := strings.ToLower(strings.TrimSpace(name))
-			if k == "" || seenTUICommands[k] {
-				return
-			}
-			seenTUICommands[k] = true
-			tuiCommands = append(tuiCommands, tui.CommandItem{Name: name, Desc: desc})
-		}
-		for _, c := range cmdReg.All() {
-			addTUICommand(c.Name(), c.Description())
-		}
-		// Add missing built-in commands to the palette.
-		addTUICommand("help", "显示帮助信息")
-		addTUICommand("history", "查看和继续历史会话")
-		addTUICommand("history clean", "清洗历史会话噪音并备份")
-		addTUICommand("model", "设置模型")
-		addTUICommand("provider", "设置提供商")
-		addTUICommand("api-key", "保存 API 密钥")
-		addTUICommand("base-url", "设置自定义接口地址")
-		addTUICommand("mode", "设置权限模式 (default|plan|auto|bypass)")
-		addTUICommand("budget", "设置每会话预算上限($)")
-		addTUICommand("stop", "取消当前运行的任务")
-		addTUICommand("cancel", "取消当前运行的任务")
-		addTUICommand("tasks", "查看运行中的任务")
-		addTUICommand("compact", "压缩对话历史")
-		addTUICommand("exit", "退出程序")
-		addTUICommand("quit", "退出程序")
-		runCommand := func(line string) string {
-			parts := strings.Fields(line)
-			if len(parts) == 0 {
-				return ""
-			}
-			name := strings.TrimPrefix(parts[0], "/")
-			cmd, ok := cmdReg.Find(name)
-			if !ok {
-				return "未知命令: /" + name + "（输入 /help 查看可用命令）"
-			}
-			cwd, _ := os.Getwd()
-			out, err := cmd.Execute(context.Background(), command.Input{
-				Args:              parts[1:],
-				Cwd:               cwd,
-				Config:            cfg,
-				SaveConfig:        config.Save,
-				Engine:            replEngineAdapter{eng: eng},
-				SessionStore:      eng.Store(),
-				PluginManager:     pluginMgr,
-				SkillManager:      skillMgr,
-				MemoryStore:       memStore,
-				PermissionManager: permMgr,
-				MCPPool:           mcpPool,
-				ProjectContext:    projCtx,
-				AppState:          appState,
-			})
-			if err != nil {
-				return "错误: " + err.Error()
-			}
-			msg := out.Message
-			if out.Data != "" {
-				if msg != "" {
-					msg += "\n"
-				}
-				msg += out.Data
-			}
-			return msg
-		}
-
-		runTUI(Version, bannerText, debugMode, eng, cfg, projCtx, permMgr, tuiCommands, runCommand, cmdReg, toolReg, pluginMgr)
+		// The interactive shell builds its own command catalogue from the
+		// registry (buildCommandList), so nothing has to be assembled here.
+		runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
 		return
 
@@ -356,7 +286,7 @@ func withInterrupt(f func(ctx context.Context)) {
 
 		case sig := <-sigCh:
 
-			fmt.Printf("\r\n[中断 - 收到信号 %v]\r\n", sig)
+			outf("\r\n[中断 - 收到信号 %v]\r\n", sig)
 
 			cancel()
 
@@ -511,7 +441,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 			}); err == nil {
 
-				fmt.Printf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
+				outf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
 				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
 
@@ -545,7 +475,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 	}
 
-	fmt.Println(resp)
+	outln(resp)
 
 }
 
@@ -640,7 +570,7 @@ func runDoctor() {
 
 	out, _ := c.Execute(context.Background(), command.Input{Cwd: cwd})
 
-	fmt.Println(out.Message)
+	outln(out.Message)
 
 }
 
@@ -838,17 +768,17 @@ func listSessions() {
 
 	if len(records) == 0 {
 
-		fmt.Println("没有找到任何会话记录。")
+		outln("没有找到任何会话记录。")
 
 		return
 
 	}
 
-	fmt.Printf("%d 条会话记录:\n", len(records))
+	outf("%d 条会话记录:\n", len(records))
 
 	for _, r := range records {
 
-		fmt.Printf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
+		outf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
 
 	}
 
@@ -856,7 +786,7 @@ func listSessions() {
 
 func printCLIHelp() {
 
-	fmt.Println(`cove 是一款基于 Go 的 AI 终端代理工具。
+	outln(`cove 是一款基于 Go 的 AI 终端代理工具。
 
 
 用法:
@@ -879,7 +809,8 @@ func printCLIHelp() {
 
  cove -r <id>               恢复之前的会话记录
 
-
+
+
 
  cove --profile <name>      使用指定 profile 启动
 
@@ -949,7 +880,7 @@ REPL 内置命令:
 
  /cd, /help, /exit`)
 
-	fmt.Println("\n提示: 在 prompt 中可以使用 @文件路径 的形式来附带文件。例如: 帮我分析这段日志 @logs/app.log")
+	outln("\n提示: 在 prompt 中可以使用 @文件路径 的形式来附带文件。例如: 帮我分析这段日志 @logs/app.log")
 
 }
 

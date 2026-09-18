@@ -11,6 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charmbracelet/x/ansi"
+	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type Transport interface {
@@ -47,11 +51,28 @@ func NewStdioTransport(command string, args []string, env map[string]string) (*s
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+
+	// The child's stderr is PIPED, not inherited.
+	//
+	// cmd.Stderr = os.Stderr gave a third-party MCP server the real terminal.
+	// That is the one output path no Go-side change elsewhere can intercept:
+	// the server is free to emit progress meters, carriage returns and cursor
+	// moves, which land past whatever the UI believes is on screen and leave a
+	// pinned input box drifting. It is also a correctness problem on its own —
+	// a chatty server could scribble over the conversation at any moment.
+	//
+	// Draining it is mandatory: an unread pipe fills its buffer and then the
+	// child blocks forever on its next write.
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", command, err)
 	}
+
+	go drainServerStderr(command, stderr)
 
 	return &stdioTransport{
 		cmd:    cmd,
@@ -59,6 +80,45 @@ func NewStdioTransport(command string, args []string, env map[string]string) (*s
 		stdout: stdout,
 		reader: bufio.NewReader(stdout),
 	}, nil
+}
+
+// maxServerStderrLine bounds one logged line from a misbehaving server.
+const maxServerStderrLine = 2000
+
+// drainServerStderr consumes the child's stderr and logs it at debug level.
+//
+// It exits when the pipe closes, which happens when the process exits — so it
+// cannot outlive the server it belongs to.
+func drainServerStderr(name string, r io.ReadCloser) {
+	defer r.Close()
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 8*1024), 256*1024)
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Strip control sequences before logging: the whole point of piping
+		// this is that the server's escapes must never reach a terminal, and
+		// the log's writer may well BE the terminal.
+		log.Debugf("mcp %s: %s", name, sanitizeServerLine(line))
+	}
+}
+
+// sanitizeServerLine removes every escape sequence and bare control byte from
+// one line of third-party output, and clips it on a rune boundary.
+func sanitizeServerLine(s string) string {
+	s = ansi.Strip(s)
+	s = strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return ' '
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	return textutil.ClipBytes(s, maxServerStderrLine, "…")
 }
 
 func (t *stdioTransport) Send(ctx context.Context, msg any) error {

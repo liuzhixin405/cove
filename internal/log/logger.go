@@ -27,19 +27,52 @@ type Logger struct {
 
 var defaultLogger = &Logger{level: Info, writer: os.Stderr}
 
-// sink, if set, receives every Warn/Error log line in addition to the writer.
-// It lets a higher-level package (e.g. diagnostic) persist problems to a file
-// without the log package taking a dependency on it (avoids an import cycle).
+// sinks receive every Warn/Error log line in addition to the writer. They let
+// higher-level packages consume problems without this package depending on
+// them (which would be an import cycle).
+//
+// There is a LIST rather than one slot because two independent consumers are
+// legitimate at the same time: internal/diagnostic persists problems to
+// ~/.cove/errors.log, and a front end displays them. With a single slot
+// whichever registered last silently disabled the other — so wiring the UI
+// would have stopped error persistence, with nothing to indicate it.
 var (
 	sinkMu sync.RWMutex
-	sink   func(level Level, msg string)
+	sinks  []func(level Level, msg string)
 )
 
-// SetSink registers a callback invoked for every Warn/Error log entry. Pass nil
-// to disable. The callback must be cheap and non-blocking; it runs inline.
+// AddSink registers a callback invoked for every Warn/Error log entry.
+// Multiple sinks may be registered; each is called in registration order.
+// The callback must be cheap and non-blocking: it runs inline on the logging
+// goroutine.
+func AddSink(fn func(level Level, msg string)) {
+	if fn == nil {
+		return
+	}
+	sinkMu.Lock()
+	sinks = append(sinks, fn)
+	sinkMu.Unlock()
+}
+
+// SetSink replaces all registered sinks with fn. Pass nil to remove them all.
+//
+// Prefer AddSink: this exists for the startup path that legitimately owns the
+// whole list, and replacing the list is how a caller would accidentally
+// disable another package's sink.
 func SetSink(fn func(level Level, msg string)) {
 	sinkMu.Lock()
-	sink = fn
+	if fn == nil {
+		sinks = nil
+	} else {
+		sinks = []func(Level, string){fn}
+	}
+	sinkMu.Unlock()
+}
+
+// ClearSinks removes every registered sink. Tests use it to isolate.
+func ClearSinks() {
+	sinkMu.Lock()
+	sinks = nil
 	sinkMu.Unlock()
 }
 
@@ -66,10 +99,16 @@ func (l *Logger) log(level Level, format string, args ...any) {
 	// problems are always persisted even when the console is quiet (Info level).
 	if level >= Warn {
 		sinkMu.RLock()
-		fn := sink
+		// Snapshot under the lock, then call outside it: a sink is free to log
+		// (a UI sink might), and holding sinkMu across that would deadlock.
+		fns := make([]func(Level, string), len(sinks))
+		copy(fns, sinks)
 		sinkMu.RUnlock()
-		if fn != nil {
-			fn(level, fmt.Sprintf(format, args...))
+		if len(fns) > 0 {
+			msg := fmt.Sprintf(format, args...)
+			for _, fn := range fns {
+				fn(level, msg)
+			}
 		}
 	}
 	// The level check moved inside the lock: it reads l.level, which SetLevel

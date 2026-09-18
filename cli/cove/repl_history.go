@@ -77,7 +77,7 @@ func autoSaveSession(eng *engine.Engine) {
 		}
 		ch.Add(sessionID, model, eng.CostTracker())
 		ch.Save()
-		fmt.Println("会话已自动保存。")
+		outln("会话已自动保存。")
 	}
 }
 

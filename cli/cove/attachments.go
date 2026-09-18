@@ -77,7 +77,7 @@ func handleAttachCommand(input, cwd string, attached *[]string) {
 
 	args, err := splitQuotedFields(argsText)
 	if err != nil {
-		fmt.Printf("附件命令解析失败: %v\n", err)
+		outf("附件命令解析失败: %v\n", err)
 		return
 	}
 	if len(args) == 0 {
@@ -90,7 +90,7 @@ func handleAttachCommand(input, cwd string, attached *[]string) {
 		printAttachmentList(*attached)
 	case "clear":
 		*attached = nil
-		fmt.Println("已清空附件列表")
+		outln("已清空附件列表")
 	case "remove", "rm":
 		removeAttachment(args[1:], attached)
 	case "add":
@@ -102,7 +102,7 @@ func handleAttachCommand(input, cwd string, attached *[]string) {
 
 func addAttachments(paths []string, cwd string, attached *[]string) {
 	if len(paths) == 0 {
-		fmt.Println("用法: /attach <文件...> | /attach list | /attach remove <序号> | /attach clear")
+		outln("用法: /attach <文件...> | /attach list | /attach remove <序号> | /attach clear")
 		return
 	}
 	seen := map[string]bool{}
@@ -113,7 +113,7 @@ func addAttachments(paths []string, cwd string, attached *[]string) {
 	for _, rawPath := range paths {
 		absPath, err := normalizeAttachmentPath(cwd, rawPath)
 		if err != nil {
-			fmt.Printf("跳过 %s: %v\n", rawPath, err)
+			outf("跳过 %s: %v\n", rawPath, err)
 			continue
 		}
 		if seen[absPath] {
@@ -123,34 +123,34 @@ func addAttachments(paths []string, cwd string, attached *[]string) {
 		seen[absPath] = true
 		added++
 	}
-	fmt.Printf("已挂载 %d 个附件，当前共 %d 个。\n", added, len(*attached))
+	outf("已挂载 %d 个附件，当前共 %d 个。\n", added, len(*attached))
 	printAttachmentList(*attached)
 }
 
 func removeAttachment(args []string, attached *[]string) {
 	if len(args) == 0 {
-		fmt.Println("用法: /attach remove <序号>")
+		outln("用法: /attach remove <序号>")
 		return
 	}
 	idx, err := strconv.Atoi(args[0])
 	if err != nil || idx < 1 || idx > len(*attached) {
-		fmt.Printf("无效附件序号: %s\n", args[0])
+		outf("无效附件序号: %s\n", args[0])
 		return
 	}
 	removed := (*attached)[idx-1]
 	*attached = append((*attached)[:idx-1], (*attached)[idx:]...)
-	fmt.Printf("已移除附件: %s\n", removed)
+	outf("已移除附件: %s\n", removed)
 	printAttachmentList(*attached)
 }
 
 func printAttachmentList(paths []string) {
 	if len(paths) == 0 {
-		fmt.Println("当前没有挂载附件。用 /attach <文件...> 添加。")
+		outln("当前没有挂载附件。用 /attach <文件...> 添加。")
 		return
 	}
-	fmt.Println("当前挂载附件:")
+	outln("当前挂载附件:")
 	for i, p := range paths {
-		fmt.Printf("  %d. %s\n", i+1, p)
+		outf("  %d. %s\n", i+1, p)
 	}
 }
 

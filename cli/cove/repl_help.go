@@ -27,7 +27,7 @@ func showConfig() {
 		"api_key_set":     pc.APIKey != "",
 		"mcp_servers":     len(cfg.MCPServers),
 	}, "", "  ")
-	fmt.Println(string(data))
+	outln(string(data))
 }
 
 func providerHelpLine() string {
@@ -39,74 +39,74 @@ func providerEnvHelpLine() string {
 }
 
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
-	fmt.Println("\n=== cove v" + Version + " ===")
-	fmt.Println("\n供应商 / 模型:")
-	fmt.Println("  /model <名称>       设置模型")
-	fmt.Println("  /profile ...        管理 profile（list/switch/save/delete/show）")
-	fmt.Println(providerHelpLine())
-	fmt.Println("  /api-key <密钥>     保存 API 密钥")
-	fmt.Println("  /base-url <地址>    设置自定义接口地址")
-	fmt.Println("  /record ...         控制录制（status/start/stop）")
-	fmt.Println("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
-	fmt.Println("  /budget <金额|auto> 设置每会话预算上限 ($)，auto 为一键提升")
-	fmt.Println("  /cost               查看用量和费用")
-	fmt.Println("  /ratelimit          查看 API 速率限制状态")
-	fmt.Println("  /attach <文件...>   挂载图片或文件；list/remove/clear 管理列表")
-	fmt.Println("  /config             查看完整配置")
-	fmt.Println("\n会话:")
-	fmt.Println("  /compact            压缩对话历史")
-	fmt.Println("  /undo               回退到上一个检查点")
-	fmt.Println("  /checkpoints        列出所有检查点")
-	fmt.Println("  /history            查看和继续历史会话")
-	fmt.Println("  /history clean      清洗历史会话噪音并自动备份")
-	fmt.Println("  /resume [id]        恢复已保存的会话")
-	fmt.Println("  /memory             管理持久化记忆")
-	fmt.Println("\n后台任务:")
-	fmt.Println("  /tasks              查看运行中/排队的任务")
-	fmt.Println("  /stop               取消当前运行的任务 (别名 /cancel)")
-	fmt.Println("\n系统:")
-	fmt.Println("  /mcp                管理 MCP 服务器")
-	fmt.Println("  /plugin             管理插件")
-	fmt.Println("  /skills             列出技能")
-	fmt.Println("\n命令:")
+	outln("\n=== cove v" + Version + " ===")
+	outln("\n供应商 / 模型:")
+	outln("  /model <名称>       设置模型")
+	outln("  /profile ...        管理 profile（list/switch/save/delete/show）")
+	outln(providerHelpLine())
+	outln("  /api-key <密钥>     保存 API 密钥")
+	outln("  /base-url <地址>    设置自定义接口地址")
+	outln("  /record ...         控制录制（status/start/stop）")
+	outln("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
+	outln("  /budget <金额|auto> 设置每会话预算上限 ($)，auto 为一键提升")
+	outln("  /cost               查看用量和费用")
+	outln("  /ratelimit          查看 API 速率限制状态")
+	outln("  /attach <文件...>   挂载图片或文件；list/remove/clear 管理列表")
+	outln("  /config             查看完整配置")
+	outln("\n会话:")
+	outln("  /compact            压缩对话历史")
+	outln("  /undo               回退到上一个检查点")
+	outln("  /checkpoints        列出所有检查点")
+	outln("  /history            查看和继续历史会话")
+	outln("  /history clean      清洗历史会话噪音并自动备份")
+	outln("  /resume [id]        恢复已保存的会话")
+	outln("  /memory             管理持久化记忆")
+	outln("\n后台任务:")
+	outln("  /tasks              查看运行中/排队的任务")
+	outln("  /stop               取消当前运行的任务 (别名 /cancel)")
+	outln("\n系统:")
+	outln("  /mcp                管理 MCP 服务器")
+	outln("  /plugin             管理插件")
+	outln("  /skills             列出技能")
+	outln("\n命令:")
 	for _, c := range cmdReg.All() {
-		fmt.Printf("  /%-16s %s\n", c.Name(), c.Description())
+		outf("  /%-16s %s\n", c.Name(), c.Description())
 	}
 	if pluginMgr != nil {
 		if pcmds := pluginMgr.CommandPrompts(); len(pcmds) > 0 {
-			fmt.Println("\n插件命令:")
+			outln("\n插件命令:")
 			for name, c := range pcmds {
-				fmt.Printf("  /%-16s %s (%s)\n", name, c.Description, c.Plugin)
+				outf("  /%-16s %s (%s)\n", name, c.Description, c.Plugin)
 			}
 		}
 	}
-	fmt.Println("\n工具:")
+	outln("\n工具:")
 	for _, t := range toolReg.All() {
 		d := t.Def()
 		ro := " "
 		if d.IsReadOnly {
 			ro = "R"
 		}
-		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
+		outf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
-	fmt.Println("\n" + providerEnvHelpLine())
-	fmt.Println("启动参数: -p <提示> [--image <路径>] [--file <路径>] | --profile <name> | --record <dir> | --replay <dir> | -d --debug | -v --version | --doctor | --config")
-	fmt.Println("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
-	fmt.Println()
+	outln("\n" + providerEnvHelpLine())
+	outln("启动参数: -p <提示> [--image <路径>] [--file <路径>] | --profile <name> | --record <dir> | --replay <dir> | -d --debug | -v --version | --doctor | --config")
+	outln("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
+	outln()
 }
 
 // printTools prints the list of available tools and their descriptions.
 func printTools(toolReg *tool.Registry, pluginMgr *plugin.Manager) {
-	fmt.Println("工具:")
+	outln("工具:")
 	for _, t := range toolReg.All() {
 		d := t.Def()
 		ro := " "
 		if d.IsReadOnly {
 			ro = "R"
 		}
-		fmt.Printf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
+		outf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
-	fmt.Println()
+	outln()
 }
 
 func missingAPIKeyMessage(provider string) string {

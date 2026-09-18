@@ -37,6 +37,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
 const MaxIterations = 200
@@ -108,8 +109,26 @@ type Engine struct {
 	enhancedRepoMap       *repomap.EnhancedGenerator // incremental repo map (P2)
 	iterCount             int                        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex                 // lock for interactive permission prompts
+	// out is where every user-facing line and block goes once a front end has
+	// wired one with SetOutput. nil means "not wired", which falls through to
+	// the deprecated OnEngineOutput callback below, and to silence when that is
+	// unset too.
+	//
+	// What is deliberately gone is the old os.Stderr fallback. It was the single
+	// most dangerous write in the codebase: a front end with a live region keeps
+	// the input box pinned by tracking how many rows it drew, and a stray stderr
+	// write invalidates that bookkeeping and leaves the prompt drifting. Silence
+	// when unwired is strictly better.
+	//
+	// It must default to nil rather than uiout.Discard: defaulting to Discard
+	// makes the sink branch always win, which silently swallowed every engine
+	// diagnostic on both front ends (neither calls SetOutput yet).
+	out uiout.Sink
+
 	// OnEngineOutput, if set, receives engine diagnostic lines
-	// (tool progress, spinner, etc.) instead of writing to stderr.
+	// (tool progress, spinner, etc.). Deprecated: set a Sink with SetOutput
+	// instead. Kept so the existing front ends keep working during the
+	// migration; when both are set the Sink wins.
 	OnEngineOutput    func(line string)
 	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
 	OnPermissionPause func()                       // called before permission prompt to pause spinners
@@ -738,6 +757,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	go e.runStallMonitor(stopMonitor)
 	defer close(stopMonitor)
 
+	// Whatever stage the turn ends in — answered, errored, cancelled — the
+	// transient status must not outlive it, or a front end is left showing
+	// "思考中…" over an idle prompt.
+	defer e.activity("")
+
 	if userMessage.Role == "" {
 		userMessage.Role = "user"
 	}
@@ -860,6 +884,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			walker = termui.NewWalkingIndicator("thinking...")
 			walker.Start()
 		}
+		// A front end with a sink gets the same information as transient
+		// status, which it renders inside its own frame.
+		e.activity("思考中…")
 
 		callbacks := streamCallbacks{onDelta: onDelta, onReasoning: onReasoning}
 		if e.replayEnabled {
@@ -1018,10 +1045,17 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 		}
 
+		// Input and Elapsed exist so the result can be turned into a
+		// render.Block after the batch drains rather than at the call site.
+		// Emitting from inside the parallel branch would interleave headers and
+		// summaries of concurrent calls unpredictably; the loop below keeps the
+		// transcript in tool-call order regardless of completion order.
 		type toolResult struct {
 			ID      string
 			Name    string
+			Input   map[string]any
 			Content string
+			Elapsed time.Duration
 		}
 		results := make([]toolResult, len(resp.ToolCalls))
 
@@ -1070,23 +1104,25 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					go func(idx int, tcall api.ToolCall) {
 						defer wg.Done()
 						defer func() { <-sem }()
+						started := time.Now()
 						defer func() {
 							if r := recover(); r != nil {
-								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: fmt.Sprintf("Error: tool panicked: %v", r)}
+								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Input: tcall.Input, Content: fmt.Sprintf("Error: tool panicked: %v", r), Elapsed: time.Since(started)}
 							}
 						}()
 						if e.OnToolStart != nil {
 							e.OnToolStart(tcall.Name)
 						}
 						res := e.executeTool(ctx, tcall)
-						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Content: res}
+						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Input: tcall.Input, Content: res, Elapsed: time.Since(started)}
 					}(i, tc)
 				} else {
 					if e.OnToolStart != nil {
 						e.OnToolStart(tc.Name)
 					}
+					started := time.Now()
 					res := e.executeTool(ctx, tc)
-					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
+					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
 				}
 			}
 			wg.Wait()
@@ -1098,19 +1134,27 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				if e.OnToolStart != nil {
 					e.OnToolStart(tc.Name)
 				}
-				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: e.executeTool(ctx, tc)}
+				started := time.Now()
+				res := e.executeTool(ctx, tc)
+				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
 			}
 		} else {
 			for i, tc := range resp.ToolCalls {
 				if !e.config.Debug {
-					// Show tool start
-					e.engineOutput(fmt.Sprintf("\r  \x1b[2m? [%s]...\x1b[0m", tc.Name))
+					// Transient "running X…" notice. It is Activity, not history:
+					// the previous code wrote it as a diagnostic line prefixed
+					// with a bare CR, expecting the terminal to overwrite it a
+					// moment later. That only works when nothing else writes in
+					// between, and it is precisely the kind of cursor-steering
+					// byte a front end with a live region must never receive.
+					e.activity(fmt.Sprintf("执行 %s…", tc.Name))
 				}
 				if e.OnToolStart != nil {
 					e.OnToolStart(tc.Name)
 				}
+				started := time.Now()
 				res := e.executeTool(ctx, tc)
-				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Content: res}
+				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
 			}
 		}
 
@@ -1123,7 +1167,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		for _, r := range results {
 			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
-				e.engineOutput(fmt.Sprintf("\r\x1b[K%s\n", formatToolLine(r.Name, summarizeResult(r.Content), isErr)))
+				e.activity("")
+				e.emitToolResult(r.Name, r.Input, r.Content, isErr, r.Elapsed)
 			}
 			// Session notes capture (always, regardless of debug mode)
 			if e.sessionNotes != nil {
@@ -1205,11 +1250,20 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	return "", fmt.Errorf("max iterations (%d) reached, cost: %s", MaxIterations, e.costTracker.Summary())
 }
 
+// shouldShowWalkingIndicator reports whether the engine may draw the legacy
+// in-terminal spinner itself.
+//
+// Only when NO front end is listening. A front end renders its own status, and
+// this indicator writes cursor-steering bytes straight to the terminal
+// (\x1b[0m\x1b[?25h\r\x1b[K) — which is precisely what desynchronises a
+// program that keeps its input box pinned by counting the rows it drew. The
+// sink check is not optional: a shell that wires a Sink and no callback would
+// otherwise get the spinner scribbled through its frame.
 func (e *Engine) shouldShowWalkingIndicator(iter int) bool {
 	if iter <= 0 || e.config.Debug {
 		return false
 	}
-	return e.OnEngineOutput == nil
+	return e.OnEngineOutput == nil && e.out == nil
 }
 
 func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string) {
@@ -1495,7 +1549,11 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 	}
 
 	if e.PermissionPrompt == nil {
-		return fmt.Errorf("permission denied for %s: user rejected", tc.Name)
+		// No interactive handler is installed, so this call can never be approved.
+		// Say so plainly instead of blaming the user for a rejection they never saw.
+		return fmt.Errorf(
+			"permission denied for %s: no interactive approval handler is installed (reason: %s); run /mode bypass or add an allow rule",
+			tc.Name, reason)
 	}
 	if e.OnPermissionPause != nil {
 		e.OnPermissionPause()
@@ -1848,6 +1906,16 @@ func (e *Engine) SaveSession() {
 // HasMessages returns true if there are conversation messages worth saving.
 func (e *Engine) HasMessages() bool { return len(e.messages) > 0 }
 
+// SessionID returns the current session's identifier, or "" when no session
+// has been started. A front end uses it to namespace per-session scratch
+// files, so they cannot collide between two cove instances.
+func (e *Engine) SessionID() string {
+	if e.session == nil {
+		return ""
+	}
+	return e.session.ID
+}
+
 func countTokens(msgs []api.Message) int {
 	n := 0
 	for i := range msgs {
@@ -2003,21 +2071,6 @@ func truncate(s string, n int) string {
 	return textutil.ClipRunes(s, n)
 }
 
-// ANSI formatting for tool output lines
-func formatToolLine(name, summary string, isError bool) string {
-	const (
-		reset = "\x1b[0m"
-		dim   = "\x1b[2m"
-		cyan  = "\x1b[36m"
-		red   = "\x1b[31m"
-		green = "\x1b[32m"
-	)
-	if isError {
-		return fmt.Sprintf("  %s?%s %s[%s]%s %s%s%s", red, reset, red, name, reset, red, summary, reset)
-	}
-	return fmt.Sprintf("  %s?%s %s[%s]%s %s%s%s", green, reset, cyan, name, reset, dim, summary, reset)
-}
-
 // runTurnEndPipeline executes quiet post-turn persistence only.
 func (e *Engine) runTurnEndPipeline() {
 	// Capture session diff for change tracking
@@ -2118,12 +2171,56 @@ func (e *Engine) SessionNotes() *notes.SessionNotes {
 
 // engineOutput emits a diagnostic line to the registered callback,
 // or falls back to stderr.
+// engineOutput emits one diagnostic line to the user.
+//
+// There is deliberately no os.Stderr fallback any more. Writing to the
+// terminal from here, behind a front end's back, is what corrupts a pinned
+// input box (see the `out` field). An unwired engine is silent; SetOutput or
+// OnEngineOutput makes it visible.
 func (e *Engine) engineOutput(line string) {
-	if e.OnEngineOutput != nil {
-		e.OnEngineOutput(line)
+	if e.out != nil {
+		e.out.Line(strings.TrimRight(line, "\r\n"))
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s", line)
+	if e.OnEngineOutput != nil {
+		e.OnEngineOutput(line)
+	}
+}
+
+// activity updates the transient status text ("执行 bash…"). Passing "" clears
+// it.
+//
+// It is explicitly not history: a front end overwrites it in place, and one
+// without a live region drops it. That is the whole difference from
+// engineOutput, and the reason a "running X…" notice must come through here —
+// as a line it would accumulate one dead row per tool call.
+// It is sink-only on purpose. There is no fallback to a line, because the two
+// front ends without a sink already show progress their own way — the legacy
+// full-screen shell through OnToolStart, the unwired case through the walking
+// indicator — and the previous code's fallback was a "\r"-prefixed line that
+// only looks transient if nothing else writes before the terminal overwrites
+// it. In a piped log it is just garbage.
+func (e *Engine) activity(s string) {
+	if e.out != nil {
+		e.out.Activity(s)
+	}
+}
+
+// SetOutput installs the sink that receives every user-facing line and block.
+//
+// Passing nil unwires it, which falls back to the deprecated OnEngineOutput
+// callback (and to silence when that is unset). It never re-enables a direct
+// terminal write.
+func (e *Engine) SetOutput(s uiout.Sink) {
+	e.out = s
+}
+
+// Output returns the engine's current sink. Never nil.
+func (e *Engine) Output() uiout.Sink {
+	if e.out == nil {
+		return uiout.Discard
+	}
+	return e.out
 }
 
 // WirePlanExecutor sets up the PlanExecuteFunc on the runtime so the
