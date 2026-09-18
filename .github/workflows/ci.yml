@@ -49,7 +49,38 @@ jobs:
           if [ "${{ matrix.os }}" != "windows-latest" ]; then
             RACE="-race"
           fi
-          go test -v ${RACE} -coverprofile=coverage.txt ./...
+          set -o pipefail
+          go test -v ${RACE} -coverprofile=coverage.txt ./... 2>&1 | tee test-output.txt
+
+      # TEMPORARY debug aid: mirrors the interesting parts of the test output
+      # into check-run annotations, which are readable without access to the
+      # job log page. Remove once CI is green.
+      - name: Publish failure summary
+        if: failure() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          try:
+              data = open("test-output.txt", "r", errors="replace").read()
+          except OSError:
+              print("::error::no test-output.txt captured")
+              sys.exit(0)
+          data = re.sub(r"\x1b\[[0-9;]*m", "", data)
+          lines = data.splitlines()
+          idx = set()
+          for i, ln in enumerate(lines):
+              if re.match(r"^\s*(--- FAIL|FAIL|WARNING: DATA RACE|panic:|fatal error:)", ln):
+                  for j in range(max(0, i - 2), min(len(lines), i + 14)):
+                      idx.add(j)
+          keep = [lines[i] for i in sorted(idx)]
+          summary = "\n".join(keep) if any(x.strip() for x in keep) else data[-6000:]
+          summary = summary[:9000]
+          print(f"::error::captured {len(summary)} bytes of failure detail")
+          for k in range(0, len(summary), 700):
+              chunk = summary[k:k+700].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error::part{k//700}: {chunk}")
+          PY
 
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
