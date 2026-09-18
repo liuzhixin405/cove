@@ -106,7 +106,28 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
-          args: --timeout=5m
+          args: --timeout=5m --output.text.path=lint.txt
+
+      # TEMPORARY debug aid: see the test job's Publish failure summary step.
+      - name: Publish lint summary
+        if: failure()
+        shell: bash
+        run: |
+          if [ ! -f lint.txt ]; then
+            echo "::error::no lint.txt produced by golangci-lint"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import re
+          data = open("lint.txt", "r", errors="replace").read()
+          data = re.sub(r"\x1b\[[0-9;]*m", "", data)
+          keep = [ln for ln in data.splitlines() if re.match(r"^\S+\.go:\d+:\d+:", ln)]
+          summary = "\n".join(keep)[:8000] or data[:8000]
+          print(f"::error::lint findings: {len(keep)} lines")
+          for k in range(0, len(summary), 700):
+              chunk = summary[k:k+700].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              print(f"::error::lint{k//700}: {chunk}")
+          PY
 
   build:
     name: Build Check
