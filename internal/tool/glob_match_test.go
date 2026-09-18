@@ -1,6 +1,9 @@
 package tool
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // TestMatchGlob covers the `**` handling. The regression it guards: a `**` in a
 // middle position (`src/**/*.ts`) matched nothing at all, because filepath.Match
@@ -50,7 +53,14 @@ func TestMatchGlob(t *testing.T) {
 
 // TestMatchGlobWindowsSeparators verifies backslash paths (what filepath.Rel
 // returns on Windows) are normalized before matching.
+//
+// The normalization is filepath.ToSlash, which only rewrites the OS separator.
+// On Unix a backslash is an ordinary filename character, so it must be left
+// alone and this test is Windows-only.
 func TestMatchGlobWindowsSeparators(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("filepath.ToSlash only rewrites separators on Windows")
+	}
 	if !matchGlob("src/**/*.ts", `src\a\b\c.ts`) {
 		t.Error("backslash-separated path did not match")
 	}

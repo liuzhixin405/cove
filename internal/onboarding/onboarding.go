@@ -87,6 +87,17 @@ func (s *State) InitProject() (string, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
+			// "Exists" is only the documented no-op result when the thing that
+			// exists is a regular file. A directory (or any other special file)
+			// squatting on the path is not a guide: reporting ("", nil) there
+			// would claim success and wrongly flip HasClaudeMD, disagreeing
+			// with Check(), which never counts a directory as a guide.
+			// Linux reports EEXIST for an existing directory, Windows reports
+			// "Access is denied" and lands in the generic branch below, so this
+			// keeps both platforms honest.
+			if info, statErr := os.Stat(path); statErr == nil && !info.Mode().IsRegular() {
+				return "", fmt.Errorf("failed to create CLAUDE.md: %s exists and is not a regular file", path)
+			}
 			s.HasClaudeMD = true
 			return "", nil
 		}
