@@ -331,7 +331,7 @@ func New(config Config) (*Engine, error) {
 
 	// Fire session start hooks
 	if e.hookMgr != nil {
-		e.hookMgr.FireLegacy(context.Background(), hooks.SessionStart, nil)
+		e.hookMgr.Fire(context.Background(), hooks.SessionStart, "", hooks.HookInput{Event: hooks.SessionStart})
 	}
 
 	return e, nil
@@ -398,7 +398,7 @@ func (e *Engine) loadReplayResponses() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	type replayEntry struct {
 		Event   string         `json:"event"`
@@ -1301,12 +1301,23 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	toolAct := e.beginActivity("run tool " + tc.Name)
 	defer e.endActivity(toolAct)
 
-	// Fire pre-tool-use hooks
+	// Fire pre-tool-use hooks. The result must be honored: returning
+	// {"continue": false} is the documented way to veto a call before the tool
+	// runs, so a hook denial has to actually stop the tool.
 	if e.hookMgr != nil {
-		e.hookMgr.FireLegacy(ctx, hooks.PreToolUse, hooks.ToolUseInfo{
-			ToolName: tc.Name,
-			Input:    tc.Input,
+		out := e.hookMgr.Fire(ctx, hooks.BeforeTool, tc.Name, hooks.HookInput{
+			Event:     hooks.BeforeTool,
+			ToolName:  tc.Name,
+			ToolInput: tc.Input,
 		})
+		if !out.Continue {
+			msg := out.Message
+			if msg == "" {
+				msg = "blocked by pre-tool-use hook"
+			}
+			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", msg))
+			return fmt.Sprintf("BLOCKED by hook: %s", msg)
+		}
 	}
 	// Guardrail check before execution. guardrailWarning, if set, is spliced
 	// onto whatever this call ultimately returns (success or error) by the
@@ -1420,13 +1431,13 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if e.guardrails != nil {
 		e.guardrails.AfterCall(tc.Name, tc.Input, output, result.IsError)
 	}
-	// Fire post-tool-use hooks
+	// Fire post-tool-use hooks. Informational only: the tool has already run, so
+	// a hook's Continue/Message cannot change the outcome here.
 	if e.hookMgr != nil {
-		e.hookMgr.FireLegacy(ctx, hooks.PostToolUse, hooks.ToolUseInfo{
-			ToolName: tc.Name,
-			Input:    tc.Input,
-			Result:   output,
-			IsError:  result.IsError,
+		e.hookMgr.Fire(ctx, hooks.AfterTool, tc.Name, hooks.HookInput{
+			Event:     hooks.AfterTool,
+			ToolName:  tc.Name,
+			ToolInput: tc.Input,
 		})
 	}
 
@@ -1772,7 +1783,7 @@ func (e *Engine) recordEvent(_ context.Context, eventType string, payload map[st
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, _ = f.Write(append(data, '\n'))
 }
 
@@ -1820,32 +1831,7 @@ func (e *Engine) saveSession() {
 			e.session.Title = title
 		}
 	}
-	e.store.Save(e.session)
-}
-
-// isSyntheticUserMessage returns true if a user-role message was injected
-// by the engine (loop guidance, compression summary, circuit breaker, etc.)
-// rather than authored by the actual user. These should never be used as
-// session titles or history previews.
-func isSyntheticUserMessage(content string) bool {
-	c := strings.TrimSpace(content)
-	if c == "" {
-		return true
-	}
-	// Engine-injected prefixes
-	syntheticPrefixes := []string{
-		"[system:",               // circuit breaker
-		"[Conversation Summary]", // AI compression
-		"[Context truncated",     // truncation notice
-		"[用户指引]",                 // steer guidance
-		"[Continue the task",     // compression continuation
-	}
-	for _, p := range syntheticPrefixes {
-		if strings.HasPrefix(c, p) {
-			return true
-		}
-	}
-	return false
+	_ = e.store.Save(e.session)
 }
 
 // newSyntheticUserMsg creates a user-role message marked as engine-injected,
@@ -2067,10 +2053,6 @@ func looksLikePath(s string) bool {
 	return false
 }
 
-func truncate(s string, n int) string {
-	return textutil.ClipRunes(s, n)
-}
-
 // runTurnEndPipeline executes quiet post-turn persistence only.
 func (e *Engine) runTurnEndPipeline() {
 	// Capture session diff for change tracking
@@ -2087,7 +2069,7 @@ func (e *Engine) runTurnEndPipeline() {
 	}
 	// Flush session notes (sync, fast I/O)
 	if e.sessionNotes != nil {
-		e.sessionNotes.Flush()
+		_ = e.sessionNotes.Flush()
 	}
 	// Extract durable memories from recent conversation (async, throttled internally)
 	if e.extractRunner != nil && len(e.messages) > 0 {

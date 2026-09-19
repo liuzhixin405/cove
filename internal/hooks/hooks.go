@@ -181,8 +181,8 @@ func (m *Manager) runCommand(ctx context.Context, cmdPath string, input HookInpu
 	}
 
 	go func() {
-		defer stdin.Close()
-		stdin.Write(inJSON)
+		defer func() { _ = stdin.Close() }()
+		_, _ = stdin.Write(inJSON)
 	}()
 
 	out, err := cmd.Output()
@@ -223,35 +223,9 @@ func (m *Manager) matches(h HookConfig, target string) bool {
 	return matched
 }
 
-// Deprecated: kept for backward compatibility with old hook callers.
-type ToolUseInfo struct {
-	ToolName string
-	Input    map[string]any
-	Result   string
-	IsError  bool
-	ToolID   string
-}
-
-// Legacy event constants for backward compatibility.
+// Legacy event aliases, kept because hook config files and docs spell the
+// pre/post-tool events both ways.
 const (
 	PreToolUse  HookEvent = BeforeTool
 	PostToolUse HookEvent = AfterTool
 )
-
-// ============================================================================
-// Backward compatibility: legacy API used by engine.go
-// ============================================================================
-
-// FireLegacy is the old 3-argument Fire(ctx, event, data) for backward compat.
-func (m *Manager) FireLegacy(ctx context.Context, event HookEvent, data any) {
-	var target string
-	input := HookInput{Event: event}
-
-	if info, ok := data.(ToolUseInfo); ok {
-		target = info.ToolName
-		input.ToolName = info.ToolName
-		input.ToolInput = info.Input
-	}
-
-	m.Fire(ctx, event, target, input)
-}

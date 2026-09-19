@@ -712,7 +712,7 @@ func TestFireIsSafeForConcurrentCallers(t *testing.T) {
 	}
 }
 
-func TestFireLegacyMapsToolUseInfoOntoHookInput(t *testing.T) {
+func TestFireDispatchesOnToolNameTarget(t *testing.T) {
 	m := NewManager()
 
 	var mu sync.Mutex
@@ -732,10 +732,10 @@ func TestFireLegacyMapsToolUseInfoOntoHookInput(t *testing.T) {
 			}},
 	)
 
-	m.FireLegacy(context.Background(), PreToolUse, ToolUseInfo{
-		ToolName: "Bash",
-		Input:    map[string]any{"command": "echo hi"},
-		ToolID:   "t1",
+	m.Fire(context.Background(), PreToolUse, "Bash", HookInput{
+		Event:     PreToolUse,
+		ToolName:  "Bash",
+		ToolInput: map[string]any{"command": "echo hi"},
 	})
 
 	mu.Lock()
@@ -754,7 +754,7 @@ func TestFireLegacyMapsToolUseInfoOntoHookInput(t *testing.T) {
 	}
 }
 
-func TestFireLegacyWithNonToolUseDataUsesEmptyTarget(t *testing.T) {
+func TestFireWithEmptyTargetSkipsToolSpecificHooks(t *testing.T) {
 	m := NewManager()
 
 	var mu sync.Mutex
@@ -776,7 +776,7 @@ func TestFireLegacyWithNonToolUseDataUsesEmptyTarget(t *testing.T) {
 			}},
 	)
 
-	m.FireLegacy(context.Background(), SessionStart, nil)
+	m.Fire(context.Background(), SessionStart, "", HookInput{Event: SessionStart})
 
 	mu.Lock()
 	defer mu.Unlock()
