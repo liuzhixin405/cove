@@ -367,7 +367,7 @@ func TestConcurrentLoggingWithSetLevelAndSetWriter(t *testing.T) {
 func TestLevelConstantsAreOrdered(t *testing.T) {
 	// The filter in log() is a numeric comparison, so the constant order is
 	// part of the contract: a reordering would silently invert filtering.
-	if !(Debug < Info && Info < Warn && Warn < Error) {
+	if Debug >= Info || Info >= Warn || Warn >= Error {
 		t.Fatalf("level constants out of order: Debug=%d Info=%d Warn=%d Error=%d", Debug, Info, Warn, Error)
 	}
 	if got := fmt.Sprint(levelNames[Debug], levelNames[Info], levelNames[Warn], levelNames[Error]); got != "DEBUGINFOWARNERROR" {

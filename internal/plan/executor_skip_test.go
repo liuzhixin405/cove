@@ -41,7 +41,7 @@ func TestRunTaskRefusesSkipped(t *testing.T) {
 	pe := &PlanExecutor{}
 	task := &Task{ID: "x", Status: "skipped"}
 
-	if pe.runTask(nil, task, map[string]bool{}) {
+	if pe.runTask(t.Context(), task, map[string]bool{}) {
 		t.Fatal("runTask reported success for a skipped task")
 	}
 	if task.Status != "skipped" {

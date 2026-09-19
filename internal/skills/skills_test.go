@@ -82,22 +82,22 @@ func TestConditionalSkillsMatchingByPath(t *testing.T) {
 		Conditional: false,
 	})
 
-	matches := mgr.Matching(nil, "/home/user/main.go")
+	matches := mgr.Matching(t.Context(), "/home/user/main.go")
 	if len(matches) != 1 || matches[0].Name != "go-debug" {
 		t.Fatalf("expected [go-debug] for main.go, got %v", skillNames(matches))
 	}
 
-	matches = mgr.Matching(nil, "/home/user/test_app.py")
+	matches = mgr.Matching(t.Context(), "/home/user/test_app.py")
 	if len(matches) != 1 || matches[0].Name != "py-test" {
 		t.Fatalf("expected [py-test] for test_app.py, got %v", skillNames(matches))
 	}
 
-	matches = mgr.Matching(nil, "/home/user/app_test.py")
+	matches = mgr.Matching(t.Context(), "/home/user/app_test.py")
 	if len(matches) != 1 || matches[0].Name != "py-test" {
 		t.Fatalf("expected [py-test] for app_test.py, got %v", skillNames(matches))
 	}
 
-	matches = mgr.Matching(nil, "/home/user/app.js")
+	matches = mgr.Matching(t.Context(), "/home/user/app.js")
 	if len(matches) != 0 {
 		t.Fatalf("expected no matches for app.js, got %v", skillNames(matches))
 	}

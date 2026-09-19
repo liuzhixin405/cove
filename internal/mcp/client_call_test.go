@@ -494,7 +494,7 @@ func TestClient_HandleRawDoesNotBlockWithFullPendingBuffer(t *testing.T) {
 	locked := make(chan struct{})
 	go func() {
 		c.mu.Lock()
-		c.mu.Unlock()
+		c.mu.Unlock() //nolint:staticcheck // SA2001: the empty section is the point - taking the lock is what proves it was released
 		close(locked)
 	}()
 	select {
@@ -533,7 +533,7 @@ func TestClient_ReceiveLoopCleanupDoesNotDeadlock(t *testing.T) {
 	locked := make(chan struct{})
 	go func() {
 		c.mu.Lock()
-		c.mu.Unlock()
+		c.mu.Unlock() //nolint:staticcheck // SA2001: the empty section is the point - taking the lock is what proves it was released
 		close(locked)
 	}()
 	select {

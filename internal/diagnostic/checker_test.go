@@ -11,7 +11,7 @@ func TestCheckConfigExistsCreatesRicherDefaultConfig(t *testing.T) {
 	checker := NewChecker(nil)
 	checker.homeDir = tmpDir
 
-	res := checker.checkConfigExists(nil)
+	res := checker.checkConfigExists(t.Context())
 	if res.Error == nil {
 		t.Fatalf("expected config missing error to be auto-fixed")
 	}

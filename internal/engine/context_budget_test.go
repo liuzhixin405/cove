@@ -31,7 +31,7 @@ func TestContextBudgeter_HigherPriorityLayerRenderedFirst(t *testing.T) {
 	if relevantIdx == -1 || onDemandIdx == -1 || overflowIdx == -1 {
 		t.Fatalf("expected all three sections present when budget is generous, got %q", got)
 	}
-	if !(relevantIdx < onDemandIdx && onDemandIdx < overflowIdx) {
+	if relevantIdx >= onDemandIdx || onDemandIdx >= overflowIdx {
 		t.Fatalf("expected layer order relevant < on-demand < overflow, got %q", got)
 	}
 }
