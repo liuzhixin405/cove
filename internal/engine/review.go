@@ -79,7 +79,7 @@ func (e *Engine) backgroundReview() {
 			if strings.HasPrefix(line, "MEMORY:") {
 				mem := strings.TrimSpace(strings.TrimPrefix(line, "MEMORY:"))
 				if mem != "" && e.memStore != nil {
-					e.memStore.Save("auto", mem)
+					_ = e.memStore.Save("auto", mem)
 					log.Debugf("background review saved memory: %s", mem)
 					e.engineOutput(fmt.Sprintf("  \x1b[2mlearned memory: %s\x1b[0m\n", reviewTruncate(mem, 50)))
 				}

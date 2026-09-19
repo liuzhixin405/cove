@@ -306,7 +306,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("http request: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
@@ -419,5 +419,5 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 }
 
 func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onEvent func(StreamEvent)) (ChatResponse, error) {
-	return ChatResponse{}, fmt.Errorf("Anthropic provider not yet supported on mobile")
+	return ChatResponse{}, fmt.Errorf("anthropic provider not yet supported on mobile")
 }

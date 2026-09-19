@@ -94,7 +94,7 @@ func (t *ReadTool) readFileStream(path string, offset, limit int) (Result, error
 		}
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024) // support long lines

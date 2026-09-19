@@ -52,7 +52,7 @@ func NewManager() *Manager {
 }
 
 func (m *Manager) Init() {
-	os.MkdirAll(m.dir, 0755)
+	_ = os.MkdirAll(m.dir, 0755)
 	m.marketplace = NewMarketplace(m.dir)
 	m.scanPlugins()
 }
@@ -148,7 +148,7 @@ func (m *Manager) Install(name string, url string) error {
 		args := []string{"clone", "--depth=1", "--quiet", url, pluginDir}
 		cmd := exec.Command("git", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			os.RemoveAll(pluginDir)
+			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 		// Generate manifest.json from .claude-plugin/plugin.json if the repo uses
@@ -156,7 +156,7 @@ func (m *Manager) Install(name string, url string) error {
 		ensureManifest(pluginDir)
 		// Validate manifest
 		if _, err := os.Stat(filepath.Join(pluginDir, "manifest.json")); os.IsNotExist(err) {
-			os.RemoveAll(pluginDir)
+			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("cloned repo has no manifest.json or .claude-plugin/plugin.json — not a valid plugin")
 		}
 		return m.loadPluginLocked(name)

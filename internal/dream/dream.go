@@ -142,7 +142,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 	defer func() {
 		if task.CurrentStatus() == StatusRunning {
 			task.Fail()
-			RollbackConsolidationLock(task.PriorMtime)
+			_ = RollbackConsolidationLock(task.PriorMtime)
 		}
 	}()
 
@@ -177,7 +177,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		if err != nil {
 			log.Warnf("[autoDream] API error: %v", err)
 			task.Fail()
-			RollbackConsolidationLock(task.PriorMtime)
+			_ = RollbackConsolidationLock(task.PriorMtime)
 			return
 		}
 
@@ -301,7 +301,7 @@ func (r *Runner) executeDreamWrite(tc api.ToolCall) string {
 		return fmt.Sprintf("Error: dream mode can only write to memory directory (%s)", r.memoryRoot)
 	}
 
-	os.MkdirAll(filepath.Dir(absPath), 0700)
+	_ = os.MkdirAll(filepath.Dir(absPath), 0700)
 	// Atomic replace: a crash mid-write would otherwise leave a half-written
 	// memory file, which is then loaded as a memory entry on every later run.
 	if err := fsatomic.WriteFile(absPath, []byte(content), 0644); err != nil {

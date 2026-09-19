@@ -82,13 +82,13 @@ func NewWriter(w io.Writer, width int, st render.Styles) Sink {
 func (s *writerSink) Block(b render.Block) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fmt.Fprintln(s.w, render.Collapsed(b, s.width, s.st))
+	_, _ = fmt.Fprintln(s.w, render.Collapsed(b, s.width, s.st))
 }
 
 func (s *writerSink) Line(str string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fmt.Fprintln(s.w, str)
+	_, _ = fmt.Fprintln(s.w, str)
 }
 
 func (s *writerSink) Activity(string) {}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"html"
 	"io"
-	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -65,7 +64,7 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	if err != nil {
 		return Result{Data: "Error fetching: " + err.Error(), IsError: true}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 	if err != nil {
@@ -172,14 +171,12 @@ func (t *WebFetchTool) CheckPermissions(input Input, tctx Context) PermissionDec
 	return Allowed("webfetch is read-only")
 }
 
-// isPrivateURL and isPrivateIP delegate to internal/safeurl, which is the
-// single implementation of these SSRF predicates. This file used to carry its
+// isPrivateURL delegates to internal/safeurl, which is the single
+// implementation of these SSRF predicates. This file used to carry its
 // own copy, byte-for-byte duplicated in internal/browser and absent entirely
 // from the skills registry fetch — the classic way a security control drifts
 // out of sync between call sites.
 func isPrivateURL(rawURL string) bool { return safeurl.IsPrivateURL(rawURL) }
-
-func isPrivateIP(ip net.IP) bool { return safeurl.IsPrivateIP(ip) }
 
 // newSafeHTTPClient returns the shared SSRF-hardened client.
 func newSafeHTTPClient(timeout time.Duration) *http.Client {

@@ -97,7 +97,7 @@ func (p *RemoteAPIEmbeddingProvider) Embed(ctx context.Context, texts []string) 
 	if err != nil {
 		return nil, fmt.Errorf("remote embeddings: request failed: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode != 200 {

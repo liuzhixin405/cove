@@ -124,14 +124,6 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 	if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
 
-		title := draft.Title
-
-		if title == "" {
-
-			title = shortDesc(draft.UserContent)
-
-		}
-
 		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
 
 		repl.PrintAbove(fmt.Sprintf("您有一个未完成的片段草稿 (创建于 %v 前)。输入\u300e继续\u300f恢复，或直接输入新指令忽略。\r\n", age))

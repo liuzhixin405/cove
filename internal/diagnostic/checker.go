@@ -113,7 +113,7 @@ func (r *Report) Format() string {
 	}
 
 	if r.AutoFixed > 0 {
-		sb.WriteString(fmt.Sprintf("\n\x1b[32m✓ 所有修复已立即生效，无需重启\x1b[0m\n"))
+		sb.WriteString("\n\x1b[32m✓ 所有修复已立即生效，无需重启\x1b[0m\n")
 	}
 	return sb.String()
 }
@@ -305,7 +305,7 @@ func (c *Checker) checkNetworkReachable(ctx context.Context) CheckResult {
 		res.Error = New(ErrAPIUnreachable, baseURL)
 		return res
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	// Quick TLS handshake test
 	tlsCtx, tlsCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -317,7 +317,7 @@ func (c *Checker) checkNetworkReachable(ctx context.Context) CheckResult {
 		res.Error = New(ErrAPIUnreachable, fmt.Sprintf("%s (TLS失败: %v)", baseURL, err))
 		return res
 	}
-	tlsConn.Close()
+	_ = tlsConn.Close()
 
 	res.Status = SevInfo
 	return res
@@ -383,7 +383,7 @@ func (c *Checker) checkDataDir(_ context.Context) CheckResult {
 		res.Error = New(ErrFSPermission, dataDir)
 		return res
 	}
-	os.Remove(testFile)
+	_ = os.Remove(testFile)
 
 	res.Status = SevInfo
 	return res
@@ -403,7 +403,7 @@ func (c *Checker) checkDiskSpace(_ context.Context) CheckResult {
 		res.Error = New(ErrFSDiskFull, "无法写入测试文件")
 		return res
 	}
-	os.Remove(testFile)
+	_ = os.Remove(testFile)
 
 	res.Status = SevInfo
 	return res
@@ -436,7 +436,7 @@ func (c *Checker) checkSessionIntegrity(_ context.Context) CheckResult {
 		if err != nil || info.Size() == 0 {
 			corrupt++
 			// Auto-fix: remove empty/corrupt session files
-			os.Remove(path)
+			_ = os.Remove(path)
 		}
 	}
 

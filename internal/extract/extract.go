@@ -93,7 +93,7 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 		return
 	}
 
-	os.MkdirAll(r.memoryDir, 0700)
+	_ = os.MkdirAll(r.memoryDir, 0700)
 	saved := 0
 	// The read-modify-write below (dedup probe, append, rewrite) must not
 	// interleave with another extraction run touching the same files.

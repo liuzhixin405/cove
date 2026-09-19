@@ -116,9 +116,7 @@ func (t *TeamDeleteTool) Call(ctx context.Context, input Input, tctx Context) (R
 			}
 		}
 		if tctx.Runtime.Teams != nil {
-			if _, ok := tctx.Runtime.Teams[name]; ok {
-				delete(tctx.Runtime.Teams, name)
-			}
+			delete(tctx.Runtime.Teams, name)
 		}
 		tctx.Runtime.Unlock()
 	}

@@ -37,12 +37,12 @@ func NewSSETransport(baseURL string) (*sseTransport, error) {
 		cancel()
 		return nil, fmt.Errorf("sse connect: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var result struct {
 		SessionID string `json:"sessionId"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.NewDecoder(resp.Body).Decode(&result)
 	if result.SessionID == "" {
 		cancel()
 		return nil, fmt.Errorf("sse: no session ID")
@@ -63,7 +63,7 @@ func (t *sseTransport) listenSSE() {
 	if err != nil {
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 256)
@@ -113,7 +113,7 @@ func (t *sseTransport) Send(ctx context.Context, msg any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// A non-2xx here (expired/invalid session, server error) means the message
 	// was not delivered. Surface it instead of returning nil, otherwise the
 	// caller blocks waiting for a response that will never arrive.

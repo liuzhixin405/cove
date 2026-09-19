@@ -74,7 +74,7 @@ func TryAcquireConsolidationLock() (time.Time, bool, error) {
 	}
 
 	// Ensure memory dir exists
-	os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.MkdirAll(filepath.Dir(path), 0700)
 
 	// Write our PID
 	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
@@ -114,7 +114,7 @@ func RollbackConsolidationLock(priorMtime time.Time) error {
 // RecordConsolidation stamps the lock file (used by manual dream trigger).
 func RecordConsolidation() error {
 	path := lockPath()
-	os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.MkdirAll(filepath.Dir(path), 0700)
 	return os.WriteFile(path, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 }
 

@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # Test helpers routinely ignore the error from writing to an
+      # httptest.ResponseRecorder or closing a fixture; the failure would show
+      # up as a failing assertion anyway, so the check is pure noise there.
+      - path: _test\.go$
+        linters:
+          - errcheck
+
+issues:
+  # Report the whole backlog; the defaults cap it at 50 per linter, which hides
+  # findings behind an arbitrary truncation.
+  max-issues-per-linter: 0
+  max-same-issues: 0

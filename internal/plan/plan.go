@@ -46,7 +46,7 @@ func FromRuntime(planID string, rt *tool.Runtime) (*Plan, error) {
 	rt.Lock()
 	defer rt.Unlock()
 
-	if rt.Tasks == nil || len(rt.Tasks) == 0 {
+	if len(rt.Tasks) == 0 {
 		return nil, fmt.Errorf("no tasks found. Use todowrite to define tasks first")
 	}
 

@@ -45,8 +45,8 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 	tmpName := tmp.Name()
 
 	cleanup := func() {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 	}
 
 	if _, err := tmp.Write(data); err != nil {
@@ -61,16 +61,16 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("sync temp for %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("close temp for %s: %w", path, err)
 	}
 	// CreateTemp always uses 0600; apply the caller's mode explicitly.
 	if err := os.Chmod(tmpName, perm); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("chmod temp for %s: %w", path, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename temp onto %s: %w", path, err)
 	}
 	return nil

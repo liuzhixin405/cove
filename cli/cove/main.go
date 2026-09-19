@@ -56,10 +56,6 @@ var (
 
 	GitCommit = "go go go!"
 
-	resumeMode = false
-
-	resumeID = ""
-
 	dumpPrompt = false
 
 	noAuto = false
@@ -159,11 +155,7 @@ func main() {
 
 				i++
 
-				resumeID = args[i]
-
 			}
-
-			resumeMode = true
 
 		case "--tui":
 
@@ -670,7 +662,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 			if e.Name == name {
 
-				skills.InstallSkill(name, "url", e.URL)
+				_ = skills.InstallSkill(name, "url", e.URL)
 
 				termui.PrintSafe("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
 
@@ -680,7 +672,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		}
 
-		skills.InstallSkill(name, "local", "")
+		_ = skills.InstallSkill(name, "local", "")
 
 		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 
@@ -696,7 +688,7 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		name := parts[2]
 
-		skills.InstallSkill(name, "local", "")
+		_ = skills.InstallSkill(name, "local", "")
 
 		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 

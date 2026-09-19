@@ -131,7 +131,7 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	if err != nil {
 		return Result{Data: "Error: create: " + err.Error(), IsError: true}, nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if err := png.Encode(f, img); err != nil {
 		return Result{Data: "Error: encode PNG: " + err.Error(), IsError: true}, nil

@@ -32,7 +32,7 @@ type NoteEntry struct {
 // New creates a session notes manager. Notes are stored per-project.
 func New(projectDir string) *SessionNotes {
 	dir := filepath.Join(projectDir, ".cove")
-	os.MkdirAll(dir, 0700)
+	_ = os.MkdirAll(dir, 0700)
 	return &SessionNotes{
 		path:    filepath.Join(dir, "session_notes.md"),
 		entries: make([]NoteEntry, 0),
@@ -43,7 +43,7 @@ func New(projectDir string) *SessionNotes {
 func NewGlobal() *SessionNotes {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cove")
-	os.MkdirAll(dir, 0700)
+	_ = os.MkdirAll(dir, 0700)
 	return &SessionNotes{
 		path:    filepath.Join(dir, "session_notes.md"),
 		entries: make([]NoteEntry, 0),

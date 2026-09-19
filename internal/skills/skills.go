@@ -297,7 +297,7 @@ func FetchRegistry() ([]RegistryEntry, error) {
 	c := safeurl.NewClient(10 * time.Second)
 	resp, err := c.Get(RegistryURL)
 	if err == nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var entries []RegistryEntry
 		if json.Unmarshal(data, &entries) == nil {
@@ -305,7 +305,7 @@ func FetchRegistry() ([]RegistryEntry, error) {
 		}
 	}
 	var fallback []RegistryEntry
-	json.Unmarshal([]byte(fallbackJSON), &fallback)
+	_ = json.Unmarshal([]byte(fallbackJSON), &fallback)
 	return fallback, nil
 }
 
@@ -336,7 +336,7 @@ func InstallSkill(name, source, url string) error {
 		if err != nil {
 			return fmt.Errorf("download: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 		}
@@ -372,7 +372,7 @@ func SeedDefaultSkills() {
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
 		return // Already seeded
 	}
-	os.MkdirAll(dir, 0755)
+	_ = os.MkdirAll(dir, 0755)
 
 	// Copy embedded skill files to ~/.cove/skills/
 	entries, err := fs.ReadDir(embeddedSkills, "embedded")
@@ -390,8 +390,8 @@ func SeedDefaultSkills() {
 			continue
 		}
 		dstDir := filepath.Join(dir, skillName)
-		os.MkdirAll(dstDir, 0755)
-		os.WriteFile(filepath.Join(dstDir, "SKILL.md"), data, 0644)
+		_ = os.MkdirAll(dstDir, 0755)
+		_ = os.WriteFile(filepath.Join(dstDir, "SKILL.md"), data, 0644)
 	}
 }
 

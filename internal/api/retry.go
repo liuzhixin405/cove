@@ -52,7 +52,7 @@ func retryConnectHTTP(
 			if attempt == cfg.MaxRetries {
 				return resp, nil
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			delay := time.Duration(1<<attempt) * cfg.BaseDelay
 			select {
 			case <-ctx.Done():

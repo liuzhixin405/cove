@@ -62,7 +62,7 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	if err != nil {
 		return Result{Data: "WebSearch error: " + err.Error(), IsError: true}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -108,7 +108,7 @@ func (t *WebSearchTool) queryTavily(ctx context.Context, apiKey string, query st
 	if err != nil {
 		return Result{Data: "Tavily API call error: " + err.Error(), IsError: true}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -156,7 +156,7 @@ func (t *WebSearchTool) queryBrave(ctx context.Context, apiKey string, query str
 	if err != nil {
 		return Result{Data: "Brave API call error: " + err.Error(), IsError: true}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)

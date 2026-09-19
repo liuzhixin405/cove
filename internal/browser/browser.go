@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -178,7 +177,7 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, b.maxBodySize))
 	if err != nil {
@@ -249,13 +248,11 @@ func (b *Browser) validateURL(rawURL string) error {
 	return nil
 }
 
-// isPrivateHost and isPrivateIP delegate to internal/safeurl, the single
-// implementation of these SSRF predicates. This file carried a byte-for-byte
-// duplicate of internal/tool's copy, and the two had already diverged (this one
-// was missing the 100.64/10 carrier-NAT and fe80::/10 ranges).
+// isPrivateHost delegates to internal/safeurl, the single implementation of
+// these SSRF predicates. This file carried a byte-for-byte duplicate of
+// internal/tool's copy, and the two had already diverged (this one was missing
+// the 100.64/10 carrier-NAT and fe80::/10 ranges).
 func isPrivateHost(host string) bool { return safeurl.IsPrivateHost(host) }
-
-func isPrivateIP(ip net.IP) bool { return safeurl.IsPrivateIP(ip) }
 
 // trimPartialTrailingRune drops an incomplete UTF-8 sequence from the end of s,
 // which is what a byte-count cap (maxBodySize) leaves behind when it lands in

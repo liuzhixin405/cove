@@ -186,7 +186,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	if err != nil {
 		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	// Update the key pool's health for this key (rate-limited / dead / ok) so
 	// multi-key rotation actually fails over.
@@ -200,7 +200,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 		retryAfter := httpResp.Header.Get("Retry-After")
 		delaySec := 5
 		if retryAfter != "" {
-			fmt.Sscanf(retryAfter, "%d", &delaySec)
+			_, _ = fmt.Sscanf(retryAfter, "%d", &delaySec)
 		}
 		return nil, &RetryableError{Msg: fmt.Sprintf("rate limited, retry after %ds", delaySec)}
 	}
@@ -451,7 +451,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	if err != nil {
 		return nil, err
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))

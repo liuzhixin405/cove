@@ -67,7 +67,7 @@ const defaultMarketplaceRepo = "https://github.com/anthropics/claude-plugins-off
 func NewMarketplace(pluginDir string) *Marketplace {
 	home, _ := os.UserHomeDir()
 	cacheDir := filepath.Join(home, ".cove", "marketplace", "cache")
-	os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(cacheDir, 0755)
 
 	m := &Marketplace{
 		dir:      pluginDir,
@@ -95,7 +95,7 @@ func (m *Marketplace) loadSources() {
 		}
 		return
 	}
-	json.Unmarshal(data, &m.sources)
+	_ = json.Unmarshal(data, &m.sources)
 	if len(m.sources) == 0 {
 		m.sources = []MarketplaceSource{
 			{Name: "official", Type: "git", URL: defaultMarketplaceRepo, Enabled: true},
@@ -171,7 +171,7 @@ func (m *Marketplace) loadCachedIndex() {
 	if err != nil {
 		return
 	}
-	json.Unmarshal(data, &m.index)
+	_ = json.Unmarshal(data, &m.index)
 }
 
 func (m *Marketplace) saveIndex() error {
@@ -260,7 +260,7 @@ func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry,
 		}
 	} else {
 		// Clone
-		os.MkdirAll(filepath.Dir(repoDir), 0755)
+		_ = os.MkdirAll(filepath.Dir(repoDir), 0755)
 		log.Infof("正在克隆 marketplace 源: %s ...", src.Name)
 		// --progress is dropped along with the inherited terminal: it only
 		// draws a meter for a tty, and there is no tty to draw it on now.
@@ -508,7 +508,7 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 	// Try to find plugin in local marketplace cache (from claude-plugins-official layout)
 	if cachedDir := m.findCachedPlugin(name); cachedDir != "" {
 		if err := copyDir(cachedDir, pluginDir); err != nil {
-			os.RemoveAll(pluginDir)
+			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("copy from cache: %w", err)
 		}
 		// Generate manifest.json from .claude-plugin/plugin.json if needed
@@ -539,13 +539,13 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 		args := []string{"clone", "--depth=1", "--quiet", source, pluginDir}
 		cmd := exec.Command("git", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			os.RemoveAll(pluginDir) // cleanup on failure
+			_ = os.RemoveAll(pluginDir) // cleanup on failure
 			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 	} else {
 		// Local path: copy directory
 		if err := copyDir(source, pluginDir); err != nil {
-			os.RemoveAll(pluginDir)
+			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("copy plugin: %w", err)
 		}
 	}
@@ -556,7 +556,7 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 	// Validate manifest exists
 	manifestPath := filepath.Join(pluginDir, "manifest.json")
 	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-		os.RemoveAll(pluginDir)
+		_ = os.RemoveAll(pluginDir)
 		return fmt.Errorf("plugin has no manifest.json or .claude-plugin/plugin.json")
 	}
 
@@ -672,7 +672,7 @@ func (m *Marketplace) loadLockfile() {
 	if err != nil {
 		return
 	}
-	json.Unmarshal(data, &m.lockfile)
+	_ = json.Unmarshal(data, &m.lockfile)
 	if m.lockfile.Plugins == nil {
 		m.lockfile.Plugins = make(map[string]LockEntry)
 	}

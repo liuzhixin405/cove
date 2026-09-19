@@ -343,16 +343,17 @@ func (g *Generator) parseRegexBased(absPath string, ext string, fm *FileMap) {
 	if err != nil {
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var patterns []*regexp.Regexp
-	if ext == ".py" {
+	switch ext {
+	case ".py":
 		// Python patterns: class, def
 		patterns = []*regexp.Regexp{
 			regexp.MustCompile(`^\s*(class\s+([a-zA-Z0-9_]+)\s*(\([a-zA-Z0-9_,\s]*\))?:)`),
 			regexp.MustCompile(`^\s*(def\s+([a-zA-Z0-9_]+)\s*\((.*?)\):)`),
 		}
-	} else if ext == ".ts" || ext == ".js" {
+	case ".ts", ".js":
 		// TypeScript/JS patterns: export class, function, interface, export function
 		patterns = []*regexp.Regexp{
 			regexp.MustCompile(`^\s*(?:export\s+)?(?:class)\s+([a-zA-Z0-9_]+)`),

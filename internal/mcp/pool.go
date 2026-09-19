@@ -84,7 +84,7 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 
 	client := NewClient(transport)
 	if err := client.Connect(ctx); err != nil {
-		transport.Close()
+		_ = transport.Close()
 		return fmt.Errorf("connect %s: %w", name, err)
 	}
 
@@ -284,7 +284,7 @@ type ResourceRef struct {
 func (ms *ManagedServer) Close() {
 	ms.Connected = false
 	if ms.Client != nil {
-		ms.Client.Close()
+		_ = ms.Client.Close()
 	}
 	// Note: transport is already closed by Client.Close(), no double-close
 }

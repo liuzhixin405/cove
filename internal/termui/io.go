@@ -104,7 +104,7 @@ func dest() io.Writer {
 func write(s string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	fmt.Fprint(dest(), s)
+	_, _ = fmt.Fprint(dest(), s)
 }
 
 func normalizeOutputNewlines(s string) string {

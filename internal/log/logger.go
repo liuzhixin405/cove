@@ -119,9 +119,9 @@ func (l *Logger) log(level Level, format string, args ...any) {
 		return
 	}
 	ts := time.Now().Format("15:04:05.000")
-	fmt.Fprintf(l.writer, "[%s %s] ", ts, levelNames[level])
-	fmt.Fprintf(l.writer, format, args...)
-	fmt.Fprintln(l.writer)
+	_, _ = fmt.Fprintf(l.writer, "[%s %s] ", ts, levelNames[level])
+	_, _ = fmt.Fprintf(l.writer, format, args...)
+	_, _ = fmt.Fprintln(l.writer)
 }
 
 func Debugf(format string, args ...any) { defaultLogger.log(Debug, format, args...) }

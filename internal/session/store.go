@@ -38,7 +38,7 @@ func NewStore() (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	os.MkdirAll(dir, 0700)
+	_ = os.MkdirAll(dir, 0700)
 	return &Store{dir: dir}, nil
 }
 
@@ -107,7 +107,7 @@ func (s *Store) List() ([]Record, error) {
 			Cost      float64 `json:"cost"`
 		}
 		err = json.NewDecoder(f).Decode(&meta)
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			continue
 		}
@@ -229,7 +229,7 @@ func compactPreview(s string, maxLen int) string {
 func trimWhitespaceLine(s string) string {
 	out := make([]rune, 0, len(s))
 	lastSpace := false
-	for _, ch := range []rune(s) {
+	for _, ch := range s {
 		if ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ' {
 			if !lastSpace {
 				out = append(out, ' ')

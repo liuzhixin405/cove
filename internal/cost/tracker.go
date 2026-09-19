@@ -214,7 +214,7 @@ type CostHistory struct {
 func NewCostHistory() *CostHistory {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cove")
-	os.MkdirAll(dir, 0700)
+	_ = os.MkdirAll(dir, 0700)
 	path := filepath.Join(dir, "cost_history.json")
 
 	h := &CostHistory{path: path}

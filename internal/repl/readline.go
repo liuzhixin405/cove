@@ -31,7 +31,6 @@ type LineReader struct {
 	completionList []string
 	completionIdx  int
 	activeHint     string
-	showingHint    bool
 }
 
 var consoleMu sync.Mutex
@@ -77,7 +76,7 @@ func (lr *LineReader) SetPrompt(p string) {
 	lr.prompt = p
 	w := 0
 	inAnsi := false
-	for _, r := range []rune(p) {
+	for _, r := range p {
 		if r == '\x1b' {
 			inAnsi = true
 			continue
@@ -243,7 +242,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 	}
 	defer func() {
 		fmt.Print("\x1b[0m\x1b[?25h")
-		term.Restore(int(os.Stdin.Fd()), oldState)
+		_ = term.Restore(int(os.Stdin.Fd()), oldState)
 	}()
 
 	lr.rawReader = bufio.NewReader(os.Stdin)
@@ -464,7 +463,7 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 		return err
 	}
 	if first != '[' {
-		lr.rawReader.UnreadRune()
+		_ = lr.rawReader.UnreadRune()
 		return nil
 	}
 	second, err := readInputRune(lr.rawReader)

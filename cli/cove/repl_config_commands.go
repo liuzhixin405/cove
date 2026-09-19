@@ -79,7 +79,7 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 			eng.SetPermissionMode(m)
 			cfg.PermissionMode = string(m)
 			as.PermissionMode = string(m)
-			config.Save(cfg)
+			_ = config.Save(cfg)
 			outf("模式: %s\n", m)
 		} else {
 			outf("无效模式。可选: %s\n", permission.Modes())
@@ -115,18 +115,18 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 			cfg.MaxBudgetUsd = b
 			as.MaxBudget = b
 			eng.SetMaxBudget(b)
-			config.Save(cfg)
+			_ = config.Save(cfg)
 			outf("预算已自动调整到: $%.2f\n", b)
 		}
 		return
 	}
 	var b float64
-	fmt.Sscanf(arg, "%f", &b)
+	_, _ = fmt.Sscanf(arg, "%f", &b)
 	if b > 0 {
 		cfg.MaxBudgetUsd = b
 		as.MaxBudget = b
 		eng.SetMaxBudget(b)
-		config.Save(cfg)
+		_ = config.Save(cfg)
 		outf("预算: $%.2f\n", b)
 	}
 }

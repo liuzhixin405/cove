@@ -65,13 +65,13 @@ func (t *streamableHTTPTransport) openStream() error {
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return fmt.Errorf("streamablehttp: server returned %d", resp.StatusCode)
 	}
 
 	t.mu.Lock()
 	if t.stream != nil {
-		t.stream.Close()
+		_ = t.stream.Close()
 	}
 	t.stream = resp.Body
 	t.mu.Unlock()
@@ -88,7 +88,7 @@ func (t *streamableHTTPTransport) readStream(body io.ReadCloser) {
 			t.stream = nil
 		}
 		t.mu.Unlock()
-		body.Close()
+		_ = body.Close()
 	}()
 
 	buf := make([]byte, 0, 4096)
@@ -153,7 +153,7 @@ func (t *streamableHTTPTransport) Send(ctx context.Context, msg any) error {
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return fmt.Errorf("streamablehttp: POST %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -166,13 +166,13 @@ func (t *streamableHTTPTransport) Send(ctx context.Context, msg any) error {
 		return nil
 	}
 
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
 // readStreamFromResponse reads SSE events from an HTTP response body.
 func (t *streamableHTTPTransport) readStreamFromResponse(body io.ReadCloser) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 256)
 	for {
@@ -223,7 +223,7 @@ func (t *streamableHTTPTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.stream != nil {
-		t.stream.Close()
+		_ = t.stream.Close()
 		t.stream = nil
 	}
 	return nil

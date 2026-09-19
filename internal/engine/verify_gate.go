@@ -142,7 +142,7 @@ func (g *VerifyGate) appendLedger(r VerifyResult) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	entry := map[string]any{
 		"time":        time.Now().Format(time.RFC3339),

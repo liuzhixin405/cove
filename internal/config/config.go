@@ -315,7 +315,7 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	os.MkdirAll(dir, 0700)
+	_ = os.MkdirAll(dir, 0700)
 
 	// First marshal triggers ProviderConfig.MarshalJSON (masks key for display).
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -339,7 +339,7 @@ func Save(cfg *Config) error {
 		return err
 	}
 	var providerVal interface{}
-	json.Unmarshal(providerRaw, &providerVal)
+	_ = json.Unmarshal(providerRaw, &providerVal)
 	m["provider"] = providerVal
 
 	if len(cfg.Profiles) > 0 {
@@ -363,7 +363,7 @@ func Save(cfg *Config) error {
 						return err
 					}
 					var profProviderVal interface{}
-					json.Unmarshal(providerRaw, &profProviderVal)
+					_ = json.Unmarshal(providerRaw, &profProviderVal)
 					profileVal["provider"] = profProviderVal
 				}
 				if prof.PermissionMode != "" {

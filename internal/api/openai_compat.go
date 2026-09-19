@@ -188,7 +188,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	if err != nil {
 		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	// Update key-pool health so multi-key rotation fails over.
 	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
@@ -489,7 +489,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	if err != nil {
 		return nil, err
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	if httpResp.StatusCode != 200 {
@@ -522,10 +522,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		if line == "" || line == "data: [DONE]" {
 			continue
 		}
-		clean := line
-		if strings.HasPrefix(clean, "data: ") {
-			clean = strings.TrimPrefix(clean, "data: ")
-		}
+		clean := strings.TrimPrefix(line, "data: ")
 
 		var chunk oaiStreamChunk
 		if err := json.Unmarshal([]byte(clean), &chunk); err != nil {
@@ -609,7 +606,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	// "stop" | "length" | "tool_calls" | "content_filter". Map to the same
 	// vocabulary the engine checks (it treats "length"/"max_tokens" with no
 	// tool calls as a truncation that needs continuation).
-	stopReason := "stop"
+	var stopReason string
 	switch lastFinish {
 	case "length":
 		stopReason = "length"

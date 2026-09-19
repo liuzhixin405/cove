@@ -90,7 +90,7 @@ const maxServerStderrLine = 2000
 // It exits when the pipe closes, which happens when the process exits — so it
 // cannot outlive the server it belongs to.
 func drainServerStderr(name string, r io.ReadCloser) {
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 8*1024), 256*1024)
 	for sc.Scan() {
@@ -166,7 +166,7 @@ const stdioCloseGrace = 2 * time.Second
 // server, those accumulated for the lifetime of the session.
 func (t *stdioTransport) Close() error {
 	t.closeOnce.Do(func() {
-		t.stdin.Close()
+		_ = t.stdin.Close()
 
 		if t.cmd.Process == nil {
 			return
@@ -178,7 +178,7 @@ func (t *stdioTransport) Close() error {
 		select {
 		case t.waitErr = <-done:
 		case <-time.After(stdioCloseGrace):
-			t.cmd.Process.Kill()
+			_ = t.cmd.Process.Kill()
 			// Still reap: Kill only delivers the signal, Wait releases the
 			// process entry and the pipe goroutines.
 			t.waitErr = <-done
@@ -241,7 +241,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.serverCaps = result.Capabilities
 	c.serverInfo = result.ServerInfo
 
-	c.SendNotification(ctx, "notifications/initialized", nil)
+	_ = c.SendNotification(ctx, "notifications/initialized", nil)
 	return nil
 }
 

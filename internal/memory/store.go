@@ -407,7 +407,7 @@ func (s *Store) Save(name, content string) error {
 	}
 	if dir == "" {
 		dir = s.dirs[0]
-		os.MkdirAll(dir, 0700)
+		_ = os.MkdirAll(dir, 0700)
 	}
 
 	// Check total size would not exceed limit

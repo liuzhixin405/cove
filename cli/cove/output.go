@@ -28,10 +28,10 @@ import (
 func outw() io.Writer { return termui.Writer() }
 
 // outf is the fmt.Printf replacement.
-func outf(format string, args ...any) { fmt.Fprintf(outw(), format, args...) }
+func outf(format string, args ...any) { _, _ = fmt.Fprintf(outw(), format, args...) }
 
 // outln is the fmt.Println replacement.
-func outln(args ...any) { fmt.Fprintln(outw(), args...) }
+func outln(args ...any) { _, _ = fmt.Fprintln(outw(), args...) }
 
 // outp is the fmt.Print replacement.
-func outp(args ...any) { fmt.Fprint(outw(), args...) }
+func outp(args ...any) { _, _ = fmt.Fprint(outw(), args...) }

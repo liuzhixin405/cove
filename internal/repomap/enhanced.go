@@ -116,7 +116,7 @@ func (eg *EnhancedGenerator) GenerateIncremental(maxFiles int) (string, *DiffRes
 // scanFiles walks the repo and returns file -> mtime map.
 func (eg *EnhancedGenerator) scanFiles() map[string]time.Time {
 	result := make(map[string]time.Time)
-	filepath.Walk(eg.root, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(eg.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip unreadable
 		}
