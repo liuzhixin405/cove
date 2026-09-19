@@ -28,16 +28,16 @@ func (c *StatusCmd) Help() string        { return "/status - 查看当前代理�
 func (c *StatusCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	var sb strings.Builder
 	sb.WriteString("=== 代理状态 ===\n")
-	sb.WriteString(fmt.Sprintf("目录: %s\n", in.Cwd))
+	fmt.Fprintf(&sb, "目录: %s\n", in.Cwd)
 	if in.AppState != nil {
 		if in.AppState.SessionID != "" {
-			sb.WriteString(fmt.Sprintf("会话: %s\n", in.AppState.SessionID))
+			fmt.Fprintf(&sb, "会话: %s\n", in.AppState.SessionID)
 		}
 		if in.AppState.Model != "" {
-			sb.WriteString(fmt.Sprintf("模型: %s\n", in.AppState.Model))
+			fmt.Fprintf(&sb, "模型: %s\n", in.AppState.Model)
 		}
 		if in.AppState.PermissionMode != "" {
-			sb.WriteString(fmt.Sprintf("模式: %s\n", in.AppState.PermissionMode))
+			fmt.Fprintf(&sb, "模式: %s\n", in.AppState.PermissionMode)
 		}
 	}
 	messageCount := 0
@@ -50,11 +50,11 @@ func (c *StatusCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	} else if in.AppState != nil {
 		messageCount = in.AppState.Messages
 	}
-	sb.WriteString(fmt.Sprintf("消息数: %d\n", messageCount))
+	fmt.Fprintf(&sb, "消息数: %d\n", messageCount)
 	if costSummary != "" {
-		sb.WriteString(fmt.Sprintf("费用: %s\n", costSummary))
+		fmt.Fprintf(&sb, "费用: %s\n", costSummary)
 	} else if in.AppState != nil {
-		sb.WriteString(fmt.Sprintf("预算: $%.2f / $%.2f\n", in.AppState.BudgetUsed, in.AppState.MaxBudget))
+		fmt.Fprintf(&sb, "预算: $%.2f / $%.2f\n", in.AppState.BudgetUsed, in.AppState.MaxBudget)
 	}
 	return Output{Message: sb.String()}, nil
 }
@@ -89,9 +89,9 @@ func (c *ExportCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	var sb strings.Builder
 	sb.WriteString("# 对话导出\n\n")
 	for _, m := range in.Engine.Messages() {
-		sb.WriteString(fmt.Sprintf("**%s**: %s\n\n", m.Role, m.Content))
+		fmt.Fprintf(&sb, "**%s**: %s\n\n", m.Role, m.Content)
 		for _, tc := range m.ToolCalls {
-			sb.WriteString(fmt.Sprintf("- tool: %s %v\n", tc.Name, tc.Input))
+			fmt.Fprintf(&sb, "- tool: %s %v\n", tc.Name, tc.Input)
 		}
 		if len(m.ToolCalls) > 0 {
 			sb.WriteString("\n")
@@ -172,12 +172,12 @@ func (c *ContextCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	}
 	var sb strings.Builder
 	sb.WriteString("=== 会话上下文 ===\n")
-	sb.WriteString(fmt.Sprintf("目录: %s\n", pc.Cwd))
-	sb.WriteString(fmt.Sprintf("平台: %s\n", pc.Platform))
-	sb.WriteString(fmt.Sprintf("Shell: %s\n", pc.Shell))
+	fmt.Fprintf(&sb, "目录: %s\n", pc.Cwd)
+	fmt.Fprintf(&sb, "平台: %s\n", pc.Platform)
+	fmt.Fprintf(&sb, "Shell: %s\n", pc.Shell)
 	if pc.IsGitRepo {
 		branch, status := pc.GetGitInfo()
-		sb.WriteString(fmt.Sprintf("Git: %s (%s)\n", branch, status))
+		fmt.Fprintf(&sb, "Git: %s (%s)\n", branch, status)
 	}
 	if pc.FileTree != "" {
 		sb.WriteString("\n项目结构:\n")

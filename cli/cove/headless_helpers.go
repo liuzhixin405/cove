@@ -48,9 +48,9 @@ func skillInvocationText(input string, eng *engine.Engine) string {
 		return fmt.Sprintf("未找到配置文件: %s", name)
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[Skill: %s]\n\n%s\n", name, prompt))
+	fmt.Fprintf(&sb, "[Skill: %s]\n\n%s\n", name, prompt)
 	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
-		sb.WriteString(fmt.Sprintf("\n无效的参数: %s\n", args))
+		fmt.Fprintf(&sb, "\n无效的参数: %s\n", args)
 	}
 	return sb.String()
 }

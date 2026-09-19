@@ -34,7 +34,7 @@ func (c *McpCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			if typeName == "" {
 				typeName = "stdio"
 			}
-			sb.WriteString(fmt.Sprintf("- %s [%s] connected=%t tools=%d resources=%d\n", s.Name, typeName, s.Connected, len(s.Tools), len(s.Resources)))
+			fmt.Fprintf(&sb, "- %s [%s] connected=%t tools=%d resources=%d\n", s.Name, typeName, s.Connected, len(s.Tools), len(s.Resources))
 		}
 		return Output{Message: sb.String()}, nil
 	case "disconnect":
@@ -130,9 +130,9 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		var sb strings.Builder
 		sb.WriteString("已安装插件:\n")
 		for _, p := range plugins {
-			sb.WriteString(fmt.Sprintf("- %s %s (%s)", p.Manifest.Name, p.Manifest.Version, pluginStateLabel(p.State)))
+			fmt.Fprintf(&sb, "- %s %s (%s)", p.Manifest.Name, p.Manifest.Version, pluginStateLabel(p.State))
 			if p.Error != "" {
-				sb.WriteString(fmt.Sprintf(" - %s", p.Error))
+				fmt.Fprintf(&sb, " - %s", p.Error)
 			}
 			sb.WriteString("\n")
 		}
@@ -260,7 +260,7 @@ func (c *SkillsCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		var sb strings.Builder
 		sb.WriteString("技能列表:\n")
 		for _, s := range all {
-			sb.WriteString(fmt.Sprintf("- %-16s %s\n", s.Name, s.Description))
+			fmt.Fprintf(&sb, "- %-16s %s\n", s.Name, s.Description)
 		}
 		return Output{Message: sb.String()}, nil
 	}

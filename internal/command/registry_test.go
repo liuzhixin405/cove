@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -62,32 +62,39 @@ func testRegistry(t *testing.T) *Registry {
 
 // declaredConstructors parses this package's sources and returns every
 // exported `func New...Cmd() Command` it declares.
+//
+// Files are walked with parser.ParseFile rather than the deprecated
+// parser.ParseDir, skipping _test.go sources by name.
 func declaredConstructors(t *testing.T) []string {
 	t.Helper()
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse package sources: %v", err)
+		t.Fatalf("read package directory: %v", err)
 	}
 	var found []string
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Recv != nil || fn.Name == nil {
-					continue
-				}
-				name := fn.Name.Name
-				if !strings.HasPrefix(name, "New") || !strings.HasSuffix(name, "Cmd") {
-					continue
-				}
-				if fn.Type.Params != nil && len(fn.Type.Params.List) != 0 {
-					continue // a constructor taking collaborators is wired elsewhere
-				}
-				found = append(found, name)
+	for _, entry := range entries {
+		fileName := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(fileName, ".go") || strings.HasSuffix(fileName, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, fileName, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", fileName, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || fn.Name == nil {
+				continue
 			}
+			name := fn.Name.Name
+			if !strings.HasPrefix(name, "New") || !strings.HasSuffix(name, "Cmd") {
+				continue
+			}
+			if fn.Type.Params != nil && len(fn.Type.Params.List) != 0 {
+				continue // a constructor taking collaborators is wired elsewhere
+			}
+			found = append(found, name)
 		}
 	}
 	sort.Strings(found)

@@ -88,7 +88,7 @@ func (s *SessionNotes) Flush() error {
 func (s *SessionNotes) writeToDisk() error {
 	var sb strings.Builder
 	sb.WriteString("# Session Notes\n\n")
-	sb.WriteString(fmt.Sprintf("_Last updated: %s_\n\n", time.Now().Format("2006-01-02 15:04")))
+	fmt.Fprintf(&sb, "_Last updated: %s_\n\n", time.Now().Format("2006-01-02 15:04"))
 
 	// Group by category
 	categories := []string{"decision", "task", "discovery", "error"}
@@ -102,9 +102,9 @@ func (s *SessionNotes) writeToDisk() error {
 		if len(entries) == 0 {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("## %s\n\n", titleCase(cat+"s")))
+		fmt.Fprintf(&sb, "## %s\n\n", titleCase(cat+"s"))
 		for _, e := range entries {
-			sb.WriteString(fmt.Sprintf("- [%s] %s\n", e.Timestamp.Format("15:04"), e.Text))
+			fmt.Fprintf(&sb, "- [%s] %s\n", e.Timestamp.Format("15:04"), e.Text)
 		}
 		sb.WriteString("\n")
 	}
@@ -190,7 +190,7 @@ func (s *SessionNotes) Content() string {
 		start = len(s.entries) - 20
 	}
 	for _, e := range s.entries[start:] {
-		sb.WriteString(fmt.Sprintf("- [%s] %s\n", e.Category, e.Text))
+		fmt.Fprintf(&sb, "- [%s] %s\n", e.Category, e.Text)
 	}
 	sb.WriteString("</session_notes>\n")
 	return sb.String()

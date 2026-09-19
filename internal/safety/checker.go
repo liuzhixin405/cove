@@ -113,7 +113,7 @@ func (c *Checker) ScanToolCall(toolName string, params map[string]any) *Result {
 	var input strings.Builder
 	input.WriteString(toolName)
 	for k, v := range params {
-		input.WriteString(fmt.Sprintf(" %s=%v", k, v))
+		fmt.Fprintf(&input, " %s=%v", k, v)
 	}
 	return c.Scan(input.String(), toolName)
 }

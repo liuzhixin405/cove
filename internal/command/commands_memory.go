@@ -28,7 +28,7 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		var sb strings.Builder
 		sb.WriteString("记忆文件:\n")
 		for _, e := range entries {
-			sb.WriteString(fmt.Sprintf("- %s\n", e.Name))
+			fmt.Fprintf(&sb, "- %s\n", e.Name)
 		}
 		return Output{Message: sb.String()}, nil
 	}
@@ -61,7 +61,7 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			return Output{Message: fmt.Sprintf("未找到与 %q 相关的记忆", query)}, nil
 		}
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("与 %q 相关的记忆 (BM25 关键词检索):\n", query))
+		fmt.Fprintf(&sb, "与 %q 相关的记忆 (BM25 关键词检索):\n", query)
 		for _, r := range results {
 			marker := ""
 			if r.Entry.Project {
@@ -71,20 +71,20 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			if len(preview) > 80 {
 				preview = textutil.ClipRunes(preview, 83)
 			}
-			sb.WriteString(fmt.Sprintf("  %s%s [%.2f]: %s\n", r.Entry.Name, marker, r.Score, preview))
+			fmt.Fprintf(&sb, "  %s%s [%.2f]: %s\n", r.Entry.Name, marker, r.Score, preview)
 		}
 		return Output{Message: sb.String()}, nil
 	case "stats", "stat":
 		st := in.MemoryStore.Stats()
 		var sb strings.Builder
 		sb.WriteString("记忆统计:\n")
-		sb.WriteString(fmt.Sprintf("  文件数:   %d (其中项目记忆 %d)\n", st.FileCount, st.ProjectCount))
-		sb.WriteString(fmt.Sprintf("  总行数:   %d\n", st.TotalLines))
-		sb.WriteString(fmt.Sprintf("  总大小:   %s / %s\n", humanBytes(st.TotalBytes), humanBytes(st.MaxTotalBytes)))
+		fmt.Fprintf(&sb, "  文件数:   %d (其中项目记忆 %d)\n", st.FileCount, st.ProjectCount)
+		fmt.Fprintf(&sb, "  总行数:   %d\n", st.TotalLines)
+		fmt.Fprintf(&sb, "  总大小:   %s / %s\n", humanBytes(st.TotalBytes), humanBytes(st.MaxTotalBytes))
 		if st.MaxTotalBytes > 0 {
-			sb.WriteString(fmt.Sprintf("  使用率:   %.1f%%\n", float64(st.TotalBytes)*100/float64(st.MaxTotalBytes)))
+			fmt.Fprintf(&sb, "  使用率:   %.1f%%\n", float64(st.TotalBytes)*100/float64(st.MaxTotalBytes))
 		}
-		sb.WriteString(fmt.Sprintf("  单条上限: %s\n", humanBytes(st.MaxEntryBytes)))
+		fmt.Fprintf(&sb, "  单条上限: %s\n", humanBytes(st.MaxEntryBytes))
 		return Output{Message: sb.String()}, nil
 	default:
 		return Output{Message: "用法: /memory [list|add|remove|search <关键词>|stats]"}, nil

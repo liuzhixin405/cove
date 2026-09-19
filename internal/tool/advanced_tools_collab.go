@@ -34,7 +34,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 		return Result{Data: "team requires at least one member", IsError: true}, nil
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Team '%s' created with %d members:\n", name, len(members)))
+	fmt.Fprintf(&sb, "Team '%s' created with %d members:\n", name, len(members))
 	now := time.Now().Format(time.RFC3339)
 	memberRecords := make([]TeamMemberRecord, 0, len(members))
 	if tctx.Runtime != nil {
@@ -50,7 +50,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 			if tctx.Runtime != nil {
 				tctx.Runtime.Tasks[id] = &TaskRecord{ID: id, Title: ag, Description: tsk, Status: "pending", Kind: "team_member", ParentID: name, CreatedAt: now, UpdatedAt: now}
 			}
-			sb.WriteString(fmt.Sprintf("  %d. [%s] %s\n", i+1, ag, tsk))
+			fmt.Fprintf(&sb, "  %d. [%s] %s\n", i+1, ag, tsk)
 		}
 	}
 	// Keep the lock across the summary below: it reads the same maps the loop
@@ -60,19 +60,19 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 	if tctx.Runtime != nil {
 		tctx.Runtime.Teams[name] = &TeamRecord{Name: name, Members: memberRecords, Status: "active", CreatedAt: now}
 		if len(tctx.Runtime.Teams) > 0 {
-			sb.WriteString(fmt.Sprintf("Teams: %d\n", len(tctx.Runtime.Teams)))
+			fmt.Fprintf(&sb, "Teams: %d\n", len(tctx.Runtime.Teams))
 			for _, team := range tctx.Runtime.Teams {
-				sb.WriteString(fmt.Sprintf("- %s [%s]: %d members\n", team.Name, team.Status, len(team.Members)))
+				fmt.Fprintf(&sb, "- %s [%s]: %d members\n", team.Name, team.Status, len(team.Members))
 			}
 		}
 		if len(tctx.Runtime.CronSchedules) > 0 {
-			sb.WriteString(fmt.Sprintf("Cron schedules: %d\n", len(tctx.Runtime.CronSchedules)))
+			fmt.Fprintf(&sb, "Cron schedules: %d\n", len(tctx.Runtime.CronSchedules))
 			for _, cron := range tctx.Runtime.CronSchedules {
-				sb.WriteString(fmt.Sprintf("- %s [%s]: %s -> %s\n", cron.ID, cron.Status, cron.Schedule, cron.Task))
+				fmt.Fprintf(&sb, "- %s [%s]: %s -> %s\n", cron.ID, cron.Status, cron.Schedule, cron.Task)
 			}
 		}
 		if len(tctx.Runtime.Messages) > 0 {
-			sb.WriteString(fmt.Sprintf("Messages: %d queued\n", len(tctx.Runtime.Messages)))
+			fmt.Fprintf(&sb, "Messages: %d queued\n", len(tctx.Runtime.Messages))
 		}
 		// Capture the callback but do not call it here. It runs the plan
 		// executor, which calls plan.FromRuntime, which takes this same lock —
@@ -85,7 +85,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 	if planExec != nil {
 		result, err := planExec(true)
 		if err != nil {
-			sb.WriteString(fmt.Sprintf("\n\n[执行失败] %v", err))
+			fmt.Fprintf(&sb, "\n\n[执行失败] %v", err)
 		} else {
 			sb.WriteString("\n\n[团队执行结果]\n" + result)
 		}

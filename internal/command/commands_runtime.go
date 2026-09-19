@@ -15,18 +15,18 @@ func (c *DoctorCmd) Help() string        { return "/doctor - 检查 Go、git、r
 func (c *DoctorCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	var sb strings.Builder
 	sb.WriteString("=== 系统诊断 ===\n")
-	sb.WriteString(fmt.Sprintf("目录: %s\n", in.Cwd))
+	fmt.Fprintf(&sb, "目录: %s\n", in.Cwd)
 	if g, err := exec.LookPath("git"); err == nil {
-		sb.WriteString(fmt.Sprintf("Git: %s\n", g))
+		fmt.Fprintf(&sb, "Git: %s\n", g)
 	} else {
 		sb.WriteString("Git: 未找到\n")
 	}
 	if rg, err := exec.LookPath("rg"); err == nil {
-		sb.WriteString(fmt.Sprintf("Ripgrep: %s\n", rg))
+		fmt.Fprintf(&sb, "Ripgrep: %s\n", rg)
 	} else {
 		sb.WriteString("Ripgrep: 未找到\n")
 	}
-	sb.WriteString(fmt.Sprintf("时间: %s\n", time.Now().Format(time.RFC3339)))
+	fmt.Fprintf(&sb, "时间: %s\n", time.Now().Format(time.RFC3339))
 	return Output{Message: sb.String()}, nil
 }
 

@@ -83,8 +83,8 @@ func (r *Report) Summary() string {
 // Format returns the full diagnostic report as a terminal-ready string.
 func (r *Report) Format() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("\x1b[1m🔍 系统诊断报告\x1b[0m (耗时 %s)\n", r.Duration.Round(time.Millisecond)))
-	sb.WriteString(fmt.Sprintf("   %s\n\n", r.Summary()))
+	fmt.Fprintf(&sb, "\x1b[1m🔍 系统诊断报告\x1b[0m (耗时 %s)\n", r.Duration.Round(time.Millisecond))
+	fmt.Fprintf(&sb, "   %s\n\n", r.Summary())
 
 	for _, res := range r.Results {
 		if res.Skipped {
@@ -98,14 +98,13 @@ func (r *Report) Format() string {
 		} else if res.Status >= SevError {
 			icon = "\x1b[31m✗\x1b[0m"
 		}
-
-		sb.WriteString(fmt.Sprintf(" %s %s", icon, res.Title))
+		fmt.Fprintf(&sb, " %s %s", icon, res.Title)
 		if res.Error != nil {
 			sb.WriteString("\n")
 			// Indent error details
 			lines := strings.Split(res.Error.Format(), "\n")
 			for _, line := range lines {
-				sb.WriteString(fmt.Sprintf("   %s\n", line))
+				fmt.Fprintf(&sb, "   %s\n", line)
 			}
 		} else {
 			sb.WriteString("\n")

@@ -63,23 +63,23 @@ func (t *BriefTool) Call(ctx context.Context, input Input, tctx Context) (Result
 	if what == "" {
 		what = "current session"
 	}
-	sb.WriteString(fmt.Sprintf("Summary for %s\n", what))
-	sb.WriteString(fmt.Sprintf("Plan mode: %t\n", tctx.Runtime.PlanMode))
+	fmt.Fprintf(&sb, "Summary for %s\n", what)
+	fmt.Fprintf(&sb, "Plan mode: %t\n", tctx.Runtime.PlanMode)
 	if tctx.Runtime.WorktreeDir != "" {
-		sb.WriteString(fmt.Sprintf("Worktree: %s\n", tctx.Runtime.WorktreeDir))
+		fmt.Fprintf(&sb, "Worktree: %s\n", tctx.Runtime.WorktreeDir)
 	}
 	if len(tctx.Runtime.Tasks) == 0 {
 		sb.WriteString("Tasks: none")
 		return Result{Data: sb.String()}, nil
 	}
-	sb.WriteString(fmt.Sprintf("Tasks: %d\n", len(tctx.Runtime.Tasks)))
+	fmt.Fprintf(&sb, "Tasks: %d\n", len(tctx.Runtime.Tasks))
 	for _, tr := range tctx.Runtime.Tasks {
-		sb.WriteString(fmt.Sprintf("- %s [%s]: %s", tr.ID, tr.Status, tr.Title))
+		fmt.Fprintf(&sb, "- %s [%s]: %s", tr.ID, tr.Status, tr.Title)
 		if tr.Description != "" {
-			sb.WriteString(fmt.Sprintf(" — %s", tr.Description))
+			fmt.Fprintf(&sb, " — %s", tr.Description)
 		}
 		if tr.Output != "" {
-			sb.WriteString(fmt.Sprintf(" | output: %s", truncateStr(tr.Output, 120)))
+			fmt.Fprintf(&sb, " | output: %s", truncateStr(tr.Output, 120))
 		}
 		sb.WriteString("\n")
 	}

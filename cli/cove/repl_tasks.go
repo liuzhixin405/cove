@@ -143,18 +143,18 @@ func commonPrefixRunes(a, b string) int {
 func formatTaskSnapshot(s TaskSnapshot) string {
 	var sb strings.Builder
 	if s.Running {
-		sb.WriteString(fmt.Sprintf("当前任务 (已运行 %s):\n  %s\n", s.Elapsed.Truncate(time.Second), s.Current))
+		fmt.Fprintf(&sb, "当前任务 (已运行 %s):\n  %s\n", s.Elapsed.Truncate(time.Second), s.Current)
 	} else {
 		sb.WriteString("当前没有运行中的任务\n")
 	}
 	if len(s.Queued) > 0 {
-		sb.WriteString(fmt.Sprintf("排队中 (%d):\n", len(s.Queued)))
+		fmt.Fprintf(&sb, "排队中 (%d):\n", len(s.Queued))
 		for i, q := range s.Queued {
-			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, q))
+			fmt.Fprintf(&sb, "  %d. %s\n", i+1, q)
 		}
 	}
 	if s.PendingRetry != "" {
-		sb.WriteString(fmt.Sprintf("可重试 (输入“继续”): %s\n", s.PendingRetry))
+		fmt.Fprintf(&sb, "可重试 (输入“继续”): %s\n", s.PendingRetry)
 	}
 	return sb.String()
 }

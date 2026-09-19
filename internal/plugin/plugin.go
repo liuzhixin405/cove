@@ -415,7 +415,7 @@ func (m *Manager) MarketplaceSearch(query string) string {
 		return "marketplace 索引为空 (试试 /plugin refresh)"
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("可用插件 (%d 个):\n\n", len(entries)))
+	fmt.Fprintf(&sb, "可用插件 (%d 个):\n\n", len(entries))
 
 	for _, e := range entries {
 		installed := ""
@@ -429,17 +429,17 @@ func (m *Manager) MarketplaceSearch(query string) string {
 			ver = " v" + ver
 		}
 		// Name + version + installed badge
-		sb.WriteString(fmt.Sprintf("  %s%s%s\n", e.Name, ver, installed))
+		fmt.Fprintf(&sb, "  %s%s%s\n", e.Name, ver, installed)
 		// Description (truncated to keep it readable)
 		desc := e.Description
 		if len(desc) > 80 {
 			desc = desc[:77] + "..."
 		}
 		if desc != "" {
-			sb.WriteString(fmt.Sprintf("    %s\n", desc))
+			fmt.Fprintf(&sb, "    %s\n", desc)
 		}
 		if e.Author != "" {
-			sb.WriteString(fmt.Sprintf("    by %s\n", e.Author))
+			fmt.Fprintf(&sb, "    by %s\n", e.Author)
 		}
 		sb.WriteString("\n")
 	}
@@ -474,12 +474,12 @@ func (m *Manager) MarketplaceUpdate(name string) (string, error) {
 	updated, errs := m.marketplace.UpdateAll()
 	var sb strings.Builder
 	if len(updated) > 0 {
-		sb.WriteString(fmt.Sprintf("✓ 已更新 %d 个插件: %s\n", len(updated), strings.Join(updated, ", ")))
+		fmt.Fprintf(&sb, "✓ 已更新 %d 个插件: %s\n", len(updated), strings.Join(updated, ", "))
 	} else {
 		sb.WriteString("所有插件已是最新\n")
 	}
 	if len(errs) > 0 {
-		sb.WriteString(fmt.Sprintf("⚠ %d 个失败: %s\n", len(errs), strings.Join(errs, "; ")))
+		fmt.Fprintf(&sb, "⚠ %d 个失败: %s\n", len(errs), strings.Join(errs, "; "))
 	}
 	return sb.String(), nil
 }

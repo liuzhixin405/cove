@@ -41,7 +41,7 @@ func (s *State) GenerateClaudeMD() string {
 	var sb strings.Builder
 	sb.WriteString("# Project Guide\n\n")
 	sb.WriteString("## Overview\n\n")
-	sb.WriteString(fmt.Sprintf("Language: %s\n", s.Language))
+	fmt.Fprintf(&sb, "Language: %s\n", s.Language)
 
 	if s.HasGit {
 		sb.WriteString("Version Control: Git\n")

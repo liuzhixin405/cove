@@ -176,16 +176,16 @@ func parseFrontmatter(content string) *frontmatter {
 // purely additive for skills that opt in.
 func (s Skill) RenderInvocation() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[Skill: %s]\n\n", s.Name))
+	fmt.Fprintf(&sb, "[Skill: %s]\n\n", s.Name)
 	if len(s.Steps) > 0 {
 		sb.WriteString("Follow these steps in order. Do not skip ahead or reorder them — treat each one as a checkpoint to complete (and verify) before starting the next:\n")
 		for i, step := range s.Steps {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, step))
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, step)
 		}
 		sb.WriteString("\n")
 	}
 	if len(s.AllowedTools) > 0 {
-		sb.WriteString(fmt.Sprintf("While executing this skill, only use these tools: %s. If the task genuinely requires a different tool, explain why before using it.\n\n", strings.Join(s.AllowedTools, ", ")))
+		fmt.Fprintf(&sb, "While executing this skill, only use these tools: %s. If the task genuinely requires a different tool, explain why before using it.\n\n", strings.Join(s.AllowedTools, ", "))
 	}
 	sb.WriteString(s.Prompt)
 	sb.WriteString("\n\nFollow these instructions to complete the task.")

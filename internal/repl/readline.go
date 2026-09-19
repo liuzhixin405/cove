@@ -577,7 +577,7 @@ func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {
 			sb.WriteString(text + "  ")
 		}
 		if len(suggestions) > max {
-			sb.WriteString(fmt.Sprintf("...(+%d)", len(suggestions)-max))
+			fmt.Fprintf(&sb, "...(+%d)", len(suggestions)-max)
 		}
 		sb.WriteString("\x1b[0m")
 		return sb.String()

@@ -626,7 +626,7 @@ For independent sub-tasks (parallel exploration, isolated tests), use agent sub-
 Available tools:`)
 	for _, t := range e.registry.All() {
 		d := t.Def()
-		sb.WriteString(fmt.Sprintf("\n- %s: %s", d.Name, d.Description))
+		fmt.Fprintf(&sb, "\n- %s: %s", d.Name, d.Description)
 	}
 
 	// Core project info (working directory, platform, shell, git
@@ -635,8 +635,8 @@ Available tools:`)
 	// shared budget below  - it must never be what gets truncated just
 	// because memory or repo-map content happens to be large.
 	if e.projCtx != nil {
-		sb.WriteString(fmt.Sprintf("\n\nWorking directory: %s | Platform: %s | Shell: %s",
-			e.projCtx.Cwd, e.projCtx.Platform, e.projCtx.Shell))
+		fmt.Fprintf(&sb, "\n\nWorking directory: %s | Platform: %s | Shell: %s",
+			e.projCtx.Cwd, e.projCtx.Platform, e.projCtx.Shell)
 		if e.projCtx.IsGitRepo {
 			// GitBranch/GitStatus are the only ProjectContext fields that are
 			// mutated after construction: the TUI refreshes them every two
@@ -647,15 +647,15 @@ Available tools:`)
 			// GetGitInfo exists for exactly this and is what the rest of the
 			// codebase already uses.
 			gitBranch, gitStatus := e.projCtx.GetGitInfo()
-			sb.WriteString(fmt.Sprintf("\nGit: %s (%s)", gitBranch, gitStatus))
+			fmt.Fprintf(&sb, "\nGit: %s (%s)", gitBranch, gitStatus)
 			if e.projCtx.GitMain != "" && e.projCtx.GitMain != gitBranch {
-				sb.WriteString(fmt.Sprintf(" | main branch: %s", e.projCtx.GitMain))
+				fmt.Fprintf(&sb, " | main branch: %s", e.projCtx.GitMain)
 			}
 			if e.projCtx.GitUser != "" {
-				sb.WriteString(fmt.Sprintf(" | user: %s", e.projCtx.GitUser))
+				fmt.Fprintf(&sb, " | user: %s", e.projCtx.GitUser)
 			}
 			if e.projCtx.GitLog != "" {
-				sb.WriteString(fmt.Sprintf("\nRecent commits:\n%s", e.projCtx.GitLog))
+				fmt.Fprintf(&sb, "\nRecent commits:\n%s", e.projCtx.GitLog)
 			}
 		}
 	}

@@ -174,7 +174,7 @@ func buildExtractionPrompt(memDir string, messages []api.Message) string {
 			// Skip in-progress atomic writes; listing one would show the model
 			// a memory file that does not exist.
 			if !e.IsDir() && !fsatomic.IsTempName(e.Name()) {
-				sb.WriteString(fmt.Sprintf("- %s\n", e.Name()))
+				fmt.Fprintf(&sb, "- %s\n", e.Name())
 			}
 		}
 	}
@@ -186,7 +186,7 @@ func buildExtractionPrompt(memDir string, messages []api.Message) string {
 		if role == "tool" {
 			content = textutil.ClipBytes(content, 200, "...")
 		}
-		sb.WriteString(fmt.Sprintf("[%s] %s\n", role, content))
+		fmt.Fprintf(&sb, "[%s] %s\n", role, content)
 	}
 
 	sb.WriteString("\nExtract important durable facts. If nothing worth saving, reply with just: NONE")

@@ -26,9 +26,9 @@ func handleExport(input string, eng *engine.Engine) {
 	var sb strings.Builder
 	sb.WriteString("# 对话导出\r\n\r\n")
 	for _, m := range eng.Messages() {
-		sb.WriteString(fmt.Sprintf("**%s**: %s\r\n\r\n", m.Role, m.Content))
+		fmt.Fprintf(&sb, "**%s**: %s\r\n\r\n", m.Role, m.Content)
 		for _, tc := range m.ToolCalls {
-			sb.WriteString(fmt.Sprintf("  > 工具: %s(%v)\r\n\r\n", tc.Name, tc.Input))
+			fmt.Fprintf(&sb, "  > 工具: %s(%v)\r\n\r\n", tc.Name, tc.Input)
 		}
 	}
 	if err := os.WriteFile(filename, []byte(sb.String()), 0644); err != nil {

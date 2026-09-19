@@ -119,10 +119,10 @@ func Summary(results []VerifyResult) string {
 	sb.WriteString("[verify_gate] Your completion was not accepted because a verification command failed. Results:\n")
 	for _, r := range results {
 		if r.Passed {
-			sb.WriteString(fmt.Sprintf("  OK   %s (%s)\n", r.Command, r.Duration.Round(time.Millisecond)))
+			fmt.Fprintf(&sb, "  OK   %s (%s)\n", r.Command, r.Duration.Round(time.Millisecond))
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("  FAIL %s (exit %d, %s)\n", r.Command, r.ExitCode, r.Duration.Round(time.Millisecond)))
+		fmt.Fprintf(&sb, "  FAIL %s (exit %d, %s)\n", r.Command, r.ExitCode, r.Duration.Round(time.Millisecond))
 		sb.WriteString("---\n")
 		sb.WriteString(truncateTail(r.Output, 2000))
 		sb.WriteString("\n---\n")

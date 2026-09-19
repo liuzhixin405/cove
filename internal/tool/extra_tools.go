@@ -75,11 +75,11 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("WebSearch (DuckDuckGo Fallback): %s\n", q))
+	fmt.Fprintf(&sb, "WebSearch (DuckDuckGo Fallback): %s\n", q)
 	for i, result := range results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, result.title, result.url))
+		fmt.Fprintf(&sb, "%d. %s\n   %s", i+1, result.title, result.url)
 		if result.snippet != "" {
-			sb.WriteString(fmt.Sprintf("\n   %s", result.snippet))
+			fmt.Fprintf(&sb, "\n   %s", result.snippet)
 		}
 		sb.WriteString("\n")
 	}
@@ -133,11 +133,11 @@ func (t *WebSearchTool) queryTavily(ctx context.Context, apiKey string, query st
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("WebSearch (Tavily Grounding): %s\n", query))
+	fmt.Fprintf(&sb, "WebSearch (Tavily Grounding): %s\n", query)
 	for i, item := range res.Results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, item.Title, item.URL))
+		fmt.Fprintf(&sb, "%d. %s\n   %s", i+1, item.Title, item.URL)
 		if item.Content != "" {
-			sb.WriteString(fmt.Sprintf("\n   %s", strings.TrimSpace(item.Content)))
+			fmt.Fprintf(&sb, "\n   %s", strings.TrimSpace(item.Content))
 		}
 		sb.WriteString("\n")
 	}
@@ -182,11 +182,11 @@ func (t *WebSearchTool) queryBrave(ctx context.Context, apiKey string, query str
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("WebSearch (Brave Grounding): %s\n", query))
+	fmt.Fprintf(&sb, "WebSearch (Brave Grounding): %s\n", query)
 	for i, item := range res.Web.Results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   %s", i+1, item.Title, item.URL))
+		fmt.Fprintf(&sb, "%d. %s\n   %s", i+1, item.Title, item.URL)
 		if item.Description != "" {
-			sb.WriteString(fmt.Sprintf("\n   %s", strings.TrimSpace(item.Description)))
+			fmt.Fprintf(&sb, "\n   %s", strings.TrimSpace(item.Description))
 		}
 		sb.WriteString("\n")
 	}
@@ -219,14 +219,14 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		h, _ := qm["header"].(string)
 		qt, _ := qm["question"].(string)
 		var prompt strings.Builder
-		prompt.WriteString(fmt.Sprintf("[Q%d] %s\n%s\n", i+1, h, qt))
+		fmt.Fprintf(&prompt, "[Q%d] %s\n%s\n", i+1, h, qt)
 		opts, _ := qm["options"].([]any)
 		labels := make([]string, 0, len(opts))
 		for idx, o := range opts {
 			om, _ := o.(map[string]any)
 			label := fmt.Sprint(om["label"])
 			labels = append(labels, label)
-			prompt.WriteString(fmt.Sprintf("  %d. %v: %v\n", idx+1, om["label"], om["description"]))
+			fmt.Fprintf(&prompt, "  %d. %v: %v\n", idx+1, om["label"], om["description"])
 		}
 		answer := strings.TrimSpace(tctx.Runtime.AskUser(prompt.String()))
 		selected := answer
@@ -236,7 +236,7 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		if selected == "" {
 			selected = "(empty)"
 		}
-		sb.WriteString(fmt.Sprintf("[Q%d] %s\nAnswer: %s\n\n", i+1, qt, selected))
+		fmt.Fprintf(&sb, "[Q%d] %s\nAnswer: %s\n\n", i+1, qt, selected)
 	}
 	return Result{Data: strings.TrimSpace(sb.String())}, nil
 }
@@ -286,7 +286,7 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		}
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Task list (%d items):\n", len(todos)))
+	fmt.Fprintf(&sb, "Task list (%d items):\n", len(todos))
 	for i, td := range todos {
 		tm, _ := td.(map[string]any)
 		status, _ := tm["status"].(string)
@@ -299,7 +299,7 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		case "cancelled":
 			mark = "[x]"
 		}
-		sb.WriteString(fmt.Sprintf("%s %d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"]))
+		fmt.Fprintf(&sb, "%s %d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"])
 	}
 	return Result{Data: sb.String()}, nil
 }

@@ -66,17 +66,17 @@ func PermissionPrompt(toolName, desc string) string {
 	var sb strings.Builder
 	sb.WriteString("\r\x1b[K") // clear spinner line
 	sb.WriteString("\a")       // terminal bell to alert user
-	sb.WriteString(fmt.Sprintf("\n  %s╭── 需要授权 ──────────────────────╮%s\n", Yellow, Reset))
-	sb.WriteString(fmt.Sprintf("  %s│%s  工具: %s%s%s\n", Yellow, Reset, Cyan, toolName, Reset))
+	fmt.Fprintf(&sb, "\n  %s╭── 需要授权 ──────────────────────╮%s\n", Yellow, Reset)
+	fmt.Fprintf(&sb, "  %s│%s  工具: %s%s%s\n", Yellow, Reset, Cyan, toolName, Reset)
 	if desc != "" {
 		// Truncate desc for display if too long
 		d := desc
 		if len(d) > 60 {
 			d = textutil.ClipRunes(d, 60)
 		}
-		sb.WriteString(fmt.Sprintf("  %s│%s  说明: %s\n", Yellow, Reset, d))
+		fmt.Fprintf(&sb, "  %s│%s  说明: %s\n", Yellow, Reset, d)
 	}
-	sb.WriteString(fmt.Sprintf("  %s╰───────────────────────────────────╯%s\n", Yellow, Reset))
+	fmt.Fprintf(&sb, "  %s╰───────────────────────────────────╯%s\n", Yellow, Reset)
 	return sb.String()
 }
 
@@ -242,23 +242,22 @@ func Banner(version, model, provider, mode, cwd, gitBranch, gitStatus string, to
 	sb.WriteString(Styled(BrightCyan+Bold, "  / /___  / /_/ /  | |/ / / /___   ") + "\n")
 	sb.WriteString(Styled(BrightCyan+Bold, "  \\____/  \\____/   |___/ /_____/   ") + "\n")
 	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("    %scove v%s%s  •  高效、安全的本地 AI 协同编程终端\n", Bold, version, Reset))
+	fmt.Fprintf(&sb, "    %scove v%s%s  •  高效、安全的本地 AI 协同编程终端\n", Bold, version, Reset)
 	sb.WriteString("\n")
-
 	// Info line
-	sb.WriteString(fmt.Sprintf("  %s模型:%s %s%s%s", Dim, Reset, Bold, model, Reset))
-	sb.WriteString(fmt.Sprintf("  %s│%s  %s供应商:%s %s", Dim, Reset, Dim, Reset, provider))
-	sb.WriteString(fmt.Sprintf("  %s│%s  %s模式:%s %s\n", Dim, Reset, Dim, Reset, mode))
+	fmt.Fprintf(&sb, "  %s模型:%s %s%s%s", Dim, Reset, Bold, model, Reset)
+	fmt.Fprintf(&sb, "  %s│%s  %s供应商:%s %s", Dim, Reset, Dim, Reset, provider)
+	fmt.Fprintf(&sb, "  %s│%s  %s模式:%s %s\n", Dim, Reset, Dim, Reset, mode)
 
 	if isGit {
-		sb.WriteString(fmt.Sprintf("  %sGit:%s %s%s%s\n",
-			Dim, Reset, Green, gitBranch, Reset))
+		fmt.Fprintf(&sb, "  %sGit:%s %s%s%s\n",
+			Dim, Reset, Green, gitBranch, Reset)
 	}
-	sb.WriteString(fmt.Sprintf("  %s目录:%s %s\n", Dim, Reset, cwd))
-	sb.WriteString(fmt.Sprintf("  %s工具:%s %d 个\n", Dim, Reset, toolCount))
+	fmt.Fprintf(&sb, "  %s目录:%s %s\n", Dim, Reset, cwd)
+	fmt.Fprintf(&sb, "  %s工具:%s %d 个\n", Dim, Reset, toolCount)
 	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("  %s提示: 输入 %s/%s%s 查看命令, %sCtrl+C%s 中断%s\n",
-		Dim, Reset, "help", Dim, Reset, Dim, Reset))
+	fmt.Fprintf(&sb, "  %s提示: 输入 %s/%s%s 查看命令, %sCtrl+C%s 中断%s\n",
+		Dim, Reset, "help", Dim, Reset, Dim, Reset)
 	sb.WriteString("\n")
 
 	return sb.String()

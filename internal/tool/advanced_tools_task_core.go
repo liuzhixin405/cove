@@ -62,7 +62,7 @@ func (t *TaskListTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		return Result{Data: "No active tasks."}, nil
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%d tasks:\n", len(tctx.Runtime.Tasks)))
+	fmt.Fprintf(&sb, "%d tasks:\n", len(tctx.Runtime.Tasks))
 	for _, tr := range tctx.Runtime.Tasks {
 		mark := "[ ]"
 		switch tr.Status {
@@ -73,7 +73,7 @@ func (t *TaskListTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		case "cancelled":
 			mark = "[x]"
 		}
-		sb.WriteString(fmt.Sprintf("%s %s: %s (%s)\n", mark, tr.ID, tr.Title, tr.Status))
+		fmt.Fprintf(&sb, "%s %s: %s (%s)\n", mark, tr.ID, tr.Title, tr.Status)
 	}
 	return Result{Data: sb.String()}, nil
 }

@@ -66,7 +66,7 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 
 	var sb strings.Builder
 	if d, ok := input["description"].(string); ok && d != "" {
-		sb.WriteString(fmt.Sprintf("Command: %s\n", d))
+		fmt.Fprintf(&sb, "Command: %s\n", d)
 	}
 
 	if stdout.Len() > 0 {
@@ -88,7 +88,7 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	}
 
 	if exitCode != 0 {
-		sb.WriteString(fmt.Sprintf("\n[exit code: %d]", exitCode))
+		fmt.Fprintf(&sb, "\n[exit code: %d]", exitCode)
 	}
 
 	return Result{Data: sb.String()}, nil

@@ -80,7 +80,7 @@ func (t *mcpToolProxy) Call(ctx context.Context, input Input, tctx Context) (Res
 		if c.Type == "text" {
 			sb.WriteString(c.Text)
 		} else {
-			sb.WriteString(fmt.Sprintf("[%s: %s]", c.Type, truncate(c.Data, 200)))
+			fmt.Fprintf(&sb, "[%s: %s]", c.Type, truncate(c.Data, 200))
 		}
 	}
 	return Result{Data: sb.String(), IsError: result.IsError}, nil
@@ -144,9 +144,9 @@ func (t *listMCPResources) Call(ctx context.Context, input Input, tctx Context) 
 		if serverFilter != "" && s.Name != serverFilter {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("[%s] %d tools, %d resources\n", s.Name, len(s.Tools), len(s.Resources)))
+		fmt.Fprintf(&sb, "[%s] %d tools, %d resources\n", s.Name, len(s.Tools), len(s.Resources))
 		for _, tool := range s.Tools {
-			sb.WriteString(fmt.Sprintf("  tool: %s - %s\n", tool.Name, tool.Description))
+			fmt.Fprintf(&sb, "  tool: %s - %s\n", tool.Name, tool.Description)
 		}
 		for _, resource := range s.Resources {
 			line := fmt.Sprintf("  resource: %s", resource.URI)

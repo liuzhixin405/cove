@@ -113,7 +113,7 @@ func TestAppStateHasNoAliasingFields(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		f := typ.Field(i)
 		switch f.Type.Kind() {
-		case reflect.Map, reflect.Slice, reflect.Ptr, reflect.Chan, reflect.Func, reflect.UnsafePointer, reflect.Interface:
+		case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Chan, reflect.Func, reflect.UnsafePointer, reflect.Interface:
 			t.Errorf("field %s is a %s: a value copy of AppState would alias it", f.Name, f.Type.Kind())
 		}
 	}

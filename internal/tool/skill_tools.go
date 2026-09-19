@@ -35,13 +35,13 @@ func (t *SkillsListTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%d skills available:\n\n", len(all)))
+	fmt.Fprintf(&sb, "%d skills available:\n\n", len(all))
 	for _, s := range all {
 		desc := s.Description
 		if len(desc) > 80 {
 			desc = textutil.ClipRunes(desc, 80)
 		}
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", s.Name, desc))
+		fmt.Fprintf(&sb, "  %-20s %s\n", s.Name, desc)
 	}
 	return Result{Data: sb.String(), IsError: false}, nil
 }

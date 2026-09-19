@@ -48,7 +48,7 @@ func (c *ResumeCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		var sb strings.Builder
 		sb.WriteString("已保存的会话:\n")
 		for _, r := range records {
-			sb.WriteString(fmt.Sprintf("- %s  %s  (%d tokens)\n", r.ID, r.Title, r.TokensIn+r.TokensOut))
+			fmt.Fprintf(&sb, "- %s  %s  (%d tokens)\n", r.ID, r.Title, r.TokensIn+r.TokensOut)
 		}
 		return Output{Message: sb.String()}, nil
 	}
@@ -88,7 +88,7 @@ func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		return Output{Message: "暂无已保存的会话"}, nil
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("历史记录 (%d 个会话):\n\n", len(records)))
+	fmt.Fprintf(&sb, "历史记录 (%d 个会话):\n\n", len(records))
 	limit := 20
 	if len(records) < limit {
 		limit = len(records)
@@ -119,10 +119,10 @@ func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		if len(title) > 50 {
 			title = textutil.ClipRunes(title, 53)
 		}
-		sb.WriteString(fmt.Sprintf("  %d. [%s] %s  (%d 条)\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title, msgCount))
+		fmt.Fprintf(&sb, "  %d. [%s] %s  (%d 条)\n", i+1, r.UpdatedAt.Format("01-02 15:04"), title, msgCount)
 	}
 	if len(records) > limit {
-		sb.WriteString(fmt.Sprintf("\n  ... 还有 %d 条。使用 Ctrl+R 查看全部。\n", len(records)-limit))
+		fmt.Fprintf(&sb, "\n  ... 还有 %d 条。使用 Ctrl+R 查看全部。\n", len(records)-limit)
 	}
 	sb.WriteString("\n提示: 在 TUI 界面中使用 Ctrl+R 可唤起选择浮层直接选回历史会话。\n")
 	return Output{Message: sb.String()}, nil

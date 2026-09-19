@@ -214,7 +214,7 @@ func detectCycle(tasks []*Task, taskByID map[string]*Task) []string {
 // FormatResult formats an execution result as a human-readable summary.
 func FormatResult(result *ExecutionResult) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Plan '%s' executed:\n", result.PlanID))
+	fmt.Fprintf(&sb, "Plan '%s' executed:\n", result.PlanID)
 	for _, t := range result.Tasks {
 		icon := "✓"
 		if t.Status == "failed" {
@@ -223,12 +223,12 @@ func FormatResult(result *ExecutionResult) string {
 		if t.Status == "skipped" {
 			icon = "○"
 		}
-		sb.WriteString(fmt.Sprintf("  %s [%s] %s — %s", icon, t.ID, t.Title, t.Status))
+		fmt.Fprintf(&sb, "  %s [%s] %s — %s", icon, t.ID, t.Title, t.Status)
 		if t.Error != "" {
-			sb.WriteString(fmt.Sprintf(" (%s)", t.Error))
+			fmt.Fprintf(&sb, " (%s)", t.Error)
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(fmt.Sprintf("\nTotal: %d tasks | Success: %v", len(result.Tasks), result.Success))
+	fmt.Fprintf(&sb, "\nTotal: %d tasks | Success: %v", len(result.Tasks), result.Success)
 	return sb.String()
 }

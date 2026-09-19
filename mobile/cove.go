@@ -221,7 +221,7 @@ func (e *MobileEngine) buildSystemPrompt() string {
 	if len(e.toolDefs) > 0 {
 		sb.WriteString("Available tools:\n")
 		for _, td := range e.toolDefs {
-			sb.WriteString(fmt.Sprintf("- %s: %s\n", td.Name, td.Description))
+			fmt.Fprintf(&sb, "- %s: %s\n", td.Name, td.Description)
 		}
 		sb.WriteString("\nGuidelines:\n")
 		sb.WriteString("- Only use tools when explicitly needed for the task.\n")

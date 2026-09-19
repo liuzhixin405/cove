@@ -192,7 +192,7 @@ func (cc *ChatCompressor) generateSummary(
 	summaryInput.WriteString("- Important context for continuing\n\n")
 
 	for _, m := range messages {
-		summaryInput.WriteString(fmt.Sprintf("[%s] ", m.Role))
+		fmt.Fprintf(&summaryInput, "[%s] ", m.Role)
 		content := m.Content
 		if m.Role == "tool" {
 			content = clipRunes(content, 100)
@@ -203,11 +203,11 @@ func (cc *ChatCompressor) generateSummary(
 		if len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
 				if path, ok := tc.Input["filePath"].(string); ok {
-					summaryInput.WriteString(fmt.Sprintf(" → %s(%s)", tc.Name, path))
+					fmt.Fprintf(&summaryInput, " → %s(%s)", tc.Name, path)
 				} else if cmd, ok := tc.Input["command"].(string); ok {
-					summaryInput.WriteString(fmt.Sprintf(" → bash(%s)", clipRunes(cmd, 60)))
+					fmt.Fprintf(&summaryInput, " → bash(%s)", clipRunes(cmd, 60))
 				} else {
-					summaryInput.WriteString(fmt.Sprintf(" → %s()", tc.Name))
+					fmt.Fprintf(&summaryInput, " → %s()", tc.Name)
 				}
 			}
 		}

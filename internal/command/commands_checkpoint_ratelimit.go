@@ -56,7 +56,7 @@ func (c *CheckpointsCmd) Execute(ctx context.Context, in Input) (Output, error) 
 	var sb strings.Builder
 	sb.WriteString("最近检查点:\n")
 	for i, it := range items {
-		sb.WriteString(fmt.Sprintf("%2d. %s\n", i+1, it))
+		fmt.Fprintf(&sb, "%2d. %s\n", i+1, it)
 	}
 	return Output{Message: strings.TrimRight(sb.String(), "\n")}, nil
 }
@@ -79,21 +79,21 @@ func (c *RateLimitCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	var sb strings.Builder
 	sb.WriteString("=== Rate Limit ===\n")
 	if info.RequestsLimit > 0 {
-		sb.WriteString(fmt.Sprintf("Requests: %d / %d", info.RequestsRemaining, info.RequestsLimit))
+		fmt.Fprintf(&sb, "Requests: %d / %d", info.RequestsRemaining, info.RequestsLimit)
 		if info.RequestsReset > 0 {
-			sb.WriteString(fmt.Sprintf(" (reset in %s)", roundDuration(info.RequestsReset)))
+			fmt.Fprintf(&sb, " (reset in %s)", roundDuration(info.RequestsReset))
 		}
 		sb.WriteString("\n")
 	}
 	if info.TokensLimit > 0 {
-		sb.WriteString(fmt.Sprintf("Tokens: %d / %d", info.TokensRemaining, info.TokensLimit))
+		fmt.Fprintf(&sb, "Tokens: %d / %d", info.TokensRemaining, info.TokensLimit)
 		if info.TokensReset > 0 {
-			sb.WriteString(fmt.Sprintf(" (reset in %s)", roundDuration(info.TokensReset)))
+			fmt.Fprintf(&sb, " (reset in %s)", roundDuration(info.TokensReset))
 		}
 		sb.WriteString("\n")
 	}
 	if !info.UpdatedAt.IsZero() {
-		sb.WriteString(fmt.Sprintf("Updated: %s", info.UpdatedAt.Format(time.RFC3339)))
+		fmt.Fprintf(&sb, "Updated: %s", info.UpdatedAt.Format(time.RFC3339))
 	}
 	return Output{Message: strings.TrimRight(sb.String(), "\n")}, nil
 }
