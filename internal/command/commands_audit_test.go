@@ -83,6 +83,21 @@ func restoreWD(t *testing.T) string {
 	return wd
 }
 
+// sameDir reports whether two paths name the same directory. It resolves
+// symlinks first: macOS reports getcwd() under /private/var while t.TempDir()
+// returns /var, so comparing the two as strings fails there.
+func sameDir(a, b string) bool {
+	ra, err := filepath.EvalSymlinks(a)
+	if err != nil {
+		return false
+	}
+	rb, err := filepath.EvalSymlinks(b)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(ra, rb)
+}
+
 // A directory outside any repository: git's answer there is an error, which
 // the git commands used to swallow and report as "no changes".
 func nonRepoDir(t *testing.T) string {
@@ -193,7 +208,7 @@ func TestCdCmdAcceptsPathWithSpaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	if !strings.EqualFold(filepath.Clean(wd), filepath.Clean(target)) {
+	if !sameDir(wd, target) {
 		t.Fatalf("cwd = %s, want %s (%s)", wd, target, out.Message)
 	}
 }
@@ -209,7 +224,7 @@ func TestCdCmdStripsQuotes(t *testing.T) {
 		t.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	if !strings.EqualFold(filepath.Clean(wd), filepath.Clean(target)) {
+	if !sameDir(wd, target) {
 		t.Fatalf("cwd = %s, want %s", wd, target)
 	}
 }
@@ -223,7 +238,7 @@ func TestCdCmdTellsEngineTheNewDir(t *testing.T) {
 	if _, err := NewCdCmd().Execute(context.Background(), Input{Args: []string{target}, Cwd: origWD, Engine: eng}); err != nil {
 		t.Fatal(err)
 	}
-	if len(eng.workDirs) != 1 || !strings.EqualFold(filepath.Clean(eng.workDirs[0]), filepath.Clean(target)) {
+	if len(eng.workDirs) != 1 || !sameDir(eng.workDirs[0], target) {
 		t.Fatalf("engine working dir updates = %v, want [%s]", eng.workDirs, target)
 	}
 }
