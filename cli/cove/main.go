@@ -462,10 +462,10 @@ func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, atta
 // cannot tell from an API failure; 130 is the shell convention for SIGINT.
 func printModeFailure(w io.Writer, canceled bool, err error) int {
 	if canceled {
-		fmt.Fprintln(w, "[已取消] 当前任务已终止")
+		_, _ = fmt.Fprintln(w, "[已取消] 当前任务已终止")
 		return 130
 	}
-	fmt.Fprintf(w, "Error: %v\n", err)
+	_, _ = fmt.Fprintf(w, "Error: %v\n", err)
 	return 1
 }
 

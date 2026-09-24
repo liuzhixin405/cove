@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/shell"
 	"github.com/liuzhixin405/cove/internal/textutil"
@@ -97,19 +96,4 @@ func (t *bashTool) CheckPermissions(input Input, tctx Context) PermissionDecisio
 		return Denied("plan mode: bash not allowed")
 	}
 	return Asked("bash requires approval")
-}
-
-func truncateUTF8(s string, maxBytes int) (string, int) {
-	if len(s) <= maxBytes {
-		return s, 0
-	}
-
-	cut := maxBytes
-	for cut > 0 && !utf8.ValidString(s[:cut]) {
-		cut--
-	}
-	if cut <= 0 {
-		return "", len(s)
-	}
-	return s[:cut], len(s) - cut
 }

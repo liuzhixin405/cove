@@ -10,9 +10,9 @@ import (
 )
 
 // streamOpenAI serves raw as the SSE body of /v1/chat/completions and runs
-// ChatStream against it, returning the response, the error and the text
-// deltas the handler saw.
-func streamOpenAI(t *testing.T, raw string) (*ChatResponse, error, string) {
+// ChatStream against it, returning the response, the text deltas the handler
+// saw and the error.
+func streamOpenAI(t *testing.T, raw string) (*ChatResponse, string, error) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -30,14 +30,14 @@ func streamOpenAI(t *testing.T, raw string) (*ChatResponse, error, string) {
 			deltas.WriteString(ev.Delta)
 		}
 	})
-	return resp, err, deltas.String()
+	return resp, deltas.String(), err
 }
 
 // The SSE spec makes the space after "data:" optional, and several
 // OpenAI-compatible gateways omit it. Those lines used to fail to decode and
 // were skipped silently, so the whole answer came back empty.
 func TestOpenAIStreamAcceptsDataLinesWithoutSpace(t *testing.T) {
-	resp, err, deltas := streamOpenAI(t, ""+
+	resp, deltas, err := streamOpenAI(t, ""+
 		"data:{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n"+
 		"data:{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n"+
 		"data:[DONE]\n\n")
@@ -52,7 +52,7 @@ func TestOpenAIStreamAcceptsDataLinesWithoutSpace(t *testing.T) {
 // CRLF line endings, keep-alive comments and event: lines are all legal SSE
 // and must not disturb parsing.
 func TestOpenAIStreamToleratesCRLFAndKeepAliveComments(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		": keep-alive\r\n\r\n"+
 		"event: message\r\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\r\n\r\n"+
@@ -70,7 +70,7 @@ func TestOpenAIStreamToleratesCRLFAndKeepAliveComments(t *testing.T) {
 // (proxy restart, dropped connection that closed cleanly). It used to come
 // back as a normal "stop" answer, so a half-written reply was taken as final.
 func TestOpenAIStreamEndingWithoutCompletionIsAnError(t *testing.T) {
-	_, err, deltas := streamOpenAI(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial ans\"}}]}\n\n")
+	_, deltas, err := streamOpenAI(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial ans\"}}]}\n\n")
 	if err == nil {
 		t.Fatal("expected an error for a stream that ended before completing")
 	}
@@ -85,7 +85,7 @@ func TestOpenAIStreamEndingWithoutCompletionIsAnError(t *testing.T) {
 // A finish_reason without [DONE] is still a complete answer: some servers
 // never send the [DONE] sentinel.
 func TestOpenAIStreamFinishReasonWithoutDoneIsComplete(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n")
+	resp, _, err := streamOpenAI(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n")
 	if err != nil {
 		t.Fatalf("ChatStream error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestOpenAIStreamFinishReasonWithoutDoneIsComplete(t *testing.T) {
 // Providers report failures that happen after the 200 header as an error
 // object inside the stream. Ignoring it returned an empty "successful" answer.
 func TestOpenAIStreamSurfacesInStreamErrorObject(t *testing.T) {
-	_, err, _ := streamOpenAI(t, ""+
+	_, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n"+
 		"data: {\"error\":{\"message\":\"upstream overloaded\",\"type\":\"server_error\"}}\n\n"+
 		"data: [DONE]\n\n")
@@ -114,7 +114,7 @@ func TestOpenAIStreamSurfacesInStreamErrorObject(t *testing.T) {
 // the stop reason to "length", sending the engine into a bogus
 // "your response was truncated" continuation.
 func TestOpenAIStreamKeepsToolCallWithEmptyArguments(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"todoread\",\"arguments\":\"\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
 		"data: [DONE]\n\n")
@@ -135,7 +135,7 @@ func TestOpenAIStreamKeepsToolCallWithEmptyArguments(t *testing.T) {
 // Parallel tool calls stream interleaved by index; each keeps its own id and
 // arguments.
 func TestOpenAIStreamAssemblesInterleavedParallelToolCalls(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"\\\"b.go\\\"}\"}},{\"index\":0,\"function\":{\"arguments\":\"\\\"a.go\\\"}\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
@@ -156,7 +156,7 @@ func TestOpenAIStreamAssemblesInterleavedParallelToolCalls(t *testing.T) {
 // with its own id. Merging them by index concatenated two argument objects
 // into one unparseable call.
 func TestOpenAIStreamSeparatesCallsThatReuseIndexWithNewID(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.go\\\"}\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"b\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*.go\\\"}\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
@@ -176,7 +176,7 @@ func TestOpenAIStreamSeparatesCallsThatReuseIndexWithNewID(t *testing.T) {
 // A tool call without an id cannot be answered: the tool result's
 // tool_call_id would be empty and the next request is rejected. Give it one.
 func TestOpenAIStreamAssignsIDToToolCallWithoutOne(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
 		"data: [DONE]\n\n")
@@ -193,7 +193,7 @@ func TestOpenAIStreamAssignsIDToToolCallWithoutOne(t *testing.T) {
 // only partly there. Closing the JSON and running the tool wrote the
 // truncated text to disk. The call must come back as a parse error instead.
 func TestOpenAIStreamDoesNotRunToolCallTruncatedByLength(t *testing.T) {
-	resp, err, _ := streamOpenAI(t, ""+
+	resp, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"w\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"a.go\\\",\\\"content\\\":\\\"package main\\\\nfunc\"}}]}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"+
 		"data: [DONE]\n\n")
@@ -231,7 +231,7 @@ func TestOpenAIChatMapsFinishReasonLength(t *testing.T) {
 // when it aborts inference under load. That half answer used to be accepted
 // as a finished turn.
 func TestOpenAIStreamTreatsInsufficientSystemResourceAsFailure(t *testing.T) {
-	_, err, _ := streamOpenAI(t, ""+
+	_, _, err := streamOpenAI(t, ""+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n"+
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n"+
 		"data: [DONE]\n\n")

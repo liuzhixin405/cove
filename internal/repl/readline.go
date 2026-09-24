@@ -248,8 +248,8 @@ func breakStreamLineLocked() {
 func endsMidLine(was bool, s string) bool {
 	mid := was
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == 0x1b:
+		switch c := s[i]; c {
+		case 0x1b:
 			// Skip a CSI sequence, the only kind that reaches this point:
 			// untrusted text is sanitised before it is printed.
 			if i+1 < len(s) && s[i+1] == '[' {
@@ -258,9 +258,9 @@ func endsMidLine(was bool, s string) bool {
 					i++
 				}
 			}
-		case c == '\n':
+		case '\n':
 			mid = false
-		case c == '\r':
+		case '\r':
 		default:
 			mid = true
 		}
@@ -508,14 +508,6 @@ func runeCellWidth(r rune) int {
 		return 2
 	}
 	return 1
-}
-
-func runesCellWidth(rs []rune) int {
-	w := 0
-	for _, r := range rs {
-		w += runeCellWidth(r)
-	}
-	return w
 }
 
 func inputDisplayWindow(buf []rune, cursor, maxCols int) (disp []rune, cursorCells, used, start int) {

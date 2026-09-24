@@ -193,7 +193,7 @@ func isScannedExt(ext string) bool {
 func signatureIdents(sig string) map[string]struct{} {
 	ids := make(map[string]struct{})
 	for _, f := range strings.FieldsFunc(sig, func(r rune) bool {
-		return !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r))
+		return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		ids[f] = struct{}{}
 	}
