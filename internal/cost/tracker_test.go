@@ -57,7 +57,8 @@ func TestTrackerAddDetailedUsesDeepSeekCacheHitPricing(t *testing.T) {
 		t.Fatalf("TotalPromptCacheMiss = %d, want 400", tracker.Totals().PromptCacheMiss)
 	}
 
-	want := (400.0/1e6)*0.14 + (600.0/1e6)*(0.14*0.1) + (200.0/1e6)*0.28
+	// deepseek-v4-pro peak list price: miss $1.32, hit $0.044, output $3.96 per MTok.
+	want := (400.0/1e6)*1.32 + (600.0/1e6)*0.044 + (200.0/1e6)*3.96
 	if diff := tracker.Totals().Cost - want; diff < -1e-12 || diff > 1e-12 {
 		t.Fatalf("TotalCost = %.12f, want %.12f", tracker.Totals().Cost, want)
 	}
@@ -87,9 +88,10 @@ func TestTrackerSummaryIncludesCacheBreakdown(t *testing.T) {
 
 func TestTrackerSummaryShowsSmallNonZeroCost(t *testing.T) {
 	tracker := NewTracker(10)
-	tracker.AddDetailed("deepseek-v4-pro", 9836, 54, 1280, 8556)
+	// flash keeps this under a cent: 8556*0.30 + 1280*0.006 + 54*1.20 per MTok = $0.00264
+	tracker.AddDetailed("deepseek-flash", 9836, 54, 1280, 8556)
 	got := tracker.Summary()
-	if got != "9836 in (cache hit 1280, miss 8556) | 54 out | $0.0012 / $10.00" {
+	if got != "9836 in (cache hit 1280, miss 8556) | 54 out | $0.0026 / $10.00" {
 		t.Fatalf("Summary() = %q", got)
 	}
 }

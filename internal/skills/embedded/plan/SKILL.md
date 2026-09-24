@@ -1,8 +1,6 @@
 ---
 name: plan
 description: Write an actionable markdown plan before implementation. Bite-sized tasks, exact paths, complete code.
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java,*.rb"
 ---
 
 # Plan Mode

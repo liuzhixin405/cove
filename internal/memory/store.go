@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove/internal/safety"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -203,6 +204,12 @@ func (s *Store) All() []Entry {
 			if fsatomic.IsTempName(f.Name()) {
 				continue
 			}
+			// Hidden files are bookkeeping, not memories: the dream
+			// consolidation lock (.consolidate-lock) lives here and holds a
+			// PID, which used to be injected into every prompt as a memory.
+			if strings.HasPrefix(f.Name(), ".") {
+				continue
+			}
 			path := filepath.Join(dir, f.Name())
 			if seen[path] {
 				continue
@@ -264,15 +271,37 @@ func (s *Store) BuildPrompt() string {
 	}
 	s.mu.Unlock()
 
+	var project, auto []Entry
+	autoBytes := 0
+	for _, e := range entries {
+		if e.Project {
+			project = append(project, e)
+			continue
+		}
+		auto = append(auto, e)
+		autoBytes += len(e.Content)
+	}
+
 	var sb strings.Builder
 	sb.WriteString("\n\n<user_memories>\n")
-	for _, e := range entries {
-		sb.WriteString("<memory>\n")
-		sb.WriteString("<name>" + e.Name + "</name>\n")
-		sb.WriteString("<content>\n")
-		sb.WriteString(e.Content)
-		sb.WriteString("\n</content>\n")
-		sb.WriteString("</memory>\n")
+	// Project instruction files (CLAUDE.md) are always included in full.
+	for _, e := range project {
+		writeMemory(&sb, e)
+	}
+	if autoBytes <= InlineBudgetBytes {
+		for _, e := range auto {
+			writeMemory(&sb, e)
+		}
+	} else {
+		// Past the budget, pasting every memory would crowd out the rest of
+		// the context on every request. List them instead; the model reads
+		// the ones relevant to the task with its read tool.
+		sb.WriteString("<memory_index>\n")
+		sb.WriteString("Saved memories (too many to include in full). Read the file of any entry relevant to the current task before relying on it:\n")
+		for _, e := range auto {
+			fmt.Fprintf(&sb, "- %s (%s): %s\n", e.Name, e.Path, firstLine(e.Content))
+		}
+		sb.WriteString("</memory_index>\n")
 	}
 	sb.WriteString("</user_memories>\n")
 
@@ -282,6 +311,38 @@ func (s *Store) BuildPrompt() string {
 	s.promptDirty = false
 	s.mu.Unlock()
 	return result
+}
+
+// InlineBudgetBytes is the total size of saved memories that BuildPrompt still
+// includes in full; beyond it the prompt carries an index instead.
+const InlineBudgetBytes = 8 * 1024
+
+func writeMemory(sb *strings.Builder, e Entry) {
+	sb.WriteString("<memory>\n")
+	sb.WriteString("<name>" + e.Name + "</name>\n")
+	sb.WriteString("<content>\n")
+	sb.WriteString(e.Content)
+	sb.WriteString("\n</content>\n")
+	sb.WriteString("</memory>\n")
+}
+
+func firstLine(content string) string {
+	line := strings.TrimSpace(content)
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	return textutil.ClipRunes(line, 120)
+}
+
+// ScreenContent rejects memory content that carries injected instructions or
+// secrets. Memories are injected into every future system prompt, so text
+// planted in a web page or file must not be able to persist that way. Every
+// writer of memory files (Save, extraction, consolidation) calls it.
+func ScreenContent(content string) error {
+	if f := safety.NewContentChecker().Scan(content, "memory").BlockingFinding(); f != nil {
+		return fmt.Errorf("%s", f.Message)
+	}
+	return nil
 }
 
 // EntryMatch is one ranked memory entry returned by Search.
@@ -387,7 +448,24 @@ type Entry struct {
 	Project bool
 }
 
+// validName reports whether name is a plain file name inside the memory
+// directory. Save and Delete join it onto the directory, so "../x" used to
+// write or delete a file outside it.
+func validName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, `/\`) || filepath.Base(name) != name || filepath.VolumeName(name) != "" {
+		return fmt.Errorf("invalid memory name %q: use a plain file name such as notes.md", name)
+	}
+	return nil
+}
+
 func (s *Store) Save(name, content string) error {
+	if err := validName(name); err != nil {
+		return err
+	}
+	if err := ScreenContent(content); err != nil {
+		return fmt.Errorf("memory entry %q refused: %w", name, err)
+	}
 	// Validate entry size
 	if len(content) > MaxEntryBytes {
 		return fmt.Errorf("memory entry %q exceeds max size (%d > %d bytes)", name, len(content), MaxEntryBytes)
@@ -453,6 +531,9 @@ func TruncateEntry(content string) string {
 }
 
 func (s *Store) Delete(name string) error {
+	if err := validName(name); err != nil {
+		return err
+	}
 	for _, d := range s.dirs {
 		path := filepath.Join(d, name)
 		if _, err := os.Stat(path); err == nil {
@@ -463,7 +544,9 @@ func (s *Store) Delete(name string) error {
 			return err
 		}
 	}
-	return nil
+	// Nothing was removed. Returning nil here made /memory remove report a
+	// typo'd name as deleted.
+	return fmt.Errorf("memory %q not found", name)
 }
 
 func (s *Store) invalidateCache() {

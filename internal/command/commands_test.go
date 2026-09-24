@@ -30,6 +30,7 @@ type fakeEngine struct {
 	checkpts []string
 	restored string
 	restErr  error
+	backup   string
 	rlInfo   api.RateLimitInfo
 }
 
@@ -39,9 +40,9 @@ func (f *fakeEngine) SetSystemOverride(prompt string) { f.override = prompt }
 func (f *fakeEngine) SystemPrompt() string            { return f.override }
 func (f *fakeEngine) CostTracker() CostTrackerView    { return f.cost }
 func (f *fakeEngine) ListCheckpoints() []string       { return f.checkpts }
-func (f *fakeEngine) RestoreCheckpoint(hash string) error {
+func (f *fakeEngine) RestoreCheckpoint(hash string) (string, error) {
 	f.restored = hash
-	return f.restErr
+	return f.backup, f.restErr
 }
 func (f *fakeEngine) RateLimitInfo() api.RateLimitInfo { return f.rlInfo }
 
@@ -208,6 +209,43 @@ func TestPluginCmdListShowsPluginDirWhenEmpty(t *testing.T) {
 	}
 }
 
+// The list says where each skill comes from, so a user can tell a built-in
+// from their own copy or a project skill that overrides it.
+func TestSkillsCmdListShowsSource(t *testing.T) {
+	sm := &fakeSkillManager{all: []skills.Skill{
+		{Name: "plan", Description: "Plan", Source: skills.SourceBuiltin},
+		{Name: "deploy", Description: "Deploy", Source: skills.SourceProject},
+		{Name: "notes", Description: "Notes", Source: skills.SourceUser},
+	}}
+	out, err := NewSkillsCmd().Execute(context.Background(), Input{Args: []string{"list"}, SkillManager: sm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"[内置]", "[项目]", "[用户]"} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("list output lacks %s:\n%s", want, out.Message)
+		}
+	}
+}
+
+func TestSkillsCmdExportCopiesABuiltin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	sm := &fakeSkillManager{}
+	out, err := NewSkillsCmd().Execute(context.Background(), Input{Args: []string{"export", "plan"}, SkillManager: sm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".cove", "skills", "plan", "SKILL.md")
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("export did not write %s: %s", path, out.Message)
+	}
+	if !strings.Contains(out.Message, "不再随") {
+		t.Fatalf("export must warn that the copy stops updating with the binary: %q", out.Message)
+	}
+}
+
 func TestSkillsCmdListAndShowSkill(t *testing.T) {
 	skill := skills.Skill{Name: "debug", Description: "Debug workflow", Prompt: "DEBUG WORKFLOW"}
 	sm := &fakeSkillManager{all: []skills.Skill{skill}, index: map[string]skills.Skill{"debug": skill}}
@@ -330,6 +368,14 @@ func TestUndoCmdRestoresLatestWhenNoArg(t *testing.T) {
 	}
 	if !strings.Contains(out.Message, "最近检查点") {
 		t.Fatalf("unexpected output: %q", out.Message)
+	}
+}
+
+func TestUndoCmdNamesTheBackup(t *testing.T) {
+	eng := &fakeEngine{backup: "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432"}
+	out, _ := NewUndoCmd().Execute(context.Background(), Input{Engine: eng})
+	if !strings.Contains(out.Message, "/undo 9f8e7d6c") {
+		t.Fatalf("undo output %q does not say how to reverse it", out.Message)
 	}
 }
 

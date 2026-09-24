@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove/internal/termui"
 )
 
 func TestPermissionAnswerDecision(t *testing.T) {
@@ -106,6 +110,13 @@ func TestInstallPermissionPromptWiresHandler(t *testing.T) {
 	oldInteractive := replInteractive
 	replInteractive = true
 	t.Cleanup(func() { replInteractive = oldInteractive; repl.ClearPermInputCh() })
+	// The engine opens its session store under HOME and project notes under
+	// the working directory; this test used to create both in the user's
+	// real ~/.cove and in the package directory.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Chdir(t.TempDir())
 
 	eng, err := engine.New(engine.Config{})
 	if err != nil {
@@ -131,6 +142,96 @@ func TestInstallPermissionPromptWiresHandler(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("engine prompt did not return after the answer was relayed")
+	}
+}
+
+// managerRules lets the prompt add session rules straight to a Manager, so a
+// test can ask the Manager what the "a" answer actually allows afterwards.
+type managerRules struct{ *permission.Manager }
+
+func (m managerRules) AddPermissionRule(d permission.Decision, r permission.Rule) { m.AddRule(d, r) }
+
+// answerPrompt runs one prompt for toolName/input, answers it and returns the
+// decision together with everything the prompt printed.
+func answerPrompt(t *testing.T, rules permissionRuleAdder, toolName string, input map[string]any, answer string) (bool, string) {
+	t.Helper()
+	oldInteractive := replInteractive
+	replInteractive = true
+	var buf bytes.Buffer
+	termui.SetWriter(&buf)
+	t.Cleanup(func() {
+		replInteractive = oldInteractive
+		termui.SetWriter(nil)
+		repl.ClearPermInputCh()
+	})
+
+	done := make(chan bool, 1)
+	go func() { done <- askToolPermission(rules, toolName, input, "") }()
+	waitForPermInputCh(t) <- answer
+	select {
+	case allow := <-done:
+		return allow, buf.String()
+	case <-time.After(5 * time.Second):
+		t.Fatal("askToolPermission did not return after the answer was relayed")
+		return false, ""
+	}
+}
+
+func checkCommand(m *permission.Manager, tool, cmd string) permission.Decision {
+	d, _ := m.Check(tool, map[string]any{"command": cmd}, permission.DAsk)
+	return d
+}
+
+// Answering "a" for a shell command must remember only that command's prefix:
+// the old whole-tool rule let every later bash command, rm -rf included, run
+// without a prompt.
+func TestAlwaysAnswerScopesShellToolsToCommandPrefix(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "go test ./..."}, "a")
+	if !allow {
+		t.Fatal("answer \"a\" must allow the current call")
+	}
+	if !strings.Contains(out, `"go test" 开头的命令`) {
+		t.Errorf("prompt output does not name the remembered prefix:\n%s", out)
+	}
+
+	if d := checkCommand(m, "bash", "go test -run TestX ./pkg"); d != permission.DAllow {
+		t.Errorf("later go test = %v, want allow", d)
+	}
+	for _, cmd := range []string{"rm -rf src", "go test ./... && rm -rf x", "sudo go test"} {
+		if d := checkCommand(m, "bash", cmd); d != permission.DAsk {
+			t.Errorf("%q after allowing go test = %v, want ask", cmd, d)
+		}
+	}
+}
+
+func TestAlwaysAnswerKeepsWholeToolScopeForOtherTools(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	allow, _ := answerPrompt(t, managerRules{m}, "write", map[string]any{"file_path": "a.go"}, "a")
+	if !allow {
+		t.Fatal("answer \"a\" must allow the current call")
+	}
+	if d, _ := m.Check("write", map[string]any{"file_path": "b.go"}, permission.DAsk); d != permission.DAllow {
+		t.Errorf("write after \"a\" = %v, want allow", d)
+	}
+}
+
+// A command no prefix can safely describe is allowed once and nothing is
+// remembered, and the prompt says so instead of offering a scope it lacks.
+func TestAlwaysAnswerForUnscopableCommandAllowsOnlyOnce(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "sudo go test"}, "a")
+	if !allow {
+		t.Fatal("answer \"a\" must still allow the current call")
+	}
+	if strings.Contains(out, "总是允许") {
+		t.Errorf("prompt offered an always-allow scope for an unscopable command:\n%s", out)
+	}
+	if d := checkCommand(m, "bash", "sudo go test"); d != permission.DAsk {
+		t.Errorf("sudo go test after \"a\" = %v, want ask", d)
+	}
+	if d := checkCommand(m, "bash", "ls"); d != permission.DAsk {
+		t.Errorf("ls after \"a\" on sudo go test = %v, want ask", d)
 	}
 }
 

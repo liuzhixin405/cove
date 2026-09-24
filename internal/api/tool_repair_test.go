@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRepairToolArguments_CleanJSON(t *testing.T) {
 	args, ok := RepairToolArguments(`{"filePath": "a.go", "content": "package main"}`)
@@ -22,27 +25,22 @@ func TestRepairToolArguments_Empty(t *testing.T) {
 	}
 }
 
-func TestRepairToolArguments_TruncatedString(t *testing.T) {
-	// Truncated mid-value: a long "content" string cut off before its closing quote.
-	raw := `{"filePath": "a.go", "content": "package main\nfunc main() {`
-	args, ok := RepairToolArguments(raw)
-	if !ok {
-		t.Fatalf("expected truncated JSON to be repaired")
+// Truncated arguments used to be "repaired" by closing the open string and
+// braces. For a write or edit that meant running the tool with half the
+// content and writing it to disk, so every truncated shape below must now
+// fail and be reported back to the model instead. (These tests used to
+// assert the opposite.)
+func TestRepairToolArguments_RefusesTruncatedArguments(t *testing.T) {
+	cases := map[string]string{
+		"cut mid string":        `{"filePath": "a.go", "content": "package main\nfunc main() {`,
+		"cut after comma":       `{"oldString": "foo", "newString": "bar",`,
+		"cut inside array":      `{"filePath": "a.go", "edits": [{"old": "x", "new": "y"}, {"old": "p", "new": "q`,
+		"brace inside open str": `{"command": "echo '{not a real brace'`,
 	}
-	if args["filePath"] != "a.go" {
-		t.Fatalf("expected filePath to survive repair, got %v", args["filePath"])
-	}
-}
-
-func TestRepairToolArguments_TruncatedAfterComma(t *testing.T) {
-	// Truncated right after a trailing comma, before the next key started.
-	raw := `{"oldString": "foo", "newString": "bar",`
-	args, ok := RepairToolArguments(raw)
-	if !ok {
-		t.Fatalf("expected trailing-comma truncation to be repaired")
-	}
-	if args["oldString"] != "foo" || args["newString"] != "bar" {
-		t.Fatalf("unexpected repaired args: %v", args)
+	for name, raw := range cases {
+		if args, ok := RepairToolArguments(raw); ok {
+			t.Errorf("%s: truncated arguments were accepted as %v", name, args)
+		}
 	}
 }
 
@@ -58,15 +56,10 @@ func TestRepairToolArguments_StrayTrailingTokens(t *testing.T) {
 	}
 }
 
-func TestRepairToolArguments_NestedTruncation(t *testing.T) {
-	raw := `{"filePath": "a.go", "edits": [{"old": "x", "new": "y"}, {"old": "p", "new": "q`
-	args, ok := RepairToolArguments(raw)
-	if !ok {
-		t.Fatalf("expected nested truncation to be repaired")
-	}
-	edits, ok := args["edits"].([]any)
-	if !ok || len(edits) != 2 {
-		t.Fatalf("expected 2 recovered edit entries, got %v", args["edits"])
+func TestRepairToolArguments_StrayTextAroundCompleteObject(t *testing.T) {
+	args, ok := RepairToolArguments("```json\n{\"command\": \"ls\"}\n```")
+	if !ok || args["command"] != "ls" {
+		t.Fatalf("args = %v, ok = %v; want the wrapped object", args, ok)
 	}
 }
 
@@ -78,15 +71,13 @@ func TestRepairToolArguments_Unrecoverable(t *testing.T) {
 	}
 }
 
-func TestRepairToolArguments_QuoteInsideTruncatedString(t *testing.T) {
-	// Ensure the brace/bracket tracker correctly ignores braces that appear
-	// inside string literals when deciding how many closers to append.
-	raw := `{"command": "echo '{not a real brace'`
-	args, ok := RepairToolArguments(raw)
-	if !ok {
-		t.Fatalf("expected repair to succeed despite brace-like characters inside a string")
+func TestToolArgsParseErrorExplainsTruncation(t *testing.T) {
+	msg, _ := toolArgsParseError(`{"content":"abc`, true)["_cove_parse_error"].(string)
+	if !strings.Contains(msg, "output token limit") {
+		t.Fatalf("message = %q, want it to name the output limit", msg)
 	}
-	if _, exists := args["command"]; !exists {
-		t.Fatalf("expected command key to survive repair: %v", args)
+	plain, _ := toolArgsParseError(`{"content":"abc`, false)["_cove_parse_error"].(string)
+	if strings.Contains(plain, "output token limit") {
+		t.Fatalf("message = %q, must not blame the limit when it was not hit", plain)
 	}
 }

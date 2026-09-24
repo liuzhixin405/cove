@@ -47,7 +47,13 @@ func TestIsPrivateIP(t *testing.T) {
 }
 
 func TestIsPrivateHostFailsClosed(t *testing.T) {
-	// An unresolvable name is not proof the target is public.
+	// An unresolvable name is not proof the target is public. The resolver is
+	// stubbed: this used to ask the real one, and fake-IP DNS (Clash TUN mode,
+	// common behind the GFW) resolves even "x.invalid." to 198.18.0.0/15, so
+	// the test failed on those machines without the code being wrong.
+	old := lookupIP
+	lookupIP = func(string) ([]net.IP, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} }
+	defer func() { lookupIP = old }()
 	if !IsPrivateHost("nonexistent.invalid.") {
 		t.Error("an unresolvable host must be treated as private")
 	}

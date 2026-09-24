@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -254,7 +253,7 @@ func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry,
 	// front end decides what to do with it.
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
 		// Pull latest
-		cmd := exec.Command("git", "-C", repoDir, "pull", "--ff-only")
+		cmd := gitCommand("-C", repoDir, "pull", "--ff-only")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			log.Debugf("marketplace pull %s: %v: %s", src.Name, err, strings.TrimSpace(string(out)))
 		}
@@ -264,9 +263,8 @@ func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry,
 		log.Infof("正在克隆 marketplace 源: %s ...", src.Name)
 		// --progress is dropped along with the inherited terminal: it only
 		// draws a meter for a tty, and there is no tty to draw it on now.
-		cmd := exec.Command("git", "clone", "--depth=1", src.URL, repoDir)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("git clone %s failed: %s: %w", src.URL, strings.TrimSpace(string(out)), err)
+		if err := cloneRepo(src.URL, repoDir); err != nil {
+			return nil, fmt.Errorf("%s: %w", src.URL, err)
 		}
 	}
 
@@ -536,11 +534,9 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 
 	// Clone the plugin repo
 	if isGitURL(source) {
-		args := []string{"clone", "--depth=1", "--quiet", source, pluginDir}
-		cmd := exec.Command("git", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if err := cloneRepo(source, pluginDir); err != nil {
 			_ = os.RemoveAll(pluginDir) // cleanup on failure
-			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
+			return err
 		}
 	} else {
 		// Local path: copy directory
@@ -603,7 +599,7 @@ func (m *Marketplace) Update(name string) error {
 	}
 
 	// Pull latest
-	cmd := exec.Command("git", "-C", pluginDir, "pull", "--ff-only", "--quiet")
+	cmd := gitCommand("-C", pluginDir, "pull", "--ff-only", "--quiet")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git pull failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -634,10 +630,16 @@ func (m *Marketplace) UpdateAll() (updated []string, errs []string) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(pluginDir, ".git")); err != nil {
+			// A copy out of the marketplace cache has no .git and cannot be
+			// pulled. Skipping it silently made "/plugin update" answer that
+			// everything was current, so the plugin quietly never updated.
+			if _, statErr := os.Stat(pluginDir); statErr == nil {
+				errs = append(errs, fmt.Sprintf("%s: 从 marketplace 缓存复制安装，不是 git 仓库，无法原地更新（先 /plugin refresh，再卸载重装）", name))
+			}
 			continue
 		}
 
-		cmd := exec.Command("git", "-C", pluginDir, "pull", "--ff-only", "--quiet")
+		cmd := gitCommand("-C", pluginDir, "pull", "--ff-only", "--quiet")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", name, strings.TrimSpace(string(out))))
 			continue
@@ -687,6 +689,32 @@ func (m *Marketplace) saveLockfile() error {
 		return err
 	}
 	return os.WriteFile(m.lockfilePath(), data, 0644)
+}
+
+// recordInstall adds a lock entry for a plugin cloned into dir outside the
+// marketplace (from a URL the user gave), so update can find it.
+func (m *Marketplace) recordInstall(name, source, dir string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lockfile.Plugins[name] = LockEntry{
+		Source:      source,
+		Version:     readManifestVersion(dir),
+		CommitSHA:   getGitSHA(dir),
+		InstalledAt: time.Now().Format(time.RFC3339),
+		AutoUpdate:  true,
+	}
+	return m.saveLockfile()
+}
+
+// forget drops a plugin's lock entry after it has been uninstalled.
+func (m *Marketplace) forget(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.lockfile.Plugins[name]; !ok {
+		return nil
+	}
+	delete(m.lockfile.Plugins, name)
+	return m.saveLockfile()
 }
 
 // LockInfo returns the lock entry for a plugin.
@@ -742,7 +770,7 @@ func isValidSource(source string) bool {
 }
 
 func getGitSHA(dir string) string {
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	cmd := gitCommand("-C", dir, "rev-parse", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

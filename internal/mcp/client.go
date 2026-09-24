@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,13 +28,21 @@ type stdioTransport struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
-	mu     sync.Mutex
 	reader *bufio.Reader
+
+	// sendSem serialises writes (a one-slot semaphore rather than a mutex so a
+	// waiting Send can give up on its context). broken is set, under sendSem,
+	// once a write was abandoned half-way: the stream is then corrupt.
+	sendSem chan struct{}
+	broken  error
 
 	// closeOnce guards the shutdown path: Close is reachable from Pool.Connect's
 	// error handling and from Client.Close, and cmd.Wait must run exactly once.
 	closeOnce sync.Once
 	waitErr   error
+
+	// tree lets Close kill the server's descendants, not just the direct child.
+	tree procTree
 }
 
 func NewStdioTransport(command string, args []string, env map[string]string) (*stdioTransport, error) {
@@ -68,18 +77,21 @@ func NewStdioTransport(command string, args []string, env map[string]string) (*s
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
 
+	setupProcTree(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", command, err)
 	}
+	t := &stdioTransport{
+		cmd:     cmd,
+		stdin:   stdin,
+		stdout:  stdout,
+		reader:  bufio.NewReader(stdout),
+		sendSem: make(chan struct{}, 1),
+	}
+	t.tree.attach(cmd)
 
 	go drainServerStderr(command, stderr)
-
-	return &stdioTransport{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: stdout,
-		reader: bufio.NewReader(stdout),
-	}, nil
+	return t, nil
 }
 
 // maxServerStderrLine bounds one logged line from a misbehaving server.
@@ -89,20 +101,44 @@ const maxServerStderrLine = 2000
 //
 // It exits when the pipe closes, which happens when the process exits — so it
 // cannot outlive the server it belongs to.
+//
+// Lines of any length are consumed. This used a Scanner capped at 256KB per
+// line, which gave up at the first longer line and closed the pipe; every
+// later stderr write of the server then failed with EPIPE, which crashes a
+// Node server outright. Only the start of a long line is kept for the log.
 func drainServerStderr(name string, r io.ReadCloser) {
 	defer func() { _ = r.Close() }()
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 8*1024), 256*1024)
-	for sc.Scan() {
-		line := strings.TrimRight(sc.Text(), "\r")
-		if strings.TrimSpace(line) == "" {
+	br := bufio.NewReaderSize(r, 8*1024)
+	var line []byte
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		// Keep a margin over the logged size: sanitizing removes escapes.
+		if room := 4*maxServerStderrLine - len(line); room > 0 {
+			if len(frag) > room {
+				frag = frag[:room]
+			}
+			line = append(line, frag...)
+		}
+		if isPrefix && err == nil {
 			continue
 		}
-		// Strip control sequences before logging: the whole point of piping
-		// this is that the server's escapes must never reach a terminal, and
-		// the log's writer may well BE the terminal.
-		log.Debugf("mcp %s: %s", name, sanitizeServerLine(line))
+		logServerLine(name, string(line))
+		line = line[:0]
+		if err != nil {
+			return
+		}
 	}
+}
+
+func logServerLine(name, line string) {
+	line = strings.TrimRight(line, "\r")
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	// Strip control sequences before logging: the whole point of piping this
+	// is that the server's escapes must never reach a terminal, and the log's
+	// writer may well BE the terminal.
+	log.Debugf("mcp %s: %s", name, sanitizeServerLine(line))
 }
 
 // sanitizeServerLine removes every escape sequence and bare control byte from
@@ -121,16 +157,55 @@ func sanitizeServerLine(s string) string {
 	return textutil.ClipBytes(s, maxServerStderrLine, "…")
 }
 
+// Send writes one message, honouring ctx.
+//
+// A server that stops draining its stdin (deadlocked, or busy in synchronous
+// work) makes the write block once the pipe buffer is full. Send used to block
+// there forever, ignoring its context and holding the lock, so the tool call
+// could not be interrupted and every later call to the server queued behind
+// it. Now the write runs aside; if ctx ends first the transport is shut down -
+// a half-written message has corrupted the stream anyway - which also unblocks
+// the abandoned write.
 func (t *stdioTransport) Send(ctx context.Context, msg any) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	_, err = t.stdin.Write(data)
-	return err
+
+	select {
+	case t.sendSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if t.broken != nil {
+		<-t.sendSem
+		return t.broken
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := t.stdin.Write(data)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		<-t.sendSem
+		return err
+	case <-ctx.Done():
+		// Both may be ready at once; a write that did complete leaves the
+		// stream intact and must not cost the connection.
+		select {
+		case err := <-done:
+			<-t.sendSem
+			return err
+		default:
+		}
+		t.broken = fmt.Errorf("mcp stdio: connection abandoned after an interrupted write")
+		<-t.sendSem
+		go func() { _ = t.Close() }()
+		return ctx.Err()
+	}
 }
 
 func (t *stdioTransport) Receive(ctx context.Context) (json.RawMessage, error) {
@@ -178,11 +253,12 @@ func (t *stdioTransport) Close() error {
 		select {
 		case t.waitErr = <-done:
 		case <-time.After(stdioCloseGrace):
-			_ = t.cmd.Process.Kill()
+			t.tree.kill(t.cmd)
 			// Still reap: Kill only delivers the signal, Wait releases the
 			// process entry and the pipe goroutines.
 			t.waitErr = <-done
 		}
+		t.tree.release()
 	})
 	return t.waitErr
 }
@@ -203,7 +279,13 @@ type Client struct {
 	pending    map[int]chan *Response
 	notifyCh   chan *Notification
 	closed     bool
-	stopCh     chan struct{} // closed by Close() to signal receiveLoop to stop
+	// dead is set when receiveLoop exits (transport EOF, server crash). Without
+	// it a Call after the server died registered a pending entry nobody would
+	// ever resolve, sent the request (HTTP transports accept it happily) and
+	// then waited for the caller's context - for a tool call, until the user
+	// interrupted the turn.
+	dead   bool
+	stopCh chan struct{} // closed by Close() to signal receiveLoop to stop
 }
 
 func NewClient(transport Transport) *Client {
@@ -257,6 +339,10 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		// no deadline.
 		return fmt.Errorf("mcp: connection closed")
 	}
+	if c.dead {
+		c.mu.Unlock()
+		return fmt.Errorf("mcp: connection lost (server exited or closed the stream); reconnect with /mcp connect")
+	}
 	c.reqID++
 	id := c.reqID
 	ch := make(chan *Response, 1)
@@ -301,6 +387,18 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		}
 		return nil
 	case <-ctx.Done():
+		// Tell the server to stop: without this an interrupted tool call kept
+		// running on the server (a long search, a build) to completion. The
+		// spec forbids cancelling initialize. Sent aside, with its own short
+		// deadline, since ctx is already done.
+		if method != "initialize" {
+			go func() {
+				nctx, cancel := context.WithTimeout(context.Background(), serverReplyTimeout)
+				defer cancel()
+				_ = c.SendNotification(nctx, "notifications/cancelled",
+					map[string]any{"requestId": id, "reason": ctx.Err().Error()})
+			}()
+		}
 		return ctx.Err()
 	}
 }
@@ -325,6 +423,15 @@ func (c *Client) Notifications() <-chan *Notification {
 
 func (c *Client) ServerInfo() Implementation { return c.serverInfo }
 
+// Alive reports whether the connection can still carry requests: the client has
+// not been closed and its receive loop is still running. A server that crashed
+// or dropped its stream leaves the client open but dead.
+func (c *Client) Alive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && !c.dead
+}
+
 func (c *Client) Close() error {
 	// Signal receiveLoop to stop (non-blocking: channel may already be closed).
 	select {
@@ -346,6 +453,7 @@ func (c *Client) Close() error {
 func (c *Client) receiveLoop() {
 	defer func() {
 		c.mu.Lock()
+		c.dead = true
 		for _, ch := range c.pending {
 			// Non-blocking: each pending channel is buffered for exactly one
 			// response. A blocking send here deadlocked the whole client — if a
@@ -401,11 +509,11 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 
 	var base struct {
 		JSONRPC
-		// Pointer so we can tell "no id" (notification) from "id: 0". With a
-		// plain int+omitempty, a response with id 0 and a notification were
-		// indistinguishable, so id-0 responses were dropped and id-0 server
-		// requests were misrouted as notifications.
-		ID     *int            `json:"id"`
+		// Raw so we can tell "no id" (notification) from "id: 0", and so a
+		// server request's id - which may be a string - can be echoed back
+		// verbatim. It used to be *int: a string id failed the whole decode and
+		// the message was dropped.
+		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method,omitempty"`
 		Result json.RawMessage `json:"result,omitempty"`
 		Error  *Error          `json:"error,omitempty"`
@@ -415,9 +523,10 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &base); err != nil {
 		return nil
 	}
+	hasID := len(base.ID) > 0 && string(base.ID) != "null"
 
 	// Notification: a method with no id.
-	if base.Method != "" && base.ID == nil {
+	if base.Method != "" && !hasID {
 		notif := &Notification{
 			JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
 			Method:  base.Method,
@@ -430,15 +539,23 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 		return nil
 	}
 
-	// Server-initiated request (method + id): this client doesn't implement
-	// server-to-client requests (sampling/roots). Ignore rather than misroute it
-	// into the pending-response table.
+	// Server-initiated request (method + id). It must never be misrouted into
+	// the pending-response table, and it must be answered: silence used to
+	// leave servers waiting forever, and ones that ping as a keepalive dropped
+	// the connection. Only ping is implemented (sampling/roots are not
+	// advertised). The reply goes out on its own goroutine so a slow Send (an
+	// HTTP POST) cannot stall the receive loop.
 	if base.Method != "" {
+		go c.answerServerRequest(base.ID, base.Method)
 		return nil
 	}
 
 	// Otherwise it's a response to one of our requests; it must carry an id.
-	if base.ID == nil {
+	if !hasID {
+		return nil
+	}
+	id, ok := responseID(base.ID)
+	if !ok {
 		return nil
 	}
 
@@ -447,7 +564,7 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 		c.mu.Unlock()
 		return fmt.Errorf("client closed")
 	}
-	ch, ok := c.pending[*base.ID]
+	ch, ok := c.pending[id]
 	if ok {
 		// Non-blocking: the channel is buffered for the single response this
 		// request expects, and a second response for the same id is a protocol
@@ -458,7 +575,7 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 		select {
 		case ch <- &Response{
 			JSONRPC: JSONRPC{Jsonrpc: base.Jsonrpc},
-			ID:      *base.ID,
+			ID:      id,
 			Result:  base.Result,
 			Error:   base.Error,
 		}:
@@ -469,15 +586,80 @@ func (c *Client) handleRaw(raw json.RawMessage) error {
 	return nil
 }
 
+// responseID decodes the id of a response to one of our requests. We only ever
+// send integer ids, but a server that echoes them back as strings is tolerated.
+func responseID(raw json.RawMessage) (int, bool) {
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n, true
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if n, err := strconv.Atoi(s); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// rpcReply is a response to a server-initiated request. Its id is raw so the
+// server's own id (string or number) goes back exactly as it was sent.
+type rpcReply struct {
+	JSONRPC
+	ID     json.RawMessage `json:"id"`
+	Result any             `json:"result,omitempty"`
+	Error  *Error          `json:"error,omitempty"`
+}
+
+// serverReplyTimeout bounds the Send of a reply to a server request.
+const serverReplyTimeout = 10 * time.Second
+
+func (c *Client) answerServerRequest(id json.RawMessage, method string) {
+	reply := rpcReply{JSONRPC: JSONRPC{Jsonrpc: "2.0"}, ID: id}
+	if method == "ping" {
+		reply.Result = struct{}{}
+	} else {
+		reply.Error = &Error{Code: -32601, Message: "Method not found: " + method}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), serverReplyTimeout)
+	defer cancel()
+	_ = c.transport.Send(ctx, reply)
+}
+
+// maxListPages bounds cursor pagination, so a server that keeps handing out
+// fresh cursors cannot keep a listing going forever.
+const maxListPages = 100
+
+// cursorParams is the params object of a paginated list request.
+func cursorParams(cursor string) any {
+	if cursor == "" {
+		return nil
+	}
+	return map[string]string{"cursor": cursor}
+}
+
+// ListTools returns every tool the server offers, following nextCursor.
+// Reading only the first page silently hid the rest of a large server's tools.
 func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 	if c.serverCaps.Tools == nil {
 		return nil, fmt.Errorf("server does not support tools")
 	}
-	var result ListToolsResult
-	if err := c.Call(ctx, "tools/list", nil, &result); err != nil {
-		return nil, err
+	var all []Tool
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 0; page < maxListPages; page++ {
+		var result ListToolsResult
+		if err := c.Call(ctx, "tools/list", cursorParams(cursor), &result); err != nil {
+			return nil, err
+		}
+		all = append(all, result.Tools...)
+		cursor = result.NextCursor
+		if cursor == "" || seen[cursor] {
+			break
+		}
+		seen[cursor] = true
 	}
-	return result.Tools, nil
+	return all, nil
 }
 
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (*CallToolResult, error) {
@@ -493,11 +675,22 @@ func (c *Client) ListResources(ctx context.Context) ([]Resource, error) {
 	if c.serverCaps.Resources == nil {
 		return nil, fmt.Errorf("server does not support resources")
 	}
-	var result ListResourcesResult
-	if err := c.Call(ctx, "resources/list", nil, &result); err != nil {
-		return nil, err
+	var all []Resource
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 0; page < maxListPages; page++ {
+		var result ListResourcesResult
+		if err := c.Call(ctx, "resources/list", cursorParams(cursor), &result); err != nil {
+			return nil, err
+		}
+		all = append(all, result.Resources...)
+		cursor = result.NextCursor
+		if cursor == "" || seen[cursor] {
+			break
+		}
+		seen[cursor] = true
 	}
-	return result.Resources, nil
+	return all, nil
 }
 
 func (c *Client) ReadResource(ctx context.Context, uri string) (*ReadResourceResult, error) {

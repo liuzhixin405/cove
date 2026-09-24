@@ -1,6 +1,8 @@
 package token
 
 import (
+	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -30,6 +32,32 @@ func TruncateToTokens(text string, maxTokens int) string {
 	if Estimate(text) <= maxTokens {
 		return text
 	}
+	return text[:prefixEnd(text, maxTokens)] + "\n... [truncated]"
+}
+
+// TruncateMiddle keeps the start and the end of text within about maxTokens
+// and drops the middle. Command output needs both ends: the first lines show
+// what ran, the last ones hold the failure summary, stderr and exit status.
+func TruncateMiddle(text string, maxTokens int) string {
+	if maxTokens <= 0 {
+		return "... [truncated]"
+	}
+	if Estimate(text) <= maxTokens {
+		return text
+	}
+	headTokens := maxTokens * 2 / 5
+	headEnd := prefixEnd(text, headTokens)
+	tailStart := suffixStart(text, maxTokens-headTokens)
+	if tailStart <= headEnd {
+		return text
+	}
+	omitted := strings.Count(text[headEnd:tailStart], "\n")
+	return text[:headEnd] + fmt.Sprintf("\n... [%d lines omitted] ...\n", omitted) + text[tailStart:]
+}
+
+// prefixEnd returns the byte offset where the first maxTokens tokens end,
+// moved back to a line or word boundary when one is near.
+func prefixEnd(text string, maxTokens int) int {
 	tokens := 0
 	end := 0
 	foundEnd := false
@@ -65,5 +93,37 @@ func TruncateToTokens(text string, maxTokens int) string {
 			}
 		}
 	}
-	return text[:end] + "\n... [truncated]"
+	return end
+}
+
+// suffixStart returns the byte offset where the last maxTokens tokens begin,
+// moved forward to the next line start when one is near.
+func suffixStart(text string, maxTokens int) int {
+	tokens := 0
+	asciiRun := 0
+	i := len(text)
+	for i > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		if r < utf8.RuneSelf {
+			asciiRun++
+			if asciiRun == 3 {
+				tokens++
+				asciiRun = 0
+			}
+		} else {
+			if asciiRun > 0 {
+				tokens++
+				asciiRun = 0
+			}
+			tokens++
+		}
+		if tokens >= maxTokens {
+			break
+		}
+		i -= size
+	}
+	if j := strings.IndexByte(text[i:], '\n'); j >= 0 && j < 80 {
+		i += j + 1
+	}
+	return i
 }

@@ -169,6 +169,11 @@ func (eg *EnhancedGenerator) computeDiff(current map[string]time.Time) *DiffResu
 }
 
 func isSourceFile(ext string) bool {
+	// Everything BuildRanked parses must be tracked here, or a change to it
+	// never triggers a rebuild (.mjs/.cjs used to be missing).
+	if isScannedExt(ext) {
+		return true
+	}
 	switch ext {
 	case ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".java",
 		".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",

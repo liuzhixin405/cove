@@ -8,10 +8,12 @@ import (
 
 // TestIsPrivateHost_FailClosed is the H-11/fail-open regression: an unresolvable
 // host must be blocked, not allowed.
+//
+// The unresolvable-name case is asserted in internal/safeurl with a stubbed
+// resolver (TestIsPrivateHostFailsClosed). It used to be asserted here against
+// the real resolver, which fails on machines with fake-IP DNS (Clash TUN mode):
+// those answer even "nonexistent.invalid." with a 198.18.0.0/15 address.
 func TestIsPrivateHost_FailClosed(t *testing.T) {
-	if !isPrivateHost("nonexistent.invalid.") {
-		t.Error("isPrivateHost fails OPEN on DNS failure; unresolvable host must be blocked")
-	}
 	if !isPrivateHost("127.0.0.1") {
 		t.Error("127.0.0.1 must be reported private")
 	}

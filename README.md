@@ -31,7 +31,7 @@ cove is a pure CLI AI programming assistant, implemented as a single-file Go bin
 - 🧠 **Self-Learning** — Auto memory extraction, skill creation, cross-session consolidation (Dream)
 - 📋 **Plan Executor** — Declarative multi-step task plans with dependency DAG + parallel sub-agent execution
 - 👥 **Multi-Agent & Teams** — Spawn sub-agents, create teams with message passing, cron scheduling
-- 📚 **Skill System** — 23 built-in skills + custom skills, conditional auto-loading by file type
+- 📚 **Skill System** — 12 built-in skills loaded on demand + custom skills; project > user > plugin > built-in precedence
 - 🎭 **Permission Modes** — default | plan | auto | bypass with intelligent classifier
 - 🛡️ **Guardrails** — Tool loop detection, rapid-failure circuit breaker, idempotent result detection
 - 💰 **Cost Tracking** — Real-time token counting, cost estimation, budget caps, rate-limit awareness
@@ -307,7 +307,7 @@ cove 是一个纯 CLI 的 AI 编程助手，以单文件 Go 二进制形式发�
 - 🛡️ **护栏保护** — 工具循环检测、快速失败断路器、幂等结果检测
 - 🔄 **检查点** — 写入前自动 Git 快照，支持撤消回退
 - 🩺 **诊断系统** — 30+ 错误码，启动检查，热修复无需重启
-- 📦 **插件与技能** — 可扩展架构，内置 23+ 技能，支持自定义
+- 📦 **插件与技能** — 可扩展架构，内置 12 个技能（按需加载），支持自定义和覆盖
 - 💰 **费用追踪** — 实时 token 计数、成本估算、预算上限、速率限制感知
 - 📱 **CovePhone** — Android 手机 AI 助手应用
 

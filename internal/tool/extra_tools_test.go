@@ -76,10 +76,12 @@ func TestTodoWriteToolMirrorsTodosIntoRuntime(t *testing.T) {
 	if len(rt.Tasks) != 3 {
 		t.Fatalf("expected unrelated task plus two todos, got %d entries", len(rt.Tasks))
 	}
-	if got := rt.Tasks["todo-1"]; got == nil || got.Title != "wire runtime" || got.Status != "in_progress" || !strings.Contains(got.Description, "priority: high") {
+	// Description carries the task text: execute_plan sends it to the
+	// sub-agent and parses depends: from it (it used to be "priority: high").
+	if got := rt.Tasks["todo-1"]; got == nil || got.Title != "wire runtime" || got.Status != "in_progress" || got.Description != "wire runtime" {
 		t.Fatalf("expected first todo mirrored into runtime, got %#v", got)
 	}
-	if got := rt.Tasks["todo-2"]; got == nil || got.Title != "run tests" || got.Status != "pending" || !strings.Contains(got.Description, "priority: medium") {
+	if got := rt.Tasks["todo-2"]; got == nil || got.Title != "run tests" || got.Status != "pending" || got.Description != "run tests" {
 		t.Fatalf("expected second todo mirrored into runtime, got %#v", got)
 	}
 	if !strings.Contains(result.Data, "wire runtime") || !strings.Contains(result.Data, "run tests") {

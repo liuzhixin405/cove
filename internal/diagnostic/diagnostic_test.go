@@ -2,6 +2,8 @@ package diagnostic
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/liuzhixin405/cove/internal/config"
@@ -15,8 +17,11 @@ func TestNewError(t *testing.T) {
 	if e.Def.Code != ErrConfigMissing {
 		t.Errorf("expected code %s, got %s", ErrConfigMissing, e.Def.Code)
 	}
-	if e.Def.Severity != SevFatal {
-		t.Errorf("expected severity Fatal, got %v", e.Def.Severity)
+	// A missing config.json is a warning, not fatal: cove runs on defaults and
+	// an API key from the environment. (This asserted Fatal, which is what made
+	// the startup check write a placeholder config to "fix" it.)
+	if e.Def.Severity != SevWarning {
+		t.Errorf("expected severity Warning, got %v", e.Def.Severity)
 	}
 	if e.Detail == "" {
 		t.Error("expected non-empty detail")
@@ -59,7 +64,9 @@ func TestCheckerRunQuick(t *testing.T) {
 			APIKey: "sk-test-key",
 		},
 	}
-	checker := NewChecker(cfg)
+	// Isolated: RunQuick writes probe files into the data directory, and this
+	// test used to do that in the developer's real ~/.cove.
+	checker, _ := newTestChecker(t, cfg)
 	report := checker.RunQuick()
 
 	if report == nil {
@@ -75,15 +82,19 @@ func TestCheckerRunQuick(t *testing.T) {
 }
 
 func TestCheckerRunAll(t *testing.T) {
+	// A local server: this test used to probe api.deepseek.com, so it depended
+	// on the internet and wrote into the real ~/.cove.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
 	cfg := &config.Config{
 		Model: "test-model",
 		Provider: config.ProviderConfig{
 			Name:    "deepseek",
 			APIKey:  "sk-test-key",
-			BaseURL: "https://api.deepseek.com/v1",
+			BaseURL: srv.URL + "/v1",
 		},
 	}
-	checker := NewChecker(cfg)
+	checker, _ := newTestChecker(t, cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*1000*1000*1000) // 10s
 	defer cancel()
@@ -101,7 +112,9 @@ func TestCheckerRunAll(t *testing.T) {
 }
 
 func TestQuickCheckNilConfig(t *testing.T) {
-	// Should not panic with nil config
+	// Should not panic with nil config. HOME is isolated: the data-dir check
+	// writes a probe file.
+	newTestChecker(t, nil)
 	issues := QuickCheck(nil)
 	// With nil config, should report config invalid
 	if len(issues) == 0 {

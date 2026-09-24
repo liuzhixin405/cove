@@ -220,10 +220,14 @@ type complexityClassifier struct {
 
 func (c *complexityClassifier) Name() string { return "classifier" }
 
+// Each English keyword has a Chinese counterpart; the list used to stop at
+// 重写, so "调试/优化/性能/安全审计" went to the fast model while the same
+// request in English went to the premium one.
 var complexKeywords = []string{
 	"refactor", "architecture", "design", "migrate", "rewrite",
 	"debug", "optimize", "performance", "security audit",
 	"重构", "架构", "设计", "迁移", "重写",
+	"调试", "优化", "性能", "安全审计",
 }
 
 // filePathPattern is a deliberately loose heuristic for "the user named

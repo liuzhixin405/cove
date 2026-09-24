@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -44,6 +45,17 @@ const (
 	// modeDialHang connects back, announces itself and then blocks forever, so
 	// the test can observe whether the hook's timeout kills it.
 	modeDialHang = "dial-hang"
+	// modeJSONNoContinue prints a JSON object that carries a message but no
+	// "continue" field, the way a hook that only wants to add a note would.
+	modeJSONNoContinue = "json-no-continue"
+	// modeSpawnBackground starts a long-lived grandchild that inherits the
+	// hook's stdout, prints a normal result and exits: a hook that launches a
+	// notifier or daemon in the background.
+	modeSpawnBackground = "spawn-background"
+	// modeDialWaitClose connects back, announces itself and stays alive until
+	// the test closes the connection. It is the grandchild of
+	// modeSpawnBackground, so the test can clean it up deterministically.
+	modeDialWaitClose = "dial-wait-close"
 )
 
 const helperMarker = "hook-ran"
@@ -100,6 +112,27 @@ func runHelperProcess(mode string) {
 		// A pending timer keeps the runtime's deadlock detector quiet; the
 		// process is expected to be killed by the hook's timeout.
 		time.Sleep(10 * time.Minute)
+	case modeJSONNoContinue:
+		_, _ = io.ReadAll(os.Stdin)
+		fmt.Print(`{"message":"note from hook"}`)
+	case modeSpawnBackground:
+		_, _ = io.ReadAll(os.Stdin)
+		exe, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "helper: os.Executable: %v\n", err)
+			os.Exit(7)
+		}
+		child := exec.Command(exe)
+		child.Env = append(os.Environ(), helperModeEnv+"="+modeDialWaitClose)
+		child.Stdout = os.Stdout // the grandchild keeps the hook's stdout open
+		if err := child.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "helper: start grandchild: %v\n", err)
+			os.Exit(8)
+		}
+		emit(HookOutput{Continue: true, Message: "spawned"})
+	case modeDialWaitClose:
+		conn := announceConn()
+		_, _ = io.Copy(io.Discard, conn) // returns when the test closes it
 	default:
 		fmt.Fprintf(os.Stderr, "helper: unknown mode %q\n", mode)
 		os.Exit(2)
@@ -111,6 +144,12 @@ func runHelperProcess(mode string) {
 // marker. Accepting that connection is the test's proof that the hook process
 // actually started, with no sleeping and no polling.
 func announce() {
+	_ = announceConn()
+}
+
+// announceConn is announce, returning the connection for modes that need to
+// watch it.
+func announceConn() net.Conn {
 	addr := os.Getenv(helperAddrEnv)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -123,6 +162,7 @@ func announce() {
 	}
 	// Deliberately left open: the parent detects the process dying by the
 	// connection closing.
+	return conn
 }
 
 func emit(out HookOutput) {

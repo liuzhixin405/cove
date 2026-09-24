@@ -2,6 +2,8 @@ package permission
 
 import (
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/safety"
 )
 
 type CmdCategory int
@@ -66,89 +68,13 @@ func (c *Classifier) baseCmd(cmd string) string {
 	return cmd
 }
 
+// isDangerous is the hard-block test the engine applies in every permission
+// mode, so it only covers damage outside the project (see
+// safety.CatastrophicCommand). Everything else that writes or deletes is
+// CatUnknown and goes through the normal approval prompt.
 func (c *Classifier) isDangerous(cmd string) bool {
-	dangerous := []string{
-		"rm ", "rmdir", "del ", "rd ",
-		"dd ", "mkfs", "fdisk", "parted",
-		"shutdown", "reboot", "halt", "poweroff",
-		"fork bomb", ":(){", "(){",
-		"chmod 777", "chmod -R 777",
-		"mv /*", "cp /*",
-		"> /dev/sda", "of=/dev/",
-		"wget -O - | sh", "curl | sh", "curl | bash", "| sh", "| bash",
-		"eval ", "exec ",
-		"format c:", "format d:",
-		"del /f /s", "rd /s /q",
-	}
-	lower := strings.ToLower(cmd)
-	for _, d := range dangerous {
-		if strings.Contains(lower, d) {
-			return true
-		}
-	}
-	// Structural checks below catch risk patterns that a pure keyword scan
-	// misses — they look at how the command is built, not just what
-	// substrings appear in it.
-	if c.pipesIntoInterpreter(cmd) {
-		return true
-	}
-	if c.hasIFSObfuscation(cmd) {
-		return true
-	}
-	return false
-}
-
-// pipesIntoInterpreter reports whether any stage of a pipe chain feeds
-// into a shell/scripting interpreter. The keyword list above only catches
-// this when the *source* is literally curl/wget ("curl | sh"), but the
-// same risk exists for any source: "echo <payload> | base64 -d | bash" or
-// "printf ... | xxd -r -p | python3" smuggle an arbitrary decoded command
-// into an interpreter without ever mentioning curl, wget, eval, or exec.
-func (c *Classifier) pipesIntoInterpreter(cmd string) bool {
-	if !strings.Contains(cmd, "|") {
-		return false
-	}
-	interpreters := map[string]bool{
-		"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true,
-		"csh": true, "tcsh": true, "fish": true, "python": true, "python3": true,
-		"perl": true, "ruby": true, "node": true, "php": true,
-		"powershell": true, "pwsh": true,
-	}
-	for _, stage := range splitPipeStages(cmd) {
-		stage = strings.TrimSpace(stage)
-		if stage == "" {
-			continue
-		}
-		base := strings.ToLower(strings.TrimSuffix(c.baseCmd(stage), ".exe"))
-		if interpreters[base] {
-			return true
-		}
-	}
-	return false
-}
-
-// splitPipeStages splits cmd on single "|" pipe boundaries while treating
-// "||" (logical OR, unrelated to piping) as a single token so it isn't
-// mistaken for two pipe stages.
-func splitPipeStages(cmd string) []string {
-	const orPlaceholder = "\x00OR\x00"
-	normalized := strings.ReplaceAll(cmd, "||", orPlaceholder)
-	stages := strings.Split(normalized, "|")
-	for i, s := range stages {
-		stages[i] = strings.ReplaceAll(s, orPlaceholder, "||")
-	}
-	return stages
-}
-
-// hasIFSObfuscation reports whether cmd references the shell IFS
-// (internal field separator) variable — a well-known technique for
-// evading substring-based keyword filters. "rm${IFS}-rf${IFS}/" contains
-// no literal "rm " substring (IFS substitutes for the space that the
-// isDangerous keyword scan looks for), so without this check the command
-// above would sail through undetected.
-func (c *Classifier) hasIFSObfuscation(cmd string) bool {
-	lower := strings.ToLower(cmd)
-	return strings.Contains(lower, "$ifs") || strings.Contains(lower, "${ifs")
+	_, ok := safety.CatastrophicCommand(cmd)
+	return ok
 }
 
 func (c *Classifier) hasShellControlOperator(cmd string) bool {
@@ -170,10 +96,10 @@ func (c *Classifier) hasShellControlOperator(cmd string) bool {
 func (c *Classifier) classifyGit(cmd string) CmdCategory {
 	readOnly := []string{"status", "log", "diff", "show", "branch", "remote -v", "ls-files", "ls-tree",
 		"rev-parse", "rev-list", "describe", "tag -l", "stash list", "config --get", "config --list",
-		"blame", "grep", "shortlog", "reflog", "bisect", "whatchanged", "cherry",
-		"checkout --", "restore --source", "worktree list", "submodule status",
+		"blame", "grep", "shortlog", "reflog", "whatchanged", "cherry",
+		"worktree list", "submodule status",
 		"fetch", "merge-base", "for-each-ref", "cat-file", "count-objects", "fsck --name-objects",
-		"gc --dry-run", "notes show", "range-diff", "submodule foreach",
+		"gc --dry-run", "notes show", "range-diff",
 	}
 
 	writeOps := []string{"commit", "add ", "rm ", "mv ", "reset", "rebase", "push", "pull",

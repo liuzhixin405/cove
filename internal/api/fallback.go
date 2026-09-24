@@ -130,6 +130,7 @@ func (mf *ModelFallback) try(
 	mf.mu.Lock()
 	startIdx := mf.currentIdx
 	tried := 0
+	called := false
 
 	for tried < len(mf.providers) {
 		idx := (startIdx + tried) % len(mf.providers)
@@ -150,6 +151,7 @@ func (mf *ModelFallback) try(
 		}
 
 		// Release lock during the actual API call to avoid blocking status reads
+		called = true
 		mf.mu.Unlock()
 		resp, err := call(pw.Provider)
 		mf.mu.Lock()
@@ -159,6 +161,14 @@ func (mf *ModelFallback) try(
 			mf.currentIdx = idx
 			mf.mu.Unlock()
 			return resp, pw.Provider, nil
+		}
+
+		// A request the caller cancelled (Ctrl+C, turn timeout) says nothing
+		// about the provider's health; counting it would cool down or
+		// blacklist a working provider.
+		if ctx.Err() != nil {
+			mf.mu.Unlock()
+			return nil, nil, err
 		}
 
 		// Handle failure (under lock)
@@ -181,14 +191,61 @@ func (mf *ModelFallback) try(
 		tried++
 	}
 
-	// All providers exhausted
+	// Every provider was skipped as cooling down or unavailable, so nothing
+	// was actually attempted. Skipping only makes sense when there is somewhere
+	// else to go; with nowhere left, refusing to call anything turned one
+	// transient error into a 60-second outage (and three into a permanently
+	// dead session). Try the preferred provider anyway.
+	if !called {
+		pw := mf.providers[startIdx]
+		mf.mu.Unlock()
+		resp, err := call(pw.Provider)
+		mf.mu.Lock()
+		if err == nil {
+			pw.Status = ProviderOK
+			pw.FailCount = 0
+			mf.mu.Unlock()
+			return resp, pw.Provider, nil
+		}
+		if ctx.Err() == nil {
+			pw.LastError = err
+		}
+	}
+
+	// All providers exhausted. With a single provider its own error is the
+	// whole story: the "all 1 providers failed: name(status):" prefix used to
+	// push the actual reason past what the UI shows.
+	if len(mf.providers) == 1 && mf.providers[0].LastError != nil {
+		err := mf.providers[0].LastError
+		mf.mu.Unlock()
+		return nil, nil, err
+	}
 	var msgs []string
+	var causes []error
 	for _, pw := range mf.providers {
 		msgs = append(msgs, fmt.Sprintf("%s(%s): %v", pw.Provider.Name(), pw.Status, pw.LastError))
+		if pw.LastError != nil {
+			causes = append(causes, pw.LastError)
+		}
 	}
 	mf.mu.Unlock()
-	return nil, nil, fmt.Errorf("all %d providers failed: %s", len(mf.providers), strings.Join(msgs, "; "))
+	return nil, nil, &allProvidersError{
+		msg:    fmt.Sprintf("all %d providers failed: %s", len(mf.providers), strings.Join(msgs, "; ")),
+		causes: causes,
+	}
 }
+
+// allProvidersError keeps every provider's error reachable through
+// errors.As / IsContextLengthError; the old fmt.Errorf("%v") flattened them
+// into text, so callers could no longer tell a context overflow or a 402
+// from anything else.
+type allProvidersError struct {
+	msg    string
+	causes []error
+}
+
+func (e *allProvidersError) Error() string   { return e.msg }
+func (e *allProvidersError) Unwrap() []error { return e.causes }
 
 // The three classifiers below decide whether a provider gets cooled down
 // (degraded) or blacklisted (unavailable), so a misclassification takes a
@@ -232,4 +289,17 @@ func isPermanent(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "invalid api key") ||
 		strings.Contains(s, "authentication")
+}
+
+// Reset clears every provider's health so a freshly switched provider starts
+// from a clean slate.
+func (mf *ModelFallback) Reset() {
+	mf.mu.Lock()
+	defer mf.mu.Unlock()
+	for _, pw := range mf.providers {
+		pw.Status = ProviderOK
+		pw.FailCount = 0
+		pw.CoolUntil = time.Time{}
+		pw.LastError = nil
+	}
 }

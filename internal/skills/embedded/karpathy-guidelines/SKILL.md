@@ -1,8 +1,6 @@
 ﻿---
 name: karpathy-guidelines
 description: "Karpathy-inspired guidelines: Think before coding, Simplicity first, Surgical changes, Goal-driven execution"
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java,*.rb,*.kt,*.swift,*.c,*.cpp,*.h,*.cs,*.vue,*.svelte,*.tsx,*.jsx,*.md"
 ---
 
 # Karpathy-Inspired Coding Guidelines

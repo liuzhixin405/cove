@@ -14,6 +14,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0
 	github.com/yuin/goldmark v1.7.8
 	golang.org/x/sys v0.45.0
+	golang.org/x/text v0.36.0
 )
 
 require (

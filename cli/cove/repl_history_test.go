@@ -214,7 +214,6 @@ func TestLooksSyntheticHistoryText(t *testing.T) {
 		"[用户指引] please",
 		"[Continue the task from here]",
 		"[会话摘要] ...",
-		"run slow tool", "do something", "slow response",
 	}
 	for _, s := range synthetic {
 		if !looksSyntheticHistoryText(s) {
@@ -226,6 +225,8 @@ func TestLooksSyntheticHistoryText(t *testing.T) {
 		"给配置加载加上 profile 支持",
 		"fix the parser",
 		"systematic review", // must not match the "[system:" prefix
+		"do something about the flaky login test",
+		"run slow tool benchmarks again",
 		"continue the refactor of the loader",
 	}
 	for _, s := range real {

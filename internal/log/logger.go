@@ -118,10 +118,12 @@ func (l *Logger) log(level Level, format string, args ...any) {
 	if level < l.level {
 		return
 	}
-	ts := time.Now().Format("15:04:05.000")
-	_, _ = fmt.Fprintf(l.writer, "[%s %s] ", ts, levelNames[level])
-	_, _ = fmt.Fprintf(l.writer, format, args...)
-	_, _ = fmt.Fprintln(l.writer)
+	// One Write per entry: the REPL's writer prints each Write as its own
+	// line, so the old three-part write put the "[time LEVEL]" prefix and the
+	// message on separate lines.
+	line := fmt.Sprintf("[%s %s] ", time.Now().Format("15:04:05.000"), levelNames[level]) +
+		fmt.Sprintf(format, args...) + "\n"
+	_, _ = io.WriteString(l.writer, line)
 }
 
 func Debugf(format string, args ...any) { defaultLogger.log(Debug, format, args...) }

@@ -16,6 +16,7 @@ type fakeProvider struct {
 	responses []*api.ChatResponse
 	seen      int
 	lastReq   api.ChatRequest
+	onCall    func()
 }
 
 func (p *fakeProvider) Name() string        { return "fake" }
@@ -25,10 +26,14 @@ func (p *fakeProvider) Validate() error     { return nil }
 func (p *fakeProvider) Chat(ctx context.Context, req api.ChatRequest) (*api.ChatResponse, error) {
 	p.lastReq = req
 	if p.seen >= len(p.responses) {
+		p.seen++
 		return &api.ChatResponse{Content: "done"}, nil
 	}
 	r := p.responses[p.seen]
 	p.seen++
+	if p.onCall != nil {
+		p.onCall()
+	}
 	return r, nil
 }
 

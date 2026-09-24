@@ -37,10 +37,21 @@ const (
 	maxDecodePixels = 64 << 20 // 67,108,864 pixels (~256MB as RGBA)
 )
 
-var attachmentTokenRE = regexp.MustCompile(`@("[^"]+"|'[^']+'|\S+)`)
+// nonVisionImageWarning is the part of the non-vision-model warning that
+// shouldAutoSwitchToVision recognises. The two used to be written separately:
+// the check looked for "fallback"/"vision" in a Chinese warning containing
+// neither, so the switch the manual promises never happened.
+const nonVisionImageWarning = "可能不支持图片视觉功能"
+
+// attachmentTokenRE matches an @path that starts a word. The @ used to match
+// anywhere, so "foo@bar.com" or "git@github.com:x" made cove look for a file
+// named "bar.com" and fail the whole prompt.
+var attachmentTokenRE = regexp.MustCompile(`(^|\s)@("[^"]+"|'[^']+'|\S+)`)
 
 func buildUserMessage(input, cwd string, explicitPaths []string, model string) (api.Message, []string, error) {
-	cleaned, inlinePaths := extractInlineAttachments(input)
+	cleaned, inlinePaths := extractInlineAttachments(input, func(raw string) bool {
+		return inlineAttachmentWanted(cwd, raw)
+	})
 	allPaths := append([]string{}, explicitPaths...)
 	allPaths = append(allPaths, inlinePaths...)
 
@@ -215,7 +226,26 @@ func splitQuotedFields(input string) ([]string, error) {
 	return fields, nil
 }
 
-func extractInlineAttachments(input string) (string, []string) {
+// inlineAttachmentWanted decides whether an @token names an attachment. A
+// token that looks like a path (it has a dot or a separator) always does, so a
+// mistyped @logs/app.lgo still fails loudly. A bare word such as @Override or
+// @dataclass only does when that file exists: coding prompts are full of
+// decorators and annotations, and each one used to fail the whole prompt.
+func inlineAttachmentWanted(cwd, raw string) bool {
+	if strings.ContainsAny(raw, `./\:`) {
+		return true
+	}
+	p := raw
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(cwd, p)
+	}
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// extractInlineAttachments removes the @path tokens that want accepts from
+// input and returns them; the others stay in the text unchanged.
+func extractInlineAttachments(input string, want func(raw string) bool) (string, []string) {
 	matches := attachmentTokenRE.FindAllStringSubmatchIndex(input, -1)
 	if len(matches) == 0 {
 		return input, nil
@@ -223,18 +253,22 @@ func extractInlineAttachments(input string) (string, []string) {
 	paths := make([]string, 0, len(matches))
 	var out strings.Builder
 	last := 0
+	taken := 0
 	for _, m := range matches {
-		start := m[0]
-		end := m[1]
-		pStart := m[2]
-		pEnd := m[3]
-		out.WriteString(input[last:start])
-		raw := strings.TrimSpace(input[pStart:pEnd])
+		// m[2]:m[3] is the whitespace before the @, m[4]:m[5] the path.
+		tokenStart, end := m[3], m[1]
+		raw := strings.TrimSpace(input[m[4]:m[5]])
 		raw = strings.Trim(raw, `"'`)
-		if raw != "" {
-			paths = append(paths, raw)
+		if raw == "" || (want != nil && !want(raw)) {
+			continue
 		}
+		out.WriteString(input[last:tokenStart])
+		paths = append(paths, raw)
 		last = end
+		taken++
+	}
+	if taken == 0 {
+		return input, nil
 	}
 	out.WriteString(input[last:])
 	cleaned := strings.Join(strings.Fields(out.String()), " ")
@@ -289,7 +323,7 @@ func buildImagePart(name, absPath string, raw []byte, mimeType, model string) (a
 	// Check if model supports vision
 	warning := ""
 	if model != "" && !api.IsVisionCapableModel(model) {
-		warning = fmt.Sprintf("⚠ 当前模型 %s 可能不支持图片视觉功能，已自动降级为文本提示。建议切换到视觉模型 (如 deepseek-v4-flash / gpt-4o / claude-sonnet-4)", model)
+		warning = fmt.Sprintf("⚠ 当前模型 %s %s，已自动降级为文本提示。建议切换到视觉模型 (如 deepseek-v4-flash / gpt-4o / claude-sonnet-4)", model, nonVisionImageWarning)
 		return api.MessagePart{
 			Type:     "text",
 			MimeType: "text/plain",

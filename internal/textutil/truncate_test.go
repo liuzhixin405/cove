@@ -1,6 +1,7 @@
 package textutil
 
 import (
+	"strings"
 	"testing"
 	"unicode/utf8"
 )
@@ -84,5 +85,25 @@ func TestHeadRunes(t *testing.T) {
 	}
 	if got := HeadRunes(s, 100); got != s {
 		t.Fatalf("HeadRunes past end = %q, want whole string", got)
+	}
+}
+
+func TestClipMiddleBytesKeepsBothEnds(t *testing.T) {
+	s := "HEAD\n" + strings.Repeat("中间内容\n", 5000) + "TAIL exit code: 1"
+	got := ClipMiddleBytes(s, 1000)
+	if !strings.HasPrefix(got, "HEAD\n") || !strings.HasSuffix(got, "TAIL exit code: 1") {
+		t.Fatalf("ClipMiddleBytes lost an end: %q ... %q", got[:20], got[len(got)-20:])
+	}
+	if !strings.Contains(got, "bytes omitted") {
+		t.Fatal("no omission marker")
+	}
+	if len(got) > 1100 {
+		t.Fatalf("len = %d, want about 1000", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("split a rune")
+	}
+	if ClipMiddleBytes("short", 1000) != "short" {
+		t.Fatal("clipped a short string")
 	}
 }

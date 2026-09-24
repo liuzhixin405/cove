@@ -512,7 +512,6 @@ func TestFirstUserPreviewSkipsSyntheticContent(t *testing.T) {
 		{Role: "assistant", Content: "hi"},
 		{Role: "user", Content: "   ", Synthetic: false},
 		{Role: "user", Content: "[系统检测到重复操作循环] 换个方法"},
-		{Role: "user", Content: "do something", Synthetic: false},
 		{Role: "user", Content: "真正的请求"},
 	}
 	if got := firstUserPreview(messages); got != "真正的请求" {

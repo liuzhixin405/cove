@@ -1,8 +1,6 @@
 ---
 name: test-driven-development
 description: TDD: enforce RED-GREEN-REFACTOR cycle. Tests before code, always.
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java"
 ---
 
 # Test-Driven Development

@@ -1,48 +1,25 @@
 package diagnostic
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/liuzhixin405/cove/internal/config"
 )
 
-func TestCheckConfigExistsCreatesRicherDefaultConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	checker := NewChecker(nil)
-	checker.homeDir = tmpDir
+// This file used to hold TestCheckConfigExistsCreatesRicherDefaultConfig,
+// which required the check to write a config.json with a placeholder API key.
+// That write was the bug (see checker_audit_test.go): it replaced the user's
+// environment key with "sk-xxxx…" from the next launch on. The test now pins
+// the opposite: a missing config is reported, never created.
+func TestCheckConfigExistsDoesNotCreateAConfig(t *testing.T) {
+	c, _ := newTestChecker(t, &config.Config{Provider: config.ProviderConfig{Name: "deepseek"}})
 
-	res := checker.checkConfigExists(t.Context())
-	if res.Error == nil {
-		t.Fatalf("expected config missing error to be auto-fixed")
-	}
+	_ = c.checkConfigExists(t.Context())
 
-	cfgPath := filepath.Join(tmpDir, ".cove", "config.json")
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read generated config: %v", err)
+	if _, err := os.Stat(filepath.Join(c.configDir, "config.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("config.json was created (err=%v)", err)
 	}
-
-	content := string(data)
-	if !contains(content, "\"provider\"") || !contains(content, "\"api_key\"") && !contains(content, "\"base_url\"") {
-		t.Fatalf("expected richer default config content, got %s", content)
-	}
-	if contains(content, "\"permission_mode\": \"ask\"") {
-		t.Fatalf("did not expect legacy minimal config template, got %s", content)
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || containsAt(s, sub, 0))
-}
-
-func containsAt(s, sub string, start int) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	for i := start; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

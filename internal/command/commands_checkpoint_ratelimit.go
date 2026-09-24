@@ -11,7 +11,7 @@ import (
 
 type checkpointEngine interface {
 	ListCheckpoints() []string
-	RestoreCheckpoint(commitHash string) error
+	RestoreCheckpoint(commitHash string) (backup string, err error)
 }
 
 type rateLimitEngine interface {
@@ -21,7 +21,9 @@ type rateLimitEngine interface {
 func (c *UndoCmd) Name() string        { return "undo" }
 func (c *UndoCmd) Aliases() []string   { return nil }
 func (c *UndoCmd) Description() string { return "回退到检查点" }
-func (c *UndoCmd) Help() string        { return "/undo [commit] - 回退到最近或指定检查点" }
+func (c *UndoCmd) Help() string {
+	return "/undo [commit] - 回退到上一个与当前不同的检查点（可连续回退），或指定检查点；回退前自动备份"
+}
 func (c *UndoCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	eng, ok := in.Engine.(checkpointEngine)
 	if !ok || eng == nil {
@@ -31,13 +33,18 @@ func (c *UndoCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if len(in.Args) > 0 {
 		hash = strings.TrimSpace(in.Args[0])
 	}
-	if err := eng.RestoreCheckpoint(hash); err != nil {
+	backup, err := eng.RestoreCheckpoint(hash)
+	if err != nil {
 		return Output{Message: fmt.Sprintf("回退失败: %v", err)}, nil
 	}
-	if hash == "" {
-		return Output{Message: "已回退到最近检查点"}, nil
+	msg := "已回退到最近检查点"
+	if hash != "" {
+		msg = fmt.Sprintf("已回退到检查点 %s", hash)
 	}
-	return Output{Message: fmt.Sprintf("已回退到检查点 %s", hash)}, nil
+	if len(backup) >= 8 {
+		msg += fmt.Sprintf("\n回退前的状态已备份，撤销这次回退: /undo %s", backup[:8])
+	}
+	return Output{Message: msg}, nil
 }
 
 func (c *CheckpointsCmd) Name() string        { return "checkpoints" }

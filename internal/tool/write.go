@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 type WriteTool struct{ baseTool }
@@ -63,12 +64,38 @@ func (t *WriteTool) Call(ctx context.Context, input Input, tctx Context) (Result
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return Result{Data: "Error: mkdir: " + err.Error(), IsError: true}, nil
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	files := fileTracker(tctx)
+	var legacy *legacyText
+	if existing, err := os.ReadFile(path); err == nil {
+		// Creating a file needs no prior read; replacing one does.
+		if err := files.Check(path, existing); err != nil {
+			return Result{Data: "Error: " + err.Error() + ", then write it again.", IsError: true}, nil
+		}
+		existingText := string(existing)
+		if !utf8.Valid(existing) {
+			if lt, ok := decodeGBK(existing); ok {
+				legacy, existingText = &lt, lt.text
+			}
+		}
+		content = matchExistingFile(content, existingText)
+	}
+	out := []byte(content)
+	if legacy != nil {
+		// Keep a GBK file GBK, as line endings and the BOM are kept: other
+		// tools reading it (the compiler, the IDE, the user's editor) assume
+		// the encoding it already has.
+		var err error
+		if out, err = legacy.encode(content); err != nil {
+			return legacy.encodeFailure(path, "content", err), nil
+		}
+	}
+	if err := replaceFile(path, out); err != nil {
 		return Result{Data: "Error: write: " + err.Error(), IsError: true}, nil
 	}
+	files.Record(path, out)
 
 	lines := strings.Count(content, "\n") + 1
-	return Result{Data: "Wrote " + strconv.Itoa(len(content)) + " bytes (" + strconv.Itoa(lines) + " lines) to " + path}, nil
+	return Result{Data: "Wrote " + strconv.Itoa(len(out)) + " bytes (" + strconv.Itoa(lines) + " lines) to " + path}, nil
 }
 
 func (t *WriteTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

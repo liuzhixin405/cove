@@ -84,7 +84,8 @@ type Tool struct {
 }
 
 type ListToolsResult struct {
-	Tools []Tool `json:"tools"`
+	Tools      []Tool `json:"tools"`
+	NextCursor string `json:"nextCursor,omitempty"`
 }
 
 type CallToolParams struct {
@@ -97,11 +98,19 @@ type CallToolResult struct {
 	IsError bool           `json:"isError,omitempty"`
 }
 
+// ContentBlock is one item of a tool result or of a resource's contents.
+// Tool results use Type plus Text (text), Data (image/audio, base64), Resource
+// (an embedded resource) or URI/Name (resource_link); resource contents use
+// URI plus Text or Blob (base64).
 type ContentBlock struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
-	Data     string `json:"data,omitempty"`
+	Type     string        `json:"type,omitempty"`
+	Text     string        `json:"text,omitempty"`
+	MimeType string        `json:"mimeType,omitempty"`
+	Data     string        `json:"data,omitempty"`
+	URI      string        `json:"uri,omitempty"`
+	Name     string        `json:"name,omitempty"`
+	Blob     string        `json:"blob,omitempty"`
+	Resource *ContentBlock `json:"resource,omitempty"`
 }
 
 type Resource struct {
@@ -112,7 +121,8 @@ type Resource struct {
 }
 
 type ListResourcesResult struct {
-	Resources []Resource `json:"resources"`
+	Resources  []Resource `json:"resources"`
+	NextCursor string     `json:"nextCursor,omitempty"`
 }
 
 type ReadResourceParams struct {

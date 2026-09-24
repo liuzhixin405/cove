@@ -85,8 +85,6 @@ type LoopDetector struct {
 	stallCount         int // consecutive iterations without new file activity
 	stallThresh        int // iterations before stagnation detection (default 25)
 
-	// Whether this is a "fast" (flash) model -> uses lower thresholds.
-	isFastModel bool
 }
 
 // LoopResult describes what was detected.
@@ -119,29 +117,9 @@ func NewLoopDetector() *LoopDetector {
 		filesTouchedTurn:   make(map[string]bool),
 		stallCount:         0,
 		stallThresh:        60, // only flag after 60 iterations without file activity
-		isFastModel:        false,
 		toolOutputs:        make(map[string][]string),
 		toolDirs:           make(map[string][]string),
 	}
-}
-
-// NewLoopDetectorWithModel creates a detector with thresholds tuned
-// for the given model type. Fast (flash) models get tighter thresholds.
-func NewLoopDetectorWithModel(isFastModel bool) *LoopDetector {
-	ld := NewLoopDetector()
-	ld.isFastModel = isFastModel
-	if isFastModel {
-		// Flash models are more prone to getting stuck -> more sensitive,
-		// but still conservative to avoid false positives.
-		ld.fpWindow = 12
-		ld.fpThresh = 8 // 8/12, relaxed from 6/10 to reduce false positives
-		ld.toolOnlyWindow = 10
-		ld.toolOnlyThresh = 8
-		ld.outWindow = 30
-		ld.outThresh = 8    // 8/30
-		ld.stallThresh = 50 // more tolerant for flash models
-	}
-	return ld
 }
 
 // isAllReadOnlyTools checks whether ALL tool names in a fingerprint

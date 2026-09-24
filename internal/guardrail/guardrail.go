@@ -198,4 +198,7 @@ func (t *Tracker) Reset() {
 	t.sameToolFails = make(map[string]int)
 	t.idempotentSeen = make(map[signature]string)
 	t.idempotentCount = make(map[signature]int)
+	// Used to be left out, so failures just before a reset still tripped the
+	// breaker on the first call after it.
+	t.recentFailures = nil
 }

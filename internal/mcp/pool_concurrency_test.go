@@ -179,9 +179,11 @@ func TestPool_ConnectDoesNotHoldLockWhileClosingStaleServer(t *testing.T) {
 	if err := <-connectDone; err == nil {
 		t.Fatal("Connect with a nonexistent command returned nil error")
 	}
-	if _, ok := p.servers["A"]; ok {
+	// The stale server must be gone; what remains is the failure record.
+	if p.servers["A"] == ms {
 		t.Fatal("failed Connect left the stale server registered")
 	}
+	requireFailedEntry(t, p, "A")
 }
 
 // TestPool_AllServersReturnsSnapshots: callers read the returned metadata after
@@ -316,9 +318,7 @@ func TestPool_ConnectRejectsBadTransportConfig(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.name) {
 			t.Fatalf("%s: error = %q; want it to name the server", tc.name, err)
 		}
-		if _, ok := p.servers[tc.name]; ok {
-			t.Fatalf("%s: a failed Connect registered the server anyway", tc.name)
-		}
+		requireFailedEntry(t, p, tc.name)
 	}
 }
 
@@ -372,9 +372,13 @@ func TestPool_LoadFromConfigOverStdio(t *testing.T) {
 	})
 	defer p.DisconnectAll()
 
+	// The rejected entry is listed as failed (sorted: "evil" before "helper").
 	all := p.AllServers()
-	if len(all) != 1 || all[0].Name != "helper" || !all[0].Connected {
-		t.Fatalf("AllServers = %+v; want only a connected helper", all)
+	if len(all) != 2 || all[1].Name != "helper" || !all[1].Connected {
+		t.Fatalf("AllServers = %+v; want a connected helper", all)
+	}
+	if all[0].Name != "evil" || all[0].Connected || !strings.Contains(all[0].Err, "shell wrappers") {
+		t.Fatalf("evil entry = {%q connected=%v err=%q}; want it listed as failed with its error", all[0].Name, all[0].Connected, all[0].Err)
 	}
 
 	tools := p.AllTools()

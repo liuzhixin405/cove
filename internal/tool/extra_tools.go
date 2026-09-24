@@ -275,12 +275,16 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 			tm, _ := td.(map[string]any)
 			content, _ := tm["content"].(string)
 			status, _ := tm["status"].(string)
-			priority, _ := tm["priority"].(string)
 			id := fmt.Sprintf("todo-%d", i+1)
+			// Description is what execute_plan sends a sub-agent as the task and
+			// where it parses the "depends:" prefix. It used to hold only
+			// "priority: high", so every sub-agent got that as its whole task.
+			// (Priority is shown in the summary below; TaskRecord has no field
+			// for it.)
 			tctx.Runtime.Tasks[id] = &TaskRecord{
 				ID:          id,
 				Title:       content,
-				Description: fmt.Sprintf("priority: %s", priority),
+				Description: content,
 				Status:      status,
 			}
 		}
@@ -299,7 +303,8 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		case "cancelled":
 			mark = "[x]"
 		}
-		fmt.Fprintf(&sb, "%s %d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"])
+		// The ID is what a later todo names in "depends:todo-N", so show it.
+		fmt.Fprintf(&sb, "%s todo-%d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"])
 	}
 	return Result{Data: sb.String()}, nil
 }

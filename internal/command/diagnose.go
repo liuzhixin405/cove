@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/liuzhixin405/cove/internal/diagnostic"
 )
@@ -154,6 +155,9 @@ func (c *diagnoseCmd) listCodes() (Output, error) {
 		if !ok {
 			continue
 		}
+		// groups was filled from a map, so without sorting the order changed
+		// on every call.
+		sort.Slice(codes, func(i, j int) bool { return codes[i] < codes[j] })
 		msg += fmt.Sprintf("  \x1b[36m[%s]\x1b[0m\n", cat)
 		for _, code := range codes {
 			def := all[code]

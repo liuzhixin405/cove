@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 // HintFiles that are looked for in subdirectories.
@@ -77,8 +79,12 @@ func (h *SubdirHints) checkDir(dir string) string {
 	workClean := filepath.Clean(h.workDir)
 
 	for depth := 0; depth < 5; depth++ {
-		if current == workClean || current == filepath.Dir(current) {
-			break // reached workspace root or filesystem root
+		// Only directories strictly inside the workspace. This used to stop
+		// only on reaching the workspace root, so a path elsewhere (a repo
+		// cloned into the temp dir, anything under home) walked up its own
+		// tree and injected that tree's AGENTS.md/CLAUDE.md as instructions.
+		if !strictlyInside(workClean, current) {
+			break
 		}
 
 		if h.seen[current] {
@@ -100,9 +106,9 @@ func (h *SubdirHints) checkDir(dir string) string {
 				continue
 			}
 			// Limit size to prevent context explosion
-			if len(content) > 2000 {
-				content = content[:2000] + "\n[...truncated]"
-			}
+			// ClipBytes, not content[:2000]: the byte cut split CJK characters
+			// and injected invalid UTF-8.
+			content = textutil.ClipBytes(content, 2000, "\n[...truncated]")
 			h.loaded[fp] = content
 			relPath, _ := filepath.Rel(h.workDir, fp)
 			if relPath == "" {
@@ -118,4 +124,15 @@ func (h *SubdirHints) checkDir(dir string) string {
 		return ""
 	}
 	return strings.Join(newHints, "\n")
+}
+
+// strictlyInside reports whether dir is below root (not root itself).
+// filepath.Rel compares case-insensitively on Windows, where D:\Repo and
+// d:\repo are the same directory.
+func strictlyInside(root, dir string) bool {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

@@ -36,6 +36,13 @@ type LineReader struct {
 var consoleMu sync.Mutex
 var activeReader *LineReader
 var streamingActive bool
+
+// streamMidLine records that streamed output left the cursor after text on
+// its row. Without it, anything that starts a new block during a stream — a
+// notice, the permission box's input-line redraw (\r ESC[2K) — landed on that
+// row: a notice was glued to the model's unfinished sentence, and the redraw
+// erased the partial line outright.
+var streamMidLine bool
 var permInputCh chan<- string
 
 func SetPermInputCh(ch chan<- string) {
@@ -117,7 +124,9 @@ func PrintAbove(s string) {
 	// so print inline without erasing/redrawing (which would corrupt partial
 	// streamed lines that don't end in a newline).
 	if streamingActive {
+		breakStreamLineLocked()
 		printOutputLocked(s, !strings.HasSuffix(s, "\r\n"))
+		streamMidLine = false
 		return
 	}
 
@@ -142,6 +151,7 @@ func StreamPrint(s string) {
 	// erase (\r\x1b[2K) wiped it.
 	if streamingActive {
 		fmt.Print(s)
+		streamMidLine = endsMidLine(streamMidLine, s)
 		return
 	}
 	if activeReader != nil && activeReader.reading {
@@ -161,6 +171,7 @@ func PrintTransientStatus(s string) {
 	// place without touching any input-line state.
 	if streamingActive {
 		fmt.Print("\x1b[0m\x1b[?25h\r\x1b[K" + s)
+		streamMidLine = s != ""
 		return
 	}
 
@@ -182,6 +193,7 @@ func BeginOutput() {
 		activeReader.eraseLineLocked()
 	}
 	streamingActive = true
+	streamMidLine = false
 	fmt.Print("\n")
 }
 
@@ -192,6 +204,7 @@ func BeginOutput() {
 func BeginPromptInput() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
+	breakStreamLineLocked()
 	streamingActive = false
 	if activeReader != nil && activeReader.reading {
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
@@ -213,10 +226,46 @@ func EndOutput() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	streamingActive = false
+	streamMidLine = false
 	printOutputLocked("\r\n", false)
 	if activeReader != nil && activeReader.reading {
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
 	}
+}
+
+// breakStreamLineLocked moves to a fresh row if the stream left text on the
+// current one. Callers hold consoleMu.
+func breakStreamLineLocked() {
+	if streamingActive && streamMidLine {
+		fmt.Print("\r\n")
+		streamMidLine = false
+	}
+}
+
+// endsMidLine reports whether the cursor is after text on its row once s has
+// been printed, given whether it was before. Escape sequences are not text,
+// and a bare \r leaves the row's text in place.
+func endsMidLine(was bool, s string) bool {
+	mid := was
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == 0x1b:
+			// Skip a CSI sequence, the only kind that reaches this point:
+			// untrusted text is sanitised before it is printed.
+			if i+1 < len(s) && s[i+1] == '[' {
+				i += 2
+				for i < len(s) && (s[i] < 0x40 || s[i] > 0x7e) {
+					i++
+				}
+			}
+		case c == '\n':
+			mid = false
+		case c == '\r':
+		default:
+			mid = true
+		}
+	}
+	return mid
 }
 
 func HasActiveInput() bool {
@@ -245,8 +294,17 @@ func (lr *LineReader) ReadLine() (string, error) {
 		_ = term.Restore(int(os.Stdin.Fd()), oldState)
 	}()
 
-	lr.rawReader = bufio.NewReader(os.Stdin)
-	fmt.Print("\x1b[0m\x1b[?25h")
+	// The reader lives as long as the LineReader. It used to be rebuilt on
+	// every call, so whatever the previous read had already buffered — the
+	// rest of a paste, keys typed ahead — was thrown away with it.
+	if lr.rawReader == nil {
+		lr.rawReader = bufio.NewReaderSize(os.Stdin, rawInputBufferSize)
+	}
+	// Bracketed paste makes the terminal wrap pasted text in ESC[200~ …
+	// ESC[201~, so its newlines can be told apart from Enter. Terminals that
+	// do not support it ignore the request.
+	fmt.Print("\x1b[0m\x1b[?25h\x1b[?2004h")
+	defer fmt.Print("\x1b[?2004l")
 
 	consoleMu.Lock()
 	activeReader = lr
@@ -266,6 +324,11 @@ func (lr *LineReader) ReadLine() (string, error) {
 		consoleMu.Unlock()
 	}()
 
+	return lr.editLine()
+}
+
+// editLine runs the raw-mode editor on lr.rawReader until a line is submitted.
+func (lr *LineReader) editLine() (string, error) {
 	var buf []rune
 	cursor := 0
 	lr.redraw(buf, cursor)
@@ -273,7 +336,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 	for {
 		r, err := readInputRune(lr.rawReader)
 		if err != nil {
-			return "", err
+			return lr.endOfInput(buf, err)
 		}
 
 		switch r {
@@ -292,13 +355,25 @@ func (lr *LineReader) ReadLine() (string, error) {
 				return "", ErrExit
 			}
 		case '\r', '\n':
+			// A person cannot press Enter and further keys within one read,
+			// so a newline with input already waiting behind it is part of a
+			// paste on a console without bracketed paste (conhost). It used
+			// to submit each pasted line as a separate message.
+			if lr.rawReader.Buffered() > 0 {
+				if r == '\r' {
+					lr.skipRune('\n')
+				}
+				buf, cursor = insertRunes(buf, cursor, []rune{'\n'})
+				lr.refresh(buf, cursor)
+				continue
+			}
 			line := string(buf)
 			consoleMu.Lock()
 			lr.eraseLineLocked()
 			// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容。
 			// 但在流式输出进行中（盲打补充输入）时不要回显，否则会把提示符+内容插进流式文本里造成错乱。
 			if !streamingActive {
-				fmt.Print(lr.prompt + line + "\r\n")
+				fmt.Print(lr.prompt + normalizeOutputNewlines(line) + "\r\n")
 			}
 			consoleMu.Unlock()
 
@@ -313,43 +388,94 @@ func (lr *LineReader) ReadLine() (string, error) {
 				copy(buf[cursor-1:], buf[cursor:])
 				buf = buf[:len(buf)-1]
 				cursor--
-				lr.redraw(buf, cursor)
-				line := string(buf)
-				if strings.HasPrefix(line, "/") && lr.completer != nil {
-					suggestions := lr.completer(line)
-					if len(suggestions) > 0 && len(suggestions) <= 10 {
-						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
-					} else if len(suggestions) > 10 {
-						lr.showCommandCountHint(len(suggestions), lr.promptWidth+cursor)
-					}
-				}
+				lr.refresh(buf, cursor)
 			}
 		case 27:
 			lr.resetCompletionCycle()
 			if err := lr.handleEscape(&buf, &cursor); err != nil {
-				return "", err
+				return lr.endOfInput(buf, err)
 			}
 		case '\t':
+			if lr.rawReader.Buffered() > 0 {
+				// A tab inside pasted text is text, not a completion request.
+				buf, cursor = insertRunes(buf, cursor, []rune{'\t'})
+				lr.refresh(buf, cursor)
+				continue
+			}
 			lr.complete(&buf, &cursor)
 		default:
 			if r >= 32 {
 				lr.resetCompletionCycle()
-				buf = append(buf, 0)
-				copy(buf[cursor+1:], buf[cursor:])
-				buf[cursor] = r
-				cursor++
-				lr.redraw(buf, cursor)
-				line := string(buf)
-				if strings.HasPrefix(line, "/") && lr.completer != nil {
-					suggestions := lr.completer(line)
-					if len(suggestions) > 0 && len(suggestions) <= 10 {
-						lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
-					} else if len(suggestions) > 10 {
-						lr.showCommandCountHint(len(suggestions), lr.promptWidth+cursor)
-					}
-				}
+				buf, cursor = insertRunes(buf, cursor, []rune{r})
+				lr.refresh(buf, cursor)
 			}
 		}
+	}
+}
+
+// rawInputBufferSize is large so that a pasted block normally arrives in one
+// buffer fill: the paste heuristic in editLine looks at what is buffered.
+const rawInputBufferSize = 64 * 1024
+
+// endOfInput maps a read error to what the REPL loop expects. A closed stdin
+// (terminal gone, pipe ended) used to come back as io.EOF, which the loop
+// treats as "reinitialise and read again" — forever, at full CPU, printing the
+// same error line. Text typed before the end is still delivered; the next call
+// then reports ErrExit.
+func (lr *LineReader) endOfInput(buf []rune, err error) (string, error) {
+	if err != io.EOF {
+		return "", err
+	}
+	consoleMu.Lock()
+	lr.eraseLineLocked()
+	consoleMu.Unlock()
+	fmt.Print("\r\n")
+	if len(buf) > 0 {
+		return string(buf), nil
+	}
+	return "", ErrExit
+}
+
+// refresh redraws the input line and its command hints, unless more input is
+// already waiting. Redrawing after every rune of a paste made a long paste
+// quadratic (each redraw copies and measures the whole buffer); the line is
+// drawn once the burst has been consumed.
+func (lr *LineReader) refresh(buf []rune, cursor int) {
+	if lr.rawReader != nil && lr.rawReader.Buffered() > 0 {
+		consoleMu.Lock()
+		lr.renderBuf = append(lr.renderBuf[:0], buf...)
+		lr.renderCursor = cursor
+		consoleMu.Unlock()
+		return
+	}
+	lr.redraw(buf, cursor)
+	if lr.completer == nil || len(buf) == 0 || buf[0] != '/' {
+		return
+	}
+	line := string(buf)
+	suggestions := lr.completer(line)
+	if len(suggestions) > 0 && len(suggestions) <= 10 {
+		lr.showInlineSuggestions(suggestions, lr.promptWidth+cursor)
+	} else if len(suggestions) > 10 {
+		lr.showCommandCountHint(len(suggestions), lr.promptWidth+cursor)
+	}
+}
+
+// insertRunes inserts rs at cursor and returns the new buffer and cursor.
+func insertRunes(buf []rune, cursor int, rs []rune) ([]rune, int) {
+	buf = append(buf, rs...)
+	copy(buf[cursor+len(rs):], buf[cursor:len(buf)-len(rs)])
+	copy(buf[cursor:], rs)
+	return buf, cursor + len(rs)
+}
+
+// skipRune consumes the next rune if it is want and already buffered.
+func (lr *LineReader) skipRune(want rune) {
+	if lr.rawReader.Buffered() == 0 {
+		return
+	}
+	if r, _, err := lr.rawReader.ReadRune(); err == nil && r != want {
+		_ = lr.rawReader.UnreadRune()
 	}
 }
 
@@ -374,7 +500,11 @@ func runeCellWidth(r rune) int {
 		(r >= 0xFE30 && r <= 0xFE6F) ||
 		(r >= 0xFF00 && r <= 0xFF60) ||
 		(r >= 0xFFE0 && r <= 0xFFE6) ||
-		(r >= 0x1F300 && r <= 0x1FAFF) {
+		(r >= 0x1F300 && r <= 0x1FAFF) ||
+		// CJK Extension B and later (planes 2 and 3). Measured as one column
+		// they overflowed the visible window, the terminal soft-wrapped the
+		// input line, and the next redraw left a ghost row.
+		(r >= 0x20000 && r <= 0x3FFFD) {
 		return 2
 	}
 	return 1
@@ -392,9 +522,19 @@ func inputDisplayWindow(buf []rune, cursor, maxCols int) (disp []rune, cursorCel
 	if maxCols < 1 {
 		maxCols = 1
 	}
-	start = 0
-	for start < cursor && runesCellWidth(buf[start:cursor]) > maxCols {
-		start++
+	// Walk back from the cursor to the widest prefix that fits. It used to
+	// advance start one rune at a time and re-measure buf[start:cursor] at
+	// each step, which is quadratic in the input length on every keystroke:
+	// a pasted log froze the editor.
+	start = cursor
+	cursorCells = 0
+	for start > 0 {
+		cw := runeCellWidth(buf[start-1])
+		if cursorCells+cw > maxCols {
+			break
+		}
+		cursorCells += cw
+		start--
 	}
 	end := start
 	used = 0
@@ -407,7 +547,6 @@ func inputDisplayWindow(buf []rune, cursor, maxCols int) (disp []rune, cursorCel
 		end++
 	}
 	disp = buf[start:end]
-	cursorCells = runesCellWidth(buf[start:cursor])
 	return disp, cursorCells, used, start
 }
 
@@ -457,20 +596,86 @@ func truncateRunesByCells(rs []rune, maxCols int) ([]rune, int) {
 	return rs[:end], used
 }
 
+// handleEscape consumes one escape sequence and applies the key it encodes.
+//
+// It used to understand only a bare ESC [ <letter>. Any sequence with
+// parameters — Ctrl/Shift/Alt + arrow ("ESC[1;5D", which Windows Terminal
+// sends for Ctrl+Left), Home/End as "ESC[1~"/"ESC[4~", Insert, F5 — stopped
+// after the first parameter byte and the rest (";5D", "~") was typed into the
+// input as text. SS3 keys (ESC O H for Home in application cursor mode, F1–F4)
+// were typed in whole. Now the full sequence is read and an unknown one is
+// dropped.
 func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 	first, err := readInputRune(lr.rawReader)
 	if err != nil {
 		return err
 	}
-	if first != '[' {
+	switch first {
+	case '[':
+		params, final, err := readCSI(lr.rawReader)
+		if err != nil {
+			return err
+		}
+		if final == '~' && csiKey(params) == 200 {
+			return lr.readBracketedPaste(buf, cursor)
+		}
+		lr.applyKey(buf, cursor, params, final)
+	case 'O':
+		final, err := readInputRune(lr.rawReader)
+		if err != nil {
+			return err
+		}
+		lr.applyKey(buf, cursor, "", final)
+	default:
 		_ = lr.rawReader.UnreadRune()
-		return nil
 	}
-	second, err := readInputRune(lr.rawReader)
-	if err != nil {
-		return err
+	return nil
+}
+
+// readCSI reads the rest of a control sequence after "ESC [": parameter
+// bytes, intermediate bytes and the final byte. A byte that cannot belong to a
+// sequence ends it early and is left unread; final is then 0.
+func readCSI(r *bufio.Reader) (params string, final rune, err error) {
+	var sb strings.Builder
+	for {
+		c, err := readInputRune(r)
+		if err != nil {
+			return sb.String(), 0, err
+		}
+		switch {
+		case c >= 0x20 && c <= 0x3f:
+			sb.WriteRune(c)
+		case c >= 0x40 && c <= 0x7e:
+			return sb.String(), c, nil
+		default:
+			_ = r.UnreadRune()
+			return sb.String(), 0, nil
+		}
 	}
-	switch second {
+}
+
+// csiKey returns the first numeric parameter of a sequence ("1;5" -> 1), or
+// -1 when there is none.
+func csiKey(params string) int {
+	head, _, _ := strings.Cut(params, ";")
+	if head == "" {
+		return -1
+	}
+	n := 0
+	for _, c := range head {
+		if c < '0' || c > '9' {
+			return -1
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// applyKey performs the editing action for a decoded key. Modifier parameters
+// (Ctrl/Shift/Alt) are accepted and ignored: Ctrl+Left moves like Left rather
+// than typing ";5D". Keys the editor has no use for do nothing.
+func (lr *LineReader) applyKey(buf *[]rune, cursor *int, params string, final rune) {
+	switch final {
 	case 'A':
 		lr.historyUp(buf, cursor)
 	case 'B':
@@ -491,15 +696,64 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 	case 'F':
 		*cursor = len(*buf)
 		lr.redraw(*buf, *cursor)
-	case '3':
-		third, _ := readInputRune(lr.rawReader)
-		if third == '~' && *cursor < len(*buf) {
-			copy((*buf)[*cursor:], (*buf)[*cursor+1:])
-			*buf = (*buf)[:len(*buf)-1]
+	case '~':
+		switch csiKey(params) {
+		case 1, 7:
+			*cursor = 0
 			lr.redraw(*buf, *cursor)
+		case 4, 8:
+			*cursor = len(*buf)
+			lr.redraw(*buf, *cursor)
+		case 3:
+			if *cursor < len(*buf) {
+				copy((*buf)[*cursor:], (*buf)[*cursor+1:])
+				*buf = (*buf)[:len(*buf)-1]
+				lr.redraw(*buf, *cursor)
+			}
 		}
 	}
-	return nil
+}
+
+// readBracketedPaste inserts everything up to the closing ESC[201~ as text.
+// Newlines in it become part of the message instead of submitting it, and the
+// line is drawn once at the end rather than once per pasted rune.
+func (lr *LineReader) readBracketedPaste(buf *[]rune, cursor *int) error {
+	var pasted []rune
+	defer func() {
+		*buf, *cursor = insertRunes(*buf, *cursor, pasted)
+		lr.redraw(*buf, *cursor)
+	}()
+	for {
+		r, err := readInputRune(lr.rawReader)
+		if err != nil {
+			return err
+		}
+		switch {
+		case r == 27:
+			next, err := readInputRune(lr.rawReader)
+			if err != nil {
+				return err
+			}
+			if next != '[' {
+				_ = lr.rawReader.UnreadRune()
+				continue
+			}
+			params, final, err := readCSI(lr.rawReader)
+			if err != nil {
+				return err
+			}
+			if final == '~' && csiKey(params) == 201 {
+				return nil
+			}
+		case r == '\r':
+			lr.skipRune('\n')
+			pasted = append(pasted, '\n')
+		case r == '\n' || r == '\t':
+			pasted = append(pasted, r)
+		case r >= 32 && r != 127:
+			pasted = append(pasted, r)
+		}
+	}
 }
 
 func (lr *LineReader) redraw(buf []rune, cursor int) {
@@ -536,7 +790,8 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	if maxVis < 1 {
 		maxVis = 1
 	}
-	disp, cells, _, start := inputDisplayWindow(buf, cursor, maxVis)
+	shown := displayRunes(buf)
+	disp, cells, _, start := inputDisplayWindow(shown, cursor, maxVis)
 	fmt.Print(lr.prompt)
 	if len(buf) == 0 && lr.placeholder != "" {
 		ph, _ := truncateRunesByCells([]rune(lr.placeholder), maxVis)
@@ -554,9 +809,35 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	// (\x1b[NC) causes with East Asian ambiguous-width glyphs such as the prompt
 	// arrow when running in a CJK terminal.
 	fmt.Print("\r")
-	left := buf[start:cursor]
+	left := shown[start:cursor]
 	fmt.Print(lr.prompt + "\x1b[0m" + string(left))
 	lr.lineDrawn = true
+}
+
+// displayRunes maps the runes of a pasted block that cannot be drawn inside a
+// one-row editor: a newline would move the cursor off the row (and, being a
+// bare \n in raw mode, staircase the screen), and a tab jumps to a tab stop
+// the width arithmetic knows nothing about. The mapping is one rune for one,
+// so cursor indexes stay valid. The buffer itself is untouched.
+func displayRunes(buf []rune) []rune {
+	var out []rune
+	for i, r := range buf {
+		if r != '\n' && r != '\t' {
+			continue
+		}
+		if out == nil {
+			out = append([]rune(nil), buf...)
+		}
+		if r == '\n' {
+			out[i] = '↵'
+		} else {
+			out[i] = ' '
+		}
+	}
+	if out == nil {
+		return buf
+	}
+	return out
 }
 
 func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {

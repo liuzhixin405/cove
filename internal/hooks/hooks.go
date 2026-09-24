@@ -3,6 +3,7 @@ package hooks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -45,6 +46,10 @@ type HookConfig struct {
 // defaultAsyncHookTimeout bounds an async hook that declares no Timeout of its
 // own, so a hung hook process cannot outlive the session.
 const defaultAsyncHookTimeout = 60 * time.Second
+
+// hookPipeWaitDelay is how long runCommand keeps reading a hook's stdout after
+// the hook process has exited or been killed; see runCommand.
+const hookPipeWaitDelay = 2 * time.Second
 
 // HookInput is the data passed to a hook when it fires.
 type HookInput struct {
@@ -174,6 +179,12 @@ func (m *Manager) runCommand(ctx context.Context, cmdPath string, input HookInpu
 	}
 
 	cmd := exec.CommandContext(ctx, cmdPath)
+	// Output reads stdout to EOF, and a background process the hook started
+	// inherits that pipe, so without a bound the call waited for the
+	// background process too: a hook that launched a notifier stalled the
+	// tool call until the notifier exited. WaitDelay stops waiting on the
+	// pipe shortly after the hook itself has exited or been killed.
+	cmd.WaitDelay = hookPipeWaitDelay
 	cmd.Stdin = nil // we'll use a pipe
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -186,11 +197,16 @@ func (m *Manager) runCommand(ctx context.Context, cmdPath string, input HookInpu
 	}()
 
 	out, err := cmd.Output()
-	if err != nil {
+	// ErrWaitDelay alone means the hook exited cleanly and only a process it
+	// left behind still held stdout; what the hook printed is its result.
+	if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 		return HookOutput{Continue: true}, fmt.Errorf("hook command: %w", err)
 	}
 
-	var output HookOutput
+	// Continue defaults to true: "continue" is the veto, so a hook that
+	// prints JSON without it has not asked to block. Decoding into a zero
+	// HookOutput used to turn {"message":"..."} into a block.
+	output := HookOutput{Continue: true}
 	if err := json.Unmarshal(out, &output); err != nil {
 		// If the command didn't return valid JSON, treat as non-blocking
 		return HookOutput{Continue: true, Message: string(out)}, nil

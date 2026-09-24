@@ -17,11 +17,10 @@ func retryWithBackoff[T any](ctx context.Context, cfg retryConfig, operation fun
 		if attempt == cfg.MaxRetries || !isRetryable(err) {
 			return zero, err
 		}
-		delay := time.Duration(1<<attempt) * cfg.BaseDelay
 		select {
 		case <-ctx.Done():
 			return zero, ctx.Err()
-		case <-time.After(delay):
+		case <-time.After(retryDelay(cfg, attempt, retryAfterOf(err))):
 		}
 	}
 	return zero, fmt.Errorf("max retries exceeded")
@@ -39,11 +38,10 @@ func retryConnectHTTP(
 			if attempt == cfg.MaxRetries {
 				return nil, err
 			}
-			delay := time.Duration(1<<attempt) * cfg.BaseDelay
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(delay):
+			case <-time.After(retryDelay(cfg, attempt, 0)):
 			}
 			continue
 		}
@@ -52,12 +50,12 @@ func retryConnectHTTP(
 			if attempt == cfg.MaxRetries {
 				return resp, nil
 			}
+			retryAfter := ParseRetryAfter(resp.Header)
 			_ = resp.Body.Close()
-			delay := time.Duration(1<<attempt) * cfg.BaseDelay
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(delay):
+			case <-time.After(retryDelay(cfg, attempt, retryAfter)):
 			}
 			continue
 		}

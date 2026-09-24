@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/permission"
 )
@@ -48,6 +49,10 @@ func applyConfigValue(cfg *config.Config, key, value string) error {
 	case "model":
 		cfg.Model = value
 	case "provider":
+		// Saved unchecked, a typo only surfaced as a failure on the next start.
+		if !api.IsKnownProvider(value) {
+			return fmt.Errorf("unknown provider: %s", value)
+		}
 		cfg.Provider.Name = value
 	case "api_key", "api-key":
 		cfg.Provider.APIKey = value

@@ -84,41 +84,39 @@ func newSSETestServer(t *testing.T) *sseTestServer {
 		postQuery:  make(chan string, 32),
 	}
 
+	// Spec HTTP+SSE: GET /sse is the event stream and its first event names the
+	// POST endpoint. (This server used to model a made-up protocol - POST /sse
+	// returning {"sessionId"}, GET /message for the stream - that matched the
+	// old transport and no real server.)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if s.omitSession.Load() {
-			io.WriteString(w, `{}`)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer is not a Flusher")
 			return
 		}
-		fmt.Fprintf(w, `{"sessionId":%q}`, s.sessionID)
-	})
-	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			flusher, ok := w.(http.Flusher)
-			if !ok {
-				t.Error("response writer is not a Flusher")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if !s.omitSession.Load() {
+			fmt.Fprintf(w, "event: endpoint\ndata: /message?sessionId=%s\n\n", s.sessionID)
+		}
+		flusher.Flush()
+		select {
+		case s.streamOpen <- struct{}{}:
+		default:
+		}
+		for {
+			select {
+			case ev := <-s.events:
+				fmt.Fprintf(w, "data: %s\n\n", ev)
+				flusher.Flush()
+			case <-r.Context().Done():
+				s.goneOnce.Do(func() { close(s.streamGone) })
 				return
 			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			flusher.Flush()
-			select {
-			case s.streamOpen <- struct{}{}:
-			default:
-			}
-			for {
-				select {
-				case ev := <-s.events:
-					fmt.Fprintf(w, "data: %s\n\n", ev)
-					flusher.Flush()
-				case <-r.Context().Done():
-					s.goneOnce.Do(func() { close(s.streamGone) })
-					return
-				}
-			}
 		}
-
+	})
+	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if code := int(s.postStatus.Load()); code >= 400 {
 			w.WriteHeader(code)
@@ -137,18 +135,22 @@ func newSSETestServer(t *testing.T) *sseTestServer {
 	return s
 }
 
-func TestNewSSETransport_RequiresSessionID(t *testing.T) {
+func TestNewSSETransport_RequiresEndpointEvent(t *testing.T) {
+	old := sseEndpointTimeout
+	sseEndpointTimeout = 300 * time.Millisecond
+	defer func() { sseEndpointTimeout = old }()
+
 	s := newSSETestServer(t)
 	defer s.srv.Close()
 	s.omitSession.Store(true)
 
-	tr, err := NewSSETransport(s.srv.URL)
+	tr, err := NewSSETransport(s.srv.URL + "/sse")
 	if err == nil {
 		tr.Close()
-		t.Fatal("NewSSETransport succeeded without a session id")
+		t.Fatal("NewSSETransport succeeded without an endpoint event")
 	}
-	if !strings.Contains(err.Error(), "session ID") {
-		t.Fatalf("error = %q; want it to mention the missing session ID", err)
+	if !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("error = %q; want it to mention the missing endpoint event", err)
 	}
 }
 
@@ -157,7 +159,7 @@ func TestNewSSETransport_ReportsConnectFailure(t *testing.T) {
 	url := s.srv.URL
 	s.srv.Close() // nothing is listening any more
 
-	tr, err := NewSSETransport(url)
+	tr, err := NewSSETransport(url + "/sse")
 	if err == nil {
 		tr.Close()
 		t.Fatal("NewSSETransport succeeded against a dead server")
@@ -171,7 +173,7 @@ func TestSSETransport_SendPostsToSessionAndSurfacesHTTPErrors(t *testing.T) {
 	s := newSSETestServer(t)
 	defer s.srv.Close()
 
-	tr, err := NewSSETransport(s.srv.URL)
+	tr, err := NewSSETransport(s.srv.URL + "/sse")
 	if err != nil {
 		t.Fatalf("NewSSETransport: %v", err)
 	}
@@ -217,7 +219,7 @@ func TestSSETransport_BackpressureDoesNotDropMessages(t *testing.T) {
 	s := newSSETestServer(t)
 	defer s.srv.Close()
 
-	tr, err := NewSSETransport(s.srv.URL)
+	tr, err := NewSSETransport(s.srv.URL + "/sse")
 	if err != nil {
 		t.Fatalf("NewSSETransport: %v", err)
 	}
@@ -267,7 +269,7 @@ func TestSSETransport_ReaderExitsOnShutdown(t *testing.T) {
 	s := newSSETestServer(t)
 	defer s.srv.Close()
 
-	tr, err := NewSSETransport(s.srv.URL)
+	tr, err := NewSSETransport(s.srv.URL + "/sse")
 	if err != nil {
 		t.Fatalf("NewSSETransport: %v", err)
 	}
@@ -325,7 +327,7 @@ func TestSSETransport_ReceiveHonoursCallerContext(t *testing.T) {
 	s := newSSETestServer(t)
 	defer s.srv.Close()
 
-	tr, err := NewSSETransport(s.srv.URL)
+	tr, err := NewSSETransport(s.srv.URL + "/sse")
 	if err != nil {
 		t.Fatalf("NewSSETransport: %v", err)
 	}
@@ -426,18 +428,28 @@ func newStreamableTestServer(t *testing.T) *streamableTestServer {
 	return s
 }
 
-func TestNewStreamableHTTPTransport_RejectsErrorStatus(t *testing.T) {
-	s := newStreamableTestServer(t)
-	defer s.srv.Close()
-	s.getStatus.Store(http.StatusNotFound)
+// TestNewStreamableHTTPTransport_ToleratesRefusedGETStream: the GET stream is
+// optional in the spec and SDK servers refuse it (405 stateless, 400 before a
+// session exists). This test used to demand that a refused GET fail the
+// connection, which made cove unusable with those servers. Errors now surface
+// on the POST, where they mean something.
+func TestNewStreamableHTTPTransport_ToleratesRefusedGETStream(t *testing.T) {
+	for _, code := range []int{http.StatusMethodNotAllowed, http.StatusBadRequest, http.StatusNotFound} {
+		s := newStreamableTestServer(t)
+		s.getStatus.Store(int32(code))
 
-	tr, err := NewStreamableHTTPTransport(s.srv.URL)
-	if err == nil {
+		tr, err := NewStreamableHTTPTransport(s.srv.URL)
+		if err != nil {
+			s.srv.Close()
+			t.Fatalf("GET %d: NewStreamableHTTPTransport failed: %v", code, err)
+		}
+		s.postStatus.Store(http.StatusNotFound)
+		err = tr.Send(context.Background(), Request{JSONRPC: JSONRPC{Jsonrpc: "2.0"}, ID: 1, Method: "initialize"})
+		if err == nil || !strings.Contains(err.Error(), "404") {
+			t.Fatalf("GET %d: POST to a 404 endpoint returned %v; want the status code", code, err)
+		}
 		tr.Close()
-		t.Fatal("NewStreamableHTTPTransport accepted a 404 stream")
-	}
-	if !strings.Contains(err.Error(), "404") {
-		t.Fatalf("error = %q; want the status code", err)
+		s.srv.Close()
 	}
 }
 
@@ -616,7 +628,7 @@ func TestPool_ConnectDoesNotHoldLockDuringHandshake(t *testing.T) {
 
 	connectDone := make(chan error, 1)
 	go func() {
-		connectDone <- p.Connect(ctx, "A", ServerConfig{Type: "sse", URL: s.srv.URL})
+		connectDone <- p.Connect(ctx, "A", ServerConfig{Type: "sse", URL: s.srv.URL + "/sse"})
 	}()
 
 	// The initialize POST proves Connect is inside the handshake.
@@ -661,7 +673,5 @@ func TestPool_ConnectDoesNotHoldLockDuringHandshake(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Connect did not return after its context was cancelled")
 	}
-	if _, ok := p.servers["A"]; ok {
-		t.Fatal("a failed Connect registered the server")
-	}
+	requireFailedEntry(t, p, "A")
 }

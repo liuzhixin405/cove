@@ -48,6 +48,16 @@ func NewKeyPool(keys []string) *KeyPool {
 	return pool
 }
 
+// size returns how many keys the pool holds; 0 for a nil pool.
+func (p *KeyPool) size() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.keys)
+}
+
 // Get returns the next available API key using round-robin.
 // Returns empty string if all keys are exhausted/dead.
 func (p *KeyPool) Get() string {
@@ -167,4 +177,3 @@ func (p *KeyPool) MarkSuccess(key string) {
 		}
 	}
 }
-

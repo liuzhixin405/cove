@@ -85,7 +85,35 @@ func (s *SessionNotes) Flush() error {
 	return s.writeToDisk()
 }
 
+// maxNotesBytes caps the notes file.
+const maxNotesBytes = 25600
+
 func (s *SessionNotes) writeToDisk() error {
+	// Keep the newest entries that fit. The file is per project and every
+	// session loads, extends and rewrites it, so it only grows; clipping the
+	// rendered file used to cut off its end — the newest notes — and the next
+	// Load skipped the marker, so past the cap every new note was lost while
+	// the oldest stayed forever. Dropping the oldest also bounds s.entries.
+	content := s.render()
+	for len(content) > maxNotesBytes && len(s.entries) > 1 {
+		excess := len(content) - maxNotesBytes
+		drop := 0
+		for freed := 0; drop < len(s.entries)-1 && freed < excess; drop++ {
+			freed += len(s.entries[drop].Text) + len("- [15:04] \n")
+		}
+		s.entries = append([]NoteEntry(nil), s.entries[drop:]...)
+		content = s.render()
+	}
+	// A single entry larger than the cap: clip it on a rune boundary, since
+	// notes are largely Chinese here and a byte-slice would cut a rune in half.
+	content = textutil.ClipBytes(content, maxNotesBytes, "\n... [truncated]\n")
+	// Atomic replace: a crash mid-write would otherwise leave a half-written
+	// notes file, which Load then parses as the session's entire history.
+	return fsatomic.WriteFile(s.path, []byte(content), 0644)
+}
+
+// render formats the entries as the notes file.
+func (s *SessionNotes) render() string {
 	var sb strings.Builder
 	sb.WriteString("# Session Notes\n\n")
 	fmt.Fprintf(&sb, "_Last updated: %s_\n\n", time.Now().Format("2006-01-02 15:04"))
@@ -108,13 +136,7 @@ func (s *SessionNotes) writeToDisk() error {
 		}
 		sb.WriteString("\n")
 	}
-
-	// Enforce max size (25KB), clipping on a rune boundary: notes are largely
-	// Chinese here, so a byte-slice would cut a rune in half.
-	content := textutil.ClipBytes(sb.String(), 25600, "\n... [truncated]\n")
-	// Atomic replace: a crash mid-write would otherwise leave a half-written
-	// notes file, which Load then parses as the session's entire history.
-	return fsatomic.WriteFile(s.path, []byte(content), 0644)
+	return sb.String()
 }
 
 // Load reads existing notes from disk (for resuming sessions).

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 )
 
 type Price struct {
@@ -18,14 +20,33 @@ type Price struct {
 }
 
 var Prices = map[string]Price{
+	// Current Claude models, per-MTok list prices from Anthropic's model table
+	// (as of 2026-06). Cache reads are 0.1x input unless the model publishes its
+	// own cache-read rate. Keys are matched as the longest substring of the
+	// model ID, so dated or platform-prefixed IDs resolve to the same entry.
+	"claude-fable-5-1":  {Input: 10.0, InputCacheHit: 0.25, Output: 50.0},
+	"claude-fable-5":    {Input: 10.0, InputCacheHit: 1.0, Output: 50.0},
+	"claude-opus-5-5":   {Input: 4.0, InputCacheHit: 0.20, Output: 20.0},
+	"claude-opus-5":     {Input: 5.0, InputCacheHit: 0.50, Output: 25.0},
+	"claude-opus-4-8":   {Input: 5.0, InputCacheHit: 0.50, Output: 25.0},
+	"claude-opus-4-7":   {Input: 5.0, InputCacheHit: 0.50, Output: 25.0},
+	"claude-opus-4-6":   {Input: 5.0, InputCacheHit: 0.50, Output: 25.0},
+	"claude-sonnet-5":   {Input: 2.0, InputCacheHit: 0.20, Output: 10.0},
+	"claude-sonnet-4-6": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
+	"claude-haiku-4-5":  {Input: 1.0, InputCacheHit: 0.10, Output: 5.0},
+
 	"claude-3-7-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
 	"claude-3-5-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
 	"claude-3-5-haiku":  {Input: 0.8, InputCacheHit: 0.08, Output: 4.0},
 	"claude-3-opus":     {Input: 15.0, InputCacheHit: 1.5, Output: 75.0},
 	"deepseek-chat":     {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
 	"deepseek-reasoner": {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
-	"deepseek-v4-flash": {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
-	"deepseek-v4-pro":   {Input: 0.14, InputCacheHit: 0.14 * 0.1, Output: 0.28},
+	// DeepSeek V4 at the peak rate (api-docs.deepseek.com). Off-peak is
+	// exactly half; billing at peak keeps max_budget_usd a real upper bound.
+	// "deepseek-v4-flash" is the retired alias of deepseek-flash.
+	"deepseek-v4-pro":   {Input: 1.32, InputCacheHit: 0.044, Output: 3.96},
+	"deepseek-flash":    {Input: 0.30, InputCacheHit: 0.006, Output: 1.20},
+	"deepseek-v4-flash": {Input: 0.30, InputCacheHit: 0.006, Output: 1.20},
 	"gpt-4o":            {Input: 2.5, InputCacheHit: 1.25, Output: 10.0},
 	"gpt-4o-mini":       {Input: 0.15, InputCacheHit: 0.075, Output: 0.6},
 	"o3-mini":           {Input: 1.1, InputCacheHit: 1.1, Output: 4.4},
@@ -227,18 +248,29 @@ func (h *CostHistory) load() {
 	if err != nil {
 		return
 	}
+	// Save writes {"records": [...]}, but this used to decode a bare array, so
+	// every reload failed, started empty, and the next Save dropped the old
+	// records. Accept the object form, and the bare array for older files.
+	var file struct {
+		Records []CostRecord `json:"records"`
+	}
+	if err := json.Unmarshal(data, &file); err == nil {
+		h.Records = file.Records
+		return
+	}
 	if err := json.Unmarshal(data, &h.Records); err != nil {
 		h.Records = nil
 	}
 }
 
-// Save persists the current cost history to disk.
+// Save persists the current cost history to disk. The replace is atomic so a
+// crash mid-write cannot truncate the history.
 func (h *CostHistory) Save() error {
 	data, err := json.MarshalIndent(h, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(h.path, data, 0600)
+	return fsatomic.WriteFile(h.path, data, 0600)
 }
 
 // Add records a new cost entry.

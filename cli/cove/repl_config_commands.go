@@ -2,8 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/api"
@@ -44,13 +44,16 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 			return true
 		}
 		if err := applyProviderConfigChange(cfg, eng, func() error {
+			oldProvider := cfg.EffectiveProvider().Name
 			cfg.Provider.Name = providerName
+			cfg.Model = providerSwitchModel(oldProvider, providerName, cfg.Model)
+			as.Model = cfg.Model
 			return config.Save(cfg)
 		}); err != nil {
 			outf("供应商更新失败: %v\n", err)
 			return true
 		}
-		outf("供应商: %s（已保存）\n", cfg.Provider.Name)
+		outf("供应商: %s，模型: %s（已保存）\n", cfg.Provider.Name, cfg.Model)
 		return true
 	case strings.HasPrefix(input, "/api-key "):
 		if err := applyProviderConfigChange(cfg, eng, func() error {
@@ -79,13 +82,13 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 			eng.SetPermissionMode(m)
 			cfg.PermissionMode = string(m)
 			as.PermissionMode = string(m)
-			_ = config.Save(cfg)
+			saveConfigOrSay(cfg)
 			outf("模式: %s\n", m)
 		} else {
 			outf("无效模式。可选: %s\n", permission.Modes())
 		}
 		return true
-	case strings.HasPrefix(input, "/budget "):
+	case input == "/budget" || strings.HasPrefix(input, "/budget "):
 		handleBudgetCommand(input, cfg, eng, as)
 		return true
 	case input == "/cost":
@@ -102,7 +105,17 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 }
 
 func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, as *state.AppState) {
-	arg := strings.TrimSpace(strings.TrimPrefix(input, "/budget "))
+	arg := strings.TrimSpace(strings.TrimPrefix(input, "/budget"))
+	if arg == "" {
+		// Bare "/budget" used to fall through to "未找到命令 /budget".
+		if cfg.MaxBudgetUsd > 0 {
+			outf("当前预算: $%.2f\n", cfg.MaxBudgetUsd)
+		} else {
+			outln("当前未设置预算上限")
+		}
+		outln(budgetUsage)
+		return
+	}
 	if strings.EqualFold(arg, "auto") {
 		b := cfg.MaxBudgetUsd
 		if tr := eng.CostTracker(); tr != nil {
@@ -115,21 +128,49 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 			cfg.MaxBudgetUsd = b
 			as.MaxBudget = b
 			eng.SetMaxBudget(b)
-			_ = config.Save(cfg)
+			saveConfigOrSay(cfg)
 			outf("预算已自动调整到: $%.2f\n", b)
 		}
 		return
 	}
-	var b float64
-	_, _ = fmt.Sscanf(arg, "%f", &b)
-	if b > 0 {
-		cfg.MaxBudgetUsd = b
-		as.MaxBudget = b
-		eng.SetMaxBudget(b)
-		_ = config.Save(cfg)
-		outf("预算: $%.2f\n", b)
+	// An unparsable or non-positive amount used to be ignored without a word,
+	// so the user believed a cap was set.
+	b, err := strconv.ParseFloat(strings.TrimPrefix(arg, "$"), 64)
+	if err != nil || b <= 0 {
+		outf("无效预算: %s\n%s\n", arg, budgetUsage)
+		return
+	}
+	cfg.MaxBudgetUsd = b
+	as.MaxBudget = b
+	eng.SetMaxBudget(b)
+	saveConfigOrSay(cfg)
+	outf("预算: $%.2f\n", b)
+}
+
+// providerSwitchModel is the model to use after switching from oldProvider to
+// newProvider. The old provider's default (or no choice at all) follows the
+// switch; /provider deepseek used to keep claude-sonnet-4 and send it to
+// DeepSeek. A model the user picked stays: it may be served by the new
+// provider too (OpenRouter, compatible gateways).
+func providerSwitchModel(oldProvider, newProvider, model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" || strings.EqualFold(m, "auto") || m == config.DefaultModelForProvider(oldProvider) {
+		return config.DefaultModelForProvider(newProvider)
+	}
+	return m
+}
+
+// saveConfigOrSay saves cfg and tells the user when that failed. The /mode and
+// /budget paths used to discard the error, and config.Save refuses to
+// overwrite a config.json it cannot parse, so a change could vanish on the
+// next start while the command had reported success.
+func saveConfigOrSay(cfg *config.Config) {
+	if err := config.Save(cfg); err != nil {
+		outf("配置保存失败（仅本次会话生效）: %v\n", err)
 	}
 }
+
+const budgetUsage = "用法: /budget <金额，美元，大于 0> | /budget auto"
 
 func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, pm *permission.Manager, as *state.AppState) {
 	args := strings.Fields(strings.TrimSpace(strings.TrimPrefix(input, "/profile")))

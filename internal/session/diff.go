@@ -84,10 +84,11 @@ func Diff(a, b *SessionView) *SessionDiff {
 	aTools, aFiles := extractArtifacts(a.Messages)
 	bTools, bFiles := extractArtifacts(b.Messages)
 
-	d.AddedTools = diffStrings(aTools, bTools)
-	d.RemovedTools = diffStrings(bTools, aTools)
-	d.AddedFiles = diffStrings(aFiles, bFiles)
-	d.RemovedFiles = diffStrings(bFiles, aFiles)
+	// diffStrings(x, y) is what x has and y lacks: added = new minus old.
+	d.AddedTools = diffStrings(bTools, aTools)
+	d.RemovedTools = diffStrings(aTools, bTools)
+	d.AddedFiles = diffStrings(bFiles, aFiles)
+	d.RemovedFiles = diffStrings(aFiles, bFiles)
 
 	return d
 }

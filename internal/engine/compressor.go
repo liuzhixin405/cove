@@ -217,7 +217,9 @@ func (cc *ChatCompressor) generateSummary(
 	req := api.ChatRequest{
 		SystemBase: "You are a conversation summarizer. Be concise and factual.",
 		Messages:   []api.Message{{Role: "user", Content: summaryInput.String()}},
-		MaxTokens:  600,
+		// Room for a reasoning model's thinking as well as the summary; the
+		// prompt itself keeps the summary short.
+		MaxTokens: backgroundMaxTokens,
 	}
 
 	resp, err := tryChat(ctx, req)

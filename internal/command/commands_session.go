@@ -124,15 +124,19 @@ func (c *SystemCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	}
 	prompt := strings.Join(in.Args, " ")
 	in.Config.SystemPrompt = prompt
-	if in.Engine != nil {
-		in.Engine.SetSystemOverride(prompt)
-	}
 	if in.SaveConfig != nil {
 		if err := in.SaveConfig(in.Config); err != nil {
 			return Output{}, err
 		}
 	}
-	return Output{Message: fmt.Sprintf("系统提示词已更新 (%d 字符)", len(prompt))}, nil
+	// The saved value is added to the built-in system prompt as the user's
+	// instructions. This used to call SetSystemOverride, which replaced the
+	// whole prompt for the rest of the session: the model lost its role, tool
+	// rules and project context, and behaved differently from the next start.
+	if s, ok := in.Engine.(instructionsSetter); ok && s.SetCustomInstructions(prompt) {
+		return Output{Message: fmt.Sprintf("系统提示词已更新 (%d 字符)", len([]rune(prompt)))}, nil
+	}
+	return Output{Message: fmt.Sprintf("系统提示词已保存 (%d 字符)，下次启动 cove 时生效", len([]rune(prompt)))}, nil
 }
 
 func (c *CdCmd) Name() string        { return "cd" }
@@ -143,7 +147,9 @@ func (c *CdCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if len(in.Args) == 0 {
 		return Output{Message: fmt.Sprintf("当前: %s", in.Cwd)}, nil
 	}
-	path := in.Args[0]
+	// The line reaches us split on whitespace, so a Windows path such as
+	// "D:\My Projects" arrived as two args and only "D:\My" was tried.
+	path := strings.Trim(strings.Join(in.Args, " "), `"'`)
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(in.Cwd, path)
 	}
@@ -154,7 +160,10 @@ func (c *CdCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.ProjectContext != nil {
 		*in.ProjectContext = *ctxt.Collect()
 	}
-	return Output{Message: fmt.Sprintf("已切换到: %s", wd)}, nil
+	if s, ok := in.Engine.(workingDirSetter); ok && s.SetWorkingDir(wd) {
+		return Output{Message: fmt.Sprintf("已切换到: %s", wd)}, nil
+	}
+	return Output{Message: fmt.Sprintf("已切换到: %s\n注意: 检查点 (/undo)、会话所属项目和自动验证仍按启动目录处理；要完整切换项目请在新目录重新启动 cove。", wd)}, nil
 }
 
 func (c *ContextCmd) Name() string        { return "context" }

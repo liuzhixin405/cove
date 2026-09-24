@@ -93,6 +93,32 @@ func DefaultBaseURL(name string) string {
 	return providerBaseURLs["openai-compatible"]
 }
 
+// normalizeOpenAIBaseURL cleans a configured OpenAI-compatible base URL.
+// A pasted full endpoint (".../chat/completions") or a doubled "/v1/v1" used
+// to be kept verbatim and produced a 404 on every request. No /v1 is added:
+// compatible APIs version their paths differently (GLM /v4, Doubao /v3).
+func normalizeOpenAIBaseURL(raw string) string {
+	u := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u = strings.TrimRight(strings.TrimSuffix(u, "/chat/completions"), "/")
+	for strings.HasSuffix(u, "/v1/v1") {
+		u = strings.TrimSuffix(u, "/v1")
+	}
+	return u
+}
+
+// normalizeAnthropicBaseURL makes a configured Anthropic base URL end in
+// /v1. The Anthropic SDKs and the claude CLI take a base URL without it
+// (ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic) and append
+// /v1/messages; cove appended only /messages, so that same value got a 404.
+func normalizeAnthropicBaseURL(raw string) string {
+	u := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u = strings.TrimRight(strings.TrimSuffix(u, "/messages"), "/")
+	if !strings.HasSuffix(u, "/v1") {
+		u += "/v1"
+	}
+	return u
+}
+
 func ProviderEnvCandidates(name string) []string {
 	normalized := NormalizeProviderName(name)
 	seen := map[string]bool{}

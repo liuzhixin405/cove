@@ -196,48 +196,43 @@ func TestPermissionPromptBoxBordersAlign(t *testing.T) {
 	}
 }
 
-func TestPermissionPromptClipsLongASCIIDescription(t *testing.T) {
+// This test used to require the description to be clipped to 60 runes. That
+// clipping was the bug: the description is the command being approved, and
+// cutting it hid whatever came after column 60. A 200-character command is
+// now shown whole.
+func TestPermissionPromptShowsLongASCIIDescriptionWhole(t *testing.T) {
 	desc := strings.Repeat("a", 200)
 	line := descriptionLine(t, PermissionPrompt("Bash", desc))
 
-	if n := utf8.RuneCountInString(line); n != 60 {
-		t.Errorf("clipped description is %d runes, want 60: %q", n, line)
-	}
-	if !strings.HasSuffix(line, "...") {
-		t.Errorf("clipped description should end with an ellipsis: %q", line)
-	}
-	if strings.Contains(line, strings.Repeat("a", 61)) {
-		t.Errorf("description was not clipped at all: %q", line)
+	if line != desc {
+		t.Errorf("200-rune description was altered: got %d runes %q", utf8.RuneCountInString(line), line)
 	}
 }
 
 // TestPermissionPromptKeepsChineseDescriptionValidUTF8 is the regression guard
-// for the byte-slicing bug class in this codebase: clipping a Chinese
-// description with desc[:60] cuts a 3-byte rune apart and renders as U+FFFD.
+// for the byte-slicing bug class in this codebase: shortening a Chinese
+// description at a byte offset cuts a 3-byte rune apart and renders as U+FFFD.
+// Only a huge description is shortened now (from the middle), so that is the
+// case exercised; it used to assert a 60-rune clip, which hid the command.
 func TestPermissionPromptKeepsChineseDescriptionValidUTF8(t *testing.T) {
-	// 108 Chinese runes = 324 bytes, well past the 60 runes the prompt allows.
-	desc := strings.Repeat("更新配置文件并运行测试以确认修复生效", 6)
+	// ~11,000 bytes of Chinese, past the prompt's byte budget.
+	desc := strings.Repeat("更新配置文件并运行测试以确认修复生效", 200)
 
 	out := PermissionPrompt("Edit", desc)
-	line := descriptionLine(t, out)
 
 	if !utf8.ValidString(out) {
-		t.Errorf("PermissionPrompt produced invalid UTF-8 for a Chinese description: %q", out)
+		t.Errorf("PermissionPrompt produced invalid UTF-8 for a Chinese description")
 	}
-	if strings.ContainsRune(line, utf8.RuneError) {
-		t.Errorf("description was cut mid-rune (contains U+FFFD): %q", line)
+	if strings.ContainsRune(out, utf8.RuneError) {
+		t.Errorf("description was cut mid-rune (contains U+FFFD)")
 	}
-	if n := utf8.RuneCountInString(line); n > 60 {
-		t.Errorf("description is %d runes, want at most 60: %q", n, line)
-	}
-	// It really was clipped, not passed through whole.
+	// It really was shortened, not passed through whole.
 	if strings.Contains(out, desc) {
-		t.Errorf("a %d-rune description was not clipped", utf8.RuneCountInString(desc))
+		t.Errorf("a %d-byte description was not shortened", len(desc))
 	}
-	// Every rune that survived must be one of the originals, in order.
-	body := strings.TrimSuffix(line, "...")
-	if !strings.HasPrefix(desc, body) {
-		t.Errorf("clipped description %q is not a prefix of the original %q", body, desc)
+	// The start survives as a prefix of the original.
+	if line := descriptionLine(t, out); !strings.HasPrefix(desc, line) {
+		t.Errorf("first description row %q is not a prefix of the original", line)
 	}
 }
 

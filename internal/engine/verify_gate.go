@@ -8,9 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/shell"
 )
 
 // VerifyResult captures the outcome of running one configured verification
@@ -46,6 +47,9 @@ type VerifyGate struct {
 	maxRetries int
 	timeout    time.Duration
 	ledgerPath string
+	// onlyWhenFilesChanged limits the gate to turns that wrote or edited a
+	// file. Set for automatically detected commands (newAutoVerifyGate).
+	onlyWhenFilesChanged bool
 }
 
 // NewVerifyGate creates a gate for the given commands. An empty commands
@@ -159,18 +163,15 @@ func (g *VerifyGate) appendLedger(r VerifyResult) {
 	_, _ = f.Write(append(line, '\n'))
 }
 
-// runVerifyCommand executes a single shell command, mirroring the same
-// cross-platform shell detection used by the bash tool (kept as a small,
-// self-contained duplicate here rather than importing internal/tool, to
-// avoid coupling the engine's completion gate to the tool package's
-// unexported helpers).
+// runVerifyCommand executes a single shell command in the same shell the bash
+// tool uses, so a verify command written like the model's own commands runs.
 func runVerifyCommand(ctx context.Context, cmdStr string, workDir string) (output string, exitCode int, err error) {
-	shell, flag := verifyShell()
-	cmd := exec.CommandContext(ctx, shell, flag, cmdStr)
+	sh := shell.Default()
+	cmd := exec.CommandContext(ctx, sh.Path, sh.Args(cmdStr)...)
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
-	cmd.Env = os.Environ()
+	cmd.Env = shell.Env(os.Environ())
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -189,33 +190,6 @@ func runVerifyCommand(ctx context.Context, cmdStr string, workDir string) (outpu
 	}
 	// Could not even start the command (bad shell, timeout before start, etc).
 	return out, -1, runErr
-}
-
-func verifyShell() (string, string) {
-	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("cmd"); err == nil {
-			return "cmd", "/C"
-		}
-		if _, err := exec.LookPath("pwsh"); err == nil {
-			return "pwsh", "-Command"
-		}
-		if _, err := exec.LookPath("powershell"); err == nil {
-			return "powershell", "-Command"
-		}
-		if _, err := exec.LookPath("bash"); err == nil {
-			return "bash", "-c"
-		}
-	}
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash", "-c"
-	}
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		return "pwsh", "-Command"
-	}
-	if _, err := exec.LookPath("sh"); err == nil {
-		return "sh", "-c"
-	}
-	return "cmd", "/C"
 }
 
 func truncateTail(s string, max int) string {

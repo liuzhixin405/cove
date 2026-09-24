@@ -2,12 +2,15 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/skills"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
@@ -41,7 +44,16 @@ func (e *Engine) backgroundReview() {
 			return
 		}
 
-		prompt := `你是一个对话回顾助手。分析以下对话片段，判断是否有值得记住的内容。
+		resp, _, err := e.fallback.TryChat(ctx, func(api.Provider) api.ChatRequest { return e.reviewRequest(snapshot) })
+		if err != nil {
+			log.Warnf("background review failed: %v", err)
+			return
+		}
+		e.applyReview(resp.Content)
+	}()
+}
+
+const reviewPrompt = `你是一个对话回顾助手。分析以下对话片段，判断是否有值得记住的内容。
 
 只在以下情况输出：
 1. 用户偏好（编码风格、工具偏好、工作习惯）→ 输出 MEMORY: <一句话描述>
@@ -54,51 +66,67 @@ func (e *Engine) backgroundReview() {
 
 如果没有值得记住的，只输出 NONE。`
 
-		compactReviewReq := func(p api.Provider) api.ChatRequest {
-			return api.ChatRequest{
-				Model:      e.config.Model,
-				SystemBase: prompt,
-				Messages:   []api.Message{{Role: "user", Content: snapshot}},
-				MaxTokens:  300,
+// backgroundMaxTokens bounds the answer of a background bookkeeping request.
+// Reasoning models (deepseek-v4-pro) spend part of max_tokens on thinking
+// before they answer; the old 300 often left no room for the answer at all.
+const backgroundMaxTokens = 4000
+
+// reviewRequest builds the background review request for a snapshot. It runs
+// on the background (fast) model, like extraction and consolidation; it used
+// to run on the premium model for a job that only writes one-line notes.
+func (e *Engine) reviewRequest(snapshot string) api.ChatRequest {
+	model := e.backgroundModel
+	if model == "" {
+		model = e.config.Model
+	}
+	return api.ChatRequest{
+		Model:      model,
+		SystemBase: reviewPrompt,
+		Messages:   []api.Message{{Role: "user", Content: snapshot}},
+		MaxTokens:  backgroundMaxTokens,
+	}
+}
+
+// applyReview stores the MEMORY and SKILL lines of a review answer.
+func (e *Engine) applyReview(output string) {
+	output = strings.TrimSpace(output)
+	if output == "NONE" || output == "" {
+		return
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "MEMORY:") {
+			mem := strings.TrimSpace(strings.TrimPrefix(line, "MEMORY:"))
+			if mem != "" && e.memStore != nil {
+				// One file per memory, named by its content: every memory used
+				// to be saved as "auto", so each review replaced the last one,
+				// while a repeated memory still lands on the same file.
+				sum := sha256.Sum256([]byte(mem))
+				_ = e.memStore.Save("auto-"+hex.EncodeToString(sum[:6]), mem)
+				log.Debugf("background review saved memory: %s", mem)
+				e.debugOutput(fmt.Sprintf("  \x1b[2mlearned memory: %s\x1b[0m\n", reviewTruncate(mem, 50)))
 			}
 		}
-		resp, _, err := e.fallback.TryChat(ctx, compactReviewReq)
-		if err != nil {
-			log.Warnf("background review failed: %v", err)
-			return
-		}
-
-		output := strings.TrimSpace(resp.Content)
-		if output == "NONE" || output == "" {
-			return
-		}
-
-		// Process MEMORY lines
-		for _, line := range strings.Split(output, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "MEMORY:") {
-				mem := strings.TrimSpace(strings.TrimPrefix(line, "MEMORY:"))
-				if mem != "" && e.memStore != nil {
-					_ = e.memStore.Save("auto", mem)
-					log.Debugf("background review saved memory: %s", mem)
-					e.engineOutput(fmt.Sprintf("  \x1b[2mlearned memory: %s\x1b[0m\n", reviewTruncate(mem, 50)))
-				}
-			}
-			if strings.HasPrefix(line, "SKILL:") {
-				skill := strings.TrimSpace(strings.TrimPrefix(line, "SKILL:"))
-				if skill != "" && e.skillMgr != nil {
-					parts := strings.SplitN(skill, "|", 2)
-					if len(parts) == 2 {
-						name := strings.TrimSpace(parts[0])
-						content := strings.TrimSpace(parts[1])
-						e.skillMgr.Register(skills.Skill{Name: name, Prompt: content})
-						log.Debugf("background review saved skill: %s", name)
-						e.engineOutput(fmt.Sprintf("  \x1b[2mlearned skill: %s\x1b[0m\n", name))
+		if strings.HasPrefix(line, "SKILL:") {
+			skill := strings.TrimSpace(strings.TrimPrefix(line, "SKILL:"))
+			if skill != "" && e.skillMgr != nil {
+				parts := strings.SplitN(skill, "|", 2)
+				if len(parts) == 2 {
+					name := strings.TrimSpace(parts[0])
+					content := strings.TrimSpace(parts[1])
+					// A learned skill is shown to the model in later turns just
+					// like a memory, so it gets the same injection screening.
+					if err := memory.ScreenContent(name + "\n" + content); err != nil {
+						log.Warnf("background review skill %q refused: %v", name, err)
+						continue
 					}
+					e.skillMgr.Register(skills.Skill{Name: name, Prompt: content})
+					log.Debugf("background review saved skill: %s", name)
+					e.debugOutput(fmt.Sprintf("  \x1b[2mlearned skill: %s\x1b[0m\n", name))
 				}
 			}
 		}
-	}()
+	}
 }
 
 func buildReviewSnapshot(msgs []api.Message) string {
@@ -125,7 +153,9 @@ func buildReviewSnapshot(msgs []api.Message) string {
 				}
 			}
 		case "tool":
-			sb.WriteString("  结果: " + clipRunes(content, 80) + "\n")
+			// Tool results are left out, as the memory extractor leaves them
+			// out: they are what files, pages and commands said (secrets,
+			// injected instructions), not what the user wants remembered.
 		}
 	}
 	return sb.String()

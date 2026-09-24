@@ -112,7 +112,7 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 			fmt.Fprintln(os.Stderr, budgetExceededRetryHint(eng.CostTracker()))
 			continue
 		}
-		if pc.APIKey == "" {
+		if runNeedsAPIKey(pc.APIKey, replayDir != "") {
 			fmt.Fprintln(os.Stderr, missingAPIKeyMessage(pc.Name))
 			continue
 		}
@@ -143,7 +143,7 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 			}
 		}
 		for _, w := range warnings {
-			fmt.Fprintf(os.Stderr, "⚠ %s\n", w)
+			fmt.Fprintln(os.Stderr, w) // the warning carries its own ⚠
 		}
 		// Clear one-shot attachments after sending (avoids resending each turn).
 		attachedFiles = nil

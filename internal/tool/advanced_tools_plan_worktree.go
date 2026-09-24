@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 type PlanModeTool struct{ baseTool }
@@ -61,17 +63,22 @@ func NewEnterWorktreeTool() Tool {
 }
 func (t *EnterWorktreeTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	branch, _ := input["branch"].(string)
+	if err := validWorktreeBranch(branch); err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
+	}
 	cwd := tctx.Cwd
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	cmd := exec.CommandContext(ctx, "git", "worktree", "add", "../"+branch, "-b", branch)
+	// Recorded as a cleaned absolute path; cwd + "/../" + branch gave
+	// `D:\proj/../feat` on Windows.
+	wtPath := filepath.Join(cwd, "..", filepath.FromSlash(branch))
+	cmd := exec.CommandContext(ctx, "git", "worktree", "add", wtPath, "-b", branch)
 	cmd.Dir = cwd
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return Result{Data: fmt.Sprintf("Error creating worktree: %v\n%s", err, string(out)), IsError: true}, nil
 	}
-	wtPath := cwd + "/../" + branch
 	if tctx.Runtime != nil {
 		tctx.Runtime.SetWorktreeDir(wtPath)
 	}
@@ -103,9 +110,29 @@ func (t *ExitWorktreeTool) Call(ctx context.Context, input Input, tctx Context) 
 	}
 	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", wtPath)
 	cmd.Dir = cwd
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Keep tracking it: git refused (uncommitted changes, wrong repo),
+		// so the worktree is still on disk. This used to report success and
+		// forget it.
+		return Result{Data: fmt.Sprintf("Error removing worktree %s: %v\n%s", wtPath, err, string(out)), IsError: true}, nil
+	}
 	tctx.Runtime.SetWorktreeDir("")
 	return Result{Data: fmt.Sprintf("Worktree removed.\n%s", string(out))}, nil
+}
+
+// validWorktreeBranch rejects branch names that git would parse as an option
+// ("-f") or that walk the new worktree out of the project's parent ("..").
+func validWorktreeBranch(branch string) error {
+	if strings.TrimSpace(branch) == "" || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
+	}
+	for _, part := range strings.FieldsFunc(branch, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return fmt.Errorf("invalid branch name %q", branch)
+		}
+	}
+	return nil
 }
 func (t *ExitWorktreeTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Asked("worktree removal requires confirmation")

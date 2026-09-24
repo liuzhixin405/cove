@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/shell"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -53,7 +54,7 @@ func (t *PowerShellTool) Call(ctx context.Context, input Input, tctx Context) (R
 	defer cancel()
 
 	// Prefer pwsh (PowerShell 7+) over powershell.exe (Windows PowerShell 5.1)
-	shell := findPowerShell()
+	ps := shell.Shell{Kind: shell.PowerShell, Path: findPowerShell()}
 
 	cwd := tctx.Cwd
 	if cwd == "" {
@@ -61,10 +62,9 @@ func (t *PowerShellTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 	cwd = filepath.Clean(cwd)
 
-	// Use -NoProfile to avoid slow startup, -NonInteractive to prevent prompts
-	cmd := exec.CommandContext(execCtx, shell, "-NoProfile", "-NonInteractive", "-Command", cmdStr)
+	cmd := exec.CommandContext(execCtx, ps.Path, ps.Args(cmdStr)...)
 	cmd.Dir = cwd
-	cmd.Env = os.Environ()
+	cmd.Env = shell.Env(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	exitCode, runErr := streamCommand(execCtx, cmd, &stdout, &stderr, tctx.OnProgress)
@@ -77,19 +77,14 @@ func (t *PowerShellTool) Call(ctx context.Context, input Input, tctx Context) (R
 		fmt.Fprintf(&sb, "Command: %s\n", d)
 	}
 
+	// Clip on a rune boundary and keep both ends: the error lines and exit
+	// status are at the bottom.
 	if stdout.Len() > 0 {
-		// Clip on a rune boundary: PowerShell output on a Chinese-locale system
-		// is full of multi-byte runes, and a raw byte slice emits invalid UTF-8
-		// that the provider's JSON encoder then mangles.
-		out := textutil.ClipBytes(stdout.String(), 30000,
-			fmt.Sprintf("\n... [truncated %d bytes]", stdout.Len()-30000))
-		sb.WriteString(out)
+		sb.WriteString(textutil.ClipMiddleBytes(stdout.String(), 30000))
 	}
 	if stderr.Len() > 0 {
 		sb.WriteString("\n[stderr]\n")
-		errOut := textutil.ClipBytes(stderr.String(), 10000,
-			fmt.Sprintf("\n... [stderr truncated %d bytes]", stderr.Len()-10000))
-		sb.WriteString(errOut)
+		sb.WriteString(textutil.ClipMiddleBytes(stderr.String(), 10000))
 	}
 
 	if exitCode != 0 {

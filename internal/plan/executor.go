@@ -85,6 +85,15 @@ func (pe *PlanExecutor) Execute(ctx context.Context, plan *Plan) *ExecutionResul
 		// transitively, since a task skipped here blocks its own dependents.
 		runnable := make([]*Task, 0, len(level))
 		for _, t := range level {
+			// Once the user has cancelled, nothing more is dispatched, and
+			// what did not run stays pending so a later execute_plan resumes
+			// it. It used to run on into failed/skipped, which left nothing
+			// for "continue" to pick up.
+			if ctx.Err() != nil {
+				pe.markCancelled(t)
+				allSuccess = false
+				continue
+			}
 			if blocker := blockingDep(t, taskByID); blocker != "" {
 				t.Status = "skipped"
 				t.Error = fmt.Sprintf("dependency %q did not succeed", blocker)
@@ -257,6 +266,11 @@ func (pe *PlanExecutor) runTask(ctx context.Context, task *Task, completed map[s
 		}
 	}
 
+	if ctx.Err() != nil {
+		// Interrupted, not failed: keep it resumable.
+		pe.markCancelled(task)
+		return false
+	}
 	task.Status = "failed"
 	task.Error = lastErr
 	pe.syncRuntimeTask(task)
@@ -280,6 +294,15 @@ func (pe *PlanExecutor) takeMessagesFor(taskID, parentID string) []string {
 		}
 	}
 	return out
+}
+
+// markCancelled records a task the user's cancellation stopped (or kept from
+// starting). The result says "cancelled"; the runtime says "pending", which is
+// what FromRuntime picks up, so running the plan again resumes it.
+func (pe *PlanExecutor) markCancelled(task *Task) {
+	task.Status = "cancelled"
+	task.Error = "cancelled by user"
+	pe.markRuntimeStatus(task.ID, "pending")
 }
 
 // syncRuntimeTask copies the task status/output back into the shared runtime.

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type cacheEntry struct {
@@ -62,14 +63,6 @@ func NewGenerator(root string) *Generator {
 	}
 }
 
-// maxFilesForCrossRefScoring bounds the O(n^2) cross-reference scoring pass
-// in BuildRanked. Repos with more parsed files than this fall back to a
-// cheap proxy score (symbol count) instead, so a huge repo can't turn a
-// per-turn incremental regeneration (see repomap/enhanced.go) into a
-// quadratic-cost operation. Typical CLI-tool target repos are far below
-// this, so ranking quality is unaffected in the common case.
-const maxFilesForCrossRefScoring = 800
-
 // Generate scans the directory, extracts definitions, ranks them, and outputs a formatted map.
 func (g *Generator) Generate(maxFiles int) string {
 	return FormatFileMaps(g.BuildRanked(maxFiles))
@@ -101,8 +94,7 @@ func (g *Generator) BuildRanked(maxFiles int) []FileMap {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".go" || ext == ".py" || ext == ".ts" || ext == ".js" {
+		if isScannedExt(strings.ToLower(filepath.Ext(path))) {
 			files = append(files, path)
 		}
 		return nil
@@ -134,45 +126,43 @@ func (g *Generator) BuildRanked(maxFiles int) []FileMap {
 		fileMaps = append(fileMaps, fm)
 	}
 
-	// Phase 2: Compute core cross-reference rankings to identify highly-referenced definitions.
-	if len(fileMaps) <= maxFilesForCrossRefScoring {
-		symbolRefCounts := make(map[string]int)
-		// Simple text-based global scan for referencing frequencies
-		for _, fm := range fileMaps {
-			for _, sym := range fm.Symbols {
-				// Find how many times this symbol is mentioned in other files
-				for _, otherFm := range fileMaps {
-					if otherFm.Path == fm.Path {
-						continue
-					}
-					// Cheap matching trick (whole word or exact substring)
-					for _, otherSym := range otherFm.Symbols {
-						if strings.Contains(otherSym.Signature, sym.Name) {
-							symbolRefCounts[sym.Name]++
-						}
-					}
-				}
+	// Phase 2: score each file by how often its symbols are named in other
+	// files' signatures.
+	//
+	// This used to test every symbol against every other file's every
+	// signature with strings.Contains: symbols x files x symbols. An 800-file
+	// repo with 20 types per file took ~29s, and the engine rebuilds the map
+	// on the prompt path after every edit. Indexing the identifiers of each
+	// signature once makes it linear; a reference now means the whole
+	// identifier ("Store" no longer counts inside "StoreOptions").
+	refs := make(map[string]int)                 // identifier -> signatures naming it
+	own := make([]map[string]int, len(fileMaps)) // per file: its own share of refs
+	for i, fm := range fileMaps {
+		own[i] = make(map[string]int)
+		for _, sym := range fm.Symbols {
+			for id := range signatureIdents(sym.Signature) {
+				refs[id]++
+				own[i][id]++
 			}
-		}
-		for i := range fileMaps {
-			score := 0
-			for _, sym := range fileMaps[i].Symbols {
-				score += symbolRefCounts[sym.Name]
-			}
-			fileMaps[i].Score = score
-		}
-	} else {
-		// Repo too large for the quadratic pass to be cheap enough to run
-		// on every incremental regeneration — use symbol count as a much
-		// cheaper (if rougher) importance proxy.
-		for i := range fileMaps {
-			fileMaps[i].Score = len(fileMaps[i].Symbols)
 		}
 	}
+	for i := range fileMaps {
+		score := 0
+		for _, sym := range fileMaps[i].Symbols {
+			score += refs[sym.Name] - own[i][sym.Name]
+		}
+		fileMaps[i].Score = score
+	}
 
-	// Sort files: highest scores first (most important symbols defined)
+	// Highest scores first. Ties are broken by path: files are parsed
+	// concurrently and arrive in random order, and sort.Slice is not stable,
+	// so a tie at the maxFiles cut used to pick a different subset on every
+	// run — the map in the system prompt changed with no file changed.
 	sort.Slice(fileMaps, func(i, j int) bool {
-		return fileMaps[i].Score > fileMaps[j].Score
+		if fileMaps[i].Score != fileMaps[j].Score {
+			return fileMaps[i].Score > fileMaps[j].Score
+		}
+		return fileMaps[i].Path < fileMaps[j].Path
 	})
 
 	// Limit to maxFiles
@@ -186,6 +176,28 @@ func (g *Generator) BuildRanked(maxFiles int) []FileMap {
 	})
 
 	return fileMaps
+}
+
+// isScannedExt reports whether files with extension ext (lower-case, with the
+// dot) are parsed for symbols. .tsx/.jsx/.mjs/.cjs share the .ts/.js syntax
+// and used to be skipped, so a React project got an empty map.
+func isScannedExt(ext string) bool {
+	switch ext {
+	case ".go", ".py", ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
+		return true
+	}
+	return false
+}
+
+// signatureIdents returns the distinct identifiers in a signature.
+func signatureIdents(sig string) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, f := range strings.FieldsFunc(sig, func(r rune) bool {
+		return !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r))
+	}) {
+		ids[f] = struct{}{}
+	}
+	return ids
 }
 
 // FormatFileMaps renders a compact, LLM-friendly text map from already
@@ -353,7 +365,7 @@ func (g *Generator) parseRegexBased(absPath string, ext string, fm *FileMap) {
 			regexp.MustCompile(`^\s*(class\s+([a-zA-Z0-9_]+)\s*(\([a-zA-Z0-9_,\s]*\))?:)`),
 			regexp.MustCompile(`^\s*(def\s+([a-zA-Z0-9_]+)\s*\((.*?)\):)`),
 		}
-	case ".ts", ".js":
+	case ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
 		// TypeScript/JS patterns: export class, function, interface, export function
 		patterns = []*regexp.Regexp{
 			regexp.MustCompile(`^\s*(?:export\s+)?(?:class)\s+([a-zA-Z0-9_]+)`),

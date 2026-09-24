@@ -181,6 +181,10 @@ func newTestEngine(provider *mockProvider, tools ...tool.Tool) *Engine {
 	eng.SetProvider(provider)
 	eng.extractRunner = nil
 	eng.dreamRunner = nil
+	// New opened a checkpoint store in the real ~/.cove and would snapshot
+	// this package directory before every write call. Tests about checkpoints
+	// create their own manager under a temporary HOME.
+	eng.cpMgr = nil
 	return eng
 }
 
@@ -865,11 +869,15 @@ func TestSteerFlowDemo(t *testing.T) {
 		t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
 	}
 
-	// Check that the steer text was injected into the tool message
+	// The steer reaches the model as its own user-side message. Tool results
+	// are left untouched, so no tool output can forge user guidance.
 	found := false
 	for _, msg := range lastReq.Messages {
 		if msg.Role == "tool" && strings.Contains(msg.Content, "[用户指引]") {
-			t.Logf("✅ 第二轮请求的工具消息中包含用户指引！")
+			t.Fatalf("❌ 用户指引被写进了工具结果: %s", msg.Content)
+		}
+		if msg.Role == "user" && strings.Contains(msg.Content, "[用户指引]") {
+			t.Logf("✅ 第二轮请求包含独立的用户指引消息")
 			t.Logf("   完整内容: %s", msg.Content)
 			found = true
 		}
@@ -885,7 +893,7 @@ func TestSteerFlowDemo(t *testing.T) {
 			}
 			t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
 		}
-		t.Fatal("❌ steer 未注入到工具消息中")
+		t.Fatal("❌ steer 未出现在第二轮请求中")
 	}
 
 	// Check that the AI's final response reflects the guidance
@@ -894,7 +902,7 @@ func TestSteerFlowDemo(t *testing.T) {
 	t.Log("")
 	t.Log("╔══════════════════════════════════════════════════════════╗")
 	t.Log("║  ✅ Steer 流程演示通过                                     ║")
-	t.Log("║  用户中途输入 → eng.Steer() → 注入 tool 消息              ║")
+	t.Log("║  用户中途输入 → eng.Steer() → 独立的用户消息              ║")
 	t.Log("║  → LLM 看到 [用户指引] → 下轮迭代调整行为                  ║")
 	t.Log("╚══════════════════════════════════════════════════════════╝")
 }
@@ -1095,7 +1103,10 @@ func TestSteerE2E(t *testing.T) {
 		}
 		t.Logf("   [%d] role=%-10s content=%s", i, msg.Role, preview)
 		if msg.Role == "tool" && strings.Contains(msg.Content, "[用户指引]") {
-			t.Logf("   ✅ 工具消息包含用户指引!")
+			t.Fatalf("   ❌ 用户指引被写进了工具结果: %s", msg.Content)
+		}
+		if msg.Role == "user" && strings.Contains(msg.Content, "[用户指引]") {
+			t.Logf("   ✅ 请求包含独立的用户指引消息!")
 			found = true
 		}
 	}

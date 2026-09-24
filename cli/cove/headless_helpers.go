@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/plugin"
 )
@@ -34,9 +35,6 @@ func skillInvocationRequested(input string, eng *engine.Engine) bool {
 
 // skillInvocationText renders an installed skill's prompt for display,
 // mirroring the classic REPL's handleSkillInvocation.
-
-// skillInvocationText renders an installed skill's prompt for display,
-// mirroring the classic REPL's handleSkillInvocation.
 func skillInvocationText(input string, eng *engine.Engine) string {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
@@ -56,14 +54,9 @@ func skillInvocationText(input string, eng *engine.Engine) string {
 }
 
 // pluginCommandPrompt resolves a "/<plugincmd> [args]" into the plugin
-// command's prompt body (with any trailing args appended). ok is false when the
-// command does not match an enabled plugin command. The caller feeds the
-// returned prompt to the engine as a normal user turn.
-
-// pluginCommandPrompt resolves a "/<plugincmd> [args]" into the plugin
-// command's prompt body (with any trailing args appended). ok is false when the
-// command does not match an enabled plugin command. The caller feeds the
-// returned prompt to the engine as a normal user turn.
+// command's prompt body, with the args filled in by command.ExpandArguments.
+// ok is false when the command does not match an enabled plugin command. The
+// caller feeds the returned prompt to the engine as a normal user turn.
 func pluginCommandPrompt(input string, pluginMgr *plugin.Manager) (prompt string, label string, ok bool) {
 	if pluginMgr == nil {
 		return "", "", false
@@ -77,12 +70,6 @@ func pluginCommandPrompt(input string, pluginMgr *plugin.Manager) (prompt string
 	if !found {
 		return "", "", false
 	}
-	p := cmd.Prompt
-	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
-		p = p + "\n\n" + args
-	}
+	p := command.ExpandArguments(cmd.Prompt, strings.TrimPrefix(input, parts[0]))
 	return p, fmt.Sprintf("%s (%s)", name, cmd.Plugin), true
 }
-
-// tuiUnknownCmdText builds the "unknown command" message with fuzzy suggestions,
-// mirroring the classic REPL's handleUnknownCmd but returning a string.

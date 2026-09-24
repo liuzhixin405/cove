@@ -73,10 +73,10 @@ func (r *Recorder) Record(eventType string, data any) {
 // RecordUsage captures common usage metrics.
 func (r *Recorder) RecordUsage(model string, tokensIn, tokensOut int, cost float64, duration time.Duration) {
 	r.Record("usage", map[string]any{
-		"model":      model,
-		"tokens_in":  tokensIn,
-		"tokens_out": tokensOut,
-		"cost":       cost,
+		"model":       model,
+		"tokens_in":   tokensIn,
+		"tokens_out":  tokensOut,
+		"cost":        cost,
 		"duration_ms": duration.Milliseconds(),
 	})
 }
@@ -84,8 +84,8 @@ func (r *Recorder) RecordUsage(model string, tokensIn, tokensOut int, cost float
 // RecordToolCall captures a tool usage event.
 func (r *Recorder) RecordToolCall(toolName string, success bool, duration time.Duration) {
 	r.Record("tool_call", map[string]any{
-		"tool":     toolName,
-		"success":   success,
+		"tool":        toolName,
+		"success":     success,
 		"duration_ms": duration.Milliseconds(),
 	})
 }

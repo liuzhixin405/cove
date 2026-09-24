@@ -144,6 +144,8 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		if err == repl.ErrInterrupt {
 
+			denyPendingPermissionPrompt()
+
 			if tasks.IsRunning() {
 
 				if tasks.CancelRunning() {
@@ -400,21 +402,30 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		case strings.HasPrefix(input, "/"):
 
-			if isSkillInvocation(input, eng) {
+			name := strings.TrimPrefix(strings.Fields(input)[0], "/")
+			var skillPrompts map[string]string
+			if eng != nil && eng.Runtime() != nil {
+				skillPrompts = eng.Runtime().SkillPrompts
+			}
+			var pluginCmds map[string]plugin.CommandPrompt
+			if pluginMgr != nil {
+				pluginCmds = pluginMgr.CommandPrompts()
+			}
+			target, shadowed := resolveSlashCommand(name, cmdReg, skillPrompts, pluginCmds)
+
+			switch target {
+			case slashSkill:
 				handleSkillInvocation(input, eng)
 				continue
-			}
-
-			if handlePluginCommand(input, pluginMgr, tasks) {
-
+			case slashPlugin:
+				handlePluginCommand(input, pluginMgr, tasks)
 				continue
-
-			}
-
-			if handleUnknownCmd(input, cmdReg) {
-
+			case slashUnknown:
+				handleUnknownCmd(input, cmdReg)
 				continue
-
+			}
+			if shadowed != "" {
+				repl.PrintAbove(fmt.Sprintf("[提示] %s 与内置命令同名，已执行内置命令 /%s\r\n", shadowed, name))
 			}
 
 			withInterrupt(func(ctx context.Context) {
@@ -505,27 +516,8 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			queuedAhead, merged := tasks.Enqueue(userMsg)
 
-			if merged {
-
-				if queuedAhead > 0 {
-
-					repl.PrintAbove(fmt.Sprintf("[已补充] 先前任务还在跑，前面排队: %d\r\n", queuedAhead))
-
-				} else {
-
-					repl.PrintAbove("[已补充] 已合并进当前处理任务\r\n")
-
-				}
-
-			} else if queuedAhead > 0 {
-
-				repl.PrintAbove(fmt.Sprintf("[任务排队中] 前方排队数: %d\r\n", queuedAhead))
-
-			} else if !tasks.IsRunning() {
-
-				// Brief feedback only when this is the first and only task
-				repl.PrintAbove("[输入已接收]\r\n")
-
+			if msg := enqueueFeedback(queuedAhead, merged, tasks.IsRunning()); msg != "" {
+				repl.PrintAbove(msg + "\r\n")
 			}
 
 			// Don't block: tasks run in the background, user can type again immediately.
@@ -534,6 +526,87 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 	}
 
+}
+
+// enqueueFeedback is the line shown after a typed message was handed to the
+// task runner. queuedAhead and merged are Enqueue's results; running is
+// whether a task is running afterwards. "" means say nothing.
+//
+// A merge always lands in a task that is still queued — Enqueue only looks at
+// the queue, never at the running task. The feedback used to say
+// "已合并进当前处理任务", so the user expected the running task to pick the
+// correction up, when it only runs after that task finishes.
+func enqueueFeedback(queuedAhead int, merged, running bool) string {
+	if merged {
+		return fmt.Sprintf("[已补充] 已合并进排队中的第 %d 个任务，当前任务结束后执行", queuedAhead+1)
+	}
+	if queuedAhead > 0 {
+		return fmt.Sprintf("[任务排队中] 前方排队数: %d", queuedAhead)
+	}
+	if !running {
+		// Brief feedback only when this is the first and only task
+		return "[输入已接收]"
+	}
+	return ""
+}
+
+// denyPendingPermissionPrompt answers a waiting approval prompt with a denial
+// and reports whether there was one.
+//
+// Ctrl+C cancels the task's context, but the prompt waits on its answer
+// channel, not on the context. So the task stayed blocked for up to
+// permissionPromptTimeout (15 minutes), and the next line the user typed — a
+// new request — was taken as the answer and discarded. The channel is
+// buffered, so this never blocks.
+func denyPendingPermissionPrompt() bool {
+	ch := repl.TakePermInputCh()
+	if ch == nil {
+		return false
+	}
+	ch <- "n"
+	return true
+}
+
+// slashTarget is what "/name ..." resolves to.
+type slashTarget int
+
+const (
+	slashUnknown slashTarget = iota
+	slashBuiltin
+	slashSkill
+	slashPlugin
+)
+
+// resolveSlashCommand decides which handler owns /name. shadowed names the
+// skill or plugin command that also claims the name when a built-in won.
+//
+// Built-ins come first. Skills and plugin commands used to be matched before
+// them, so a plugin shipping commands/config.md or permissions.md silently
+// replaced /config or /permissions — the very commands a user reaches for to
+// see and change what tools may do — with a prompt of its own.
+func resolveSlashCommand(name string, cmdReg *command.Registry, skillPrompts map[string]string, pluginCmds map[string]plugin.CommandPrompt) (target slashTarget, shadowed string) {
+	_, isSkill := skillPrompts[name]
+	isSkill = isSkill && name != "" && name != "skill" && name != "skills"
+	pc, isPlugin := pluginCmds[name]
+
+	if cmdReg != nil {
+		if _, ok := cmdReg.Find(name); ok {
+			switch {
+			case isPlugin:
+				shadowed = fmt.Sprintf("插件 %s 的命令 /%s", pc.Plugin, name)
+			case isSkill:
+				shadowed = fmt.Sprintf("技能 %s", name)
+			}
+			return slashBuiltin, shadowed
+		}
+	}
+	switch {
+	case isSkill:
+		return slashSkill, ""
+	case isPlugin:
+		return slashPlugin, ""
+	}
+	return slashUnknown, ""
 }
 
 // handlePluginCommand checks whether the slash command matches a command
@@ -554,48 +627,15 @@ func handlePluginCommand(input string, pluginMgr *plugin.Manager, tasks *replTas
 	if !ok {
 		return false
 	}
-	prompt := cmd.Prompt
-	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
-		prompt = prompt + "\n\n" + args
-	}
+	// $ARGUMENTS in the command file is replaced by what was typed after the
+	// name; it used to be appended instead, leaving the placeholder literal.
+	prompt := command.ExpandArguments(cmd.Prompt, strings.TrimPrefix(input, parts[0]))
 	repl.PrintAbove(fmt.Sprintf("[插件命令: /%s (%s)]\r\n", name, cmd.Plugin))
-	_, merged := tasks.Enqueue(api.Message{Role: "user", Content: prompt})
-	if merged {
-		repl.PrintAbove("[已补充] 已合并进当前处理任务\r\n")
-	} else {
-		repl.PrintAbove("[输入已接收]\r\n")
+	queuedAhead, merged := tasks.Enqueue(api.Message{Role: "user", Content: prompt})
+	if msg := enqueueFeedback(queuedAhead, merged, tasks.IsRunning()); msg != "" {
+		repl.PrintAbove(msg + "\r\n")
 	}
 	return true
-}
-
-func isSkillInvocation(input string, eng *engine.Engine) bool {
-
-	if eng == nil || eng.Runtime() == nil {
-
-		return false
-
-	}
-
-	parts := strings.Fields(input)
-
-	if len(parts) == 0 || !strings.HasPrefix(parts[0], "/") {
-
-		return false
-
-	}
-
-	name := strings.TrimPrefix(parts[0], "/")
-
-	if name == "" || name == "skill" || name == "skills" {
-
-		return false
-
-	}
-
-	_, ok := eng.Runtime().SkillPrompts[name]
-
-	return ok
-
 }
 
 func handleSkillInvocation(input string, eng *engine.Engine) {

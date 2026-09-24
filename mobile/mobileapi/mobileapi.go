@@ -169,6 +169,7 @@ type oaiStreamChoice struct {
 
 type oaiStreamChunk struct {
 	Choices []oaiStreamChoice `json:"choices"`
+	Error   *oaiError         `json:"error,omitempty"`
 }
 
 type oaiToolCallFunction struct {
@@ -186,7 +187,9 @@ type oaiToolCall struct {
 type oaiError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
-	Code    string `json:"code"`
+	// any, not string: some servers send a numeric code, and a type
+	// mismatch failed the whole chunk's decode, hiding the error.
+	Code any `json:"code"`
 }
 
 type oaiErrorBody struct {
@@ -318,19 +321,27 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	}
 
 	var resp ChatResponse
-	var toolArgsAccum []string
+	// Calls in the order they started; byIndex maps a stream index to the
+	// call currently using it.
+	type callAccum struct {
+		id, name string
+		args     strings.Builder
+	}
+	var calls []*callAccum
+	byIndex := make(map[int]*callAccum)
+	sawDone := false
+	lastFinish := ""
+
 	scanner := bufio.NewScanner(httpResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
-		line := scanner.Text()
-
-		if !strings.HasPrefix(line, "data: ") {
+		data, ok := sseDataPayload(scanner.Text())
+		if !ok {
 			continue
 		}
-
-		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 
@@ -338,8 +349,24 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
+		// A failure after the 200 header (upstream overload, moderation) comes
+		// as {"error":...} in the stream. It used to be skipped like any other
+		// unrecognised chunk, and the caller got an empty "success".
+		if chunk.Error != nil {
+			msg := strings.TrimSpace(chunk.Error.Message)
+			if msg == "" {
+				msg = "unknown error"
+			}
+			if chunk.Error.Type != "" {
+				msg = chunk.Error.Type + ": " + msg
+			}
+			return ChatResponse{}, fmt.Errorf("provider stream error: %s", msg)
+		}
 
 		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				lastFinish = *choice.FinishReason
+			}
 			if choice.Delta.Content != "" {
 				resp.Content += choice.Delta.Content
 				onEvent(StreamEvent{Delta: choice.Delta.Content})
@@ -348,59 +375,74 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 				resp.ReasoningContent += choice.Delta.Reasoning
 				onEvent(StreamEvent{Reasoning: choice.Delta.Reasoning})
 			}
-			// Handle tool calls from streaming chunks
 			for _, tc := range choice.Delta.ToolCalls {
 				// tc.Index comes straight from the provider's JSON. A negative
-				// value skips the grow branch below and then indexes the slice
-				// with it — resp.ToolCalls[-1] panics, taking the whole mobile
-				// process down on one malformed chunk. An absurd value would
-				// also make the grow loop allocate without bound.
+				// value used to index the slice with it and panic the whole
+				// mobile process; an absurd one drove unbounded growth.
 				if tc.Index < 0 || tc.Index > maxStreamToolCalls {
 					continue
 				}
-				// Use index to match chunks for the same tool call (streaming args)
-				if tc.Index >= len(resp.ToolCalls) {
-					// New tool call - extend slice
-					for len(resp.ToolCalls) <= tc.Index {
-						resp.ToolCalls = append(resp.ToolCalls, ToolCall{
-							ID:    tc.ID,
-							Name:  tc.Function.Name,
-							Input: make(map[string]any),
-						})
+				acc, exists := byIndex[tc.Index]
+				// A new id at a used index is a new call: some servers send
+				// every parallel call whole at index 0, and merging by index
+				// glued their argument objects into one call that did not parse.
+				if !exists || (tc.ID != "" && acc.id != "" && tc.ID != acc.id) {
+					if len(calls) >= maxStreamToolCalls {
+						continue
 					}
-					// Initialize the arguments accumulator
-					if len(toolArgsAccum) <= tc.Index {
-						for len(toolArgsAccum) <= tc.Index {
-							toolArgsAccum = append(toolArgsAccum, "")
-						}
-					}
+					acc = &callAccum{}
+					byIndex[tc.Index] = acc
+					calls = append(calls, acc)
 				}
-				// Update ID and name if present (first chunk has them)
 				if tc.ID != "" {
-					resp.ToolCalls[tc.Index].ID = tc.ID
+					acc.id = tc.ID
 				}
 				if tc.Function.Name != "" {
-					resp.ToolCalls[tc.Index].Name = tc.Function.Name
+					acc.name = tc.Function.Name
 				}
-				// Accumulate raw arguments (streamed in pieces)
-				if tc.Function.Arguments != "" {
-					toolArgsAccum[tc.Index] += tc.Function.Arguments
-				}
+				acc.args.WriteString(tc.Function.Arguments)
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return resp, err
+	}
+	// Neither [DONE] nor a finish_reason: the connection closed in the middle
+	// of the answer, which used to be returned as a complete one.
+	if !sawDone && lastFinish == "" {
+		return ChatResponse{}, fmt.Errorf("stream ended before the response completed (no finish_reason or [DONE])")
+	}
 
-	// Parse accumulated tool call arguments
-	for i, raw := range toolArgsAccum {
-		if raw != "" && i < len(resp.ToolCalls) {
+	for _, c := range calls {
+		input := make(map[string]any)
+		if raw := c.args.String(); raw != "" {
 			var parsed map[string]any
-			if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
-				resp.ToolCalls[i].Input = parsed
+			if err := json.Unmarshal([]byte(raw), &parsed); err == nil && parsed != nil {
+				input = parsed
 			}
 		}
+		resp.ToolCalls = append(resp.ToolCalls, ToolCall{ID: c.id, Name: c.name, Input: input})
 	}
+	return resp, nil
+}
 
-	return resp, scanner.Err()
+// sseDataPayload returns the payload of a server-sent-events "data" line.
+//
+// The space after "data:" is optional in SSE and several OpenAI-compatible
+// gateways leave it out; matching only "data: " used to drop every line of
+// such a stream, so the answer came back empty. A bare JSON object line is
+// accepted too, for servers that stream newline-delimited JSON. (A copy of
+// internal/api's helper: this package stays free of internal imports for
+// gomobile bind.)
+func sseDataPayload(line string) (payload string, ok bool) {
+	line = strings.TrimSpace(line) // also drops the  of CRLF streams
+	if strings.HasPrefix(line, "data:") {
+		return strings.TrimSpace(strings.TrimPrefix(line, "data:")), true
+	}
+	if strings.HasPrefix(line, "{") {
+		return line, true
+	}
+	return "", false
 }
 
 // ---------- Anthropic Provider (stub) ----------

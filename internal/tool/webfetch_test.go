@@ -3,22 +3,23 @@ package tool
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestIsPrivateURL covers the SSRF gate. The DNS-failure case is the H-2/fail-open
-// regression: before the fix an unresolvable host returned false (allowed), which
-// combined with the redirect gap to widen the SSRF surface. It must fail closed.
+// TestIsPrivateURL covers the SSRF gate. The DNS-failure case (an unresolvable
+// host must fail closed) is tested in internal/safeurl with a stubbed
+// resolver: resolving a real name here failed on machines whose DNS answers
+// every name (fake-IP proxies resolve nonexistent.invalid. to 198.18.0.0/15).
 func TestIsPrivateURL(t *testing.T) {
 	cases := map[string]bool{
-		"http://127.0.0.1":            true,
-		"http://localhost":            true,
-		"http://169.254.169.254/x":    true, // cloud metadata
-		"http://10.0.0.5":             true,
-		"http://192.168.1.1":          true,
-		"https://8.8.8.8":             false, // public literal IP
-		"http://nonexistent.invalid.": true,  // DNS fails -> must fail CLOSED
+		"http://127.0.0.1":         true,
+		"http://localhost":         true,
+		"http://169.254.169.254/x": true, // cloud metadata
+		"http://10.0.0.5":          true,
+		"http://192.168.1.1":       true,
+		"https://8.8.8.8":          false, // public literal IP
 	}
 	for u, want := range cases {
 		if got := isPrivateURL(u); got != want {
@@ -42,5 +43,16 @@ func TestSafeHTTPClient_BlocksPrivateDial(t *testing.T) {
 	if err == nil {
 		resp.Body.Close()
 		t.Fatalf("safe client reached private address %s; SSRF dial guard failed", srv.URL)
+	}
+}
+
+func TestFetchedBodyRefusesBinary(t *testing.T) {
+	pdf := append([]byte("%PDF-1.7\n"), make([]byte, 64)...)
+	if _, err := fetchedText(pdf, "application/pdf", "markdown"); err == nil {
+		t.Fatal("binary body was returned as text")
+	}
+	got, err := fetchedText([]byte("<html><body><h1>Title</h1><p>hi</p></body></html>"), "text/html; charset=utf-8", "markdown")
+	if err != nil || !strings.Contains(got, "# Title") {
+		t.Fatalf("html body = %q, %v", got, err)
 	}
 }

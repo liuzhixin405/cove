@@ -9,6 +9,7 @@
 package textutil
 
 import (
+	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -47,6 +48,22 @@ func ClipBytes(s string, maxBytes int, suffix string) string {
 		return s
 	}
 	return truncAtRuneBoundary(s, maxBytes) + suffix
+}
+
+// ClipMiddleBytes limits s to about maxBytes by dropping its middle: 40% of
+// the budget keeps the start, 60% the end, and a marker says how much went.
+// Command output needs both ends — the failure summary and exit status are
+// at the bottom.
+func ClipMiddleBytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	head := truncAtRuneBoundary(s, maxBytes*2/5)
+	start := len(s) - (maxBytes - len(head))
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return head + fmt.Sprintf("\n... [%d bytes omitted] ...\n", start-len(head)) + s[start:]
 }
 
 // HeadRunes returns the first n runes of s, with no ellipsis. Used where the

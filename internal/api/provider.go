@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -42,6 +43,10 @@ type Message struct {
 	Name             string        `json:"name,omitempty"`
 	CacheControl     string        `json:"cache_control,omitempty"` // Anthropic prompt caching
 	Synthetic        bool          `json:"synthetic,omitempty"`     // engine-injected (not from real user)
+	// ThinkingBlocks are the provider's opaque reasoning blocks for an
+	// assistant turn (Anthropic thinking / redacted_thinking), kept verbatim
+	// because they must be passed back byte-for-byte on later requests.
+	ThinkingBlocks []json.RawMessage `json:"thinking_blocks,omitempty"`
 }
 
 type ToolDef struct {
@@ -57,6 +62,11 @@ type ChatRequest struct {
 	SystemBase string // base system prompt (Anthropic: system field; OpenAI: first system message)
 	Tools      []ToolDef
 	MaxTokens  int
+	// Thinking selects the provider's thinking mode ("adaptive", "disabled");
+	// empty leaves the model default. Effort ("low".."max") controls depth.
+	// Providers without such controls ignore both.
+	Thinking string
+	Effort   string
 }
 
 type ChatResponse struct {
@@ -71,6 +81,8 @@ type ChatResponse struct {
 	ReasoningTokens       int
 	StopReason            string
 	RateLimitHeaders      http.Header // raw rate limit headers from response
+	// ThinkingBlocks mirrors Message.ThinkingBlocks for the returned turn.
+	ThinkingBlocks []json.RawMessage
 }
 
 type StreamEvent struct {
@@ -142,6 +154,9 @@ var (
 func defaultHTTPTransport() *http.Transport {
 	sharedTransportOnce.Do(func() {
 		sharedTransport = &http.Transport{
+			// A hand-built Transport has no proxy unless told; without this
+			// HTTPS_PROXY / HTTP_PROXY / NO_PROXY were silently ignored.
+			Proxy:               http.ProxyFromEnvironment,
 			TLSHandshakeTimeout: 10 * time.Second,
 			DialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,

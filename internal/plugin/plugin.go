@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type State int
@@ -143,13 +144,14 @@ func (m *Manager) Install(name string, url string) error {
 		return fmt.Errorf("plugin %s already installed", name)
 	}
 
-	// Remote install via git clone if URL looks like a git repo
-	if url != "" && looksLikeGitRepo(url) {
-		args := []string{"clone", "--depth=1", "--quiet", url, pluginDir}
-		cmd := exec.Command("git", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+	// Any URL the user gave is cloned; git itself decides whether it is a
+	// repository. This used to require a .git suffix or one of a few known
+	// hosts, and any other URL (a self-hosted Gitea, a local path) was
+	// silently dropped in favour of an empty scaffold reported as installed.
+	if url != "" {
+		if err := cloneRepo(url, pluginDir); err != nil {
 			_ = os.RemoveAll(pluginDir)
-			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
+			return err
 		}
 		// Generate manifest.json from .claude-plugin/plugin.json if the repo uses
 		// the Claude plugin format instead of a native manifest.json.
@@ -158,6 +160,13 @@ func (m *Manager) Install(name string, url string) error {
 		if _, err := os.Stat(filepath.Join(pluginDir, "manifest.json")); os.IsNotExist(err) {
 			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("cloned repo has no manifest.json or .claude-plugin/plugin.json — not a valid plugin")
+		}
+		// Without a lock entry `/plugin update` answered "not tracked" for
+		// every plugin installed from a URL: only marketplace installs wrote one.
+		if m.marketplace != nil {
+			if err := m.marketplace.recordInstall(name, url, pluginDir); err != nil {
+				return fmt.Errorf("save lockfile: %w", err)
+			}
 		}
 		return m.loadPluginLocked(name)
 	}
@@ -223,6 +232,14 @@ func (m *Manager) Uninstall(name string) error {
 	}
 	if err := os.RemoveAll(strings.TrimSuffix(p.Dir, ".disabled") + ".disabled"); err != nil {
 		return err
+	}
+	// The lock entry is keyed by directory name, which can differ from the
+	// manifest name the user typed. Left behind, it kept `/plugin update`
+	// trying (and failing) to update a plugin that no longer exists.
+	if m.marketplace != nil {
+		if err := m.marketplace.forget(filepath.Base(strings.TrimSuffix(p.Dir, ".disabled"))); err != nil {
+			return fmt.Errorf("save lockfile: %w", err)
+		}
 	}
 	return nil
 }
@@ -363,6 +380,9 @@ func (m *Manager) CommandPrompts() map[string]CommandPrompt {
 // The description comes from a frontmatter "description:" field when present,
 // otherwise the first non-empty content line.
 func parseCommandMarkdown(content string) (description, body string) {
+	// Windows editors may save a UTF-8 byte-order mark, which hid the
+	// frontmatter from the "---" check below and sent it to the model.
+	content = strings.TrimPrefix(content, string(rune(0xFEFF)))
 	body = content
 	if strings.HasPrefix(content, "---") {
 		rest := content[3:]
@@ -394,9 +414,8 @@ func parseCommandMarkdown(content string) (description, body string) {
 			}
 		}
 	}
-	if len(description) > 60 {
-		description = description[:57] + "..."
-	}
+	// Clipped by rune: description[:57] cut Chinese text mid-character.
+	description = textutil.ClipRunes(description, 60)
 	return description, body
 }
 
@@ -431,10 +450,7 @@ func (m *Manager) MarketplaceSearch(query string) string {
 		// Name + version + installed badge
 		fmt.Fprintf(&sb, "  %s%s%s\n", e.Name, ver, installed)
 		// Description (truncated to keep it readable)
-		desc := e.Description
-		if len(desc) > 80 {
-			desc = desc[:77] + "..."
-		}
+		desc := textutil.ClipRunes(e.Description, 80)
 		if desc != "" {
 			fmt.Fprintf(&sb, "    %s\n", desc)
 		}
@@ -475,8 +491,10 @@ func (m *Manager) MarketplaceUpdate(name string) (string, error) {
 	var sb strings.Builder
 	if len(updated) > 0 {
 		fmt.Fprintf(&sb, "✓ 已更新 %d 个插件: %s\n", len(updated), strings.Join(updated, ", "))
-	} else {
+	} else if len(errs) == 0 {
 		sb.WriteString("所有插件已是最新\n")
+	} else {
+		sb.WriteString("没有插件被更新\n")
 	}
 	if len(errs) > 0 {
 		fmt.Fprintf(&sb, "⚠ %d 个失败: %s\n", len(errs), strings.Join(errs, "; "))
@@ -511,23 +529,4 @@ func (m *Manager) MarketplaceInstall(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.loadPluginLocked(name)
-}
-
-// looksLikeGitRepo returns true if the URL appears to be a git repository.
-// More strict than isGitURL — requires .git suffix, git@ prefix, or known git hosts.
-func looksLikeGitRepo(url string) bool {
-	if strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://") {
-		return true
-	}
-	if strings.HasSuffix(url, ".git") {
-		return true
-	}
-	// Known git hosting platforms
-	knownHosts := []string{"github.com", "gitlab.com", "bitbucket.org", "gitee.com", "codeberg.org"}
-	for _, host := range knownHosts {
-		if strings.Contains(url, host+"/") {
-			return true
-		}
-	}
-	return false
 }

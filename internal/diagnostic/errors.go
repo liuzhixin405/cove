@@ -72,6 +72,9 @@ const (
 	ErrConfigProviderEmpty ErrorCode = "E1004"
 	ErrConfigAPIKeyMissing ErrorCode = "E1005"
 	ErrConfigPermMode      ErrorCode = "E1006"
+	// ErrConfigAPIKeyPlaceholder is the "sk-xxxx…" key older versions of the
+	// missing-config auto-fix wrote into config.json.
+	ErrConfigAPIKeyPlaceholder ErrorCode = "E1007"
 )
 
 // Network/API errors (E2xxx)
@@ -99,6 +102,9 @@ const (
 	ErrToolPanic      ErrorCode = "E4003"
 	ErrToolExecFailed ErrorCode = "E4004"
 	ErrToolShellMiss  ErrorCode = "E4005"
+	ErrToolNoGitBash  ErrorCode = "E4006"
+	ErrToolShellWSL   ErrorCode = "E4007"
+	ErrToolGitMissing ErrorCode = "E4008"
 )
 
 // Engine errors (E5xxx)
@@ -135,12 +141,16 @@ var registry = map[ErrorCode]*ErrorDef{}
 
 func init() {
 	// Config errors — all config fixes are hot-reloadable (take effect immediately)
-	register(&ErrorDef{ErrConfigMissing, CatConfig, SevFatal, "配置文件不存在", "找不到配置文件: %s", "运行 /init 创建默认配置，或手动创建 ~/.cove/config.json", true, true})
-	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevFatal, "配置文件格式错误", "JSON解析失败: %s", "检查配置文件语法，或删除后重新生成", true, true})
+	// ErrConfigMissing is a warning, not fatal: cove runs on defaults plus an
+	// API key from the environment. The old hint sent users to /init, which
+	// writes CLAUDE.md, and the old "auto-fix" wrote a placeholder API key.
+	register(&ErrorDef{ErrConfigMissing, CatConfig, SevWarning, "配置文件不存在", "找不到配置文件: %s", "设置对应的 API Key 环境变量（如 DEEPSEEK_API_KEY），或用 /provider <名称> 和 /api-key <密钥> 保存到配置文件", false, false})
+	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevError, "配置文件格式错误", "JSON解析失败: %s", "按提示的位置修正 JSON 语法；在修好之前该文件中的设置不会生效，/model 等命令也不会覆盖它", false, false})
+	register(&ErrorDef{ErrConfigAPIKeyPlaceholder, CatConfig, SevFatal, "API Key 是占位符", "provider.api_key 仍是示例值 %s（旧版诊断自动写入）", "用 /api-key <密钥> 设置真实密钥，或删除该字段改用环境变量", false, false})
 	register(&ErrorDef{ErrConfigModelInvalid, CatConfig, SevError, "模型名无效", "模型 '%s' 不被当前 provider 支持", "使用 /model 命令切换模型，或在配置中设置有效模型名", true, true})
 	register(&ErrorDef{ErrConfigProviderEmpty, CatConfig, SevFatal, "未配置 Provider", "provider.name 为空", "在配置中设置 provider.name (如 deepseek, openai, anthropic)", false, false})
 	register(&ErrorDef{ErrConfigAPIKeyMissing, CatConfig, SevFatal, "API Key 未设置", "provider '%s' 需要 API Key", "设置环境变量 LLM_API_KEY 或在配置中设置 provider.api_key", false, false})
-	register(&ErrorDef{ErrConfigPermMode, CatConfig, SevWarning, "权限模式无效", "permission_mode '%s' 不是有效值", "有效值: auto, ask, bypass。已回退到 ask 模式", true, true})
+	register(&ErrorDef{ErrConfigPermMode, CatConfig, SevWarning, "权限模式无效", "permission_mode '%s' 不是有效值", "有效值: default, plan, auto, bypass。当前按 default 模式运行", false, false})
 
 	// Network/API errors
 	register(&ErrorDef{ErrAPIUnreachable, CatNetwork, SevError, "API 服务不可达", "无法连接到 %s", "检查网络连接和代理设置，确认 base_url 正确", false, false})
@@ -162,6 +172,9 @@ func init() {
 	register(&ErrorDef{ErrToolPanic, CatTool, SevError, "工具执行崩溃", "%s 发生了内部错误: %v", "这是一个 Bug，请反馈到项目 Issue", false, false})
 	register(&ErrorDef{ErrToolExecFailed, CatTool, SevWarning, "命令执行失败", "%s 退出码 %d", "命令返回了错误，Agent 会分析输出并调整", false, false})
 	register(&ErrorDef{ErrToolShellMiss, CatTool, SevError, "Shell 不可用", "找不到 %s", "确保系统 PATH 中有可用的 shell (bash/powershell)", false, false})
+	register(&ErrorDef{ErrToolNoGitBash, CatTool, SevWarning, "未找到 Git Bash", "命令将由 %s 执行，模型写出的 bash 语法可能失败", "安装 Git for Windows (https://git-scm.com/download/win)，重启 cove 后会自动使用其中的 bash", false, false})
+	register(&ErrorDef{ErrToolShellWSL, CatTool, SevError, "Shell 是 WSL 启动器", "%s 会把命令交给 WSL 发行版执行，而不是 Windows 工具链", "安装 Git for Windows，或把 Git 的 bin 目录放到 PATH 中 System32 之前", false, false})
+	register(&ErrorDef{ErrToolGitMissing, CatTool, SevWarning, "未找到 git", "PATH 中没有 git", "安装 git 后重启 cove；检查点 (/rewind) 和工作树等功能依赖 git", false, false})
 
 	// Engine errors
 	register(&ErrorDef{ErrEngineMaxIter, CatEngine, SevWarning, "达到最大迭代次数", "Agent 执行了 %d 次迭代未完成", "任务可能过于复杂，尝试拆分为更小的子任务", false, false})

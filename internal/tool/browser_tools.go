@@ -67,15 +67,16 @@ func (t *BrowserTool) Call(ctx context.Context, input Input, tctx Context) (Resu
 		if t.br.ChromeAvailable() {
 			res, err = t.br.FetchRendered(ctx, rawURL, format)
 		} else {
-			res, err = t.br.FetchMarkdown(ctx, rawURL)
-			if err == nil && format != "markdown" {
-				// re-fetch in requested format via HTTP path
-				switch format {
-				case "text":
-					res, err = t.br.FetchHeadless(ctx, rawURL)
-				case "html":
-					res, err = t.br.FetchHTML(ctx, rawURL)
-				}
+			// One request in the requested format. This used to fetch as
+			// markdown first and then fetch again for text/html, doubling the
+			// latency and any side effect of the GET.
+			switch format {
+			case "markdown":
+				res, err = t.br.FetchMarkdown(ctx, rawURL)
+			case "html":
+				res, err = t.br.FetchHTML(ctx, rawURL)
+			default:
+				res, err = t.br.FetchHeadless(ctx, rawURL)
 			}
 		}
 		if err != nil {
@@ -89,16 +90,12 @@ func (t *BrowserTool) Call(ctx context.Context, input Input, tctx Context) (Resu
 		return Result{Data: header + res.Content}, nil
 
 	case "screenshot", "capture":
+		out, err := screenshotPath(input, tctx.Cwd)
+		if err != nil {
+			return Result{Data: "Error: " + err.Error(), IsError: true}, nil
+		}
 		if !t.br.ChromeAvailable() {
 			return Result{Data: "Error: " + browser.ErrChromeUnavailable.Error(), IsError: true}, nil
-		}
-		out, _ := input["output"].(string)
-		out = strings.TrimSpace(out)
-		if out == "" {
-			out = "browser-screenshot.png"
-		}
-		if !filepath.IsAbs(out) && tctx.Cwd != "" {
-			out = filepath.Join(tctx.Cwd, out)
 		}
 		png, err := t.br.Screenshot(ctx, rawURL)
 		if err != nil {
@@ -126,10 +123,58 @@ func (t *BrowserTool) CheckPermissions(input Input, tctx Context) PermissionDeci
 	if isPrivateURL(u) {
 		return Denied("access to private/internal URLs is blocked")
 	}
-	action, _ := input["action"].(string)
-	if strings.EqualFold(strings.TrimSpace(action), "screenshot") {
+	if isScreenshotAction(input) {
+		out, err := screenshotPath(input, tctx.Cwd)
+		if err != nil {
+			return Denied(err.Error())
+		}
 		// Writes a file to disk; surface for confirmation under default mode.
-		return Asked("browser screenshot writes a PNG file")
+		return Asked("browser screenshot writes a PNG file: " + out)
 	}
 	return Allowed("browser navigation is read-only")
+}
+
+// isScreenshotAction reports whether the call writes a screenshot. It must
+// accept every alias Call does: CheckPermissions used to match only the literal
+// "screenshot", so action=capture wrote its file without asking.
+func isScreenshotAction(input Input) bool {
+	action, _ := input["action"].(string)
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "screenshot", "capture":
+		return true
+	}
+	return false
+}
+
+// screenshotPath resolves the screenshot's output path and refuses anything
+// but a .png file inside the workspace. The tool is marked read-only, so a
+// read-only sub-agent runs it with no permission gate at all, and the path is
+// picked by the model: without this check an absolute path or "../" let such a
+// call overwrite any file the user can write.
+func screenshotPath(input Input, cwd string) (string, error) {
+	out, _ := input["output"].(string)
+	out = strings.TrimSpace(out)
+	if out == "" {
+		out = "browser-screenshot.png"
+	}
+	if !strings.EqualFold(filepath.Ext(out), ".png") {
+		return "", fmt.Errorf("screenshot output must be a .png file, got %q", out)
+	}
+	if cwd == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("screenshot output: cannot determine the workspace: %w", err)
+		}
+		cwd = wd
+	}
+	abs := out
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(cwd, abs)
+	}
+	abs = filepath.Clean(abs)
+	rel, err := filepath.Rel(filepath.Clean(cwd), abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("screenshot output must be inside the workspace %s, got %q", cwd, out)
+	}
+	return abs, nil
 }

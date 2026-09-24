@@ -1,8 +1,6 @@
 ---
 name: spike
 description: Throwaway experiments to validate an idea before building. Disposable by design.
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java"
 ---
 
 # Spike

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,7 +39,7 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 	return &anthropicProvider{
 		apiKey:  cfg.APIKey,
 		keyPool: pool,
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
+		baseURL: normalizeAnthropicBaseURL(cfg.BaseURL),
 		client: &http.Client{
 			Timeout:   300 * time.Second,
 			Transport: transport,
@@ -61,7 +60,7 @@ func (p *anthropicProvider) activeKey() string {
 func (p *anthropicProvider) Name() string        { return "anthropic" }
 func (p *anthropicProvider) DisplayName() string { return "anthropic" }
 func (p *anthropicProvider) Validate() error {
-	if p.apiKey == "" {
+	if p.apiKey == "" && p.keyPool.size() == 0 {
 		return fmt.Errorf("API key required (set ANTHROPIC_API_KEY)")
 	}
 	return nil
@@ -78,6 +77,54 @@ type anthropicContentBlock struct {
 	Content      any               `json:"content,omitempty"`
 	IsError      *bool             `json:"is_error,omitempty"`
 	CacheControl map[string]string `json:"cache_control,omitempty"`
+	// Raw holds the exact JSON of a thinking / redacted_thinking block. Those
+	// blocks carry a signature over the reasoning and must go back to the API
+	// byte-for-byte, so they are never re-encoded from parsed fields.
+	Raw json.RawMessage `json:"-"`
+}
+
+func isThinkingType(t string) bool { return t == "thinking" || t == "redacted_thinking" }
+
+func (b *anthropicContentBlock) UnmarshalJSON(data []byte) error {
+	type alias anthropicContentBlock
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*b = anthropicContentBlock(a)
+	if isThinkingType(b.Type) {
+		b.Raw = append(json.RawMessage(nil), data...)
+	}
+	return nil
+}
+
+func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 {
+		return b.Raw, nil
+	}
+	type alias anthropicContentBlock
+	if b.Type == "tool_use" {
+		// input is required on tool_use even when the tool takes no
+		// arguments; omitempty would drop an empty map and get a 400.
+		input := b.Input
+		if input == nil {
+			input = map[string]any{}
+		}
+		return json.Marshal(struct {
+			alias
+			Input map[string]any `json:"input"`
+		}{alias(b), input})
+	}
+	return json.Marshal(alias(b))
+}
+
+type anthropicThinking struct {
+	Type    string `json:"type"`
+	Display string `json:"display,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthropicMsg struct {
@@ -92,6 +139,44 @@ type anthropicReq struct {
 	System    string           `json:"system,omitempty"`
 	Tools     []map[string]any `json:"tools,omitempty"`
 	Stream    bool             `json:"stream"`
+
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+// buildRequest assembles the wire request shared by Chat and ChatStream.
+//
+// req.System is appended to the system prompt rather than sent as a leading
+// user message: anything placed before the history is part of every cached
+// prefix, so volatile text there invalidates the whole conversation cache.
+func (p *anthropicProvider) buildRequest(req ChatRequest, stream bool) anthropicReq {
+	system := req.SystemBase
+	if req.System != "" {
+		if system != "" {
+			system += "\n\n"
+		}
+		system += req.System
+	}
+	body := anthropicReq{
+		Model:     req.Model,
+		MaxTokens: req.MaxTokens,
+		System:    system,
+		Messages:  p.convertMessages(req.Messages),
+		Tools:     p.convertTools(req.Tools),
+		Stream:    stream,
+	}
+	switch req.Thinking {
+	case "adaptive":
+		// summarized: the reasoning is surfaced to the user like other
+		// providers' reasoning_content instead of arriving as empty blocks.
+		body.Thinking = &anthropicThinking{Type: "adaptive", Display: "summarized"}
+	case "disabled":
+		body.Thinking = &anthropicThinking{Type: "disabled"}
+	}
+	if req.Effort != "" {
+		body.OutputConfig = &anthropicOutputConfig{Effort: req.Effort}
+	}
+	return body
 }
 
 type anthropicUsage struct {
@@ -147,21 +232,7 @@ type anthropicResp struct {
 }
 
 func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	msgs := p.convertMessages(req.Messages)
-	if req.System != "" && len(msgs) > 0 {
-		msgs = append([]anthropicMsg{{Role: "user", Content: []anthropicContentBlock{
-			{Type: "text", Text: req.System},
-		}}}, msgs...)
-	}
-
-	body := anthropicReq{
-		Model:     req.Model,
-		MaxTokens: req.MaxTokens,
-		System:    req.SystemBase,
-		Messages:  msgs,
-		Tools:     p.convertTools(req.Tools),
-	}
-
+	body := p.buildRequest(req, false)
 	return retryWithBackoff(ctx, defaultRetry, func() (*ChatResponse, error) {
 		return p.doChat(ctx, body)
 	})
@@ -193,16 +264,9 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
-	if httpResp.StatusCode >= 500 {
-		return nil, &RetryableError{Msg: fmt.Sprintf("server error %d: %s", httpResp.StatusCode, string(raw))}
-	}
-	if httpResp.StatusCode == 429 {
-		retryAfter := httpResp.Header.Get("Retry-After")
-		delaySec := 5
-		if retryAfter != "" {
-			_, _ = fmt.Sscanf(retryAfter, "%d", &delaySec)
-		}
-		return nil, &RetryableError{Msg: fmt.Sprintf("rate limited, retry after %ds", delaySec)}
+	// 529 is Anthropic's "overloaded"; it falls under >= 500.
+	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: ParseRetryAfter(httpResp.Header)}
 	}
 	if httpResp.StatusCode != 200 {
 		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(raw), 500)}
@@ -216,6 +280,7 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	return &ChatResponse{
 		Content:               p.extractContent(ar.Content),
 		ToolCalls:             p.extractToolCalls(ar.Content),
+		ThinkingBlocks:        extractThinkingBlocks(ar.Content),
 		Model:                 ar.Model,
 		InputTokens:           ar.Usage.totalInputTokens(),
 		OutputTokens:          ar.Usage.OutputTokens,
@@ -236,6 +301,16 @@ func (p *anthropicProvider) extractContent(blocks []anthropicContentBlock) strin
 	return strings.Join(texts, "\n")
 }
 
+func extractThinkingBlocks(blocks []anthropicContentBlock) []json.RawMessage {
+	var out []json.RawMessage
+	for _, b := range blocks {
+		if len(b.Raw) > 0 {
+			out = append(out, b.Raw)
+		}
+	}
+	return out
+}
+
 func (p *anthropicProvider) extractToolCalls(blocks []anthropicContentBlock) []ToolCall {
 	var calls []ToolCall
 	for _, b := range blocks {
@@ -248,45 +323,68 @@ func (p *anthropicProvider) extractToolCalls(blocks []anthropicContentBlock) []T
 
 func (p *anthropicProvider) convertMessages(in []Message) []anthropicMsg {
 	var out []anthropicMsg
-	for _, m := range in {
-		am := anthropicMsg{Role: m.Role}
-		switch m.Role {
-		case "tool":
-			am.Content = []anthropicContentBlock{{
-				Type:      "tool_result",
-				ToolUseID: m.ToolCallID,
-				Content:   m.Content,
-			}}
-		case "assistant":
-			if len(m.ToolCalls) > 0 {
-				for _, tc := range m.ToolCalls {
-					am.Content = append(am.Content, anthropicContentBlock{
-						Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: tc.Input,
-					})
+	// appendTurn folds consecutive same-role messages into one turn. The API
+	// has only user and assistant roles: every tool result of one assistant
+	// turn, plus any engine text that follows them, must arrive as a single
+	// user message with the tool_result blocks first.
+	appendTurn := func(role string, blocks []anthropicContentBlock, cache string) {
+		if len(blocks) == 0 {
+			return
+		}
+		if cache != "" {
+			for i := len(blocks) - 1; i >= 0; i-- {
+				if len(blocks[i].Raw) == 0 { // thinking blocks cannot carry cache_control
+					blocks[i].CacheControl = map[string]string{"type": cache}
+					break
 				}
 			}
-			if m.Content != "" {
-				am.Content = append(am.Content, anthropicContentBlock{Type: "text", Text: m.Content})
+		}
+		if n := len(out); n > 0 && out[n-1].Role == role {
+			out[n-1].Content = append(out[n-1].Content, blocks...)
+			return
+		}
+		out = append(out, anthropicMsg{Role: role, Content: blocks})
+	}
+	for _, m := range in {
+		switch m.Role {
+		case "tool":
+			block := anthropicContentBlock{Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content}
+			if isToolErrorContent(m.Content) {
+				isErr := true
+				block.IsError = &isErr
 			}
+			appendTurn("user", []anthropicContentBlock{block}, m.CacheControl)
+		case "assistant":
+			var blocks []anthropicContentBlock
+			// Thinking first, verbatim, then text, then tool_use: the order
+			// the model produced them in.
+			for _, raw := range m.ThinkingBlocks {
+				blocks = append(blocks, anthropicContentBlock{Raw: raw})
+			}
+			if strings.TrimSpace(m.Content) != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				blocks = append(blocks, anthropicContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: tc.Input})
+			}
+			appendTurn("assistant", blocks, m.CacheControl)
 		default:
-			am.Content = convertAnthropicUserContent(m)
+			appendTurn("user", convertAnthropicUserContent(m), m.CacheControl)
 		}
-		if len(am.Content) == 0 {
-			am.Content = []anthropicContentBlock{{Type: "text", Text: ""}}
-		}
-		// Inject cache_control if set on the message (prompt caching)
-		if m.CacheControl != "" && len(am.Content) > 0 {
-			last := &am.Content[len(am.Content)-1]
-			last.CacheControl = map[string]string{"type": m.CacheControl}
-		}
-		out = append(out, am)
 	}
 	return out
 }
 
+// isToolErrorContent recognises the engine's convention for failed tool
+// results so they can be flagged with is_error.
+func isToolErrorContent(content string) bool {
+	return strings.HasPrefix(content, "Error:") || strings.HasPrefix(content, "Error (") ||
+		strings.HasPrefix(content, "BLOCKED")
+}
+
 func convertAnthropicUserContent(m Message) []anthropicContentBlock {
 	blocks := make([]anthropicContentBlock, 0, len(m.Parts)+1)
-	if m.Content != "" {
+	if strings.TrimSpace(m.Content) != "" {
 		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
 	}
 	for _, part := range m.Parts {
@@ -338,40 +436,6 @@ func truncate(s string, n int) string {
 	return textutil.ClipBytes(s, n, "...")
 }
 
-type RetryableError struct{ Msg string }
-
-func (e *RetryableError) Error() string { return e.Msg }
-
-// StatusError carries the HTTP status of a failed provider call.
-//
-// Without it, fallback.go had to classify failures by substring-matching the
-// error text for "429", "500", "401" and friends — which misfires on any
-// message that merely contains those digits ("max_tokens must be under 1500",
-// "model gpt-4o-mini-2024-07-18"), wrongly cooling down or permanently
-// blacklisting a perfectly healthy provider. Providers return this type so the
-// status is read, not guessed; the substring heuristics remain only as a
-// fallback for transport-level errors that carry no status at all.
-type StatusError struct {
-	Status int
-	Msg    string
-}
-
-func (e *StatusError) Error() string { return fmt.Sprintf("API error %d: %s", e.Status, e.Msg) }
-
-// statusOf returns the HTTP status carried by err, or 0 when it carries none.
-func statusOf(err error) int {
-	var se *StatusError
-	if errors.As(err, &se) {
-		return se.Status
-	}
-	return 0
-}
-
-func isRetryable(err error) bool {
-	_, ok := err.(*RetryableError)
-	return ok
-}
-
 type anthropicStreamBlock struct {
 	Type         string                 `json:"type"`
 	Index        int                    `json:"index"`
@@ -380,6 +444,9 @@ type anthropicStreamBlock struct {
 	Usage        *anthropicUsage        `json:"usage,omitempty"`
 	// message_start nests the initial usage snapshot under "message".
 	Message *anthropicStreamMessage `json:"message,omitempty"`
+	// Error is set on an "error" event: a failure after the 200 header,
+	// typically overloaded_error.
+	Error *oaiStreamError `json:"error,omitempty"`
 }
 
 type anthropicStreamMessage struct {
@@ -391,29 +458,12 @@ type anthropicDelta struct {
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error) {
-	msgs := p.convertMessages(req.Messages)
-	// Mirrors Chat(): req.System is per-turn/volatile content (e.g. model-tier
-	// guidance) that must NOT be folded into the cached SystemBase block, so
-	// it's injected as a prepended synthetic user message instead. This was
-	// previously only wired up in the non-streaming Chat() path — ChatStream
-	// silently dropped req.System entirely, which matters since streaming is
-	// the path actually used by the REPL.
-	if req.System != "" && len(msgs) > 0 {
-		msgs = append([]anthropicMsg{{Role: "user", Content: []anthropicContentBlock{
-			{Type: "text", Text: req.System},
-		}}}, msgs...)
-	}
-	body := anthropicReq{
-		Model:     req.Model,
-		MaxTokens: req.MaxTokens,
-		System:    req.SystemBase,
-		Messages:  msgs,
-		Tools:     p.convertTools(req.Tools),
-		Stream:    true,
-	}
+	body := p.buildRequest(req, true)
 
 	data, _ := json.Marshal(body)
 
@@ -466,8 +516,17 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		JSONBuf strings.Builder
 	}
 	tcAccum := make(map[int]*accumTC)
+	// Thinking blocks by content index. A thinking block streams its text and
+	// signature as deltas; a redacted_thinking block arrives whole at start.
+	type accumThinking struct {
+		raw       json.RawMessage // complete block (redacted_thinking)
+		text      strings.Builder
+		signature strings.Builder
+	}
+	thinkAccum := make(map[int]*accumThinking)
 	var usage anthropicUsage
 	var stopReason string
+	sawStop := false
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -482,9 +541,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 			return nil, ctx.Err()
 		}
 		markProgress() // reset the idle watchdog on every received line
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "data: ") {
-			payload := strings.TrimPrefix(trimmed, "data: ")
+		if payload, ok := sseDataPayload(line); ok {
 			if payload != "" && payload != "[DONE]" {
 				var ev anthropicStreamBlock
 				if err := json.Unmarshal([]byte(payload), &ev); err != nil {
@@ -492,6 +549,14 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				}
 
 				switch ev.Type {
+				case "error":
+					e := ev.Error
+					if e == nil {
+						e = &oaiStreamError{}
+					}
+					return nil, fmt.Errorf("provider stream error: %s", streamErrorText(e))
+				case "message_stop":
+					sawStop = true
 				case "message_start":
 					// Prompt-side counters arrive here and nowhere else.
 					if ev.Message != nil && ev.Message.Usage != nil {
@@ -505,6 +570,13 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 						acc := &accumTC{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
 						tcAccum[ev.Index] = acc
 					}
+					if ev.ContentBlock != nil && isThinkingType(ev.ContentBlock.Type) {
+						acc := &accumThinking{}
+						if ev.ContentBlock.Type == "redacted_thinking" {
+							acc.raw = ev.ContentBlock.Raw
+						}
+						thinkAccum[ev.Index] = acc
+					}
 				case "content_block_delta":
 					if ev.Delta != nil {
 						if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
@@ -516,6 +588,17 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 						if ev.Delta.Type == "input_json_delta" && ev.Delta.PartialJSON != "" {
 							if acc, ok := tcAccum[ev.Index]; ok {
 								acc.JSONBuf.WriteString(ev.Delta.PartialJSON)
+							}
+						}
+						if acc, ok := thinkAccum[ev.Index]; ok {
+							switch ev.Delta.Type {
+							case "thinking_delta":
+								acc.text.WriteString(ev.Delta.Thinking)
+								if handler != nil && ev.Delta.Thinking != "" {
+									handler(StreamEvent{Type: "reasoning", Reasoning: ev.Delta.Thinking})
+								}
+							case "signature_delta":
+								acc.signature.WriteString(ev.Delta.Signature)
 							}
 						}
 					}
@@ -533,6 +616,11 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 			break
 		}
 	}
+	// No message_stop and no stop_reason: the connection closed in the middle
+	// of the answer, which used to be reported as a complete end_turn.
+	if !sawStop && stopReason == "" {
+		return nil, fmt.Errorf("stream ended before the response completed (unexpected EOF: no message_stop)")
+	}
 
 	indices := make([]int, 0, len(tcAccum))
 	for idx := range tcAccum {
@@ -543,10 +631,16 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		acc := tcAccum[idx]
 		rawJSON := acc.JSONBuf.String()
 		if rawJSON == "" {
-			// Empty JSON buffer means this tool call was truncated (likely max_tokens hit)
-			// log, not os.Stderr: this is library code, and a direct terminal
-			// write from here corrupts a front end that manages its own frame.
-			log.Warnf("tool %s: empty input (response likely truncated, stop=%s)", acc.Name, stopReason)
+			if stopReason == "max_tokens" {
+				// The call was cut off before its arguments arrived.
+				// log, not os.Stderr: this is library code, and a direct terminal
+				// write from here corrupts a front end that manages its own frame.
+				log.Warnf("tool %s: empty input (response truncated, stop=%s)", acc.Name, stopReason)
+				continue
+			}
+			// A tool that takes no arguments streams no input_json_delta at
+			// all; that is a complete call with an empty input.
+			streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: map[string]any{}})
 			continue
 		}
 		input, ok := RepairToolArguments(rawJSON)
@@ -554,11 +648,9 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 			// Incomplete/malformed JSON even after best-effort repair (tool_repair.go).
 			log.Warnf("tool %s: failed to parse input JSON even after repair (stop=%s, raw: %s)", acc.Name, stopReason, truncate(rawJSON, 200))
 			streamAcc.AddToolCall(adapter.ToolCall{
-				ID:   acc.ID,
-				Name: acc.Name,
-				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
-					"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
-					len(rawJSON), truncate(rawJSON, 120))},
+				ID:         acc.ID,
+				Name:       acc.Name,
+				Input:      toolArgsParseError(rawJSON, stopReason == "max_tokens"),
 				ParseError: true,
 			})
 			continue
@@ -567,6 +659,26 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 	toolCalls := toAPIToolCalls(streamAcc.ToolCalls())
 
+	thinkIdx := make([]int, 0, len(thinkAccum))
+	for idx := range thinkAccum {
+		thinkIdx = append(thinkIdx, idx)
+	}
+	sort.Ints(thinkIdx)
+	var thinkingBlocks []json.RawMessage
+	for _, idx := range thinkIdx {
+		acc := thinkAccum[idx]
+		if len(acc.raw) > 0 {
+			thinkingBlocks = append(thinkingBlocks, acc.raw)
+			continue
+		}
+		raw, err := json.Marshal(map[string]string{
+			"type": "thinking", "thinking": acc.text.String(), "signature": acc.signature.String(),
+		})
+		if err == nil {
+			thinkingBlocks = append(thinkingBlocks, raw)
+		}
+	}
+
 	if stopReason == "" {
 		stopReason = "end_turn"
 	}
@@ -574,6 +686,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	return &ChatResponse{
 		Content:               streamAcc.Content(),
 		ToolCalls:             toolCalls,
+		ThinkingBlocks:        thinkingBlocks,
 		Model:                 req.Model,
 		InputTokens:           usage.totalInputTokens(),
 		OutputTokens:          usage.OutputTokens,

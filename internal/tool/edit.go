@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
@@ -72,8 +73,28 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		}
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
+	files := fileTracker(tctx)
+	if err := files.Check(path, data); err != nil {
+		return Result{Data: "Error: " + err.Error() + ", then retry the edit.", IsError: true}, nil
+	}
 
 	content := string(data)
+	// A GBK file is edited as text and encoded back, so the whole file stays
+	// in one encoding; anything else that is not UTF-8 is refused, because
+	// the model's UTF-8 would leave the file in two.
+	var legacy *legacyText
+	if !utf8.Valid(data) {
+		lt, ok := decodeGBK(data)
+		if !ok {
+			return Result{Data: "Error: " + path + " is not valid UTF-8, and not GBK either (probably another ANSI code page). Editing it would mix encodings in one file; convert it to UTF-8 first (e.g. iconv -f <encoding> -t UTF-8) or change it with a tool that keeps its encoding.", IsError: true}, nil
+		}
+		legacy, content = &lt, lt.text
+	}
+	// The model saw the file without its \r (the read tool strips it), so
+	// its strings are LF. Match and write them in the file's own line ending.
+	if usesCRLF(content) {
+		oldS, newS = toCRLF(oldS), toCRLF(newS)
+	}
 	count := strings.Count(content, oldS)
 
 	var result string
@@ -110,13 +131,17 @@ func (t *EditTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		}
 	}
 
-	perm := os.FileMode(0644)
-	if info, err := os.Stat(path); err == nil {
-		perm = info.Mode().Perm()
+	out := []byte(result)
+	if legacy != nil {
+		if out, err = legacy.encode(result); err != nil {
+			return legacy.encodeFailure(path, "newString", err), nil
+		}
 	}
-	if err := os.WriteFile(path, []byte(result), perm); err != nil {
+
+	if err := replaceFile(path, out); err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
+	files.Record(path, out)
 
 	return Result{Data: fmt.Sprintf("Edited %s: %d replacement(s)", path, replacements)}, nil
 }

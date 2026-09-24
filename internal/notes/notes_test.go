@@ -317,6 +317,12 @@ func TestFlushClipsAt25KBOnRuneBoundary(t *testing.T) {
 	const maxBytes = 25600
 	const suffix = "\n... [truncated]\n"
 
+	// Over the cap, whole old entries are dropped first (see
+	// TestFlushOverCapKeepsNewestEntries); the byte clip is left for a single
+	// entry that alone exceeds the cap. This test used to fill the file with
+	// 250 entries and expect the clip — that tail clip is what threw away the
+	// newest notes, so it now uses one oversized entry.
+	//
 	// The byte at offset 25600 has to land inside a 3-byte rune for the clip to
 	// be interesting. Its alignment depends on how many bytes precede the
 	// Chinese block, so shift that prefix by 0/1/2 bytes to cover all three
@@ -324,14 +330,8 @@ func TestFlushClipsAt25KBOnRuneBoundary(t *testing.T) {
 	for pad := 0; pad < 3; pad++ {
 		t.Run(fmt.Sprintf("pad=%d", pad), func(t *testing.T) {
 			s, projectDir := newTestNotes(t)
-			if pad > 0 {
-				s.AddTask(strings.Repeat("x", pad))
-			}
-			// 250 entries x 100 Chinese runes ~= 78KB, well past the cap.
-			line := strings.Repeat("会话笔记内容", 17) // 102 runes, 306 bytes
-			for i := 0; i < 250; i++ {
-				s.AddTask(line)
-			}
+			// One entry of ~30KB Chinese, well past the cap on its own.
+			s.AddTask(strings.Repeat("x", pad) + strings.Repeat("会话笔记内容", 1700))
 			if err := s.Flush(); err != nil {
 				t.Fatalf("Flush: %v", err)
 			}

@@ -35,6 +35,10 @@ func TestHelperProcess(t *testing.T) {
 		time.Sleep(60 * time.Second)
 	case "rpc":
 		helperServeRPC()
+	case "tree":
+		helperSpawnTree()
+	case "stderr-flood":
+		helperStderrFlood()
 	}
 	os.Exit(0)
 }

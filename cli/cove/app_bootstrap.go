@@ -74,6 +74,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 	hookMgr := hooks.NewManager()
 	skillMgr := skills.NewManager()
 	skills.LoadAll(skillMgr, projCtx.Cwd)
+	skillMgr.Disable(cfg.DisabledSkills...)
 	memStore := memory.NewStore()
 	if cfg.MemoryEmbedding != nil {
 		// Reuse the main chat provider's base URL/API key when the embedding
@@ -130,6 +131,10 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 		HookManager:        hookMgr,
 		Classifier:         classifier,
 		DoneVerifyCommands: cfg.DoneVerifyCommands,
+		DoneVerifyAuto:     cfg.VerifyAutoEnabled(),
+		Thinking:           cfg.Thinking,
+		Effort:             cfg.Effort,
+		CustomInstructions: cfg.SystemPrompt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("engine start error: %w", err)
@@ -137,6 +142,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 
 	eng.SetProjectContext(projCtx)
 	eng.WirePlanExecutor()
+	showReasoning = cfg.ShowReasoning
 
 	return &appBootstrap{
 		cfg:       cfg,

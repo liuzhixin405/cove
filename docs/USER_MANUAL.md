@@ -1,4 +1,4 @@
-﻿# Cove 使用手册
+# Cove 使用手册
 
 > **cove** — Go 语言 AI 编程助手，单文件二进制，零依赖，终端即用。
 
@@ -85,7 +85,7 @@ Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
 
 ### 从源码构建
 
-需要 Go 1.24+：
+需要 Go 1.25+：
 ```bash
 git clone https://github.com/liuzhixin405/cove.git
 cd cove
@@ -97,18 +97,33 @@ go build -o cove ./cli/cove
 
 | 参数 | 说明 |
 |------|------|
-| `-p, --print <prompt>` | 单次查询模式，非交互 |
+| `-p, --print <prompt>` | 单次查询模式，非交互（见下方说明） |
 | `--image <path>` | 附加图片（可多次指定） |
 | `--file <path>` | 附加文件（可多次指定） |
 | `-v, --version` | 显示版本信息 |
 | `-d, --debug` | 调试模式 |
-| `--doctor` | 系统诊断 |
-| `--config` | 查看配置 |
-| `-r, --resume <id>` | 恢复会话 |
-| `--list-sessions` | 列出所有会话 |
+| `--doctor` | 系统诊断（git、ripgrep、供应商与 API key 是否设置） |
+| `--config` | 查看配置（不显示 API key，只显示 `api_key_set`） |
+| `-r, --resume <id>` | 按 ID 恢复会话后启动；可与 `-p` 连用继续该会话。会话属于其他项目目录时给出提示；ID 不存在时报错退出 |
+| `--list-sessions [all]` | 列出当前项目的会话；加 `all` 列出所有项目的会话 |
 | `--dump-system-prompt` | 打印系统提示词 |
 | `--no-auto` | 禁用后台自学习功能 |
+| `--no-tui` | 使用 headless 模式（按行读 stdin，答案写 stdout，提示写 stderr） |
+| `--tui` | 即使 stdin/stdout 不是终端也强制使用交互界面 |
+| `--profile <name>` | 使用指定 profile 启动 |
+| `--record <dir>` | 录制本次会话的请求与响应到目录 |
+| `--replay <dir>` | 用录制数据回放，不调用真实 API |
 | `-h, --help` | 帮助信息 |
+
+未知参数（例如拼错的 `--no-tiu`）和没有 `-p` 的多余文字会报错退出（退出码 2），不再被静默忽略。
+
+**`-p` 单次查询说明：**
+
+- 只有最终答案写到 stdout，提示、警告和错误都写到 stderr，因此 `cove -p "..." > out.txt` 只得到答案。
+- 管道输入会附在提示后面一起发送：`cat app.log | cove -p "解释这段日志"`；只有管道输入时它就是提示本身。管道输入上限 8MB，超出部分截断并在 stderr 提示。
+- 提示可以不加引号：`cove -p 解释 这段 代码` 等同于 `cove -p "解释 这段 代码"`。
+- 退出码：`0` 成功，`1` 失败（API 错误、附件读取失败等），`2` 参数错误，`130` 被 Ctrl+C 中断。
+- 没有人能回答授权询问：需要询问的工具调用（写文件、执行非只读命令）一律拒绝，不会卡住等待，模型会收到拒绝原因。要非交互地放行这些操作，用 `auto` 或 `bypass` 权限模式（配置 `permission_mode`，或用一个设置了该模式的 `--profile`）。注意 `/mode` 会写入配置文件，之后的交互会话也会沿用。
 
 ---
 
@@ -167,9 +182,11 @@ go build -o cove ./cli/cove
 | 配置字段 | 用途 | 推荐值 |
 |---------|------|-------|
 | `model` | **复杂任务模型**（高级、昂贵、能力强） | `deepseek-v4-pro`, `claude-sonnet-4-20250514`, `gpt-4o` |
-| `model_fast` | **简单任务模型**（快速、便宜、够用） | `deepseek-v4-flash`, `gpt-4o-mini`, `claude-haiku-3-5` |
+| `model_fast` | **简单任务模型**（快速、便宜、够用） | `deepseek-flash`（旧名 `deepseek-v4-flash` 仍可用）, `gpt-4o-mini`, `claude-haiku-4-5` |
 
-> 如果只配置 `model`，不配置 `model_fast`，则默认 `model_fast = "deepseek-v4-flash"`。
+> 如果只配置 `model`，不配置 `model_fast`，则 `model_fast` 与 `model` 相同，即不做模型切换。
+>
+> 快速模型和高级模型使用同一套提示词和行为规则，不会因为走了快速模型就额外加限制。复杂任务进行中的简短跟进（如"继续"）会留在当前模型上；快速模型在一轮中连续失败时，该轮后续会自动改用高级模型。
 
 #### 自动切换规则
 
@@ -386,7 +403,7 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | 模式 | 说明 |
 |------|------|
 | `default` | 智能分类：高风险操作（写文件、执行命令）弹出确认，读取操作自动允许 |
-| `plan` | 计划模式：只能执行只读操作，写入请求被拒绝 |
+| `plan` | 计划模式：只能执行只读操作，写入请求被拒绝（之前选过的"本次会话总是允许"在此模式下不生效） |
 | `auto` | 自动模式：所有操作自动批准（适合信任的场景） |
 | `bypass` | 绕过模式：完全跳过权限检查 |
 
@@ -398,7 +415,19 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 权限提示交互：
 - `y` — 确认本次操作
 - `n` — 拒绝
-- `a` — 始终允许此类操作（当前会话）
+- `a` — 始终允许此类操作（当前会话，不持久化）。对 `bash`/`powershell` 只记住命令前缀，提示里会写明，例如 `[a] 本次会话总是允许 "go test" 开头的命令`：
+  - 前缀取法：`git`、`go`、`npm`、`docker`、`kubectl`、`dotnet`、`cargo`、`pip` 等带子命令的工具取"程序 + 子命令"（`git status`、`go test`、`npm run`、`docker compose`），其他程序只取程序名（`ls`、`cat`）。复合命令会为其中每条命令各记一个前缀（`cd src && go test ./...` 记住 `cd` 和 `go test`）
+  - 之后一行命令里的**每一条**命令（`&&`、`||`、`;`、`&`、管道、换行、子 shell 分隔的都算）都必须以已允许的前缀开头才免询问，按词比较：允许 `go test` 后，`go test ./... && rm -rf x`、`go test ./... | tee out.txt`（除非也允许了 `tee`）、`sudo go test`、`FOO=1 go test`、`go vet` 仍会询问
+  - 含命令替换或进程替换（`$(...)`、反引号、`<(...)`、`>(...)`，引号内也算）、输出重定向到文件（`/dev/null`、`NUL`、`$null` 除外）、或引号内出现 `; & | < > ( )` 的命令行不会被前缀规则放行，照常询问
+  - `sudo`、`env`、`xargs`、`bash -c`、`VAR=值` 开头，或 `git -C dir …` 这类取不到子命令的命令无法安全地记住前缀，提示中不提供 `[a]`；此时输入 `a` 只允许本次
+  - 其他工具（`write`、`edit` 等）选 `a` 仍对整个工具生效
+  - plan 模式下这些规则不起作用，非只读工具照样被拒绝
+
+无论哪种模式，以下命令都会被直接拦截：递归删除根目录/家目录/系统目录或盘符根（如 `rm -rf /`、`rm -rf ~`、`Remove-Item -Recurse C:\`）、格式化磁盘或写裸设备（`mkfs`、`dd of=/dev/sda`、`format c:`）、关机重启、fork bomb、把下载或解码的内容直接交给解释器执行（`curl … | sh`、`irm … | iex`、`base64 -d | bash`）。删除项目内的文件或目录（如 `rm -rf build`）不会被拦截，按当前模式正常确认。
+
+#### 命令运行在哪个 shell
+
+`bash` 工具在 Windows 上优先使用 Git for Windows 的 bash（通过 `git.exe` 的位置找到），不会使用 `C:\Windows\System32\bash.exe`（WSL 启动器）；找不到时依次回退到 PowerShell、cmd。实际使用的 shell 会写进系统提示词告诉模型。命令以非交互方式运行：`git commit` 不带 `-m` 会直接失败而不是打开编辑器，git 不会在终端里等待输入密码。
 
 #### 持久化权限规则
 
@@ -457,15 +486,27 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `model` | string | **复杂任务模型**，如 `deepseek-v4-pro`（高级）、`claude-sonnet-4-20250514`、`gpt-4o` |
-| `model_fast` | string | **简单任务模型**（快速/便宜），如 `deepseek-v4-flash`、`gpt-4o-mini`、`claude-haiku-3-5`。不配置则默认 `deepseek-v4-flash` |
+| `model_fast` | string | **简单任务模型**（快速/便宜），如 `deepseek-flash`（旧名 `deepseek-v4-flash`）、`gpt-4o-mini`、`claude-haiku-4-5`。不配置则与 `model` 相同，即不做模型切换 |
 | `provider.name` | string | 提供商名称（anthropic/deepseek/openai/glm/kimi/qwen/doubao/...）|
-| `provider.api_key` | string | API 密钥（也支持通过环境变量设置） |
+| `provider.api_key` | string | API 密钥。留空时读取提供商对应的环境变量（如 `DEEPSEEK_API_KEY`、`LLM_API_KEY`）；配置文件里有值时优先于环境变量 |
 | `provider.base_url` | string | 自定义 API 端点（留空则自动匹配提供商默认地址） |
-| `permission_mode` | string | 默认权限模式（default/plan/auto/bypass） |
-| `max_budget_usd` | number | 会话预算上限（美元），超过时自动暂停 |
-| `thinking_tokens` | number | thinking/推理 token 预算，最小值 1024（默认 16000） |
+| `permission_mode` | string | 默认权限模式（default/plan/auto/bypass）。拼错的值按 `default` 运行，`/diagnose` 会提示 |
+| `max_budget_usd` | number | 会话预算上限（美元）。每次模型调用前都会检查，超过时暂停；主循环、子智能体、记忆提取、上下文压缩等所有模型调用都计入 |
+| `thinking` | string | 支持该能力的提供商（Anthropic）的思考模式：`adaptive`（由模型决定是否思考、思考多少，推理摘要会显示出来）或 `disabled`；留空则使用模型默认值 |
+| `effort` | string | 推理深度：`low` / `medium` / `high` / `xhigh` / `max`；留空则使用模型默认值 |
+| `done_verify_commands` | string[] | 模型声称完成后必须通过的校验命令（如 `go build ./...`），不通过则打回继续修改 |
+| `done_verify_auto` | boolean | 未配置 `done_verify_commands` 时，按项目自动推断校验命令（`go.mod` → `go build ./...`，`Cargo.toml` → `cargo check`，本地安装了 TypeScript → `tsc --noEmit`），且只在本轮改过文件时执行。默认开启，设为 `false` 关闭 |
+| `show_reasoning` | boolean | 是否把思考型模型（如 DeepSeek V4）的完整推理过程实时输出到对话区。默认关闭：推理进度只显示在状态行（"思考中… 已推理 N 字"） |
+| `disabled_skills` | string[] | 不加载的技能名称列表（内置或自定义均可），如 `["spike", "plan"]` |
+| `system_prompt` | string | 你自己的长期指令（如"提交信息用英文"），会**追加**到内置系统提示词末尾，不会替换内置规则 |
+| `thinking_tokens` | number | 已不再生效：新版 Claude 模型不接受固定的思考 token 预算，请改用 `thinking` + `effort` |
 | `debug` | boolean | 调试模式（开启详细日志） |
+| `verbose` | boolean | 详细输出；可在 profile 中单独设置 |
 | `mcp_servers` | object | MCP 服务器配置（支持 stdio/SSE/Streamable HTTP 传输） |
+| `profiles` | object | 具名配置组，可覆盖 `model`、`model_fast`、`provider`、`permission_mode`、`max_budget_usd`、`thinking_tokens`、`debug`、`verbose`、`system_prompt`；用 `/profile save/switch` 管理 |
+| `active_profile` | string | 启动时应用的 profile 名称（`--profile` 参数优先）；名称不存在时会给出警告并使用基础配置 |
+| `memory_embedding` | object | 可选：`{"base_url", "api_key", "model"}`，为记忆检索启用远程语义向量；留空的字段沿用主 provider 的值。不配置则只用关键词检索，不产生额外请求 |
+| `telemetry` | boolean | 目前不生效（当前版本没有读取该字段的代码） |
 
 ### 配置迁移
 
@@ -475,37 +516,49 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 ## 技能系统
 
-Cove 内置 **23+ 技能**，按文件类型自动加载。
+Cove 内置 **12 个技能**，编译在二进制里，随 cove 版本一起更新。
 
 ### 技能加载机制
 
-- **自动加载**：技能在 `paths` 中声明匹配的 glob 模式，当 Agent 操作匹配文件时自动注入
-- **手动加载**：Agent 通过 `skill_view` 工具主动加载
-- **用户可创建**：在 `~/.cove/skills/<name>/SKILL.md` 放入自定义技能
+- **按需加载**：所有技能只把名称和一句话描述列在系统提示词里，模型判断任务需要时再用 `skill` 工具加载全文。内置技能都是工作流（写计划、TDD、调试等），不会因为读写了某类文件就被自动塞进对话
+- **按文件类型注入（仅自定义技能）**：自己写的技能如果在 `paths` 里声明了 glob 模式，操作匹配文件时会自动注入，每个会话只注入一次
+- **禁用**：在配置里写 `"disabled_skills": ["spike", "plan"]`，就不会加载这些技能（内置或自定义都可以）
+
+### 技能来源与优先级
+
+同名技能以更"近"的定义为准：**项目 > 用户 > 插件 > 内置**。
+
+| 来源 | 位置 |
+|------|------|
+| 内置 | 编译在 cove 二进制中 |
+| 插件 | `~/.cove/plugins/<插件名>/skills/` |
+| 用户 | `~/.claude/skills/`，然后 `~/.cove/skills/`（后者优先） |
+| 项目 | 从 git 仓库根目录到当前目录，每一级的 `.claude/skills/` 和 `.cove/skills/`，越靠近当前目录越优先 |
+
+- 不读取仓库根目录以上的目录；不在 git 仓库里时，只读当前目录
+- 不扫描当前目录下的子目录：克隆或 vendor 进来的第三方代码即使带着 `.claude/skills`，也不会被加载
+- `/skills list` 会标注每个技能的来源（`[内置]` `[插件]` `[用户]` `[项目]`）
+
+### 修改内置技能
+
+`/skills export <名称>` 会把内置技能复制到 `~/.cove/skills/<名称>/SKILL.md`，修改后重启即生效。注意：导出的副本会一直覆盖内置版本，**不再随 cove 升级更新**；删除这个文件即可恢复内置版本。
 
 ### 内置技能
 
-| 技能 | 触发文件 | 说明 |
-|------|---------|------|
-| `commit-messages` | - | 编写 Conventional Commits 提交信息 |
-| `executing-plans` | - | 执行实现计划 |
-| `github-code-review` | - | GitHub PR 代码审查 |
-| `github-pr-workflow` | `*.go,*.py,*.js,*.ts,*.rs,*.java` | GitHub PR 生命周期管理 |
-| `performance-optimization` | - | 基于测量的性能优化 |
-| `plan` | `*.go,*.py,*.js,*.ts,*.rs,*.java,*.rb` | 编写可执行的实现计划 |
-| `requesting-code-review` | - | 请求代码审查 |
-| `safe-refactoring` | - | 安全重构（小步、绿测试） |
-| `spike` | `*.go,*.py,*.js,*.ts,*.rs,*.java` | 快速原型验证 |
-| `systematic-debugging` | - | 系统化调试方法论 |
-| `test-driven-development` | - | TDD 测试驱动开发 |
-| `using-git-worktrees` | - | Git 工作树使用 |
-| `writing-skills` | - | 编写自定义技能 |
-| `commit` | - | 通用提交技能 |
-| `dispatching-parallel-agents` | - | 并行智能体调度 |
-| `brainstorming` | - | 创意构思 |
-| `receiving-code-review` | - | 接收代码审查反馈 |
-| `verification-before-completion` | - | 完成前验证 |
-| `writing-plans` | - | 编写计划方法论 |
+| 技能 | 说明 |
+|------|------|
+| `commit-messages` | 编写 Conventional Commits 提交信息 |
+| `executing-plans` | 按已有的实现计划分步执行，设置检查点 |
+| `github-code-review` | 在 GitHub 上审查 PR：读 diff、行内评论、批准或要求修改 |
+| `github-pr-workflow` | GitHub PR 生命周期：建分支、提交、开 PR、盯 CI、合并 |
+| `karpathy-guidelines` | 编码准则：先想后写、简单优先、改动精准、目标驱动 |
+| `performance-optimization` | 基于测量的性能优化：先 profile，修真正的瓶颈，再验证效果 |
+| `plan` | 实现前先写可执行的计划：小任务、精确路径、完整代码 |
+| `requesting-code-review` | 提交前自检：安全扫描、质量门禁、自动修复 |
+| `safe-refactoring` | 不改变行为的重构：小步走，每步测试保持通过 |
+| `spike` | 用一次性实验先验证想法再动手 |
+| `systematic-debugging` | 四阶段根因调试：先弄清原因再修，不靠猜 |
+| `test-driven-development` | TDD：红-绿-重构，先写测试再写代码 |
 
 ### 技能文件格式
 
@@ -641,7 +694,7 @@ depends:task-1,task-2 实现用户登录功能
 
 - 支持的类型：`general`（通用）、`explore`（探索代码）、`plan`（计划）、`review`（审查）、`test`（测试）
 - 子智能体拥有受限的工具集
-- 子智能体在 `auto` 权限模式下运行
+- 子智能体沿用当前会话的权限模式，每次工具调用都经过与主会话相同的授权检查
 - 最多 30 次迭代，超时 5 分钟
 - 通过 `delegate.Delegator` 管理生命周期
 
@@ -740,14 +793,19 @@ Cove 内置多阶段自学习流水线，在对话过程中自动提取和整合
 
 ### 自动检查点
 
-在执行 `write` 或 `edit` 操作前，系统自动创建 Git 快照作为检查点。
+在执行 `write` 或 `edit` 操作前（整批工具调用开始之前），系统自动创建 Git 快照作为检查点。快照存放在 `~/.cove/checkpoints/store`，每个项目有独立的历史，不会写入项目自己的 Git 仓库；项目的 `.gitignore` 会被遵守。内容与上一个检查点相同时不会重复创建。
 
 ### 手动操作
 
 ```
-/checkpoints       # 列出所有检查点
-/undo              # 回退到上一个检查点
+/checkpoints       # 列出当前项目最近的检查点
+/undo              # 回退到上一个与当前状态不同的检查点；连续执行会一步步往前回退
+/undo <commit>     # 回退到指定检查点（只接受当前项目的检查点）
 ```
+
+回退会恢复检查点里的文件内容，并删除检查点之后新建的文件。回退前的状态会先自动备份，输出里会给出撤销这次回退的命令（`/undo <备份>`）。
+
+`bash`/`powershell` 命令执行前也会创建检查点，所以 `rm`、`sed -i`、代码生成器造成的改动同样可以回退；明确只读的命令（`ls`、`cat`、`git status`、`git diff` 等）不创建。
 
 ---
 
@@ -755,15 +813,35 @@ Cove 内置多阶段自学习流水线，在对话过程中自动提取和整合
 
 ### 会话保存
 
-会话自动保存到 `~/.cove/sessions/`。
+会话自动保存到 `~/.cove/sessions/`，每个会话会记录启动 cove 时所在的项目目录（会话文件中的 `cwd` 字段）。
+
+### 按项目区分的历史
+
+`/history`、`/resume`、`cove --list-sessions` 以及输入“继续”时自动恢复最近任务，默认**只列出当前目录（项目）的会话**，避免把其他代码库的对话恢复到当前项目、让模型混淆文件路径。目录比较前会规范化为绝对路径；在 Windows 上不区分大小写（`D:\Proj` 与 `d:\proj` 视为同一项目）。
+
+需要查看所有项目的会话时加上 `all`：
+
+```
+/history all               # 列出所有项目的会话（每行标注所属目录）
+/history all <编号>        # 按 all 列表的编号恢复
+/history all detail <编号> # 按 all 列表的编号查看详情
+/resume all                # 列出所有项目的会话 ID
+cove --list-sessions all   # 命令行列出所有项目的会话
+```
+
+执行 `/history all` 后直接输入编号，按的是 all 列表的编号；执行 `/history` 后则按当前项目列表的编号。
+
+旧版本 cove 保存的会话没有记录目录，无法判断属于哪个项目，因此不出现在按项目的列表中（否则每个项目都会看到它们），但文件不会被删除，仍可在 `all` 视图中看到（标注为“旧版会话，未记录目录”）并恢复。列表中有被隐藏的会话时，会提示隐藏的数量和 `all` 用法。
+
+按会话 ID 恢复（`/resume <id>`、`/history <id>`）不受项目限制；如果该会话属于其他目录，恢复时会给出提示，显示会话目录和当前目录。
 
 ### 会话恢复
 
 ```
-/resume            # 列出可恢复的会话
-/resume <id>       # 恢复指定会话
-/history           # 查看历史会话
-/history <id>      # 恢复历史会话并美化显式
+/resume            # 列出当前项目可恢复的会话
+/resume <id>       # 恢复指定会话（可跨项目，会提示）
+/history           # 查看当前项目的历史会话
+/history <编号|id> # 恢复历史会话并美化显式
 ```
 
 #### 🛡️ 历史记录智能降噪

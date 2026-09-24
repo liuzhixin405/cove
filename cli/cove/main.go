@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 
+	"errors"
+
 	"fmt"
+
+	"io"
 
 	"os"
 
@@ -50,7 +54,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "10.0.0"
+	Version = "11.0.0"
 
 	BuildTime = "pro"
 
@@ -73,126 +77,56 @@ var (
 
 func main() {
 
-	args := os.Args[1:]
+	opts, err := parseCLIArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
 
-	debugMode, printMode := false, false
+	// Set first: --doctor reports the config of "--profile x --doctor".
+	profileName = opts.profile
 
-	var printPrompt string
+	switch opts.action {
+	case actionVersion:
+		outf("cove %s (built %s, commit %s)\n", Version, BuildTime, GitCommit)
+		return
+	case actionHelp:
+		printCLIHelp()
+		return
+	case actionDoctor:
+		runDoctor()
+		return
+	case actionConfig:
+		showConfig()
+		return
+	case actionListSessions:
+		listSessions(opts.listAll)
+		return
+	}
 
-	var printAttachments []string
+	debugMode := opts.debug
+	dumpPrompt, noAuto, tuiMode, noTUI = opts.dumpPrompt, opts.noAuto, opts.tui, opts.noTUI
+	recordDir, replayDir = opts.recordDir, opts.replayDir
 
-	for i := 0; i < len(args); i++ {
-
-		switch args[i] {
-
-		case "-v", "--version":
-
-			outf("cove %s (built %s, commit %s)\n", Version, BuildTime, GitCommit)
-
-			return
-
-		case "--help", "-h":
-
-			printCLIHelp()
-
-			return
-
-		case "--doctor":
-
-			runDoctor()
-
-			return
-
-		case "--config":
-
-			showConfig()
-
-			return
-
-		case "--list-sessions":
-
-			listSessions()
-
-			return
-
-		case "--dump-system-prompt":
-
-			dumpPrompt = true
-
-		case "--no-auto":
-
-			noAuto = true
-
-		case "-d", "--debug":
-
-			debugMode = true
-
-		case "-p", "--print":
-
-			if i+1 < len(args) {
-
-				i++
-
-				printPrompt = args[i]
-
+	printPrompt := opts.printPrompt
+	if opts.printMode {
+		// `cat app.log | cove -p "解释"` used to drop the log: -p never read
+		// stdin, and without a prompt it fell through to the interactive shell.
+		if stdinIsPiped() {
+			piped, truncated, err := readPipedStdin(os.Stdin, stdinFirstDataTimeout, maxPipedStdin)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: 读取 stdin 失败: %v\n", err)
+				os.Exit(1)
 			}
-
-			printMode = true
-
-		case "--image", "--file":
-
-			if i+1 < len(args) {
-
-				i++
-
-				printAttachments = append(printAttachments, args[i])
-
+			if truncated {
+				fmt.Fprintf(os.Stderr, "⚠ stdin 超过 %dMB，只发送了前 %dMB\n", maxPipedStdin>>20, maxPipedStdin>>20)
 			}
-
-		case "-r", "--resume":
-
-			if i+1 < len(args) {
-
-				i++
-
-			}
-
-		case "--tui":
-
-			tuiMode = true
-
-		case "--no-tui":
-
-			noTUI = true
-
-		case "--profile":
-			if i+1 < len(args) {
-				i++
-				profileName = args[i]
-			}
-
-		case "--record":
-			if i+1 < len(args) {
-				i++
-				recordDir = args[i]
-			}
-
-		case "--replay":
-			if i+1 < len(args) {
-				i++
-				replayDir = args[i]
-			}
-
-		default:
-
-			if printMode && printPrompt == "" {
-
-				printPrompt = args[i]
-
-			}
-
+			printPrompt = combinePromptAndStdin(printPrompt, piped)
 		}
-
+		if strings.TrimSpace(printPrompt) == "" {
+			fmt.Fprintln(os.Stderr, "Error: -p 需要提示内容：cove -p \"提示\"，或通过管道传入，例如 cat app.log | cove -p \"解释\"")
+			os.Exit(2)
+		}
 	}
 
 	app, err := bootstrapApp(debugMode, profileName, recordDir, replayDir)
@@ -219,6 +153,26 @@ func main() {
 		eng.SetAutoExtract(false)
 	}
 
+	if opts.resumeID != "" {
+		// Notices go to stderr so "cove -r <id> -p ..." keeps stdout for the
+		// answer alone.
+		r, warning, err := resumeStartupSession(eng.Store(), opts.resumeID, currentProjectDir(), eng.ResumeSession)
+		if err != nil {
+			reason := err.Error()
+			if errors.Is(err, os.ErrNotExist) {
+				reason = "没有这个会话"
+			}
+			fmt.Fprintf(os.Stderr, "Error: 无法恢复会话 %s: %s\n用 cove --list-sessions all 查看可用会话。\n", opts.resumeID, reason)
+			mcpPool.DisconnectAll()
+			os.Exit(1)
+		}
+		if warning != "" {
+			fmt.Fprint(os.Stderr, warning)
+		}
+		fmt.Fprintf(os.Stderr, "已恢复会话: %s (%d 条消息)\n", shortDesc(effectiveHistoryTitle(*r)), len(r.Messages))
+		appState.Messages = len(r.Messages)
+	}
+
 	// Set up interactive permission prompt for the REPL
 
 	// Startup diagnostic: quick check for critical issues
@@ -231,15 +185,19 @@ func main() {
 
 		outln(eng.SystemPrompt())
 
+		mcpPool.DisconnectAll()
+
 		return
 
 	}
 
-	if printMode && printPrompt != "" {
+	if opts.printMode {
 
-		runPrintMode(eng, printPrompt, debugMode, printAttachments, cfg)
+		code := runPrintMode(eng, opts.printPrompt, printPrompt, debugMode, opts.attachments, cfg)
 
-		return
+		finishSession(eng, mcpPool)
+
+		os.Exit(code)
 
 	}
 
@@ -249,6 +207,10 @@ func main() {
 		// registry (buildCommandList), so nothing has to be assembled here.
 		runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
+		// The shell's /exit and Ctrl+D paths already saved the session and
+		// recorded its cost (autoSaveSession); only MCP is left.
+		mcpPool.DisconnectAll()
+
 		return
 
 	}
@@ -257,6 +219,8 @@ func main() {
 	// frontend. The classic line REPL has been removed; its behavior lives in
 	// the Bubble Tea TUI (interactive) and here (non-interactive).
 	runHeadless(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
+
+	finishSession(eng, mcpPool)
 
 }
 
@@ -296,7 +260,7 @@ func shouldAutoSwitchToVision(warnings []string) bool {
 
 	for _, w := range warnings {
 
-		if strings.Contains(w, "fallback") || strings.Contains(w, "vision") {
+		if strings.Contains(w, nonVisionImageWarning) {
 
 			return true
 
@@ -384,15 +348,37 @@ func isPositiveNumber(input string) bool {
 
 }
 
-func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths []string, cfg *config.Config) {
-	trimmedPrompt := strings.TrimSpace(prompt)
-	if strings.HasPrefix(trimmedPrompt, "/") {
-		if strings.EqualFold(trimmedPrompt, "/history clean") {
+// runNeedsAPIKey reports whether a run must stop for a missing API key. -p
+// used to send the request anyway, so the user got a 401 or a connection
+// error instead of the setup guidance; a --replay run never calls the API.
+func runNeedsAPIKey(apiKey string, replaying bool) bool {
+	return strings.TrimSpace(apiKey) == "" && !replaying
+}
+
+// printPromptIsSlashCommand reports whether the prompt typed after -p is a
+// slash command. Only that argument is checked: piped stdin is content, and a
+// log starting with "/usr/bin/foo: error" must not be refused as a command.
+func printPromptIsSlashCommand(argPrompt string) bool {
+	return strings.HasPrefix(strings.TrimSpace(argPrompt), "/")
+}
+
+// runPrintMode runs one -p turn and returns the process exit code. argPrompt
+// is what the user typed after -p; prompt is the full message, which also
+// carries piped stdin. It returns instead of calling os.Exit so main can save
+// the session, record its cost and disconnect MCP servers on every outcome.
+func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, attachmentPaths []string, cfg *config.Config) int {
+	if printPromptIsSlashCommand(argPrompt) {
+		if strings.EqualFold(strings.TrimSpace(argPrompt), "/history clean") {
 			handleHistoryClean()
-			return
+			return 0
 		}
 		fmt.Fprintln(os.Stderr, "Error: -p 模式不执行 slash 命令（避免命令文本被当作对话写入历史）。请使用交互模式执行该命令。")
-		os.Exit(1)
+		return 1
+	}
+
+	if runNeedsAPIKey(cfg.EffectiveProvider().APIKey, replayDir != "") {
+		fmt.Fprintln(os.Stderr, missingAPIKeyMessage(cfg.EffectiveProvider().Name))
+		return 1
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -415,7 +401,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 
-		os.Exit(1)
+		return 1
 
 	}
 
@@ -433,7 +419,9 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 			}); err == nil {
 
-				outf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
+				// stderr: stdout carries only the answer, so `cove -p ... > out.txt`
+				// must not capture this notice.
+				fmt.Fprintf(os.Stderr, "[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
 				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
 
@@ -441,7 +429,7 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 
-					os.Exit(1)
+					return 1
 
 				}
 
@@ -453,22 +441,32 @@ func runPrintMode(eng *engine.Engine, prompt string, debug bool, attachmentPaths
 
 	for _, w := range warnings {
 
-		fmt.Fprintf(os.Stderr, "⚠ %s\n", w)
+		fmt.Fprintln(os.Stderr, w) // the warning carries its own ⚠
 
 	}
 
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil, nil)
 
 	if err != nil {
-
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-
-		os.Exit(1)
-
+		return printModeFailure(os.Stderr, ctx.Err() != nil, err)
 	}
 
 	outln(resp)
 
+	return 0
+
+}
+
+// printModeFailure reports a failed -p turn on w and returns the exit code.
+// Ctrl+C used to print "Error: context canceled" and exit 1, which a script
+// cannot tell from an API failure; 130 is the shell convention for SIGINT.
+func printModeFailure(w io.Writer, canceled bool, err error) int {
+	if canceled {
+		fmt.Fprintln(w, "[已取消] 当前任务已终止")
+		return 130
+	}
+	fmt.Fprintf(w, "Error: %v\n", err)
+	return 1
 }
 
 type replEngineAdapter struct {
@@ -484,6 +482,43 @@ func (a replEngineAdapter) SetSystemOverride(prompt string) { a.eng.SetSystemOve
 func (a replEngineAdapter) SystemPrompt() string { return a.eng.SystemPrompt() }
 
 func (a replEngineAdapter) CostTracker() command.CostTrackerView { return a.eng.CostTracker() }
+
+// The commands look for these by type assertion on the view they are given.
+// The adapter used to forward only the five EngineView methods, so /undo,
+// /checkpoints and /ratelimit always answered "不可用" in the real program
+// while their tests, which hand the command a fake engine, passed.
+
+func (a replEngineAdapter) ListCheckpoints() []string { return a.eng.ListCheckpoints() }
+
+func (a replEngineAdapter) RestoreCheckpoint(commitHash string) (string, error) {
+	return a.eng.RestoreCheckpoint(commitHash)
+}
+
+func (a replEngineAdapter) RateLimitInfo() api.RateLimitInfo { return a.eng.RateLimitInfo() }
+
+func (a replEngineAdapter) ReloadProvider(provider, model, baseURL, apiKey string) error {
+	return a.eng.ReloadProvider(provider, model, baseURL, apiKey)
+}
+
+func (a replEngineAdapter) SetPermissionMode(mode permission.Mode) { a.eng.SetPermissionMode(mode) }
+
+func (a replEngineAdapter) SetMaxBudget(maxBudget float64) { a.eng.SetMaxBudget(maxBudget) }
+
+// SetCustomInstructions and SetWorkingDir report true: the engine applies
+// both to the running session (/system without replacing the whole prompt,
+// /cd moving checkpoints and the session's project along).
+
+func (a replEngineAdapter) SetCustomInstructions(ci string) bool {
+	a.eng.SetCustomInstructions(ci)
+	return true
+}
+
+func (a replEngineAdapter) SetWorkingDir(dir string) bool {
+	a.eng.SetWorkingDir(dir)
+	return true
+}
+
+func (a replEngineAdapter) ResumeSession(r *session.Record) { a.eng.ResumeSession(r) }
 
 func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg *config.Config, eng *engine.Engine, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, permMgr *permission.Manager, projCtx *ctxt.ProjectContext, appState *state.AppState) {
 
@@ -560,7 +595,11 @@ func runDoctor() {
 
 	c := command.NewDoctorCmd()
 
-	out, _ := c.Execute(context.Background(), command.Input{Cwd: cwd})
+	// The config (never the key itself) lets the report say whether an API key
+	// is set, the most common first-run problem.
+	cfg, _ := config.LoadWithProfile(profileName)
+
+	out, _ := c.Execute(context.Background(), command.Input{Cwd: cwd, Config: cfg})
 
 	outln(out.Message)
 
@@ -752,25 +791,43 @@ func applyProviderConfigChange(cfg *config.Config, reloader providerReloader, mu
 
 }
 
-func listSessions() {
+func listSessions(all bool) {
 
 	s, _ := session.NewStore()
 
 	records, _ := s.List()
 
+	hidden := 0
+
+	if !all {
+
+		project := session.FilterByProject(records, currentProjectDir())
+
+		hidden = len(records) - len(project)
+
+		records = project
+
+	}
+
 	if len(records) == 0 {
 
 		outln("没有找到任何会话记录。")
 
-		return
+	} else {
+
+		outf("%d 条会话记录:\n", len(records))
+
+		for _, r := range records {
+
+			outf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
+
+		}
 
 	}
 
-	outf("%d 条会话记录:\n", len(records))
+	if hidden > 0 {
 
-	for _, r := range records {
-
-		outf("  %s  %s  (%dt)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("2006-01-02 15:04"))
+		outf("另有 %d 条其他项目或旧版本的会话未显示，使用 cove --list-sessions all 查看全部。\n", hidden)
 
 	}
 
@@ -789,8 +846,12 @@ func printCLIHelp() {
 
  cove --no-tui              使用 headless 无 UI 模式（适合脚本/管道）
 
+ cove --tui                 即使 stdin/stdout 不是终端也强制使用交互界面
 
- cove -p <prompt>           执行单次询问并输出结果
+
+ cove -p, --print <prompt>  执行单次询问：答案输出到 stdout，提示与错误输出到 stderr
+                            管道输入会附在提示后: cat app.log | cove -p "解释"
+                            退出码: 0 成功, 1 失败, 2 参数错误, 130 被 Ctrl+C 中断
 
 
  cove -p <prompt> --image <path> 执行单次带有图片的询问
@@ -799,9 +860,11 @@ func printCLIHelp() {
  cove -p <prompt> --file <path>  执行单次带有文件的询问
 
 
- cove -r <id>               恢复之前的会话记录
+ cove -r, --resume <id>     恢复之前的会话记录（可与 -p 连用，继续该会话）
 
+ cove --dump-system-prompt  打印系统提示词后退出
 
+ cove --no-auto             禁用后台自学习功能（记忆提取等额外 API 调用）
 
 
  cove --profile <name>      使用指定 profile 启动
@@ -810,10 +873,10 @@ func printCLIHelp() {
 
  cove --replay <dir>        使用录制数据回放（不调用真实 API）
 
- cove --list-sessions       列出所有会话记录
+ cove --list-sessions [all] 列出当前目录的会话记录（all: 所有项目）
 
 
- cove -d                    开启调试模式并打印日志
+ cove -d, --debug           开启调试模式并打印日志
 
 
  cove --doctor              运行环境自检

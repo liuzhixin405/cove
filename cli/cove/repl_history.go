@@ -44,16 +44,24 @@ func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
-	if sessionID == "" {
+	sessionID = strings.TrimSpace(sessionID)
+	if all := strings.EqualFold(sessionID, "all"); sessionID == "" || all {
 		records, _ := store.List()
+		hidden := 0
+		if !all {
+			project := session.FilterByProject(records, currentProjectDir())
+			hidden = len(records) - len(project)
+			records = project
+		}
 		if len(records) == 0 {
 			termui.PrintSafe("没有已保存的会话\n")
-			return
+		} else {
+			termui.PrintSafe("%d 个已保存的会话:\n", len(records))
+			for _, r := range records {
+				termui.PrintSafe("  %s  %s  (%d tokens)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("15:04"))
+			}
 		}
-		termui.PrintSafe("%d 个已保存的会话:\n", len(records))
-		for _, r := range records {
-			termui.PrintSafe("  %s  %s  (%d tokens)  %s\n", r.ID, r.Title, r.TokensIn+r.TokensOut, r.UpdatedAt.Format("15:04"))
-		}
+		printHiddenSessionsHint(hidden, "/resume all")
 		return
 	}
 	r, err := store.Load(sessionID)
@@ -61,12 +69,26 @@ func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 		termui.PrintSafe("会话 %s 未找到\n", sessionID)
 		return
 	}
-	eng.LoadMessages(r.Messages)
+	// An explicit ID resumes whatever project it came from; the warning is
+	// what tells the user the conversation is about another codebase.
+	printProjectMismatchWarning(r)
+	// ResumeSession, not LoadMessages: loading only the messages continued in
+	// a fresh session, so every resume saved a copy under a new ID and the
+	// original never grew.
+	eng.ResumeSession(r)
 	termui.PrintSafe("已恢复: %s (%d 条消息, %d tokens)\n", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)
 }
 
-func autoSaveSession(eng *engine.Engine) {
-	if eng.HasMessages() {
+// finishSession is the exit work every front end owes: save the session,
+// record its cost in the history /cost reads, and disconnect MCP servers so
+// stdio servers can shut down cleanly (pool may be nil). It prints nothing,
+// since the headless and -p paths keep stdout for answers.
+//
+// Only the TUI's /exit and Ctrl+D used to record cost (via autoSaveSession),
+// so /cost's 24h and 7-day figures ignored every headless and -p run, and no
+// path disconnected MCP servers.
+func finishSession(eng *engine.Engine, pool interface{ DisconnectAll() }) {
+	if eng != nil && eng.HasMessages() {
 		eng.SaveSession()
 		ch := cost.NewCostHistory()
 		sessionID := ""
@@ -76,7 +98,18 @@ func autoSaveSession(eng *engine.Engine) {
 			model = s.Model
 		}
 		ch.Add(sessionID, model, eng.CostTracker())
-		_ = ch.Save()
+		if err := ch.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "费用记录保存失败: %v\n", err)
+		}
+	}
+	if pool != nil {
+		pool.DisconnectAll()
+	}
+}
+
+func autoSaveSession(eng *engine.Engine) {
+	if eng.HasMessages() {
+		finishSession(eng, nil)
 		outln("会话已自动保存。")
 	}
 }
@@ -173,19 +206,62 @@ func clearInterruptedDraft() error {
 	return os.Remove(p)
 }
 
-func handleHistory(eng *engine.Engine) {
+// historyPickAll records whether the last /history listing was the
+// all-projects view. The REPL loops resolve a bare number typed after a
+// listing through handleHistoryResume, which must index the list the user
+// just saw: otherwise "3" after /history all resumes the project list's #3.
+var historyPickAll bool
+
+// currentProjectDir is the directory the per-project history views filter
+// on. The engine records a new session's directory with os.Getwd too, so the
+// two always agree.
+func currentProjectDir() string {
+	dir, _ := os.Getwd()
+	return dir
+}
+
+// printHiddenSessionsHint says where the other projects' (and legacy)
+// sessions went, so the per-project default never looks like lost history.
+func printHiddenSessionsHint(hidden int, allCmd string) {
+	if hidden > 0 {
+		termui.PrintSafe("\n  另有 %d 个其他项目或旧版本的会话未显示，使用 %s 查看全部。\n", hidden, allCmd)
+	}
+}
+
+func printProjectMismatchWarning(r *session.Record) {
+	if w := session.ProjectMismatchWarning(r, currentProjectDir()); w != "" {
+		termui.PrintSafe("%s%s%s", termui.Yellow, w, termui.Reset)
+	}
+}
+
+// historyProjectLabel names the project a session belongs to in the
+// all-projects view, where rows from different directories sit side by side.
+func historyProjectLabel(r session.Record) string {
+	if r.Cwd == "" {
+		return "旧版会话，未记录目录"
+	}
+	return filepath.Base(r.Cwd)
+}
+
+func handleHistory(eng *engine.Engine, all bool) {
 	store := eng.Store()
 	if store == nil {
 		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
-	records := listHistoryRecords(store)
+	historyPickAll = all
+	records, hidden := listHistoryRecords(store, currentProjectDir(), all)
 	draft, _ := loadInterruptedDraft()
 	if len(records) == 0 && draft == nil {
-		termui.PrintSafe("暂无历史。退出时会自动保存会话。\n")
+		termui.PrintSafe("当前项目暂无历史。退出时会自动保存会话。\n")
+		printHiddenSessionsHint(hidden, "/history all")
 		return
 	}
-	termui.PrintSafe("\n  历史记录 (%d 个会话):\n\n", len(records))
+	if all {
+		termui.PrintSafe("\n  历史记录 (所有项目, %d 个会话):\n\n", len(records))
+	} else {
+		termui.PrintSafe("\n  历史记录 (当前项目, %d 个会话):\n\n", len(records))
+	}
 	if draft != nil {
 		termui.PrintSafe("  ⚠ 中断草稿 [%s] %s\n", draft.UpdatedAt.Format("01-02 15:04"), shortDesc(draft.Title))
 	}
@@ -210,14 +286,26 @@ func handleHistory(eng *engine.Engine) {
 		// compactRunes, not title[:50]: these titles are mostly Chinese, and a
 		// byte slice cut one mid-rune so the history list showed mojibake.
 		title = compactRunes(title, 50)
-		termui.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
+		if all {
+			termui.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)  <%s>\n", i+1, date, title, turns, msgCount, historyProjectLabel(r))
+		} else {
+			termui.PrintSafe("  %2d. [%s] %s  (%d 轮 / %d 条)\n", i+1, date, title, turns, msgCount)
+		}
 	}
 	if len(records) > limit {
 		termui.PrintSafe("\n  ... 还有 %d 条。\n", len(records)-limit)
 	}
-	termui.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
-	termui.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
-	termui.PrintSafe("  查看详情: /history detail <编号>\n\n")
+	printHiddenSessionsHint(hidden, "/history all")
+	if all {
+		termui.PrintSafe("\n  继续会话: /history all <编号>  (例如 /history all 1)\n")
+		termui.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
+		termui.PrintSafe("  查看详情: /history all detail <编号>\n\n")
+	} else {
+		termui.PrintSafe("\n  继续会话: /history <编号>  (例如 /history 1)\n")
+		termui.PrintSafe("  或直接输入编号: 1 / 2 / 3 ...\n")
+		termui.PrintSafe("  查看详情: /history detail <编号>\n")
+		termui.PrintSafe("  所有项目: /history all\n\n")
+	}
 	termui.PrintSafe("  清洗历史: /history clean\n\n")
 	if draft != nil {
 		termui.PrintSafe("  中断详情: /history detail interrupted\n\n")
@@ -390,14 +478,23 @@ func sessionPreview(r session.Record) string {
 	return ""
 }
 
+// handleHistoryResume resumes a number typed after a /history listing,
+// indexing whichever view (project or all) was listed last.
 func handleHistoryResume(input string, eng *engine.Engine) {
+	handleHistoryResumeIn(input, eng, historyPickAll)
+}
+
+// handleHistoryResumeIn resumes by list number or session ID. A number
+// indexes the current project's list, or every project's when all is set; an
+// ID resolves regardless of project.
+func handleHistoryResumeIn(input string, eng *engine.Engine, all bool) {
 	store := eng.Store()
 	if store == nil {
 		termui.PrintSafe("会话存储不可用\n")
 		return
 	}
 
-	records := listHistoryRecords(store)
+	records, _ := listHistoryRecords(store, currentProjectDir(), all)
 	var idx int
 	var r *session.Record
 	var err error
@@ -423,7 +520,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 		return
 	}
 
-	eng.LoadMessages(r.Messages)
+	eng.ResumeSession(r)
 	title := effectiveHistoryTitle(*r)
 
 	// Dynamic interactive feedback: print last 4 messages on main console instead of a dry summary!
@@ -434,6 +531,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 		termui.PrintSafe("  ★ 已成功拉回历史会话: %s\n", title)
 	}
 	termui.PrintSafe("==================================================\n\n")
+	printProjectMismatchWarning(r)
 
 	if len(r.Messages) == 0 {
 		termui.PrintSafe("  (该历史会话为空，现在可以输入指令开始新的对话)\n\n")
@@ -481,7 +579,7 @@ func handleHistoryResume(input string, eng *engine.Engine) {
 	termui.PrintSafe("%s历史会话与运行上下文已被完整恢复。您可以直接继续向 Cove 提问了：%s\n\n", termui.Green, termui.Reset)
 }
 
-func handleHistoryDetail(input string, eng *engine.Engine) {
+func handleHistoryDetail(input string, eng *engine.Engine, all bool) {
 	if strings.TrimSpace(input) == "" {
 		termui.PrintSafe("用法: /history detail <编号|session-id>\n")
 		return
@@ -507,7 +605,7 @@ func handleHistoryDetail(input string, eng *engine.Engine) {
 	}
 
 	resolve := func(sel string) (*session.Record, error) {
-		records := listHistoryRecords(store)
+		records, _ := listHistoryRecords(store, currentProjectDir(), all)
 		var idx int
 		if _, err := fmt.Sscanf(sel, "%d", &idx); err == nil && idx >= 1 && idx <= len(records) {
 			return store.Load(records[idx-1].ID)
@@ -573,9 +671,13 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 		termui.PrintSafe("会话存储不可用\n")
 		return false
 	}
-	records, _ := store.List()
+	// Only this project's sessions: auto-resuming another codebase's task
+	// and then sending "继续" would have the model edit the wrong project.
+	all, _ := store.List()
+	records := session.FilterByProject(all, currentProjectDir())
 	if len(records) == 0 {
-		termui.PrintSafe("暂无历史。\n")
+		termui.PrintSafe("当前项目暂无历史。\n")
+		printHiddenSessionsHint(len(all), "/history all")
 		return false
 	}
 
@@ -601,19 +703,23 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	}
 
 	if best.rec == nil {
-		handleHistoryResume("1", eng)
+		handleHistoryResumeIn("1", eng, false)
 		return true
 	}
 
-	eng.LoadMessages(best.rec.Messages)
+	eng.ResumeSession(best.rec)
 	title := effectiveHistoryTitle(*best.rec)
 	userTurns := countUserTurns(best.rec.Messages)
 	termui.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
 	return true
 }
 
-func listHistoryRecords(store *session.Store) []session.Record {
-	records, _ := store.List()
+// listHistoryRecords returns the sessions /history (and the Ctrl+R picker)
+// shows: cwd's project only, or every project when all is set, minus empty
+// and low-signal ones. hidden counts the listable sessions the project view
+// left out, so the caller can point at /history all.
+func listHistoryRecords(store *session.Store, cwd string, all bool) (records []session.Record, hidden int) {
+	records, _ = store.List()
 	out := make([]session.Record, 0, len(records))
 	for _, r := range records {
 		if r.UserTurns == 0 {
@@ -629,7 +735,11 @@ func listHistoryRecords(store *session.Store) []session.Record {
 		}
 		out = append(out, r)
 	}
-	return out
+	if all {
+		return out, 0
+	}
+	project := session.FilterByProject(out, cwd)
+	return project, len(out) - len(project)
 }
 
 func effectiveHistoryTitle(r session.Record) string {
@@ -671,7 +781,6 @@ func looksSyntheticHistoryText(s string) bool {
 		"[system:", "[Conversation Summary]",
 		"[系统检测到重复操作循环]", "[Context truncated",
 		"[用户指引]", "[Continue the task", "[会话摘要]",
-		"run slow tool", "do something", "slow response",
 	}
 	for _, p := range knownPrefixes {
 		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {

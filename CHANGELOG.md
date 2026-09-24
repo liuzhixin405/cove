@@ -1,4 +1,33 @@
-﻿## [Unreleased]
+﻿## [11.0.0] - 2026-09-25
+
+### Added
+- **Shell 抽象层** (`internal/shell`)：统一命令解释器的选择（Windows 上 cmd/PowerShell，类 Unix 上 sh/bash），使 bash 工具、done-verify 门禁与系统提示词中的环境行保持一致。
+- **终端控制序列净化** (`internal/render/sanitize`)：模型回复、推理内容、命令文本、文件/网页摘要等一切非 cove 自身产生的输出在渲染前统一剥离 ANSI 转义序列。
+- **灾难性命令检测** (`internal/safety/command.go`)：识别会破坏项目之外数据的 shell 命令（清空文件系统/家目录/系统目录、写裸盘、关机、执行网络拉取的代码）并给出简短原因。
+- **读后写保护** (`internal/tool/file_tracker.go`)：记录本会话中模型已读取的文件版本，write/edit 拒绝覆盖模型未曾读取过的文件。
+- **旧版编码与行尾支持** (`internal/tool/gbk.go`、`internal/browser/charset.go`、`internal/tool/line_endings.go`)：GBK/GB18030 文件的解码与回写、UTF-8 BOM 处理、CRLF 行尾保留。
+- **原子文件替换** (`internal/tool/replace_file*.go`)：write/edit 通过临时文件 + rename 落盘，避免写入中途损坏目标文件。
+- **Shell 工具权限作用域** (`internal/permission/command_prefix.go`)：“总是允许”对 shell 类工具按命令前缀授权，而非整工具放行。
+- **SSE 解析健壮性** (`internal/api/sse.go`、`internal/mcp/sseparse.go`)：容忍 `data:` 后缺省空格、注释行等非标准但常见的 SSE 写法。
+- **API 错误分类** (`internal/api/errors.go`) 与**调用计量 Provider** (`internal/api/metered.go`)：统一的错误判定/重试语义与用量回调。
+- **会话项目规范化** (`internal/session/project.go`)：统一项目目录的规范形式，避免同一项目因路径写法不同被拆成多个。
+- **Windows 进程树终止** (`internal/mcp/proctree_*.go`)：确保 MCP 子进程连同其子进程一并清理。
+- **自定义/插件命令参数展开** (`internal/command/arguments.go`)：`$ARGUMENTS` 占位符填充与追加逻辑。
+- **CLI 参数解析独立成文件** (`cli/cove/cli_args.go`) 与 **stdin PTY 检测** (`cli/cove/stdin_pty_*.go`)：支持 `--print`/`--resume` 等参数与管道输入的可靠判定。
+
+### Changed
+- **技能系统** (`internal/skills`)：每个技能记录来源，加载优先级为 项目 > 用户 > 插件 > 内置；内置技能收敛为 12 个按需加载技能。
+- **大规模重构**：engine、MCP 客户端与连接池、delegate、diagnostic、config、cost 等模块的职责拆分与错误处理整理。
+- **工具加固**：grep、read、glob、mcp_tool、webfetch、bash/powershell、browser 等工具的输出处理、编码与路径安全增强。
+- **文档**：README 与 `docs/USER_MANUAL.md` 更新（技能数量、命令与配置说明）。
+
+### Fixed
+- 引入依赖 `golang.org/x/text` 以支持 GBK/GB18030 解码。
+
+### Tests
+- 新增 113 个测试文件，覆盖 api、engine、tool、mcp、permission、config、session、delegate 等模块的边界与回归场景。
+
+## [Unreleased]
 
 ### Added
 - **配置档案 (Profiles)**：新增 /profile 命令（list/switch/save/delete/show）和 --profile 启动参数，支持切换命名配置切片（model/provider/budget 等）。

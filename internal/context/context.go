@@ -1,6 +1,7 @@
 package context
 
 import (
+	stdctx "context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,8 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/liuzhixin405/cove/internal/repomap"
+	"github.com/liuzhixin405/cove/internal/shell"
 )
 
 type ProjectContext struct {
@@ -53,7 +56,7 @@ func (c *ProjectContext) GetGitInfo() (branch string, status string) {
 func Collect() *ProjectContext {
 	c := &ProjectContext{
 		Platform: runtime.GOOS + "/" + runtime.GOARCH,
-		Shell:    detectShell(),
+		Shell:    shell.Default().Describe(),
 	}
 	c.Cwd, _ = os.Getwd()
 	c.GitRoot = findGitRoot(c.Cwd)
@@ -94,9 +97,33 @@ func Collect() *ProjectContext {
 	return c
 }
 
+// gitTimeout bounds each git call made while collecting project context.
+// Collect runs at startup and waits for all of them; with no bound, a git that
+// never returned (status on a huge repo, a network filesystem, a stuck
+// fsmonitor) kept cove from starting.
+var gitTimeout = 5 * time.Second
+
+// gitCommand builds a bounded git invocation in dir. The caller must call the
+// returned cancel func.
+//
+// GIT_OPTIONAL_LOCKS=0: "git status" otherwise refreshes the index under
+// .git/index.lock, so running it in the background made the user's own commit
+// (or the model's bash call) fail with "index.lock: File exists".
+// core.quotePath=false: git otherwise prints non-ASCII paths as octal escapes,
+// and the prompt showed "ä¸­æ.go" for 中文.go.
+func gitCommand(dir string, args ...string) (*exec.Cmd, stdctx.CancelFunc) {
+	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), gitTimeout)
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.quotePath=false"}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(shell.Env(os.Environ()), "GIT_OPTIONAL_LOCKS=0")
+	// A killed git can leave a child holding stdout open; don't wait on it.
+	cmd.WaitDelay = time.Second
+	return cmd, cancel
+}
+
 func findGitRoot(cwd string) string {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = cwd
+	cmd, cancel := gitCommand(cwd, "rev-parse", "--show-toplevel")
+	defer cancel()
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -105,16 +132,21 @@ func findGitRoot(cwd string) string {
 }
 
 func gitBranch(root string) string {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = root
+	cmd, cancel := gitCommand(root, "rev-parse", "--abbrev-ref", "HEAD")
+	defer cancel()
 	out, _ := cmd.Output()
 	return strings.TrimSpace(string(out))
 }
 
 func gitStatus(root string) string {
-	cmd := exec.Command("git", "status", "--porcelain")
-	cmd.Dir = root
-	out, _ := cmd.Output()
+	cmd, cancel := gitCommand(root, "status", "--porcelain")
+	defer cancel()
+	out, err := cmd.Output()
+	if err != nil {
+		// Used to fall through to "(clean)": a failed or timed-out status
+		// printed nothing, and the model was told a dirty tree was clean.
+		return "(unknown: git status failed or timed out)"
+	}
 	s := strings.TrimSpace(string(out))
 	if s == "" {
 		return "(clean)"
@@ -126,19 +158,9 @@ func gitStatus(root string) string {
 	return s
 }
 
-func detectShell() string {
-	if s := os.Getenv("SHELL"); s != "" {
-		return s
-	}
-	if runtime.GOOS == "windows" {
-		return "powershell"
-	}
-	return "/bin/sh"
-}
-
 func gitLog(root string) string {
-	cmd := exec.Command("git", "log", "--oneline", "--format=%h %an %s", "-5")
-	cmd.Dir = root
+	cmd, cancel := gitCommand(root, "log", "--oneline", "--format=%h %an %s", "-5")
+	defer cancel()
 	out, _ := cmd.Output()
 	s := strings.TrimSpace(string(out))
 	if s == "" {
@@ -150,15 +172,15 @@ func gitLog(root string) string {
 func detectMainBranch(root string) string {
 	// Try common remote main branch names
 	for _, name := range []string{"main", "master"} {
-		cmd := exec.Command("git", "rev-parse", "--verify", "refs/heads/"+name)
-		cmd.Dir = root
+		cmd, cancel := gitCommand(root, "rev-parse", "--verify", "refs/heads/"+name)
+		defer cancel()
 		if err := cmd.Run(); err == nil {
 			return name
 		}
 	}
 	// Fallback: check remote HEAD
-	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
-	cmd.Dir = root
+	cmd, cancel := gitCommand(root, "symbolic-ref", "refs/remotes/origin/HEAD")
+	defer cancel()
 	out, err := cmd.Output()
 	if err == nil {
 		ref := strings.TrimSpace(string(out))
@@ -171,8 +193,8 @@ func detectMainBranch(root string) string {
 }
 
 func gitUser(root string) string {
-	cmd := exec.Command("git", "config", "user.name")
-	cmd.Dir = root
+	cmd, cancel := gitCommand(root, "config", "user.name")
+	defer cancel()
 	out, _ := cmd.Output()
 	return strings.TrimSpace(string(out))
 }

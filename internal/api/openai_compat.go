@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -40,7 +39,7 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 		name:    cfg.Name,
 		apiKey:  cfg.APIKey,
 		keyPool: pool,
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
+		baseURL: normalizeOpenAIBaseURL(cfg.BaseURL),
 		client: &http.Client{
 			Timeout:   180 * time.Second,
 			Transport: transport,
@@ -68,7 +67,7 @@ func (p *openAICompatProvider) DisplayName() string {
 	return p.name
 }
 func (p *openAICompatProvider) Validate() error {
-	if p.apiKey == "" {
+	if p.apiKey == "" && p.keyPool.size() == 0 {
 		return fmt.Errorf("API key required (set LLM_API_KEY or provider-specific env var)")
 	}
 	return nil
@@ -113,8 +112,9 @@ type oaiStreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 type oaiChoice struct {
-	Index   int    `json:"index"`
-	Message oaiMsg `json:"message,omitempty"`
+	Index        int    `json:"index"`
+	Message      oaiMsg `json:"message,omitempty"`
+	FinishReason string `json:"finish_reason,omitempty"`
 }
 type oaiUsage struct {
 	PromptTokens            int                        `json:"prompt_tokens"`
@@ -194,11 +194,8 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
-	if httpResp.StatusCode >= 500 {
-		return nil, &RetryableError{Msg: fmt.Sprintf("server error %d", httpResp.StatusCode)}
-	}
-	if httpResp.StatusCode == 429 {
-		return nil, &RetryableError{Msg: "rate limited"}
+	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: ParseRetryAfter(httpResp.Header)}
 	}
 	if httpResp.StatusCode != 200 {
 		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, raw, hadImage)
@@ -215,15 +212,20 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		msg := cr.Choices[0].Message
 		content = extractOAIMsgText(msg.Content)
 		reasoningContent := msg.ReasoningContent
+		if cr.Choices[0].FinishReason == finishInsufficientResource {
+			return nil, errInsufficientResource()
+		}
+		stopReason := openAIStopReason(cr.Choices[0].FinishReason)
 		for _, tc := range msg.ToolCalls {
+			if tc.ID == "" {
+				tc.ID = newToolCallID()
+			}
 			input, ok := RepairToolArguments(tc.Function.Arguments)
 			if !ok {
 				toolCalls = append(toolCalls, ToolCall{
-					ID:   tc.ID,
-					Name: tc.Function.Name,
-					Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
-						"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
-						len(tc.Function.Arguments), truncate(tc.Function.Arguments, 120))},
+					ID:         tc.ID,
+					Name:       tc.Function.Name,
+					Input:      toolArgsParseError(tc.Function.Arguments, stopReason == "length"),
 					ParseError: true,
 				})
 				continue
@@ -242,7 +244,7 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 			PromptCacheHitTokens:  cr.Usage.cacheHitTokens(),
 			PromptCacheMissTokens: cr.Usage.cacheMissTokens(),
 			ReasoningTokens:       cr.Usage.reasoningTokens(),
-			StopReason:            "stop",
+			StopReason:            stopReason,
 			RateLimitHeaders:      httpResp.Header,
 		}, nil
 	}
@@ -292,6 +294,15 @@ func (u oaiUsage) reasoningTokens() int {
 func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 	var out []oaiMsg
 	for _, m := range in {
+		// Consecutive plain-text user turns (a real message followed by
+		// engine-supplied context) go out as one message: several compatible
+		// backends reject successive user messages.
+		if n := len(out); n > 0 && m.Role == "user" && len(m.Parts) == 0 && out[n-1].Role == "user" {
+			if prev, ok := out[n-1].Content.(string); ok {
+				out[n-1].Content = prev + "\n\n" + m.Content
+				continue
+			}
+		}
 		om := oaiMsg{Role: m.Role, Content: p.convertMessageContent(m), ToolCallID: m.ToolCallID}
 		if len(m.ToolCalls) > 0 {
 			// DeepSeek Think/Tool-use guidelines:
@@ -404,6 +415,15 @@ func (p *openAICompatProvider) toolChoice(tools []oaiTool) string {
 type oaiStreamChunk struct {
 	Choices []oaiStreamChoice `json:"choices"`
 	Usage   *oaiUsage         `json:"usage,omitempty"`
+	// Error is how compatible servers report a failure that happens after the
+	// 200 header was sent (upstream overload, moderation, a dropped backend).
+	Error *oaiStreamError `json:"error,omitempty"`
+}
+
+type oaiStreamError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    any    `json:"code"`
 }
 
 type oaiStreamChoice struct {
@@ -509,8 +529,12 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		Name    string
 		ArgsBuf strings.Builder
 	}
-	tcMap := make(map[int]*tcAccum)
+	// Calls in the order they started; byIndex maps a stream index to the
+	// call currently using it.
+	var calls []*tcAccum
+	byIndex := make(map[int]*tcAccum)
 	lastFinish := "" // finish_reason from the most recent chunk that reported one
+	sawDone := false
 
 	for scanner.Scan() {
 		// Stop promptly if the caller cancelled (e.g. user pressed Ctrl+C).
@@ -518,15 +542,21 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			return nil, ctx.Err()
 		}
 		markProgress() // reset the idle watchdog on every received line
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || line == "data: [DONE]" {
-			continue
+		payload, ok := sseDataPayload(scanner.Text())
+		if !ok {
+			continue // blank line, ": keep-alive" comment, event:/id: field
 		}
-		clean := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			sawDone = true
+			break
+		}
 
 		var chunk oaiStreamChunk
-		if err := json.Unmarshal([]byte(clean), &chunk); err != nil {
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
+		}
+		if chunk.Error != nil {
+			return nil, fmt.Errorf("provider stream error: %s", streamErrorText(chunk.Error))
 		}
 		if len(chunk.Choices) > 0 {
 			if fr := chunk.Choices[0].FinishReason; fr != "" {
@@ -546,10 +576,14 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 				}
 			}
 			for _, tc := range d.ToolCalls {
-				acc, exists := tcMap[tc.Index]
-				if !exists {
+				acc, exists := byIndex[tc.Index]
+				// A new id at a used index is a new call: some servers send
+				// every parallel call whole at index 0, and merging them by
+				// index glued two argument objects into one broken call.
+				if !exists || (tc.ID != "" && acc.ID != "" && tc.ID != acc.ID) {
 					acc = &tcAccum{ID: tc.ID, Name: tc.Function.Name}
-					tcMap[tc.Index] = acc
+					byIndex[tc.Index] = acc
+					calls = append(calls, acc)
 				}
 				if tc.ID != "" {
 					acc.ID = tc.ID
@@ -574,26 +608,38 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		}
 		return nil, fmt.Errorf("stream read error: %w", err)
 	}
-
-	indices := make([]int, 0, len(tcMap))
-	for idx := range tcMap {
-		indices = append(indices, idx)
+	// Neither a finish_reason nor [DONE]: the connection closed cleanly in
+	// the middle of the answer. This used to be returned as a normal "stop",
+	// so a half-written reply was taken as the final one.
+	if !sawDone && lastFinish == "" {
+		return nil, fmt.Errorf("stream ended before the response completed (unexpected EOF: no finish_reason or [DONE])")
 	}
-	sort.Ints(indices)
-	for _, idx := range indices {
-		acc := tcMap[idx]
+
+	if lastFinish == finishInsufficientResource {
+		return nil, errInsufficientResource()
+	}
+
+	truncated := lastFinish == "length"
+	for _, acc := range calls {
 		rawArgs := acc.ArgsBuf.String()
-		if rawArgs == "" {
-			continue // nothing arrived at all for this call, nothing to repair or report
+		if acc.ID == "" {
+			acc.ID = newToolCallID()
+		}
+		if strings.TrimSpace(rawArgs) == "" {
+			if truncated || acc.Name == "" {
+				continue // cut off before any arguments arrived
+			}
+			// A tool without parameters may stream no argument text at all;
+			// that is a complete call with an empty input.
+			streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: map[string]any{}})
+			continue
 		}
 		input, ok := RepairToolArguments(rawArgs)
 		if !ok {
 			streamAcc.AddToolCall(adapter.ToolCall{
-				ID:   acc.ID,
-				Name: acc.Name,
-				Input: map[string]any{"_cove_parse_error": fmt.Sprintf(
-					"tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
-					len(rawArgs), truncate(rawArgs, 120))},
+				ID:         acc.ID,
+				Name:       acc.Name,
+				Input:      toolArgsParseError(rawArgs, truncated),
 				ParseError: true,
 			})
 			continue
@@ -602,24 +648,8 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	}
 	toolCalls := toAPIToolCalls(streamAcc.ToolCalls())
 
-	// Derive the stop reason from the stream's finish_reason. OpenAI sends
-	// "stop" | "length" | "tool_calls" | "content_filter". Map to the same
-	// vocabulary the engine checks (it treats "length"/"max_tokens" with no
-	// tool calls as a truncation that needs continuation).
-	var stopReason string
-	switch lastFinish {
-	case "length":
-		stopReason = "length"
-	case "tool_calls":
-		stopReason = "tool_use"
-	case "content_filter":
-		stopReason = "content_filter"
-	case "stop", "":
-		stopReason = "stop"
-	default:
-		stopReason = lastFinish
-	}
-	if stopReason == "stop" && len(toolCalls) == 0 && len(tcMap) > 0 {
+	stopReason := openAIStopReason(lastFinish)
+	if stopReason == "stop" && len(toolCalls) == 0 && len(calls) > 0 {
 		// Tool calls started streaming but none completed → truncated mid-call.
 		stopReason = "length"
 	}
@@ -637,6 +667,30 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		StopReason:            stopReason,
 		RateLimitHeaders:      httpResp.Header,
 	}, nil
+}
+
+// finishInsufficientResource is DeepSeek's finish_reason for inference it
+// aborted under load. The answer is incomplete; it used to be accepted as a
+// finished turn.
+const finishInsufficientResource = "insufficient_system_resource"
+
+func errInsufficientResource() error {
+	return &RetryableError{Status: http.StatusServiceUnavailable,
+		Msg: "the server aborted inference (finish_reason insufficient_system_resource); the answer is incomplete"}
+}
+
+// openAIStopReason maps an OpenAI finish_reason ("stop" | "length" |
+// "tool_calls" | "content_filter") to the vocabulary the engine checks: it
+// treats "length" with no tool calls as a truncation that needs continuation.
+func openAIStopReason(finish string) string {
+	switch finish {
+	case "tool_calls", "function_call":
+		return "tool_use"
+	case "", "stop":
+		return "stop"
+	default:
+		return finish
+	}
 }
 
 func toAPIToolCalls(calls []adapter.ToolCall) []ToolCall {

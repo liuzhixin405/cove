@@ -1,6 +1,9 @@
 package permission
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 type Mode string
 
@@ -36,9 +39,19 @@ type Rule struct {
 	ToolPattern string
 	Decision    Decision
 	ArgPattern  string
+	// CommandPrefix scopes a bash/powershell rule to command lines built from
+	// commands that start with these words; see commandCovered.
+	CommandPrefix string
+	// InputEquals scopes a rule to calls whose input has each of these
+	// fields set to exactly this string, e.g. serverName+toolName for the
+	// MCP proxy tool.
+	InputEquals map[string]string
 }
 
 type Manager struct {
+	// mu guards everything below: parallel tool calls Check while the
+	// approval prompt adds session rules.
+	mu              sync.RWMutex
 	mode            Mode
 	allow           []Rule
 	deny            []Rule
@@ -50,11 +63,27 @@ func NewManager(mode Mode) *Manager {
 	return &Manager{mode: mode}
 }
 
-func (m *Manager) SetMode(mode Mode)         { m.mode = mode }
-func (m *Manager) Mode() Mode                { return m.mode }
-func (m *Manager) SetBypassAvailable(v bool) { m.bypassAvailable = v }
+func (m *Manager) SetMode(mode Mode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mode = mode
+}
+
+func (m *Manager) Mode() Mode {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.mode
+}
+
+func (m *Manager) SetBypassAvailable(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bypassAvailable = v
+}
 
 func (m *Manager) AddRule(decision Decision, rule Rule) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	rule.Decision = decision
 	switch decision {
 	case DAllow:
@@ -67,18 +96,37 @@ func (m *Manager) AddRule(decision Decision, rule Rule) {
 }
 
 func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecision Decision) (Decision, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for _, r := range m.deny {
 		if matchRule(r, toolName, toolInput) {
 			return DDeny, "denied by policy rule"
 		}
 	}
+	// Plan mode is read-only whatever rules were added earlier: an "always
+	// allow bash" answered in default mode must not let plan mode run bash.
+	if m.mode == Plan && defaultDecision != DAllow {
+		return DDeny, "plan mode - only read operations allowed"
+	}
 	if m.mode == Bypass && m.bypassAvailable {
 		return DBypass, "bypass mode"
 	}
+	var prefixes [][]string
 	for _, r := range m.allow {
+		if r.CommandPrefix != "" {
+			// Prefix rules are pooled: a compound line is allowed when each of
+			// its commands is covered by some rule, not necessarily the same one.
+			if toolMatches(r, toolName) {
+				prefixes = append(prefixes, strings.Fields(r.CommandPrefix))
+			}
+			continue
+		}
 		if matchRule(r, toolName, toolInput) {
 			return DAllow, "allowed by policy rule"
 		}
+	}
+	if len(prefixes) > 0 && commandCovered(inputCommand(toolInput), prefixes) {
+		return DAllow, "allowed by command prefix rule"
 	}
 	for _, r := range m.ask {
 		if matchRule(r, toolName, toolInput) {
@@ -101,9 +149,23 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	}
 }
 
+func toolMatches(r Rule, toolName string) bool {
+	return r.ToolPattern == "*" || r.ToolPattern == toolName
+}
+
 func matchRule(r Rule, toolName string, input map[string]any) bool {
-	if r.ToolPattern != "*" && r.ToolPattern != toolName {
+	if !toolMatches(r, toolName) {
 		return false
+	}
+	// Allow rules with a prefix never reach here (Check pools them); for deny
+	// and ask a prefix rule applies when any command in the line matches it.
+	if r.CommandPrefix != "" {
+		return anyCommandHasPrefix(inputCommand(input), strings.Fields(r.CommandPrefix))
+	}
+	for field, want := range r.InputEquals {
+		if got, ok := input[field].(string); !ok || got != want {
+			return false
+		}
 	}
 	// An arg-restricted rule only matches when some string argument contains the
 	// pattern. A nil/empty input must NOT match (previously it fell through to

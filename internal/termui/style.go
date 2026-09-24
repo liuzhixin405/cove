@@ -4,8 +4,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
+
+// maxPromptDescBytes bounds the description in the permission box. It is far
+// above any command a person reads before approving; it only stops a
+// multi-kilobyte heredoc from scrolling the question itself off the screen.
+const maxPromptDescBytes = 4000
 
 const (
 	Reset     = "\x1b[0m"
@@ -57,13 +63,22 @@ func PermissionPrompt(toolName, desc string) string {
 	sb.WriteString("\r\x1b[K")
 	sb.WriteString("\a")
 	fmt.Fprintf(&sb, "\n  %s╭── 需要授权 ──────────────────────╮%s\n", Yellow, Reset)
-	fmt.Fprintf(&sb, "  %s│%s  工具: %s%s%s\n", Yellow, Reset, Cyan, toolName, Reset)
-	if desc != "" {
-		d := desc
-		if len(d) > 60 {
-			d = textutil.ClipRunes(d, 60)
+	fmt.Fprintf(&sb, "  %s│%s  工具: %s%s%s\n", Yellow, Reset, Cyan, render.StripControls(toolName), Reset)
+	// The description is the command or path being approved, written by the
+	// model, so it is shown whole and inert. It used to be clipped to 60
+	// runes, which hid the tail of a long command ("echo <padding> ; rm -rf ~"
+	// showed only the echo), and printed raw, so a \r or a cursor move in it
+	// made the text on screen differ from what would run. Only something
+	// enormous is shortened, from the middle and with a marker, so both ends
+	// stay visible and the omission is stated.
+	d := strings.TrimRight(render.StripControls(desc), "\n")
+	if strings.TrimSpace(d) != "" {
+		d = textutil.ClipMiddleBytes(d, maxPromptDescBytes)
+		label := "说明: "
+		for _, line := range strings.Split(d, "\n") {
+			fmt.Fprintf(&sb, "  %s│%s  %s%s\n", Yellow, Reset, label, line)
+			label = "      " // continuation rows align under the first
 		}
-		fmt.Fprintf(&sb, "  %s│%s  说明: %s\n", Yellow, Reset, d)
 	}
 	// 34 rules, not 35: the top rule's title is CJK, so its 32 runes occupy 36
 	// display columns (每个汉字两列). An all-rule bottom row therefore needs 34

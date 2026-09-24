@@ -102,12 +102,14 @@ func TestFromRuntimeErrors(t *testing.T) {
 	})
 
 	t.Run("dependency on an unknown task", func(t *testing.T) {
-		// A dep on a task that exists but is NOT pending is still unknown to the
-		// plan, which matters: the plan would otherwise run with a dep it can
-		// never satisfy.
+		// This used to use a "done" task as the ghost, pinning that a
+		// dependency on finished work is rejected — which broke resuming a
+		// plan. A finished dependency is satisfied now (see
+		// TestResumedPlanAcceptsDependenciesOnCompletedTasks); only a task
+		// that does not exist at all is unknown.
 		rt := newRuntime(
 			pendingTask("b", "depends:ghost Work"),
-			&tool.TaskRecord{ID: "ghost", Description: "x", Status: "done"},
+			&tool.TaskRecord{ID: "other", Description: "x", Status: "done"},
 		)
 		_, err := FromRuntime("p", rt)
 		if err == nil || !strings.Contains(err.Error(), "unknown task") {

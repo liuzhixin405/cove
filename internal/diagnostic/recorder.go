@@ -28,6 +28,9 @@ type RuntimeEvent struct {
 
 const maxRuntimeEvents = 200
 
+// maxRuntimeLogBytes caps errors.log before it is rotated to errors.log.1.
+const maxRuntimeLogBytes = 1 << 20
+
 var (
 	runtimeMu     sync.Mutex
 	runtimeEvents []RuntimeEvent
@@ -89,6 +92,14 @@ func RecordRuntime(sev Severity, cat Category, message string) {
 	runtimeMu.Unlock()
 
 	if p := runtimeLogPath(); p != "-" {
+		// Every Warn/Error from any goroutine lands here and the file was
+		// never trimmed, while LoadRuntimeLog reads it whole. Past the cap the
+		// current file becomes errors.log.1 (replacing the previous one), so
+		// at most two capped files exist. A concurrent cove doing the same
+		// makes one rename fail, which is harmless.
+		if info, err := os.Stat(p); err == nil && info.Size() >= maxRuntimeLogBytes {
+			_ = os.Rename(p, p+".1")
+		}
 		if line, err := json.Marshal(ev); err == nil {
 			if f, ferr := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); ferr == nil {
 				_, _ = f.Write(append(line, '\n'))

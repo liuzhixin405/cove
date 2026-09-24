@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 func NewBashTool() Tool {
@@ -46,7 +49,7 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	shell, shellFlag := detectShell()
+	sh := shell.Default()
 	cwd := tctx.Cwd
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -54,9 +57,9 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 
 	cwd = filepath.Clean(cwd)
 
-	cmd := exec.CommandContext(execCtx, shell, shellFlag, cmdStr)
+	cmd := exec.CommandContext(execCtx, sh.Path, sh.Args(cmdStr)...)
 	cmd.Dir = cwd
-	cmd.Env = os.Environ()
+	cmd.Env = shell.Env(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	exitCode, runErr := streamCommand(execCtx, cmd, &stdout, &stderr, tctx.OnProgress)
@@ -69,22 +72,14 @@ func (t *bashTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		fmt.Fprintf(&sb, "Command: %s\n", d)
 	}
 
+	// Long output keeps both ends: test failures, build summaries and the last
+	// error lines are at the bottom, which head-only truncation dropped.
 	if stdout.Len() > 0 {
-		out := stdout.String()
-		if len(out) > 30000 {
-			trimmed, truncated := truncateUTF8(out, 30000)
-			out = trimmed + fmt.Sprintf("\n... [truncated %d bytes, use grep for targeted search]", truncated)
-		}
-		sb.WriteString(out)
+		sb.WriteString(textutil.ClipMiddleBytes(stdout.String(), 30000))
 	}
 	if stderr.Len() > 0 {
 		sb.WriteString("\n[stderr]\n")
-		errOut := stderr.String()
-		if len(errOut) > 10000 {
-			trimmed, truncated := truncateUTF8(errOut, 10000)
-			errOut = trimmed + fmt.Sprintf("\n... [stderr truncated %d bytes]", truncated)
-		}
-		sb.WriteString(errOut)
+		sb.WriteString(textutil.ClipMiddleBytes(stderr.String(), 10000))
 	}
 
 	if exitCode != 0 {
@@ -102,16 +97,6 @@ func (t *bashTool) CheckPermissions(input Input, tctx Context) PermissionDecisio
 		return Denied("plan mode: bash not allowed")
 	}
 	return Asked("bash requires approval")
-}
-
-func detectShell() (string, string) {
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash", "-c"
-	}
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		return "pwsh", "-Command"
-	}
-	return "cmd", "/C"
 }
 
 func truncateUTF8(s string, maxBytes int) (string, int) {

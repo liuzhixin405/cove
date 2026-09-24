@@ -1,8 +1,6 @@
 ---
 name: systematic-debugging
 description: 4-phase root cause debugging: understand bugs before fixing. Never guess at fixes.
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java,*.rb,*.cpp,*.c"
 ---
 
 # Systematic Debugging

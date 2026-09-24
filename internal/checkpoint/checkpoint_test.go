@@ -42,7 +42,7 @@ func TestManagerCreateAndRestore(t *testing.T) {
 	if err := os.WriteFile(filePath, []byte("after"), 0o600); err != nil {
 		t.Fatalf("write modified file: %v", err)
 	}
-	if err := mgr.Restore(hash); err != nil {
+	if _, err := mgr.Restore(hash); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 

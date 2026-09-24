@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -16,9 +19,14 @@ import (
 // tool call on any json.Unmarshal error. That throws away a real intent the
 // model already spent tokens producing, and gives the model no signal that
 // anything went wrong (from its point of view, it just never sees a result
-// for that call). RepairToolArguments tries a couple of cheap, deterministic
-// repairs before giving up, so a one-character formatting slip doesn't cost
-// an entire turn.
+// for that call). RepairToolArguments strips stray text around an otherwise
+// complete object before giving up.
+//
+// It deliberately does not "close off" truncated arguments any more. It used
+// to append the missing quotes and braces, which turned a write or edit cut
+// off by the output limit into a valid call carrying half the content, and
+// the tool then wrote that half to disk. Truncated arguments now fail, and
+// the model is asked to resend the call.
 //
 // It returns the parsed arguments and true on success (either a clean parse
 // or a successful repair). On failure it returns nil and false; callers
@@ -29,13 +37,35 @@ func RepairToolArguments(raw string) (map[string]any, bool) {
 		return args, true
 	}
 
-	if repaired := repairJSONObject(raw); repaired != "" {
-		if args, ok := tryUnmarshalObject(repaired); ok {
+	if extracted := extractBalancedObject(strings.TrimSpace(raw)); extracted != "" {
+		if args, ok := tryUnmarshalObject(extracted); ok {
 			return args, true
 		}
 	}
 
 	return nil, false
+}
+
+// toolArgsParseError is the Input of a call whose arguments could not be
+// parsed; Engine.executeTool reports the message to the model. truncated
+// says the response hit the output token limit, which is almost always why
+// the arguments are incomplete, so the model is told to send less at once.
+func toolArgsParseError(raw string, truncated bool) map[string]any {
+	msg := fmt.Sprintf("tool call arguments were not valid JSON and could not be auto-repaired (%d bytes, starts with: %s)",
+		len(raw), truncate(raw, 120))
+	if truncated {
+		msg += "; the response hit the output token limit and cut the arguments off, so split the work into smaller calls (for example write a large file in several parts)"
+	}
+	return map[string]any{"_cove_parse_error": msg}
+}
+
+// newToolCallID makes an id for a tool call the provider sent without one.
+// The tool result must name the call it answers, and an empty tool_call_id
+// gets the next request rejected.
+func newToolCallID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "call_" + hex.EncodeToString(b[:])
 }
 
 // tryUnmarshalObject parses s as a JSON object. An empty/whitespace-only
@@ -56,33 +86,10 @@ func tryUnmarshalObject(s string) (map[string]any, bool) {
 	return m, true
 }
 
-// repairJSONObject attempts a small number of deterministic fixes for the
-// most common truncation/formatting problems seen in tool-call arguments,
-// returning a best-effort candidate string. The caller re-validates the
-// result by attempting to unmarshal it again; repairJSONObject itself never
-// panics and returns "" if it cannot produce any candidate worth trying.
-func repairJSONObject(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return ""
-	}
-
-	// Some providers wrap the real object in stray leading/trailing tokens
-	// (e.g. a leftover newline, or the start of a second call that never
-	// completed). Extract the first balanced {...} block if present.
-	if extracted := extractBalancedObject(s); extracted != "" {
-		s = extracted
-	}
-
-	// The most common real-world failure is a response cut off mid-value
-	// (token limit hit while streaming a long string field). Try to close
-	// off any unterminated string/array/object so the fields that did arrive
-	// intact are not lost.
-	return closeUnterminated(s)
-}
-
 // extractBalancedObject returns the longest string-aware, brace-balanced
 // substring starting at the first "{" in s. Returns "" if s has no "{".
+// Some providers wrap the real object in stray leading/trailing tokens (a
+// leftover newline, or the start of a second call that never completed).
 func extractBalancedObject(s string) string {
 	start := strings.IndexByte(s, '{')
 	if start < 0 {
@@ -122,72 +129,8 @@ func extractBalancedObject(s string) string {
 		}
 	}
 
-	if lastBalancedEnd >= 0 {
-		return s[start : lastBalancedEnd+1]
+	if lastBalancedEnd < 0 {
+		return "" // no complete object: the arguments were cut off
 	}
-	// No fully-balanced object found; return from the opening brace onward
-	// so closeUnterminated can still try to close it off.
-	return s[start:]
-}
-
-// closeUnterminated walks s tracking open string/brace/bracket state and
-// appends the minimum set of closing tokens needed to make it syntactically
-// well-formed. It does not attempt to recover the *content* of a value that
-// was cut off mid-stream — only to stop that truncation from invalidating
-// every field that arrived before it. A trailing dangling comma/colon (a
-// common truncation artifact right before a cut-off key or value) is
-// trimmed before closing.
-func closeUnterminated(s string) string {
-	if s == "" {
-		return ""
-	}
-
-	inStr := false
-	escaped := false
-	var stack []byte // '{' or '['
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			if escaped {
-				escaped = false
-				continue
-			}
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{', '[':
-			stack = append(stack, c)
-		case '}', ']':
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-		}
-	}
-
-	result := s
-	if inStr {
-		result += `"`
-	}
-	result = strings.TrimRight(result, " \t\r\n")
-	result = strings.TrimRight(result, ",")
-	result = strings.TrimRight(result, ":")
-
-	for i := len(stack) - 1; i >= 0; i-- {
-		switch stack[i] {
-		case '{':
-			result += "}"
-		case '[':
-			result += "]"
-		}
-	}
-	return result
+	return s[start : lastBalancedEnd+1]
 }

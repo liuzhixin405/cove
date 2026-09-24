@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -32,31 +33,43 @@ func (c *CostCmd) Execute(ctx context.Context, in Input) (Output, error) {
 func (c *ResumeCmd) Name() string        { return "resume" }
 func (c *ResumeCmd) Aliases() []string   { return nil }
 func (c *ResumeCmd) Description() string { return "恢复已保存的会话" }
-func (c *ResumeCmd) Help() string        { return "/resume [session-id] - 列出或恢复已保存的会话" }
+func (c *ResumeCmd) Help() string {
+	return "/resume [session-id|all] - 列出当前项目目录的会话，或按 ID 恢复会话（可恢复其他项目的会话，会给出提示）；/resume all 列出所有项目的会话"
+}
 func (c *ResumeCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.SessionStore == nil {
 		return Output{Message: "会话存储不可用"}, nil
 	}
-	if len(in.Args) == 0 {
-		records, err := in.SessionStore.List()
+	if len(in.Args) == 0 || isAllSessionsArg(in.Args) {
+		records, hidden, err := listSessionsForView(in.SessionStore, in.Cwd, len(in.Args) > 0)
 		if err != nil {
 			return Output{}, err
 		}
-		if len(records) == 0 {
-			return Output{Message: "暂无已保存的会话"}, nil
-		}
 		var sb strings.Builder
-		sb.WriteString("已保存的会话:\n")
-		for _, r := range records {
-			fmt.Fprintf(&sb, "- %s  %s  (%d tokens)\n", r.ID, r.Title, r.TokensIn+r.TokensOut)
+		if len(records) == 0 {
+			sb.WriteString("暂无已保存的会话\n")
+		} else {
+			sb.WriteString("已保存的会话:\n")
+			for _, r := range records {
+				fmt.Fprintf(&sb, "- %s  %s  (%d tokens)\n", r.ID, r.Title, r.TokensIn+r.TokensOut)
+			}
 		}
+		writeHiddenSessionsHint(&sb, hidden, "/resume all")
 		return Output{Message: sb.String()}, nil
 	}
 	r, err := in.SessionStore.Load(in.Args[0])
 	if err != nil {
 		return Output{}, err
 	}
-	if in.Engine != nil {
+	// An explicit ID is honored whatever project it came from; the warning
+	// is what tells the user the conversation is about another codebase.
+	warning := session.ProjectMismatchWarning(r, in.Cwd)
+	// Continue the saved session under its own ID when the engine can; loading
+	// only its messages saved every resume as a new copy, and the original
+	// never grew.
+	if s, ok := in.Engine.(sessionResumer); ok {
+		s.ResumeSession(r)
+	} else if in.Engine != nil {
 		in.Engine.LoadMessages(r.Messages)
 	}
 	if in.AppState != nil {
@@ -67,25 +80,56 @@ func (c *ResumeCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		in.AppState.Messages = len(r.Messages)
 		in.AppState.BudgetUsed = r.Cost
 	}
-	return Output{Message: fmt.Sprintf("已恢复: %s (%d 条消息, %d tokens)", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)}, nil
+	return Output{Message: warning + fmt.Sprintf("已恢复: %s (%d 条消息, %d tokens)", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)}, nil
+}
+
+// isAllSessionsArg reports whether args ask for every project's sessions
+// rather than just the current project's.
+func isAllSessionsArg(args []string) bool {
+	return len(args) == 1 && strings.EqualFold(args[0], "all")
+}
+
+// listSessionsForView returns the sessions a list command shows: the current
+// project's by default, every saved session when all is set. hidden counts
+// the sessions the project view left out, so the list can say they exist.
+func listSessionsForView(store SessionStore, cwd string, all bool) (records []session.Record, hidden int, err error) {
+	records, err = store.List()
+	if err != nil || all {
+		return records, 0, err
+	}
+	project := session.FilterByProject(records, cwd)
+	return project, len(records) - len(project), nil
+}
+
+// writeHiddenSessionsHint tells the user where the other projects' (and
+// legacy) sessions went, so the per-project default never looks like lost
+// history.
+func writeHiddenSessionsHint(sb *strings.Builder, hidden int, allCmd string) {
+	if hidden > 0 {
+		fmt.Fprintf(sb, "\n另有 %d 个其他项目或旧版本的会话未显示，使用 %s 查看全部。\n", hidden, allCmd)
+	}
 }
 
 func (c *HistoryCmd) Name() string        { return "history" }
 func (c *HistoryCmd) Aliases() []string   { return nil }
 func (c *HistoryCmd) Description() string { return "查看或选回历史会话" }
 func (c *HistoryCmd) Help() string {
-	return "/history - 获取详细的交互式历史会话菜单列表"
+	return "/history [all] - 列出当前项目目录的历史会话；/history all 列出所有项目的会话（含未记录目录的旧版会话）"
 }
 func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.SessionStore == nil {
 		return Output{Message: "会话存储不可用"}, nil
 	}
-	records, err := in.SessionStore.List()
+	all := isAllSessionsArg(in.Args)
+	records, hidden, err := listSessionsForView(in.SessionStore, in.Cwd, all)
 	if err != nil {
 		return Output{}, err
 	}
 	if len(records) == 0 {
-		return Output{Message: "暂无已保存的会话"}, nil
+		var sb strings.Builder
+		sb.WriteString("暂无已保存的会话\n")
+		writeHiddenSessionsHint(&sb, hidden, "/history all")
+		return Output{Message: sb.String()}, nil
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "历史记录 (%d 个会话):\n\n", len(records))
@@ -124,6 +168,7 @@ func (c *HistoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if len(records) > limit {
 		fmt.Fprintf(&sb, "\n  ... 还有 %d 条。使用 Ctrl+R 查看全部。\n", len(records)-limit)
 	}
+	writeHiddenSessionsHint(&sb, hidden, "/history all")
 	sb.WriteString("\n提示: 在 TUI 界面中使用 Ctrl+R 可唤起选择浮层直接选回历史会话。\n")
 	return Output{Message: sb.String()}, nil
 }

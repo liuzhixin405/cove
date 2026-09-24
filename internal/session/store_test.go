@@ -23,3 +23,19 @@ func TestListMetadataCountsUserTurnsAndToolMessages(t *testing.T) {
 		t.Fatalf("countToolMessages = %d, want 2", got)
 	}
 }
+
+// Phrases that engine tests happen to send are ordinary user requests.
+func TestTestPhrasesAreGenuineUserTurns(t *testing.T) {
+	type msg = struct {
+		Role      string `json:"role"`
+		Content   string `json:"content"`
+		Synthetic bool   `json:"synthetic,omitempty"`
+	}
+	messages := []msg{{Role: "user", Content: "do something about the flaky login test"}}
+	if got := firstUserPreview(messages); got == "" {
+		t.Error("a user message starting with \"do something\" got no preview")
+	}
+	if got := countGenuineUserTurns(messages); got != 1 {
+		t.Errorf("countGenuineUserTurns = %d, want 1", got)
+	}
+}

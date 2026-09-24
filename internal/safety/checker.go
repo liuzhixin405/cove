@@ -108,14 +108,26 @@ func (c *Checker) Scan(input string, location string) *Result {
 	return result
 }
 
-// ScanToolCall checks a tool invocation for safety issues.
+// ScanToolCall checks a tool invocation before it runs. Only the command of a
+// shell tool is something cove executes; the arguments of every other tool are
+// data the model is writing or searching for. Scanning those used to block
+// writing a cleanup script, editing a doc that quotes an injection phrase, or
+// saving `token = getTokenFromEnv()`. Injection in content the model reads is
+// NewContentChecker's job.
 func (c *Checker) ScanToolCall(toolName string, params map[string]any) *Result {
-	var input strings.Builder
-	input.WriteString(toolName)
-	for k, v := range params {
-		fmt.Fprintf(&input, " %s=%v", k, v)
+	result := &Result{Passed: true, Findings: make([]Finding, 0)}
+	command, _ := params["command"].(string)
+	if command == "" || (toolName != "bash" && toolName != "powershell") {
+		return result
 	}
-	return c.Scan(input.String(), toolName)
+	if f := (&dangerousCommandCheck{}).Check(command); f != nil {
+		f.Location = toolName
+		result.Findings = append(result.Findings, *f)
+		if f.Severity >= SevError {
+			result.Passed = false
+		}
+	}
+	return result
 }
 
 // ──── Built-in Checks ────
@@ -128,6 +140,8 @@ func (ch *injectionCheck) Severity() Severity { return SevError }
 
 var injectionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)ignore (all |previous )?instructions`),
+	regexp.MustCompile(`(?i)disregard (all |any )?(the )?(previous|prior|above) (instructions|prompts)`),
+	regexp.MustCompile(`忽略(之前|以上|前面|上面|先前|所有)(的)?(所有)?(指令|指示|提示|要求)`),
 	regexp.MustCompile(`(?i)forget (everything|your training)`),
 	regexp.MustCompile(`(?i)you are now (DAN|STAN|a different)`),
 	regexp.MustCompile(`(?i)system:\s*you are`),
@@ -190,23 +204,6 @@ func (ch *dangerousCommandCheck) Name() string { return "dangerous_command" }
 // severity is set in Check (SevCritical for catastrophic, SevWarning for risky).
 func (ch *dangerousCommandCheck) Severity() Severity { return SevCritical }
 
-// catastrophicCommands are irreversible and destroy state outside the project:
-// the whole filesystem, the user's home directory, a raw device, the machine's
-// permission model. These are reported at SevCritical so the engine's
-// BlockingFinding check actually stops them.
-//
-// Every entry here used to be SevWarning, which the engine only logs — so a
-// checker whose entire purpose was to stop `rm -rf /` never stopped anything.
-var catastrophicCommands = []string{
-	"rm -rf /", "rm -rf ~", "rm -fr /", "rm -fr ~",
-	"rm -rf --no-preserve-root", "rm --no-preserve-root",
-	":(){ :|:& };:", "fork bomb",
-	"dd if=/dev/zero", "dd if=/dev/random", "mkfs.",
-	"> /dev/sda", "> /dev/sdb", "> /dev/nvme",
-	"chmod -r 777 /", "chmod 777 /", "chown -r / ",
-	"format c:", "del /f /s /q c:\\",
-}
-
 // riskyCommands are destructive but project-scoped and routinely legitimate.
 // They stay at SevWarning: surfaced to the user, not blocked.
 var riskyCommands = []string{
@@ -227,15 +224,14 @@ var riskyPatterns = []*regexp.Regexp{
 
 func (ch *dangerousCommandCheck) Check(input string) *Finding {
 	lower := strings.ToLower(input)
-	// Catastrophic patterns are checked first: "rm -rf /" must not be reported
-	// as the milder "rm -rf ." match when a command contains both.
-	for _, cmd := range catastrophicCommands {
-		if strings.Contains(lower, strings.ToLower(cmd)) {
-			return &Finding{
-				Rule:     "dangerous_command",
-				Severity: SevCritical,
-				Message:  fmt.Sprintf("irreversible destructive command refused: %s", cmd),
-			}
+	// Catastrophic commands are checked first: "rm -rf /" must not be reported
+	// as the milder "rm -rf ." match when a command contains both. They are
+	// SevCritical so the engine's BlockingFinding check actually stops them.
+	if why, ok := CatastrophicCommand(input); ok {
+		return &Finding{
+			Rule:     "dangerous_command",
+			Severity: SevCritical,
+			Message:  fmt.Sprintf("irreversible destructive command refused: %s", why),
 		}
 	}
 	for _, cmd := range riskyCommands {
@@ -257,4 +253,13 @@ func (ch *dangerousCommandCheck) Check(input string) *Finding {
 		}
 	}
 	return nil
+}
+
+// NewContentChecker returns a checker for content that will be shown to the
+// model later — stored memories, fetched web pages, MCP results. It looks for
+// injected instructions and leaked secrets only: shell commands are ordinary
+// content there ("never run rm -rf /" is worth remembering), so the
+// dangerous-command check that guards tool *calls* does not apply.
+func NewContentChecker() *Checker {
+	return &Checker{checks: []Check{&injectionCheck{}, &secretCheck{}}}
 }

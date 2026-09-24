@@ -38,8 +38,7 @@ Session transcripts: %s (JSON files — grep narrowly, don't read whole files)
 Look for new information worth persisting. Sources in rough priority order:
 
 1. **Existing memories that drifted** — facts that contradict something you see in the codebase now
-2. **Transcript search** — if you need specific context, grep the JSON transcripts for narrow terms:
-   grep -rn "<narrow term>" %s/ --include="*.json" | tail -50
+2. **Transcript search** — if you need specific context, search the JSON transcripts for narrow terms with the grep tool (pattern "<narrow term>", path %s). Bash pipes are not available.
 
 Don't exhaustively read transcripts. Look only for things you already suspect matter.
 

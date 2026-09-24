@@ -43,6 +43,15 @@ func ValidateName(kind, name string) error {
 	if strings.HasPrefix(name, ".") {
 		return fmt.Errorf("%s name may not start with a dot: %q", kind, name)
 	}
+	// Windows drops trailing dots, so "foo." IS the directory "foo": a name from
+	// a remote manifest could land on (and the install cleanup delete) another
+	// plugin's directory, and "x.disabled." got past the check below.
+	if strings.HasSuffix(name, ".") {
+		return fmt.Errorf("%s name may not end with a dot: %q", kind, name)
+	}
+	if isWindowsDeviceName(name) {
+		return fmt.Errorf("%s name is a reserved Windows device name: %q", kind, name)
+	}
 	if strings.HasSuffix(name, ".disabled") {
 		return fmt.Errorf("%s name may not end with .disabled: %q", kind, name)
 	}
@@ -71,4 +80,21 @@ func Join(kind, root, name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, name), nil
+}
+
+// isWindowsDeviceName reports whether name opens a device instead of a file on
+// Windows: CON, PRN, AUX, NUL, COM1-9 and LPT1-9, in any case and with any
+// extension ("nul.txt" is NUL too). Rejected on every platform, since plugin
+// and skill names travel between machines.
+func isWindowsDeviceName(name string) bool {
+	base := strings.ToUpper(name)
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) &&
+		base[3] >= '1' && base[3] <= '9'
 }

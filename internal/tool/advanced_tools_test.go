@@ -164,10 +164,12 @@ func TestSkillTool(t *testing.T) {
 		t.Errorf("expected name 'skill', got %q", tsk.Def().Name)
 	}
 
-	// Without runtime
+	// Without runtime there is no skill to run. This used to expect success
+	// ("Skill 'test' activated"), which told the model a skill ran that
+	// does not exist.
 	result, _ := tsk.Call(context.Background(), Input{"name": "test"}, Context{})
-	if result.IsError {
-		t.Errorf("skill without runtime failed: %s", result.Data)
+	if !result.IsError {
+		t.Errorf("skill without runtime reported success: %s", result.Data)
 	}
 
 	// With runtime and skill prompts

@@ -88,7 +88,17 @@ func (e *MobileEngine) Reset() {
 // Handles the tool-calling loop: when AI calls a tool, the callback is invoked,
 // the result is fed back to the AI, and the loop continues until a final text response.
 func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback StreamCallback) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	// timeoutSecs <= 0 means no deadline. It used to build an already-expired
+	// context, so a caller passing 0 got "timeout" before any request was sent.
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if timeoutSecs > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	defer cancel()
 
 	if callback == nil {
@@ -143,9 +153,9 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 		if resp.Content != "" {
 			fullResponse.WriteString(resp.Content)
 		}
-		if resp.ReasoningContent != "" {
-			callback.OnReasoning(resp.ReasoningContent)
-		}
+		// resp.ReasoningContent is not sent again: it is the accumulation of
+		// the pieces the stream callback above already delivered, and re-sending
+		// it showed every thought twice.
 
 		if len(resp.ToolCalls) > 0 {
 			// Add assistant message with tool calls to history

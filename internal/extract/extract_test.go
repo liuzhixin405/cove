@@ -710,11 +710,10 @@ func TestBuildExtractionPromptClipsMessages(t *testing.T) {
 	if strings.Contains(prompt, strings.Repeat("u", 501)) {
 		t.Error("user message exceeded the 500-byte clip")
 	}
-	if !strings.Contains(prompt, "[tool] "+strings.Repeat("t", 200)+"...") {
-		t.Error("tool message was not clipped to 200 bytes")
-	}
-	if strings.Contains(prompt, strings.Repeat("t", 201)) {
-		t.Error("tool message exceeded the 200-byte clip")
+	// Tool output is untrusted and is never shown to the extractor at all
+	// (see TestExtractionPromptLeavesOutToolOutput).
+	if strings.Contains(prompt, "ttt") {
+		t.Error("tool output reached the extraction prompt")
 	}
 	if !strings.Contains(prompt, "[assistant] short answer") {
 		t.Error("short message was altered")

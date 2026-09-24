@@ -43,5 +43,8 @@ func assistantMessageFromResponse(resp *api.ChatResponse) api.Message {
 		Content:          resp.Content,
 		ReasoningContent: resp.ReasoningContent,
 		ToolCalls:        resp.ToolCalls,
+		// Must go back verbatim with the tool results, or the API rejects
+		// the continuation.
+		ThinkingBlocks: resp.ThinkingBlocks,
 	}
 }

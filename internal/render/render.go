@@ -158,6 +158,7 @@ func collapsedForm(b Block, width int, st Styles, open bool) string {
 	if width < minRenderWidth {
 		width = minRenderWidth
 	}
+	b = withSafeText(b)
 
 	g := st.glyphs()
 
@@ -249,6 +250,7 @@ func Expanded(b Block, width int, st Styles) string {
 	if width < minRenderWidth {
 		width = minRenderWidth
 	}
+	b = withSafeText(b)
 
 	var sb strings.Builder
 	// The header is repeated with the marker turned down, so an open block
@@ -284,6 +286,21 @@ func Expanded(b Block, width int, st Styles) string {
 		sb.WriteString("\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// withSafeText neutralises terminal controls in the block's text fields.
+//
+// They are untrusted - the model's command, a file's first line, a web page -
+// and used to be printed verbatim, so an escape sequence in them was executed
+// by the terminal (see sanitize.go). The single-line fields lose every
+// control; the full output keeps the tool's own colour, which is the only
+// styling a reader of a build log relies on.
+func withSafeText(b Block) Block {
+	b.Header = StripControls(b.Header)
+	b.Summary = StripControls(b.Summary)
+	b.FullPath = StripControls(b.FullPath)
+	b.Full = SanitizeStream(b.Full)
+	return b
 }
 
 // clipLine clips one line to width without splitting an escape sequence or a

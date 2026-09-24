@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 const (
@@ -64,9 +66,9 @@ func grepFiles(pattern, root string) string {
 			if !matches(line) {
 				continue
 			}
-			if len(line) > grepMaxLineWidth {
-				line = line[:grepMaxLineWidth] + "…"
-			}
+			// Clip on a rune boundary: a byte slice cut Chinese text mid-rune
+			// and put invalid UTF-8 into the next request body.
+			line = textutil.ClipBytes(line, grepMaxLineWidth, "…")
 			out = append(out, fmt.Sprintf("%s:%d:%s", path, lineNo, line))
 			if len(out) >= grepMaxMatches {
 				truncated = true

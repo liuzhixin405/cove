@@ -19,7 +19,10 @@ func TestManagerInstallDisableEnableAndReload(t *testing.T) {
 
 	mgr := NewManager()
 	mgr.Init()
-	if err := mgr.Install("demo", "https://example.com/plugin"); err != nil {
+	// No URL: the local scaffold. This used to pass a URL and rely on it being
+	// silently ignored (it is not on a known host), which was the bug; a URL
+	// is now always cloned and would reach the network.
+	if err := mgr.Install("demo", ""); err != nil {
 		t.Fatalf("install plugin: %v", err)
 	}
 

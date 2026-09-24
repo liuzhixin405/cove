@@ -14,6 +14,16 @@ type contextWindowPattern struct {
 }
 
 var contextWindowPatterns = []contextWindowPattern{
+	// Current 1M-context Claude models, listed before the family fallbacks
+	// below that would otherwise shadow them.
+	{"claude-fable", 1000000},
+	{"claude-mythos", 1000000},
+	{"claude-opus-5", 1000000},
+	{"claude-opus-4-8", 1000000},
+	{"claude-opus-4-7", 1000000},
+	{"claude-opus-4-6", 1000000},
+	{"claude-sonnet-5", 1000000},
+	{"claude-sonnet-4-6", 1000000},
 	{"claude-opus", 200000},
 	{"claude-sonnet", 200000},
 	{"claude-haiku", 200000},
@@ -23,7 +33,11 @@ var contextWindowPatterns = []contextWindowPattern{
 	{"o1", 128000},
 	{"o3", 128000},
 	{"o4", 128000},
-	{"deepseek-v4", 128000},
+	// DeepSeek V4: 1M context for both tiers (api-docs.deepseek.com). The
+	// current flash name is "deepseek-flash"; "deepseek-v4-flash" is the
+	// retired alias, still accepted.
+	{"deepseek-v4", 1000000},
+	{"deepseek-flash", 1000000},
 	{"deepseek-chat", 64000},
 	{"deepseek-reasoner", 64000},
 	{"glm-4", 128000},
@@ -55,31 +69,12 @@ func ContextWindowForModel(model string) int {
 	return defaultContextWindow
 }
 
-// fastBudgetIndicators mirrors internal/engine's isFastModelName check. Kept
-// as a small local duplicate (rather than an internal/engine ->
-// internal/api dependency, which would invert the project's existing
-// layering) since it's a one-line substring check.
-var fastBudgetIndicators = []string{"flash", "mini", "lite", "tiny", "fast", "haiku", "nano"}
-
-func isFastBudgetModel(model string) bool {
-	lower := strings.ToLower(model)
-	for _, ind := range fastBudgetIndicators {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
-}
-
 // UtilizationRatioForModel returns how much of a model's raw context window
-// Cove should assume can actually be put to effective use before quality
-// degrades on long-context tasks. Mid-tier/fast models are assumed to make
-// less effective use of a long context than top-tier models — a
-// deliberately conservative, coarse heuristic, not a measured benchmark.
+// Cove assumes can be put to effective use. It is the same for every tier:
+// the fast tiers in use today (deepseek-flash, Haiku 4.5, ...) are fully
+// capable models, and the old "fast models use long context less well"
+// discount (0.65) only made Cove throw their history away sooner.
 func UtilizationRatioForModel(model string) float64 {
-	if isFastBudgetModel(model) {
-		return 0.65
-	}
 	return 0.85
 }
 

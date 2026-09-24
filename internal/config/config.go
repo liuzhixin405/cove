@@ -1,13 +1,17 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 )
 
 type ProviderConfig struct {
@@ -89,11 +93,38 @@ type Config struct {
 	// as actually complete; see internal/engine/verify_gate.go. Off by
 	// default; an empty/absent list disables the gate entirely.
 	DoneVerifyCommands []string `json:"done_verify_commands,omitempty"`
+	// DoneVerifyAuto, when no done_verify_commands are configured, derives a
+	// verification command from the project (go.mod -> "go build ./...",
+	// Cargo.toml -> "cargo check", a local TypeScript install -> tsc) and runs
+	// it only on turns that changed files. nil means on.
+	DoneVerifyAuto *bool `json:"done_verify_auto,omitempty"`
+	// Thinking selects the model's thinking mode on providers that support it
+	// ("adaptive" or "disabled"); empty keeps the model's default. Effort
+	// ("low", "medium", "high", "xhigh", "max") sets reasoning depth.
+	Thinking string `json:"thinking,omitempty"`
+	Effort   string `json:"effort,omitempty"`
+	// ShowReasoning streams a thinking model's full reasoning into the
+	// conversation. Off by default: the status line shows its progress.
+	ShowReasoning bool `json:"show_reasoning,omitempty"`
+	// DisabledSkills are skills (built-in or otherwise) that are not loaded.
+	DisabledSkills []string `json:"disabled_skills,omitempty"`
 	// MemoryEmbedding, if set, opts the memory store into blending BM25
 	// keyword search with real semantic similarity from a remote embeddings
 	// API. Off by default; nil means pure BM25 with zero extra network calls
 	// or cost, exactly like before this field existed.
 	MemoryEmbedding *MemoryEmbeddingConfig `json:"memory_embedding,omitempty"`
+
+	// loadedView is the effective config as Load returned it (see rawView).
+	// Save writes only the fields that differ from it, so values that came
+	// from .cove.json, the active profile or the built-in defaults stay where
+	// they came from instead of being copied into ~/.cove/config.json.
+	// nil (a Config not built by Load) means "write every field".
+	loadedView map[string]json.RawMessage
+}
+
+// VerifyAutoEnabled reports whether automatic completion verification is on.
+func (c *Config) VerifyAutoEnabled() bool {
+	return c.DoneVerifyAuto == nil || *c.DoneVerifyAuto
 }
 
 // MemoryEmbeddingConfig configures the optional remote embeddings endpoint
@@ -141,31 +172,65 @@ func Load() (*Config, error) {
 
 func LoadWithProfile(profileName string) (*Config, error) {
 	cfg := DefaultConfig()
+	// DefaultConfig's model is Anthropic's. Left in place, a config that only
+	// says "provider": {"name": "deepseek"} sent claude-sonnet-4 to DeepSeek and
+	// every request failed; empty lets applyDefaults pick the provider's default.
+	cfg.Model = ""
+	finish := func(err error) (*Config, error) {
+		applyDefaults(cfg)
+		cfg.loadedView, _ = rawView(cfg)
+		return cfg, err
+	}
 	dir, err := ConfigDir()
 	if err == nil {
 		p := filepath.Join(dir, "config.json")
 		data, err := os.ReadFile(p)
 		if err == nil {
-			if err := json.Unmarshal(data, cfg); err != nil {
-				applyDefaults(cfg)
-				return cfg, fmt.Errorf("parse config %s: %w", p, err)
+			if err := json.Unmarshal(stripBOM(data), cfg); err != nil {
+				return finish(fmt.Errorf("parse config %s: %w", p, err))
 			}
 		}
 	}
 	if err := loadProjectOverride(cfg); err != nil {
-		applyDefaults(cfg)
-		return cfg, err
+		return finish(err)
 	}
 	if profileName == "" {
 		profileName = cfg.ActiveProfile
 	}
 	if profileName != "" {
-		if prof, ok := cfg.Profiles[profileName]; ok {
-			applyProfile(cfg, prof)
+		prof, ok := cfg.Profiles[profileName]
+		if !ok {
+			// Used to be ignored, so `cove --profile wrok` quietly ran on the
+			// base settings. The base config is still returned and usable.
+			return finish(fmt.Errorf("profile %q not found in config", profileName))
 		}
+		applyProfile(cfg, prof)
 	}
-	applyDefaults(cfg)
-	return cfg, nil
+	return finish(nil)
+}
+
+// utf8BOM is what Windows PowerShell 5.1 (Out-File, Set-Content -Encoding
+// utf8) and older Notepad put in front of a UTF-8 file. encoding/json rejects
+// it, which made such a config fail to parse and every setting in it ignored.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+func stripBOM(data []byte) []byte { return bytes.TrimPrefix(data, utf8BOM) }
+
+// CheckFile reports whether the config file at path would be rejected by
+// Load. A missing file is fine: cove runs on defaults and environment keys.
+func CheckFile(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var probe Config
+	if err := json.Unmarshal(stripBOM(data), &probe); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
 }
 
 func loadProjectOverride(cfg *Config) error {
@@ -179,7 +244,7 @@ func loadProjectOverride(cfg *Config) error {
 		return nil
 	}
 	var override Config
-	if err := json.Unmarshal(data, &override); err != nil {
+	if err := json.Unmarshal(stripBOM(data), &override); err != nil {
 		return fmt.Errorf("parse project config %s: %w", p, err)
 	}
 	if override.Model != "" {
@@ -202,6 +267,21 @@ func loadProjectOverride(cfg *Config) error {
 	}
 	if len(override.DoneVerifyCommands) > 0 {
 		cfg.DoneVerifyCommands = override.DoneVerifyCommands
+	}
+	if override.DoneVerifyAuto != nil {
+		cfg.DoneVerifyAuto = override.DoneVerifyAuto
+	}
+	if override.Thinking != "" {
+		cfg.Thinking = override.Thinking
+	}
+	if override.Effort != "" {
+		cfg.Effort = override.Effort
+	}
+	if override.ShowReasoning {
+		cfg.ShowReasoning = true
+	}
+	if len(override.DisabledSkills) > 0 {
+		cfg.DisabledSkills = override.DisabledSkills
 	}
 	if override.MemoryEmbedding != nil {
 		cfg.MemoryEmbedding = override.MemoryEmbedding
@@ -310,23 +390,120 @@ func ResolveModelForProvider(model, providerName string) string {
 	return model
 }
 
+// Save writes the settings cfg changed since Load into ~/.cove/config.json.
+//
+// It used to serialize the whole Config over the file. Because Load merges
+// .cove.json, the active profile and the defaults into cfg, one /model in a
+// cloned repo copied that repo's base_url, MCP servers and permission mode
+// into the global config, the active profile's values leaked into the top
+// level, keys this version does not know were dropped, and two cove windows
+// reverted each other's changes. Now the file is re-read and only the fields
+// that differ from what Load returned are replaced (see loadedView). A file
+// that no longer parses is left alone: overwriting it with defaults destroyed
+// the user's whole config, API key included.
 func Save(cfg *Config) error {
 	dir, err := ConfigDir()
 	if err != nil {
 		return err
 	}
-	_ = os.MkdirAll(dir, 0700)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "config.json")
 
-	// First marshal triggers ProviderConfig.MarshalJSON (masks key for display).
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	view, err := rawView(cfg)
 	if err != nil {
 		return err
 	}
-
-	// Unmarshal into map so we can fix the masked api_key.
-	var m map[string]interface{}
-	if err := json.Unmarshal(data, &m); err != nil {
+	onDisk := map[string]json.RawMessage{}
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if body := stripBOM(data); len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &onDisk); err != nil {
+				return fmt.Errorf("%s is not valid JSON (%v); fix or delete it first, it was not overwritten", path, err)
+			}
+			if onDisk == nil { // the file said "null"
+				onDisk = map[string]json.RawMessage{}
+			}
+		}
+	case !errors.Is(err, fs.ErrNotExist):
 		return err
+	}
+
+	mergeChanges(onDisk, cfg.loadedView, view)
+	out, err := json.MarshalIndent(onDisk, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Atomic replace: a crash mid-write used to leave a truncated config.json.
+	// It also applies 0600 every time, where os.WriteFile only did so when it
+	// created the file, so a pre-existing 0644 file holding the key stayed so.
+	if err := fsatomic.WriteFile(path, out, 0o600); err != nil {
+		return err
+	}
+	cfg.loadedView = view
+	return nil
+}
+
+// mergeChanges copies into dst every top-level field of cur that differs from
+// base, and removes the ones cur no longer has. Keys dst has that neither
+// knows about are kept. A nil base (a Config not built by Load) writes all.
+func mergeChanges(dst, base, cur map[string]json.RawMessage) {
+	for k, v := range cur {
+		if old, ok := base[k]; ok && bytes.Equal(old, v) {
+			continue
+		}
+		if k == "provider" {
+			// Field by field: a project's base_url must not ride along with
+			// a global /api-key change.
+			mergeProvider(dst, base[k], v, base == nil)
+			continue
+		}
+		dst[k] = v
+	}
+	if base == nil {
+		return
+	}
+	for k := range base {
+		if _, ok := cur[k]; !ok {
+			delete(dst, k)
+		}
+	}
+}
+
+func mergeProvider(dst map[string]json.RawMessage, base, cur json.RawMessage, writeAll bool) {
+	var disk, was, now map[string]json.RawMessage
+	_ = json.Unmarshal(dst["provider"], &disk)
+	if disk == nil {
+		disk = map[string]json.RawMessage{}
+	}
+	_ = json.Unmarshal(base, &was)
+	_ = json.Unmarshal(cur, &now)
+	for _, k := range []string{"name", "api_key", "base_url"} {
+		v, ok := now[k]
+		if !writeAll && bytes.Equal(was[k], v) {
+			continue
+		}
+		if ok {
+			disk[k] = v
+		} else {
+			delete(disk, k)
+		}
+	}
+	dst["provider"], _ = json.Marshal(disk)
+}
+
+// rawView is cfg as it is written to disk: each field under its JSON name, the
+// API keys in full (ProviderConfig.MarshalJSON masks them for display).
+func rawView(cfg *Config) (map[string]json.RawMessage, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
 	}
 
 	// Re-marshal provider using rawProvider  - no masking MarshalJSON.
@@ -336,11 +513,9 @@ func Save(cfg *Config) error {
 		BaseURL: cfg.Provider.BaseURL,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var providerVal interface{}
-	_ = json.Unmarshal(providerRaw, &providerVal)
-	m["provider"] = providerVal
+	m["provider"] = providerRaw
 
 	if len(cfg.Profiles) > 0 {
 		profilesRaw := make(map[string]interface{}, len(cfg.Profiles))
@@ -360,7 +535,7 @@ func Save(cfg *Config) error {
 						BaseURL: prof.Provider.BaseURL,
 					})
 					if err != nil {
-						return err
+						return nil, err
 					}
 					var profProviderVal interface{}
 					_ = json.Unmarshal(providerRaw, &profProviderVal)
@@ -389,15 +564,11 @@ func Save(cfg *Config) error {
 			}
 			profilesRaw[name] = profileVal
 		}
-		m["profiles"] = profilesRaw
+		if m["profiles"], err = json.Marshal(profilesRaw); err != nil {
+			return nil, err
+		}
 	}
-
-	data, err = json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+	return m, nil
 }
 
 // rawProvider mirrors ProviderConfig fields without the masking MarshalJSON method.

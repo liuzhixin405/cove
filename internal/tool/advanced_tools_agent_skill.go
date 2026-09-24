@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/skills"
@@ -40,10 +42,43 @@ func (t *SkillTool) Call(ctx context.Context, input Input, tctx Context) (Result
 			if prompt, ok := tctx.Runtime.SkillPrompts[name]; ok {
 				return Result{Data: fmt.Sprintf("[Skill: %s]\n\n%s\n\nFollow these instructions to complete the task.", name, prompt)}, nil
 			}
-			return Result{Data: fmt.Sprintf("Skill '%s' activated. Available skills: %v", name, tctx.Runtime.SkillPrompts)}, nil
 		}
 	}
-	return Result{Data: fmt.Sprintf("Skill '%s' activated. No runtime skill registry available.", name)}, nil
+	// Not found. This used to answer "Skill 'x' activated" (with every
+	// skill's full prompt printed via %v) and no error flag, so the model
+	// went on as if a nonexistent skill had run.
+	msg := fmt.Sprintf("Error: skill %q not found.", name)
+	if names := skillNames(tctx); len(names) > 0 {
+		msg += " Available skills: " + strings.Join(names, ", ")
+	} else {
+		msg += " No skills are available."
+	}
+	return Result{Data: msg, IsError: true}, nil
+}
+
+// skillNames lists the skills the runtime knows, by name only.
+func skillNames(tctx Context) []string {
+	if tctx.Runtime == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	if mgr, ok := tctx.Runtime.SkillManager.(interface{ All() []skills.Skill }); ok {
+		for _, s := range mgr.All() {
+			if !seen[s.Name] {
+				seen[s.Name] = true
+				names = append(names, s.Name)
+			}
+		}
+	}
+	for n := range tctx.Runtime.SkillPrompts {
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 func (t *SkillTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("skill execution is safe")

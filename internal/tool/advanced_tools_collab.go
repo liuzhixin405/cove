@@ -56,7 +56,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 	// Keep the lock across the summary below: it reads the same maps the loop
 	// above writes, and releasing it here would let another goroutine mutate
 	// them mid-iteration (a fatal error).
-	var planExec func(parallel bool) (string, error)
+	var planExec func(ctx context.Context, parallel bool) (string, error)
 	if tctx.Runtime != nil {
 		tctx.Runtime.Teams[name] = &TeamRecord{Name: name, Members: memberRecords, Status: "active", CreatedAt: now}
 		if len(tctx.Runtime.Teams) > 0 {
@@ -83,7 +83,7 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 
 	if planExec != nil {
-		result, err := planExec(true)
+		result, err := planExec(ctx, true)
 		if err != nil {
 			fmt.Fprintf(&sb, "\n\n[执行失败] %v", err)
 		} else {
@@ -286,7 +286,11 @@ func runLocalDiagnostics(ctx context.Context, filePath string, tctx Context) (Re
 	}
 	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(execCtx, "go", "test", "./...")
+	// go vet type-checks the file's package (tests included) without running
+	// anything. This used to be `go test ./...`: lsp is read-only and never
+	// asks, even in plan mode or for a read-only sub-agent, so "diagnostics"
+	// ran the project's test code unprompted.
+	cmd := exec.CommandContext(execCtx, "go", "vet", ".")
 	cmd.Dir = filepath.Dir(filePath)
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
@@ -297,7 +301,7 @@ func runLocalDiagnostics(ctx context.Context, filePath string, tctx Context) (Re
 		return Result{Data: fmt.Sprintf("Go diagnostics for %s failed:\n%s", filePath, text), IsError: true}, nil
 	}
 	if text == "" {
-		text = "go test ./... passed"
+		text = "go vet: no problems found"
 	}
 	return Result{Data: fmt.Sprintf("Go diagnostics for %s:\n%s", filePath, text)}, nil
 }

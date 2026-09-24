@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type Skill struct {
 	// as before.
 	Steps     []string `json:"steps,omitempty"`
 	Builtin   bool     `json:"-"`
+	Source    string   `json:"-"`
 	FilePath  string   `json:"-"`
 	Directory string   `json:"-"`
 }
@@ -58,27 +60,25 @@ type frontmatter struct {
 
 func NewManager() *Manager { return &Manager{skills: make(map[string]Skill)} }
 
-func (m *Manager) AddDirectory(dir string) {
+// AddDirectory loads every skill in dir as a user skill. A skill with the same
+// name as one already loaded replaces it.
+func (m *Manager) AddDirectory(dir string) { m.addDirectory(dir, SourceUser) }
+
+func (m *Manager) addDirectory(dir, source string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.scanDir(dir)
-}
-
-func (m *Manager) scanDir(dir string) {
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			m.loadSkillFromDir(filepath.Join(dir, e.Name()))
+			m.loadSkillFile(filepath.Join(dir, e.Name(), "SKILL.md"), source)
 		}
 		if strings.HasSuffix(e.Name(), ".md") && !e.IsDir() {
-			m.loadSkillFile(filepath.Join(dir, e.Name()))
+			m.loadSkillFile(filepath.Join(dir, e.Name()), source)
 		}
 	}
 }
 
-func (m *Manager) loadSkillFromDir(dir string) { m.loadSkillFile(filepath.Join(dir, "SKILL.md")) }
-
-func (m *Manager) loadSkillFile(path string) {
+func (m *Manager) loadSkillFile(path, source string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -87,7 +87,9 @@ func (m *Manager) loadSkillFile(path string) {
 	if name == "SKILL" || name == "skill" {
 		name = filepath.Base(filepath.Dir(path))
 	}
-	m.skills[name] = parseSkill(name, string(data), path)
+	sk := parseSkill(name, string(data), path)
+	sk.Source = source
+	m.skills[sk.Name] = sk
 }
 
 // parseSkill builds a Skill from raw SKILL.md content. It is a pure function
@@ -142,7 +144,7 @@ func parseFrontmatter(content string) *frontmatter {
 		if len(parts) != 2 {
 			continue
 		}
-		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		k, v := strings.TrimSpace(parts[0]), unquote(strings.TrimSpace(parts[1]))
 		switch k {
 		case "name":
 			fm.Name = v
@@ -165,6 +167,16 @@ func parseFrontmatter(content string) *frontmatter {
 		}
 	}
 	return fm
+}
+
+// unquote removes one pair of matching surrounding quotes. Values are split
+// on commas afterwards, so a quoted list like "*.go,*.py" would otherwise leave
+// a stray quote on its first and last patterns, which then match nothing.
+func unquote(v string) string {
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 // RenderInvocation builds the text handed back to the model when this
@@ -205,13 +217,19 @@ func (m *Manager) Get(name string) (Skill, bool) {
 	return s, ok
 }
 
+// All returns every loaded skill, sorted by name.
 func (m *Manager) All() []Skill {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var r []Skill
+	return m.sortedLocked()
+}
+
+func (m *Manager) sortedLocked() []Skill {
+	r := make([]Skill, 0, len(m.skills))
 	for _, s := range m.skills {
 		r = append(r, s)
 	}
+	sort.Slice(r, func(i, j int) bool { return r[i].Name < r[j].Name })
 	return r
 }
 
@@ -236,32 +254,18 @@ func (m *Manager) Matching(ctx context.Context, filePath string) []Skill {
 	return r
 }
 
-// MatchingPrompt returns concatenated prompts of all skills matching a file path.
-func (m *Manager) MatchingPrompt(filePath string) string {
-	skills := m.Matching(context.Background(), filePath)
-	if len(skills) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("\n\n<relevant_skills>\n")
-	for _, s := range skills {
-		sb.WriteString("<skill name=\"" + s.Name + "\">\n")
-		sb.WriteString(s.Prompt)
-		sb.WriteString("\n</skill>\n")
-	}
-	sb.WriteString("</relevant_skills>\n")
-	return sb.String()
-}
-
 func (m *Manager) BuildPrompt() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.skills) == 0 {
 		return ""
 	}
+	// Sorted: this text is part of the system prompt, and map order differs
+	// on every start, which made the prompt differ between sessions.
 	var sb strings.Builder
 	sb.WriteString("\n\n<available_skills>\n")
-	for _, s := range m.skills {
+	sb.WriteString("Load a skill with the skill tool when it fits the task at hand.\n")
+	for _, s := range m.sortedLocked() {
 		sb.WriteString("<skill>\n  <name>" + s.Name + "</name>\n  <description>" + s.Description + "</description>\n")
 		if len(s.AllowedTools) > 0 {
 			sb.WriteString("  <allowed_tools>" + strings.Join(s.AllowedTools, ",") + "</allowed_tools>\n")
@@ -357,92 +361,73 @@ func InstallSkill(name, source, url string) error {
 	return os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644)
 }
 
-// SeedDefaultSkills ensures built-in skills are present on disk.
-// On first run, copies the bundled SKILL.md files to ~/.cove/skills/.
+// embeddedSkills holds the built-in skills compiled into the binary. They are
+// loaded straight into memory (LoadEmbedded), never copied to disk: a copy in
+// the user directory would override every later built-in version, so skills
+// would stop updating with the binary.
 //
 //go:embed embedded
 var embeddedSkills embed.FS
 
-func SeedDefaultSkills() {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		return
-	}
-	dir := filepath.Join(home, ".cove", "skills")
-	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
-		return // Already seeded
-	}
-	_ = os.MkdirAll(dir, 0755)
-
-	// Copy embedded skill files to ~/.cove/skills/
-	entries, err := fs.ReadDir(embeddedSkills, "embedded")
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		skillName := entry.Name()
-		srcPath := "embedded/" + skillName + "/SKILL.md"
-		data, err := embeddedSkills.ReadFile(srcPath)
-		if err != nil {
-			continue
-		}
-		dstDir := filepath.Join(dir, skillName)
-		_ = os.MkdirAll(dstDir, 0755)
-		_ = os.WriteFile(filepath.Join(dstDir, "SKILL.md"), data, 0644)
-	}
-}
-
+// LoadAll loads skills from every source, lowest precedence first; a later
+// definition with the same name replaces an earlier one, so the closer
+// definition wins:
+//
+//  1. built-in skills compiled into the binary
+//  2. skills bundled with enabled plugins (~/.cove/plugins/<name>/skills)
+//  3. the user's own (~/.claude/skills, then ~/.cove/skills)
+//  4. the project's: every directory from the repository root down to cwd,
+//     .claude/skills then .cove/skills in each, the innermost last
+//
+// Nothing above the repository root is read (without a repository, only cwd
+// itself), and subdirectories below cwd are never scanned: a vendored or cloned
+// dependency that ships a skills folder must not inject skills into the session.
 func LoadAll(m *Manager, cwd string) {
-	// Built-in skills are loaded directly from the embedded filesystem into
-	// memory. This makes them available out of the box (no config required) and
-	// keeps them in sync with the binary on every upgrade.
 	m.LoadEmbedded()
 
-	// User- and project-level skills are loaded next. Because AddDirectory
-	// registers by name, a local skill with the same name transparently
-	// overrides the built-in one, allowing customization.
 	home, _ := os.UserHomeDir()
 	if home != "" {
-		m.AddDirectory(filepath.Join(home, ".cove", "skills"))
-		m.AddDirectory(filepath.Join(home, ".claude", "skills"))
-		// Installed plugins may bundle skills under plugins/<name>/skills/.
-		// Scan each enabled plugin's skills directory so plugin skills become
-		// available without manual symlinking. Directories suffixed .disabled
-		// are skipped to honour the plugin enable/disable state.
 		pluginsDir := filepath.Join(home, ".cove", "plugins")
 		if entries, err := os.ReadDir(pluginsDir); err == nil {
 			for _, e := range entries {
+				// Directories suffixed .disabled honour the plugin enable/disable state.
 				if !e.IsDir() || strings.HasSuffix(e.Name(), ".disabled") {
 					continue
 				}
-				m.AddDirectory(filepath.Join(pluginsDir, e.Name(), "skills"))
+				m.addDirectory(filepath.Join(pluginsDir, e.Name(), "skills"), SourcePlugin)
 			}
 		}
+		m.addDirectory(filepath.Join(home, ".claude", "skills"), SourceUser)
+		m.addDirectory(filepath.Join(home, ".cove", "skills"), SourceUser)
 	}
 
-	if cwd != "" {
-		m.AddDirectory(filepath.Join(cwd, ".claude", "skills"))
-		m.AddDirectory(filepath.Join(cwd, ".cove", "skills"))
+	for _, dir := range projectDirs(cwd) {
+		m.addDirectory(filepath.Join(dir, ".claude", "skills"), SourceProject)
+		m.addDirectory(filepath.Join(dir, ".cove", "skills"), SourceProject)
+	}
+}
 
-		entries, _ := os.ReadDir(cwd)
-		for _, e := range entries {
-			if e.IsDir() {
-				m.AddDirectory(filepath.Join(cwd, e.Name(), ".claude", "skills"))
+// projectDirs returns the directories from the repository root down to cwd,
+// outermost first, or just cwd when it is not inside a repository.
+func projectDirs(cwd string) []string {
+	if cwd == "" {
+		return nil
+	}
+	dirs := []string{cwd}
+	for dir := cwd; ; {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			// Reverse: repository root first, cwd last.
+			for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
+				dirs[i], dirs[j] = dirs[j], dirs[i]
 			}
+			return dirs
 		}
-
-		dir := cwd
-		for {
-			parent := filepath.Dir(dir)
-			m.AddDirectory(filepath.Join(parent, ".claude", "skills"))
-			if parent == dir {
-				break
-			}
-			dir = parent
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return []string{cwd} // no repository: the project is cwd alone
 		}
+		dir = parent
+		dirs = append(dirs, dir)
 	}
 }
 
@@ -467,6 +452,55 @@ func (m *Manager) LoadEmbedded() {
 		}
 		sk := parseSkill(name, string(data), srcPath)
 		sk.Builtin = true
+		sk.Source = SourceBuiltin
 		m.skills[sk.Name] = sk
 	}
+}
+
+// Skill sources, lowest precedence first.
+const (
+	SourceBuiltin = "builtin"
+	SourcePlugin  = "plugin"
+	SourceUser    = "user"
+	SourceProject = "project"
+)
+
+// Disable removes the named skills (config "disabled_skills"). Unknown names
+// are ignored.
+func (m *Manager) Disable(names ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range names {
+		delete(m.skills, strings.TrimSpace(n))
+	}
+}
+
+// ExportBuiltin writes an editable copy of a built-in skill to
+// ~/.cove/skills/<name>/SKILL.md and returns its path. The copy overrides the
+// built-in from then on — including later versions shipped with the binary —
+// until it is deleted. It never overwrites an existing file.
+func ExportBuiltin(name string) (string, error) {
+	data, err := embeddedSkills.ReadFile("embedded/" + name + "/SKILL.md")
+	if err != nil {
+		return "", fmt.Errorf("no built-in skill named %q", name)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("cannot locate home directory")
+	}
+	dir, err := safepath.Join("skill", filepath.Join(home, ".cove", "skills"), name)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "SKILL.md")
+	if _, err := os.Stat(path); err == nil {
+		return "", fmt.Errorf("%s already exists; edit or delete it instead", path)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }

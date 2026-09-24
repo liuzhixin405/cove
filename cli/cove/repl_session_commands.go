@@ -22,7 +22,7 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 	case input == "/history":
 		// Display the history list and set pick-pending state so the next numeric
 		// input is treated as a session selection by the main loop.
-		handleHistory(eng)
+		handleHistory(eng, false)
 		*historyPickPending = true
 		return true
 	case strings.HasPrefix(input, "/history "):
@@ -32,12 +32,24 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 			*historyPickPending = false
 			return true
 		}
+		// "/history all ..." addresses the all-projects list; without it,
+		// numbers index the current project's list.
+		all := false
+		if strings.EqualFold(histID, "all") {
+			handleHistory(eng, true)
+			*historyPickPending = true
+			return true
+		}
+		if strings.HasPrefix(strings.ToLower(histID), "all ") {
+			all = true
+			histID = strings.TrimSpace(histID[len("all "):])
+		}
 		if strings.HasPrefix(strings.ToLower(histID), "detail ") {
-			handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng)
+			handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng, all)
 			*historyPickPending = false
 			return true
 		}
-		handleHistoryResume(histID, eng)
+		handleHistoryResumeIn(histID, eng, all)
 		*historyPickPending = false
 		return true
 	case input == "/compact":

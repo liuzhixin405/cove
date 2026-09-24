@@ -90,7 +90,7 @@ func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plug
 		outf("  [%s] %-12s %s\n", ro, d.Name, truncateDesc(d.Description, 48))
 	}
 	outln("\n" + providerEnvHelpLine())
-	outln("启动参数: -p <提示> [--image <路径>] [--file <路径>] | --profile <name> | --record <dir> | --replay <dir> | -d --debug | -v --version | --doctor | --config")
+	outln("启动参数: -p <提示> [--image <路径>] [--file <路径>] | -r <会话ID> | --profile <name> | --record <dir> | --replay <dir> | --no-tui | -d --debug | -v --version | --doctor | --config（完整列表: cove --help）")
 	outln("附件输入: 在 REPL 或 -p 文本中可写 @路径，例如：解释这张图 @assets/screen.png")
 	outln()
 }

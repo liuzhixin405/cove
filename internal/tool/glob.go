@@ -3,7 +3,6 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -91,30 +90,25 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		basePath = "."
 	}
 
-	var matches []string
-	err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			name := filepath.Base(path)
-			// Skip common large/irrelevant directories
-			switch name {
-			case ".git", "node_modules", ".next", ".nuxt", "vendor", "dist", "__pycache__", ".venv", "venv", ".tox":
-				return filepath.SkipDir
-			}
-			if strings.HasPrefix(name, ".") && path != basePath {
-				return filepath.SkipDir
-			}
-		}
-		rel, _ := filepath.Rel(basePath, path)
-		if matchGlob(pattern, rel) {
-			matches = append(matches, rel)
-		}
-		return nil
-	})
+	// Same boundary as the read tool: listing files outside the project is a
+	// way to read it too.
+	basePath, err := resolvePathInCwd(basePath, tctx, false)
 	if err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
+	}
+
+	// projectFiles honors .gitignore inside a repository and, unlike the old
+	// walk, does not hide every dot-directory — .github/workflows is exactly
+	// what "find the CI config" is looking for.
+	files, err := projectFiles(ctx, basePath)
+	if err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
+	}
+	var matches []string
+	for _, rel := range files {
+		if matchGlob(pattern, rel) {
+			matches = append(matches, filepath.FromSlash(rel))
+		}
 	}
 
 	if len(matches) == 0 {

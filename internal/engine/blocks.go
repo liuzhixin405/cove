@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,11 +54,23 @@ const legacyBlockWidth = 120
 
 // blockStyles is how a block is coloured on its way to the terminal.
 //
-// The glyph set is chosen once, at startup, from the console's code page. On a
-// console that is not UTF-8 the disclosure marker and the ✓/✗ pair come out as
+// The glyph set is chosen once, from the console's code page. On a console
+// that is not UTF-8 the disclosure marker and the ✓/✗ pair come out as
 // mojibake — and a "?" standing for both success and failure is how those two
 // states became indistinguishable in the first place.
-var blockStyles = newBlockStyles()
+//
+// It is chosen at first use, not at package init: package initialization runs
+// before cli/cove's init switches the Windows console to UTF-8, so a Chinese
+// console (code page 936 at that moment) got the ASCII set for good.
+var (
+	blockStylesOnce sync.Once
+	blockStyles     render.Styles
+)
+
+func currentBlockStyles() render.Styles {
+	blockStylesOnce.Do(func() { blockStyles = newBlockStyles() })
+	return blockStyles
+}
 
 func newBlockStyles() render.Styles {
 	st := render.Styles{
@@ -84,7 +97,7 @@ func (e *Engine) emitBlock(b render.Block) {
 		return
 	}
 	if e.OnEngineOutput != nil {
-		e.OnEngineOutput(render.Collapsed(withoutID(b), legacyBlockWidth, blockStyles) + "\n")
+		e.OnEngineOutput(render.Collapsed(withoutID(b), legacyBlockWidth, currentBlockStyles()) + "\n")
 	}
 }
 

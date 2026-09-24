@@ -2,10 +2,10 @@ package diagnostic
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
-	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/shell"
 )
 
 // CheckResult represents one diagnostic check's outcome.
@@ -119,14 +122,34 @@ func (r *Report) Format() string {
 
 // Checker runs diagnostic checks against the current environment.
 type Checker struct {
-	cfg     *config.Config
-	homeDir string
+	cfg       *config.Config
+	homeDir   string
+	configDir string // where config.json lives; honors COVE_CONFIG_DIR
+	cwd       string // where a project .cove.json would be
+
+	// Host probes, replaceable in tests.
+	goos     string
+	shell    func() shell.Shell
+	lookPath func(string) (string, error)
 }
 
 // NewChecker creates a new diagnostic checker.
 func NewChecker(cfg *config.Config) *Checker {
 	home, _ := os.UserHomeDir()
-	return &Checker{cfg: cfg, homeDir: home}
+	cfgDir, err := config.ConfigDir()
+	if err != nil {
+		cfgDir = filepath.Join(home, ".cove")
+	}
+	cwd, _ := os.Getwd()
+	return &Checker{
+		cfg:       cfg,
+		homeDir:   home,
+		configDir: cfgDir,
+		cwd:       cwd,
+		goos:      runtime.GOOS,
+		shell:     shell.Default,
+		lookPath:  exec.LookPath,
+	}
 }
 
 // RunAll executes all diagnostic checks and returns a report.
@@ -139,8 +162,10 @@ func (c *Checker) RunAll(ctx context.Context) *Report {
 		c.checkConfigValid,
 		c.checkAPIKey,
 		c.checkModelValid,
+		c.checkPermissionMode,
 		c.checkNetworkReachable,
 		c.checkShellAvailable,
+		c.checkGit,
 		c.checkDataDir,
 		c.checkDiskSpace,
 		c.checkSessionIntegrity,
@@ -168,6 +193,7 @@ func (c *Checker) RunQuick() *Report {
 		c.checkConfigValid,
 		c.checkAPIKey,
 		c.checkModelValid,
+		c.checkPermissionMode,
 		c.checkShellAvailable,
 		c.checkDataDir,
 	}
@@ -187,21 +213,20 @@ func (c *Checker) RunQuick() *Report {
 
 func (c *Checker) checkConfigExists(_ context.Context) CheckResult {
 	res := CheckResult{Name: "config_exists", Title: "配置文件"}
-	cfgPath := filepath.Join(c.homeDir, ".cove", "config.json")
+	cfgPath := filepath.Join(c.configDir, "config.json")
 
+	// A missing config.json used to be "auto-fixed" with a template holding the
+	// API key "sk-xxxxxxxx…" (and telemetry on). This runs from QuickCheck on
+	// every start, and a key in the file beats the environment, so a user who
+	// keeps the key in DEEPSEEK_API_KEY got 401s from the second launch on.
+	// cove runs fine without the file; it is only worth a warning when no key
+	// is available either, and nothing is written.
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		// Try to auto-fix by creating a richer default config that matches the
-		// documented shape and leaves room for the user to set their provider/api key.
-		dir := filepath.Dir(cfgPath)
-		if err := os.MkdirAll(dir, 0750); err == nil {
-			defaultCfg := "{\n  \"debug\": false,\n  \"max_budget_usd\": 10,\n  \"model\": \"deepseek-v4-pro\",\n  \"model_fast\": \"deepseek-v4-flash\",\n  \"permission_mode\": \"default\",\n  \"provider\": {\n    \"api_key\": \"sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n    \"base_url\": \"https://api.deepseek.com/v1\",\n    \"name\": \"deepseek\"\n  },\n  \"system_prompt\": \"你是 Cove，一个高效的 AI 编程助手。先理解任务，再用工具完成它；需要时读取、搜索、修改、执行、验证并给出真实结果，遇到问题要诚实说明。\",\n  \"telemetry\": true,\n  \"thinking_tokens\": 16000,\n  \"verbose\": false\n}\n"
-			if err := os.WriteFile(cfgPath, []byte(defaultCfg), 0640); err == nil {
-				res.Status = SevRecovered
-				res.Error = NewFixed(ErrConfigMissing, cfgPath)
-				return res
-			}
+		if c.cfg != nil && c.cfg.EffectiveProvider().APIKey != "" {
+			res.Status = SevInfo
+			return res
 		}
-		res.Status = SevFatal
+		res.Status = SevWarning
 		res.Error = New(ErrConfigMissing, cfgPath)
 	} else {
 		res.Status = SevInfo
@@ -216,8 +241,24 @@ func (c *Checker) checkConfigValid(_ context.Context) CheckResult {
 		res.Error = New(ErrConfigInvalid, "config is nil")
 		return res
 	}
+	// This only checked that a config was in memory, so a config.json with a
+	// syntax error — whose settings Load had just thrown away — passed.
+	for _, p := range []string{filepath.Join(c.configDir, "config.json"), filepath.Join(c.cwd, ".cove.json")} {
+		if err := config.CheckFile(p); err != nil {
+			res.Status = SevError
+			res.Error = New(ErrConfigInvalid, err.Error())
+			return res
+		}
+	}
 	res.Status = SevInfo
 	return res
+}
+
+// placeholderKey matches "sk-" followed only by x's: the key the old
+// missing-config auto-fix wrote, which some configs still carry.
+func placeholderKey(key string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(key), "sk-")
+	return ok && rest != "" && strings.Trim(rest, "x") == ""
 }
 
 func (c *Checker) checkAPIKey(_ context.Context) CheckResult {
@@ -227,27 +268,38 @@ func (c *Checker) checkAPIKey(_ context.Context) CheckResult {
 		return res
 	}
 
-	provName := c.cfg.Provider.Name
-	if provName == "" {
+	// Resolve the key exactly as the client will. This used to test four
+	// hard-coded variables: GLM_API_KEY, KIMI_API_KEY ... were "missing", a
+	// DEEPSEEK_API_KEY counted for the openai provider, and an empty provider
+	// name (which runs as anthropic) was reported as fatal.
+	pc := c.cfg.EffectiveProvider()
+	switch {
+	case placeholderKey(pc.APIKey):
 		res.Status = SevFatal
-		res.Error = New(ErrConfigProviderEmpty)
-		return res
-	}
-
-	// Check various sources for API key
-	hasKey := c.cfg.Provider.APIKey != "" ||
-		len(c.cfg.Provider.APIKeys) > 0 ||
-		os.Getenv("LLM_API_KEY") != "" ||
-		os.Getenv("DEEPSEEK_API_KEY") != "" ||
-		os.Getenv("OPENAI_API_KEY") != "" ||
-		os.Getenv("ANTHROPIC_API_KEY") != ""
-
-	if !hasKey {
+		res.Error = New(ErrConfigAPIKeyPlaceholder, pc.APIKey)
+	case pc.APIKey == "":
 		res.Status = SevFatal
-		res.Error = New(ErrConfigAPIKeyMissing, provName)
-	} else {
+		res.Error = New(ErrConfigAPIKeyMissing, pc.Name)
+	default:
 		res.Status = SevInfo
 	}
+	return res
+}
+
+func (c *Checker) checkPermissionMode(_ context.Context) CheckResult {
+	res := CheckResult{Name: "permission_mode", Title: "权限模式"}
+	if c.cfg == nil {
+		res.Skipped = true
+		return res
+	}
+	// Startup ignores a mode it does not know and runs in "default", so a
+	// typo in permission_mode had no visible effect at all.
+	if m := c.cfg.PermissionMode; m != "" && !permission.ValidMode(permission.Mode(m)) {
+		res.Status = SevWarning
+		res.Error = New(ErrConfigPermMode, m)
+		return res
+	}
+	res.Status = SevInfo
 	return res
 }
 
@@ -278,84 +330,112 @@ func (c *Checker) checkModelValid(_ context.Context) CheckResult {
 
 func (c *Checker) checkNetworkReachable(ctx context.Context) CheckResult {
 	res := CheckResult{Name: "network", Title: "API 网络连通"}
-	if c.cfg == nil || c.cfg.Provider.BaseURL == "" {
+	if c.cfg == nil {
 		res.Skipped = true
 		return res
 	}
-
-	baseURL := c.cfg.Provider.BaseURL
-	// Extract host from base URL
-	host := baseURL
-	host = strings.TrimPrefix(host, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	if idx := strings.IndexByte(host, '/'); idx > 0 {
-		host = host[:idx]
+	// Probe the URL the client will actually use. This read only
+	// provider.base_url, so the usual setup (no base_url, provider default or
+	// LLM_BASE_URL) skipped the check. It also dialed TCP and then forced a TLS
+	// handshake, which reported every http:// endpoint as "TLS失败" and went
+	// around HTTPS_PROXY. An HTTP request covers DNS, proxy, TCP and TLS, and
+	// any status code at all proves the server is reachable. No credentials
+	// are sent.
+	pc := c.cfg.EffectiveProvider()
+	baseURL := pc.BaseURL
+	if baseURL == "" {
+		baseURL = api.DefaultBaseURL(pc.Name)
 	}
-	if !strings.Contains(host, ":") {
-		host += ":443"
-	}
-
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", host)
-	if err != nil {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" {
 		res.Status = SevError
-		res.Error = New(ErrAPIUnreachable, baseURL)
+		res.Error = New(ErrAPIUnreachable, fmt.Sprintf("%s (base_url 无效)", displayURL(baseURL)))
 		return res
 	}
-	_ = conn.Close()
 
-	// Quick TLS handshake test
-	tlsCtx, tlsCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer tlsCancel()
-
-	tlsConn, err := (&tls.Dialer{}).DialContext(tlsCtx, "tcp", host)
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
+	if err == nil {
+		var resp *http.Response
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}
+		if resp, err = client.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}
 	if err != nil {
-		res.Status = SevWarning
-		res.Error = New(ErrAPIUnreachable, fmt.Sprintf("%s (TLS失败: %v)", baseURL, err))
+		// *url.Error's text repeats the full URL, query string included.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		res.Status = SevError
+		res.Error = New(ErrAPIUnreachable, fmt.Sprintf("%s (%v)", displayURL(baseURL), err))
 		return res
 	}
-	_ = tlsConn.Close()
 
 	res.Status = SevInfo
 	return res
 }
 
+// displayURL is scheme://host/path: base URLs sometimes carry a key in the
+// query string or userinfo, and the report is shown on screen.
+func displayURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<无法解析的地址>"
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 func (c *Checker) checkShellAvailable(_ context.Context) CheckResult {
 	res := CheckResult{Name: "shell", Title: "Shell 可用性"}
 
-	if runtime.GOOS == "windows" {
-		// Check PowerShell
-		shells := []string{"pwsh", "powershell"}
-		found := false
-		for _, sh := range shells {
-			if _, err := exec.LookPath(sh); err == nil {
-				found = true
-				break
-			}
-		}
-		if !found {
+	// Check the shell cove really runs commands with. On Windows this used to
+	// look for PowerShell, while the bash tool uses Git Bash first — so the
+	// check passed on machines where cove had fallen back to PowerShell (and
+	// the model's bash syntax failed), and it could never have noticed the
+	// WSL launcher being picked as "bash".
+	sh := c.shell()
+	if _, err := c.lookPath(sh.Path); err != nil {
+		res.Status = SevError
+		res.Error = New(ErrToolShellMiss, sh.Path)
+		return res
+	}
+	if c.goos == "windows" {
+		if sh.Kind == shell.Bash && isWSLLauncher(sh.Path) {
 			res.Status = SevError
-			res.Error = New(ErrToolShellMiss, "powershell/pwsh")
+			res.Error = New(ErrToolShellWSL, sh.Path)
 			return res
 		}
-	} else {
-		shells := []string{"bash", "sh"}
-		found := false
-		for _, sh := range shells {
-			if _, err := exec.LookPath(sh); err == nil {
-				found = true
-				break
-			}
-		}
-		if !found {
-			res.Status = SevError
-			res.Error = New(ErrToolShellMiss, "bash/sh")
+		if sh.Kind != shell.Bash {
+			res.Status = SevWarning
+			res.Error = New(ErrToolNoGitBash, sh.Describe())
 			return res
 		}
 	}
 
+	res.Status = SevInfo
+	return res
+}
+
+// isWSLLauncher mirrors internal/shell's guard: System32\bash.exe and the
+// WindowsApps alias hand commands to a WSL distro, not the Windows toolchain.
+func isWSLLauncher(path string) bool {
+	lower := strings.ToLower(strings.ReplaceAll(path, "/", `\`))
+	return strings.HasSuffix(lower, `\system32\bash.exe`) ||
+		strings.HasSuffix(lower, `\sysnative\bash.exe`) ||
+		strings.Contains(lower, `\windowsapps\`)
+}
+
+func (c *Checker) checkGit(_ context.Context) CheckResult {
+	res := CheckResult{Name: "git", Title: "Git"}
+	// Checkpoints (/rewind), worktrees and the file list rely on git.
+	if _, err := c.lookPath("git"); err != nil {
+		res.Status = SevWarning
+		res.Error = New(ErrToolGitMissing)
+		return res
+	}
 	res.Status = SevInfo
 	return res
 }
@@ -462,6 +542,3 @@ func QuickCheck(cfg *config.Config) []*DiagError {
 	}
 	return issues
 }
-
-// Ensure http package is used (for potential future health-check endpoint tests)
-var _ = http.StatusOK

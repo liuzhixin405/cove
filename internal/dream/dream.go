@@ -12,6 +12,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -249,7 +250,17 @@ func (r *Runner) executeDreamBash(tc api.ToolCall) string {
 	if cmd == "" {
 		return "Error: empty command"
 	}
+	if err := dreamBashAllowed(cmd); err != nil {
+		return "Error: only read-only commands (ls, find, grep, cat, stat, wc, head, tail) are allowed in dream mode"
+	}
 
+	// Execute via os/exec
+	return executeReadOnlyCommand(cmd)
+}
+
+// dreamBashAllowed reports whether cmd is a single read-only command the
+// unattended dream agent may run.
+func dreamBashAllowed(cmd string) error {
 	// Allow only read-only commands
 	allowedPrefixes := []string{
 		"ls", "find", "grep", "cat", "stat", "wc", "head", "tail",
@@ -263,24 +274,36 @@ func (r *Runner) executeDreamBash(tc api.ToolCall) string {
 			break
 		}
 	}
+	if !allowed {
+		return fmt.Errorf("not an allowlisted read-only command")
+	}
 
 	// Block shell meta operators to prevent command chaining/substitution.
 	// Dream mode allows only a single read-only command.
 	if strings.ContainsAny(cmd, "|;&`$<") || strings.Contains(cmd, "\n") || strings.Contains(cmd, "\r") {
-		allowed = false
+		return fmt.Errorf("shell operators are not allowed")
 	}
 
 	// Block output/input redirection.
 	if strings.Contains(cmd, ">") || strings.Contains(cmd, ">>") {
-		allowed = false
+		return fmt.Errorf("redirection is not allowed")
 	}
 
-	if !allowed {
-		return "Error: only read-only commands (ls, find, grep, cat, stat, wc, head, tail) are allowed in dream mode"
+	// find is allowlisted, but these actions delete, write files, or run
+	// programs with no shell operator involved, so the checks above never saw
+	// them: `find ~ -delete` passed as read-only (and on Windows, cmd resolves
+	// find to Git's GNU find when Git's usr/bin is on PATH).
+	for _, tok := range strings.Fields(cmdLower) {
+		if findWriteActions[tok] {
+			return fmt.Errorf("find action %s is not allowed", tok)
+		}
 	}
+	return nil
+}
 
-	// Execute via os/exec
-	return executeReadOnlyCommand(cmd)
+var findWriteActions = map[string]bool{
+	"-delete": true, "-exec": true, "-execdir": true, "-ok": true, "-okdir": true,
+	"-fprint": true, "-fprint0": true, "-fprintf": true, "-fls": true,
 }
 
 // executeDreamWrite writes content to memory files only.
@@ -301,6 +324,9 @@ func (r *Runner) executeDreamWrite(tc api.ToolCall) string {
 		return fmt.Sprintf("Error: dream mode can only write to memory directory (%s)", r.memoryRoot)
 	}
 
+	if err := memory.ScreenContent(content); err != nil {
+		return fmt.Sprintf("Error: refused to write memory: %v", err)
+	}
 	_ = os.MkdirAll(filepath.Dir(absPath), 0700)
 	// Atomic replace: a crash mid-write would otherwise leave a half-written
 	// memory file, which is then loaded as a memory entry on every later run.
@@ -339,6 +365,9 @@ func (r *Runner) executeDreamEdit(tc api.ToolCall) string {
 	}
 
 	newContent := strings.Replace(content, oldStr, newStr, 1)
+	if err := memory.ScreenContent(newContent); err != nil {
+		return fmt.Sprintf("Error: refused to edit memory: %v", err)
+	}
 	if err := fsatomic.WriteFile(absPath, []byte(newContent), 0644); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}

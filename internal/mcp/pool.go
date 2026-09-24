@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -18,11 +19,13 @@ type ManagedServer struct {
 	Tools     []Tool
 	Resources []Resource
 	Connected bool
+	Err       string
 }
 
 type Pool struct {
 	servers map[string]*ManagedServer
 	mu      sync.RWMutex
+	dial    func(name string, cfg ServerConfig) (Transport, error)
 }
 
 func NewPool() *Pool {
@@ -41,7 +44,10 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 	p.mu.Lock()
 	var stale *ManagedServer
 	if existing, ok := p.servers[name]; ok {
-		if existing.Connected {
+		// A server whose connection died (child crashed, stream dropped) is
+		// still in the map with Connected set; treating it as live made
+		// "/mcp connect" report success while doing nothing.
+		if existing.live() {
 			p.mu.Unlock()
 			return nil
 		}
@@ -58,34 +64,19 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 		stale.Close()
 	}
 
-	var transport Transport
-	var err error
-
-	switch strings.ToLower(cfg.Type) {
-	case "sse":
-		if cfg.URL != "" {
-			transport, err = NewSSETransport(cfg.URL)
-		} else {
-			err = fmt.Errorf("sse type requires 'url' in config")
-		}
-	case "http", "streamablehttp":
-		if cfg.URL != "" {
-			transport, err = NewStreamableHTTPTransport(cfg.URL)
-		} else {
-			err = fmt.Errorf("%s type requires 'url' in config", cfg.Type)
-		}
-	default:
-		transport, err = NewSTDIOTransport(name, cfg)
+	dial := p.dial
+	if dial == nil {
+		dial = newTransport
 	}
-
+	transport, err := dial(name, cfg)
 	if err != nil {
-		return fmt.Errorf("transport for %s: %w", name, err)
+		return p.recordFailure(name, cfg, fmt.Errorf("transport for %s: %w", name, err))
 	}
 
 	client := NewClient(transport)
 	if err := client.Connect(ctx); err != nil {
 		_ = transport.Close()
-		return fmt.Errorf("connect %s: %w", name, err)
+		return p.recordFailure(name, cfg, fmt.Errorf("connect %s: %w", name, err))
 	}
 
 	ms := &ManagedServer{
@@ -107,7 +98,7 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 	p.mu.Lock()
 	// A concurrent Connect for the same name may have won the race while this
 	// one was handshaking; keep the existing live server and discard ours.
-	if existing, ok := p.servers[name]; ok && existing.Connected {
+	if existing, ok := p.servers[name]; ok && existing.live() {
 		p.mu.Unlock()
 		ms.Close()
 		return nil
@@ -115,6 +106,44 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 	p.servers[name] = ms
 	p.mu.Unlock()
 	return nil
+}
+
+// recordFailure keeps a server that failed to connect in the pool, marked not
+// connected and carrying its error, and returns err. Dropping it made a broken
+// server simply vanish: the error only reached the debug log, and "/mcp list"
+// claimed no servers were configured. A live entry is never overwritten.
+func (p *Pool) recordFailure(name string, cfg ServerConfig, err error) error {
+	p.mu.Lock()
+	if existing, ok := p.servers[name]; !ok || !existing.live() {
+		p.servers[name] = &ManagedServer{Name: name, Config: cfg, Err: err.Error()}
+	}
+	p.mu.Unlock()
+	return err
+}
+
+// newTransport picks the transport for a server config. The type is matched
+// loosely because every ecosystem spells it differently (the docs say
+// "streamable_http", other MCP clients say "http", the SDKs "streamable-http"), and
+// an unknown type is an error: it used to fall through to stdio and fail with
+// "command is required", which pointed at the wrong field entirely.
+func newTransport(name string, cfg ServerConfig) (Transport, error) {
+	typ := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(cfg.Type))
+	switch typ {
+	case "sse":
+		if cfg.URL == "" {
+			return nil, fmt.Errorf("sse type requires 'url' in config")
+		}
+		return NewSSETransport(cfg.URL)
+	case "http", "streamablehttp":
+		if cfg.URL == "" {
+			return nil, fmt.Errorf("%s type requires 'url' in config", cfg.Type)
+		}
+		return NewStreamableHTTPTransport(cfg.URL)
+	case "", "stdio":
+		return NewSTDIOTransport(name, cfg)
+	default:
+		return nil, fmt.Errorf("unknown transport type %q (want stdio, sse or http)", cfg.Type)
+	}
 }
 
 func NewSTDIOTransport(name string, cfg ServerConfig) (Transport, error) {
@@ -197,14 +226,30 @@ func (p *Pool) DisconnectAll() {
 // Handing out the live pointers let callers read Connected/Tools/Resources
 // after releasing the lock, racing Close() and Connect() which write those same
 // fields. Callers only ever read the metadata, so a snapshot costs nothing.
+//
+// Every listing is sorted by server name. The mcp tool's description is rebuilt
+// from AllTools on each request, and map iteration order made it differ from
+// turn to turn - a changed tool definition in the prompt prefix, which throws
+// away the provider's prompt cache (DeepSeek and Anthropic both cache by
+// prefix) on every single request.
 func (p *Pool) AllServers() []*ManagedServer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	result := make([]*ManagedServer, 0, len(p.servers))
-	for _, s := range p.servers {
-		result = append(result, s.snapshot())
+	for _, name := range p.sortedNames() {
+		result = append(result, p.servers[name].snapshot())
 	}
 	return result
+}
+
+// sortedNames returns the pool's server names in order. Callers hold p.mu.
+func (p *Pool) sortedNames() []string {
+	names := make([]string, 0, len(p.servers))
+	for name := range p.servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // snapshot returns a copy safe to read outside the pool lock. Client and
@@ -216,7 +261,8 @@ func (ms *ManagedServer) snapshot() *ManagedServer {
 		Config:    ms.Config,
 		Client:    ms.Client,
 		Transport: ms.Transport,
-		Connected: ms.Connected,
+		Connected: ms.live(),
+		Err:       ms.Err,
 	}
 	if len(ms.Tools) > 0 {
 		cp.Tools = append([]Tool(nil), ms.Tools...)
@@ -231,30 +277,43 @@ func (p *Pool) AllTools() []ToolRef {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var refs []ToolRef
-	for name, s := range p.servers {
-		for _, t := range s.Tools {
+	for _, name := range p.sortedNames() {
+		for _, t := range p.servers[name].Tools {
 			refs = append(refs, ToolRef{Server: name, Tool: t})
 		}
 	}
 	return refs
 }
 
-func (p *Pool) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (*CallToolResult, error) {
+// client returns the connection for serverName, or an error that says why
+// there is none (never configured, or its connect failed and with what).
+func (p *Pool) client(serverName string) (*Client, error) {
 	p.mu.RLock()
 	s, ok := p.servers[serverName]
 	p.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("mcp server %s not connected", serverName)
 	}
-	return s.Client.CallTool(ctx, toolName, args)
+	if s.Client == nil {
+		return nil, fmt.Errorf("mcp server %s not connected: %s", serverName, s.Err)
+	}
+	return s.Client, nil
+}
+
+func (p *Pool) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (*CallToolResult, error) {
+	c, err := p.client(serverName)
+	if err != nil {
+		return nil, err
+	}
+	return c.CallTool(ctx, toolName, args)
 }
 
 func (p *Pool) AllResources() []ResourceRef {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var refs []ResourceRef
-	for name, s := range p.servers {
-		for _, r := range s.Resources {
+	for _, name := range p.sortedNames() {
+		for _, r := range p.servers[name].Resources {
 			refs = append(refs, ResourceRef{Server: name, Resource: r})
 		}
 	}
@@ -262,13 +321,11 @@ func (p *Pool) AllResources() []ResourceRef {
 }
 
 func (p *Pool) ReadResource(ctx context.Context, serverName, uri string) (*ReadResourceResult, error) {
-	p.mu.RLock()
-	s, ok := p.servers[serverName]
-	p.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("mcp server %s not connected", serverName)
+	c, err := p.client(serverName)
+	if err != nil {
+		return nil, err
 	}
-	return s.Client.ReadResource(ctx, uri)
+	return c.ReadResource(ctx, uri)
 }
 
 type ToolRef struct {
@@ -281,6 +338,11 @@ type ResourceRef struct {
 	Resource Resource
 }
 
+// live reports whether the server is connected AND its connection still works.
+func (ms *ManagedServer) live() bool {
+	return ms.Connected && ms.Client != nil && ms.Client.Alive()
+}
+
 func (ms *ManagedServer) Close() {
 	ms.Connected = false
 	if ms.Client != nil {
@@ -290,12 +352,24 @@ func (ms *ManagedServer) Close() {
 }
 
 // LoadFromConfig connects to all servers defined in the config map.
+//
+// The servers are dialled concurrently. Startup gives MCP a single shared
+// deadline, and connecting one after another meant a single server that never
+// answered initialize used up the whole budget, so every server after it
+// failed with an expired context. Failures are recorded in the pool (see
+// recordFailure) so /mcp list can show them.
 func (p *Pool) LoadFromConfig(ctx context.Context, servers map[string]ServerConfig) {
+	var wg sync.WaitGroup
 	for name, cfg := range servers {
-		if err := p.Connect(ctx, name, cfg); err != nil {
-			logF("MCP: %s: %v", name, err)
-		}
+		wg.Add(1)
+		go func(name string, cfg ServerConfig) {
+			defer wg.Done()
+			if err := p.Connect(ctx, name, cfg); err != nil {
+				logF("MCP: %s: %v", name, err)
+			}
+		}(name, cfg)
 	}
+	wg.Wait()
 }
 
 // logF emits diagnostic messages only when the global log level is Debug,

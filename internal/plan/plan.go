@@ -97,11 +97,20 @@ func FromRuntime(planID string, rt *tool.Runtime) (*Plan, error) {
 		return nil, fmt.Errorf("no pending tasks found")
 	}
 
-	// Validate dependencies exist and detect cycles
+	// Validate dependencies exist and detect cycles. A dependency outside the
+	// plan is fine when that task already finished: a plan resumed after its
+	// first steps completed used to be rejected with "unknown task" for them.
 	for _, t := range tasks {
 		for _, dep := range t.DependsOn {
-			if !seen[dep] {
+			if seen[dep] {
+				continue
+			}
+			tr, ok := rt.Tasks[dep]
+			if !ok {
 				return nil, fmt.Errorf("task %q depends on unknown task %q", t.ID, dep)
+			}
+			if !isFinished(tr.Status) {
+				return nil, fmt.Errorf("task %q depends on task %q, which is %s, not completed", t.ID, dep, tr.Status)
 			}
 		}
 	}
@@ -114,6 +123,12 @@ func FromRuntime(planID string, rt *tool.Runtime) (*Plan, error) {
 		ID:    planID,
 		Tasks: tasks,
 	}, nil
+}
+
+// isFinished reports whether a runtime task status means the work is done:
+// the executor writes "done", todowrite uses "completed".
+func isFinished(status string) bool {
+	return status == "done" || status == "completed"
 }
 
 // TopologicalSort returns tasks grouped by depth level (BFS).
@@ -180,6 +195,9 @@ func detectCycle(tasks []*Task, taskByID map[string]*Task) []string {
 
 		t := taskByID[id]
 		for _, dep := range t.DependsOn {
+			if _, inPlan := taskByID[dep]; !inPlan {
+				continue // an already-finished task outside the plan
+			}
 			if recStack[dep] {
 				// Found cycle
 				cycleStart := -1
@@ -220,7 +238,7 @@ func FormatResult(result *ExecutionResult) string {
 		if t.Status == "failed" {
 			icon = "✗"
 		}
-		if t.Status == "skipped" {
+		if t.Status == "skipped" || t.Status == "cancelled" {
 			icon = "○"
 		}
 		fmt.Fprintf(&sb, "  %s [%s] %s — %s", icon, t.ID, t.Title, t.Status)

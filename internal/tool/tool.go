@@ -62,7 +62,12 @@ type Runtime struct {
 	AskUser       func(prompt string) string
 	// PlanExecuteFunc, when set, is invoked by the execute_plan tool.
 	// It receives parallel flag and returns a formatted result summary.
-	PlanExecuteFunc func(parallel bool) (string, error)
+	// ctx is the calling tool's context: cancelling the turn cancels the
+	// sub-agents the plan executor is running.
+	PlanExecuteFunc func(ctx context.Context, parallel bool) (string, error)
+
+	// files is created lazily by Files(); guarded by mu.
+	files *FileTracker
 }
 
 func (r *Runtime) Lock()   { r.mu.Lock() }

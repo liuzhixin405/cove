@@ -1,8 +1,6 @@
 ---
 name: github-pr-workflow
 description: GitHub PR lifecycle: branch, commit, open PR, monitor CI, merge.
-conditional: true
-paths: "*.go,*.py,*.js,*.ts,*.rs,*.java"
 ---
 
 # GitHub Pull Request Workflow

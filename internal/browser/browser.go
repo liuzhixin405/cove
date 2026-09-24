@@ -187,9 +187,13 @@ func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*Fet
 	// maxBodySize is a byte budget applied by LimitReader, so a body larger than
 	// the cap is cut at an arbitrary byte — regularly inside a multi-byte
 	// character. Drop that half rune before the bytes become a string.
-	content := trimPartialTrailingRune(string(body))
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	isHTML := strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/xhtml+xml")
+	content, err := decodeBody(body, contentType, isHTML)
+	if err != nil {
+		return nil, err
+	}
+	content = trimPartialTrailingRune(content)
 
 	if isHTML {
 		switch format {

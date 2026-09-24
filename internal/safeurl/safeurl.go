@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,16 @@ var privateCIDRs = []string{
 	"fc00::/7",       // IPv6 unique-local
 	"fe80::/10",      // IPv6 link-local
 }
+
+// proxyFromEnvironment picks the proxy for a request. It is a variable so tests
+// can supply a proxy: http.ProxyFromEnvironment reads the environment once per
+// process and caches it.
+var proxyFromEnvironment = http.ProxyFromEnvironment
+
+// lookupIP resolves a hostname for IsPrivateHost. A variable so tests do not
+// depend on the machine's resolver: fake-IP DNS (Clash/Surge TUN mode) answers
+// every name, even "x.invalid.", with an address in 198.18.0.0/15.
+var lookupIP = net.LookupIP
 
 var parsedPrivate []*net.IPNet
 
@@ -91,7 +102,7 @@ func IsPrivateHost(host string) bool {
 	if ip := net.ParseIP(host); ip != nil {
 		return IsPrivateIP(ip)
 	}
-	ips, err := net.LookupIP(host)
+	ips, err := lookupIP(host)
 	if err != nil || len(ips) == 0 {
 		return true
 	}
@@ -155,7 +166,30 @@ func ValidateURL(rawURL string) error {
 // are still bounded by the transport).
 func NewClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 10 * time.Second}
+
+	// The transport dials a configured proxy through safeDial too. A proxy
+	// normally lives on loopback or the LAN (HTTPS_PROXY=http://127.0.0.1:7890,
+	// a corporate 10.x proxy), so every fetch used to be refused at the proxy
+	// dial. The proxy comes from the user's own environment, not from the
+	// fetched URL, so its address is allowed; the target is then vetted in
+	// proxy() instead, because the proxy — not safeDial — connects to it.
+	var proxyAddrs sync.Map // canonical "host:port" of proxies in use
+	proxy := func(req *http.Request) (*url.URL, error) {
+		p, err := proxyFromEnvironment(req)
+		if err != nil || p == nil {
+			return p, err
+		}
+		if IsPrivateHost(req.URL.Hostname()) {
+			return nil, fmt.Errorf("blocked: %s is private, internal or unresolvable", req.URL.Hostname())
+		}
+		proxyAddrs.Store(canonicalProxyAddr(p), true)
+		return p, nil
+	}
+
 	safeDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := proxyAddrs.Load(addr); ok {
+			return dialer.DialContext(ctx, network, addr)
+		}
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
@@ -181,7 +215,7 @@ func NewClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
+			Proxy:                 proxy,
 			DialContext:           safeDial,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: headerTimeout,
@@ -200,4 +234,21 @@ func NewClient(timeout time.Duration) *http.Client {
 			return nil
 		},
 	}
+}
+
+// canonicalProxyAddr returns the "host:port" the transport dials for proxy p,
+// filling in the scheme's default port the way net/http does.
+func canonicalProxyAddr(p *url.URL) string {
+	port := p.Port()
+	if port == "" {
+		switch strings.ToLower(p.Scheme) {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(p.Hostname(), port)
 }

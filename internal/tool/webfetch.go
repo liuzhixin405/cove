@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"html"
 	"io"
 	"net/http"
@@ -71,19 +72,9 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		return Result{Data: "Error reading: " + err.Error(), IsError: true}, nil
 	}
 
-	content := string(body)
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-	isHTML := strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/xhtml+xml")
-
-	if isHTML {
-		switch format {
-		case "text":
-			content = htmlToText(content)
-		case "markdown":
-			content = htmlToMarkdown(content)
-		case "html":
-			// Keep as-is.
-		}
+	content, err := fetchedText(body, resp.Header.Get("Content-Type"), format)
+	if err != nil {
+		return Result{Data: "Error: " + url + ": " + err.Error(), IsError: true}, nil
 	}
 
 	limit := 100000
@@ -91,6 +82,33 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		"\n... [truncated from "+strconv.Itoa(len(body))+" bytes]")
 
 	return Result{Data: "URL: " + url + "\nStatus: " + strconv.Itoa(resp.StatusCode) + "\nFormat: " + format + "\n\n" + strings.TrimSpace(content)}, nil
+}
+
+// fetchedText turns a response body into text for the model. Binary bodies
+// (PDFs, images, archives) are refused: dumped as text they were up to 100KB
+// of noise in the context.
+func fetchedText(body []byte, contentType, format string) (string, error) {
+	sample := body
+	if len(sample) > 8192 {
+		sample = sample[:8192]
+	}
+	if sniffText(sample) == textBinary {
+		if contentType == "" {
+			contentType = "unknown type"
+		}
+		return "", fmt.Errorf("binary content (%s, %d bytes); webfetch only returns text. Download it with bash (curl -o) if you need the file", contentType, len(body))
+	}
+	content := string(body)
+	ct := strings.ToLower(contentType)
+	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml") {
+		switch format {
+		case "text":
+			content = htmlToText(content)
+		case "markdown":
+			content = htmlToMarkdown(content)
+		}
+	}
+	return content, nil
 }
 
 var (

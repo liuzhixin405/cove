@@ -12,102 +12,147 @@ import (
 	"time"
 )
 
+// httpPostTimeout bounds a POST whose answer is only an acknowledgement (the
+// SSE transport's responses arrive on the stream, not on the POST).
+var httpPostTimeout = 30 * time.Second
+
+// sseEndpointTimeout bounds the wait for the server's "endpoint" event.
+var sseEndpointTimeout = 30 * time.Second
+
+// sseTransport implements the HTTP+SSE transport (spec 2024-11-05): the client
+// GETs the configured URL as an event stream, the server's first event
+// ("endpoint") names the URL to POST messages to, and every server message -
+// responses included - arrives on the stream.
+//
+// It used to POST to "<url>/sse" for a JSON {"sessionId"} and then GET
+// "<url>/message": a protocol no real server speaks, so "type": "sse" could
+// not connect to anything.
 type sseTransport struct {
-	baseURL   string
-	client    *http.Client
-	sessionID string
-	msgChan   chan json.RawMessage
-	ctx       context.Context
-	cancel    context.CancelFunc
+	sseURL   string
+	endpoint string // absolute POST URL from the endpoint event
+	client   *http.Client
+	msgChan  chan json.RawMessage
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
-func NewSSETransport(baseURL string) (*sseTransport, error) {
+func NewSSETransport(sseURL string) (*sseTransport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &sseTransport{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		sseURL:  sseURL,
+		client:  &http.Client{Timeout: httpPostTimeout},
 		msgChan: make(chan json.RawMessage, 64),
 		ctx:     ctx,
 		cancel:  cancel,
 	}
 
-	req, _ := http.NewRequest("POST", t.baseURL+"/sse", nil)
-	resp, err := t.client.Do(req)
+	req, err := http.NewRequestWithContext(ctx, "GET", sseURL, nil)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("sse connect: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var result struct {
-		SessionID string `json:"sessionId"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
-	if result.SessionID == "" {
+	req.Header.Set("Accept", "text/event-stream")
+	// No timeout on the long-lived stream itself.
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("sse: no session ID")
+		return nil, fmt.Errorf("sse connect: %w", err)
 	}
-	t.sessionID = result.SessionID
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("sse connect: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
-	go t.listenSSE()
+	endpointCh := make(chan string, 1)
+	streamDone := make(chan struct{})
+	go func() {
+		defer close(streamDone)
+		t.listenSSE(resp.Body, endpointCh)
+	}()
+
+	timer := time.NewTimer(sseEndpointTimeout)
+	defer timer.Stop()
+	var raw string
+	select {
+	case raw = <-endpointCh:
+	case <-streamDone:
+		cancel()
+		return nil, fmt.Errorf("sse: stream closed before the server sent its endpoint event")
+	case <-timer.C:
+		cancel()
+		return nil, fmt.Errorf("sse: no endpoint event within %v (is %s an SSE endpoint?)", sseEndpointTimeout, sseURL)
+	}
+
+	endpoint, err := resolveSSEEndpoint(sseURL, raw)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	t.endpoint = endpoint
 	return t, nil
 }
 
-func (t *sseTransport) listenSSE() {
-	defer t.cancel()
-	req, _ := http.NewRequestWithContext(t.ctx, "GET", fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, url.QueryEscape(t.sessionID)), nil)
-	req.Header.Set("Accept", "text/event-stream")
-	// Use a client with no timeout for long-lived SSE stream
-	sseClient := &http.Client{}
-	resp, err := sseClient.Do(req)
+// resolveSSEEndpoint resolves the endpoint event against the SSE URL and
+// refuses one on another origin: the event is server-controlled, and following
+// it elsewhere would send every later request - arguments included - to a
+// host the user never configured.
+func resolveSSEEndpoint(sseURL, raw string) (string, error) {
+	base, err := url.Parse(sseURL)
 	if err != nil {
-		return
+		return "", fmt.Errorf("sse: bad url %q: %w", sseURL, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	ref, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("sse: bad endpoint %q: %w", raw, err)
+	}
+	abs := base.ResolveReference(ref)
+	if abs.Scheme != base.Scheme || abs.Host != base.Host {
+		return "", fmt.Errorf("sse: endpoint %q is on a different origin than %s; refusing to follow it", raw, sseURL)
+	}
+	return abs.String(), nil
+}
 
-	buf := make([]byte, 0, 4096)
-	chunk := make([]byte, 256)
-	for {
+// listenSSE reads the stream: the first endpoint event is handed to the
+// constructor, message events to Receive. When the stream ends the transport
+// is shut down, so Receive reports EOF and the client knows it is dead.
+func (t *sseTransport) listenSSE(body io.ReadCloser, endpointCh chan<- string) {
+	defer t.cancel()
+	defer func() { _ = body.Close() }()
+	sentEndpoint := false
+	_ = readSSE(body, func(ev sseEvent) bool {
+		if ev.Type == "endpoint" {
+			if !sentEndpoint {
+				sentEndpoint = true
+				endpointCh <- ev.Data
+			}
+			return true
+		}
+		if !isMessageEvent(ev) {
+			return true
+		}
+		// Block until the message is consumed (backpressure) rather than
+		// dropping it; dropping a JSON-RPC response would hang the caller
+		// until its timeout. Unblock on transport shutdown.
 		select {
+		case t.msgChan <- json.RawMessage(ev.Data):
+			return true
 		case <-t.ctx.Done():
-			return
-		default:
+			return false
 		}
-		n, err := resp.Body.Read(chunk)
-		if err != nil {
-			return
-		}
-		buf = append(buf, chunk[:n]...)
-
-		for {
-			idx := bytes.Index(buf, []byte("\n\n"))
-			if idx == -1 {
-				break
-			}
-			event := strings.TrimSpace(string(buf[:idx]))
-			buf = buf[idx+2:]
-
-			if strings.HasPrefix(event, "data: ") {
-				payload := strings.TrimPrefix(event, "data: ")
-				// Block until the message is consumed (backpressure) rather than
-				// dropping it; dropping a JSON-RPC response would hang the caller
-				// until its timeout. Unblock on transport shutdown.
-				// Mirrors the streamable-HTTP transport, where this was already fixed.
-				select {
-				case t.msgChan <- json.RawMessage(payload):
-				case <-t.ctx.Done():
-					return
-				}
-			}
-		}
-	}
+	})
 }
 
 func (t *sseTransport) Send(ctx context.Context, msg any) error {
-	data, _ := json.Marshal(msg)
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/message?sessionId=%s", t.baseURL, url.QueryEscape(t.sessionID)),
-		bytes.NewReader(data))
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", t.endpoint, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.client.Do(req)
 	if err != nil {

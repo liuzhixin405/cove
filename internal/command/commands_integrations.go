@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/mcp"
 	"github.com/liuzhixin405/cove/internal/plugin"
+	"github.com/liuzhixin405/cove/internal/skills"
 )
 
 func (c *McpCmd) Name() string        { return "mcp" }
@@ -35,6 +36,11 @@ func (c *McpCmd) Execute(ctx context.Context, in Input) (Output, error) {
 				typeName = "stdio"
 			}
 			fmt.Fprintf(&sb, "- %s [%s] connected=%t tools=%d resources=%d\n", s.Name, typeName, s.Connected, len(s.Tools), len(s.Resources))
+			// Connection errors are only logged at debug level, so this is
+			// the one place the user can see why a server is down.
+			if s.Err != "" {
+				fmt.Fprintf(&sb, "  错误: %s\n", s.Err)
+			}
 		}
 		return Output{Message: sb.String()}, nil
 	case "disconnect":
@@ -44,6 +50,18 @@ func (c *McpCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		if in.Args[1] == "all" {
 			in.MCPPool.DisconnectAll()
 			return Output{Message: "已断开所有 MCP 服务器"}, nil
+		}
+		// Disconnect ignores unknown names; without this check a typo was
+		// reported as a successful disconnect.
+		known := false
+		for _, s := range in.MCPPool.AllServers() {
+			if s.Name == in.Args[1] {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return Output{Message: fmt.Sprintf("未找到 MCP 服务器 '%s'（/mcp list 查看）", in.Args[1])}, nil
 		}
 		in.MCPPool.Disconnect(in.Args[1])
 		return Output{Message: fmt.Sprintf("已断开 MCP 服务器: %s", in.Args[1])}, nil
@@ -146,10 +164,9 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		if len(in.Args) > 2 {
 			url = in.Args[2]
 		}
-		if strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "git@") {
+		if isPluginGitURL(name) {
 			url = name
-			parts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
-			name = parts[len(parts)-1]
+			name = pluginNameFromURL(url)
 		} else if at := strings.IndexByte(name, '@'); at > 0 {
 			name = name[:at]
 		}
@@ -245,8 +262,23 @@ func (c *SkillsCmd) Name() string        { return "skills" }
 func (c *SkillsCmd) Aliases() []string   { return []string{"skill"} }
 func (c *SkillsCmd) Description() string { return "查看可用技能" }
 func (c *SkillsCmd) Help() string {
-	return "/skills [list|名称] - 列出内置和用户定义的技能"
+	return "/skills [list|名称|export 名称] - 列出技能（标注来源）、查看技能内容，或导出内置技能到 ~/.cove/skills 以便修改"
 }
+
+// skillSourceLabel names where a skill was loaded from.
+func skillSourceLabel(source string) string {
+	switch source {
+	case skills.SourceBuiltin:
+		return "[内置]"
+	case skills.SourcePlugin:
+		return "[插件]"
+	case skills.SourceProject:
+		return "[项目]"
+	default:
+		return "[用户]"
+	}
+}
+
 func (c *SkillsCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if in.SkillManager == nil {
 		return Output{Message: "技能管理器不可用"}, nil
@@ -258,11 +290,21 @@ func (c *SkillsCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		}
 		sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
 		var sb strings.Builder
-		sb.WriteString("技能列表:\n")
+		sb.WriteString("技能列表（同名时 项目 > 用户 > 插件 > 内置）:\n")
 		for _, s := range all {
-			fmt.Fprintf(&sb, "- %-16s %s\n", s.Name, s.Description)
+			fmt.Fprintf(&sb, "- %-24s %-6s %s\n", s.Name, skillSourceLabel(s.Source), s.Description)
 		}
 		return Output{Message: sb.String()}, nil
+	}
+	if in.Args[0] == "export" {
+		if len(in.Args) < 2 {
+			return Output{Message: "用法: /skills export <内置技能名>"}, nil
+		}
+		path, err := skills.ExportBuiltin(in.Args[1])
+		if err != nil {
+			return Output{Message: fmt.Sprintf("导出失败: %v", err)}, nil
+		}
+		return Output{Message: fmt.Sprintf("已导出到 %s\n重启后该副本会覆盖内置版本；它不再随 cove 升级更新，删除这个文件即可恢复内置版本。", path)}, nil
 	}
 	name := in.Args[0]
 	s, ok := in.SkillManager.Get(name)
@@ -270,6 +312,29 @@ func (c *SkillsCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		return Output{Message: fmt.Sprintf("未找到技能 '%s'", name)}, nil
 	}
 	return Output{Message: fmt.Sprintf("# %s\n\n%s", s.Name, s.Prompt)}, nil
+}
+
+// isPluginGitURL reports whether a /plugin install argument is a git URL
+// rather than a marketplace name. Only https:// and git@ used to count, so an
+// http:// or ssh:// URL was looked up in the marketplace as a plugin name.
+func isPluginGitURL(s string) bool {
+	for _, prefix := range []string{"https://", "http://", "ssh://", "git@"} {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// pluginNameFromURL is the last path element of a git URL without ".git".
+// A trailing slash used to leave an empty name, and the scp form
+// git@host:repo.git (no slash) kept the host in it.
+func pluginNameFromURL(url string) string {
+	s := strings.TrimSuffix(strings.TrimRight(url, "/"), ".git")
+	if i := strings.LastIndexAny(s, "/:"); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
 }
 
 func pluginStateLabel(s plugin.State) string {

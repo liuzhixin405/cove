@@ -27,6 +27,9 @@ type Record struct {
 	TokensIn     int     `json:"tokens_in"`
 	TokensOut    int     `json:"tokens_out"`
 	Cost         float64 `json:"cost"`
+	// Cwd is the project directory the session was started in, normalized
+	// with NormalizeProjectDir. Empty for sessions saved before it existed.
+	Cwd string `json:"cwd,omitempty"`
 }
 
 type Store struct {
@@ -105,6 +108,7 @@ func (s *Store) List() ([]Record, error) {
 			TokensIn  int     `json:"tokens_in"`
 			TokensOut int     `json:"tokens_out"`
 			Cost      float64 `json:"cost"`
+			Cwd       string  `json:"cwd"`
 		}
 		err = json.NewDecoder(f).Decode(&meta)
 		_ = f.Close()
@@ -129,6 +133,7 @@ func (s *Store) List() ([]Record, error) {
 			TokensIn:     meta.TokensIn,
 			TokensOut:    meta.TokensOut,
 			Cost:         meta.Cost,
+			Cwd:          meta.Cwd,
 		})
 	}
 	sort.Slice(records, func(i, j int) bool {
@@ -163,7 +168,6 @@ func looksSyntheticContent(c string) bool {
 		"[system:", "[Conversation Summary]",
 		"[系统检测到重复操作循环]", "[Context truncated",
 		"[用户指引]", "[Continue the task", "[会话摘要]",
-		"run slow tool", "do something", "slow response",
 	}
 	for _, p := range knownPrefixes {
 		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {

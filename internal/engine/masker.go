@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +29,9 @@ type ToolOutputMasker struct {
 	minPrunableThreshold int             // min prunable before masking triggers (default 30000)
 	outputDir            string          // ~/.cove/tool-outputs/
 	exemptTools          map[string]bool // tools whose output is never masked
+	// protectionScale multiplies protectionThreshold for larger context
+	// windows; values below 1 are treated as 1.
+	protectionScale float64
 }
 
 // NewToolOutputMasker creates a masker with sensible defaults.
@@ -55,12 +60,16 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 	}
 
 	// ── Pass 1: backward scan to find protection boundary ──
+	threshold := m.protectionThreshold
+	if m.protectionScale > 1 {
+		threshold = int(float64(threshold) * m.protectionScale)
+	}
 	protected := 0
 	cutoffIdx := 0
 	for i := len(history) - 1; i >= 0; i-- {
 		msg := history[i]
 		protected += m.msgTokens(msg)
-		if protected >= m.protectionThreshold {
+		if protected >= threshold {
 			cutoffIdx = i
 			break
 		}
@@ -96,7 +105,12 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 		}
 
 		name := strings.ReplaceAll(newHistory[i].Name, "/", "_")
-		filename := fmt.Sprintf("output_%d_%s.txt", i, name)
+		// Named by content, not by message index: every session shares this
+		// directory, and index-based names ("output_3_read.txt") were
+		// overwritten by the next session or after compaction renumbered the
+		// history, so a placeholder could point at someone else's output.
+		sum := sha256.Sum256([]byte(newHistory[i].Content))
+		filename := fmt.Sprintf("output_%s_%s.txt", hex.EncodeToString(sum[:8]), name)
 		filePath := filepath.Join(m.outputDir, filename)
 
 		if err := os.WriteFile(filePath, []byte(newHistory[i].Content), 0644); err != nil {
