@@ -1,12 +1,14 @@
 package plugin
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -39,17 +41,66 @@ func runGit(t *testing.T, dir string, args ...string) string {
 
 // newPluginRepo creates a local git repository holding a plugin whose
 // manifest has the given version, and returns its path.
+//
+// Building one takes three git processes, a second or more on Windows; each
+// (name, version) is built once per test binary and copied (with its .git)
+// for every test that asks, so each test still gets a repository of its own.
 func newPluginRepo(t *testing.T, name, version string) string {
 	t.Helper()
+	key := name + "@" + version
+	pluginRepoMu.Lock()
+	tmpl, ok := pluginRepoTemplates[key]
+	if !ok {
+		root, err := os.MkdirTemp("", "cove-plugin-tmpl-")
+		if err != nil {
+			pluginRepoMu.Unlock()
+			t.Fatal(err)
+		}
+		tmpl = filepath.Join(root, "src-"+name)
+		if err := os.MkdirAll(tmpl, 0o755); err != nil {
+			pluginRepoMu.Unlock()
+			t.Fatal(err)
+		}
+		runGit(t, tmpl, "init", "--quiet")
+		writeManifestVersion(t, tmpl, name, version)
+		runGit(t, tmpl, "add", "-A")
+		runGit(t, tmpl, "commit", "--quiet", "-m", "v"+version)
+		pluginRepoTemplates[key] = tmpl
+	}
+	pluginRepoMu.Unlock()
+
 	dir := filepath.Join(t.TempDir(), "src-"+name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := copyTree(tmpl, dir); err != nil {
 		t.Fatal(err)
 	}
-	runGit(t, dir, "init", "--quiet")
-	writeManifestVersion(t, dir, name, version)
-	runGit(t, dir, "add", "-A")
-	runGit(t, dir, "commit", "--quiet", "-m", "v"+version)
 	return dir
+}
+
+var (
+	pluginRepoMu        sync.Mutex
+	pluginRepoTemplates = map[string]string{}
+)
+
+// copyTree copies the directory src to dst, which must not exist.
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
 }
 
 func writeManifestVersion(t *testing.T, dir, name, version string) {

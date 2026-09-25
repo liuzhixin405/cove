@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove/internal/diagnostic"
 	"github.com/liuzhixin405/cove/internal/permission"
 )
 
@@ -46,6 +47,9 @@ func (c *DoctorCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		}
 	}
 	fmt.Fprintf(&sb, "时间: %s\n", time.Now().Format(time.RFC3339))
+	// Background learning and the policies file: cheap, and otherwise only
+	// visible in /diagnose.
+	sb.WriteString(diagnostic.BackgroundSummary())
 	return Output{Message: sb.String()}, nil
 }
 

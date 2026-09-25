@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"strings"
@@ -12,15 +13,10 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 )
 
-// register installs hooks on the manager. The package exposes no Register
-// method (Manager.hooks is only ever read), so the in-package test writes the
-// map through the same mutex Fire uses. See the report: production code has no
-// way to add a hook.
+// register installs hooks on the manager through the public Register method.
 func register(m *Manager, configs ...HookConfig) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, h := range configs {
-		m.hooks[h.Event] = append(m.hooks[h.Event], h)
+		m.Register(h)
 	}
 }
 
@@ -76,7 +72,7 @@ func acceptWithin(t *testing.T, ln net.Listener, d time.Duration) net.Conn {
 
 // fireAsync runs Fire on another goroutine so a hook that hangs fails the test
 // with a clear message instead of blocking it forever.
-func fireAsync(t *testing.T, m *Manager, ctx context.Context, event HookEvent, target string, in HookInput) <-chan HookOutput {
+func fireAsync(t *testing.T, ctx context.Context, m *Manager, event HookEvent, target string, in HookInput) <-chan HookOutput {
 	t.Helper()
 	ch := make(chan HookOutput, 1)
 	go func() { ch <- m.Fire(ctx, event, target, in) }()
@@ -498,7 +494,7 @@ func TestFireSequentialCommandHookHonoursTimeout(t *testing.T) {
 	})
 
 	start := time.Now()
-	done := fireAsync(t, m, context.Background(), BeforeTool, "Bash", HookInput{Event: BeforeTool})
+	done := fireAsync(t, context.Background(), m, BeforeTool, "Bash", HookInput{Event: BeforeTool})
 
 	conn := acceptWithin(t, ln, 30*time.Second) // the hook process really started
 	out := waitOutput(t, done, 30*time.Second)  // and Fire came back
@@ -536,7 +532,7 @@ func TestFireAsyncHookIsNotAwaited(t *testing.T) {
 		},
 	})
 
-	done := fireAsync(t, m, context.Background(), SessionStart, "", HookInput{Event: SessionStart})
+	done := fireAsync(t, context.Background(), m, SessionStart, "", HookInput{Event: SessionStart})
 
 	// Fire must not wait for the hook, which is still parked on <-release.
 	out := waitOutput(t, done, 30*time.Second)
@@ -849,7 +845,7 @@ func assertConnClosed(t *testing.T, conn net.Conn, d time.Duration) {
 		if err == nil {
 			continue // drain the marker bytes, keep waiting for the close
 		}
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		if ne := net.Error(nil); errors.As(err, &ne) && ne.Timeout() {
 			t.Fatalf("hook process was still alive after %v: its timeout never abandoned it", d)
 		}
 		return // EOF / reset: the process is gone

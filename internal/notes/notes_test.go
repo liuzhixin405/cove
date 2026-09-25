@@ -9,6 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/fsatomic"
 )
 
@@ -20,23 +21,25 @@ func newTestNotes(t *testing.T) (*SessionNotes, string) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("COVE_CONFIG_DIR", filepath.Join(home, ".cove"))
 	projectDir := t.TempDir()
 	return New(projectDir), projectDir
 }
 
-func TestNewPlacesNotesUnderProjectCoveDir(t *testing.T) {
+// Notes live in the per-project data directory, not in a .cove directory
+// New used to create inside the user's repository.
+func TestNewPlacesNotesUnderProjectDataDir(t *testing.T) {
 	s, projectDir := newTestNotes(t)
 
-	want := filepath.Join(projectDir, ".cove", "session_notes.md")
-	if s.path != want {
+	dataDir, err := config.ProjectDataDir(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dataDir, "session_notes.md"); s.path != want {
 		t.Errorf("path = %q, want %q", s.path, want)
 	}
-	info, err := os.Stat(filepath.Join(projectDir, ".cove"))
-	if err != nil {
-		t.Fatalf("New did not create the .cove dir: %v", err)
-	}
-	if !info.IsDir() {
-		t.Error(".cove is not a directory")
+	if _, err := os.Stat(filepath.Join(projectDir, ".cove")); !os.IsNotExist(err) {
+		t.Errorf("New created .cove in the project (stat err %v)", err)
 	}
 	if len(s.entries) != 0 {
 		t.Errorf("new notes already holds %d entries", len(s.entries))
@@ -76,7 +79,7 @@ func TestAddCategoriesFlushAndLoadRoundTrip(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	path := s.path
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read notes file: %v", err)
@@ -134,7 +137,7 @@ func TestAddCategoriesFlushAndLoadRoundTrip(t *testing.T) {
 }
 
 func TestWriteToDiskGroupsCategoriesInFixedOrder(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 
 	// Added out of order on purpose: the file must still be grouped
 	// decision -> task -> discovery -> error.
@@ -147,7 +150,7 @@ func TestWriteToDiskGroupsCategoriesInFixedOrder(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(projectDir, ".cove", "session_notes.md"))
+	data, err := os.ReadFile(s.path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -174,12 +177,12 @@ func TestWriteToDiskGroupsCategoriesInFixedOrder(t *testing.T) {
 	}
 
 	// A category with no entries must not emit an empty header.
-	s2, dir2 := newTestNotes(t)
+	s2, _ := newTestNotes(t)
 	s2.AddDecision("only a decision")
 	if err := s2.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	data2, err := os.ReadFile(filepath.Join(dir2, ".cove", "session_notes.md"))
+	data2, err := os.ReadFile(s2.path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -191,8 +194,8 @@ func TestWriteToDiskGroupsCategoriesInFixedOrder(t *testing.T) {
 }
 
 func TestFlushWithoutModificationDoesNotWrite(t *testing.T) {
-	s, projectDir := newTestNotes(t)
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	s, _ := newTestNotes(t)
+	path := s.path
 
 	s.AddTask("first")
 	if err := s.Flush(); err != nil {
@@ -229,18 +232,18 @@ func TestFlushWithoutModificationDoesNotWrite(t *testing.T) {
 }
 
 func TestFlushWithNoEntriesWritesNothing(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	path := s.path
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("Flush with no entries created %s (stat err = %v)", path, err)
 	}
 }
 
 func TestFlushLeavesNoTempFileBehind(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 	for i := 0; i < 3; i++ {
 		s.AddTask(fmt.Sprintf("entry-%d", i))
 		if err := s.Flush(); err != nil {
@@ -248,7 +251,7 @@ func TestFlushLeavesNoTempFileBehind(t *testing.T) {
 		}
 	}
 
-	entries, err := os.ReadDir(filepath.Join(projectDir, ".cove"))
+	entries, err := os.ReadDir(filepath.Dir(s.path))
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
@@ -329,14 +332,14 @@ func TestFlushClipsAt25KBOnRuneBoundary(t *testing.T) {
 	// residues; at least one run puts the cut mid-rune.
 	for pad := 0; pad < 3; pad++ {
 		t.Run(fmt.Sprintf("pad=%d", pad), func(t *testing.T) {
-			s, projectDir := newTestNotes(t)
+			s, _ := newTestNotes(t)
 			// One entry of ~30KB Chinese, well past the cap on its own.
 			s.AddTask(strings.Repeat("x", pad) + strings.Repeat("会话笔记内容", 1700))
 			if err := s.Flush(); err != nil {
 				t.Fatalf("Flush: %v", err)
 			}
 
-			data, err := os.ReadFile(filepath.Join(projectDir, ".cove", "session_notes.md"))
+			data, err := os.ReadFile(s.path)
 			if err != nil {
 				t.Fatalf("read: %v", err)
 			}
@@ -365,12 +368,12 @@ func tail(s string, n int) string {
 }
 
 func TestFlushDoesNotClipContentUnderTheCap(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 	s.AddTask(strings.Repeat("短", 100))
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(projectDir, ".cove", "session_notes.md"))
+	data, err := os.ReadFile(s.path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -383,7 +386,7 @@ func TestFlushDoesNotClipContentUnderTheCap(t *testing.T) {
 }
 
 func TestLoadIgnoresMissingAndUnparseableFiles(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 
 	// No file yet.
 	s.Load()
@@ -391,7 +394,7 @@ func TestLoadIgnoresMissingAndUnparseableFiles(t *testing.T) {
 		t.Fatalf("Load of a missing file added %d entries", len(s.entries))
 	}
 
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	path := s.path
 	body := strings.Join([]string{
 		"# Session Notes",
 		"",
@@ -430,8 +433,8 @@ func TestLoadIgnoresMissingAndUnparseableFiles(t *testing.T) {
 }
 
 func TestLoadDefaultsToTaskWithoutAHeader(t *testing.T) {
-	s, projectDir := newTestNotes(t)
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	s, _ := newTestNotes(t)
+	path := s.path
 	if err := os.WriteFile(path, []byte("- [09:30] headerless entry\n"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -448,10 +451,10 @@ func TestLoadDefaultsToTaskWithoutAHeader(t *testing.T) {
 // append Load used to do. Under -race an unlocked s.entries append here fails.
 //
 // The count is deterministic: the file is written once before the goroutines
-// start and never rewritten, so every Load appends exactly the same number of
-// entries.
+// start and never rewritten, and it holds only notes already in memory, which
+// Load does not add twice (notes are deduplicated by content).
 func TestLoadConcurrentWithAdd(t *testing.T) {
-	s, projectDir := newTestNotes(t)
+	s, _ := newTestNotes(t)
 
 	const fileEntries = 4
 	for i := 0; i < fileEntries; i++ {
@@ -460,7 +463,7 @@ func TestLoadConcurrentWithAdd(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(projectDir, ".cove", "session_notes.md")); err != nil {
+	if _, err := os.Stat(s.path); err != nil {
 		t.Fatalf("seed file missing: %v", err)
 	}
 
@@ -487,10 +490,10 @@ func TestLoadConcurrentWithAdd(t *testing.T) {
 	}
 	wg.Wait()
 
-	want := fileEntries + adds + loads*fileEntries
+	want := fileEntries + adds
 	if len(s.entries) != want {
-		t.Fatalf("entries = %d, want %d (%d seed + %d added + %d x %d loaded)",
-			len(s.entries), want, fileEntries, adds, loads, fileEntries)
+		t.Fatalf("entries = %d, want %d (%d seed + %d added; %d loads of known notes add none)",
+			len(s.entries), want, fileEntries, adds, loads)
 	}
 
 	// Every concurrent Add must be present exactly once.

@@ -49,38 +49,7 @@ jobs:
           if [ "${{ matrix.os }}" != "windows-latest" ]; then
             RACE="-race"
           fi
-          set -o pipefail
-          go test -v ${RACE} -coverprofile=coverage.txt ./... 2>&1 | tee test-output.txt
-
-      # TEMPORARY debug aid: mirrors the interesting parts of the test output
-      # into check-run annotations, which are readable without access to the
-      # job log page. Remove once CI is green.
-      - name: Publish failure summary
-        if: failure() && matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import re, sys
-          try:
-              data = open("test-output.txt", "r", errors="replace").read()
-          except OSError:
-              print("::error::no test-output.txt captured")
-              sys.exit(0)
-          data = re.sub(r"\x1b\[[0-9;]*m", "", data)
-          lines = data.splitlines()
-          idx = set()
-          for i, ln in enumerate(lines):
-              if re.match(r"^\s*(--- FAIL|FAIL|WARNING: DATA RACE|panic:|fatal error:)", ln):
-                  for j in range(max(0, i - 2), min(len(lines), i + 14)):
-                      idx.add(j)
-          keep = [lines[i] for i in sorted(idx)]
-          summary = "\n".join(keep) if any(x.strip() for x in keep) else data[-6000:]
-          summary = summary[:9000]
-          print(f"::error::captured {len(summary)} bytes of failure detail")
-          for k in range(0, len(summary), 700):
-              chunk = summary[k:k+700].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-              print(f"::error::part{k//700}: {chunk}")
-          PY
+          go test ${RACE} -coverprofile=coverage.txt ./...
 
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
@@ -102,34 +71,13 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      # Pinned: "latest" let a new golangci-lint release (new default rules,
+      # config schema changes) turn a green build red without a code change.
       - name: golangci-lint
-        shell: bash
-        run: |
-          set -o pipefail
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" latest
-          "$(go env GOPATH)/bin/golangci-lint" run --timeout=5m ./... 2>&1 | tee lint.txt
-
-      # TEMPORARY debug aid: see the test job's Publish failure summary step.
-      - name: Publish lint summary
-        if: failure()
-        shell: bash
-        run: |
-          if [ ! -f lint.txt ]; then
-            echo "::error::no lint.txt produced by golangci-lint"
-            exit 0
-          fi
-          python3 - <<'PY'
-          import re
-          data = open("lint.txt", "r", errors="replace").read()
-          data = re.sub(r"\x1b\[[0-9;]*m", "", data)
-          keep = [ln for ln in data.splitlines() if re.match(r"^\S+\.go:\d+:\d+:", ln)]
-          summary = "\n".join(keep)[:8000] or data[:8000]
-          print(f"::error::lint findings: {len(keep)} lines")
-          for k in range(0, len(summary), 700):
-              chunk = summary[k:k+700].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-              print(f"::error::lint{k//700}: {chunk}")
-          PY
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1.6
+          args: --timeout=5m
 
   build:
     name: Build Check
@@ -147,5 +95,16 @@ jobs:
       - name: Build
         run: go build -o cove ./cli/cove
 
+      # The headless-Chrome backend is behind a build tag; keep it compiling
+      # and its request-interception test running (no Chrome needed).
+      - name: Vet and test with -tags chromedp
+        run: |
+          go vet -tags chromedp ./internal/browser/
+          go test -tags chromedp -run 'PausedRequest|ShouldBlock' ./internal/browser/
+
       - name: Verify version
-        run: ./cove --version
+        shell: bash
+        run: |
+          want=$(sed -n 's/^[[:space:]]*Version = "\(.*\)"/\1/p' cli/cove/main.go)
+          ./cove --version
+          ./cove --version | grep -F "cove ${want} "

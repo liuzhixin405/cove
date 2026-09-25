@@ -3,6 +3,8 @@ package permission
 import (
 	"reflect"
 	"testing"
+
+	"github.com/liuzhixin405/cove/internal/shell"
 )
 
 func TestCommandPrefixesPicksExecutableAndSubcommand(t *testing.T) {
@@ -181,6 +183,172 @@ func TestIsShellTool(t *testing.T) {
 	} {
 		if got := IsShellTool(name); got != want {
 			t.Errorf("IsShellTool(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// Under a POSIX shell (Git Bash, sh) or PowerShell, operator characters inside
+// a fully quoted word are part of the argument, so a remembered "git commit"
+// prefix covers commit messages such as "fix(api): handle 429; retry".
+func TestCommandPrefixToleratesQuotedOperatorsUnderPOSIX(t *testing.T) {
+	for _, kind := range []ShellKind{ShellPOSIX, ShellPowerShell} {
+		m := NewManager(Default)
+		m.SetShellKind(kind)
+		m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandPrefix: "git commit"})
+
+		for _, cmd := range []string{
+			`git commit -m "fix(api): handle 429; retry"`,
+			`git commit -m 'a && b'`,
+			`git commit -m "line1" -m "line2"`,
+			"git commit -F- <<'EOF'\nmsg\nEOF",
+			"git commit -F- <<'EOF'\nfix(api): x; y | z > w\nEOF",
+			`git commit -m "a|b" 2>&1`,
+		} {
+			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAllow {
+				t.Errorf("[%s] %q = %v, want allow", kind, cmd, d)
+			}
+		}
+		for _, cmd := range []string{
+			`git commit -m "x" && rm -rf build`,
+			`git commit -m "x" > out.txt`,
+			`git commit -m "$(rm x)"`,
+			`git commit -m x; rm y`,
+			"git commit -m \"`rm x`\"",
+			// A backslash before a quote: bash and PowerShell may end the
+			// string where the tokenizer did not.
+			`git commit -m "a\"; rm -rf x; echo \"b"`,
+			`git commit -m 'a\'; rm -rf x`,
+			// Partly quoted words keep the strict check.
+			`git commit --message=x"a;b"`,
+			"git commit -F- <<EOF\n$(rm x)\nEOF",
+			"git commit -F- <<'EOF'\nmsg\nEOF\nrm -rf x",
+		} {
+			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAsk {
+				t.Errorf("[%s] %q = %v, want ask", kind, cmd, d)
+			}
+		}
+	}
+}
+
+// cmd.exe does not treat single quotes as quotes, and even its double quotes
+// are fragile, so the strict rule stays: any operator character refuses.
+func TestCommandPrefixStaysStrictUnderCmd(t *testing.T) {
+	for _, kind := range []ShellKind{ShellCmd, ""} {
+		m := NewManager(Default)
+		m.SetShellKind(kind)
+		m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandPrefix: "git commit"})
+		for _, cmd := range []string{`git commit -m 'a;b'`, `git commit -m "a;b"`, `git commit -m 'a && b'`} {
+			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAsk {
+				t.Errorf("[%q] %q = %v, want ask", kind, cmd, d)
+			}
+		}
+		if d, _ := m.Check("bash", map[string]any{"command": `git commit -m "plain message"`}, DAsk); d != DAllow {
+			t.Errorf("[%q] plain quoted message = %v, want allow", kind, d)
+		}
+	}
+}
+
+// The powershell tool always runs PowerShell, whatever shell bash resolves to.
+func TestPowerShellToolUsesPowerShellQuoting(t *testing.T) {
+	m := NewManager(Default)
+	m.SetShellKind(ShellCmd)
+	m.AddRule(DAllow, Rule{ToolPattern: "powershell", CommandPrefix: "git commit"})
+	if d, _ := m.Check("powershell", map[string]any{"command": `git commit -m 'a; b'`}, DAsk); d != DAllow {
+		t.Errorf("powershell quoted operator = %v, want allow", d)
+	}
+}
+
+func TestCommandPrefixesOffersPrefixForQuotedMessageUnderPOSIX(t *testing.T) {
+	got, ok := CommandPrefixesFor(`git commit -m "fix(api): x; y"`, ShellPOSIX)
+	if !ok || !reflect.DeepEqual(got, []string{"git commit"}) {
+		t.Errorf("CommandPrefixesFor = %q, %v; want [git commit], true", got, ok)
+	}
+	if _, ok := CommandPrefixesFor(`git commit -m "fix(api): x; y"`, ShellCmd); ok {
+		t.Error("cmd: a quoted operator must not yield a prefix")
+	}
+}
+
+func TestShellKindOf(t *testing.T) {
+	for _, c := range []struct {
+		sh   shell.Shell
+		want ShellKind
+	}{
+		{shell.Shell{Kind: shell.Bash, Path: `D:\Program Files\Git\bin\bash.exe`}, ShellPOSIX},
+		{shell.Shell{Kind: shell.Bash, Path: "/bin/sh"}, ShellPOSIX},
+		{shell.Shell{Kind: shell.PowerShell, Path: "pwsh"}, ShellPowerShell},
+		{shell.Shell{Kind: shell.Cmd, Path: "cmd"}, ShellCmd},
+		{shell.Shell{Path: `C:\Windows\System32\cmd.exe`}, ShellCmd},
+		{shell.Shell{Path: `C:\x\powershell.exe`}, ShellPowerShell},
+	} {
+		sh := c.sh
+		if got := ShellKindOf(&sh); got != c.want {
+			t.Errorf("ShellKindOf(%+v) = %q, want %q", c.sh, got, c.want)
+		}
+	}
+	if got := ShellKindOf(nil); got != ShellCmd {
+		t.Errorf("ShellKindOf(nil) = %q, want the strict ShellCmd", got)
+	}
+}
+
+// Deny and ask prefix rules see through the ways a command can be written
+// differently without changing what runs: a path or .exe on the program, a
+// runner or VAR=value in front, git's global options before the subcommand.
+func TestDenyPrefixMatchesNormalizedCommands(t *testing.T) {
+	for _, decision := range []Decision{DDeny, DAsk} {
+		m := NewManager(Default)
+		m.AddRule(decision, Rule{ToolPattern: "bash", CommandPrefix: "git push"})
+		for _, cmd := range []string{
+			"git push",
+			"git -C . push",
+			"git -c user.name=x push origin",
+			"git --no-pager push",
+			"git -P push",
+			"git --git-dir=.git --work-tree=. push",
+			"/usr/bin/git push",
+			`C:\Program\git.exe push`,
+			"git.exe push",
+			"GIT.EXE push",
+			"command git push",
+			"sudo git push",
+			"sudo -u root git push",
+			"env X=1 git push",
+			"env -i X=1 git push",
+			"X=1 git push",
+			"nohup git push",
+			"echo a && git push",
+		} {
+			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAllow); d != decision {
+				t.Errorf("%s rule git push: %q = %v, want %v", decision, cmd, d, decision)
+			}
+		}
+		for _, cmd := range []string{"git pushx", "gitk push", "git status", "echo git push", "git -C push status"} {
+			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAllow); d != DAllow {
+				t.Errorf("%s rule git push: %q = %v, want allow", decision, cmd, d)
+			}
+		}
+	}
+}
+
+// Other subcommand tools skip their global options too.
+func TestDenyPrefixSkipsGlobalOptionsOfSubcommandTools(t *testing.T) {
+	m := NewManager(Default)
+	m.AddRule(DDeny, Rule{ToolPattern: "bash", CommandPrefix: "kubectl delete"})
+	m.AddRule(DDeny, Rule{ToolPattern: "bash", CommandPrefix: "docker rm"})
+	for _, cmd := range []string{"kubectl -n prod delete pod x", "kubectl --context=c delete pod x", "docker -H tcp://h rm x", "docker --context c rm x"} {
+		if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAllow); d != DDeny {
+			t.Errorf("%q = %v, want deny", cmd, d)
+		}
+	}
+}
+
+// Allow prefix rules keep comparing words as written: the normalisation
+// only widens deny/ask.
+func TestAllowPrefixDoesNotNormalize(t *testing.T) {
+	m := NewManager(Default)
+	m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandPrefix: "git push"})
+	for _, cmd := range []string{"git -C . push", "/usr/bin/git push", "git.exe push", "command git push", "sudo git push", "env X=1 git push"} {
+		if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAsk {
+			t.Errorf("allow git push covered %q: %v, want ask", cmd, d)
 		}
 	}
 }

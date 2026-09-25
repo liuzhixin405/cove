@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
@@ -23,6 +25,9 @@ const (
 	actionDoctor
 	actionConfig
 	actionListSessions
+	// actionDreamWorker is the hidden --dream-worker <sessions-dir>: one
+	// memory consolidation, then exit (started detached at session end).
+	actionDreamWorker
 )
 
 // cliOptions is the parsed command line.
@@ -41,6 +46,15 @@ type cliOptions struct {
 	profile     string
 	recordDir   string
 	replayDir   string
+	// dreamWorkerDir is the sessions directory given to --dream-worker.
+	dreamWorkerDir string
+	// dreamProjectRoot is the hidden --dream-project <root> given before
+	// --dream-worker: the project whose memory directory is consolidated too.
+	dreamProjectRoot string
+	// maxTurns is --max-turns: the -p turn's model-call cap (0 = no cap).
+	// maxTurnsSet tells an explicit 0 from the flag being absent.
+	maxTurns    int
+	maxTurnsSet bool
 }
 
 // cliFlags lists every flag parseCLIArgs understands. -p stops short of
@@ -52,7 +66,7 @@ var cliFlags = map[string]bool{
 	"--dump-system-prompt": true, "--no-auto": true, "-d": true, "--debug": true,
 	"-p": true, "--print": true, "--image": true, "--file": true,
 	"-r": true, "--resume": true, "--tui": true, "--no-tui": true,
-	"--profile": true, "--record": true, "--replay": true,
+	"--profile": true, "--record": true, "--replay": true, "--max-turns": true,
 }
 
 // parseCLIArgs parses os.Args[1:].
@@ -94,6 +108,23 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 			opts.action = actionListSessions
 			opts.listAll = i+1 < len(args) && strings.EqualFold(args[i+1], "all")
 			return opts, nil
+		case dream.WorkerProjectFlag:
+			// Hidden, like --dream-worker, which follows it.
+			v, err := value(i)
+			if err != nil {
+				return opts, err
+			}
+			opts.dreamProjectRoot = v
+			i++
+		case dream.WorkerFlag:
+			// Hidden (not in cliFlags, --help or the manual): only cove's own
+			// exit path starts it.
+			v, err := value(i)
+			if err != nil {
+				return opts, err
+			}
+			opts.action, opts.dreamWorkerDir = actionDreamWorker, v
+			return opts, nil
 		case "--dump-system-prompt":
 			opts.dumpPrompt = true
 		case "--no-auto":
@@ -112,6 +143,17 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 				i++
 				words = append(words, args[i])
 			}
+		case "--max-turns":
+			v, err := value(i)
+			if err != nil {
+				return opts, err
+			}
+			i++
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n < 0 {
+				return opts, fmt.Errorf("--max-turns 需要一个非负整数（0 表示不限制），收到 %q", v)
+			}
+			opts.maxTurns, opts.maxTurnsSet = n, true
 		case "--image", "--file", "-r", "--resume", "--profile", "--record", "--replay":
 			v, err := value(i)
 			if err != nil {
@@ -138,6 +180,11 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 		}
 	}
 
+	if opts.maxTurnsSet && !opts.printMode {
+		// The interactive shell asks at the cap instead (config
+		// max_iterations sets its window).
+		return opts, errors.New("--max-turns 只能与 -p 一起使用（交互模式达到上限时会询问是否继续，窗口大小由配置 max_iterations 决定）")
+	}
 	if len(words) > 0 {
 		if !opts.printMode {
 			return opts, fmt.Errorf("未知参数: %s（单次询问请用 cove -p \"提示\"）", strings.Join(words, " "))
@@ -167,8 +214,12 @@ func resumeStartupSession(store sessionLoader, id, cwd string, resume func(*sess
 	if store == nil {
 		return nil, "", errors.New("会话存储不可用")
 	}
-	// Users copy the file name out of ~/.cove/sessions.
-	id = strings.TrimSuffix(strings.TrimSpace(id), ".json")
+	// Users copy the file name out of ~/.cove/sessions (<id>.jsonl, or a
+	// legacy <id>.json). "index" names the sessions index and is refused.
+	id, err := session.ParseSessionID(id)
+	if err != nil {
+		return nil, "", err
+	}
 	r, err := store.Load(id)
 	if err != nil {
 		return nil, "", err

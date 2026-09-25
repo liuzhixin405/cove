@@ -16,6 +16,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/shell"
 )
 
@@ -26,6 +27,7 @@ type CheckResult struct {
 	Status  Severity   // SevInfo=pass, SevWarning/SevError/SevFatal=problem found
 	Error   *DiagError // Structured error if problem found
 	Skipped bool       // Check was skipped (e.g. not applicable on this OS)
+	Detail  string     // Informational lines shown under the title (may be multi-line)
 }
 
 // Report aggregates all diagnostic results.
@@ -90,34 +92,45 @@ func (r *Report) Format() string {
 	fmt.Fprintf(&sb, "   %s\n\n", r.Summary())
 
 	for _, res := range r.Results {
-		if res.Skipped {
-			continue
-		}
-		icon := "\x1b[32m✓\x1b[0m"
-		if res.Error != nil && res.Error.Fixed {
-			icon = "\x1b[32m🔧\x1b[0m"
-		} else if res.Status == SevWarning {
-			icon = "\x1b[33m⚠\x1b[0m"
-		} else if res.Status >= SevError {
-			icon = "\x1b[31m✗\x1b[0m"
-		}
-		fmt.Fprintf(&sb, " %s %s", icon, res.Title)
-		if res.Error != nil {
-			sb.WriteString("\n")
-			// Indent error details
-			lines := strings.Split(res.Error.Format(), "\n")
-			for _, line := range lines {
-				fmt.Fprintf(&sb, "   %s\n", line)
-			}
-		} else {
-			sb.WriteString("\n")
-		}
+		formatResult(&sb, res)
 	}
 
 	if r.AutoFixed > 0 {
 		sb.WriteString("\n\x1b[32m✓ 所有修复已立即生效，无需重启\x1b[0m\n")
 	}
 	return sb.String()
+}
+
+// formatResult writes one check's line (icon and title), its detail lines and
+// its error, if any; skipped checks write nothing.
+func formatResult(sb *strings.Builder, res CheckResult) {
+	if res.Skipped {
+		return
+	}
+	icon := "\x1b[32m✓\x1b[0m"
+	if res.Error != nil && res.Error.Fixed {
+		icon = "\x1b[32m🔧\x1b[0m"
+	} else if res.Status == SevWarning {
+		icon = "\x1b[33m⚠\x1b[0m"
+	} else if res.Status >= SevError {
+		icon = "\x1b[31m✗\x1b[0m"
+	}
+	fmt.Fprintf(sb, " %s %s", icon, res.Title)
+	if res.Detail != "" {
+		for _, line := range strings.Split(res.Detail, "\n") {
+			fmt.Fprintf(sb, "\n   \x1b[2m%s\x1b[0m", line)
+		}
+	}
+	if res.Error != nil {
+		sb.WriteString("\n")
+		// Indent error details
+		lines := strings.Split(res.Error.Format(), "\n")
+		for _, line := range lines {
+			fmt.Fprintf(sb, "   %s\n", line)
+		}
+	} else {
+		sb.WriteString("\n")
+	}
 }
 
 // Checker runs diagnostic checks against the current environment.
@@ -131,6 +144,11 @@ type Checker struct {
 	goos     string
 	shell    func() shell.Shell
 	lookPath func(string) (string, error)
+
+	// Engine state, replaceable in tests; nil falls back to the package-level
+	// BackgroundStatusFn / PolicyLoadErrorFn, then to what is on disk.
+	background func() BackgroundStatus
+	policyErr  func() error
 }
 
 // NewChecker creates a new diagnostic checker.
@@ -169,6 +187,8 @@ func (c *Checker) RunAll(ctx context.Context) *Report {
 		c.checkDataDir,
 		c.checkDiskSpace,
 		c.checkSessionIntegrity,
+		c.checkPolicyFile,
+		c.checkBackgroundLearning,
 	}
 
 	for _, check := range checks {
@@ -507,7 +527,9 @@ func (c *Checker) checkSessionIntegrity(_ context.Context) CheckResult {
 
 	corrupt := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		// Only session files (<id>.jsonl, legacy <id>.json): index.json is
+		// the list index and may legitimately be tiny.
+		if entry.IsDir() || !session.IsSessionFile(entry.Name()) {
 			continue
 		}
 		path := filepath.Join(sessDir, entry.Name())

@@ -36,7 +36,7 @@
 
 1. **最小侵入** — 新代码通过接口注入 Engine，不破坏现有逻辑
 2. **优雅降级** — 每个子系统可选，不可用时不影响核心对话功能
-3. **100% 完整实现** — 每个模块必须完整可用：完整的数据结构、完整的错误处理、完整的测试覆盖、完整的 TUI 用户感知。不允许 demo / 骨架 / TODO。
+3. **100% 完整实现** — 每个模块必须完整可用：完整的数据结构、完整的错误处理、完整的测试覆盖、完整的终端用户感知。不允许 demo / 骨架 / TODO。
 4. **Go 惯用写法** — 遵循现有代码风格（短变量名、显式错误处理、goroutine + context、接口抽象）
 5. **向后兼容** — 现有配置文件和命令行参数不受影响，新功能默认启用但可关闭
 
@@ -56,7 +56,7 @@
 | **ModelRouter** | 策略链 override→classifier→default | 基本一致 |
 | **Hook 系统** | 事件系统增强 | 新增异步处理支持 + 结果修改能力 |
 | **MCP 传输** | SSE 扩展 | 新增 **Streamable HTTP**（2025 新规范） |
-| **P2 新增项** | 未在设计范围内 | 实际新增：NextSpeaker、SessionDiff、Telemetry、Safety、EnhancedRepoMap |
+| **P2 新增项** | 未在设计范围内 | 实际新增：NextSpeaker、SessionDiff、Telemetry（11.1.0 已移除）、Safety、EnhancedRepoMap |
 
 > 详细信息在每个模块的「实现要点」章节中说明。
 
@@ -74,7 +74,7 @@
 
 1. **最小侵入** — 新代码通过接口注入 Engine，不破坏现有逻辑
 2. **优雅降级** — 每个子系统可选，不可用时不影响核心对话功能
-3. **100% 完整实现** — 每个模块必须完整可用：完整的数据结构、完整的错误处理、完整的测试覆盖、完整的 TUI 用户感知。不允许 demo / 骨架 / TODO。
+3. **100% 完整实现** — 每个模块必须完整可用：完整的数据结构、完整的错误处理、完整的测试覆盖、完整的终端用户感知。不允许 demo / 骨架 / TODO。
 4. **Go 惯用写法** — 遵循现有代码风格（短变量名、显式错误处理、goroutine + context、接口抽象）
 5. **向后兼容** — 现有配置文件和命令行参数不受影响，新功能默认启用但可关闭
 
@@ -117,7 +117,7 @@ Gemini CLI 的 `loopDetectionService.ts` 用三层检测解决此问题。我们
 │       └─ Layer 3: 停滞检测 (60轮)                          │
 │           连续 60 轮无文件创建/修改 → 空转                  │
 │                                                           │
-│  只读工具豁免: read/grep/glob/lsp/webfetch/browser/task_list│
+│  只读工具豁免: read/grep/glob/webfetch/browser/task_list 等 │
 │  自适应阈值: Flash模型使用更敏感的 8/12, 8/10, 8/30, 50    │
 │  分级响应: 前5次非致命注入引导, 超出则硬终止                │
 │  指纹重置: 注入后清空窗口, 让模型重新开始                   │
@@ -340,7 +340,7 @@ func (e *Engine) executeToolCallsWithLoopDetection(toolCalls []api.ToolCall) []t
 
 **用户感知**：
 
-当循环检测触发时，用户在 TUI 中看到：
+当循环检测触发时，用户在终端中看到：
 ```
 ⚠ 检测到循环: 工具 'write' 以相同参数连续调用了 5 次 — 已中断
 ```
@@ -546,7 +546,7 @@ func (mf *ModelFallback) TryChatStream(ctx context.Context, buildRequest func(Pr
     // 同 TryChat 逻辑，调用 Provider.ChatStream
 }
 
-// Status 返回所有 provider 的状态（给 TUI 状态栏显示）
+// Status 返回所有 provider 的状态（给 /ratelimit、/status 等显示）
 func (mf *ModelFallback) Status() []ProviderStatusInfo {
     mf.mu.Lock()
     defer mf.mu.Unlock()
@@ -589,7 +589,7 @@ func isPermanent(err error) bool  { /* 检测 401/403 */ }
 
 向后兼容：单 `provider` 配置仍然有效，自动包装为只有一个 provider 的 `ModelFallback`。
 
-**TUI 状态栏显示**：
+**终端显示**：
 
 ```
 cove · claude-sonnet-4 · anthropic ● | openai ○ | openrouter ○
@@ -805,7 +805,7 @@ func (e *Engine) maybeCompress(ctx context.Context) {
 }
 ```
 
-**用户感知**（TUI 中）：
+**用户感知**（终端中）：
 
 ```
 📦 对话压缩完成: 85 → 32 条消息, 节省 ~12000 tokens
@@ -1103,6 +1103,8 @@ Cove 现有权限系统 `permission/classifier.go`（229 行）：每次工具�
 
 ### 8.2 设计
 
+> **实现说明（11.1.0）**：下面是最初的设计稿，实际实现有差异。实际规则文件是 `~/.cove/policies.json`（设置了 `COVE_CONFIG_DIR` 时位于该目录下），内容为规则数组，字段为 `id`/`description`/`tool_pattern`/`action`（allow/deny/ask）/`priority`/`enabled`/`param_match`/`command_prefix`/`input_equals`/`scope`；没有 `modes`、`expires_at`、`param_rules` 等字段。授权提示的 `[p] 永久允许` 会追加带 `scope`（项目根）的 allow 规则。以 `docs/USER_MANUAL.md`「持久化权限规则（policies.json）」为准。
+
 ```go
 // internal/permission/policy.go (新建)
 
@@ -1136,7 +1138,7 @@ const (
 
 type PolicyEngine struct {
     rules     []PolicyRule
-    storage   PolicyStorage // 持久化到 ~/.cove/policy.json
+    storage   PolicyStorage // 持久化到 policies.json（实际实现，见 8.2 说明）
     mu        sync.RWMutex
 }
 
@@ -1169,30 +1171,20 @@ func (pe *PolicyEngine) AddRule(rule PolicyRule) error {
 func (pe *PolicyEngine) RemoveRule(ruleID string) error { ... }
 ```
 
-**持久化**（`~/.cove/policy.json`）：
+**持久化**（实际实现：`~/.cove/policies.json`，设置了 `COVE_CONFIG_DIR` 时位于该目录下；JSON 数组）：
 
 ```json
-{
-    "rules": [
-        {
-            "id": "rule-001",
-            "tool_pattern": "read",
-            "decision": "always_allow",
-            "description": "始终允许 read 工具",
-            "created_at": "2025-01-01T00:00:00Z"
-        },
-        {
-            "id": "rule-002",
-            "tool_pattern": "bash",
-            "decision": "always_deny",
-            "param_rules": [
-                {"param": "command", "operator": "contains", "value": "curl | bash"}
-            ],
-            "description": "禁止管道执行远程脚本",
-            "created_at": "2025-01-01T00:00:00Z"
-        }
-    ]
-}
+[
+    {
+        "id": "allow-bash-git commit",
+        "tool_pattern": "bash",
+        "action": "allow",
+        "priority": 0,
+        "enabled": true,
+        "command_prefix": "git commit",
+        "scope": "D:\\github\\cove-main"
+    }
+]
 ```
 
 ### 8.3 文件变更
@@ -1301,18 +1293,9 @@ func (mr *ModelRouter) Route(ctx context.Context, userMessage string) *RoutingDe
 - 会话结束检测：扫描最近 3 条消息中的终止短语
 - 集成在 Engine 主循环中，作为每次工具调用后的决策点
 
-### 10.3 本地遥测系统 ✅ 已实现
+### 10.3 本地遥测系统（已移除）
 
-**目标**：本地使用数据记录（非匿名上报）。
-
-**实现**：`internal/telemetry/telemetry.go`（132 行）
-
-**关键特性**：
-- 事件录制：结构化事件记录（类型、时间戳、数据）
-- 本地存储：保存至 `~/.cove/telemetry.json`
-- 容量保护：上限 1000 条，超出时裁剪后半
-- 选择加入：默认关闭，需 `Enable()` 启用
-- 轻量级：仅记录关键事件，不包含敏感数据
+原 `internal/telemetry` 包没有任何调用方，已在 11.1.0 删除，配置字段 `telemetry` 同时移除（旧配置中的该键仍可加载，不再生效）。
 
 ### 10.4 IDE 伴生
 **规划中**：VS Code 扩展。独立仓库。通过 MCP 连接 Cove Agent 进程。

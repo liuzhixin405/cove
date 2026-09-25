@@ -58,6 +58,7 @@ func TestExitPlanModeTool(t *testing.T) {
 }
 
 func TestSleepTool(t *testing.T) {
+	t.Parallel() // sleeps a real second (0 is clamped to 1)
 	ts := NewSleepTool()
 	if ts.Def().Name != "sleep" {
 		t.Errorf("expected name 'sleep', got %q", ts.Def().Name)

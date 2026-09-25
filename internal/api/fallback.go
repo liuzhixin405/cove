@@ -40,7 +40,6 @@ type ProviderWithStatus struct {
 	CoolUntil time.Time
 	FailCount int
 	LastError error
-	Model     string // the model used with this provider
 }
 
 // ProviderStatusInfo is a public snapshot for UI display.
@@ -87,17 +86,6 @@ func (mf *ModelFallback) Current() Provider {
 	mf.mu.Lock()
 	defer mf.mu.Unlock()
 	return mf.providers[mf.currentIdx].Provider
-}
-
-// CurrentModel returns the model name for the currently active provider.
-func (mf *ModelFallback) CurrentModel() string {
-	mf.mu.Lock()
-	defer mf.mu.Unlock()
-	m := mf.providers[mf.currentIdx].Model
-	if m == "" {
-		m = "unknown"
-	}
-	return m
 }
 
 // TryChat attempts a chat request with automatic failover.

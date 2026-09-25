@@ -10,6 +10,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/token"
 )
 
 // MaskingResult holds metrics about an output masking operation.
@@ -54,11 +55,106 @@ func NewToolOutputMasker() *ToolOutputMasker {
 // Mask runs the Hybrid Backward Scanned FIFO algorithm on the message history.
 // It scans from the end, protects the most recent ~protectionThreshold tokens,
 // then masks older tool outputs that exceed minPrunableThreshold.
+//
+// Before that it collapses repeated identical tool results into stubs (see
+// dedupeRepeatedResults). Rewriting history costs the prompt cache, so the
+// stubs are applied only when disk masking rewrites history this round anyway
+// or they save at least dedupeMinSavedTokens on their own. Applied stubs
+// count towards MaskedCount and TokensSaved so the caller invalidates caches
+// exactly as for disk masking.
 func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*MaskingResult, []api.Message) {
 	if !m.enabled || len(history) == 0 {
 		return &MaskingResult{}, history
 	}
+	deduped, dedupedCount, dedupeSaved := m.dedupeRepeatedResults(history)
+	if dedupedCount > 0 && dedupeSaved < dedupeMinSavedTokens {
+		// Not worth a rewrite by itself: go ahead only if disk masking is
+		// rewriting history anyway.
+		res, out := m.maskOldOutputs(history)
+		if res.MaskedCount == 0 {
+			return res, out
+		}
+	}
+	if dedupedCount == 0 {
+		return m.maskOldOutputs(history)
+	}
+	res, out := m.maskOldOutputs(deduped)
+	res.MaskedCount += dedupedCount
+	res.TokensSaved += dedupeSaved
+	res.NewHistory = out
+	return res, out
+}
 
+// dedupeMinSavedTokens is the least a dedupe pass must save to rewrite
+// history on its own (when disk masking leaves history untouched).
+const dedupeMinSavedTokens = 2000
+
+// protectRecentResults is how many of the latest tool messages dedupe never
+// touches: the model is most likely still reasoning about them.
+const protectRecentResults = 4
+
+// dedupeMinBytes is the smallest tool result worth replacing with a stub;
+// shorter ones cost about as much as the stub itself.
+const dedupeMinBytes = 512
+
+// dedupeRepeatedResults replaces the second and later occurrences of an
+// identical (sha256) tool result of at least dedupeMinBytes with a short stub
+// naming the tool_call_id of the first occurrence (message indices shift on
+// compaction; call IDs do not). The latest protectRecentResults
+// tool messages are left alone, message count and tool_call_id are
+// preserved, and the input slice is never mutated. Stubs are shorter than
+// dedupeMinBytes, so a second pass is a no-op.
+func (m *ToolOutputMasker) dedupeRepeatedResults(history []api.Message) ([]api.Message, int, int) {
+	var toolIdx []int
+	for i, msg := range history {
+		if msg.Role == "tool" {
+			toolIdx = append(toolIdx, i)
+		}
+	}
+	limit := len(toolIdx) - protectRecentResults
+	if limit < 2 {
+		return history, 0, 0
+	}
+	protectFrom := toolIdx[limit]
+
+	first := make(map[[32]byte]string)
+	var out []api.Message
+	count, saved := 0, 0
+	for _, i := range toolIdx {
+		msg := history[i]
+		if len(msg.Content) < dedupeMinBytes || m.isExempt(msg.Name) ||
+			strings.HasPrefix(msg.Content, maskedPrefix) {
+			continue
+		}
+		sum := sha256.Sum256([]byte(msg.Content))
+		orig, seen := first[sum]
+		if !seen {
+			first[sum] = msg.ToolCallID
+			if first[sum] == "" {
+				first[sum] = fmt.Sprintf("#%d", i)
+			}
+			continue
+		}
+		if i >= protectFrom {
+			continue
+		}
+		if out == nil {
+			out = make([]api.Message, len(history))
+			copy(out, history)
+		}
+		stub := fmt.Sprintf("[identical to earlier tool result for call %s (%d bytes); content omitted]", orig, len(msg.Content))
+		saved += token.Estimate(msg.Content) - token.Estimate(stub)
+		out[i].Content = stub
+		count++
+	}
+	if out == nil {
+		return history, 0, 0
+	}
+	return out, count, saved
+}
+
+// maskOldOutputs is the disk-masking pass of Mask.
+func (m *ToolOutputMasker) maskOldOutputs(history []api.Message) (*MaskingResult, []api.Message) {
 	// ── Pass 1: backward scan to find protection boundary ──
 	threshold := m.protectionThreshold
 	if m.protectionScale > 1 {
@@ -79,7 +175,7 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 	prunable := 0
 	for i := 0; i < cutoffIdx; i++ {
 		if m.maskable(history[i]) {
-			prunable += len(history[i].Content) / 4
+			prunable += token.Estimate(history[i].Content)
 		}
 	}
 
@@ -118,9 +214,10 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 			continue
 		}
 
-		tokensSaved += len(newHistory[i].Content) / 4
+		n := token.Estimate(newHistory[i].Content)
+		tokensSaved += n
 		newHistory[i].Content = fmt.Sprintf("%s%s...] %d tokens masked to %s",
-			maskedPrefix, strings.ReplaceAll(name, "_", " "), len(history[i].Content)/4, filePath)
+			maskedPrefix, strings.ReplaceAll(name, "_", " "), n, filePath)
 		maskedCount++
 	}
 
@@ -131,13 +228,11 @@ func (m *ToolOutputMasker) Mask(history []api.Message, toolNames []string) (*Mas
 	}, newHistory
 }
 
-// msgTokens estimates the token count of a message.
+// msgTokens estimates the token count of a message with the shared
+// estimator (see countTokens). It used to be bytes/4, which reads Chinese
+// text at three quarters of its size.
 func (m *ToolOutputMasker) msgTokens(msg api.Message) int {
-	t := len(msg.Content)
-	for _, tc := range msg.ToolCalls {
-		t += len(tc.Name) + 50
-	}
-	return t / 4
+	return countTokens([]api.Message{msg})
 }
 
 // maskedPrefix marks a tool message whose output has already been masked to disk.

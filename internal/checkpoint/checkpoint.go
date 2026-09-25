@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove/internal/log"
 )
 
 // Manager handles file system checkpoints using a git shadow store.
@@ -19,6 +21,14 @@ type Manager struct {
 	refName  string // refs/cove/<hash(workdir)>
 	workDir  string
 	count    int
+	// created counts checkpoints created by this manager, for the periodic
+	// trim and gc; the rest is the background maintenance state (all under mu
+	// except maintWG).
+	created     int
+	pendingTrim bool
+	pendingGC   bool
+	maintaining bool
+	maintWG     sync.WaitGroup
 }
 
 // New creates a checkpoint manager for the given working directory.
@@ -105,6 +115,9 @@ func (m *Manager) Create(label string) (string, error) {
 	}
 	if created {
 		m.count++
+		// Trim and gc run in the background (retention.go); a trim rewrites
+		// the kept commits, so this hash may be replaced by then.
+		m.scheduleMaintenanceLocked()
 	}
 	return hash, nil
 }
@@ -166,9 +179,17 @@ func (m *Manager) Restore(commitHash string) (string, error) {
 
 	env := m.env()
 	backupRef := m.refName + "-undo"
-	backup, _, err := m.snapshot(backupRef, "before undo")
+	backup, backedUp, err := m.snapshot(backupRef, "before undo")
 	if err != nil {
 		return "", fmt.Errorf("备份当前状态失败: %w", err)
+	}
+	if backedUp {
+		// The undo-backup chain is kept to the same length as checkpoints.
+		if trimmed, err := m.trimLocked(backupRef); err != nil {
+			log.Warnf("[checkpoint] trim undo backups: %v", err)
+		} else if trimmed != "" {
+			backup = trimmed
+		}
 	}
 	current := m.treeOf(backup)
 
@@ -291,7 +312,7 @@ func (m *Manager) gitCmd(env []string, args ...string) error {
 	cmd.Dir = m.workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %s", err, string(out))
+		return fmt.Errorf("%w: %s", err, string(out))
 	}
 	return nil
 }
@@ -302,7 +323,7 @@ func (m *Manager) gitOutput(env []string, args ...string) (string, error) {
 	cmd.Dir = m.workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%s: %s", err, string(out))
+		return "", fmt.Errorf("%w: %s", err, string(out))
 	}
 	return string(out), nil
 }

@@ -112,7 +112,7 @@ func TestModelRouter_TightBudgetSuppressesUpgrade(t *testing.T) {
 // TestModelRouter_HighFailureRateCanTipToPremium: a high recent failure
 // rate for the fast model is a real (if weak) signal that this session
 // needs the premium model more readily. Constructed so length(~0.17) +
-// file-scope(0.15) alone sit just under the 0.40 threshold (~0.32), and a
+// file-scope(0.15) alone sit just under the 0.35 threshold (~0.32), and a
 // maxed-out failure rate (+0.10) is exactly what tips it over — this
 // exercises the signal actually changing the outcome, not just being
 // present without effect.

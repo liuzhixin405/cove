@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -283,7 +284,9 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 			repl.PrintAbove(budgetExceededRetryHint(r.eng.CostTracker()) + "\n")
 		} else {
 			_ = saveInterruptedDraft(userMsg, reqErr)
-			repl.PrintAbove("可输入“继续”重试刚才中断的任务。\n")
+			if hint := taskErrorHint(reqErr); hint != "" {
+				repl.PrintAbove(hint + "\n")
+			}
 		}
 	} else {
 		r.pendingFailedMsg = nil
@@ -300,4 +303,20 @@ func (r *replTaskRunner) finishLocked() {
 	r.current = api.Message{}
 	r.currentStart = time.Time{}
 	r.cond.Broadcast()
+}
+
+// interruptedTaskHint follows a task that ended with an error: the engine
+// kept its completed steps, and /continue resumes it from there ("继续"
+// still works too).
+const interruptedTaskHint = "输入 /continue 可从中断处继续刚才的任务。"
+
+// taskErrorHint is the line shown after a task that ended with err. A turn
+// stopped at its limit gets none: the stop line already says /continue
+// resumes it (three hints in a row used to follow an "s").
+func taskErrorHint(err error) string {
+	var le *engine.LimitError
+	if errors.As(err, &le) {
+		return ""
+	}
+	return interruptedTaskHint
 }

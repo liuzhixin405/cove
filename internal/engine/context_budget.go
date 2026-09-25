@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/token"
@@ -26,8 +27,9 @@ const (
 	layerRelevant contextLayer = 0
 	// layerOnDemand holds broad situational overviews the model can
 	// otherwise reconstruct with a single tool call (ls, read, grep) —
-	// the repo map and the project file tree. Losing this costs an extra
-	// tool round-trip, not correctness.
+	// the project outline (the repo map itself is queried with the
+	// repo_map tool). Losing this costs an extra tool round-trip, not
+	// correctness.
 	layerOnDemand contextLayer = 1
 	// layerOverflow holds "nice to have" additions — session notes — that
 	// are the first to be dropped under budget pressure.
@@ -101,4 +103,57 @@ func (b *contextBudgeter) Render() string {
 		remaining -= est
 	}
 	return sb.String()
+}
+
+// Caps of the project context the engine adds on its own.
+const (
+	// memoryIndexMaxBytes caps the <memory_index> block of the system prompt
+	// (the list of saved memories shown when they are too many to inline).
+	// Entries past the cap are still found by the per-turn relevant-memory
+	// note, which searches every memory.
+	memoryIndexMaxBytes = 4096
+	// repoMapExcerptMaxBytes caps the <repo_map_excerpt> turn note.
+	repoMapExcerptMaxBytes = 12 * 1024
+	// repoMapExcerptsPerSession is how many turns get an automatic repo map
+	// excerpt: the first task-like one; later turns use the repo_map tool.
+	repoMapExcerptsPerSession = 1
+)
+
+// capMemoryIndex cuts the <memory_index> block of a memory prompt to
+// memoryIndexMaxBytes at entry boundaries, saying how many entries were left
+// out. The rest of the prompt (instruction files, inlined memories) is kept.
+func capMemoryIndex(prompt string) string {
+	const open, closing = "<memory_index>\n", "</memory_index>\n"
+	start := strings.Index(prompt, open)
+	if start < 0 {
+		return prompt
+	}
+	rel := strings.Index(prompt[start:], closing)
+	if rel < 0 {
+		return prompt
+	}
+	end := start + rel + len(closing)
+	if end-start <= memoryIndexMaxBytes {
+		return prompt
+	}
+	body := prompt[start+len(open) : start+rel]
+	lines := strings.SplitAfter(body, "\n")
+	var kept strings.Builder
+	used := len(open) + len(closing) + 80 // room for the "more" line
+	dropped := 0
+	for i, l := range lines {
+		if l == "" {
+			continue
+		}
+		if dropped > 0 || (i > 0 && used+len(l) > memoryIndexMaxBytes) {
+			dropped++
+			continue
+		}
+		used += len(l)
+		kept.WriteString(l)
+	}
+	if dropped > 0 {
+		kept.WriteString("- … " + strconv.Itoa(dropped) + " more saved memories (list the memory directory to see them all)\n")
+	}
+	return prompt[:start] + open + kept.String() + closing + prompt[end:]
 }

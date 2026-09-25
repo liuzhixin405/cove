@@ -52,6 +52,12 @@ type Profile struct {
 	Debug        *bool  `json:"debug,omitempty"`
 	Verbose      *bool  `json:"verbose,omitempty"`
 	SystemPrompt string `json:"system_prompt,omitempty"`
+	// The per-turn limits and max_sessions, as in Config. MaxTurnMinutes is a
+	// pointer because 0 ("off") is a value a profile may set.
+	MaxIterations         int  `json:"max_iterations,omitempty"`
+	MaxTurnMinutes        *int `json:"max_turn_minutes,omitempty"`
+	SubagentMaxIterations int  `json:"subagent_max_iterations,omitempty"`
+	MaxSessions           int  `json:"max_sessions,omitempty"`
 }
 
 // UnmarshalJSON keeps backward compatibility with older configs that used
@@ -85,9 +91,9 @@ type Config struct {
 	MCPServers     map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
 	Profiles       map[string]*Profile        `json:"profiles,omitempty"`
 	ActiveProfile  string                     `json:"active_profile,omitempty"`
-	// Telemetry enables local, opt-in usage recording (~/.cove/telemetry.json).
-	// Off by default; can also be enabled with COVE_TELEMETRY=1.
-	Telemetry bool `json:"telemetry,omitempty"`
+	// The former "telemetry" key is no longer read (the recorder had no
+	// callers and was removed). Old files that still carry it load fine:
+	// unknown keys are ignored, and Save keeps them on disk.
 	// DoneVerifyCommands, if set, are shell commands (e.g. "go build ./...")
 	// run before the engine accepts a model's "no more tool calls" response
 	// as actually complete; see internal/engine/verify_gate.go. Off by
@@ -98,6 +104,15 @@ type Config struct {
 	// Cargo.toml -> "cargo check", a local TypeScript install -> tsc) and runs
 	// it only on turns that changed files. nil means on.
 	DoneVerifyAuto *bool `json:"done_verify_auto,omitempty"`
+	// DoneVerifyTimeoutSeconds bounds each verification command; 0 (the
+	// default) keeps 120 s, and 300 s for dotnet and npm commands. A command
+	// that runs out of time is reported, not counted as a failure.
+	DoneVerifyTimeoutSeconds int `json:"done_verify_timeout_seconds,omitempty"`
+	// DoneCheck controls the one-time "is the request fully met?" prompt the
+	// engine shows a model that is about to end a turn which changed files:
+	// "on", "off", or "auto" (the default, also for an empty or unknown
+	// value): only fast-tier models and providers other than anthropic.
+	DoneCheck string `json:"done_check,omitempty"`
 	// Thinking selects the model's thinking mode on providers that support it
 	// ("adaptive" or "disabled"); empty keeps the model's default. Effort
 	// ("low", "medium", "high", "xhigh", "max") sets reasoning depth.
@@ -113,6 +128,31 @@ type Config struct {
 	// API. Off by default; nil means pure BM25 with zero extra network calls
 	// or cost, exactly like before this field existed.
 	MemoryEmbedding *MemoryEmbeddingConfig `json:"memory_embedding,omitempty"`
+	// ExperimentalTools registers the experimental coordination tools
+	// (task/task_*, team_*, send_message, brief, sleep). Off by default:
+	// every registered tool costs prompt tokens on every request.
+	ExperimentalTools bool `json:"experimental_tools,omitempty"`
+	// WebSearch selects the websearch backend ("tavily", "brave" or
+	// "duckduckgo") and its API key. A configured provider wins over the
+	// environment; its key falls back to the provider's environment variable
+	// (TAVILY_API_KEY, BRAVE_API_KEY / BRAVE_SEARCH_API_KEY). Without a
+	// provider the environment variables pick the backend as before.
+	WebSearch *WebSearchConfig `json:"web_search,omitempty"`
+	// MaxSessions is how many saved sessions are kept: older ones are deleted
+	// automatically at the end of a turn (the session in use never is).
+	// Unset or 0 means DefaultMaxSessions; a negative value turns pruning off.
+	MaxSessions int `json:"max_sessions,omitempty"`
+	// MaxIterations caps the model calls of one turn. At the cap the
+	// interactive shell asks whether to go on; -p stops (--max-turns
+	// overrides it there). Unset or <= 0 means DefaultMaxIterations.
+	MaxIterations int `json:"max_iterations,omitempty"`
+	// MaxTurnMinutes limits how long one turn runs before the shell asks
+	// whether to go on (-p stops). 0 or negative turns the limit off, so the
+	// key has no omitempty: an explicit 0 must survive a Save.
+	MaxTurnMinutes int `json:"max_turn_minutes"`
+	// SubagentMaxIterations caps each sub-agent's model calls (agent,
+	// execute_plan). Unset or <= 0 means DefaultSubagentMaxIterations.
+	SubagentMaxIterations int `json:"subagent_max_iterations,omitempty"`
 
 	// loadedView is the effective config as Load returned it (see rawView).
 	// Save writes only the fields that differ from it, so values that came
@@ -120,6 +160,41 @@ type Config struct {
 	// they came from instead of being copied into ~/.cove/config.json.
 	// nil (a Config not built by Load) means "write every field".
 	loadedView map[string]json.RawMessage
+	// turnMinutesExplicit records that config.json, .cove.json or the active
+	// profile set max_turn_minutes (UnattendedTurnMinutes).
+	turnMinutesExplicit bool
+}
+
+// UnattendedTurnMinutes is the turn time limit for -p and headless runs,
+// where nobody can answer the prompt that the interactive shell shows at the
+// limit: only a max_turn_minutes the user wrote applies there, the default
+// does not (0 = no limit).
+func (c *Config) UnattendedTurnMinutes() int {
+	if c == nil || !c.turnMinutesExplicit {
+		return 0
+	}
+	return c.MaxTurnMinutes
+}
+
+// hasKey reports whether the JSON object in data has a top-level key.
+func hasKey(data []byte, key string) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(data, &m) != nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
+}
+
+// DoneCheckMode is the effective done_check setting: "on", "off" or "auto".
+func (c *Config) DoneCheckMode() string {
+	if c != nil {
+		switch m := strings.ToLower(strings.TrimSpace(c.DoneCheck)); m {
+		case "on", "off":
+			return m
+		}
+	}
+	return "auto"
 }
 
 // VerifyAutoEnabled reports whether automatic completion verification is on.
@@ -138,6 +213,12 @@ type MemoryEmbeddingConfig struct {
 	Model   string `json:"model,omitempty"`
 }
 
+// WebSearchConfig configures the websearch tool (config key web_search).
+type WebSearchConfig struct {
+	Provider string `json:"provider,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
+}
+
 type MCPServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args,omitempty"`
@@ -146,12 +227,27 @@ type MCPServerConfig struct {
 	URL     string            `json:"url,omitempty"`
 }
 
+// DefaultMaxSessions is the max_sessions default.
+const DefaultMaxSessions = 200
+
+// Defaults of the per-turn limits.
+const (
+	DefaultMaxIterations         = 200
+	DefaultMaxTurnMinutes        = 60
+	DefaultSubagentMaxIterations = 60
+)
+
 func DefaultConfig() *Config {
 	return &Config{
 		Model:          "claude-sonnet-4-20250514",
 		PermissionMode: "default",
 		MaxBudgetUsd:   10,
 		ThinkingTokens: 16000,
+		MaxSessions:    DefaultMaxSessions,
+
+		MaxIterations:         DefaultMaxIterations,
+		MaxTurnMinutes:        DefaultMaxTurnMinutes,
+		SubagentMaxIterations: DefaultSubagentMaxIterations,
 	}
 }
 
@@ -189,6 +285,7 @@ func LoadWithProfile(profileName string) (*Config, error) {
 			if err := json.Unmarshal(stripBOM(data), cfg); err != nil {
 				return finish(fmt.Errorf("parse config %s: %w", p, err))
 			}
+			cfg.turnMinutesExplicit = hasKey(stripBOM(data), "max_turn_minutes")
 		}
 	}
 	if err := loadProjectOverride(cfg); err != nil {
@@ -271,6 +368,12 @@ func loadProjectOverride(cfg *Config) error {
 	if override.DoneVerifyAuto != nil {
 		cfg.DoneVerifyAuto = override.DoneVerifyAuto
 	}
+	if override.DoneVerifyTimeoutSeconds > 0 {
+		cfg.DoneVerifyTimeoutSeconds = override.DoneVerifyTimeoutSeconds
+	}
+	if override.DoneCheck != "" {
+		cfg.DoneCheck = override.DoneCheck
+	}
 	if override.Thinking != "" {
 		cfg.Thinking = override.Thinking
 	}
@@ -286,6 +389,12 @@ func loadProjectOverride(cfg *Config) error {
 	if override.MemoryEmbedding != nil {
 		cfg.MemoryEmbedding = override.MemoryEmbedding
 	}
+	if override.ExperimentalTools {
+		cfg.ExperimentalTools = true
+	}
+	if override.WebSearch != nil {
+		cfg.WebSearch = override.WebSearch
+	}
 	// Provider and ThinkingTokens were silently dropped here, so a project that
 	// pinned its own endpoint or thinking budget in .cove.json was ignored with
 	// no message — the user's setting simply had no effect.
@@ -300,6 +409,22 @@ func loadProjectOverride(cfg *Config) error {
 	}
 	if override.ThinkingTokens > 0 {
 		cfg.ThinkingTokens = override.ThinkingTokens
+	}
+	// The per-turn limits and max_sessions were only read from config.json.
+	if override.MaxIterations > 0 {
+		cfg.MaxIterations = override.MaxIterations
+	}
+	if override.SubagentMaxIterations > 0 {
+		cfg.SubagentMaxIterations = override.SubagentMaxIterations
+	}
+	if override.MaxSessions != 0 {
+		cfg.MaxSessions = override.MaxSessions
+	}
+	// max_turn_minutes has no omitempty and 0 means "off": only the key's
+	// presence tells an explicit value from an absent one.
+	if hasKey(stripBOM(data), "max_turn_minutes") {
+		cfg.MaxTurnMinutes = override.MaxTurnMinutes
+		cfg.turnMinutesExplicit = true
 	}
 	return nil
 }
@@ -335,6 +460,19 @@ func applyProfile(cfg *Config, prof *Profile) {
 	if prof.SystemPrompt != "" {
 		cfg.SystemPrompt = prof.SystemPrompt
 	}
+	if prof.MaxIterations > 0 {
+		cfg.MaxIterations = prof.MaxIterations
+	}
+	if prof.SubagentMaxIterations > 0 {
+		cfg.SubagentMaxIterations = prof.SubagentMaxIterations
+	}
+	if prof.MaxSessions != 0 {
+		cfg.MaxSessions = prof.MaxSessions
+	}
+	if prof.MaxTurnMinutes != nil {
+		cfg.MaxTurnMinutes = *prof.MaxTurnMinutes
+		cfg.turnMinutesExplicit = true
+	}
 }
 
 func applyDefaults(cfg *Config) {
@@ -354,6 +492,20 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ThinkingTokens < 1024 {
 		cfg.ThinkingTokens = 16000
+	}
+	if cfg.MaxSessions == 0 {
+		cfg.MaxSessions = DefaultMaxSessions
+	}
+	if cfg.MaxIterations <= 0 {
+		cfg.MaxIterations = DefaultMaxIterations
+	}
+	if cfg.SubagentMaxIterations <= 0 {
+		cfg.SubagentMaxIterations = DefaultSubagentMaxIterations
+	}
+	// MaxTurnMinutes starts at its default (DefaultConfig) and only an
+	// explicit value in a config file changes it; 0 is "off", not "unset".
+	if cfg.MaxTurnMinutes < 0 {
+		cfg.MaxTurnMinutes = 0
 	}
 }
 
@@ -421,7 +573,7 @@ func Save(cfg *Config) error {
 	case err == nil:
 		if body := stripBOM(data); len(bytes.TrimSpace(body)) > 0 {
 			if err := json.Unmarshal(body, &onDisk); err != nil {
-				return fmt.Errorf("%s is not valid JSON (%v); fix or delete it first, it was not overwritten", path, err)
+				return fmt.Errorf("%s is not valid JSON (%w); fix or delete it first, it was not overwritten", path, err)
 			}
 			if onDisk == nil { // the file said "null"
 				onDisk = map[string]json.RawMessage{}

@@ -15,7 +15,58 @@ import (
 	"time"
 )
 
-type WebSearchTool struct{ baseTool }
+type WebSearchTool struct {
+	baseTool
+	settings WebSearchSettings
+}
+
+// WebSearchSettings is the web_search config key: Provider is "tavily",
+// "brave" or "duckduckgo"; APIKey is the key for tavily/brave.
+type WebSearchSettings struct {
+	Provider string
+	APIKey   string
+}
+
+// ResolveWebSearchBackend picks the backend websearch uses and its key. A
+// configured provider wins; its key comes from the config or, when absent,
+// from the provider's environment variable. Without a provider the
+// environment decides (TAVILY_API_KEY, then BRAVE_API_KEY /
+// BRAVE_SEARCH_API_KEY). A keyed provider with no key, and everything else,
+// falls back to the key-less DuckDuckGo scraper.
+func ResolveWebSearchBackend(cfg WebSearchSettings) (provider, apiKey string) {
+	envKey := func(p string) string {
+		switch p {
+		case "tavily":
+			return os.Getenv("TAVILY_API_KEY")
+		case "brave":
+			if k := os.Getenv("BRAVE_API_KEY"); k != "" {
+				return k
+			}
+			return os.Getenv("BRAVE_SEARCH_API_KEY")
+		}
+		return ""
+	}
+	switch p := strings.ToLower(strings.TrimSpace(cfg.Provider)); p {
+	case "tavily", "brave":
+		key := strings.TrimSpace(cfg.APIKey)
+		if key == "" {
+			key = envKey(p)
+		}
+		if key == "" {
+			return "duckduckgo", ""
+		}
+		return p, key
+	case "duckduckgo", "ddg":
+		return "duckduckgo", ""
+	}
+	for _, p := range []string{"tavily", "brave"} {
+		if k := envKey(p); k != "" {
+			return p, k
+		}
+	}
+	return "duckduckgo", ""
+}
+
 type QuestionTool struct{ baseTool }
 type TodoWriteTool struct{ baseTool }
 
@@ -27,12 +78,15 @@ var (
 	webSearchSpaceRE    = regexp.MustCompile(`\s+`)
 )
 
-func NewWebSearchTool() Tool {
-	return &WebSearchTool{baseTool{def: Def{
+func NewWebSearchTool() Tool { return NewWebSearchToolWith(WebSearchSettings{}) }
+
+// NewWebSearchToolWith is NewWebSearchTool using the web_search config key.
+func NewWebSearchToolWith(settings WebSearchSettings) Tool {
+	return &WebSearchTool{baseTool: baseTool{def: Def{
 		Name: "websearch", Description: "Search the web and return live results.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
 		IsReadOnly:  true, IsConcurrencySafe: true, UserFacingName: "WebSearch",
-	}}}
+	}}, settings: settings}
 }
 func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	q, _ := input["query"].(string)
@@ -41,13 +95,12 @@ func (t *WebSearchTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		return Result{Data: "Error: query required", IsError: true}, nil
 	}
 
-	// 1. High-fidelity Grounding: Tavily Search API
-	if apiKey := os.Getenv("TAVILY_API_KEY"); apiKey != "" {
+	// Tavily / Brave when configured (web_search or environment), else the
+	// zero-config DuckDuckGo scraper below.
+	switch provider, apiKey := ResolveWebSearchBackend(t.settings); provider {
+	case "tavily":
 		return t.queryTavily(ctx, apiKey, q)
-	}
-
-	// 2. High-fidelity Grounding: Brave Search API
-	if apiKey := os.Getenv("BRAVE_API_KEY"); apiKey != "" {
+	case "brave":
 		return t.queryBrave(ctx, apiKey, q)
 	}
 
@@ -208,6 +261,14 @@ func NewQuestionTool() Tool {
 		IsConcurrencySafe: false, UserFacingName: "Question",
 	}}}
 }
+
+// AskUserCancelled is what Runtime.AskUser returns when the user interrupted
+// the question (Ctrl+C) instead of answering it.
+const AskUserCancelled = "\x00cancel"
+
+// questionCancelled is the question tool's result for an interrupted ask.
+var questionCancelled = Result{Data: "Error: cancelled by user", IsError: true}
+
 func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	if tctx.IsNonInteractive || tctx.Runtime == nil || tctx.Runtime.AskUser == nil {
 		return Result{Data: "[Question requires interactive mode]", IsError: true}, nil
@@ -215,6 +276,11 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	questions, _ := input["questions"].([]any)
 	var sb strings.Builder
 	for i, q := range questions {
+		// A cancelled turn (Ctrl+C) asks nothing more: a later question
+		// would take the user's next line as its answer.
+		if ctx.Err() != nil {
+			return questionCancelled, nil
+		}
 		qm, _ := q.(map[string]any)
 		h, _ := qm["header"].(string)
 		qt, _ := qm["question"].(string)
@@ -228,7 +294,11 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 			labels = append(labels, label)
 			fmt.Fprintf(&prompt, "  %d. %v: %v\n", idx+1, om["label"], om["description"])
 		}
-		answer := strings.TrimSpace(tctx.Runtime.AskUser(prompt.String()))
+		raw := tctx.Runtime.AskUser(prompt.String())
+		if raw == AskUserCancelled || ctx.Err() != nil {
+			return questionCancelled, nil
+		}
+		answer := strings.TrimSpace(raw)
 		selected := answer
 		if n, err := strconv.Atoi(answer); err == nil && n >= 1 && n <= len(labels) {
 			selected = labels[n-1]
@@ -249,7 +319,7 @@ func NewTodoWriteTool() Tool {
 		Name: "todowrite", Aliases: []string{"TodoWrite"},
 		Description: "Create and manage a structured task list. Track progress of multi-step tasks.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{
-			"content":{"type":"string"},"status":{"type":"string"},"priority":{"type":"string"}
+			"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}
 		},"required":["content","status","priority"]}}},"required":["todos"]}`),
 		IsReadOnly: false, IsConcurrencySafe: false, UserFacingName: "TodoWrite",
 	}}}

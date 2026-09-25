@@ -84,6 +84,23 @@ func TestReadOnlyShellCommandIsNotCheckpointed(t *testing.T) {
 	}
 }
 
+// A compound line of read-only commands is read-only too: the single-command
+// classifier treated "git status && git diff" as unknown and snapshotted.
+func TestReadOnlyCompoundShellLineIsNotCheckpointed(t *testing.T) {
+	_, cp, _ := runShellTurn(t, "git status && git diff")
+	if got := cp.List(); len(got) != 0 {
+		t.Fatalf("read-only compound line created checkpoints: %q", got)
+	}
+}
+
+// A compound line with one writing command is checkpointed.
+func TestCompoundShellLineThatMayWriteIsCheckpointed(t *testing.T) {
+	_, cp, _ := runShellTurn(t, "git status && rm -rf build")
+	if got := cp.List(); len(got) == 0 {
+		t.Fatal("compound line with rm -rf created no checkpoint")
+	}
+}
+
 // namedWriter is a tool that writes a file when called, under any name.
 type namedWriter struct {
 	fileWriteTool
@@ -106,9 +123,10 @@ func TestDelegatingCallIsCheckpointed(t *testing.T) {
 			if _, err := exec.LookPath("git"); err != nil {
 				t.Skip("git not available")
 			}
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			t.Setenv("USERPROFILE", home)
+			// The package's temporary HOME (TestMain) holds the shadow store,
+			// already initialized, so no subtest pays for a "git init". The
+			// subtests stay sequential: run in parallel against the one store
+			// they failed intermittently (Windows file locks, a missing ref).
 			dir := t.TempDir()
 			if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("before"), 0o600); err != nil {
 				t.Fatal(err)

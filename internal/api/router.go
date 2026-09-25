@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // RoutingDecision is the result of model routing.
@@ -52,6 +53,7 @@ type ModelRouter struct {
 	override     string // user-specified override (e.g. /model gpt-4o)
 	budget       BudgetSignal
 	failureRate  FailureRateSignal
+	lastRouted   string // model chosen by the last Route
 }
 
 // DefaultModel returns the configured premium model.
@@ -156,12 +158,30 @@ func (mr *ModelRouter) Route(ctx context.Context, userMessage string) *RoutingDe
 	// Snapshot once so every strategy in this chain sees the same default,
 	// even if SetModels lands mid-evaluation.
 	defaultModel := mr.DefaultModel()
+	decision := &RoutingDecision{Model: defaultModel, Source: "default", Reason: "no strategy matched"}
 	for _, s := range mr.strategies {
-		if decision := s.Route(ctx, userMessage, defaultModel); decision != nil {
-			return decision
+		if d := s.Route(ctx, userMessage, defaultModel); d != nil {
+			decision = d
+			break
 		}
 	}
-	return &RoutingDecision{Model: defaultModel, Source: "default", Reason: "no strategy matched"}
+	mr.mu.Lock()
+	mr.lastRouted = decision.Model
+	mr.mu.Unlock()
+	return decision
+}
+
+// RoutedModelLabel is the model the last Route chose, for the status line at
+// the start of a turn ("模型：<label>"). It is empty when routing cannot pick
+// between two models (no fast model, or fast == main) or nothing was routed
+// yet, so the line only appears when it tells the user something.
+func (mr *ModelRouter) RoutedModelLabel() string {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	if mr.fastModel == "" || mr.fastModel == mr.defaultModel {
+		return ""
+	}
+	return mr.lastRouted
 }
 
 // ──── Strategies ────
@@ -207,10 +227,12 @@ const (
 
 	// scoreThreshold is the minimum combined score to route to the premium
 	// (default) model instead of the fast model.
-	scoreThreshold = 0.40
+	// 0.40 was unreachable without a keyword (length 0.20 + files 0.15).
+	scoreThreshold = 0.35
 
 	// hardLengthCeiling: regardless of other signals, a message this long
-	// always needs the premium model's deeper context handling.
+	// (in characters) always needs the premium model's deeper context
+	// handling.
 	hardLengthCeiling = 2000
 )
 
@@ -258,7 +280,9 @@ func (c *complexityClassifier) Route(_ context.Context, userMessage string, _ st
 	// Signal 2: message length, graduated rather than a hard cutoff (a
 	// message just over the old 500-char cutoff no longer forces premium
 	// by itself; a genuinely long one still contributes strongly).
-	length := len(userMessage)
+	// Characters, not bytes: a Chinese character is three bytes, so byte
+	// length sent short Chinese messages to the premium model.
+	length := utf8.RuneCountInString(userMessage)
 	if length >= hardLengthCeiling {
 		return &RoutingDecision{
 			Model:  c.router.DefaultModel(),

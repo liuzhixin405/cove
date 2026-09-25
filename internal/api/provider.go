@@ -78,9 +78,13 @@ type ChatResponse struct {
 	OutputTokens          int
 	PromptCacheHitTokens  int
 	PromptCacheMissTokens int
-	ReasoningTokens       int
-	StopReason            string
-	RateLimitHeaders      http.Header // raw rate limit headers from response
+	// PromptCacheWriteTokens is the share of PromptCacheMissTokens written
+	// into the prompt cache (Anthropic cache_creation_input_tokens), billed
+	// at a premium over plain input.
+	PromptCacheWriteTokens int
+	ReasoningTokens        int
+	StopReason             string
+	RateLimitHeaders       http.Header // raw rate limit headers from response
 	// ThinkingBlocks mirrors Message.ThinkingBlocks for the returned turn.
 	ThinkingBlocks []json.RawMessage
 }
@@ -235,6 +239,12 @@ type AgentRunResult struct {
 	Steps   int
 	Success bool
 	Error   string
+	// ExitReason is why the sub-agent stopped (delegate.Exit*: completed,
+	// max_iterations, interrupted, error, loop); empty if the runner does
+	// not report it.
+	ExitReason string
+	// Truncated reports that Output is a partial result.
+	Truncated bool
 }
 
 type AgentRunner interface {

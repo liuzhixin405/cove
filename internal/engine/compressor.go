@@ -17,7 +17,29 @@ type CompressResult struct {
 	OldCount     int    // message count before compression
 	NewCount     int    // message count after compression
 	TokenSavings int    // estimated tokens saved
+	// Summarized reports that layer 2 replaced the older history with a
+	// model-written summary (not just trimmed tool output or truncated).
+	Summarized bool
+	// Reason says, for the user, why nothing (or only a fallback) was done.
+	Reason string
 }
+
+// Minimum history sizes. A forced compression (/compact, limit 0) works on
+// much shorter histories than the automatic one.
+const (
+	compressMinMessages      = 12
+	forceCompressMinMessages = 4
+)
+
+// Summary-input character budgets per message (generateSummary). The first
+// real user message usually states the whole task; at 250 characters the
+// summary lost the original requirements.
+const (
+	summaryFirstUserRunes = 2000
+	summaryUserRunes      = 600
+	summaryAssistantRunes = 250
+	summaryToolRunes      = 100
+)
 
 // ChatCompressor handles context window compression.
 // Two-layer design:
@@ -26,15 +48,20 @@ type CompressResult struct {
 //	Layer 2: AI-powered summarization of middle conversation (API call)
 type ChatCompressor struct {
 	enabled        bool
-	tokenThreshold float64 // fraction of model limit at which to trigger (default 0.5)
+	tokenThreshold float64 // fraction of the limit at which to trigger (default 1.0: the limit is the trigger)
 	keepFraction   float64 // fraction of recent messages to keep intact (default 0.3)
 }
 
 // NewChatCompressor creates a compressor with sensible defaults.
 func NewChatCompressor() *ChatCompressor {
 	return &ChatCompressor{
-		enabled:        true,
-		tokenThreshold: 0.5,
+		enabled: true,
+		// The limit passed in is already the trigger point (see
+		// api.CompactionTrigger, which also leaves room for the reply), and
+		// the count is the provider's real prompt size, system prompt and
+		// tools included (token_count.go). It used to be half of an estimate
+		// that missed Chinese text and the system prompt.
+		tokenThreshold: 1.0,
 		keepFraction:   0.3,
 	}
 }
@@ -50,6 +77,8 @@ func (cc *ChatCompressor) NeedsCompression(tokenCount, tokenLimit int) bool {
 // Compress runs the two-layer compression pipeline.
 // Returns a CompressResult and the compressed message list.
 // If no compression is needed or possible, returns the original messages unchanged.
+// A tokenLimit of 0 or less forces the summary layer (the /compact command):
+// layer-1 trimming alone does not end it, and 4 messages are enough.
 func (cc *ChatCompressor) Compress(
 	ctx context.Context,
 	messages []api.Message,
@@ -61,17 +90,29 @@ func (cc *ChatCompressor) Compress(
 		return &CompressResult{}, messages
 	}
 
-	if len(messages) < 12 {
-		return &CompressResult{}, messages
+	force := tokenLimit <= 0
+	minMsgs := compressMinMessages
+	if force {
+		minMsgs = forceCompressMinMessages
+	}
+	if len(messages) < minMsgs {
+		return &CompressResult{Reason: fmt.Sprintf("对话只有 %d 条消息，至少 %d 条才能压缩", len(messages), minMsgs)}, messages
 	}
 
 	originalCount := len(messages)
 	originalTokens := tokenCount
+	// tokenCount covers what the request sends besides the messages (system
+	// prompt, tools), and may be the provider's figure; keep that share when
+	// re-estimating the trimmed messages.
+	overhead := tokenCount - countTokens(messages)
+	if overhead < 0 {
+		overhead = 0
+	}
 
 	// ─ Layer 1: Trim old tool results ─
 	cc.trimOldToolResults(messages, int(float64(len(messages))*cc.keepFraction))
-	tokenCount = countTokens(messages)
-	if !cc.NeedsCompression(tokenCount, tokenLimit) {
+	tokenCount = overhead + countTokens(messages)
+	if !force && !cc.NeedsCompression(tokenCount, tokenLimit) {
 		log.Debugf("compressor: layer1 trimming sufficient (%d tokens)", tokenCount)
 		return &CompressResult{
 			Compressed:   true,
@@ -84,8 +125,12 @@ func (cc *ChatCompressor) Compress(
 	// ─ Layer 2: AI summarization ─
 	// Find split point: preserve recent messages
 	keepCount := int(float64(len(messages)) * cc.keepFraction)
-	if keepCount < 6 {
-		keepCount = 6
+	minKeep, minHistory := 6, 4
+	if force {
+		minKeep, minHistory = 1, 2
+	}
+	if keepCount < minKeep {
+		keepCount = minKeep
 	}
 	if keepCount > len(messages)-2 {
 		keepCount = len(messages) - 2
@@ -98,12 +143,13 @@ func (cc *ChatCompressor) Compress(
 	// user turns (which the model API rejects with a 400, breaking every long chat).
 	splitIdx := chooseCompressionSplitAssistant(messages, keepCount)
 	if splitIdx <= 0 {
-		return &CompressResult{}, messages // no clean assistant boundary — nothing safe to summarize
+		// no clean assistant boundary — nothing safe to summarize
+		return &CompressResult{Reason: "找不到可安全切分的助手回复边界"}, messages
 	}
 
 	history := messages[:splitIdx]
-	if len(history) < 4 {
-		return &CompressResult{}, messages
+	if len(history) < minHistory {
+		return &CompressResult{Reason: "可摘要的历史太短"}, messages
 	}
 
 	summary, err := cc.generateSummary(ctx, history, tryChat)
@@ -135,6 +181,7 @@ func (cc *ChatCompressor) Compress(
 			OldCount:     len(messages),
 			NewCount:     len(truncated),
 			TokenSavings: 0,
+			Reason:       "摘要生成失败，已改为截断旧历史",
 		}, truncated
 	}
 
@@ -147,13 +194,14 @@ func (cc *ChatCompressor) Compress(
 	})
 	compressed = append(compressed, messages[splitIdx:]...)
 
-	newTokens := countTokens(compressed)
+	newTokens := overhead + countTokens(compressed)
 	result := &CompressResult{
 		Compressed:   true,
 		Summary:      summary,
 		OldCount:     len(messages),
 		NewCount:     len(compressed),
 		TokenSavings: tokenCount - newTokens,
+		Summarized:   true,
 	}
 
 	log.Debugf("compressor: %d tokens/%d msgs -> %d tokens/%d msgs (kept tail %d)",
@@ -185,19 +233,29 @@ func (cc *ChatCompressor) generateSummary(
 ) (string, error) {
 	var summaryInput strings.Builder
 	summaryInput.WriteString("Summarize this conversation history concisely. Structure:\n")
+	summaryInput.WriteString("- The user's original request and its requirements (keep them specific)\n")
 	summaryInput.WriteString("- Key decisions made\n")
 	summaryInput.WriteString("- Files created/modified (paths)\n")
 	summaryInput.WriteString("- Current task status\n")
 	summaryInput.WriteString("- Errors encountered and resolutions\n")
 	summaryInput.WriteString("- Important context for continuing\n\n")
 
+	sawRequest := false
 	for _, m := range messages {
 		fmt.Fprintf(&summaryInput, "[%s] ", m.Role)
 		content := m.Content
-		if m.Role == "tool" {
-			content = clipRunes(content, 100)
-		} else {
-			content = clipRunes(content, 250)
+		switch {
+		case m.Role == "tool":
+			content = clipRunes(content, summaryToolRunes)
+		case m.Role == "user" && !sawRequest && !looksSynthetic(m):
+			// The original request: keep enough of it that the summary
+			// can carry the requirements forward.
+			sawRequest = true
+			content = clipRunes(content, summaryFirstUserRunes)
+		case m.Role == "user":
+			content = clipRunes(content, summaryUserRunes)
+		default:
+			content = clipRunes(content, summaryAssistantRunes)
 		}
 		summaryInput.WriteString(content)
 		if len(m.ToolCalls) > 0 {
@@ -307,4 +365,4 @@ func clipRunes(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
-// countTokens is declared in engine.go (1 token ≈ 4 chars)
+// countTokens is declared in token_count.go

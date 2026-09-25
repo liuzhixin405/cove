@@ -1,6 +1,49 @@
 version: "2"
 
 linters:
+  # The standard set (errcheck, govet, ineffassign, staticcheck, unused) plus
+  # security, error-wrapping and style checks. (unused is already in the
+  # standard set; listing it again here was redundant.)
+  default: standard
+  enable:
+    - gosec
+    - revive
+    - errorlint
+  settings:
+    gosec:
+      excludes:
+        # A coding assistant runs the commands and opens the files the user
+        # and the model ask for; these two fire on every such call site and
+        # carry no signal here. Permission checks guard them instead.
+        - G204 # subprocess launched with variable
+        - G304 # file inclusion via variable
+        # It writes the user's project files and directories with the usual
+        # 0644/0755; private state under ~/.cove already uses 0600/0700.
+        - G301 # directory permissions above 0750
+        - G302 # chmod/open permissions above 0600
+        - G306 # WriteFile permissions above 0600
+    revive:
+      # Only correctness-flavoured rules: the default set also demands a doc
+      # comment on every exported name, which would drown the rest.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T"
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: unused-parameter
+          disabled: true
   exclusions:
     rules:
       # Test helpers routinely ignore the error from writing to an
@@ -9,6 +52,7 @@ linters:
       - path: _test\.go$
         linters:
           - errcheck
+          - gosec
 
 issues:
   # Report the whole backlog; the defaults cap it at 50 per linter, which hides

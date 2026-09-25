@@ -40,6 +40,8 @@ func setupProjectHistory(t *testing.T) *projectHistory {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("COVE_CONFIG_DIR", filepath.Join(home, ".cove"))
+	seedCheckpointStore(t, home)
 	root := t.TempDir()
 	dirA := filepath.Join(root, "project-a")
 	dirB := filepath.Join(root, "project-b")

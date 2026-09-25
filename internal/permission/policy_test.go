@@ -1,7 +1,10 @@
 package permission
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -34,8 +37,10 @@ func TestPolicyEngine_EvaluateAndGlob(t *testing.T) {
 	if got := pe.Evaluate("write", nil, "default"); got != ActionAsk {
 		t.Fatalf("unmatched in default mode: want ask, got %v", got)
 	}
-	if got := pe.Evaluate("write", nil, "auto"); got != ActionAllow {
-		t.Fatalf("unmatched in auto mode: want allow, got %v", got)
+	// No rule matched: ask in every mode. Auto mode's extra allowances are
+	// decided by the engine's mode tiers, not by a blanket policy default.
+	if got := pe.Evaluate("write", nil, "auto"); got != ActionAsk {
+		t.Fatalf("unmatched in auto mode: want ask, got %v", got)
 	}
 }
 
@@ -84,5 +89,67 @@ func TestPolicyEngine_PersistsAcrossRestart(t *testing.T) {
 	rules3, _ := store3.Load()
 	if len(rules3) != 0 {
 		t.Fatalf("removal not persisted: %d rules remain", len(rules3))
+	}
+}
+
+func TestPolicyRuleToRule(t *testing.T) {
+	got, ok := PolicyRule{CommandPrefix: "git commit"}.ToRule()
+	if !ok || !reflect.DeepEqual(got, Rule{ToolPattern: "bash", CommandPrefix: "git commit"}) {
+		t.Fatalf("ToRule = %+v, %v; want bash/git commit", got, ok)
+	}
+	got, ok = PolicyRule{ToolPattern: "powershell", CommandPrefix: "go test"}.ToRule()
+	if !ok || got.ToolPattern != "powershell" || got.CommandPrefix != "go test" {
+		t.Fatalf("powershell prefix rule = %+v, %v", got, ok)
+	}
+	got, ok = PolicyRule{ToolPattern: "mcp", InputEquals: map[string]string{"serverName": "gh", "toolName": "x"}}.ToRule()
+	if !ok || got.InputEquals["toolName"] != "x" {
+		t.Fatalf("mcp rule = %+v, %v", got, ok)
+	}
+	if got, ok := (PolicyRule{ToolPattern: "write"}).ToRule(); !ok || got.ToolPattern != "write" {
+		t.Fatalf("whole-tool rule = %+v, %v", got, ok)
+	}
+	// Globs and param matches have no Manager equivalent.
+	for _, r := range []PolicyRule{
+		{ToolPattern: "mcp_*"},
+		{ToolPattern: "bash", ParamMatch: map[string]string{"command": "git *"}},
+		{},
+	} {
+		if got, ok := r.ToRule(); ok {
+			t.Errorf("%+v.ToRule() = %+v, true; want false", r, got)
+		}
+	}
+}
+
+// A persisted prefix rule must not turn into a whole-tool allow inside the
+// policy engine: Match has to respect CommandPrefix and InputEquals.
+func TestPolicyRuleMatchRespectsCommandPrefix(t *testing.T) {
+	r := PolicyRule{ID: "p", ToolPattern: "bash", Action: ActionAllow, Enabled: true, CommandPrefix: "git commit"}
+	if !r.Match("bash", map[string]any{"command": "git commit -m x"}) {
+		t.Error("git commit not matched")
+	}
+	for _, cmd := range []string{"rm -rf x", "git commit -m x && rm -rf y", "git push"} {
+		if r.Match("bash", map[string]any{"command": cmd}) {
+			t.Errorf("allow prefix rule matched %q", cmd)
+		}
+	}
+	deny := PolicyRule{ID: "d", ToolPattern: "bash", Action: ActionDeny, Enabled: true, CommandPrefix: "rm"}
+	if !deny.Match("bash", map[string]any{"command": "cd x && rm -rf y"}) {
+		t.Error("deny prefix rule missed rm inside a compound line")
+	}
+	mcp := PolicyRule{ID: "m", ToolPattern: "mcp", Action: ActionAllow, Enabled: true, InputEquals: map[string]string{"toolName": "a"}}
+	if mcp.Match("mcp", map[string]any{"toolName": "b"}) || !mcp.Match("mcp", map[string]any{"toolName": "a"}) {
+		t.Error("InputEquals not respected")
+	}
+}
+
+func TestPolicyRuleJSONFormat(t *testing.T) {
+	data, err := json.Marshal(PolicyRule{ID: "allow-bash-git commit", ToolPattern: "bash", Action: ActionAllow, Enabled: true, CommandPrefix: "git commit", Scope: `D:\proj`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"command_prefix":"git commit"`, `"scope":"D:\\proj"`, `"tool_pattern":"bash"`, `"action":"allow"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("JSON %s lacks %s", data, want)
+		}
 	}
 }

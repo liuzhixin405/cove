@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
@@ -29,13 +30,45 @@ type NoteEntry struct {
 	Text      string
 }
 
-// New creates a session notes manager. Notes are stored per-project.
+// New creates a session notes manager for projectDir. The notes live in the
+// project's data directory (~/.cove/projects/<hash>/session_notes.md); they
+// used to be written into a .cove directory inside the repository itself,
+// and a file left there by an older version is moved over.
 func New(projectDir string) *SessionNotes {
-	dir := filepath.Join(projectDir, ".cove")
-	_ = os.MkdirAll(dir, 0700)
-	return &SessionNotes{
-		path:    filepath.Join(dir, "session_notes.md"),
-		entries: make([]NoteEntry, 0),
+	dir, err := config.ProjectDataDir(projectDir)
+	if err != nil {
+		// No config directory: keep the notes in memory only.
+		return &SessionNotes{entries: make([]NoteEntry, 0)}
+	}
+	path := filepath.Join(dir, notesFileName)
+	migrateLegacyNotes(filepath.Join(projectDir, ".cove"), path)
+	return &SessionNotes{path: path, entries: make([]NoteEntry, 0)}
+}
+
+const notesFileName = "session_notes.md"
+
+// migrateLegacyNotes moves <project>/.cove/session_notes.md to path, unless
+// path already exists (then the newer file wins and the old one is removed
+// only if it holds the same notes), and removes the .cove directory when
+// nothing else is in it.
+func migrateLegacyNotes(legacyDir, path string) {
+	legacy := filepath.Join(legacyDir, notesFileName)
+	data, err := os.ReadFile(legacy)
+	if err != nil {
+		return
+	}
+	if cur, err := os.ReadFile(path); err == nil {
+		if string(cur) != string(data) {
+			return
+		}
+	} else if err := fsatomic.WriteFile(path, data, 0o644); err != nil {
+		return
+	}
+	if err := os.Remove(legacy); err != nil {
+		return
+	}
+	if rest, err := os.ReadDir(legacyDir); err == nil && len(rest) == 0 {
+		_ = os.Remove(legacyDir)
 	}
 }
 
@@ -50,16 +83,33 @@ func NewGlobal() *SessionNotes {
 	}
 }
 
-// Add records a new note.
+// Add records a new note. A note with the same category and text as one
+// already kept is dropped: the same decision used to fill the file.
 func (s *SessionNotes) Add(category, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.hasLocked(category, text) {
+		return
+	}
 	s.entries = append(s.entries, NoteEntry{
 		Timestamp: time.Now(),
 		Category:  category,
 		Text:      text,
 	})
 	s.modified = true
+}
+
+func (s *SessionNotes) hasLocked(category, text string) bool {
+	for _, e := range s.entries {
+		if e.Category == category && e.Text == text {
+			return true
+		}
+	}
+	return false
 }
 
 // AddDecision records a key decision.
@@ -78,7 +128,7 @@ func (s *SessionNotes) AddTask(text string) { s.Add("task", text) }
 func (s *SessionNotes) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.modified || len(s.entries) == 0 {
+	if !s.modified || len(s.entries) == 0 || s.path == "" {
 		return nil
 	}
 	s.modified = false
@@ -99,7 +149,7 @@ func (s *SessionNotes) writeToDisk() error {
 		excess := len(content) - maxNotesBytes
 		drop := 0
 		for freed := 0; drop < len(s.entries)-1 && freed < excess; drop++ {
-			freed += len(s.entries[drop].Text) + len("- [15:04] \n")
+			freed += len(s.entries[drop].Text) + len("- ["+noteTimeLayout+"] \n")
 		}
 		s.entries = append([]NoteEntry(nil), s.entries[drop:]...)
 		content = s.render()
@@ -132,7 +182,7 @@ func (s *SessionNotes) render() string {
 		}
 		fmt.Fprintf(&sb, "## %s\n\n", titleCase(cat+"s"))
 		for _, e := range entries {
-			fmt.Fprintf(&sb, "- [%s] %s\n", e.Timestamp.Format("15:04"), e.Text)
+			fmt.Fprintf(&sb, "- [%s] %s\n", e.Timestamp.Format(noteTimeLayout), e.Text)
 		}
 		sb.WriteString("\n")
 	}
@@ -146,9 +196,18 @@ func (s *SessionNotes) render() string {
 // s.entries with no lock at all, racing every Add/Flush from the engine's
 // background goroutines.
 func (s *SessionNotes) Load() {
+	if s.path == "" {
+		return
+	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return
+	}
+	// Lines of the old "- [15:04] text" format carry no date: they get the
+	// file's modification day.
+	day := time.Now()
+	if info, err := os.Stat(s.path); err == nil {
+		day = info.ModTime()
 	}
 	var loaded []NoteEntry
 	var currentCategory string
@@ -172,18 +231,18 @@ func (s *SessionNotes) Load() {
 		if !strings.HasPrefix(trimmed, "- [") {
 			continue
 		}
-		// Parse "- [15:04] text"
+		// Parse "- [2006-01-02 15:04] text" (or the old "- [15:04] text")
 		closeBracket := strings.Index(trimmed, "] ")
 		if closeBracket < 0 {
 			continue
 		}
-		text := trimmed[closeBracket+2:]
+		text := strings.TrimSpace(trimmed[closeBracket+2:])
 		cat := currentCategory
 		if cat == "" {
 			cat = "task"
 		}
 		loaded = append(loaded, NoteEntry{
-			Timestamp: time.Now(),
+			Timestamp: parseNoteTime(trimmed[len("- ["):closeBracket], day),
 			Category:  cat,
 			Text:      text,
 		})
@@ -193,8 +252,28 @@ func (s *SessionNotes) Load() {
 		return
 	}
 	s.mu.Lock()
-	s.entries = append(s.entries, loaded...)
+	for _, e := range loaded {
+		if !s.hasLocked(e.Category, e.Text) {
+			s.entries = append(s.entries, e)
+		}
+	}
 	s.mu.Unlock()
+}
+
+// noteTimeLayout is how a note's time is written. It used to be "15:04"
+// alone, and every loaded note was then stamped with the load time.
+const noteTimeLayout = "2006-01-02 15:04"
+
+// parseNoteTime reads a note's bracketed time: a full date and time, or the
+// old hour and minute on day. Unparseable text gives day itself.
+func parseNoteTime(s string, day time.Time) time.Time {
+	if t, err := time.ParseInLocation(noteTimeLayout, s, time.Local); err == nil {
+		return t
+	}
+	if t, err := time.ParseInLocation("15:04", s, time.Local); err == nil {
+		return time.Date(day.Year(), day.Month(), day.Day(), t.Hour(), t.Minute(), 0, 0, time.Local)
+	}
+	return day
 }
 
 // Content returns the current notes as a string for system prompt injection.

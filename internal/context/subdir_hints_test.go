@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-// TestSubdirHintsClipOnRuneBoundary: hint files over 2000 bytes were cut with
+// TestSubdirHintsClipOnRuneBoundary: hint files over the cap were cut with
 // content[:2000], which splits a CJK character (2000 is not a multiple of 3),
 // and the injected context carried invalid UTF-8.
 func TestSubdirHintsClipOnRuneBoundary(t *testing.T) {
@@ -18,7 +18,7 @@ func TestSubdirHintsClipOnRuneBoundary(t *testing.T) {
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sub, "AGENTS.md"), []byte(strings.Repeat("中文说明", 400)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sub, "AGENTS.md"), []byte(strings.Repeat("中文说明", 1200)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got := NewSubdirHints(work).CheckPath(filepath.Join(sub, "a.go"))

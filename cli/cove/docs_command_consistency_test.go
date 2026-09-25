@@ -62,6 +62,7 @@ func TestDocumentedCommandsAreImplemented(t *testing.T) {
 		"attach",
 		"model", "provider", "api-key", "base-url", "mode", "budget",
 		"tasks", "stop", "cancel",
+		"continue",
 		"skill",
 	} {
 		implemented[name] = true

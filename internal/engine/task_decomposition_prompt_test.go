@@ -51,3 +51,16 @@ func TestTaskDecompositionGuidance_NonEmptyForComplexMessage(t *testing.T) {
 		t.Fatalf("expected guidance to mention step decomposition, got: %q", g)
 	}
 }
+
+// The length threshold counts characters, not bytes: 120 Chinese characters
+// (360 bytes) are a short message, not a multi-step task.
+func TestSuggestsComplexTaskCountsRunes(t *testing.T) {
+	short := strings.Repeat("中", 120) // 360 bytes, 120 runes
+	if suggestsComplexTask(short) {
+		t.Fatal("120 Chinese characters counted as a long message")
+	}
+	long := strings.Repeat("中", 300)
+	if !suggestsComplexTask(long) {
+		t.Fatal("300 Chinese characters not counted as a long message")
+	}
+}

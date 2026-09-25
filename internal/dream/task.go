@@ -7,13 +7,14 @@ import (
 	"time"
 )
 
-// Status represents the current state of the dream task.
-type Status string
+// TaskStatus represents the current state of the dream task. (Status is the
+// runner-level snapshot reported by Runner.Status.)
+type TaskStatus string
 
 const (
-	StatusRunning   Status = "running"
-	StatusCompleted Status = "completed"
-	StatusFailed    Status = "failed"
+	StatusRunning   TaskStatus = "running"
+	StatusCompleted TaskStatus = "completed"
+	StatusFailed    TaskStatus = "failed"
 )
 
 // Turn represents a single assistant turn from the dream agent.
@@ -26,7 +27,7 @@ type Turn struct {
 type Task struct {
 	mu               sync.Mutex
 	ID               string
-	Status           Status
+	Status           TaskStatus
 	SessionsReviewed int
 	FilesTouched     []string
 	Turns            []Turn
@@ -34,6 +35,8 @@ type Task struct {
 	EndTime          time.Time
 	PriorMtime       time.Time
 	CancelFunc       func() // cancels the dream context
+	// Usage is the run's token usage and cost so far (guarded by mu).
+	Usage Usage
 }
 
 const maxTurns = 30
@@ -63,13 +66,20 @@ func NewTask(sessionsReviewed int, priorMtime time.Time, cancelFunc func()) *Tas
 	return t
 }
 
+// setUsage records the run's cumulative usage so far.
+func (t *Task) setUsage(u Usage) {
+	t.mu.Lock()
+	t.Usage = u
+	t.mu.Unlock()
+}
+
 // CurrentStatus returns the task's status.
 //
 // Status is written under t.mu by Complete/Fail, so it must be read under t.mu
 // too. Reading the field directly — as ActiveTask and runDream's deferred
 // cleanup both used to — meant the same field was effectively "protected" by
 // two different mutexes, which protects nothing.
-func (t *Task) CurrentStatus() Status {
+func (t *Task) CurrentStatus() TaskStatus {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.Status
@@ -128,11 +138,11 @@ func (t *Task) AddTurn(turn Turn, touchedPaths []string) {
 	t.Turns = append(t.Turns, turn)
 }
 
-// Complete marks the task as completed.
-func (t *Task) Complete() { t.finish(StatusCompleted) }
+// Complete marks the task as completed; see finish for the return value.
+func (t *Task) Complete() bool { return t.finish(StatusCompleted) }
 
-// Fail marks the task as failed.
-func (t *Task) Fail() { t.finish(StatusFailed) }
+// Fail marks the task as failed; see finish for the return value.
+func (t *Task) Fail() bool { return t.finish(StatusFailed) }
 
 // finish records a terminal status and unregisters the task.
 //
@@ -140,8 +150,16 @@ func (t *Task) Fail() { t.finish(StatusFailed) }
 // consolidation run since process start stayed reachable (with its turns and
 // touched-file lists) and ActiveTask had to scan them all. Keeping the last
 // finished task is enough for the UI to report on the run that just ended.
-func (t *Task) finish(status Status) {
+//
+// Only the first call counts: a task cancelled at exit (CancelActive) is
+// failed there, and the run's goroutine finishing afterwards must not turn it
+// into "completed". It reports whether this call finished the task.
+func (t *Task) finish(status TaskStatus) bool {
 	t.mu.Lock()
+	if t.Status != StatusRunning {
+		t.mu.Unlock()
+		return false
+	}
 	t.Status = status
 	t.EndTime = time.Now()
 	t.CancelFunc = nil
@@ -155,6 +173,7 @@ func (t *Task) finish(status Status) {
 	lastFinished = t
 	delete(activeTasks, id)
 	taskMu.Unlock()
+	return true
 }
 
 // LastFinishedTask returns the most recently completed or failed task, if any.

@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/delegate"
+	"github.com/liuzhixin405/cove/internal/repomap"
 	"github.com/liuzhixin405/cove/internal/safety"
 )
 
@@ -27,9 +30,30 @@ import (
 // work it cannot see. Re-sending the same message resumes the turn.
 func (e *Engine) interrupt(user api.Message, routedModel, reason string) {
 	e.closeDanglingToolCalls()
+	// The model reads this on the next turn (or the /continue resume): the
+	// previous one stopped part-way. Written once per interruption; a
+	// resume that fails again adds no second marker (interruptMarked is
+	// cleared when a turn completes or a different request is sent).
+	if !e.interruptMarked {
+		e.messages = append(e.messages, newSyntheticUserMsg(fmt.Sprintf(interruptMarkerFmt, interruptMarkerReason(reason))))
+		e.interruptMarked = true
+	}
 	e.interrupted = &interruption{user: user, routedModel: routedModel, reason: reason}
 	e.saveSession()
 }
+
+// InterruptedTurn returns the user message of the turn that last ended before
+// completing (iteration or time limit, cancel, API error, loop), which
+// re-sending resumes. ok is false when the last turn completed.
+func (e *Engine) InterruptedTurn() (msg api.Message, ok bool) {
+	if e.interrupted == nil {
+		return api.Message{}, false
+	}
+	return e.interrupted.user, true
+}
+
+// HasInterruptedTurn reports whether there is a turn /continue can resume.
+func (e *Engine) HasInterruptedTurn() bool { return e.interrupted != nil }
 
 // closeDanglingToolCalls gives every tool call of the last assistant turn a
 // result. A turn can end between a tool_use and its tool_result (fatal loop
@@ -64,6 +88,7 @@ func (e *Engine) closeDanglingToolCalls() {
 		fill := syntheticToolResults(missing, interruptedToolNote)
 		rest := append([]api.Message(nil), e.messages[insertAt:]...)
 		e.messages = append(append(e.messages[:insertAt], fill...), rest...)
+		e.invalidateUsage()
 		return
 	}
 }
@@ -79,7 +104,8 @@ func sameRequest(interrupted, msg api.Message) bool {
 // ---------------------------------------------------------------------------
 
 // turnContextNote builds the engine text that accompanies a user message: the
-// working-tree state, when it changed since the model last saw it. It is
+// working-tree state, when it changed since the model last saw it, and the
+// memory note for query (turnMemoryNote). It is
 // appended after the user's message so the system prompt — the front of every
 // cached prefix — never changes.
 //
@@ -88,7 +114,7 @@ func sameRequest(interrupted, msg api.Message) bool {
 // to the fast tier, and a "plan it first with todowrite" note for any message of
 // 300+ bytes (about 100 Chinese characters). The fast tiers in use are capable
 // models, and the planning note turned ordinary requests into ceremony.
-func (e *Engine) turnContextNote() string {
+func (e *Engine) turnContextNote(query string) string {
 	var parts []string
 	if e.projCtx != nil && e.projCtx.IsGitRepo {
 		branch, status := e.projCtx.GetGitInfo()
@@ -101,7 +127,99 @@ func (e *Engine) turnContextNote() string {
 			parts = append(parts, "<environment>\n"+git+"\n</environment>")
 		}
 	}
+	if mem := e.turnMemoryNote(query); mem != "" {
+		parts = append(parts, mem)
+	}
+	if ex := e.turnRepoMapExcerpt(query); ex != "" {
+		parts = append(parts, ex)
+	}
 	return strings.Join(parts, "\n\n")
+}
+
+// repoMapRoot is the directory the repo map and project outline describe.
+func (e *Engine) repoMapRoot() string {
+	if root := e.enhancedRepoMap.Root(); root != "" {
+		return root
+	}
+	return e.projectCwd()
+}
+
+// turnRepoMapExcerpt returns, for the first task-like turn of the session
+// (looksLikeTask), the repo map entries relevant to query in a
+// <repo_map_excerpt> block of at most repoMapExcerptMaxBytes. Later turns,
+// and chat turns, get nothing: the model asks the repo_map tool. The excerpt
+// travels in the turn note, never in the system prompt, so the cached prefix
+// is unchanged.
+//
+// A message with nothing to search for (no path, identifier or backticked
+// code: say a long Chinese chat, or "我在测试你的能力") gets no excerpt and
+// leaves the session's one excerpt for a later turn; ranking the whole
+// repository for it would only fill the context with unrelated files.
+func (e *Engine) turnRepoMapExcerpt(query string) string {
+	if !e.repoMapExcerptLeft() || e.projCtx == nil || !looksLikeTask(query) {
+		return ""
+	}
+	terms := repomap.ExtractTerms(query)
+	root := e.repoMapRoot()
+	if len(terms) == 0 || root == "" {
+		return ""
+	}
+	const open = "<repo_map_excerpt>\nRepository map entries likely relevant to this request (path, symbols, :line). Call the repo_map tool for other parts of the code.\n"
+	const closing = "</repo_map_excerpt>"
+	body := repomap.Query(root, terms, repoMapExcerptMaxBytes-len(open)-len(closing))
+	if body == "" {
+		return ""
+	}
+	e.repoMapMu.Lock()
+	defer e.repoMapMu.Unlock()
+	if e.repoMapExcerpts >= repoMapExcerptsPerSession {
+		return ""
+	}
+	e.repoMapExcerpts++
+	return open + body + closing
+}
+
+// repoMapExcerptLeft reports whether this session may still get an automatic
+// repo map excerpt.
+func (e *Engine) repoMapExcerptLeft() bool {
+	e.repoMapMu.Lock()
+	defer e.repoMapMu.Unlock()
+	return e.repoMapExcerpts < repoMapExcerptsPerSession
+}
+
+// Signals that a message asks for work on the code rather than a chat.
+var (
+	taskPathRe    = regexp.MustCompile(`[A-Za-z0-9_.\-]+[/\\][A-Za-z0-9_.\-/\\]+|[A-Za-z0-9_\-]+\.(?:go|py|ts|tsx|js|jsx|mjs|rs|java|kt|cs|rb|php|swift|c|h|cpp|hpp|md|json|ya?ml|toml|sql|sh|ps1|html|css|vue)\b`)
+	taskCallRe    = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_.]*\(`)
+	taskIdentRe   = regexp.MustCompile(`\b[a-z]+[A-Z][A-Za-z0-9]*\b|\b[A-Za-z]+_[A-Za-z0-9_]+\b`)
+	taskKeywordEN = regexp.MustCompile(`(?i)\b(fix(es|ed|ing)?|implement\w*|refactor\w*|errors?|bugs?|tests?|testing)\b`)
+)
+
+// taskKeywordsZH are the Chinese words that make a message a task.
+var taskKeywordsZH = []string{"修复", "实现", "重构", "报错", "测试"}
+
+// taskMinRunes: a message at least this long is treated as a task.
+const taskMinRunes = 200
+
+// looksLikeTask reports whether msg reads as a request to work on the code: it
+// names a file path, a function call, a camelCase/snake_case identifier or
+// backticked code, uses a task word (修复 实现 重构 报错 测试 fix implement
+// refactor error bug test), or is at least taskMinRunes long.
+func looksLikeTask(msg string) bool {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return false
+	}
+	if utf8.RuneCountInString(msg) >= taskMinRunes || strings.Contains(msg, "`") {
+		return true
+	}
+	for _, k := range taskKeywordsZH {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return taskKeywordEN.MatchString(msg) || taskPathRe.MatchString(msg) ||
+		taskIdentRe.MatchString(msg) || taskCallRe.MatchString(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +289,41 @@ func (e *Engine) newSkillPrompts(path string) string {
 		return ""
 	}
 	return "\n\n<relevant_skills>\n" + sb.String() + "</relevant_skills>\n"
+}
+
+// toolContextHints is what a successful tool call's paths bring into its
+// result: file-type skills matching its filePath and the AGENTS.md-style
+// hint files of the directories it touches (filePath, grep/glob's path, or
+// path-like tokens of a command). Each is shown once until the next
+// compaction (resetShownContext).
+func (e *Engine) toolContextHints(tc api.ToolCall) string {
+	var out string
+	if filePath, ok := tc.Input["filePath"].(string); ok {
+		out += e.newSkillPrompts(filePath)
+	}
+	if e.subdirHints == nil {
+		return out
+	}
+	if path, ok := tc.Input["filePath"].(string); ok && path != "" {
+		out += e.subdirHints.CheckPath(path)
+	} else if path, ok := tc.Input["path"].(string); ok && path != "" {
+		out += e.subdirHints.CheckPath(path)
+	} else if cmd, ok := tc.Input["command"].(string); ok {
+		out += e.subdirHints.CheckCommand(cmd)
+	}
+	return out
+}
+
+// resetShownContext forgets which file-type skills and subdirectory hints
+// were shown. Compaction calls it: the summary may have dropped them, and a
+// skill never shown again was lost for the rest of the session.
+func (e *Engine) resetShownContext() {
+	e.skillMu.Lock()
+	e.injectedSkills = nil
+	e.skillMu.Unlock()
+	if e.subdirHints != nil {
+		e.subdirHints.Reset()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -247,11 +400,91 @@ func detectVerifyCommands(dir string) []string {
 	if exists("Cargo.toml") {
 		cmds = append(cmds, "cargo check")
 	}
-	if exists("tsconfig.json") && (exists("node_modules", ".bin", "tsc") || exists("node_modules", ".bin", "tsc.cmd")) {
+	tsc := exists("tsconfig.json") && (exists("node_modules", ".bin", "tsc") || exists("node_modules", ".bin", "tsc.cmd"))
+	if tsc {
 		// --no-install: use the project's own compiler, never download one.
 		cmds = append(cmds, "npx --no-install tsc --noEmit")
 	}
+	if hasDotnetProject(dir) {
+		cmds = append(cmds, "dotnet build --nologo -v q")
+	}
+	// A TypeScript project's build mostly repeats the type check tsc just
+	// did (and bundles on top), so it is only the check when tsc is not.
+	if !tsc && hasNpmBuildScript(filepath.Join(dir, "package.json")) {
+		cmds = append(cmds, "npm run build --if-present")
+	}
+	if exists("pyproject.toml") || exists("setup.py") {
+		// A syntax check of every module; it does not import or run them.
+		// Virtual environments, node_modules, .git and bytecode caches are
+		// excluded: they are not the project's code and can be huge.
+		cmds = append(cmds, pythonCommand()+` -m compileall -q -x "(\.venv|venv|node_modules|\.git|__pycache__)" .`)
+	}
 	return cmds
+}
+
+// hasDotnetProject reports whether dir holds exactly one solution, or no
+// solution and exactly one project: with more, a bare "dotnet build" stops
+// with MSB1011 ("more than one project or solution file") and would fail
+// every turn.
+func hasDotnetProject(dir string) bool {
+	slns, _ := filepath.Glob(filepath.Join(dir, "*.sln"))
+	if len(slns) > 0 {
+		return len(slns) == 1
+	}
+	projs, _ := filepath.Glob(filepath.Join(dir, "*.csproj"))
+	return len(projs) == 1
+}
+
+// hasNpmBuildScript reports whether the package.json at path declares a
+// "build" script.
+func hasNpmBuildScript(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	return strings.TrimSpace(pkg.Scripts["build"]) != ""
+}
+
+// pythonCommand is the Python interpreter on PATH: "python", or "python3"
+// where only that exists (most Linux distributions and macOS).
+func pythonCommand() string {
+	if _, err := exec.LookPath("python"); err != nil {
+		if _, err3 := exec.LookPath("python3"); err3 == nil {
+			return "python3"
+		}
+	}
+	return "python"
+}
+
+// announceVerifyGate tells the user, once, which commands check a turn's
+// work before it may end (they run on their own and can take a while).
+func (e *Engine) announceVerifyGate() {
+	if e.verifyAnnounced || e.verifyGate == nil || !e.verifyGate.Enabled() {
+		return
+	}
+	e.verifyAnnounced = true
+	e.engineOutput("  \x1b[2m完成校验命令：" + strings.Join(e.verifyGate.commands, "；") + "\x1b[0m")
+}
+
+// newVerifyGate builds the gate for dir from the configuration: the
+// configured commands, else detected ones (done_verify_auto), else nil.
+func (e *Engine) newVerifyGate(dir string) *VerifyGate {
+	var g *VerifyGate
+	if len(e.config.DoneVerifyCommands) > 0 {
+		g = NewVerifyGate(e.config.DoneVerifyCommands, dir)
+	} else if e.config.DoneVerifyAuto {
+		if cmds := detectVerifyCommands(dir); len(cmds) > 0 {
+			g = newAutoVerifyGate(cmds, dir)
+		}
+	}
+	g.SetTimeout(e.config.DoneVerifyTimeout)
+	return g
 }
 
 // newAutoVerifyGate builds a gate from detected commands. Unlike a configured
@@ -363,9 +596,15 @@ func (r *agentRunner) Run(ctx context.Context, name, task string) (*api.AgentRun
 	price.AddDetailed(res.Model, res.InputTokens, res.OutputTokens, 0, 0)
 	out := &api.AgentRunResult{
 		Output: res.Output, Cost: price.Totals().Cost, Steps: res.Steps, Success: res.Success, Error: res.Error,
+		ExitReason: res.ExitReason, Truncated: res.Truncated,
 	}
-	if !res.Success && out.Output == "" {
+	switch {
+	case !res.Success && out.Output == "":
 		out.Output = "Sub-agent did not finish: " + res.Error
+	case !res.Success && res.Error != "":
+		// A partial result (the cap was reached): the agent tool shows only
+		// Output, so the reason goes in front of it.
+		out.Output = "Sub-agent did not finish: " + res.Error + "\n\n" + out.Output
 	}
 	return out, nil
 }

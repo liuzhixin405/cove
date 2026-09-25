@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/liuzhixin405/cove/internal/fsatomic"
 )
 
 // FilePolicyStorage persists policy rules to a JSON file.
@@ -41,11 +43,16 @@ func (s *FilePolicyStorage) Load() ([]PolicyRule, error) {
 	return rules, nil
 }
 
-// Save writes policy rules to the JSON file.
+// Save writes policy rules to the JSON file atomically, so a crash or a
+// concurrent cove process never leaves a truncated file that would drop every
+// persisted rule on the next load.
 func (s *FilePolicyStorage) Save(rules []PolicyRule) error {
+	if rules == nil {
+		rules = []PolicyRule{}
+	}
 	data, err := json.MarshalIndent(rules, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
+	return fsatomic.WriteFile(s.path, data, 0600)
 }

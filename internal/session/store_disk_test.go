@@ -198,8 +198,8 @@ func TestSaveLeavesNoTempFileBehind(t *testing.T) {
 			t.Errorf("Save left an atomic-write temp file behind: %s", e.Name())
 		}
 	}
-	if len(names) != 1 || names[0] != "atomic.json" {
-		t.Errorf("directory contains %v, want exactly [atomic.json]", names)
+	if len(names) != 2 || names[0] != "atomic.jsonl" || names[1] != indexFileName {
+		t.Errorf("directory contains %v, want exactly [atomic.jsonl %s]", names, indexFileName)
 	}
 }
 
@@ -223,11 +223,11 @@ func TestSavePathStaysInsideStoreDir(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(s.dir, "evil.json")); err != nil {
-		t.Fatalf("expected evil.json inside the store dir: %v", err)
+	if _, err := os.Stat(filepath.Join(s.dir, "evil.jsonl")); err != nil {
+		t.Fatalf("expected evil.jsonl inside the store dir: %v", err)
 	}
 	parent := filepath.Dir(filepath.Dir(s.dir))
-	if _, err := os.Stat(filepath.Join(parent, "evil.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(parent, "evil.jsonl")); err == nil {
 		t.Fatalf("session id escaped the store directory into %s", parent)
 	}
 
@@ -243,12 +243,12 @@ func TestSavePathStaysInsideStoreDir(t *testing.T) {
 func TestListFiltersNonJSONAndTempFiles(t *testing.T) {
 	s := newTestStore(t)
 
-	real := Record{
+	realRec := Record{
 		ID: "real", Title: "real session", Model: "claude-opus-5",
 		UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		Messages:  []api.Message{{Role: "user", Content: "hello"}},
 	}
-	writeRawSession(t, s.dir, "real.json", recordJSON(t, real))
+	writeRawSession(t, s.dir, "real.json", recordJSON(t, realRec))
 
 	// A leftover in-progress atomic write: fsatomic names temp files
 	// ".cove-tmp-<target>.<random>", so this is the exact shape a crash between

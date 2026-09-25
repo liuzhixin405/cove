@@ -2,6 +2,7 @@ package dream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/memory"
@@ -27,24 +30,99 @@ type Runner struct {
 	model          string
 	currentSession string
 	memoryRoot     string
-	sessionsDir    string
+	// projectMemory is the memory directory of the project the run belongs
+	// to (config.ProjectDataDir(root)/memory), consolidated alongside
+	// memoryRoot; "" when there is none (guarded by mu).
+	projectMemory string
+	sessionsDir   string
+
+	// The last finished run, for Status (guarded by mu).
+	lastRunFiles int
+	lastRunErr   error
+	lastRunAt    time.Time
+	lastRunUsage Usage
+}
+
+// Usage is the token usage and cost of one consolidation run.
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+	CostUSD      float64
 }
 
 // NewRunner creates an auto-dream runner. Call ExecuteAutoDream after each turn.
 func NewRunner(provider api.Provider, model string, sessionID string) *Runner {
-	home, _ := os.UserHomeDir()
-	return &Runner{
+	home := homeDir()
+	r := &Runner{
 		provider:       provider,
 		model:          model,
 		currentSession: sessionID,
 		memoryRoot:     filepath.Join(home, ".cove", "memory"),
-		sessionsDir:    filepath.Join(home, ".cove", "sessions"),
+		sessionsDir:    sessionsDirIn(home),
 	}
+	// The engine starts in the project directory; SetProjectRoot changes it.
+	if cwd, err := os.Getwd(); err == nil {
+		r.SetProjectRoot(memory.ProjectRoot(cwd))
+	}
+	setCurrent(r)
+	return r
 }
+
+// SetProjectRoot makes the runner consolidate root's project memory
+// directory (config.ProjectDataDir(root)/memory) as well as the global one.
+// An empty root leaves only the global directory.
+func (r *Runner) SetProjectRoot(root string) {
+	dir := ""
+	if root != "" {
+		// The path only: the directory is created when the run writes to it.
+		if d, err := config.ProjectDataPath(root); err == nil {
+			dir = filepath.Join(d, "memory")
+		} else {
+			log.Debugf("[autoDream] project data dir for %s: %v", root, err)
+		}
+	}
+	r.mu.Lock()
+	r.projectMemory = dir
+	r.mu.Unlock()
+}
+
+// memoryRoots are the directories the run may write: the global memory
+// directory first, then the project's (when set and different).
+func (r *Runner) memoryRoots() []string {
+	r.mu.Lock()
+	proj := r.projectMemory
+	r.mu.Unlock()
+	roots := []string{r.memoryRoot}
+	if proj != "" && !strings.EqualFold(filepath.Clean(proj), filepath.Clean(r.memoryRoot)) {
+		roots = append(roots, proj)
+	}
+	return roots
+}
+
+// insideMemoryRoots reports whether absPath is inside one of memoryRoots.
+func (r *Runner) insideMemoryRoots(absPath string) bool {
+	for _, root := range r.memoryRoots() {
+		if isInsideMemoryDir(absPath, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func homeDir() string {
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+func sessionsDirIn(home string) string { return filepath.Join(home, ".cove", "sessions") }
 
 // ExecuteAutoDream checks all gates and runs the dream if conditions are met.
 // This should be called at the end of each turn (from session end hook).
 const dreamRunTimeout = 5 * time.Minute
+
+// MaxDreamIterations bounds the model calls of one consolidation (the dream
+// agent should finish well before it); the exit notice quotes it.
+const MaxDreamIterations = 30
 
 // deriveDreamContext returns the context for the background consolidation run.
 // It is DETACHED from the parent's cancellation — the turn that triggered the
@@ -55,11 +133,19 @@ func deriveDreamContext(parent context.Context) (context.Context, context.Cancel
 }
 
 func (r *Runner) ExecuteAutoDream(ctx context.Context) {
-	if !IsEnabled() {
+	cfg := LoadConfig()
+	if !cfg.Enabled {
 		return
 	}
-
-	cfg := LoadConfig()
+	if cfg.Trigger == TriggerSessionEnd {
+		// Consolidation runs when the conversation ends (a detached worker
+		// started from the exit path), not from the per-turn check.
+		return
+	}
+	if reason := autoSuppressed(); reason != "" {
+		log.Debugf("[autoDream] skip — automatic runs are off: %s", reason)
+		return
+	}
 
 	// --- Time gate ---
 	lastAt, err := ReadLastConsolidatedAt()
@@ -90,20 +176,12 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 	r.mu.Unlock()
 
 	// --- Session gate ---
-	sessionIDs, err := ListSessionsTouchedSince(lastAt, r.sessionsDir)
+	// The current session is excluded: it is still being written.
+	sessionIDs, err := r.sessionsSince(lastAt)
 	if err != nil {
 		log.Warnf("[autoDream] ListSessionsTouchedSince failed: %v", err)
 		return
 	}
-
-	// Exclude current session
-	filtered := make([]string, 0, len(sessionIDs))
-	for _, id := range sessionIDs {
-		if id != r.currentSession {
-			filtered = append(filtered, id)
-		}
-	}
-	sessionIDs = filtered
 
 	if len(sessionIDs) < cfg.MinSessions {
 		log.Debugf("[autoDream] skip — %d sessions since last consolidation, need %d",
@@ -123,31 +201,50 @@ func (r *Runner) ExecuteAutoDream(ctx context.Context) {
 
 	log.Debugf("[autoDream] firing — %.1fh since last, %d sessions to review",
 		hoursSince, len(sessionIDs))
+	r.start(ctx, priorMtime, sessionIDs)
+}
 
-	// Run the dream in a detached background goroutine. Its context must outlive
-	// the caller's (the triggering turn ends and cancels its context right away),
-	// so derive a detached, self-timed context here. cancel() runs when runDream
-	// returns to release the timer; task.CancelFunc still allows explicit early
-	// cancellation.
+// start runs the dream in a detached background goroutine; the caller holds
+// the lock. Its context must outlive the caller's (the triggering turn ends
+// and cancels its context right away), so derive a detached, self-timed
+// context here. cancel() runs when runDream returns to release the timer;
+// task.CancelFunc still allows explicit early cancellation.
+func (r *Runner) start(ctx context.Context, priorMtime time.Time, sessionIDs []string) {
 	dreamCtx, cancel := deriveDreamContext(ctx)
 	task := NewTask(len(sessionIDs), priorMtime, cancel)
 
 	go func() {
 		defer cancel()
-		r.runDream(dreamCtx, task, sessionIDs)
+		err := r.runDream(dreamCtx, task, sessionIDs)
+		task.mu.Lock()
+		files := len(task.FilesTouched)
+		usage := task.Usage
+		task.mu.Unlock()
+		r.mu.Lock()
+		r.lastRunFiles, r.lastRunErr, r.lastRunAt, r.lastRunUsage = files, err, time.Now(), usage
+		r.mu.Unlock()
 	}()
 }
 
 // runDream executes the memory consolidation agent loop.
-func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) {
+// It returns why the run failed, or nil when it completed.
+func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) (runErr error) {
 	defer func() {
-		if task.CurrentStatus() == StatusRunning {
-			task.Fail()
+		// Fail reports false when CancelActive already failed the task and
+		// rolled the lock back.
+		if task.Fail() {
 			_ = RollbackConsolidationLock(task.PriorMtime)
+			if runErr == nil {
+				runErr = errors.New("dream run did not finish")
+			}
 		}
 	}()
 
-	prompt := BuildConsolidationPrompt(r.memoryRoot, r.sessionsDir, sessionIDs)
+	roots := r.memoryRoots()
+	prompt := BuildConsolidationPrompt(roots[0], r.sessionsDir, sessionIDs, roots[1:]...)
+	// Priced like the billing tracker the metered provider reports to; kept
+	// per run so /dream can show what the last consolidation cost.
+	meter := cost.NewTracker(0)
 
 	messages := []api.Message{
 		{Role: "user", Content: prompt},
@@ -156,13 +253,11 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 	systemPrompt := r.buildDreamSystemPrompt()
 	toolDefs := r.buildDreamToolDefs()
 
-	// Run up to 30 iterations (the dream agent should finish well before this)
-	const maxDreamIterations = 30
-	for iter := 0; iter < maxDreamIterations; iter++ {
+	for iter := 0; iter < MaxDreamIterations; iter++ {
 		select {
 		case <-ctx.Done():
 			log.Debugf("[autoDream] cancelled")
-			return
+			return ctx.Err()
 		default:
 		}
 
@@ -177,10 +272,19 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		resp, err := r.provider.Chat(ctx, req)
 		if err != nil {
 			log.Warnf("[autoDream] API error: %v", err)
-			task.Fail()
-			_ = RollbackConsolidationLock(task.PriorMtime)
-			return
+			if task.Fail() {
+				_ = RollbackConsolidationLock(task.PriorMtime)
+			}
+			return err
 		}
+
+		model := resp.Model
+		if model == "" {
+			model = r.model
+		}
+		meter.AddWithCacheWrite(model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens, resp.PromptCacheWriteTokens)
+		tot := meter.Totals()
+		task.setUsage(Usage{InputTokens: tot.Input, OutputTokens: tot.Output, CostUSD: tot.Cost})
 
 		// Track assistant turn
 		var touchedPaths []string
@@ -198,7 +302,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		if len(resp.ToolCalls) == 0 {
 			task.Complete()
 			log.Debugf("[autoDream] completed — %d files touched", len(task.FilesTouched))
-			return
+			return nil
 		}
 
 		// Append assistant message
@@ -222,6 +326,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 	task.Complete()
 	log.Debugf("[autoDream] completed (max iterations) — %d files touched", len(task.FilesTouched))
+	return nil
 }
 
 // executeDreamTool runs a tool call with dream-mode restrictions.
@@ -320,8 +425,8 @@ func (r *Runner) executeDreamWrite(tc api.ToolCall) string {
 	if err != nil {
 		return fmt.Sprintf("Error: invalid path: %v", err)
 	}
-	if !isInsideMemoryDir(absPath, r.memoryRoot) {
-		return fmt.Sprintf("Error: dream mode can only write to memory directory (%s)", r.memoryRoot)
+	if !r.insideMemoryRoots(absPath) {
+		return fmt.Sprintf("Error: dream mode can only write to the memory directories (%s)", strings.Join(r.memoryRoots(), ", "))
 	}
 
 	if err := memory.ScreenContent(content); err != nil {
@@ -350,8 +455,8 @@ func (r *Runner) executeDreamEdit(tc api.ToolCall) string {
 	if err != nil {
 		return fmt.Sprintf("Error: invalid path: %v", err)
 	}
-	if !isInsideMemoryDir(absPath, r.memoryRoot) {
-		return fmt.Sprintf("Error: dream mode can only edit files in memory directory (%s)", r.memoryRoot)
+	if !r.insideMemoryRoots(absPath) {
+		return fmt.Sprintf("Error: dream mode can only edit files in the memory directories (%s)", strings.Join(r.memoryRoots(), ", "))
 	}
 
 	data, err := os.ReadFile(absPath)

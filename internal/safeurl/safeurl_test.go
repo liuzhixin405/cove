@@ -148,3 +148,45 @@ func TestClientRevalidatesRedirects(t *testing.T) {
 		t.Fatal("CheckRedirect did not stop an over-long redirect chain")
 	}
 }
+
+// Ranges that were missing: "this network", NAT64 (which embeds an IPv4
+// address, here 10.0.0.1), benchmarking, multicast, reserved, IPv6 multicast.
+func TestIsPrivateURLCoversSpecialPurposeRanges(t *testing.T) {
+	for _, u := range []string{
+		"http://0.0.0.0/",
+		"http://0.1.2.3/",
+		"http://[64:ff9b::a00:1]/",
+		"http://198.18.0.1/",
+		"http://198.19.255.254/",
+		"http://224.0.0.1/",
+		"http://239.255.255.250/",
+		"http://240.0.0.1/",
+		"http://255.255.255.255/",
+		"http://[ff02::1]/",
+	} {
+		if !IsPrivateURL(u) {
+			t.Errorf("IsPrivateURL(%q) = false, want true", u)
+		}
+	}
+	for _, u := range []string{"http://8.8.8.8/", "http://198.20.0.1/", "http://223.255.255.1/", "http://[2606:4700::1111]/"} {
+		if IsPrivateURL(u) {
+			t.Errorf("IsPrivateURL(%q) = true, want false", u)
+		}
+	}
+}
+
+// Fake-IP DNS (Clash/Surge TUN mode) answers every name with an address in
+// 198.18.0.0/15 and proxies the connection to the real host. Blocking those
+// resolved addresses would block every fetch on such a machine, so the range
+// is refused only when the URL names it literally.
+func TestFakeIPResolvedAddressIsNotBlocked(t *testing.T) {
+	old := lookupIP
+	lookupIP = func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.18.0.7")}, nil }
+	defer func() { lookupIP = old }()
+	if IsPrivateHost("example.com") {
+		t.Error("a hostname resolved by fake-IP DNS was treated as private")
+	}
+	if !IsPrivateHost("198.18.0.7") {
+		t.Error("a literal 198.18.0.0/15 address was allowed")
+	}
+}

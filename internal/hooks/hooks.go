@@ -12,6 +12,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/shell"
 )
 
 // HookEvent represents a lifecycle event that can trigger hooks.
@@ -38,6 +39,7 @@ type HookConfig struct {
 	Matcher    string                              // optional regex to filter by tool/model name (empty = all)
 	Type       HookType                            // runtime or command
 	Command    string                              // command path (for HookCommand)
+	Shell      bool                                // Command is a command line for the user's shell, not a path
 	RuntimeFn  func(HookInput) (HookOutput, error) // Go callback (for HookRuntime)
 	Timeout    time.Duration                       // max execution time (0 = no limit)
 	Sequential bool                                // true = must complete before continuing; false = fire-and-forget
@@ -57,7 +59,10 @@ type HookInput struct {
 	ToolName  string         `json:"tool_name,omitempty"`
 	ToolInput map[string]any `json:"tool_input,omitempty"`
 	Model     string         `json:"model,omitempty"`
-	Messages  []api.Message  `json:"-"`
+	// SessionID and Cwd identify the session for SessionStart/SessionEnd.
+	SessionID string        `json:"session_id,omitempty"`
+	Cwd       string        `json:"cwd,omitempty"`
+	Messages  []api.Message `json:"-"`
 }
 
 // HookOutput is returned by a hook. A hook can block execution or modify inputs.
@@ -155,6 +160,59 @@ func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, inpu
 	return output
 }
 
+// FireAndWait runs every hook matching event + target — async ones included —
+// concurrently and waits for all of them, but not past ctx's deadline. It is for events
+// fired as the process exits (SessionEnd): a fire-and-forget hook started
+// then would be killed with the process before it did anything. Each hook
+// still has its own Timeout (async ones defaultAsyncHookTimeout); nothing can
+// be vetoed at exit, so the outputs are only logged.
+func (m *Manager) FireAndWait(ctx context.Context, event HookEvent, target string, input HookInput) {
+	m.mu.RLock()
+	hooks := m.copyHooks(event)
+	m.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, h := range hooks {
+		if !m.matches(h, target) {
+			continue
+		}
+		timeout := h.Timeout
+		if timeout <= 0 && !h.Sequential {
+			timeout = defaultAsyncHookTimeout
+		}
+		wg.Add(1)
+		go func(h HookConfig, timeout time.Duration) {
+			defer wg.Done()
+			hookCtx, cancel := ctx, context.CancelFunc(func() {})
+			if timeout > 0 {
+				hookCtx, cancel = context.WithTimeout(ctx, timeout)
+			}
+			defer cancel()
+			if _, err := m.executeHook(hookCtx, h, input); err != nil {
+				log.Warnf("hook %s error: %v", event, err)
+			}
+		}(h, timeout)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Warnf("%s hooks still running at the deadline: %v", event, ctx.Err())
+	}
+}
+
+// Has reports whether any hook is registered for event.
+func (m *Manager) Has(event HookEvent) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.hooks[event]) > 0
+}
+
 // executeHook runs a single hook and returns its output.
 func (m *Manager) executeHook(ctx context.Context, h HookConfig, input HookInput) (HookOutput, error) {
 	switch h.Type {
@@ -164,21 +222,30 @@ func (m *Manager) executeHook(ctx context.Context, h HookConfig, input HookInput
 		}
 		return h.RuntimeFn(input)
 	case HookCommand:
+		if h.Shell {
+			sh := shell.Default()
+			return m.runProgram(ctx, input, sh.Path, sh.Args(h.Command)...)
+		}
 		return m.runCommand(ctx, h.Command, input)
 	default:
 		return HookOutput{Continue: true}, fmt.Errorf("unknown hook type: %v", h.Type)
 	}
 }
 
-// runCommand executes an external script, passing HookInput as JSON on stdin
-// and reading HookOutput as JSON from stdout.
+// runCommand executes an external program by path, with no arguments.
 func (m *Manager) runCommand(ctx context.Context, cmdPath string, input HookInput) (HookOutput, error) {
+	return m.runProgram(ctx, input, cmdPath)
+}
+
+// runProgram executes an external program, passing HookInput as JSON on stdin
+// and reading HookOutput as JSON from stdout.
+func (m *Manager) runProgram(ctx context.Context, input HookInput, cmdPath string, args ...string) (HookOutput, error) {
 	inJSON, err := json.Marshal(input)
 	if err != nil {
 		return HookOutput{Continue: true}, fmt.Errorf("hook marshal: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, cmdPath)
+	cmd := exec.CommandContext(ctx, cmdPath, args...)
 	// Output reads stdout to EOF, and a background process the hook started
 	// inherits that pipe, so without a bound the call waited for the
 	// background process too: a hook that launched a notifier stalled the

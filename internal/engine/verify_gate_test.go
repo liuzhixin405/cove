@@ -11,7 +11,7 @@ func TestVerifyGate_DisabledWhenNoCommands(t *testing.T) {
 	if g.Enabled() {
 		t.Fatalf("expected gate with no commands to be disabled")
 	}
-	results, passed := g.Run(context.Background())
+	results, passed := g.Run(context.Background(), nil)
 	if !passed || results != nil {
 		t.Fatalf("expected no-op Run() to pass trivially, got passed=%v results=%v", passed, results)
 	}
@@ -22,7 +22,7 @@ func TestVerifyGate_AllPass(t *testing.T) {
 	if !g.Enabled() {
 		t.Fatalf("expected gate with commands to be enabled")
 	}
-	results, passed := g.Run(context.Background())
+	results, passed := g.Run(context.Background(), nil)
 	if !passed {
 		t.Fatalf("expected all-passing commands to pass, results=%v", results)
 	}
@@ -33,7 +33,7 @@ func TestVerifyGate_AllPass(t *testing.T) {
 
 func TestVerifyGate_FailFastStopsAtFirstFailure(t *testing.T) {
 	g := NewVerifyGate([]string{"exit 1", "exit 0"}, "")
-	results, passed := g.Run(context.Background())
+	results, passed := g.Run(context.Background(), nil)
 	if passed {
 		t.Fatalf("expected failure to be reported")
 	}

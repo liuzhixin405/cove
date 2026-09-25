@@ -127,3 +127,20 @@ func TestGitStatusShowsCJKNamesVerbatim(t *testing.T) {
 		t.Fatalf("git status = %q, want the file name verbatim", got)
 	}
 }
+
+// TestRefreshGitAllRereadsBranchStatusAndLog: the per-turn refresh re-reads
+// all three git fields the turn note shows. RefreshGit only covered branch and
+// status, so "Recent commits" stayed as they were at startup.
+func TestRefreshGitAllRereadsBranchStatusAndLog(t *testing.T) {
+	installFakeGit(t, "env") // answers every git command with one line
+	root := t.TempDir()
+	c := &ProjectContext{Cwd: root, GitRoot: root, IsGitRepo: true, FileTree: "tree", RepoMap: "map"}
+	c.RefreshGitAll()
+	branch, status := c.GetGitInfo()
+	if branch == "" || status == "" || c.GitLog == "" {
+		t.Fatalf("after RefreshGitAll branch=%q status=%q log=%q; want all three re-read", branch, status, c.GitLog)
+	}
+	if c.FileTree != "tree" || c.RepoMap != "map" {
+		t.Fatal("RefreshGitAll touched the file tree or repo map")
+	}
+}

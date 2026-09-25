@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,21 +16,58 @@ import (
 func writeSyntheticRepo(t *testing.T, n, symsPerFile int) string {
 	t.Helper()
 	root := t.TempDir()
-	for i := 0; i < n; i++ {
+	for d := 0; d < 40 && d < n; d++ {
+		if err := os.MkdirAll(filepath.Join(root, fmt.Sprintf("d%02d", d)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths := make([]string, n)
+	for i := range paths {
+		paths[i] = filepath.Join(root, fmt.Sprintf("d%02d", i%40), fmt.Sprintf("f%04d.go", i))
+	}
+	// Creating and deleting hundreds of files one at a time took most of
+	// this test's time on Windows; both run on a few workers. The files are
+	// removed here, ahead of t.TempDir's own cleanup (cleanups run last-in
+	// first-out), which is then left with empty directories.
+	t.Cleanup(func() { forEachParallel(paths, func(_ int, p string) error { return os.Remove(p) }) })
+	if err := forEachParallel(paths, func(i int, p string) error {
 		var sb strings.Builder
 		sb.WriteString("package p\n")
 		for j := 0; j < symsPerFile; j++ {
 			fmt.Fprintf(&sb, "type T%d_%d struct{}\nfunc (t *T%d_%d) M%d(a T%d_%d, b int) {}\n", i, j, i, j, j, (i+1)%n, j)
 		}
-		dir := filepath.Join(root, fmt.Sprintf("d%02d", i%40))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%04d.go", i)), []byte(sb.String()), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		return os.WriteFile(p, []byte(sb.String()), 0o644)
+	}); err != nil {
+		t.Fatal(err)
 	}
 	return root
+}
+
+// forEachParallel runs fn over items on a few goroutines and returns the
+// first error.
+func forEachParallel(items []string, fn func(int, string) error) error {
+	const workers = 8
+	var wg sync.WaitGroup
+	var once sync.Once
+	var first error
+	next := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				if err := fn(i, items[i]); err != nil {
+					once.Do(func() { first = err })
+				}
+			}
+		}()
+	}
+	for i := range items {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+	return first
 }
 
 // TestBuildRankedScalesOnMidSizeRepo: the engine regenerates the map on the

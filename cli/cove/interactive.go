@@ -24,3 +24,10 @@ func useInteractiveShell() bool {
 	}
 	return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
 }
+
+// toolsInteractiveFor reports whether a run in this mode has someone to
+// answer the question tool: not -p, and the interactive shell rather than
+// the piped/headless frontend (the branch main takes after bootstrap).
+func toolsInteractiveFor(printMode bool) bool {
+	return !printMode && useInteractiveShell()
+}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // tempPrefix marks the in-progress files WriteFile creates.
@@ -69,9 +70,38 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("chmod temp for %s: %w", path, err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := renameWithRetry(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename temp onto %s: %w", path, err)
 	}
 	return nil
+}
+
+// renameBackoff is the wait before each retry of a failed rename.
+var renameBackoff = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
+
+// Seams for tests.
+var (
+	rename          = os.Rename
+	retryableRename = isRetryableRename
+	sleep           = time.Sleep
+)
+
+// renameWithRetry renames from onto to, retrying a transient failure.
+//
+// On Windows, replacing a file fails with a sharing violation or access
+// denied while another process (a second cove, an editor, an antivirus
+// scanner) has the destination open. That lasts milliseconds, and giving up
+// on it turned a routine write of a shared file such as the session index
+// into an error.
+func renameWithRetry(from, to string) error {
+	err := rename(from, to)
+	for _, d := range renameBackoff {
+		if err == nil || !retryableRename(err) {
+			return err
+		}
+		sleep(d)
+		err = rename(from, to)
+	}
+	return err
 }

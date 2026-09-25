@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -40,14 +42,29 @@ func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 		apiKey:  cfg.APIKey,
 		keyPool: pool,
 		baseURL: normalizeAnthropicBaseURL(cfg.BaseURL),
+		// A request that times out is not retried (see doChat): the model
+		// may have generated for the whole timeout.
 		client: &http.Client{
-			Timeout:   300 * time.Second,
+			Timeout:   anthropicChatTimeout,
 			Transport: transport,
 		},
 		streamClient: &http.Client{
 			Transport: transport,
 		},
 	}
+}
+
+// anthropicChatTimeout bounds one non-streaming request, like the streaming
+// path's watchdog allows a long generation to finish.
+const anthropicChatTimeout = 300 * time.Second
+
+// isClientTimeout reports whether err is a request timing out (http.Client's
+// Timeout, a deadline). Such a request may have had the model generate for
+// the whole timeout, so it is not retried; other transport failures (a
+// refused or reset connection) are.
+func isClientTimeout(err error) bool {
+	var ue *url.Error
+	return errors.As(err, &ue) && ue.Timeout()
 }
 
 func (p *anthropicProvider) activeKey() string {
@@ -255,18 +272,24 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 
 	httpResp, err := p.client.Do(httpReq)
 	if err != nil {
+		if isClientTimeout(err) {
+			// The request went out and the model generated for the whole
+			// timeout. Retrying repeats that wait up to MaxRetries more
+			// times for what is most likely the same outcome.
+			return nil, fmt.Errorf("http: %w", err)
+		}
 		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
 	// Update the key pool's health for this key (rate-limited / dead / ok) so
 	// multi-key rotation actually fails over.
-	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
+	p.keyPool.MarkOutcome(key, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	// 529 is Anthropic's "overloaded"; it falls under >= 500.
 	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: ParseRetryAfter(httpResp.Header)}
+		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: RetryAfterFor(httpResp.StatusCode, httpResp.Header)}
 	}
 	if httpResp.StatusCode != 200 {
 		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(raw), 500)}
@@ -278,16 +301,17 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	}
 
 	return &ChatResponse{
-		Content:               p.extractContent(ar.Content),
-		ToolCalls:             p.extractToolCalls(ar.Content),
-		ThinkingBlocks:        extractThinkingBlocks(ar.Content),
-		Model:                 ar.Model,
-		InputTokens:           ar.Usage.totalInputTokens(),
-		OutputTokens:          ar.Usage.OutputTokens,
-		PromptCacheHitTokens:  ar.Usage.cacheHitTokens(),
-		PromptCacheMissTokens: ar.Usage.cacheMissTokens(),
-		StopReason:            ar.StopReason,
-		RateLimitHeaders:      httpResp.Header,
+		Content:                p.extractContent(ar.Content),
+		ToolCalls:              p.extractToolCalls(ar.Content),
+		ThinkingBlocks:         extractThinkingBlocks(ar.Content),
+		Model:                  ar.Model,
+		InputTokens:            ar.Usage.totalInputTokens(),
+		OutputTokens:           ar.Usage.OutputTokens,
+		PromptCacheHitTokens:   ar.Usage.cacheHitTokens(),
+		PromptCacheMissTokens:  ar.Usage.cacheMissTokens(),
+		PromptCacheWriteTokens: ar.Usage.CacheCreationInputTokens,
+		StopReason:             ar.StopReason,
+		RateLimitHeaders:       httpResp.Header,
 	}, nil
 }
 
@@ -502,7 +526,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
-	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
+	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(body), 500)}
@@ -684,15 +708,16 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	}
 
 	return &ChatResponse{
-		Content:               streamAcc.Content(),
-		ToolCalls:             toolCalls,
-		ThinkingBlocks:        thinkingBlocks,
-		Model:                 req.Model,
-		InputTokens:           usage.totalInputTokens(),
-		OutputTokens:          usage.OutputTokens,
-		PromptCacheHitTokens:  usage.cacheHitTokens(),
-		PromptCacheMissTokens: usage.cacheMissTokens(),
-		StopReason:            stopReason,
-		RateLimitHeaders:      httpResp.Header,
+		Content:                streamAcc.Content(),
+		ToolCalls:              toolCalls,
+		ThinkingBlocks:         thinkingBlocks,
+		Model:                  req.Model,
+		InputTokens:            usage.totalInputTokens(),
+		OutputTokens:           usage.OutputTokens,
+		PromptCacheHitTokens:   usage.cacheHitTokens(),
+		PromptCacheMissTokens:  usage.cacheMissTokens(),
+		PromptCacheWriteTokens: usage.CacheCreationInputTokens,
+		StopReason:             stopReason,
+		RateLimitHeaders:       httpResp.Header,
 	}, nil
 }

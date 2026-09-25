@@ -44,8 +44,10 @@ func TestParseRetryAfter(t *testing.T) {
 	if d := ParseRetryAfter(h); d != 7*time.Second {
 		t.Fatalf("want 7s, got %v", d)
 	}
-	h.Set("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT")
+	// The HTTP-date form is honoured now (TestParseRetryAfterHTTPDate); a
+	// date in the past still means no wait.
+	h.Set("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT")
 	if d := ParseRetryAfter(h); d != 0 {
-		t.Fatalf("HTTP-date form want 0 (fallback), got %v", d)
+		t.Fatalf("past HTTP-date want 0 (fallback), got %v", d)
 	}
 }

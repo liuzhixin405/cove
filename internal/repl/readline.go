@@ -2,6 +2,7 @@ package repl
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -423,7 +424,7 @@ const rawInputBufferSize = 64 * 1024
 // same error line. Text typed before the end is still delivered; the next call
 // then reports ErrExit.
 func (lr *LineReader) endOfInput(buf []rune, err error) (string, error) {
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		return "", err
 	}
 	consoleMu.Lock()
@@ -833,14 +834,14 @@ func displayRunes(buf []rune) []rune {
 }
 
 func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {
-	const max = 8
+	const maxHints = 8
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	printHints := func() string {
 		var sb strings.Builder
 		sb.WriteString("\x1b[90m  ")
 		for i, s := range suggestions {
-			if i >= max {
+			if i >= maxHints {
 				break
 			}
 			text := s
@@ -849,8 +850,8 @@ func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {
 			}
 			sb.WriteString(text + "  ")
 		}
-		if len(suggestions) > max {
-			fmt.Fprintf(&sb, "...(+%d)", len(suggestions)-max)
+		if len(suggestions) > maxHints {
+			fmt.Fprintf(&sb, "...(+%d)", len(suggestions)-maxHints)
 		}
 		sb.WriteString("\x1b[0m")
 		return sb.String()

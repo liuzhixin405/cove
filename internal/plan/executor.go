@@ -9,7 +9,8 @@ import (
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
-// MaxParallelAgents is the maximum number of sub-agents that can run concurrently.
+// MaxParallelAgents is the default number of sub-agents that run concurrently
+// when the caller did not set max_agents (tool.WithMaxAgents).
 const MaxParallelAgents = 4
 
 // DefaultMaxRetries is how many times the supervisor re-dispatches a failed
@@ -112,7 +113,8 @@ func (pe *PlanExecutor) Execute(ctx context.Context, plan *Plan) *ExecutionResul
 		if plan.Parallel && len(level) > 1 {
 			// Execute level concurrently
 			var wg sync.WaitGroup
-			sem := make(chan struct{}, MaxParallelAgents)
+			// execute_plan's max_agents (1-8) travels in the context.
+			sem := make(chan struct{}, tool.MaxAgentsFrom(ctx, MaxParallelAgents))
 			results := make([]struct {
 				task    *Task
 				success bool
@@ -235,7 +237,7 @@ func (pe *PlanExecutor) runTask(ctx context.Context, task *Task, completed map[s
 		"Report your results concisely. Do not ask for confirmation — just do the task."
 
 	prompt := basePrompt
-	var lastErr string
+	var lastErr, lastOutput string
 	for attempt := 0; attempt <= pe.maxRetries; attempt++ {
 		if attempt > 0 {
 			// Supervisor re-dispatch: feed the prior failure back in.
@@ -246,10 +248,19 @@ func (pe *PlanExecutor) runTask(ctx context.Context, task *Task, completed map[s
 
 		result := pe.delegator.Delegate(ctx, task.ID, prompt, systemPrompt)
 
+		if result != nil {
+			task.ExitReason = result.ExitReason
+		}
 		if result == nil {
 			lastErr = "delegator returned nil result"
 		} else if result.Error != "" {
 			lastErr = result.Error
+			lastOutput = result.Output
+			if result.CapReached {
+				// Re-running the task from scratch would redo the same work
+				// and hit the same cap; keep what was done instead.
+				break
+			}
 		} else if !result.Success {
 			lastErr = "task did not complete successfully"
 		} else {
@@ -273,6 +284,9 @@ func (pe *PlanExecutor) runTask(ctx context.Context, task *Task, completed map[s
 	}
 	task.Status = "failed"
 	task.Error = lastErr
+	// A sub-agent stopped at its cap hands back what it did; losing it made
+	// the model redo the whole task.
+	task.Output = lastOutput
 	pe.syncRuntimeTask(task)
 	return false
 }

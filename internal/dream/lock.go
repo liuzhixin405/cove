@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove/internal/session"
 )
 
 const lockFileName = ".consolidate-lock"
@@ -120,7 +121,9 @@ func RecordConsolidation() error {
 
 // ListSessionsTouchedSince returns session IDs with mtime after the given time.
 func ListSessionsTouchedSince(since time.Time, sessionsDir string) ([]string, error) {
-	entries, err := os.ReadDir(sessionsDir)
+	// session.ListSessionFiles knows the directory layout: <id>.jsonl and
+	// legacy <id>.json are sessions, index.json is not.
+	names, err := session.ListSessionFiles(sessionsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -128,16 +131,13 @@ func ListSessionsTouchedSince(since time.Time, sessionsDir string) ([]string, er
 		return nil, err
 	}
 	var ids []string
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
-		info, err := e.Info()
+	for _, name := range names {
+		info, err := os.Stat(filepath.Join(sessionsDir, name))
 		if err != nil {
 			continue
 		}
 		if info.ModTime().After(since) {
-			ids = append(ids, strings.TrimSuffix(e.Name(), ".json"))
+			ids = append(ids, session.SessionIDFromFile(name))
 		}
 	}
 	return ids, nil

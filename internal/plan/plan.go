@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/liuzhixin405/cove/internal/delegate"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -30,6 +31,9 @@ type Task struct {
 	MaxIter     int      // max iterations for sub-agent, 0 = default (20)
 	Output      string
 	Error       string
+	// ExitReason is the last sub-agent run's delegate.Exit* reason; empty
+	// when no sub-agent ran (skipped, cancelled before start).
+	ExitReason string
 }
 
 // Plan holds a set of tasks with dependency ordering.
@@ -229,6 +233,9 @@ func detectCycle(tasks []*Task, taskByID map[string]*Task) []string {
 	return nil
 }
 
+// partialOutputRunes bounds the partial result FormatResult shows per task.
+const partialOutputRunes = 1500
+
 // FormatResult formats an execution result as a human-readable summary.
 func FormatResult(result *ExecutionResult) string {
 	var sb strings.Builder
@@ -242,11 +249,70 @@ func FormatResult(result *ExecutionResult) string {
 			icon = "○"
 		}
 		fmt.Fprintf(&sb, "  %s [%s] %s — %s", icon, t.ID, t.Title, t.Status)
+		if t.ExitReason != "" && t.ExitReason != delegate.ExitCompleted {
+			fmt.Fprintf(&sb, " [exit: %s]", t.ExitReason)
+		}
 		if t.Error != "" {
 			fmt.Fprintf(&sb, " (%s)", t.Error)
 		}
 		sb.WriteString("\n")
+		if t.Status == "failed" && strings.TrimSpace(t.Output) != "" {
+			// The partial result of a sub-agent stopped at its cap.
+			out := []rune(strings.TrimSpace(t.Output))
+			if len(out) > partialOutputRunes {
+				out = append(out[:partialOutputRunes], []rune("…")...)
+			}
+			sb.WriteString("    部分结果:\n    " + strings.ReplaceAll(string(out), "\n", "\n    ") + "\n")
+		}
 	}
+	sb.WriteString("\n" + summaryLine(result.Tasks))
 	fmt.Fprintf(&sb, "\nTotal: %d tasks | Success: %v", len(result.Tasks), result.Success)
 	return sb.String()
+}
+
+// outcomeOrder lists summaryLine's buckets in display order.
+var outcomeOrder = []struct{ key, label string }{
+	{"done", "个任务完成"},
+	{"cap", "个到达上限（含部分结果）"},
+	{"loop", "个陷入循环"},
+	{"interrupted", "个已中断"},
+	{"failed", "个失败"},
+	{"skipped", "个跳过"},
+}
+
+// taskOutcome classifies a finished task for the summary line.
+func taskOutcome(t *Task) string {
+	switch {
+	case t.Status == "done":
+		return "done"
+	case t.Status == "skipped":
+		return "skipped"
+	case t.Status == "cancelled" || t.ExitReason == delegate.ExitInterrupted:
+		return "interrupted"
+	case t.ExitReason == delegate.ExitMaxIterations:
+		return "cap"
+	case t.ExitReason == delegate.ExitLoop:
+		return "loop"
+	default:
+		return "failed"
+	}
+}
+
+// summaryLine counts tasks by outcome, e.g.
+// "汇总：3 个任务完成，1 个到达上限（含部分结果），1 个失败".
+func summaryLine(tasks []*Task) string {
+	counts := map[string]int{}
+	for _, t := range tasks {
+		counts[taskOutcome(t)]++
+	}
+	var parts []string
+	for _, o := range outcomeOrder {
+		if n := counts[o.key]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, o.label))
+		}
+	}
+	if len(parts) == 0 {
+		return "汇总：无任务"
+	}
+	return "汇总：" + strings.Join(parts, "，")
 }

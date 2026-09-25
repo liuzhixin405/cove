@@ -28,6 +28,11 @@ func Modes() string {
 
 type Decision string
 
+// ReasonAskRule is the reason Check gives when an ask rule matched, so the
+// engine can tell "an ask rule wants a prompt" (which nothing but a deny may
+// override) from "the mode default is to ask".
+const ReasonAskRule = "approval required by policy rule"
+
 const (
 	DAllow  Decision = "allow"
 	DDeny   Decision = "deny"
@@ -57,6 +62,9 @@ type Manager struct {
 	deny            []Rule
 	ask             []Rule
 	bypassAvailable bool
+	// shellKind is the quoting family the bash tool's commands run under;
+	// the zero value is the strict cmd behaviour.
+	shellKind ShellKind
 }
 
 func NewManager(mode Mode) *Manager {
@@ -73,6 +81,22 @@ func (m *Manager) Mode() Mode {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.mode
+}
+
+// SetShellKind records which shell the bash tool runs commands with, which
+// decides how quoted operator characters are treated by prefix rules.
+func (m *Manager) SetShellKind(k ShellKind) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.shellKind = k
+}
+
+// ShellKindFor is the quoting family toolName's command runs under: always
+// PowerShell for the powershell tool, the configured shell for bash.
+func (m *Manager) ShellKindFor(toolName string) ShellKind {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return shellKindFor(toolName, m.shellKind)
 }
 
 func (m *Manager) SetBypassAvailable(v bool) {
@@ -95,6 +119,52 @@ func (m *Manager) AddRule(decision Decision, rule Rule) {
 	}
 }
 
+// RemoveRules takes rules previously added with decision out again, one
+// instance per given rule; rules not present are ignored. The engine uses it
+// to drop the rules it loaded from policies.json when /cd moves it to another
+// project, leaving rules added during the session in place.
+func (m *Manager) RemoveRules(decision Decision, rules []Rule) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var list *[]Rule
+	switch decision {
+	case DAllow:
+		list = &m.allow
+	case DDeny:
+		list = &m.deny
+	case DAsk:
+		list = &m.ask
+	default:
+		return
+	}
+	for _, r := range rules {
+		// Search from the end so the most recently added copy goes first.
+		for i := len(*list) - 1; i >= 0; i-- {
+			if sameRule((*list)[i], r) {
+				*list = append((*list)[:i:i], (*list)[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// SameRule reports whether a and b match the same calls; Decision is ignored.
+func SameRule(a, b Rule) bool { return sameRule(a, b) }
+
+// sameRule reports whether a and b match the same calls; Decision is ignored.
+func sameRule(a, b Rule) bool {
+	if a.ToolPattern != b.ToolPattern || a.ArgPattern != b.ArgPattern ||
+		a.CommandPrefix != b.CommandPrefix || len(a.InputEquals) != len(b.InputEquals) {
+		return false
+	}
+	for k, v := range a.InputEquals {
+		if bv, ok := b.InputEquals[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecision Decision) (Decision, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -111,6 +181,14 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	if m.mode == Bypass && m.bypassAvailable {
 		return DBypass, "bypass mode"
 	}
+	// Ask rules come before allow rules: "always ask for git push" must not
+	// be silenced by an earlier "[a]"/"[p]" answer or a whole-tool allow.
+	// Bypass mode (above) skips them; only deny rules and plan mode stop it.
+	for _, r := range m.ask {
+		if matchRule(r, toolName, toolInput) {
+			return DAsk, ReasonAskRule
+		}
+	}
 	var prefixes [][]string
 	for _, r := range m.allow {
 		if r.CommandPrefix != "" {
@@ -125,13 +203,8 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 			return DAllow, "allowed by policy rule"
 		}
 	}
-	if len(prefixes) > 0 && commandCovered(inputCommand(toolInput), prefixes) {
+	if len(prefixes) > 0 && commandCovered(inputCommand(toolInput), prefixes, shellKindFor(toolName, m.shellKind)) {
 		return DAllow, "allowed by command prefix rule"
-	}
-	for _, r := range m.ask {
-		if matchRule(r, toolName, toolInput) {
-			return DAsk, "approval required by policy rule"
-		}
 	}
 	switch m.mode {
 	case Auto:
@@ -160,7 +233,7 @@ func matchRule(r Rule, toolName string, input map[string]any) bool {
 	// Allow rules with a prefix never reach here (Check pools them); for deny
 	// and ask a prefix rule applies when any command in the line matches it.
 	if r.CommandPrefix != "" {
-		return anyCommandHasPrefix(inputCommand(input), strings.Fields(r.CommandPrefix))
+		return anyCommandHasPrefixNormalized(inputCommand(input), strings.Fields(r.CommandPrefix))
 	}
 	for field, want := range r.InputEquals {
 		if got, ok := input[field].(string); !ok || got != want {

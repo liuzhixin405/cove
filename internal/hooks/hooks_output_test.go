@@ -43,7 +43,7 @@ func TestFireReturnsWhenHookLeavesBackgroundProcess(t *testing.T) {
 		Sequential: true,
 	})
 
-	done := fireAsync(t, m, context.Background(), BeforeTool, "bash", HookInput{Event: BeforeTool})
+	done := fireAsync(t, context.Background(), m, BeforeTool, "bash", HookInput{Event: BeforeTool})
 
 	// The grandchild really is running and holding the pipe; closing this
 	// connection at cleanup is what lets it exit.

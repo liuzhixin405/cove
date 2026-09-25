@@ -3,6 +3,7 @@ package engine
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // complexTaskFilePattern is a light, best-effort heuristic for "the user
@@ -17,7 +18,8 @@ var complexTaskKeywords = []string{
 }
 
 // complexTaskLengthThreshold: messages at least this long are, empirically,
-// far more likely to describe a multi-step task than a one-off request.
+// far more likely to describe a multi-step task than a one-off request. It
+// counts characters: counted in bytes, 100 Chinese characters already passed.
 const complexTaskLengthThreshold = 300
 
 // suggestsComplexTask is a cheap heuristic for "this message probably
@@ -26,7 +28,7 @@ const complexTaskLengthThreshold = 300
 // means the model sees an extra, ignorable suggestion) since the guidance
 // this drives is a suggestion, never a gate.
 func suggestsComplexTask(userMessage string) bool {
-	if len(userMessage) >= complexTaskLengthThreshold {
+	if utf8.RuneCountInString(userMessage) >= complexTaskLengthThreshold {
 		return true
 	}
 	if len(complexTaskFilePattern.FindAllString(userMessage, -1)) >= 3 {

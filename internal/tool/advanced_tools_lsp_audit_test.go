@@ -14,9 +14,8 @@ func writeGoModule(t *testing.T, files map[string]string) string {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go toolchain not on PATH")
 	}
-	t.Setenv("GOWORK", "off")
-	t.Setenv("GOTOOLCHAIN", "local")
-	t.Setenv("GOFLAGS", "-mod=mod")
+	// GOWORK, GOTOOLCHAIN and GOFLAGS are set for the package by TestMain,
+	// so these tests can run in parallel (t.Setenv forbids that).
 	dir := t.TempDir()
 	files["go.mod"] = "module example.com/diag\n\ngo 1.21\n"
 	for name, body := range files {
@@ -31,6 +30,7 @@ func writeGoModule(t *testing.T, files map[string]string) string {
 // sub-agents), yet with no LSP backend its "diagnostics" ran `go test ./...`,
 // which executes the project's test code — anything at all — unprompted.
 func TestLSPDiagnosticsDoesNotExecuteProjectCode(t *testing.T) {
+	t.Parallel() // runs the go toolchain: seconds, spent alongside other slow tests
 	marker := filepath.Join(t.TempDir(), "RAN")
 	dir := writeGoModule(t, map[string]string{
 		"lib.go": "package diag\n\nfunc Add(a, b int) int { return a + b }\n",
@@ -49,6 +49,7 @@ func TestLSPDiagnosticsDoesNotExecuteProjectCode(t *testing.T) {
 }
 
 func TestLSPDiagnosticsReportsCompileErrors(t *testing.T) {
+	t.Parallel()
 	dir := writeGoModule(t, map[string]string{
 		"lib.go": "package diag\n\nfunc Add(a, b int) int { return undefinedName }\n",
 	})

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 )
@@ -161,10 +162,36 @@ func (c *CdCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		*in.ProjectContext = *ctxt.Collect()
 	}
 	if s, ok := in.Engine.(workingDirSetter); ok && s.SetWorkingDir(wd) {
-		return Output{Message: fmt.Sprintf("已切换到: %s", wd)}, nil
+		return Output{Message: fmt.Sprintf("已切换到: %s", wd) + policyLoadWarning(in.Engine)}, nil
 	}
 	return Output{Message: fmt.Sprintf("已切换到: %s\n注意: 检查点 (/undo)、会话所属项目和自动验证仍按启动目录处理；要完整切换项目请在新目录重新启动 cove。", wd)}, nil
 }
+
+// policyLoadErrorer reports why the engine's last load of policies.json
+// failed (nil when it loaded or does not exist); /cd reloads that file.
+type policyLoadErrorer interface {
+	PolicyLoadError() error
+}
+
+// policyLoadWarning is the line /cd adds when the engine could not reload
+// policies.json for the new directory: the rules of the previous load stay in
+// effect and the new project's are not applied, so say so instead of letting
+// its deny rules silently not apply.
+func policyLoadWarning(eng any) string {
+	p, ok := eng.(policyLoadErrorer)
+	if !ok {
+		return ""
+	}
+	err := p.PolicyLoadError()
+	if err == nil {
+		return ""
+	}
+	return "\n警告: 权限规则文件无法加载，新项目的规则未生效，仍沿用切换前已加载的规则（修复文件后再次 /cd 即可重新加载）: " + err.Error()
+}
+
+// contextStructureTimeout bounds how long /context waits for the file tree
+// and repo map it builds on first use.
+const contextStructureTimeout = 5 * time.Second
 
 func (c *ContextCmd) Name() string        { return "context" }
 func (c *ContextCmd) Aliases() []string   { return nil }
@@ -188,17 +215,23 @@ func (c *ContextCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		branch, status := pc.GetGitInfo()
 		fmt.Fprintf(&sb, "Git: %s (%s)\n", branch, status)
 	}
-	if pc.FileTree != "" {
+	// Startup no longer builds the file tree and repo map; they are built
+	// here on first use, waiting at most contextStructureTimeout.
+	tree, repoMap, ok := pc.Structure(contextStructureTimeout)
+	if !ok {
+		sb.WriteString("\n项目结构与代码大纲仍在生成（超过 5 秒），稍后再运行 /context 查看。\n")
+	}
+	if tree != "" {
 		sb.WriteString("\n项目结构:\n")
-		sb.WriteString(pc.FileTree)
-		if !strings.HasSuffix(pc.FileTree, "\n") {
+		sb.WriteString(tree)
+		if !strings.HasSuffix(tree, "\n") {
 			sb.WriteString("\n")
 		}
 	}
-	if pc.RepoMap != "" {
+	if repoMap != "" {
 		sb.WriteString("\n代码大纲地图 (Repo Map):\n")
-		sb.WriteString(pc.RepoMap)
-		if !strings.HasSuffix(pc.RepoMap, "\n") {
+		sb.WriteString(repoMap)
+		if !strings.HasSuffix(repoMap, "\n") {
 			sb.WriteString("\n")
 		}
 	}

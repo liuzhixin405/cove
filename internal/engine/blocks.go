@@ -2,11 +2,14 @@ package engine
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/textmode"
@@ -46,11 +49,38 @@ func nextBlockID() string {
 	return strconv.FormatUint(blockIDSeq.Add(1), 10)
 }
 
-// legacyBlockWidth is the width used when rendering a block back down to a line
-// for the deprecated OnEngineOutput callback. It is generous because those
-// front ends re-wrap or clip the text themselves; the ID is stripped first so
-// no expand hint is right-aligned against a width that is not the real one.
+// legacyBlockWidth is the fallback width for rendering a block back down to a
+// line for the deprecated OnEngineOutput callback, used when the terminal's
+// width is unknown (output piped, no console) or implausibly narrow. The ID is
+// stripped first so no expand hint is right-aligned against a width that is
+// not the real one.
 const legacyBlockWidth = 120
+
+// minTerminalBlockWidth is the narrowest terminal width taken at face value.
+const minTerminalBlockWidth = 40
+
+// terminalWidth reports the width of the terminal on stdout, or 0 when it
+// cannot be determined. Replaced in tests.
+var terminalWidth = func() int {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 0
+	}
+	return w
+}
+
+// blockRenderWidth is the width a block is laid out for: the live terminal
+// width, read on every render so a resized window is followed, or
+// legacyBlockWidth when there is no usable one. It used to be a fixed 120,
+// which wrapped every header on an 80-column terminal.
+func blockRenderWidth() int {
+	if w := terminalWidth(); w >= minTerminalBlockWidth {
+		// One column short: writing the last column makes the Windows
+		// console wrap the line by itself, leaving a blank line after it.
+		return w - 1
+	}
+	return legacyBlockWidth
+}
 
 // blockStyles is how a block is coloured on its way to the terminal.
 //
@@ -97,7 +127,7 @@ func (e *Engine) emitBlock(b render.Block) {
 		return
 	}
 	if e.OnEngineOutput != nil {
-		e.OnEngineOutput(render.Collapsed(withoutID(b), legacyBlockWidth, currentBlockStyles()) + "\n")
+		e.OnEngineOutput(render.Collapsed(withoutID(b), blockRenderWidth(), currentBlockStyles()) + "\n")
 	}
 }
 

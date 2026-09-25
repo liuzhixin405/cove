@@ -16,14 +16,50 @@ const (
 )
 
 // PolicyRule defines a single permission rule with optional parameter matching.
+//
+// Rules persisted by the "[p] 永久允许" prompt answer use CommandPrefix (shell
+// tools), InputEquals (the MCP proxy) or neither (a whole tool), and Scope:
+// the absolute project root they were granted in. The engine ignores a rule
+// whose non-empty Scope is a different project.
 type PolicyRule struct {
 	ID          string            `json:"id"`
 	Description string            `json:"description"`
 	ToolPattern string            `json:"tool_pattern"` // glob pattern: "bash", "write:*", "*"
 	Action      PolicyAction      `json:"action"`
-	Priority    int               `json:"priority"`    // higher = evaluated first
+	Priority    int               `json:"priority"` // higher = evaluated first
 	Enabled     bool              `json:"enabled"`
 	ParamMatch  map[string]string `json:"param_match,omitempty"` // param key -> glob value
+	// CommandPrefix scopes a shell-tool rule to commands starting with these
+	// words, with the same semantics as Rule.CommandPrefix.
+	CommandPrefix string `json:"command_prefix,omitempty"`
+	// InputEquals requires each input field to equal this string exactly.
+	InputEquals map[string]string `json:"input_equals,omitempty"`
+	// Scope is the project root the rule applies to; empty means everywhere.
+	Scope string `json:"scope,omitempty"`
+}
+
+// ToRule converts the rule to the session Manager's form, so persisted allow
+// rules are enforced by the same matcher (prefix pooling, plan mode) as
+// session ones. A rule with a CommandPrefix and no tool defaults to bash. It
+// reports false for rules the Manager cannot express: glob tool patterns
+// other than "*", ParamMatch, or no tool at all. The Decision is left for
+// Manager.AddRule to set.
+func (r PolicyRule) ToRule() (Rule, bool) {
+	tool := r.ToolPattern
+	if tool == "" && r.CommandPrefix != "" {
+		tool = "bash"
+	}
+	if tool == "" || len(r.ParamMatch) > 0 || (tool != "*" && strings.Contains(tool, "*")) {
+		return Rule{}, false
+	}
+	out := Rule{ToolPattern: tool, CommandPrefix: r.CommandPrefix}
+	if len(r.InputEquals) > 0 {
+		out.InputEquals = make(map[string]string, len(r.InputEquals))
+		for k, v := range r.InputEquals {
+			out.InputEquals[k] = v
+		}
+	}
+	return out, true
 }
 
 // Match checks if this rule matches a tool call.
@@ -33,6 +69,24 @@ func (r *PolicyRule) Match(toolName string, params map[string]any) bool {
 	}
 	if !matchGlob(r.ToolPattern, toolName) {
 		return false
+	}
+	for k, want := range r.InputEquals {
+		if got, ok := params[k].(string); !ok || got != want {
+			return false
+		}
+	}
+	if r.CommandPrefix != "" {
+		prefix := strings.Fields(r.CommandPrefix)
+		command, _ := params["command"].(string)
+		if r.Action == ActionAllow {
+			// An allow prefix must cover every command of the line, like a
+			// session prefix rule; strict quoting (the zero ShellKind).
+			if !commandCovered(command, [][]string{prefix}, "") {
+				return false
+			}
+		} else if !anyCommandHasPrefixNormalized(command, prefix) {
+			return false
+		}
 	}
 	for k, v := range r.ParamMatch {
 		actual, ok := params[k]
@@ -87,23 +141,41 @@ func (pe *PolicyEngine) persistLocked() {
 	_ = pe.storage.Save(snapshot) // best-effort; rules still apply in-memory if save fails
 }
 
-// Evaluate checks all rules and returns the first matching action.
+// Evaluate returns the action of the highest-priority matching rule. Among
+// matching rules of that priority deny beats ask and ask beats allow, so the
+// result does not depend on the order the rules were written in.
 // Returns ActionAsk if no rule matches.
 func (pe *PolicyEngine) Evaluate(toolName string, params map[string]any, mode string) PolicyAction {
 	pe.mu.RLock()
 	defer pe.mu.RUnlock()
 
-	// Sort by priority (higher first) — rules are kept sorted on insert
+	// Rules are kept sorted by priority (higher first).
+	matched := false
+	var action PolicyAction
+	priority := 0
 	for _, rule := range pe.rules {
-		if rule.Match(toolName, params) {
-			return rule.Action
+		if matched && rule.Priority < priority {
+			break
+		}
+		if !rule.Match(toolName, params) {
+			continue
+		}
+		switch {
+		case rule.Action == ActionDeny:
+			return ActionDeny
+		case !matched:
+			matched, action, priority = true, rule.Action, rule.Priority
+		case rule.Action == ActionAsk:
+			action = ActionAsk
 		}
 	}
-
-	// Default: ask for confirmation in default mode, allow in auto mode
-	if mode == "auto" {
-		return ActionAllow
+	if matched {
+		return action
 	}
+
+	// No rule matched: ask, in every mode. What auto mode runs unasked is
+	// decided by the engine's mode tiers (read-only and build commands,
+	// in-project writes), not by a blanket default here.
 	return ActionAsk
 }
 

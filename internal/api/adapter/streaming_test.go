@@ -25,7 +25,7 @@ func TestStreamAccumulatorAggregatesContentReasoningAndToolCalls(t *testing.T) {
 	}
 }
 
-func TestCloneToolCallsAndParseErrorHelpers(t *testing.T) {
+func TestCloneToolCallsCopies(t *testing.T) {
 	orig := []ToolCall{
 		{ID: "1", Name: "ok"},
 		{ID: "2", Name: "bad", ParseError: true},
@@ -37,14 +37,7 @@ func TestCloneToolCallsAndParseErrorHelpers(t *testing.T) {
 	if &cp[0] == &orig[0] {
 		t.Fatal("clone should allocate a new slice")
 	}
-	if !HasParseError(cp) {
-		t.Fatal("expected parse error detection")
-	}
-}
-
-func TestMergeReasoningSkipsEmptyParts(t *testing.T) {
-	got := MergeReasoning("", " first ", "", "second")
-	if got != "first\nsecond" {
-		t.Fatalf("MergeReasoning = %q, want first\\nsecond", got)
+	if !cp[1].ParseError {
+		t.Fatal("clone dropped the ParseError flag")
 	}
 }

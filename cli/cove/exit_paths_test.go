@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
+	"github.com/liuzhixin405/cove/internal/session"
 )
 
 // Only the TUI's /exit and Ctrl+D paths recorded the session's cost, so after
@@ -29,8 +30,8 @@ func TestFinishSessionRecordsCostQuietly(t *testing.T) {
 		t.Fatalf("cost history = %+v, want one record for %s", h.Records, eng.SessionID())
 	}
 	home, _ := os.UserHomeDir()
-	sessions, _ := filepath.Glob(filepath.Join(home, ".cove", "sessions", "*.json"))
-	if len(sessions) != 1 {
+	sessions, _ := session.ListSessionFiles(filepath.Join(home, ".cove", "sessions"))
+	if len(sessions) != 1 || sessions[0] != eng.SessionID()+".jsonl" {
 		t.Fatalf("session files = %v, want the one saved session", sessions)
 	}
 }

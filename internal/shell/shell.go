@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -37,7 +38,10 @@ func (s Shell) Args(command string) []string {
 		// the console code page (GBK on a Chinese system).
 		return []string{"-NoProfile", "-NonInteractive", "-Command", psUTF8 + command}
 	case Cmd:
-		return []string{"/C", command}
+		// cmd's built-ins write in the console code page (GBK on a Chinese
+		// system) unless it is switched to UTF-8 first. cove already runs its
+		// own console in 65001, so the shared console is not changed.
+		return []string{"/C", cmdUTF8 + command}
 	default:
 		return []string{"-c", command}
 	}
@@ -54,20 +58,64 @@ func (s Shell) Describe() string {
 }
 
 // Env returns base with the variables that keep a command from waiting on
-// input nobody can type: no commit-message editor, no terminal credential
-// prompt, no pager. A later entry wins, so these override the user's own.
+// input nobody can type — no commit-message editor, no terminal credential
+// prompt, no pager — and from colouring its output: the escapes reach the
+// model as noise and cost tokens. A later entry wins, so these override the
+// user's own.
+//
+// It also turns off core.fsmonitor for git through GIT_CONFIG_COUNT: a
+// repository's .git/config can name an fsmonitor program that git status
+// runs, and git status runs unasked as a read-only command. A
+// GIT_CONFIG_COUNT already in base is extended, so config the user passes
+// that way still applies.
 func Env(base []string) []string {
+	n := gitConfigCount(base)
+	idx := strconv.Itoa(n)
 	return append(append([]string(nil), base...),
 		"GIT_EDITOR=true",
 		"GIT_SEQUENCE_EDITOR=true",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_PAGER=cat",
 		"PAGER=cat",
+		"NO_COLOR=1",
+		"TERM=dumb",
+		"CLICOLOR=0",
+		"FORCE_COLOR=0",
+		"GIT_CONFIG_COUNT="+strconv.Itoa(n+1),
+		"GIT_CONFIG_KEY_"+idx+"=core.fsmonitor",
+		"GIT_CONFIG_VALUE_"+idx+"=false",
 	)
+}
+
+// gitConfigCount is the GIT_CONFIG_COUNT base sets (the last entry wins,
+// names compared case-insensitively on Windows), or 0 when it is unset or
+// not a count git would accept — git refuses to run with a bogus count, so
+// replacing it loses nothing.
+func gitConfigCount(base []string) int {
+	n := 0
+	for _, kv := range base {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		isCount := k == "GIT_CONFIG_COUNT" || runtime.GOOS == "windows" && strings.EqualFold(k, "GIT_CONFIG_COUNT")
+		if !isCount {
+			continue
+		}
+		c, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || c < 0 || c > 1<<20 {
+			c = 0
+		}
+		n = c
+	}
+	return n
 }
 
 // psUTF8 switches PowerShell's output to UTF-8 without a byte-order mark.
 const psUTF8 = "$OutputEncoding=[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding $false; "
+
+// cmdUTF8 switches cmd's code page to UTF-8 before the command runs.
+const cmdUTF8 = "chcp 65001>nul & "
 
 var (
 	once     sync.Once

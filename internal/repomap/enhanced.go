@@ -34,13 +34,13 @@ func (dr *DiffResult) Summary() string {
 	return strings.Join(parts, "; ")
 }
 
-func truncateList(items []string, max int) []string {
-	if len(items) <= max {
+func truncateList(items []string, maxLen int) []string {
+	if len(items) <= maxLen {
 		return items
 	}
-	result := make([]string, max+1)
-	copy(result, items[:max])
-	result[max] = "..."
+	result := make([]string, maxLen+1)
+	copy(result, items[:maxLen])
+	result[maxLen] = "..."
 	return result
 }
 
@@ -77,6 +77,14 @@ func NewEnhancedGenerator(root string) *EnhancedGenerator {
 		fileMTimes: make(map[string]time.Time),
 		gen:        NewGenerator(root),
 	}
+}
+
+// Root is the directory the generator maps.
+func (eg *EnhancedGenerator) Root() string {
+	if eg == nil {
+		return ""
+	}
+	return eg.root
 }
 
 // GenerateIncremental produces a repo map, using incremental updates when possible.

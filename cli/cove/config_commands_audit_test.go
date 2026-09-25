@@ -63,7 +63,7 @@ func TestProviderCommandMovesDefaultModelAndSavesIt(t *testing.T) {
 // config.Save refuses to overwrite a config.json it cannot parse; /mode and
 // /budget discarded that error and reported success.
 func TestConfigCommandsReportSaveFailure(t *testing.T) {
-	for _, in := range []string{"/mode auto", "/budget 3"} {
+	for _, in := range []string{"/mode auto", "/budget save"} {
 		eng := newTestEngine(t)
 		dir := os.Getenv("COVE_CONFIG_DIR")
 		if err := os.MkdirAll(dir, 0o700); err != nil {

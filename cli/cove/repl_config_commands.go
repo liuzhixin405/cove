@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,32 +105,47 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 	}
 }
 
+// handleBudgetCommand changes the spend cap of this session only; the
+// configured max_budget_usd changes with "/budget save". Every /budget used
+// to rewrite the global config.json, so raising the cap for one expensive
+// task raised it for every later session.
 func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, as *state.AppState) {
 	arg := strings.TrimSpace(strings.TrimPrefix(input, "/budget"))
-	if arg == "" {
+	current := sessionBudget(cfg, eng)
+	switch {
+	case arg == "":
 		// Bare "/budget" used to fall through to "未找到命令 /budget".
-		if cfg.MaxBudgetUsd > 0 {
-			outf("当前预算: $%.2f\n", cfg.MaxBudgetUsd)
+		if current > 0 {
+			outf("当前预算: $%.2f（本会话）\n", current)
 		} else {
 			outln("当前未设置预算上限")
 		}
+		if cfg.MaxBudgetUsd != current {
+			outf("配置中的预算: %s\n", budgetLabel(cfg.MaxBudgetUsd))
+		}
 		outln(budgetUsage)
 		return
-	}
-	if strings.EqualFold(arg, "auto") {
-		b := cfg.MaxBudgetUsd
-		if tr := eng.CostTracker(); tr != nil {
-			suggested := tr.SuggestedBudget()
-			if suggested > b {
-				b = suggested
+	case strings.EqualFold(arg, "save"):
+		cfg.MaxBudgetUsd = current
+		saveConfigOrSay(cfg)
+		outf("已把预算 %s 写入配置\n", budgetLabel(current))
+		return
+	case strings.EqualFold(arg, "off"):
+		setSessionBudget(0, eng, as)
+		outln("已取消本会话的预算上限（/budget save 可写入配置）")
+		return
+	case strings.EqualFold(arg, "auto"):
+		b := current
+		if eng != nil {
+			if tr := eng.CostTracker(); tr != nil {
+				if suggested := tr.SuggestedBudget(); suggested > b {
+					b = suggested
+				}
 			}
 		}
 		if b > 0 {
-			cfg.MaxBudgetUsd = b
-			as.MaxBudget = b
-			eng.SetMaxBudget(b)
-			saveConfigOrSay(cfg)
-			outf("预算已自动调整到: $%.2f\n", b)
+			setSessionBudget(b, eng, as)
+			outf("本会话预算已自动调整到: $%.2f（/budget save 可写入配置）\n", b)
 		}
 		return
 	}
@@ -140,11 +156,33 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 		outf("无效预算: %s\n%s\n", arg, budgetUsage)
 		return
 	}
-	cfg.MaxBudgetUsd = b
+	setSessionBudget(b, eng, as)
+	outf("本会话预算: $%.2f（/budget save 可写入配置）\n", b)
+}
+
+// sessionBudget is the cap this session runs under: the engine's, or the
+// configured one without an engine.
+func sessionBudget(cfg *config.Config, eng *engine.Engine) float64 {
+	if eng != nil {
+		if tr := eng.CostTracker(); tr != nil {
+			return tr.Totals().MaxBudget
+		}
+	}
+	return cfg.MaxBudgetUsd
+}
+
+func setSessionBudget(b float64, eng *engine.Engine, as *state.AppState) {
 	as.MaxBudget = b
-	eng.SetMaxBudget(b)
-	saveConfigOrSay(cfg)
-	outf("预算: $%.2f\n", b)
+	if eng != nil {
+		eng.SetMaxBudget(b)
+	}
+}
+
+func budgetLabel(b float64) string {
+	if b <= 0 {
+		return "无上限"
+	}
+	return fmt.Sprintf("$%.2f", b)
 }
 
 // providerSwitchModel is the model to use after switching from oldProvider to
@@ -170,7 +208,7 @@ func saveConfigOrSay(cfg *config.Config) {
 	}
 }
 
-const budgetUsage = "用法: /budget <金额，美元，大于 0> | /budget auto"
+const budgetUsage = "用法: /budget <金额，美元，大于 0> | /budget auto | /budget off（以上只改本会话）| /budget save（写入配置）"
 
 func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, pm *permission.Manager, as *state.AppState) {
 	args := strings.Fields(strings.TrimSpace(strings.TrimPrefix(input, "/profile")))

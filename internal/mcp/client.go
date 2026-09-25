@@ -286,6 +286,9 @@ type Client struct {
 	// interrupted the turn.
 	dead   bool
 	stopCh chan struct{} // closed by Close() to signal receiveLoop to stop
+	// done is closed when receiveLoop exits (see Done).
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func NewClient(transport Transport) *Client {
@@ -294,6 +297,7 @@ func NewClient(transport Transport) *Client {
 		pending:   make(map[int]chan *Response),
 		notifyCh:  make(chan *Notification, 64),
 		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -450,7 +454,23 @@ func (c *Client) Close() error {
 	return c.transport.Close()
 }
 
+// Done is closed once the connection's receive loop has stopped: the server
+// exited or dropped the stream, or Close was called (see ClosedByUser).
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+// ClosedByUser reports whether Close was called, as opposed to the connection
+// dying on its own.
+func (c *Client) ClosedByUser() bool {
+	select {
+	case <-c.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) receiveLoop() {
+	defer c.doneOnce.Do(func() { close(c.done) })
 	defer func() {
 		c.mu.Lock()
 		c.dead = true

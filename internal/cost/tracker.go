@@ -17,7 +17,14 @@ type Price struct {
 	Input         float64
 	InputCacheHit float64
 	Output        float64
+	// InputCacheWrite is the rate for tokens written into the prompt cache;
+	// 0 means cacheWriteMultiplier × Input.
+	InputCacheWrite float64
 }
+
+// cacheWriteMultiplier is Anthropic's price for a 5-minute prompt-cache write
+// relative to plain input.
+const cacheWriteMultiplier = 1.25
 
 var Prices = map[string]Price{
 	// Current Claude models, per-MTok list prices from Anthropic's model table
@@ -114,6 +121,14 @@ func (t *Tracker) Add(model string, input, output int) {
 }
 
 func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss int) {
+	t.AddWithCacheWrite(model, input, output, cacheHit, cacheMiss, 0)
+}
+
+// AddWithCacheWrite is AddDetailed for a response that also reports prompt
+// cache writes: cacheWrite of the cacheMiss tokens were written into the
+// cache and are billed at InputCacheWrite (1.25× input by default) instead of
+// the input rate. They used to be billed as plain input.
+func (t *Tracker) AddWithCacheWrite(model string, input, output, cacheHit, cacheMiss, cacheWrite int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.totalInput += input
@@ -155,7 +170,17 @@ func (t *Tracker) AddDetailed(model string, input, output, cacheHit, cacheMiss i
 	if p.InputCacheHit == 0 {
 		p.InputCacheHit = p.Input
 	}
-	t.totalCost += (float64(cacheMiss)/1e6)*p.Input + (float64(cacheHit)/1e6)*p.InputCacheHit + (float64(output)/1e6)*p.Output
+	if p.InputCacheWrite == 0 {
+		p.InputCacheWrite = p.Input * cacheWriteMultiplier
+	}
+	if cacheWrite < 0 {
+		cacheWrite = 0
+	}
+	if cacheWrite > cacheMiss {
+		cacheWrite = cacheMiss
+	}
+	t.totalCost += (float64(cacheMiss-cacheWrite)/1e6)*p.Input + (float64(cacheWrite)/1e6)*p.InputCacheWrite +
+		(float64(cacheHit)/1e6)*p.InputCacheHit + (float64(output)/1e6)*p.Output
 }
 
 func (t *Tracker) OverBudget() bool {

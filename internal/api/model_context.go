@@ -78,17 +78,19 @@ func UtilizationRatioForModel(model string) float64 {
 	return 0.85
 }
 
-// EffectiveCompactionBudget returns the token count at which Cove should
-// start compacting conversation history for the given model: its
-// (approximate) context window, scaled by an assumed effective-utilization
-// ratio, with a further 30% safety buffer reserved for the system prompt,
-// tool definitions, repo map, and the model's own response — matching the
-// "安全预算 = model_context_limit × utilization_rate × 0.7" formula from
-// docs/中等模型平替优化建议.md §2.3.
+// EffectiveCompactionBudget returns the context size Cove budgets for a
+// model: its (approximate) context window scaled by the effective-utilization
+// ratio. The engine compacts at CompactionTrigger, a fraction of it that
+// also leaves room for the model's response.
+//
+// It used to reserve a further 30% for the system prompt, tool definitions
+// and repo map ("× 0.7", docs/中等模型平替优化建议.md §2.3). The count it is
+// compared with is now the provider's reported prompt size, which already
+// includes all of those, so the reserve counted them twice.
 func EffectiveCompactionBudget(model string) int {
 	window := ContextWindowForModel(model)
 	ratio := UtilizationRatioForModel(model)
-	budget := int(float64(window) * ratio * 0.7)
+	budget := int(float64(window) * ratio)
 	const floor = 4000 // never compact so aggressively useful history can't fit at all
 	if budget < floor {
 		budget = floor
@@ -99,10 +101,9 @@ func EffectiveCompactionBudget(model string) int {
 // StaticContextBudget returns the token budget Cove allocates to
 // per-turn "static" system-prompt content that isn't the running
 // conversation — matched skill prompts, retrieved memories, the repo
-// map, and the project file tree. It's the complement of
-// EffectiveCompactionBudget's 0.7 factor: that function reserves 30% of
-// the effective window for exactly this content, so this returns that
-// same 30% share, clamped to a sane floor/ceiling so extreme-context
+// map, and the project file tree: 30% of the effective window (the share
+// EffectiveCompactionBudget used to hold back for it), clamped to a sane
+// floor/ceiling so extreme-context
 // models (e.g. qwen-long's 1M-token window) don't get an unbounded
 // allowance that would just get shipped to the provider unexamined.
 //
@@ -124,4 +125,81 @@ func StaticContextBudget(model string) int {
 		budget = ceiling
 	}
 	return budget
+}
+
+// maxRequestOutputTokens caps the output any request asks for.
+const maxRequestOutputTokens = 64000
+
+// minRequestOutputTokens is the least output a request asks for, however
+// small the window.
+const minRequestOutputTokens = 4000
+
+// CompactionSafetyMargin is kept free on top of the reply's MaxTokens when
+// deciding where compaction triggers: token counts are partly estimated,
+// and the provider's own framing takes a little room too.
+const CompactionSafetyMargin = 8000
+
+// compactionFraction is the share of EffectiveCompactionBudget at which the
+// engine compacts. 0.75 of a 200K model's 170K budget is 127.5K: history
+// of 128K on a 200K window already crowds the reply out.
+const compactionFraction = 0.75
+
+// modelOutputCaps lists models whose API rejects or truncates larger
+// max_tokens values. Substring match, most specific first.
+var modelOutputCaps = []contextWindowPattern{
+	{"claude-3-5-sonnet", 8192},
+	{"claude-3-5-haiku", 8192},
+	{"claude-3-opus", 4096},
+	{"claude-3-haiku", 4096},
+	{"gpt-4o", 16384},
+	{"deepseek-chat", 8192},
+}
+
+// MaxOutputTokensForModel is the max_tokens a request to model asks for:
+// min(64000, the model's own output cap, a quarter of its window), and never
+// below 4000. A fixed 64000 asked a 64K-window model for its whole window.
+func MaxOutputTokensForModel(model string) int {
+	n := outputReserve(model)
+	lower := strings.ToLower(model)
+	for _, c := range modelOutputCaps {
+		if strings.Contains(lower, c.pattern) {
+			if c.window < n {
+				n = c.window
+			}
+			break
+		}
+	}
+	return n
+}
+
+// outputReserve is the share of model's window kept for the reply: a quarter
+// of it, clamped to [4000, 64000]. It is MaxOutputTokensForModel before the
+// model's own output cap, so a model with a small cap still compacts with
+// the same headroom.
+func outputReserve(model string) int {
+	n := ContextWindowForModel(model) / 4
+	if n < minRequestOutputTokens {
+		n = minRequestOutputTokens
+	}
+	if n > maxRequestOutputTokens {
+		n = maxRequestOutputTokens
+	}
+	return n
+}
+
+// CompactionTrigger is the context size at which the engine compacts the
+// history for model: compactionFraction of EffectiveCompactionBudget, but
+// never so late that the reply (outputReserve, which is at least
+// MaxOutputTokensForModel) plus CompactionSafetyMargin no longer fits the
+// window.
+func CompactionTrigger(model string) int {
+	trigger := int(compactionFraction * float64(EffectiveCompactionBudget(model)))
+	if room := ContextWindowForModel(model) - outputReserve(model) - CompactionSafetyMargin; room < trigger {
+		trigger = room
+	}
+	const floor = 2000 // a window this small cannot hold a useful history anyway
+	if trigger < floor {
+		trigger = floor
+	}
+	return trigger
 }

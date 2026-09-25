@@ -238,6 +238,9 @@ func TestFetchRendered_ValidatesBeforeRendering(t *testing.T) {
 	// A permitted URL gets past validation and then fails on the build tag,
 	// which also proves the scheme-less form above was normalized to https
 	// rather than rejected outright.
+	if chromeAvailable() {
+		return // -tags chromedp: a real Chrome would be launched
+	}
 	_, err := b.FetchRendered(context.Background(), publicIP+"/page", "text")
 	if !errors.Is(err, ErrChromeUnavailable) {
 		t.Errorf("FetchRendered on a public host = %v, want ErrChromeUnavailable in a non-chromedp build", err)

@@ -66,3 +66,12 @@ func TestVerifyAutoIsOnByDefault(t *testing.T) {
 		t.Fatal("automatic completion verification should default to on")
 	}
 }
+
+func TestProjectOverrideSetsDoneVerifyTimeout(t *testing.T) {
+	if got := loadIn(t, `{"done_verify_timeout_seconds":600}`).DoneVerifyTimeoutSeconds; got != 600 {
+		t.Fatalf("done_verify_timeout_seconds = %d, want 600", got)
+	}
+	if got := loadIn(t, "").DoneVerifyTimeoutSeconds; got != 0 {
+		t.Fatalf("default = %d, want 0 (built-in timeouts)", got)
+	}
+}

@@ -11,8 +11,11 @@ import (
 
 // State tracks the onboarding status of a project.
 type State struct {
-	ProjectDir     string
-	HasClaudeMD    bool
+	ProjectDir  string
+	HasClaudeMD bool
+	// HasAgentsMD: an AGENTS.md is present. cove loads it alongside
+	// CLAUDE.md, so the project is not missing a guide.
+	HasAgentsMD    bool
 	HasGit         bool
 	HasPackageJSON bool
 	HasGoMod       bool
@@ -24,6 +27,7 @@ func Check(projectDir string) *State {
 	s := &State{ProjectDir: projectDir}
 	s.HasClaudeMD = fileExists(filepath.Join(projectDir, "CLAUDE.md")) ||
 		fileExists(filepath.Join(projectDir, ".claude", "CLAUDE.md"))
+	s.HasAgentsMD = fileExists(filepath.Join(projectDir, "AGENTS.md"))
 	s.HasGit = gitExists(filepath.Join(projectDir, ".git"))
 	s.HasPackageJSON = fileExists(filepath.Join(projectDir, "package.json"))
 	s.HasGoMod = fileExists(filepath.Join(projectDir, "go.mod"))
@@ -32,6 +36,8 @@ func Check(projectDir string) *State {
 }
 
 // NeedsOnboarding returns true if the project doesn't have a CLAUDE.md yet.
+// An AGENTS.md alone still leaves room for a CLAUDE.md (/init can add one),
+// but the project is not described as missing a guide (see Summary).
 func (s *State) NeedsOnboarding() bool {
 	return !s.HasClaudeMD
 }
@@ -69,8 +75,12 @@ func (s *State) InitProject() (string, error) {
 	if s.HasClaudeMD {
 		return "", nil
 	}
+	return s.WriteGuide(s.GenerateClaudeMD())
+}
 
-	content := s.GenerateClaudeMD()
+// WriteGuide creates CLAUDE.md with content, never overwriting an existing
+// file: an existing guide yields ("", nil), like InitProject.
+func (s *State) WriteGuide(content string) (string, error) {
 	path := filepath.Join(s.ProjectDir, "CLAUDE.md")
 
 	// Create exclusively rather than with os.WriteFile, which truncates.
@@ -125,9 +135,14 @@ func (s *State) Summary() string {
 	if s.Language != "" {
 		parts = append(parts, s.Language)
 	}
-	if s.HasClaudeMD {
+	switch {
+	case s.HasClaudeMD && s.HasAgentsMD:
+		parts = append(parts, "CLAUDE.md ✓", "AGENTS.md ✓")
+	case s.HasClaudeMD:
 		parts = append(parts, "CLAUDE.md ✓")
-	} else {
+	case s.HasAgentsMD:
+		parts = append(parts, "AGENTS.md ✓")
+	default:
 		parts = append(parts, "no CLAUDE.md")
 	}
 	return strings.Join(parts, " | ")

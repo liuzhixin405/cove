@@ -5,8 +5,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 	"github.com/liuzhixin405/cove/internal/browser"
+	"time"
 )
 
 func main() {

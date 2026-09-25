@@ -54,7 +54,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "11.0.0"
+	Version = "11.3.0"
 
 	BuildTime = "pro"
 
@@ -102,6 +102,8 @@ func main() {
 	case actionListSessions:
 		listSessions(opts.listAll)
 		return
+	case actionDreamWorker:
+		os.Exit(runDreamWorker(opts.dreamWorkerDir, opts.dreamProjectRoot, opts.profile))
 	}
 
 	debugMode := opts.debug
@@ -129,7 +131,7 @@ func main() {
 		}
 	}
 
-	app, err := bootstrapApp(debugMode, profileName, recordDir, replayDir)
+	app, err := bootstrapApp(debugMode, profileName, recordDir, replayDir, toolsInteractiveFor(opts.printMode))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Engine start error: %v\n", err)
 		os.Exit(1)
@@ -140,6 +142,7 @@ func main() {
 	permMgr := app.permMgr
 	appState := app.appState
 	mcpPool := app.mcpPool
+	wireToolDefsVersion(eng, mcpPool)
 	skillMgr := app.skillMgr
 	memStore := app.memStore
 	pluginMgr := app.pluginMgr
@@ -193,9 +196,12 @@ func main() {
 
 	if opts.printMode {
 
-		code := runPrintMode(eng, opts.printPrompt, printPrompt, debugMode, opts.attachments, cfg)
+		// Nobody can answer a limit prompt here: the cap is hard, and
+		// --max-turns sets it (0 = none); the time limit applies only when
+		// max_turn_minutes is configured explicitly.
+		applyUnattendedLimits(eng, opts, cfg)
 
-		finishSession(eng, mcpPool)
+		code := runPrintModeSession(eng, opts.printPrompt, printPrompt, debugMode, opts.attachments, cfg, mcpPool)
 
 		os.Exit(code)
 
@@ -208,7 +214,10 @@ func main() {
 		runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
 		// The shell's /exit and Ctrl+D paths already saved the session and
-		// recorded its cost (autoSaveSession); only MCP is left.
+		// recorded its cost (autoSaveSession, which also fires SessionEnd);
+		// an empty session skipped that, so SessionEnd (fired once) and MCP
+		// are left.
+		fireSessionEnd(eng)
 		mcpPool.DisconnectAll()
 
 		return
@@ -218,6 +227,7 @@ func main() {
 	// Non-TTY (pipes/redirects) or TUI explicitly disabled: use the headless
 	// frontend. The classic line REPL has been removed; its behavior lives in
 	// the Bubble Tea TUI (interactive) and here (non-interactive).
+	applyUnattendedLimits(eng, opts, cfg)
 	runHeadless(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
 
 	finishSession(eng, mcpPool)
@@ -448,9 +458,15 @@ func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, atta
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil, nil)
 
 	if err != nil {
+		// A turn stopped at a limit or a loop ends with the model's no-tool
+		// summary of what was done and what remains: the answer a script gets.
+		if s := eng.LastWrapUp(); s != "" {
+			outln(s)
+		}
 		return printModeFailure(os.Stderr, ctx.Err() != nil, err)
 	}
 
+	noteTurnCompleted()
 	outln(resp)
 
 	return 0
@@ -465,7 +481,7 @@ func printModeFailure(w io.Writer, canceled bool, err error) int {
 		_, _ = fmt.Fprintln(w, "[已取消] 当前任务已终止")
 		return 130
 	}
-	_, _ = fmt.Fprintf(w, "Error: %v\n", err)
+	_, _ = fmt.Fprintf(w, "Error: %s\n", printModeErrorText(err))
 	return 1
 }
 
@@ -474,6 +490,12 @@ type replEngineAdapter struct {
 }
 
 func (a replEngineAdapter) Messages() []api.Message { return a.eng.Messages() }
+
+// GenerateOnce forwards Engine.GenerateOnce (command.GuideGenerator), so
+// /init drafts CLAUDE.md with the model.
+func (a replEngineAdapter) GenerateOnce(ctx context.Context, system, prompt string) (string, error) {
+	return a.eng.GenerateOnce(ctx, system, prompt)
+}
 
 func (a replEngineAdapter) LoadMessages(msgs []api.Message) { a.eng.LoadMessages(msgs) }
 
@@ -858,6 +880,8 @@ func printCLIHelp() {
 
 
  cove -p <prompt> --file <path>  执行单次带有文件的询问
+
+ cove -p <prompt> --max-turns <N> 单轮最多调用模型 N 次（默认取配置 max_iterations=200，0 不限制），达到上限退出码 1
 
 
  cove -r, --resume <id>     恢复之前的会话记录（可与 -p 连用，继续该会话）

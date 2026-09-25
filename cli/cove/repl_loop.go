@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/charmbracelet/x/term"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/command"
@@ -39,8 +42,15 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 	// repl.TakePermInputCh, so tools that need approval can ask instead of being
 	// denied by the engine's "no interactive approval handler" path.
 	installPermissionPrompt(eng)
+	// The question tool asks through the same relay.
+	installQuestionPrompt(eng)
+	// The same relay answers the prompt shown when a turn reaches its
+	// iteration cap, its time limit or looks stuck.
+	installLimitPrompt(eng)
+	installBackgroundSummary(eng, term.IsTerminal(os.Stdout.Fd()))
 
 	allCommands := buildCommandList(cmdReg, toolReg)
+	allCommands = append(allCommands, cmdEntry{Name: "/continue", Desc: "从中断处继续上一轮（达到上限、取消或出错后）", Type: "builtin"})
 
 	for name, c := range pluginMgr.CommandPrompts() {
 
@@ -112,7 +122,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			if tasks.CancelRunning() {
 
-				repl.PrintAbove(fmt.Sprintf("\r\n%s[已中断] 正在停止当前任务…%s\r\n", repl.Yellow, repl.Reset))
+				repl.PrintAbove(fmt.Sprintf("\r\n%s[已中断] 正在停止当前任务…输入 /continue 可继续%s\r\n", repl.Yellow, repl.Reset))
 
 			}
 
@@ -142,7 +152,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		input, err := reader.ReadLine()
 
-		if err == repl.ErrInterrupt {
+		if errors.Is(err, repl.ErrInterrupt) {
 
 			denyPendingPermissionPrompt()
 
@@ -164,7 +174,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		}
 
-		if err == repl.ErrExit {
+		if errors.Is(err, repl.ErrExit) {
 
 			autoSaveSession(eng)
 
@@ -346,6 +356,22 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			historyPickPending = false
 
+			continue
+
+		case isContinueSlashCommand(input):
+			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
+				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
+				continue
+			}
+			note := continueInterruptedTurn(eng, tasks.IsRunning(), func(msg api.Message) {
+				// The engine resumes the turn when its message is sent again;
+				// the retry bookkeeping of the "继续" path is now stale.
+				tasks.ClearPendingFailed()
+				_ = clearInterruptedDraft()
+				tasks.Enqueue(msg)
+			})
+			repl.PrintAbove(note + "\r\n")
+			historyPickPending = false
 			continue
 
 		case input == "/stop" || input == "/cancel":
@@ -563,9 +589,16 @@ func denyPendingPermissionPrompt() bool {
 	if ch == nil {
 		return false
 	}
-	ch <- "n"
+	ch <- promptInterrupt
 	return true
 }
+
+// promptInterrupt is what Ctrl+C sends to a waiting prompt instead of a
+// typed answer: the permission and limit prompts treat it as a denial or a
+// stop, the question tool as a cancellation. It used to be "n", which the
+// question tool recorded as the user's answer before asking its next
+// question on the same relay.
+const promptInterrupt = tool.AskUserCancelled
 
 // slashTarget is what "/name ..." resolves to.
 type slashTarget int
@@ -686,4 +719,31 @@ func (replLogWriter) Write(p []byte) (int, error) {
 		repl.PrintAbove(s + "\r\n")
 	}
 	return len(p), nil
+}
+
+// isContinueSlashCommand reports whether input is the /continue command.
+func isContinueSlashCommand(input string) bool {
+	return strings.TrimSpace(input) == "/continue"
+}
+
+// interruptedTurnSource is the part of *engine.Engine /continue needs.
+type interruptedTurnSource interface {
+	InterruptedTurn() (api.Message, bool)
+}
+
+// continueInterruptedTurn is /continue: when the last turn ended before
+// completing (iteration or time limit, Ctrl+C, an API error) its message is
+// sent again through enqueue, which the engine takes as "resume from where it
+// stopped" (completed steps are kept, not redone). It returns the notice to
+// show.
+func continueInterruptedTurn(src interruptedTurnSource, running bool, enqueue func(api.Message)) string {
+	if running {
+		return "[提示] 当前有任务正在运行，请等待其结束后再输入 /continue。"
+	}
+	msg, ok := src.InterruptedTurn()
+	if !ok {
+		return "没有可继续的回合"
+	}
+	enqueue(msg)
+	return "[继续] 正在从上一轮中断处继续…"
 }

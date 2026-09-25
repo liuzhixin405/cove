@@ -11,6 +11,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
 type ReadTool struct{ baseTool }
@@ -169,7 +172,7 @@ func (t *ReadTool) readFileStream(path string, offset, limit int, files *FileTra
 		}
 		sb.WriteString(strconv.Itoa(lineNum))
 		sb.WriteString(": ")
-		sb.WriteString(scanner.Text())
+		sb.WriteString(clipReadLine(scanner.Text()))
 		sb.WriteByte('\n')
 		collected++
 	}
@@ -221,10 +224,30 @@ func (t *ReadTool) readFileStream(path string, offset, limit int, files *FileTra
 	}
 
 	if totalLines > offset+maxCollect {
-		result += fmt.Sprintf("\n... [truncated, showing %d/%d lines. Use offset/limit for more.]\n", collected, totalLines)
+		// The last line is a fixed marker the engine keeps when it truncates a
+		// tool result, so the model always learns where to continue.
+		result = strings.TrimRight(result, "\n") + fmt.Sprintf("\n... [showing lines %d-%d of %d]\n[next: offset=%d]",
+			offset+1, offset+collected, totalLines, offset+collected+1)
 	}
 
 	return Result{Data: strings.TrimRight(result, "\n")}, nil
+}
+
+// readMaxLineChars caps one line of read output. A minified bundle or a JSON
+// blob on a single line would otherwise fill the context by itself.
+const readMaxLineChars = 2000
+
+// clipReadLine cuts line to readMaxLineChars characters and says how many
+// were left out.
+func clipReadLine(line string) string {
+	if len(line) <= readMaxLineChars {
+		return line
+	}
+	n := utf8.RuneCountInString(line)
+	if n <= readMaxLineChars {
+		return line
+	}
+	return textutil.HeadRunes(line, readMaxLineChars) + fmt.Sprintf("…[+%d chars]", n-readMaxLineChars)
 }
 
 func (t *ReadTool) CheckPermissions(input Input, tctx Context) PermissionDecision {

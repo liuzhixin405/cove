@@ -33,8 +33,6 @@ type Context struct {
 	ToolUseID        string
 	SessionID        string
 	PermissionMode   string
-	AlwaysAllowRules map[string][]string
-	AlwaysDenyRules  map[string][]string
 	IsNonInteractive bool
 	Debug            bool
 	Runtime          *Runtime

@@ -48,6 +48,8 @@ type Glyphs struct {
 	// User marks what the user typed.
 	User string
 	// Closed and Open are the disclosure marker for an expandable block.
+	// This package only prints Closed (it no longer renders an expanded
+	// form); Open stays so front ends that do can share the glyph set.
 	Closed string
 	Open   string
 	// Leaf occupies the disclosure column for a block with nothing hidden, so
@@ -100,16 +102,12 @@ func (s Styles) glyphs() Glyphs {
 }
 
 // disclosure returns the marker for b's disclosure column.
-func (s Styles) disclosure(b Block, open bool) string {
+func (s Styles) disclosure(b Block) string {
 	g := s.glyphs()
-	switch {
-	case !b.Expandable():
+	if !b.Expandable() {
 		return g.Leaf
-	case open:
-		return g.Open
-	default:
-		return g.Closed
 	}
+	return g.Closed
 }
 
 // Styles carries the styling functions the renderer applies. Passing them in
@@ -149,12 +147,6 @@ func apply(f func(string) string, s string) string {
 // the caller prints this straight into the terminal where a line one column too
 // wide soft-wraps and silently adds a row.
 func Collapsed(b Block, width int, st Styles) string {
-	return collapsedForm(b, width, st, false)
-}
-
-// collapsedForm is Collapsed, plus the flag that flips the disclosure marker
-// for the header Expanded reuses.
-func collapsedForm(b Block, width int, st Styles, open bool) string {
 	if width < minRenderWidth {
 		width = minRenderWidth
 	}
@@ -181,14 +173,14 @@ func collapsedForm(b Block, width int, st Styles, open bool) string {
 		return wrapBlock(apply(style, glyph+" "+b.Header), width, gutter, textutil.Width(glyph)+1)
 
 	case KindThinking:
-		label := st.disclosure(b, open) + " 思考"
+		label := st.disclosure(b) + " 思考"
 		if b.Header != "" {
 			label += " " + b.Header
 		}
 		return clipLine(gutter+apply(st.Thinking, label), width)
 
 	case KindTool:
-		return collapsedTool(b, width, st, open)
+		return collapsedTool(b, width, st)
 	}
 	return ""
 }
@@ -196,8 +188,8 @@ func collapsedForm(b Block, width int, st Styles, open bool) string {
 // collapsedTool renders the two-line folded form of a tool call:
 //
 //	⚙ bash   go test ./internal/tool/
-//	  ⎿ ok 0.336s · 共 12 行                              /x a4
-func collapsedTool(b Block, width int, st Styles, open bool) string {
+//	  ⎿ ok 0.336s · 共 12 行
+func collapsedTool(b Block, width int, st Styles) string {
 	var sb strings.Builder
 
 	// Header: disclosure marker + tool name + target.
@@ -208,7 +200,7 @@ func collapsedTool(b Block, width int, st Styles, open bool) string {
 	g := st.glyphs()
 	// The marker is styled with the name, not dimmed: it is the affordance,
 	// and chrome you have to hunt for is not an affordance.
-	head := gutter + apply(st.ToolName, st.disclosure(b, open)+" "+name)
+	head := gutter + apply(st.ToolName, st.disclosure(b)+" "+name)
 	if b.Header != "" {
 		head += " " + b.Header
 	}
@@ -228,64 +220,6 @@ func collapsedTool(b Block, width int, st Styles, open bool) string {
 		return clipLine(head, width)
 	}
 	return sb.String()
-}
-
-// Expanded renders the full form of a block, used by the expand command.
-//
-// It reprints the block rather than mutating what is already on screen: in the
-// scrollback model the earlier lines are owned by the terminal and cannot be
-// revised. The header is repeated so the reprint is self-identifying when it
-// lands far below the original.
-//
-// The body is wrapped to the width under the continuation indent rather than
-// clipped or left to the terminal.
-//
-// Clipping it defeats the purpose of expanding: the user asked for the
-// content, and a truncated build error is worse than a wrapped one. But
-// leaving it to the terminal is no better — the terminal wraps at column zero,
-// so a long line continues hard against the left edge and the indentation that
-// showed which step the text belonged to is gone. Wrapping here keeps the
-// continuation under its own block.
-func Expanded(b Block, width int, st Styles) string {
-	if width < minRenderWidth {
-		width = minRenderWidth
-	}
-	b = withSafeText(b)
-
-	var sb strings.Builder
-	// The header is repeated with the marker turned down, so an open block
-	// reads as open and a second click (or a glance) knows to close it.
-	sb.WriteString(collapsedForm(b, width, st, true))
-
-	pathLine := ""
-	if b.FullPath != "" {
-		pathLine = contIndent + apply(st.Hint, "完整输出: ") + b.FullPath
-	}
-
-	body := b.Full
-	if body == "" {
-		if pathLine != "" {
-			// Spilled to disk with nothing kept inline: point at the file
-			// instead of reprinting megabytes into the scrollback.
-			sb.WriteString("\n")
-			sb.WriteString(pathLine)
-		}
-		return sb.String()
-	}
-	if strings.TrimSpace(body) == "" {
-		return sb.String()
-	}
-
-	sb.WriteString("\n")
-	for _, l := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
-		sb.WriteString(contIndent + l)
-		sb.WriteString("\n")
-	}
-	if pathLine != "" {
-		sb.WriteString(pathLine)
-		sb.WriteString("\n")
-	}
-	return strings.TrimRight(sb.String(), "\n")
 }
 
 // withSafeText neutralises terminal controls in the block's text fields.
@@ -386,16 +320,4 @@ func utf8RuneCount(s string) int {
 		n++
 	}
 	return n
-}
-
-// ExpandHint describes how to open a collapsed step.
-//
-// It is a sentence in the help text, not a per-row affordance. The right-
-// aligned "/x <id>" that used to ride on every collapsed row is gone: the
-// disclosure marker already says the row can be opened, and clicking it is how
-// you open one. The hint also had to be positioned against the exact terminal
-// width, which made every row depend on getting the width of a decorative
-// glyph right — and terminals disagree about those.
-func ExpandHint() string {
-	return "折叠的步骤：点箭头展开，或用 /x <id>（例: /x 7）"
 }

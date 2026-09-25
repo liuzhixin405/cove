@@ -62,6 +62,9 @@ func TestCoveBranding_NoLegacyClaudeNamesInDemoTree(t *testing.T) {
 			switch relSlash {
 			case ".git", "dist", "vendor":
 				return filepath.SkipDir
+			case "docs/superpowers", ".superpowers":
+				// research/plan documents legitimately mention other products.
+				return filepath.SkipDir
 			}
 			return nil
 		}

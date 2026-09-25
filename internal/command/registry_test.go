@@ -42,6 +42,7 @@ var allCommandConstructors = map[string]func() Command{
 	"NewSkillsCmd":      NewSkillsCmd,
 	"NewPluginCmd":      NewPluginCmd,
 	"NewMcpCmd":         NewMcpCmd,
+	"NewHooksCmd":       NewHooksCmd,
 }
 
 // testRegistry builds a registry holding every command, in a stable order.

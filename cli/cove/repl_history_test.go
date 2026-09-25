@@ -221,7 +221,7 @@ func TestLooksSyntheticHistoryText(t *testing.T) {
 		}
 	}
 
-	real := []string{
+	realTasks := []string{
 		"给配置加载加上 profile 支持",
 		"fix the parser",
 		"systematic review", // must not match the "[system:" prefix
@@ -229,7 +229,7 @@ func TestLooksSyntheticHistoryText(t *testing.T) {
 		"run slow tool benchmarks again",
 		"continue the refactor of the loader",
 	}
-	for _, s := range real {
+	for _, s := range realTasks {
 		if looksSyntheticHistoryText(s) {
 			t.Errorf("looksSyntheticHistoryText(%q) = true, want false", s)
 		}
@@ -441,5 +441,69 @@ func TestEffectiveHistoryTitleFallsBackFromPlaceholders(t *testing.T) {
 	r := session.Record{Title: "重构配置加载", Messages: []api.Message{userMsg("x")}}
 	if got := effectiveHistoryTitle(r); got != "重构配置加载" {
 		t.Fatalf("effectiveHistoryTitle = %q, want the real title preserved", got)
+	}
+}
+
+// ---------- /history clean ----------
+
+// /history clean walks the sessions directory. It must treat <id>.jsonl and
+// legacy <id>.json as sessions and leave index.json alone: matching "*.json"
+// skipped every .jsonl session and parsed the index as if it were one.
+func TestHistoryCleanRepairsSessionFilesAndSkipsIndex(t *testing.T) {
+	dir := t.TempDir()
+	store := session.NewStoreAt(dir)
+	jsonl := &session.Record{ID: "a", Title: "New session", Model: "claude-opus-5", Messages: []api.Message{
+		userMsg("[system: continue]"), userMsg("修复登录页的空指针"),
+	}}
+	if err := store.Save(jsonl); err != nil {
+		t.Fatal(err)
+	}
+	legacy := session.Record{ID: "b", Title: "", Model: "claude-opus-5", Messages: []api.Message{userMsg("整理 README 的安装步骤")}}
+	raw, _ := json.Marshal(legacy)
+	if err := os.WriteFile(filepath.Join(dir, "b.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	indexBefore, err := os.ReadFile(filepath.Join(dir, "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedBefore := jsonl.UpdatedAt
+
+	captureOut(t)
+	stats := historyCleanIn(dir)
+
+	if stats.Scanned != 2 || stats.ParseFailed != 0 {
+		t.Fatalf("stats = %+v, want 2 sessions scanned and none failing to parse", stats)
+	}
+	if stats.Modified != 2 || stats.SyntheticFlag != 1 || stats.TitlesFixed != 2 {
+		t.Errorf("stats = %+v, want both sessions repaired", stats)
+	}
+	// index.json is not a session: never backed up, never rewritten as one.
+	if _, err := os.Stat(filepath.Join(dir, "index.json.bak")); err == nil {
+		t.Error("index.json was backed up as if it were a session")
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "index.json.bak.*"))
+	if len(matches) != 0 {
+		t.Errorf("index.json was treated as a session: %v", matches)
+	}
+	var idx map[string]any
+	data, err := os.ReadFile(filepath.Join(dir, "index.json"))
+	if err != nil || json.Unmarshal(data, &idx) != nil || idx["sessions"] == nil {
+		t.Fatalf("index.json damaged (before %q, after %q, err %v)", indexBefore, data, err)
+	}
+
+	got, err := session.NewStoreAt(dir).Load("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Messages[0].Synthetic || got.Title == "New session" {
+		t.Errorf("jsonl session not repaired: %+v", got)
+	}
+	if !got.UpdatedAt.Equal(updatedBefore) {
+		t.Errorf("cleaning moved the session in the history order: UpdatedAt %v -> %v", updatedBefore, got.UpdatedAt)
+	}
+	b, err := session.NewStoreAt(dir).Load("b")
+	if err != nil || b.Title == "" {
+		t.Errorf("legacy session not repaired: %+v, %v", b, err)
 	}
 }

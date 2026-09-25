@@ -8,12 +8,15 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
+	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/mcp"
 	"github.com/liuzhixin405/cove/internal/memory"
 	"github.com/liuzhixin405/cove/internal/permission"
@@ -30,6 +33,11 @@ import (
 // writing engine output to stdout and diagnostics to stderr. There is no
 // alternate screen, raw-mode reader, or task queue — output is script-friendly.
 func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
+	// Headless runs exit when stdin ends, so a skill review started on the last
+	// turn would be abandoned mid-request like in -p; skip it here too.
+	if eng != nil {
+		eng.SetNonInteractive(true)
+	}
 	// Banner goes to stderr so stdout carries only assistant/command output.
 	if strings.TrimSpace(bannerText) != "" {
 		fmt.Fprint(os.Stderr, bannerText)
@@ -156,6 +164,64 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 	}
 }
 
+// printModeBackgroundWait bounds how long cove -p waits, after the answer,
+// for the engine's background work (memory extraction) before exiting. A -p
+// process used to exit the moment the answer was printed, so the extraction
+// started at the end of the turn was always killed and -p never learned.
+const printModeBackgroundWait = 20 * time.Second
+
+// backgroundWaiter is the engine's WaitBackground (waits for its background
+// goroutines, returning early when ctx ends). Asserted rather than called
+// directly so this builds against an engine that does not have it yet.
+type backgroundWaiter interface {
+	WaitBackground(ctx context.Context)
+}
+
+// waitForBackground waits for v's background work up to limit and reports
+// whether v supports waiting at all. The limit is enforced here, not left to
+// WaitBackground: a waiter that ignores its context still cannot hold the
+// exit up (its goroutine is simply abandoned; the process is exiting).
+func waitForBackground(v any, limit time.Duration) bool {
+	w, ok := v.(backgroundWaiter)
+	if !ok || w == nil {
+		log.Debugf("[-p] engine has no WaitBackground; exiting without waiting for background work")
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.WaitBackground(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Debugf("[-p] background work still running after %v; exiting anyway", limit)
+	}
+	return true
+}
+
+// runPrintModeSession is the whole -p run: the turn (runPrintMode), then the
+// wrap-up every -p exit owes — waiting for memory extraction, then
+// finishSession. Automatic dream is switched off for the process first: its
+// run would be killed at exit with the consolidation lock already stamped, so
+// the sessions it was reviewing would count as consolidated.
+func runPrintModeSession(eng *engine.Engine, argPrompt, prompt string, debug bool, attachmentPaths []string, cfg *config.Config, pool interface{ DisconnectAll() }) int {
+	dream.SuppressAuto("-p 模式：回答后进程立即退出，整理会被中途终止")
+	log.Debugf("[autoDream] skipped for this process: -p mode exits right after the answer")
+	if eng != nil {
+		// The skill review would be abandoned at exit after its paid call.
+		eng.SetNonInteractive(true)
+	}
+	code := runPrintMode(eng, argPrompt, prompt, debug, attachmentPaths, cfg)
+	if eng != nil {
+		waitForBackground(eng, printModeBackgroundWait)
+	}
+	finishSession(eng, pool)
+	return code
+}
+
 // runHeadlessTurn drives a single engine turn synchronously, printing the reply
 // to stdout. SIGINT/SIGTERM cancel the in-flight turn instead of killing the
 // process outright.
@@ -170,6 +236,9 @@ func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) {
 
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil, nil)
 	if err != nil {
+		if s := eng.LastWrapUp(); s != "" {
+			outln(s) // the stopped turn's no-tool summary
+		}
 		if ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "[已取消] 当前任务已终止")
 		} else {
@@ -177,6 +246,7 @@ func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) {
 		}
 		return
 	}
+	noteTurnCompleted()
 	outln(resp)
 	if eng.HasMessages() {
 		eng.SaveSession()

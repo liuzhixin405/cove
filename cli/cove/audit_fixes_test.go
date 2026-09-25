@@ -104,6 +104,7 @@ func newTestEngine(t *testing.T) *engine.Engine {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("COVE_CONFIG_DIR", filepath.Join(home, ".cove"))
+	seedCheckpointStore(t, home)
 	origWD, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(origWD) })
 	if err := os.Chdir(t.TempDir()); err != nil {

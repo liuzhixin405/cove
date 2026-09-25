@@ -2,7 +2,7 @@
 
 > **目标读者**: 零基础新手。读完本文档即可从零开发整个 Cove Agent 项目。
 > **项目**: Cove — 一个 Go 语言编写的 AI 编程助手 (Coding Agent CLI)
-> **版本**: v6.3.1+
+> **版本**: 初版基于 v6.3.1；交互层、权限、会话存储、hooks 等章节已按 11.0.0 源码及待发布的 11.1.0 变更更新（见 CHANGELOG）。部分行数、结构示意仍为旧版，以源码为准。
 
 ---
 
@@ -31,9 +31,8 @@
    - [5.12d 策略引擎 (PolicyEngine)](#512d-策略引擎-policyengine)
    - [5.12e 发言人预测 (NextSpeaker)](#512e-发言人预测-nextspeaker)
    - [5.12f 会话 Diff (SessionDiff)](#512f-会话-diff-sessiondiff)
-   - [5.12g 本地遥测 (Telemetry)](#512g-本地遥测-telemetry)
    - [5.12h 安全检查 (Safety)](#512h-安全检查-safety)
-   - [5.13 TUI 界面层 (tui)](#513-tui-界面层-tui)
+   - [5.13 交互式 REPL 界面层](#513-交互式-repl-界面层)
    - [5.14 移动端引擎 (mobile)](#514-移动端引擎-mobile)
    - [5.15 其他辅助模块](#515-其他辅助模块)
    - [5.16 后台回顾系统 (review)](#516-后台回顾系统-review)
@@ -64,7 +63,7 @@ Cove 是一个**在终端中运行的 AI 编程助手**。你输入自然语言�
 6. **多轮迭代**：模型可能连续调用 10-30 轮工具，逐步完成任务
 
 **三大交互模式**：
-- **TUI 模式**（默认）：全屏 Bubble Tea 界面，分屏显示对话和工具进度
+- **交互式 REPL**（默认）：行编辑器（`internal/repl`）+ 流式输出，输出打印在输入行上方，模型回答做 Markdown 渐进渲染
 - **Headless 模式**（非交互）：无 UI，逐行读取 stdin，适合管道/重定向/脚本
 - **Mobile 模式**：Android 手机控制引擎，通过 gomobile 绑定
 
@@ -85,7 +84,7 @@ mkdir -p ~/.cove && echo '{"model":"gpt-4o","provider":{"name":"openai","api_key
 
 # 3. 构建并运行
 go build -o cove ./cli/cove/
-./cove                    # TUI 模式（默认）
+./cove                    # 交互式 REPL（默认）
 ./cove --no-tui           # headless 无 UI 模式
 echo "hello" | ./cove     # 管道模式(自动 headless)
 
@@ -105,7 +104,7 @@ go test ./...
 ```
 cove/agent/
 │
-├── go.mod                          # Go 模块定义（依赖极少，主要是 Bubble Tea + chromedp）
+├── go.mod                          # Go 模块定义（依赖极少，主要是 golang.org/x/term、x/text + chromedp）
 ├── go.sum
 │
 ├── cli/cove/                       # ★ 命令行入口（程序起点）
@@ -113,7 +112,9 @@ cove/agent/
 │   ├── app_bootstrap.go            #   启动引导：创建所有子系统 (178行)
 │   ├── registry.go                 #   工具注册表：注册所有内置工具 (87行)
 │   ├── headless.go                 #   非交互前端（管道/重定向/--no-tui）
-│   ├── repl_tui.go                 #   TUI 交互桥接（默认模式）(785行)
+│   ├── repl_loop.go                #   交互式 REPL 主循环（默认模式）
+│   ├── repl_tasks.go               #   REPL 任务队列（排队/取消/失败重试）
+│   ├── interactive.go              #   useInteractiveShell()：选择 REPL 或 headless
 │   └── chat_interaction.go         #   单次对话处理 (139行)
 │
 ├── internal/                       # ★ 核心实现（所有 .go 文件都在这里）
@@ -165,7 +166,7 @@ cove/agent/
 │   │   └── executor.go             #   计划执行器
 │   │
 │   ├── session/                    # 会话持久化
-│   │   ├── store.go                #   文件存储（~/.cove/sessions/*.json）
+│   │   ├── store.go                #   文件存储（~/.cove/sessions/*.jsonl + index.json）
 │   │   └── store_test.go
 │   │
 │   ├── memory/                     # 记忆系统
@@ -184,10 +185,10 @@ cove/agent/
 │   │   ├── pool.go                 #   连接池管理
 │   │   └── client.go               #   MCP 客户端（stdio + HTTP）
 │   │
-│   ├── tui/                        # 全屏 TUI 界面
-│   │   ├── tui.go                  #   Bubble Tea Model (757行)
-│   │   ├── app.go                  #   程序包装器
-│   │   └── styles.go               #   样式 + 布局渲染 (313行)
+│   ├── repl/                       # 行编辑器（输入行、历史、补全、输出插在输入行上方）
+│   │   └── readline.go
+│   │
+│   ├── render/                     # 工具块渲染 + Markdown 渐进渲染（markdown.go）
 │   │
 │   ├── context/                    # 项目上下文
 │   │   └── context.go              #   文件树、Git 状态、Repo Map 收集
@@ -300,14 +301,14 @@ main()                                     // cli/cove/main.go:75
   ├─ 3. eng.SetProjectContext(projCtx)     // 注入项目上下文
   ├─ 4. eng.WirePlanExecutor()             // 连接计划执行器
   │
-  ├─ 5. useTUI() 判断交互模式
+  ├─ 5. useInteractiveShell() 判断交互模式
   │     │
-  │     ├─ true  → runTUI()                // repl_tui.go（默认）
+  │     ├─ true  → runREPL()               // repl_loop.go（默认）
   │     │           │
-  │     │           ├─ 创建 TUI 程序（Bubble Tea）
-  │     │           ├─ 创建任务队列（串行处理用户消息）
+  │     │           ├─ 创建行编辑器 repl.New()，termui/log 输出改走编辑器（打印在输入行上方）
+  │     │           ├─ 创建任务队列 replTaskRunner（串行处理用户消息）
   │     │           ├─ 启动 goroutine: 从队列取消息 → eng.RunMessageWithStream()
-  │     │           └─ 引擎回调 → App.Send*() → TUI 更新
+  │     │           └─ 引擎回调 → termui 输出 / Markdown 渐进渲染
   │     │
     │     └─ false → runHeadless()           // headless.go（管道/--no-tui）
   │                 │
@@ -320,7 +321,7 @@ main()                                     // cli/cove/main.go:75
 
 **关键理解**：
 - `Engine` 是整个程序的核心——它拥有所有子系统的引用
-- TUI/REPL 只是 UI 壳，真正的逻辑全部在 Engine 里
+- REPL/headless 只是 UI 壳，真正的逻辑全部在 Engine 里
 - `RunMessageWithStream()` 是 Engine 最重要的方法，处理"一条用户消息 → 多轮 AI 调用 → 工具执行 → 最终响应"的完整循环
 
 ---
@@ -441,7 +442,7 @@ KeyOK → KeyDead（401/403 永久失效）
 
 **重试** (`retry.go`): 指数退避，1s→2s→4s→8s，最多 3 次。可重试：网络超时、5xx、429。不可重试：401、403。
 
-**速率限制追踪** (`ratelimit.go`): 解析 API 响应头，在 TUI 状态栏显示：
+**速率限制追踪** (`ratelimit.go`): 解析 API 响应头，`/ratelimit` 显示：
 ```
 请求: 150/200(75%) 重置:1m30s | Token: 45K/100K(45%)
 ```
@@ -527,8 +528,8 @@ func (e *Engine) RunMessageWithStream(
 │ 3. 重置循环检测器                                       │
 │    e.loopDetector.Reset()                              │
 ├───────────────────────────────────────────────────────┤
-│ 4. ★ 主循环（最多 200 轮迭代）                          │
-│    for iter := 0; iter < MaxIterations; iter++ {       │
+│ 4. ★ 主循环（max_iterations，默认 200；交互模式到上限询问）│
+│    for iter := 0; iter < maxIter; iter++ {             │
 │                                                         │
 │      a. 处理待注入的用户引导 (Steer)                      │
 │         if steer := e.drainPendingSteer(); steer != "" { │
@@ -581,7 +582,7 @@ func (e *Engine) RunMessageWithStream(
 │      j. 断路器检查（连续工具失败 ≥3 → 引导）               │
 │                                                         │
 │      k. 检查是否需要压缩                                 │
-│         if totalTokens > 64000 → e.Compact(ctx)         │
+│         if totalTokens ≥ CompactionTrigger(model) → 压缩 │
 │    }                                                    │
 ├───────────────────────────────────────────────────────┤
 │ 5. 超过最大迭代次数 → 返回错误                            │
@@ -724,8 +725,6 @@ type Def struct {
 | `sleep` | adv_*.go | 暂停等待 | ✅ | ✅ |
 | `brief` | adv_*.go | 生成摘要 | ✅ | ✅ |
 | `send_message` | adv_*.go | 发送消息 | ✅ | ✅ |
-| `lsp` | adv_*.go | LSP 调用 | ✅ | ✅ |
-| `cron` | adv_*.go | 定时任务 | ❌ | ✅ |
 | `mcp` | 动态 | 调用 MCP 工具 | 取决于工具 | 取决于工具 |
 
 **工具注册**(`registry.go`)：
@@ -774,15 +773,14 @@ type Runtime struct {
 
 ### 5.5 权限系统 (permission)
 
-**四种模式**：
+**四种模式**（`internal/permission/permission.go`，分层放宽）：
 ```
-Default  — 写操作需确认（默认）
-Auto     — 全部允许（自动）
-Strict   — 全部需确认
-Yolo     — 仅危险操作需确认
-Bypass   — 引擎内部使用
-Plan     — 计划执行期间使用
+Default  — 只读工具与整行只读的 shell 命令自动放行，其余询问（默认）
+Auto     — Default + 构建/测试命令（CatBuild）+ 项目内 write/edit；git 写/安装/网络/未知命令仍询问
+Bypass   — 全部放行（灾难命令仍硬拦截）
+Plan     — 只读工具；bash 与写入一律拒绝
 ```
+没有规则命中时任何模式都不会“默认放行”；`-p` 无提示器，需要询问的调用直接拒绝。
 
 **权限决策链**：
 ```
@@ -802,7 +800,7 @@ CatDangerous — rm -rf、curl|bash、修改系统文件
 
 ### 5.6 会话持久化 (session)
 
-**存储位置**：`~/.cove/sessions/{session-id}.json`
+**存储位置**：`~/.cove/sessions/{session-id}.jsonl`（首行元数据 + 每行一条消息，保存时只追加）+ `index.json`（列表索引）；旧版 `{session-id}.json` 仍可加载，下次保存时迁移为 `.jsonl`
 
 ```go
 type Record struct {
@@ -868,18 +866,19 @@ type Skill struct {
 
 ### 5.9 钩子系统 (hooks)
 
-**文件**: `internal/hooks/hooks.go`
+**文件**: `internal/hooks/hooks.go`、`internal/hooks/config.go`
 
-支持的生命周期事件：
-```go
-SessionStart   // 会话开始
-PreToolUse     // 工具调用前（可修改输入）
-PostToolUse    // 工具调用后（可修改输出）
-```
+支持的生命周期事件：`BeforeTool`、`AfterTool`、`SessionStart`、`SessionEnd`（配置中也接受 `PreToolUse`/`PostToolUse` 别名；`SessionEnd` 由 cli 在退出时触发一次，最多等待 30 秒）。
 
 每个钩子可以是：
 - **内置 Go 函数** — 直接注册
-- **外部脚本** — 配置在 `~/.cove/hooks/` 下
+- **外部命令** — 只从用户级 `~/.cove/hooks.json` 读取（不读项目级，避免克隆的仓库在本机执行命令）：
+
+```json
+{"hooks": {"BeforeTool": [{"matcher": "bash", "command": "echo run >> C:/logs/cove.log", "timeout": 10}]}}
+```
+
+`matcher` 是匹配完整工具名的正则（空或 `*` = 所有工具）；`command` 用 bash 工具同款 shell 执行，stdin 收到 HookInput JSON；`BeforeTool` 钩子输出 `{"continue": false}` 可阻止调用；`async: true` 不等待结果。格式详见 USER_MANUAL「Hooks（hooks.json）」。
 
 ---
 
@@ -932,7 +931,7 @@ AI: tool_call("mcp", {serverName: "filesystem", toolName: "read_file", arguments
 │  ──────────────────────────────────────────                  │
 │  连续 60 轮无任何文件创建/修改 → 空转检测                     │
 │                                                             │
-│  只读工具豁免: read/grep/glob/lsp/webfetch/browser/task_list │
+│  只读工具豁免: read/grep/glob/webfetch/browser/task_list 等  │
 │  自适应阈值: Flash模型使用更敏感的 8/12, 8/10, 8/30, 50      │
 │  分级响应: 前5次非致命注入引导, 超出则硬终止                   │
 │  指纹重置: 注入引导后自动清空窗口                              │
@@ -1094,19 +1093,25 @@ Mask(history) → (result, newHistory)
 
 **方案**：策略持久化 + 细粒度规则匹配。
 
-**规则模型**：
+**规则模型**（`policies.json` 中的一个数组元素）：
 ```go
 type PolicyRule struct {
-    ToolPattern string           // "read", "bash", "mcp_*_*"
-    Decision    RuleDecision     // always_allow / always_deny / ask
-    ParamRules  []ParamCondition // 参数级条件
-    ExpiresAt   *time.Time       // 可选过期
+    ID            string            `json:"id"`
+    Description   string            `json:"description"`
+    ToolPattern   string            `json:"tool_pattern"`   // "bash", "write", "mcp", "*"
+    Action        PolicyAction      `json:"action"`         // allow / deny / ask
+    Priority      int               `json:"priority"`       // 越大越先评估
+    Enabled       bool              `json:"enabled"`
+    ParamMatch    map[string]string `json:"param_match,omitempty"`
+    CommandPrefix string            `json:"command_prefix,omitempty"` // shell 命令前缀
+    InputEquals   map[string]string `json:"input_equals,omitempty"`   // 参数精确相等（MCP 服务器+工具名）
+    Scope         string            `json:"scope,omitempty"`          // 项目根；空 = 所有项目
 }
 ```
 
-**匹配优先级**：精确匹配 → 通配符匹配 → 回退到分类器
+**匹配**：规则按优先级评估；deny/ask 规则优先于模式的自动放行；没有规则命中时任何模式都回到分层默认（default/auto/bypass/plan，见 USER_MANUAL「权限模式」），不会直接放行。
 
-**持久化**：`~/.cove/policy.json`
+**持久化**：`~/.cove/policies.json`（设置了 `COVE_CONFIG_DIR` 时位于该目录下）。授权提示选 `[p] 永久允许` 时追加一条带 `scope`（当前项目根）的 allow 规则；`scope` 不等于当前项目根的规则加载时被忽略。文件原子写入，损坏时不覆盖。
 
 ---
 
@@ -1154,23 +1159,6 @@ type SessionDiff struct {
 
 ---
 
-### 5.12g 本地遥测 (Telemetry)
-
-**文件**: `internal/telemetry/telemetry.go` (132行)
-
-**问题**：需要了解使用情况以优化产品。
-
-**方案**：本地事件记录（非匿名上报）。
-
-**特性**：
-- 结构化事件（类型、时间戳、数据）
-- 本地存储 `~/.cove/telemetry.json`
-- 上限 1000 条，超出裁剪
-- 选择加入（默认关闭）
-- 轻量级，不包含敏感数据
-
----
-
 ### 5.12h 安全检查 (Safety)
 
 **文件**: `internal/permission/safety.go` (集成在 Permission 中)
@@ -1184,45 +1172,26 @@ type SessionDiff struct {
 
 ---
 
-### 5.13 TUI 界面层 (tui)
+### 5.13 交互式 REPL 界面层
 
-**文件**: `internal/tui/tui.go` (757行)
+**文件**: `cli/cove/repl_loop.go`（主循环）、`cli/cove/repl_tasks.go`（任务队列）、`internal/repl/readline.go`（行编辑器）、`internal/termui/`（样式与输出）、`internal/render/markdown.go`（Markdown 渐进渲染）
 
-基于 **Bubble Tea** (Elm Architecture) 的全屏终端 UI。
+交互模式是一个行式 REPL，不占用全屏：输入行固定在底部，所有输出（termui、日志、引擎诊断）经 `termui.SetConsole(reader)` 打印在输入行上方；任务执行时仍可继续输入（排队）。
 
-**布局**：
+**数据流（REPL ↔ Engine）**：
 ```
-┌────────────────────────────────────────────┐
-│  Cove v6.3.1 · claude-sonnet-4 · main*    │ ← 顶部状态栏
-├────────────────────────────────────────────┤
-│                                            │
-│  用户: 帮我写一个 HTTP 服务器               │
-│                                            │
-│  Cove: 好的，我来创建...                    │ ← 对话流（可滚动）
-│                                            │
-│  ⏳ [write] server.go                      │ ← 工具进度
-│  ✓ [write] server.go (1.2 KB)              │
-│                                            │
-├────────────────────────────────────────────┤
-│  > 用户输入区...                            │ ← 底部输入框
-├────────────────────────────────────────────┤
-│  📊 in:1.2K out:3.4K | 💰 0.02/10.00 USD  │ ← 底部状态栏
-└────────────────────────────────────────────┘
-```
-
-**数据流（TUI ↔ Engine）**：
-```
-User submits text in TUI
-  → App.Submit(text) 回调
-  → 推入 tuiJobQueue
-  → Worker goroutine: eng.RunMessageWithStream(ctx, text, ...)
+用户在输入行回车
+  → 斜杠命令：命令注册表执行
+  → 普通消息：replTaskRunner 入队（相似任务合并）
+  → Worker goroutine: runChatInteractionMessage → eng.RunMessageWithStream(...)
        │
-       ├─ onDelta → App.SendDelta(tea.Msg)
-       ├─ onReasoning → App.SendReasoning(tea.Msg)
-       ├─ OnEngineOutput → App.SendOutput(tea.Msg)
-       ├─ OnToolProgress → App.SendProgress(tea.Msg)
-       └─ return → App.SendDone(tea.Msg)
+       ├─ onDelta → render.MarkdownStream → 打印在输入行上方
+       ├─ onReasoning → 状态行 / show_reasoning 时整段输出
+       ├─ OnEngineOutput → 工具块渲染
+       └─ 需要授权 → askToolPermission：提示 [y]/[a]/[p]/[n]，经 repl.TakePermInputCh 读取回答
 ```
+
+非交互（管道、重定向、`--no-tui`、`COVE_TUI=0`）走 `cli/cove/headless.go` 的 `runHeadless()`：逐行读 stdin，答案写 stdout，提示写 stderr，不做 Markdown 渲染。
 
 ---
 
@@ -1286,7 +1255,6 @@ type StreamCallback interface {
 | **loopdetect** | `engine/loopdetect.go` | 3 层循环检测 + 自适应阈值 + 停滞检测 |
 | **nextspeaker** | `engine/nextspeaker.go` | 发言人预测（继续/停止决策） |
 | **sessiondiff** | `session/diff.go` | 会话变更对比（工具/文件/Token） |
-| **telemetry** | `telemetry/telemetry.go` | 本地事件记录（选择加入） |
 | **safety** | `permission/safety.go` | 安全检查（敏感命令/路径/密钥） |
 | **policy** | `permission/policy.go` | 策略引擎（持久化权限规则） |
 
@@ -1370,7 +1338,7 @@ type EngineView interface {
 用户输入: "在 server.go 中添加一个 /health 端点"
   │
   ▼
-[CLI] headless.go / repl_tui.go
+[CLI] headless.go / repl_loop.go
   │  调用 eng.RunMessageWithStream(ctx, "在 server.go 中添加...", onDelta, nil)
   │
   ▼
@@ -1429,7 +1397,7 @@ type EngineView interface {
   │       ├─ 权限: 写操作 → 检查模式 → Default → Ask
   │       ├─ e.perm.Check() → DAsk
   │       ├─ 调用 PermissionPrompt("edit", {filePath:"server.go"}, "will modify file")
-  │       │     → TUI 显示: "⚠ 允许执行 edit: server.go? [y/N]"
+  │       │     → REPL 显示授权框与选项 [y] 允许 [a] 本次会话总是允许 [p] 永久允许（本项目） [n] 拒绝
   │       │     → 用户输入 y → 返回 true
   │       ├─ Git checkpoint（自动 git commit）
   │       ├─ editTool.Call() → 精确替换
@@ -1638,7 +1606,7 @@ r.Register(command.NewStatsCmd())
 
 #### 第 3 步：在 REPL 中处理
 
-在 `cli/cove/main.go` 中通过命令注册表统一分发命令；交互端（TUI/headless）共享同一套命令实现。
+在 `cli/cove/main.go` 中通过命令注册表统一分发命令；交互端（REPL/headless）共享同一套命令实现。
 
 ---
 
@@ -1704,6 +1672,8 @@ func (p *groqProvider) ChatStream(ctx context.Context, req ChatRequest, handler 
 ### 7.4 添加一个配置项
 
 假设要添加 `max_iterations` 配置项。
+
+> 注：`max_iterations` 已在 11.2.0 实现（默认 200，交互模式到上限询问、`-p` 为硬上限，见 `internal/engine/turn_limits.go`），下面仅作为添加配置项的步骤示例。
 
 #### 第 1 步：修改 Config 结构
 
@@ -1963,7 +1933,7 @@ A: gomobile 对依赖有限制。`mobile/mobileapi/` 自包含，不引用 `inte
 A: Layer 1 只检测完全相同的工具+参数组合（如反复写同一个文件）。批量操作中每次参数不同，不会触发。Layer 2 的阈值 10/50 足够高，正常重复不会触发。
 
 **Q: 内存使用是否可控？**
-A: 对话历史在 Token 超过 64000 或超过 16 条消息时自动压缩。会话文件在磁盘上可能较大（包含完整历史），但内存中总是压缩后的版本。
+A: 对话历史在 Token 达到 `api.CompactionTrigger(model)` 时自动压缩：min(0.75 × 窗口 × 0.85, 窗口 − 回复预留 − 8K)，200K 模型约 127.5K；无法确定模型时回退为 `CompactTokenThreshold`（64000）。会话文件在磁盘上可能较大（包含完整历史），但内存中总是压缩后的版本。
 
 **Q: 怎么回滚 Agent 的误操作？**
 A: write/edit 操作前会自动执行 `git commit`（checkpoint 系统）。使用 `git diff HEAD~1` 查看变更，`git reset --hard HEAD~1` 回滚。
@@ -1979,8 +1949,8 @@ A: 当任务复杂时，AI 可以调用 `plan_mode` 进入只读规划模式，�
 
 | 常量 | 值 | 位置 |
 |------|-----|------|
-| `MaxIterations` | 200 | engine.go |
-| `CompactTokenThreshold` | 64000 | engine.go |
+| `max_iterations`（`config.DefaultMaxIterations`） | 200（交互模式到上限询问是否继续；`-p` 为硬上限，`--max-turns` 覆盖） | config.go / engine/turn_limits.go |
+| `CompactTokenThreshold` | 64000（仅在无法确定模型时使用；正常按 `api.CompactionTrigger`） | engine.go |
 | `maxParallelTools` | 8 | engine.go |
 | `streamIdleTimeout` | 180s | api/provider.go |
 | `fpWindow` (循环检测) | 10 | loopdetect.go |
@@ -2003,7 +1973,7 @@ A: 当任务复杂时，AI 可以调用 `plan_mode` 进入只读规划模式，�
 | API Provider 接口 | `internal/api/provider.go` |
 | 配置加载 | `internal/config/config.go` |
 | 循环检测 | `internal/engine/loopdetect.go` |
-| TUI 界面 | `internal/tui/tui.go` |
+| 交互式 REPL | `cli/cove/repl_loop.go` + `internal/repl/readline.go` |
 | 会话存储 | `internal/session/store.go` |
 | 权限管理 | `internal/permission/permission.go` |
 | 移动端引擎 | `mobile/cove.go` |

@@ -34,13 +34,14 @@ func (p *procTree) attach(cmd *exec.Cmd) {
 	}
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	//nolint:gosec // Windows job-object API requires passing the struct by unsafe pointer
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
 		log.Debugf("mcp: SetInformationJobObject: %v", err)
 		_ = windows.CloseHandle(job)
 		return
 	}
-	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid)) //nolint:gosec // a live process's PID is a small positive OS handle value, never near uint32's range
 	if err != nil {
 		log.Debugf("mcp: OpenProcess: %v", err)
 		_ = windows.CloseHandle(job)

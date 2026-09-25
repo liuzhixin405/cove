@@ -176,13 +176,13 @@ func (c *PluginCmd) Execute(ctx context.Context, in Input) (Output, error) {
 				MarketplaceInstall(name string) error
 			}
 			if mi, ok := in.PluginManager.(marketInstaller); ok {
-				if err := mi.MarketplaceInstall(name); err == nil {
+				err := mi.MarketplaceInstall(name)
+				if err == nil {
 					return Output{Message: fmt.Sprintf("✓ 已从 marketplace 安装: %s", name)}, nil
-				} else {
-					return Output{Message: fmt.Sprintf(
-						"无法从 marketplace 安装 %q: %v\n如果你知道插件仓库地址，用: /plugin install %s <git-url>\n或先刷新索引: /plugin refresh",
-						name, err, name)}, nil
 				}
+				return Output{Message: fmt.Sprintf(
+					"无法从 marketplace 安装 %q: %v\n如果你知道插件仓库地址，用: /plugin install %s <git-url>\n或先刷新索引: /plugin refresh",
+					name, err, name)}, nil
 			}
 		}
 

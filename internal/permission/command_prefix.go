@@ -28,7 +28,15 @@ func IsShellTool(name string) bool {
 // commandCovered would refuse anyway. The rules it returns always cover the
 // command they came from.
 func CommandPrefixes(command string) ([]string, bool) {
-	cmds, ok := coverableCommands(command)
+	return CommandPrefixesFor(command, "")
+}
+
+// CommandPrefixesFor is CommandPrefixes for a command that runs under the
+// given shell: under POSIX shells and PowerShell a fully quoted word may hold
+// operator characters (a commit message such as "fix(api): x; y"), under cmd
+// (and the zero ShellKind) it may not.
+func CommandPrefixesFor(command string, kind ShellKind) ([]string, bool) {
+	cmds, ok := coverableCommands(command, kind)
 	if !ok {
 		return nil, false
 	}
@@ -96,13 +104,7 @@ func commandPrefix(words []string) (string, bool) {
 
 // programName normalizes an executable word the way the shell resolves it:
 // case-insensitive on Windows, directory and .exe dropped.
-func programName(exe string) string {
-	name := strings.ToLower(exe)
-	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
-		name = name[i+1:]
-	}
-	return strings.TrimSuffix(name, ".exe")
-}
+func programName(exe string) string { return safety.ProgramName(exe) }
 
 // commandCovered reports whether every simple command in command starts with
 // one of prefixes. This is the whole policy for prefix allow rules:
@@ -116,13 +118,16 @@ func programName(exe string) string {
 //     expand it.
 //   - Output redirects only match when they discard (/dev/null, NUL, $null);
 //     writing a file is not part of running the allowed command.
-//   - A word holding an operator character (; & | < > parentheses) never
-//     matches. The tokenizer read it as quoted, but the real shell may not:
-//     \" in bash, or a single quote in cmd, leaves the operator live.
+//   - A word holding an operator character (; & | < > parentheses) only
+//     matches when the tokenizer saw the whole word inside quotes and the
+//     shell honours those quotes (POSIX sh/bash, PowerShell), and no quote in
+//     the line is preceded by a backslash (\" in bash). Under cmd, where a
+//     single quote is an ordinary character, such a word never matches.
+//   - Here-document and here-string bodies are stdin data, not commands.
 //
 // Anything refused here simply falls back to asking the user again.
-func commandCovered(command string, prefixes [][]string) bool {
-	cmds, ok := coverableCommands(command)
+func commandCovered(command string, prefixes [][]string, kind ShellKind) bool {
+	cmds, ok := coverableCommands(command, kind)
 	if !ok {
 		return false
 	}
@@ -143,11 +148,11 @@ func commandCovered(command string, prefixes [][]string) bool {
 
 // coverableCommands splits command into the words of each simple command, or
 // reports false when the line contains something commandCovered refuses.
-func coverableCommands(command string) ([][]string, bool) {
-	if strings.ContainsAny(command, "`") ||
-		strings.Contains(command, "$(") || strings.Contains(command, "<(") || strings.Contains(command, ">(") {
+func coverableCommands(command string, kind ShellKind) ([][]string, bool) {
+	if hasSubstitution(command) || maybePowerShell(kind) && (hasUnquotedBrace(command) || hasTypographicQuote(command)) {
 		return nil, false
 	}
+	trustQuotes := quotingTrusted(command, kind)
 	simple := safety.SimpleCommands(command)
 	if len(simple) == 0 {
 		return nil, false
@@ -162,14 +167,44 @@ func coverableCommands(command string) ([][]string, bool) {
 				return nil, false
 			}
 		}
-		for _, w := range c.Words {
-			if strings.ContainsAny(w, ";&|<>()\n\r") {
-				return nil, false
-			}
+		if !literalWords(c, kind, trustQuotes) {
+			return nil, false
 		}
 		out = append(out, c.Words)
 	}
 	return out, true
+}
+
+// quotingTrusted reports whether a word the tokenizer saw entirely inside
+// quotes is a literal argument for the shell command runs under: true for
+// POSIX shells and PowerShell, unless a backslash precedes a quote somewhere
+// in the line — the tokenizer keeps backslashes literally, so there it and
+// bash (\" outside quotes is a literal quote) can disagree about where a
+// quoted string ends. cmd.exe, where ' is an ordinary character, never
+// qualifies.
+func quotingTrusted(command string, kind ShellKind) bool {
+	return kind.trustsQuotes() &&
+		!strings.Contains(command, `\"`) && !strings.Contains(command, `\'`)
+}
+
+// literalWords reports whether every word of c is certainly a plain argument
+// rather than shell syntax the tokenizer may have misread: a word holding an
+// operator character must be fully quoted under a shell whose quotes are
+// trusted, and under PowerShell an unquoted $ is refused because
+// $var.Method(...) in argument position runs code.
+func literalWords(c safety.SimpleCommand, kind ShellKind, trustQuotes bool) bool {
+	for i, w := range c.Words {
+		if trustQuotes && i < len(c.Quoted) && c.Quoted[i] {
+			continue
+		}
+		if strings.ContainsAny(w, ";&|<>()\n\r") {
+			return false
+		}
+		if kind == ShellPowerShell && strings.Contains(w, "$") {
+			return false
+		}
+	}
+	return true
 }
 
 func discardTarget(path string) bool {
@@ -192,16 +227,91 @@ func hasWordPrefix(words, prefix []string) bool {
 	return true
 }
 
-// anyCommandHasPrefix is the deny/ask reading of a prefix rule: the rule
-// applies as soon as one simple command in the line starts with the prefix,
-// including commands inside substitutions.
-func anyCommandHasPrefix(command string, prefix []string) bool {
+// anyCommandHasPrefixNormalized is the deny/ask reading of a prefix rule:
+// the rule applies as soon as one simple command in the line starts with the
+// prefix, including commands inside substitutions. Unlike the allow reading
+// (commandCovered, words as written) it looks through spellings that run the
+// same program: a directory or .exe on the program name and any letter case
+// ("/usr/bin/git", "git.exe", "GIT"), runners and assignments in front
+// ("sudo", "env X=1", "command", "nohup", "X=1"; see
+// safety.StripCommandRunners), and the global options a subcommand tool
+// takes before its subcommand ("git -C . push", "kubectl -n prod delete").
+// Widening a deny or ask rule only ever asks or refuses more often.
+func anyCommandHasPrefixNormalized(command string, prefix []string) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	want := normalizeProgram(prefix)
 	for _, c := range safety.SimpleCommands(command) {
-		if hasWordPrefix(c.Words, prefix) {
+		if hasWordPrefix(c.Words, prefix) ||
+			hasWordPrefix(normalizeProgram(c.Words), want) ||
+			hasWordPrefix(normalizeProgram(safety.StripCommandRunners(c.Words)), want) {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeProgram returns words with the program name normalized
+// (programName) and, for a subcommand tool, the global options in front of
+// the subcommand dropped. It does not strip runners: a "sudo rm" rule keeps
+// meaning sudo rm.
+func normalizeProgram(words []string) []string {
+	if len(words) == 0 {
+		return nil
+	}
+	name := programName(words[0])
+	rest := words[1:]
+	if subcommandTools[name] {
+		rest = skipGlobalOptions(rest, globalArgOptions[name])
+	}
+	out := make([]string, 0, 1+len(rest))
+	return append(append(out, name), rest...)
+}
+
+// skipGlobalOptions drops the leading option words of a subcommand tool's
+// arguments; argOpts lists the options whose value is a separate word
+// ("-C dir"). "--opt=value" is one word either way. An unknown option taking
+// a separate value leaves that value in place, so the match is missed (the
+// rule then behaves as before), never widened to another subcommand.
+func skipGlobalOptions(args []string, argOpts map[string]bool) []string {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") && args[0] != "-" {
+		opt := args[0]
+		args = args[1:]
+		if opt == "--" {
+			break
+		}
+		if argOpts[opt] && len(args) > 0 {
+			args = args[1:]
+		}
+	}
+	return args
+}
+
+// globalArgOptions lists, per subcommand tool, the global options before the
+// subcommand whose value is a separate word.
+var globalArgOptions = map[string]map[string]bool{
+	"git": {"-C": true, "-c": true, "--git-dir": true, "--work-tree": true, "--namespace": true,
+		"--super-prefix": true, "--config-env": true},
+	"docker": {"-H": true, "--host": true, "--context": true, "-c": true, "--config": true,
+		"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true},
+	"podman": {"--connection": true, "-c": true, "--url": true, "--root": true, "--runroot": true,
+		"--log-level": true, "--identity": true},
+	"kubectl": {"-n": true, "--namespace": true, "--context": true, "--kubeconfig": true,
+		"-s": true, "--server": true, "--cluster": true, "--user": true, "--token": true,
+		"--as": true, "--as-group": true, "-v": true, "--request-timeout": true,
+		"--certificate-authority": true, "--client-certificate": true, "--client-key": true},
+	"helm":      {"-n": true, "--namespace": true, "--kube-context": true, "--kubeconfig": true},
+	"go":        {"-C": true},
+	"cargo":     {"-C": true, "--config": true, "-Z": true},
+	"npm":       {"--prefix": true, "-w": true, "--workspace": true},
+	"pnpm":      {"-C": true, "--dir": true, "--filter": true, "-F": true},
+	"yarn":      {"--cwd": true},
+	"gh":        {"-R": true, "--repo": true},
+	"systemctl": {"-H": true, "--host": true, "-M": true, "--machine": true},
+	"aws":       {"--profile": true, "--region": true, "--output": true, "--endpoint-url": true},
+	"az":        {"--subscription": true, "--output": true, "-o": true},
+	"gcloud":    {"--project": true, "--account": true, "--configuration": true},
 }
 
 func inputCommand(input map[string]any) string {

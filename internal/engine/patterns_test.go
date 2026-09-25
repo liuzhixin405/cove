@@ -79,6 +79,7 @@ func newPatternEngine(t *testing.T, prov api.Provider, mutate func(*Config), too
 	eng.dreamRunner = nil
 	eng.cpMgr = nil
 	eng.sessionNotes = nil // never read or write notes files in the source tree
+	eng.store = nil        // no session files: two fsync'd writes per turn
 	eng.perm.SetMode(permission.Bypass)
 	return eng
 }
@@ -108,6 +109,12 @@ func TestSystemPromptStaysByteStableWhenTheWorkingTreeChanges(t *testing.T) {
 	eng.collectContext = func() *ctxt.ProjectContext {
 		return &ctxt.ProjectContext{Cwd: "/w", IsGitRepo: true, GitBranch: "main",
 			GitStatus: statuses[turn], GitLog: "abc123 commit " + statuses[turn], Platform: "linux", Shell: "sh"}
+	}
+	// Each turn re-reads only the git state, so the fake refresh plays the
+	// working tree changing between turns.
+	eng.refreshGit = func(pc *ctxt.ProjectContext) {
+		pc.GitStatus = statuses[turn]
+		pc.GitLog = "abc123 commit " + statuses[turn]
 	}
 	eng.SetProjectContext(eng.collectContext())
 

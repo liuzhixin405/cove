@@ -20,8 +20,9 @@ func TestTurnEndSavesTheReply(t *testing.T) {
 
 	prov := &mockProvider{responses: []mockResponse{{content: "the answer"}}}
 	eng := newTestEngine(prov)
-	if eng.store == nil || eng.session == nil {
-		t.Skip("engine has no session store")
+	eng.store = mustSessionStore(t)
+	if eng.session == nil {
+		t.Skip("engine has no session record")
 	}
 	if _, err := eng.RunMessageWithStream(context.Background(), api.Message{Role: "user", Content: "question"}, nil, nil); err != nil {
 		t.Fatal(err)
@@ -51,8 +52,9 @@ func TestSavedSessionRecordsProjectDir(t *testing.T) {
 
 	prov := &mockProvider{responses: []mockResponse{{content: "ok"}}}
 	eng := newTestEngine(prov)
-	if eng.store == nil || eng.session == nil {
-		t.Skip("engine has no session store")
+	eng.store = mustSessionStore(t)
+	if eng.session == nil {
+		t.Skip("engine has no session record")
 	}
 	if _, err := eng.RunMessageWithStream(context.Background(), api.Message{Role: "user", Content: "question"}, nil, nil); err != nil {
 		t.Fatal(err)

@@ -104,7 +104,8 @@ func TestCommandArgs(t *testing.T) {
 	}{
 		{Shell{Kind: Bash, Path: "bash"}, []string{"-c", "echo hi"}},
 		{Shell{Kind: PowerShell, Path: "pwsh"}, []string{"-NoProfile", "-NonInteractive", "-Command", psUTF8 + "echo hi"}},
-		{Shell{Kind: Cmd, Path: "cmd"}, []string{"/C", "echo hi"}},
+		// cmd writes in the console code page unless switched to UTF-8.
+		{Shell{Kind: Cmd, Path: "cmd"}, []string{"/C", "chcp 65001>nul & echo hi"}},
 	}
 	for _, c := range cases {
 		if got := c.sh.Args("echo hi"); strings.Join(got, "|") != strings.Join(c.want, "|") {

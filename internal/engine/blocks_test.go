@@ -24,8 +24,8 @@ func TestToolCallReachesTheSinkAsAnExpandableBlock(t *testing.T) {
 	tl := &mockTool{name: "bash", readOnly: true, safe: true, result: big}
 	eng := newTestEngine(prov, tl)
 
-	cap := uiout.NewCapture()
-	eng.SetOutput(cap)
+	capture := uiout.NewCapture()
+	eng.SetOutput(capture)
 
 	if _, err := eng.RunMessageWithStream(context.Background(),
 		api.Message{Role: "user", Content: "run the tests"}, nil, nil); err != nil {
@@ -33,14 +33,14 @@ func TestToolCallReachesTheSinkAsAnExpandableBlock(t *testing.T) {
 	}
 
 	var got *render.Block
-	for _, b := range cap.Blocks() {
+	for _, b := range capture.Blocks() {
 		if b.Kind == render.KindTool && b.Tool == "bash" {
 			cp := b
 			got = &cp
 		}
 	}
 	if got == nil {
-		t.Fatalf("no tool block reached the sink; blocks=%+v lines=%q", cap.Blocks(), cap.Lines())
+		t.Fatalf("no tool block reached the sink; blocks=%+v lines=%q", capture.Blocks(), capture.Lines())
 	}
 	if !strings.Contains(got.Header, "go test ./...") {
 		t.Errorf("header does not name the command that ran: %q", got.Header)
@@ -73,14 +73,14 @@ func TestFailedToolCallIsAlwaysExpandable(t *testing.T) {
 	tl := &mockTool{name: "read", readOnly: true, safe: true, result: "Error: file not found: missing.go\n  at some/path"}
 	eng := newTestEngine(prov, tl)
 
-	cap := uiout.NewCapture()
-	eng.SetOutput(cap)
+	capture := uiout.NewCapture()
+	eng.SetOutput(capture)
 	if _, err := eng.RunMessageWithStream(context.Background(),
 		api.Message{Role: "user", Content: "read it"}, nil, nil); err != nil {
 		t.Fatalf("turn failed: %v", err)
 	}
 
-	for _, b := range cap.Blocks() {
+	for _, b := range capture.Blocks() {
 		if b.Kind != render.KindTool || b.Tool != "read" {
 			continue
 		}
@@ -111,20 +111,20 @@ func TestRunningToolIsActivityNotHistory(t *testing.T) {
 	}
 	eng := newTestEngine(prov, &mockTool{name: "bash", readOnly: true, safe: true, result: "a\nb"})
 
-	cap := uiout.NewCapture()
-	eng.SetOutput(cap)
+	capture := uiout.NewCapture()
+	eng.SetOutput(capture)
 	if _, err := eng.RunMessageWithStream(context.Background(),
 		api.Message{Role: "user", Content: "ls"}, nil, nil); err != nil {
 		t.Fatalf("turn failed: %v", err)
 	}
 
-	for _, l := range cap.Lines() {
+	for _, l := range capture.Lines() {
 		if strings.Contains(l, "执行 bash") {
 			t.Fatalf("the transient notice was emitted as a history line: %q", l)
 		}
 	}
 	// And it must be cleared afterwards, or the spinner text outlives the tool.
-	acts := cap.Activities()
+	acts := capture.Activities()
 	if len(acts) == 0 {
 		t.Fatal("no activity was reported at all")
 	}

@@ -55,6 +55,46 @@ func TruncateMiddle(text string, maxTokens int) string {
 	return text[:headEnd] + fmt.Sprintf("\n... [%d lines omitted] ...\n", omitted) + text[tailStart:]
 }
 
+// TruncateKeepTail keeps text within about maxTokens by dropping lines from
+// the middle while keeping the last tailLines lines verbatim and as much of
+// the start as fits. It suits results whose first line names the outcome
+// ("Error: ...") and whose last lines carry the conclusion (exit status, the
+// final failure), where cutting either end loses the point.
+func TruncateKeepTail(text string, maxTokens int, tailLines int) string {
+	if maxTokens <= 0 {
+		return "... [truncated]"
+	}
+	if Estimate(text) <= maxTokens {
+		return text
+	}
+	if tailLines < 0 {
+		tailLines = 0
+	}
+	tailStart := len(text)
+	for n := 0; n < tailLines && tailStart > 0; n++ {
+		i := strings.LastIndexByte(text[:tailStart-1], '\n')
+		if i < 0 {
+			tailStart = 0
+			break
+		}
+		tailStart = i + 1
+	}
+	// Room for the omission marker, which Estimate counts too.
+	const markerReserve = 16
+	tail := text[tailStart:]
+	headBudget := maxTokens - Estimate(tail) - markerReserve
+	if tailStart == 0 || headBudget < maxTokens/4 {
+		// The tail alone would crowd out the head; keep both ends evenly.
+		return TruncateMiddle(text, maxTokens-markerReserve)
+	}
+	headEnd := prefixEnd(text, headBudget)
+	if headEnd >= tailStart {
+		return text
+	}
+	omitted := strings.Count(text[headEnd:tailStart], "\n")
+	return text[:headEnd] + fmt.Sprintf("\n... [%d lines omitted] ...\n", omitted) + tail
+}
+
 // prefixEnd returns the byte offset where the first maxTokens tokens end,
 // moved back to a line or word boundary when one is near.
 func prefixEnd(text string, maxTokens int) int {

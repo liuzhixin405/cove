@@ -201,8 +201,15 @@ func TestResumeStartupSessionLoadsMessages(t *testing.T) {
 // of the ID.
 func TestResumeStartupSessionAcceptsFileName(t *testing.T) {
 	store := fakeSessionLoader{"s1": {ID: "s1"}}
-	if _, _, err := resumeStartupSession(store, "s1.json", "", func(*session.Record) {}); err != nil {
-		t.Fatalf("s1.json: %v", err)
+	for _, arg := range []string{"s1.json", "s1.jsonl", " s1.jsonl ", "s1"} {
+		if _, _, err := resumeStartupSession(store, arg, "", func(*session.Record) {}); err != nil {
+			t.Fatalf("%q: %v", arg, err)
+		}
+	}
+	// A dot inside an ID is not an extension.
+	dotted := fakeSessionLoader{"2026.09.25": {ID: "2026.09.25"}}
+	if _, _, err := resumeStartupSession(dotted, "2026.09.25", "", func(*session.Record) {}); err != nil {
+		t.Fatalf("dotted id: %v", err)
 	}
 }
 
@@ -226,5 +233,21 @@ func TestResumeStartupSessionMissingIDFails(t *testing.T) {
 	}
 	if called {
 		t.Fatal("messages must not be replaced when the session is missing")
+	}
+}
+
+// "cove -r index.json" names the sessions index, not a session: it fails
+// with a clear message instead of loading the index as a session.
+func TestResumeStartupSessionRejectsIndex(t *testing.T) {
+	store := fakeSessionLoader{"index": {ID: "index"}}
+	for _, arg := range []string{"index", "index.json", "index.jsonl"} {
+		called := false
+		_, _, err := resumeStartupSession(store, arg, "", func(*session.Record) { called = true })
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("%q: err = %v, want a reserved-id error", arg, err)
+		}
+		if called {
+			t.Fatalf("%q: resume called for the index file", arg)
+		}
 	}
 }

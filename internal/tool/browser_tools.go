@@ -178,3 +178,10 @@ func screenshotPath(input Input, cwd string) (string, error) {
 	}
 	return abs, nil
 }
+
+// BrowserChromeAvailable reports whether headless Chrome is compiled in
+// (-tags chromedp). Without it the browser tool only falls back to an HTTP
+// fetch, which webfetch already does, so the registry leaves it out.
+func BrowserChromeAvailable() bool {
+	return browser.New(browser.DefaultConfig()).ChromeAvailable()
+}

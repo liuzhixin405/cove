@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/diagnostic"
+	"github.com/liuzhixin405/cove/internal/tool"
 )
 
 type diagnoseCmd struct{}
@@ -41,7 +44,7 @@ func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) 
 		return c.archiveRuntimeLog()
 	case "quick":
 		report := checker.RunQuick()
-		return Output{Message: report.Format()}, nil
+		return Output{Message: report.Format() + webSearchHint(cfg)}, nil
 	default:
 		report := checker.RunAll(ctx)
 		msg := report.Format()
@@ -50,6 +53,7 @@ func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) 
 		}
 		// Append a runtime-error reminder so recurring hangs/failures from this
 		// session (and previous ones) surface alongside the static checks.
+		msg += webSearchHint(cfg)
 		msg += c.runtimeReminder()
 		return Output{Message: msg}, nil
 	}
@@ -173,4 +177,24 @@ func (c *diagnoseCmd) listCodes() (Output, error) {
 	}
 
 	return Output{Message: msg}, nil
+}
+
+// webSearchHint is the /diagnose line about the websearch backend: empty when
+// a search API is configured or DuckDuckGo was chosen explicitly.
+func webSearchHint(cfg *config.Config) string {
+	var s tool.WebSearchSettings
+	if cfg != nil && cfg.WebSearch != nil {
+		s = tool.WebSearchSettings{Provider: cfg.WebSearch.Provider, APIKey: cfg.WebSearch.APIKey}
+	}
+	provider, _ := tool.ResolveWebSearchBackend(s)
+	if provider != "duckduckgo" {
+		return ""
+	}
+	switch p := strings.ToLower(strings.TrimSpace(s.Provider)); p {
+	case "duckduckgo", "ddg":
+		return ""
+	case "tavily", "brave":
+		return fmt.Sprintf("\n\x1b[33m⚠ web_search.provider 为 %s，但没有 api_key（也没有对应环境变量），websearch 已回退到 DuckDuckGo 抓取。\x1b[0m\n", p)
+	}
+	return "\n\x1b[2mℹ websearch 未配置搜索 API，当前使用 DuckDuckGo 抓取（结果有限）。可在 config.json 设置 web_search.provider（tavily|brave）与 api_key，或设置 TAVILY_API_KEY / BRAVE_API_KEY。\x1b[0m\n"
 }

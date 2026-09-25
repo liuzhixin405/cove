@@ -32,9 +32,26 @@ var privateCIDRs = []string{
 	"169.254.0.0/16", // link-local, incl. 169.254.169.254 cloud metadata
 	"100.64.0.0/10",  // RFC6598 carrier NAT
 	"192.0.0.0/24",   // IETF protocol assignments
+	"0.0.0.0/8",      // "this network"; 0.0.0.0 reaches the local host on Linux/macOS
+	"224.0.0.0/4",    // multicast
+	"240.0.0.0/4",    // reserved, incl. 255.255.255.255 broadcast
 	"::1/128",        // IPv6 loopback
 	"fc00::/7",       // IPv6 unique-local
 	"fe80::/10",      // IPv6 link-local
+	"ff00::/8",       // IPv6 multicast
+	"64:ff9b::/96",   // NAT64: embeds an IPv4 address (64:ff9b::a00:1 is 10.0.0.1)
+}
+
+// literalOnlyCIDRs are refused when a URL names them as a literal address, but
+// not when a hostname resolves into them.
+//
+// 198.18.0.0/15 is the benchmarking range, and it is also where fake-IP DNS
+// (Clash/Surge TUN mode, common on machines behind the GFW) puts every name
+// it answers, proxying the connection to the real host. Refusing resolved
+// addresses in it would refuse every fetch on such a machine, while a target
+// someone spells out as http://198.18.x.y/ has no business being fetched.
+var literalOnlyCIDRs = []string{
+	"198.18.0.0/15",
 }
 
 // proxyFromEnvironment picks the proxy for a request. It is a variable so tests
@@ -47,14 +64,40 @@ var proxyFromEnvironment = http.ProxyFromEnvironment
 // every name, even "x.invalid.", with an address in 198.18.0.0/15.
 var lookupIP = net.LookupIP
 
-var parsedPrivate []*net.IPNet
+var parsedPrivate, parsedLiteralOnly []*net.IPNet
 
 func init() {
-	for _, cidr := range privateCIDRs {
-		if _, n, err := net.ParseCIDR(cidr); err == nil {
-			parsedPrivate = append(parsedPrivate, n)
+	parsedPrivate = mustParseCIDRs(privateCIDRs)
+	parsedLiteralOnly = mustParseCIDRs(literalOnlyCIDRs)
+}
+
+func mustParseCIDRs(cidrs []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic("safeurl: bad CIDR " + cidr)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// isPrivateLiteral is IsPrivateIP for an address the URL (or dial target)
+// names literally, which additionally covers literalOnlyCIDRs.
+func isPrivateLiteral(ip net.IP) bool {
+	if IsPrivateIP(ip) {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range parsedLiteralOnly {
+		if n.Contains(ip) {
+			return true
 		}
 	}
+	return false
 }
 
 // IsPrivateIP reports whether ip must not be reachable from a fetch.
@@ -100,7 +143,7 @@ func IsPrivateHost(host string) bool {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return IsPrivateIP(ip)
+		return isPrivateLiteral(ip)
 	}
 	ips, err := lookupIP(host)
 	if err != nil || len(ips) == 0 {
@@ -193,6 +236,9 @@ func NewClient(timeout time.Duration) *http.Client {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
+		}
+		if ip := net.ParseIP(host); ip != nil && isPrivateLiteral(ip) {
+			return nil, fmt.Errorf("blocked: %s is a private address", host)
 		}
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 		if err != nil || len(ips) == 0 {

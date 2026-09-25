@@ -47,7 +47,7 @@ type Config struct {
 	Provider api.Provider
 	Model    string
 	Tools    []tool.Tool // restricted tool set
-	MaxIter  int         // max iterations (default 30)
+	MaxIter  int         // max model calls (0 = DefaultMaxIter)
 	// Cwd is the project directory tool calls resolve relative paths against.
 	Cwd string
 	// PermissionMode is the session's real mode. It is passed through to
@@ -88,10 +88,14 @@ const loopLimit = 3
 // subAgentResultBytes backstops the size of one tool result in a sub-agent.
 const subAgentResultBytes = 32 * 1024
 
+// DefaultMaxIter is a sub-agent's model-call cap when none is configured
+// (config "subagent_max_iterations").
+const DefaultMaxIter = 60
+
 // NewSubAgent creates a new isolated sub-agent.
 func NewSubAgent(cfg Config) *SubAgent {
-	if cfg.MaxIter == 0 {
-		cfg.MaxIter = 30
+	if cfg.MaxIter <= 0 {
+		cfg.MaxIter = DefaultMaxIter
 	}
 	reg := tool.NewRegistry()
 	for _, t := range cfg.Tools {
@@ -128,12 +132,36 @@ func (sa *SubAgent) gate(ctx context.Context, tc api.ToolCall, t tool.Tool) erro
 	return fmt.Errorf("no permission gate configured for sub-agent: refusing non-read-only tool %q", tc.Name)
 }
 
+// Exit reasons of a sub-agent run (Result.ExitReason).
+const (
+	// ExitCompleted: the model answered without further tool calls.
+	ExitCompleted = "completed"
+	// ExitMaxIterations: the model-call cap stopped the run; Output holds
+	// the partial result.
+	ExitMaxIterations = "max_iterations"
+	// ExitInterrupted: cancelled, timed out, or out of budget.
+	ExitInterrupted = "interrupted"
+	// ExitError: a model call failed.
+	ExitError = "error"
+	// ExitLoop: the same tool-call batch was requested loopLimit times.
+	ExitLoop = "loop"
+)
+
 // Result is the outcome of a sub-agent task.
 type Result struct {
 	Output  string
 	Steps   int
 	Success bool
-	Error   string
+	// ExitReason says why the run stopped: one of the Exit* constants.
+	ExitReason string
+	// Truncated reports that Output is a partial result rather than the
+	// sub-agent's final answer.
+	Truncated bool
+	// CapReached reports that the run stopped at its model-call cap; Output
+	// then holds the partial result (the steps done and the last text).
+	// Kept for compatibility: it equals ExitReason == ExitMaxIterations.
+	CapReached bool
+	Error      string
 
 	// Token usage across every model call the sub-agent made, and the model
 	// that served them, so callers can report what the task cost.
@@ -179,6 +207,10 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 
 	var lastPrint string
 	repeats := 0
+	// steps and lastText make up the partial result when the cap is reached:
+	// what the sub-agent did and what it last said.
+	var steps []string
+	var lastText string
 	for iter := 0; iter < sa.maxIter; iter++ {
 		res.Steps = iter
 		select {
@@ -186,7 +218,7 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			// A deadline is the sub-agent's own time limit running out, not
 			// the user cancelling; "cancelled" for both made a timeout look
 			// like a Ctrl+C in the plan summary.
-			res.Error = "cancelled"
+			res.Error, res.ExitReason = "cancelled", ExitInterrupted
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				res.Error = "timed out"
 			}
@@ -194,7 +226,7 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 		default:
 		}
 		if sa.budgetExceeded != nil && sa.budgetExceeded() {
-			res.Error = "budget exceeded"
+			res.Error, res.ExitReason = "budget exceeded", ExitInterrupted
 			return res
 		}
 
@@ -206,7 +238,11 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			MaxTokens:  16000,
 		})
 		if err != nil {
-			res.Error = err.Error()
+			res.Error, res.ExitReason = err.Error(), ExitError
+			if ctx.Err() != nil {
+				// The call failed because the run was stopped, not on its own.
+				res.ExitReason = ExitInterrupted
+			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				res.Error = "timed out: " + res.Error
 			}
@@ -220,6 +256,7 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 
 		if len(resp.ToolCalls) == 0 {
 			res.Output, res.Success, res.Steps = resp.Content, true, iter+1
+			res.ExitReason = ExitCompleted
 			return res
 		}
 
@@ -231,14 +268,19 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 		if repeats >= loopLimit {
 			res.Error = fmt.Sprintf("loop detected: the same tool calls were requested %d times in a row", repeats)
 			res.Steps = iter + 1
+			res.ExitReason = ExitLoop
 			return res
 		}
 
+		if strings.TrimSpace(resp.Content) != "" {
+			lastText = resp.Content
+		}
 		messages = append(messages, api.Message{
 			Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls, ThinkingBlocks: resp.ThinkingBlocks,
 		})
 		for _, tc := range resp.ToolCalls {
 			content := sa.runTool(ctx, tc)
+			steps = append(steps, stepSummary(tc, content))
 			// Truncate large results on a rune boundary (a byte slice lands
 			// inside a multi-byte rune for Chinese output, and invalid UTF-8
 			// goes straight into the next request's JSON body). The engine's
@@ -252,8 +294,51 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 		}
 	}
 
-	res.Error, res.Steps = "max iterations reached", sa.maxIter
+	res.Steps = sa.maxIter
+	res.Error = fmt.Sprintf("已达上限（%d 次模型调用），以下为部分结果", sa.maxIter)
+	res.Output = partialOutput(steps, lastText)
+	res.ExitReason = ExitMaxIterations
+	res.CapReached = true
+	res.Truncated = true
 	return res
+}
+
+// maxPartialSteps bounds how many completed steps a partial result lists.
+const maxPartialSteps = 30
+
+// stepSummary is one line of a partial result: the tool, its main argument
+// and whether it failed.
+func stepSummary(tc api.ToolCall, result string) string {
+	line := tc.Name
+	for _, k := range []string{"filePath", "file_path", "path", "command", "pattern", "query", "url"} {
+		if v, ok := tc.Input[k].(string); ok && strings.TrimSpace(v) != "" {
+			line += " " + textutil.ClipRunes(strings.TrimSpace(v), 80)
+			break
+		}
+	}
+	if strings.HasPrefix(result, "Error:") {
+		line += "（失败）"
+	}
+	return line
+}
+
+// partialOutput is the Output of a sub-agent stopped at its cap: the steps it
+// completed (the latest maxPartialSteps) and its last text.
+func partialOutput(steps []string, lastText string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "已完成 %d 个步骤：\n", len(steps))
+	shown := steps
+	if len(shown) > maxPartialSteps {
+		fmt.Fprintf(&b, "（省略前 %d 个）\n", len(shown)-maxPartialSteps)
+		shown = shown[len(shown)-maxPartialSteps:]
+	}
+	for i, st := range shown {
+		fmt.Fprintf(&b, "%d. %s\n", len(steps)-len(shown)+i+1, st)
+	}
+	if t := strings.TrimSpace(lastText); t != "" {
+		b.WriteString("\n最后一次模型输出：\n" + textutil.ClipRunes(t, 2000))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // runTool executes one call and returns the text for its tool result.
@@ -298,6 +383,8 @@ type Delegator struct {
 	authorize      Authorizer
 	executor       Executor
 	budgetExceeded func() bool
+	// maxIter is each sub-agent's model-call cap; 0 = DefaultMaxIter.
+	maxIter int
 }
 
 // NewDelegator creates a sub-agent delegator.
@@ -327,6 +414,23 @@ func (d *Delegator) SetGate(cwd, permissionMode string, authorize Authorizer) {
 // SetExecutor routes every sub-agent tool call through exec. It supersedes the
 // gate installed by SetGate.
 func (d *Delegator) SetExecutor(exec Executor) { d.executor = exec }
+
+// SetMaxIter sets each later sub-agent's model-call cap (config
+// "subagent_max_iterations"); n <= 0 restores DefaultMaxIter. Call it before
+// the first Delegate; not guarded by mu.
+func (d *Delegator) SetMaxIter(n int) {
+	if n < 0 {
+		n = 0
+	}
+	d.maxIter = n
+}
+
+func (d *Delegator) maxIterOrDefault() int {
+	if d.maxIter > 0 {
+		return d.maxIter
+	}
+	return DefaultMaxIter
+}
 
 // SetBudgetCheck stops sub-agents before a model call once exceeded() is true.
 func (d *Delegator) SetBudgetCheck(exceeded func() bool) { d.budgetExceeded = exceeded }
@@ -367,7 +471,7 @@ func (d *Delegator) DelegateWith(ctx context.Context, taskID, task, systemPrompt
 		Provider:       provider,
 		Model:          model,
 		Tools:          tools,
-		MaxIter:        30,
+		MaxIter:        d.maxIterOrDefault(),
 		Cwd:            d.cwd,
 		PermissionMode: d.permissionMode,
 		Authorize:      d.authorize,

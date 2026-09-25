@@ -191,11 +191,11 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 	defer func() { _ = httpResp.Body.Close() }()
 
 	// Update key-pool health so multi-key rotation fails over.
-	p.keyPool.MarkOutcome(key, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
+	p.keyPool.MarkOutcome(key, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 
 	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
 	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: ParseRetryAfter(httpResp.Header)}
+		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: RetryAfterFor(httpResp.StatusCode, httpResp.Header)}
 	}
 	if httpResp.StatusCode != 200 {
 		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, raw, hadImage)
@@ -510,7 +510,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
-	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, ParseRetryAfter(httpResp.Header))
+	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))

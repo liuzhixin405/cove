@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -15,7 +16,8 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && len(strings.TrimSpace(string(ee.Stderr))) > 0 {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(strings.TrimSpace(string(ee.Stderr))) > 0 {
 			return string(out), fmt.Errorf("git %s: %s", args[0], strings.TrimSpace(string(ee.Stderr)))
 		}
 		return string(out), fmt.Errorf("git %s: %w", args[0], err)

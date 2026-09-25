@@ -39,7 +39,9 @@ type appBootstrap struct {
 	toolReg   *tool.Registry
 }
 
-func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*appBootstrap, error) {
+// bootstrapApp builds the session. interactive says whether someone can
+// answer the question tool (main's mode branch: not -p, interactive shell).
+func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, interactive bool) (*appBootstrap, error) {
 	cfg, err := config.LoadWithProfile(profileName)
 	if err != nil {
 		log.Warnf("config load: %v", err)
@@ -72,10 +74,20 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 
 	classifier := permission.NewClassifier()
 	hookMgr := hooks.NewManager()
+	// User-level hooks only (hooks.json in the config directory): a
+	// project-level file would let a cloned repository run commands on this
+	// machine.
+	defs, err := loadUserHooks()
+	if err != nil {
+		log.Warnf("hooks config: %v", err)
+	}
+	hookMgr.RegisterDefs(defs)
 	skillMgr := skills.NewManager()
 	skills.LoadAll(skillMgr, projCtx.Cwd)
 	skillMgr.Disable(cfg.DisabledSkills...)
-	memStore := memory.NewStore()
+	memStore := newProjectMemoryStore(projCtx.Cwd)
+	// Masked tool outputs older than a week are never read again.
+	go tool.PruneOldToolOutputs(tool.ToolOutputDir(), tool.ToolOutputMaxAge)
 	if cfg.MemoryEmbedding != nil {
 		// Reuse the main chat provider's base URL/API key when the embedding
 		// config doesn't override them — enabling this should not require a
@@ -113,7 +125,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 		cancelMCP()
 	}
 
-	toolReg := registerAllTools(mcpPool)
+	toolReg := registerAllTools(mcpPool, cfg, interactive)
 	eng, err := engine.New(engine.Config{
 		Model:          cfg.Model,
 		ModelFast:      cfg.ModelFast,
@@ -132,9 +144,16 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 		Classifier:         classifier,
 		DoneVerifyCommands: cfg.DoneVerifyCommands,
 		DoneVerifyAuto:     cfg.VerifyAutoEnabled(),
+		DoneVerifyTimeout:  time.Duration(cfg.DoneVerifyTimeoutSeconds) * time.Second,
+		DoneCheck:          cfg.DoneCheckMode(),
 		Thinking:           cfg.Thinking,
 		Effort:             cfg.Effort,
 		CustomInstructions: cfg.SystemPrompt,
+
+		MaxIterations:         cfg.MaxIterations,
+		MaxTurnMinutes:        cfg.MaxTurnMinutes,
+		SubagentMaxIterations: cfg.SubagentMaxIterations,
+		MaxSessions:           cfg.MaxSessions,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("engine start error: %w", err)
@@ -142,6 +161,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 
 	eng.SetProjectContext(projCtx)
 	eng.WirePlanExecutor()
+	wireDiagnostics(eng, memStore)
 	showReasoning = cfg.ShowReasoning
 
 	return &appBootstrap{
@@ -158,6 +178,18 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string) (*ap
 	}, nil
 }
 
+// newProjectMemoryStore is the memory store for the project around cwd: its
+// own ~/.cove/projects/<hash>/memory (written to, and winning on name clashes)
+// merged with the global ~/.cove/memory, which is read but not migrated.
+func newProjectMemoryStore(cwd string) *memory.Store {
+	dir, err := config.ProjectDataDir(memory.ProjectRoot(cwd))
+	if err != nil {
+		log.Warnf("project data dir: %v (using the global memory directory only)", err)
+		return memory.NewStore()
+	}
+	return memory.NewProjectStore(dir)
+}
+
 func runStartupDiagnostics(cfg *config.Config, debugMode bool) {
 	if s := startupDiagnosticsText(cfg, debugMode); s != "" {
 		fmt.Fprint(os.Stderr, s)
@@ -172,4 +204,29 @@ func startupDiagnosticsText(cfg *config.Config, debugMode bool) string {
 		return "\n  \x1b[90m⚠️  系统检测到潜在环境或配置异常，建议输入 \x1b[36m/diagnose\x1b[90m 查看并进行一键修复。\x1b[0m\n"
 	}
 	return ""
+}
+
+// loadUserHooks reads hooks.json from the config directory policies.json and
+// config.json are read from (COVE_CONFIG_DIR, else ~/.cove). It used to be
+// ~/.cove regardless, so COVE_CONFIG_DIR moved the config but not the hooks.
+func loadUserHooks() ([]hooks.HookDef, error) {
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	return hooks.LoadConfigDir(dir)
+}
+
+// wireDiagnostics points /diagnose and /doctor at the running session: the
+// engine's dream runner and memory store, and why policies.json failed to
+// load. Unset, the checker re-reads the same state from disk.
+func wireDiagnostics(eng *engine.Engine, memStore *memory.Store) {
+	diagnostic.PolicyLoadErrorFn = eng.PolicyLoadError
+	diagnostic.BackgroundStatusFn = func() diagnostic.BackgroundStatus {
+		st := diagnostic.BackgroundStatus{Dream: eng.DreamStatus()}
+		if memStore != nil {
+			st.Memory = memStore.Stats()
+		}
+		return st
+	}
 }

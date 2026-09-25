@@ -86,7 +86,8 @@ func handleResume(ctx context.Context, sessionID string, eng *engine.Engine) {
 //
 // Only the TUI's /exit and Ctrl+D used to record cost (via autoSaveSession),
 // so /cost's 24h and 7-day figures ignored every headless and -p run, and no
-// path disconnected MCP servers.
+// path disconnected MCP servers. It also fires the SessionEnd hooks (once per
+// process, after the save so a hook sees the saved session).
 func finishSession(eng *engine.Engine, pool interface{ DisconnectAll() }) {
 	if eng != nil && eng.HasMessages() {
 		eng.SaveSession()
@@ -102,9 +103,42 @@ func finishSession(eng *engine.Engine, pool interface{ DisconnectAll() }) {
 			fmt.Fprintf(os.Stderr, "费用记录保存失败: %v\n", err)
 		}
 	}
+	waitExitBackground(eng)
+	fireSessionEnd(eng)
 	if pool != nil {
 		pool.DisconnectAll()
 	}
+}
+
+// exitBackgroundWait bounds how long an exit waits for the last turn's
+// memory extraction; -p has already waited longer (printModeBackgroundWait).
+// A variable so tests can shorten it.
+var exitBackgroundWait = 10 * time.Second
+
+// pendingWaiter is the engine's BackgroundPending plus WaitBackground.
+type pendingWaiter interface {
+	backgroundWaiter
+	BackgroundPending() bool
+}
+
+// waitExitBackground lets the last turn's memory extraction finish before
+// the process exits (bounded by exitBackgroundWait): the interactive exit
+// used to kill it, so the last turn was never learned. The stderr line is
+// printed only when there is something to wait for.
+func waitExitBackground(eng *engine.Engine) {
+	if eng == nil {
+		return
+	}
+	waitPending(eng, exitBackgroundWait)
+}
+
+// waitPending is waitExitBackground for any pendingWaiter.
+func waitPending(w pendingWaiter, limit time.Duration) {
+	if !w.BackgroundPending() {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "正在保存本轮记忆…")
+	waitForBackground(w, limit)
 }
 
 func autoSaveSession(eng *engine.Engine) {
@@ -336,21 +370,28 @@ func handleHistoryClean() {
 		termui.PrintSafe("历史清洗失败: %v\n", err)
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	historyCleanIn(dir)
+}
+
+// historyCleanIn repairs the sessions in dir and prints what it did. Session
+// files are enumerated by the session package (<id>.jsonl and legacy
+// <id>.json); index.json and backups are not sessions. JSONL sessions are
+// rewritten through the store, which keeps the index in step and leaves
+// UpdatedAt alone so cleaning does not reorder the history list.
+func historyCleanIn(dir string) historyCleanStats {
+	stats := historyCleanStats{}
+	names, err := session.ListSessionFiles(dir)
 	if err != nil {
 		termui.PrintSafe("历史清洗失败: %v\n", err)
-		return
+		return stats
 	}
-
+	store := session.NewStoreAt(dir)
 	stamp := time.Now().Format("20060102-150405")
-	stats := historyCleanStats{}
 
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
+	for _, name := range names {
 		stats.Scanned++
-		path := filepath.Join(dir, e.Name())
+		path := filepath.Join(dir, name)
+		jsonl := filepath.Ext(name) == ".jsonl"
 
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -358,8 +399,14 @@ func handleHistoryClean() {
 			continue
 		}
 
-		var rec session.Record
-		if err := json.Unmarshal(raw, &rec); err != nil {
+		var rec *session.Record
+		if jsonl {
+			rec, err = store.Load(session.SessionIDFromFile(name))
+		} else {
+			rec = &session.Record{}
+			err = json.Unmarshal(raw, rec)
+		}
+		if err != nil {
 			stats.ParseFailed++
 			continue
 		}
@@ -396,14 +443,21 @@ func handleHistoryClean() {
 			continue
 		}
 
-		newRaw, err := json.MarshalIndent(&rec, "", "  ")
-		if err != nil {
-			stats.WriteFailed++
-			continue
-		}
-		if err := writeFileAtomic(path, newRaw, 0600); err != nil {
-			stats.WriteFailed++
-			continue
+		if jsonl {
+			if err := store.Replace(rec); err != nil {
+				stats.WriteFailed++
+				continue
+			}
+		} else {
+			newRaw, err := json.MarshalIndent(rec, "", "  ")
+			if err != nil {
+				stats.WriteFailed++
+				continue
+			}
+			if err := writeFileAtomic(path, newRaw, 0600); err != nil {
+				stats.WriteFailed++
+				continue
+			}
 		}
 		stats.Modified++
 	}
@@ -417,6 +471,7 @@ func handleHistoryClean() {
 	termui.PrintSafe("  备份失败: %d\n", stats.BackupFailed)
 	termui.PrintSafe("  写回失败: %d\n", stats.WriteFailed)
 	termui.PrintSafe("  备份后缀: .bak.%s\n", stamp)
+	return stats
 }
 
 func deriveCleanTitle(msgs []api.Message) string {
@@ -454,12 +509,12 @@ func deriveCleanTitle(msgs []api.Message) string {
 	return compactRunes(strings.ReplaceAll(cands[0].text, "\n", " "), 60)
 }
 
-func compactRunes(s string, max int) string {
+func compactRunes(s string, maxLen int) string {
 	r := []rune(strings.TrimSpace(s))
-	if len(r) <= max {
+	if len(r) <= maxLen {
 		return string(r)
 	}
-	return string(r[:max]) + "..."
+	return string(r[:maxLen]) + "..."
 }
 
 func sessionPreview(r session.Record) string {
@@ -835,7 +890,7 @@ func scoreSessionForResume(r session.Record) int {
 			score += 2
 		}
 		if len([]rune(userText)) >= 20 {
-			score += 1
+			score++
 		}
 	}
 

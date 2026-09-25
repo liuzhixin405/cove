@@ -107,7 +107,7 @@ func (b *Browser) FetchRendered(ctx context.Context, rawURL, format string) (*Fe
 	if err := b.validateURL(rawURL); err != nil {
 		return nil, err
 	}
-	htmlContent, err := renderHeadless(ctx, rawURL, b.timeout)
+	htmlContent, err := renderHeadless(ctx, rawURL, b.timeout, !b.allowLocalhost)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,7 @@ func (b *Browser) Screenshot(ctx context.Context, rawURL string) ([]byte, error)
 	if err := b.validateURL(rawURL); err != nil {
 		return nil, err
 	}
-	return captureScreenshot(ctx, rawURL, b.timeout)
+	return captureScreenshot(ctx, rawURL, b.timeout, !b.allowLocalhost)
 }
 
 func (b *Browser) fetch(ctx context.Context, rawURL string, format string) (*FetchResult, error) {

@@ -14,6 +14,14 @@ var hintFileNames = []string{
 	"AGENTS.md", "CLAUDE.md", ".cursorrules", ".cove.md",
 }
 
+// maxHintFileBytes caps one injected hint file. It was 2000 bytes, which cut
+// most real AGENTS.md files in half.
+const maxHintFileBytes = 12 * 1024
+
+// maxHintCallBytes caps what one CheckPath or CheckCommand call injects;
+// files that do not fit are shown by a later call.
+const maxHintCallBytes = 24 * 1024
+
 // SubdirHints tracks discovered subdirectory context files.
 type SubdirHints struct {
 	mu      sync.Mutex
@@ -34,6 +42,12 @@ func NewSubdirHints(workDir string) *SubdirHints {
 // CheckPath extracts directory from a file path and discovers hint files.
 // Returns any newly found hint content to inject, or empty string.
 func (h *SubdirHints) CheckPath(path string) string {
+	budget := maxHintCallBytes
+	return h.checkPath(path, &budget)
+}
+
+// checkPath is CheckPath within budget bytes (shared by a command's paths).
+func (h *SubdirHints) checkPath(path string, budget *int) string {
 	if path == "" {
 		return ""
 	}
@@ -49,19 +63,30 @@ func (h *SubdirHints) CheckPath(path string) string {
 		dir = filepath.Dir(path)
 	}
 
-	return h.checkDir(dir)
+	return h.checkDir(dir, budget)
+}
+
+// Reset forgets which directories and files were already shown. The engine
+// calls it after compacting the history, which may have summarized the
+// injected hints away, so the next touch of a directory shows them again.
+func (h *SubdirHints) Reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = make(map[string]bool)
+	h.loaded = make(map[string]string)
 }
 
 // CheckCommand extracts paths from a shell command and discovers hints.
 func (h *SubdirHints) CheckCommand(cmd string) string {
 	var results []string
+	budget := maxHintCallBytes
 	// Extract path-like tokens from the command
 	for _, token := range strings.Fields(cmd) {
 		if strings.HasPrefix(token, "-") {
 			continue
 		}
 		if strings.Contains(token, "/") || strings.Contains(token, "\\") {
-			if hint := h.CheckPath(token); hint != "" {
+			if hint := h.checkPath(token, &budget); hint != "" {
 				results = append(results, hint)
 			}
 		}
@@ -69,7 +94,7 @@ func (h *SubdirHints) CheckCommand(cmd string) string {
 	return strings.Join(results, "\n")
 }
 
-func (h *SubdirHints) checkDir(dir string) string {
+func (h *SubdirHints) checkDir(dir string, budget *int) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -88,9 +113,12 @@ func (h *SubdirHints) checkDir(dir string) string {
 		}
 
 		if h.seen[current] {
-			break // already checked from here up
+			// Already shown; a parent may still hold files an earlier
+			// call's cap left out, so keep walking up.
+			current = filepath.Dir(current)
+			continue
 		}
-		h.seen[current] = true
+		skipped := false
 
 		for _, name := range hintFileNames {
 			fp := filepath.Join(current, name)
@@ -108,14 +136,25 @@ func (h *SubdirHints) checkDir(dir string) string {
 			// Limit size to prevent context explosion
 			// ClipBytes, not content[:2000]: the byte cut split CJK characters
 			// and injected invalid UTF-8.
-			content = textutil.ClipBytes(content, 2000, "\n[...truncated]")
-			h.loaded[fp] = content
+			content = textutil.ClipBytes(content, maxHintFileBytes, "\n[...truncated]")
 			relPath, _ := filepath.Rel(h.workDir, fp)
 			if relPath == "" {
 				relPath = fp
 			}
-			newHints = append(newHints, "\n[Context from "+relPath+"]\n"+content)
+			hint := "\n[Context from " + relPath + "]\n" + content
+			if len(hint) > *budget {
+				// Over this call's cap: left for a later call.
+				skipped = true
+				continue
+			}
+			*budget -= len(hint)
+			h.loaded[fp] = content
+			newHints = append(newHints, hint)
 		}
+		if skipped {
+			break // not seen: a later call picks up what did not fit
+		}
+		h.seen[current] = true
 
 		current = filepath.Dir(current)
 	}

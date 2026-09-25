@@ -24,7 +24,9 @@ type Decision struct {
 	Message string
 }
 
-// Rapid-failure circuit-breaker thresholds, counted over a 30-second window.
+// Rapid-failure circuit-breaker thresholds, counted per tool name over a
+// 30-second window (a global count let five failed bash commands block the
+// next read).
 //
 // These are named constants because the previous inline numbers had drifted
 // from the documented behavior: the comment promised a block at 3 failures
@@ -89,14 +91,14 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Rapid-failure circuit breaker: rapidFailBlock failures in 30s → block,
-	// rapidFailWarn → warn.
+	// Rapid-failure circuit breaker: rapidFailBlock failures of this tool in
+	// 30s → block, rapidFailWarn → warn.
 	now := time.Now()
 	window := 30 * time.Second
 	cutoff := now.Add(-window)
 	var recentFails int
 	for _, f := range t.recentFailures {
-		if f.time.After(cutoff) && f.isError {
+		if f.time.After(cutoff) && f.isError && f.toolName == name {
 			recentFails++
 		}
 	}
@@ -111,11 +113,11 @@ func (t *Tracker) BeforeCall(name string, args map[string]any) Decision {
 
 	if recentFails >= rapidFailBlock {
 		return Decision{Action: Block, Message: fmt.Sprintf(
-			"短时间内连续失败 %d 次，已触发熔断。请暂停并检查根本原因。", recentFails)}
+			"%s 短时间内连续失败 %d 次，已触发熔断。请暂停并检查根本原因。", name, recentFails)}
 	}
 	if recentFails >= rapidFailWarn {
 		return Decision{Action: Warn, Message: fmt.Sprintf(
-			"最近 30 秒内已失败 %d 次，接近熔断阈值 %d，建议改变思路。", recentFails, rapidFailBlock)}
+			"%s 最近 30 秒内已失败 %d 次，接近熔断阈值 %d，建议改变思路。", name, recentFails, rapidFailBlock)}
 	}
 
 	sig := makeSignature(name, args)
@@ -159,9 +161,17 @@ func (t *Tracker) AfterCall(name string, args map[string]any, result string, isE
 			isError:  true,
 		})
 	} else {
-		// Success resets the rapid-failure window
-		t.recentFailures = nil
+		// Success resets this tool's rapid-failure window (only its own:
+		// a successful read says nothing about the failing bash command).
+		kept := t.recentFailures[:0]
+		for _, f := range t.recentFailures {
+			if f.toolName != name {
+				kept = append(kept, f)
+			}
+		}
+		t.recentFailures = kept
 	}
+
 	// Keep window bounded
 	if len(t.recentFailures) > 100 {
 		t.recentFailures = t.recentFailures[len(t.recentFailures)-100:]

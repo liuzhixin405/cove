@@ -579,10 +579,13 @@ func stripAlpha(img image.Image) *image.RGBA {
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
+			// r, g, b are always in [0, 0xffff] per image.Color.RGBA's contract,
+			// so the >>8 shift always yields a value in [0, 255]: safe despite
+			// the narrowing conversion.
 			dst.SetRGBA(x, y, color.RGBA{
-				R: uint8(r >> 8),
-				G: uint8(g >> 8),
-				B: uint8(b >> 8),
+				R: uint8(r >> 8), //nolint:gosec // bounded to 0-255 by the shift, see above
+				G: uint8(g >> 8), //nolint:gosec // bounded to 0-255 by the shift, see above
+				B: uint8(b >> 8), //nolint:gosec // bounded to 0-255 by the shift, see above
 				A: 255,
 			})
 		}

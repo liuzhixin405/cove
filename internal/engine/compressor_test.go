@@ -51,7 +51,9 @@ func TestCompressor_ProducesValidSequence(t *testing.T) {
 	cc := NewChatCompressor()
 	msgs := buildConversation()
 	tokens := countTokens(msgs)
-	tokenLimit := tokens // threshold is 50% of the limit, so this forces compression
+	// Any positive count exceeds a limit of 1, so Layer 1 trimming can never
+	// be enough and Layer 2 always runs.
+	tokenLimit := 1
 
 	// Long enough, and mentions the file the conversation actually touched
 	// (a.go), so it passes validateSummaryQuality's coverage check — a
@@ -92,7 +94,7 @@ func TestCompressor_FallbackTruncationValid(t *testing.T) {
 		return nil, context.DeadlineExceeded
 	}
 
-	result, out := cc.Compress(context.Background(), msgs, tokens, tokens, stub)
+	result, out := cc.Compress(context.Background(), msgs, tokens, 1, stub) // limit 1 forces Layer 2
 	if !result.Compressed {
 		t.Fatal("expected fallback truncation to mark Compressed")
 	}
@@ -110,7 +112,7 @@ func TestCompressor_RejectsLowQualitySummary(t *testing.T) {
 	cc := NewChatCompressor()
 	msgs := buildConversation()
 	tokens := countTokens(msgs)
-	tokenLimit := tokens
+	tokenLimit := 1 // forces Layer 2, as above
 
 	stub := func(context.Context, api.ChatRequest) (*api.ChatResponse, error) {
 		return &api.ChatResponse{Content: "Summary of prior work."}, nil // too generic, mentions no files
@@ -137,7 +139,7 @@ func TestCompressor_BelowThresholdNoLayer2(t *testing.T) {
 		called = true
 		return &api.ChatResponse{Content: "unused"}, nil
 	}
-	// Huge limit → well below the 50% Layer-2 trigger. Layer-1 tool-output
+	// Huge limit → well below the Layer-2 trigger. Layer-1 tool-output
 	// trimming may still run, but the expensive AI summarization (Layer 2) must
 	// not: no summary call, no message dropped, roles unchanged.
 	_, out := cc.Compress(context.Background(), msgs, countTokens(msgs), 10_000_000, stub)

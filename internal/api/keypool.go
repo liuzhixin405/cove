@@ -152,15 +152,71 @@ func (p *KeyPool) MarkOutcome(key string, status int, retryAfter time.Duration) 
 	}
 }
 
-// ParseRetryAfter reads an integer-seconds Retry-After header. Returns 0 when
-// absent or in HTTP-date form (callers fall back to a default cooldown).
+// ParseRetryAfter returns the wait a response explicitly asks for before the
+// next request, or 0 when it names none (callers fall back to a default
+// cooldown or the backoff schedule). In order of precedence:
+//
+//   - retry-after-ms: milliseconds (OpenAI and compatible APIs);
+//   - Retry-After: delay-seconds or an HTTP-date (RFC 9110 §10.2.3).
+//
+// Only the integer-seconds form of Retry-After used to be read; an HTTP-date
+// counted as "no wait" and the retry went straight back into the limit.
 func ParseRetryAfter(h http.Header) time.Duration {
-	v := strings.TrimSpace(h.Get("Retry-After"))
-	if v == "" {
-		return 0
+	if v := strings.TrimSpace(h.Get("retry-after-ms")); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
+			return time.Duration(ms * float64(time.Millisecond))
+		}
 	}
-	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-		return time.Duration(secs) * time.Second
+	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil {
+			if secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+			return 0
+		}
+		if at, err := http.ParseTime(v); err == nil {
+			return untilPositive(at)
+		}
+	}
+	return 0
+}
+
+// anthropicLimits are the rate limits Anthropic reports as
+// anthropic-ratelimit-<name>-remaining / -reset header pairs.
+var anthropicLimits = []string{"requests", "tokens", "input-tokens", "output-tokens"}
+
+// RetryAfterFor is the wait before retrying a response with the given status:
+// ParseRetryAfter's explicit headers first; then, for a 429 only, the latest
+// anthropic-ratelimit-*-reset (RFC 3339) among the limits whose -remaining
+// is 0, since retrying before every exhausted limit resets only fails again.
+//
+// The reset headers ride on every Anthropic response, 5xx included, and name
+// when a window rolls over, not how long to wait; read on a 500 they turned
+// a 1s backoff into a wait for an unrelated limit.
+func RetryAfterFor(status int, h http.Header) time.Duration {
+	if d := ParseRetryAfter(h); d > 0 || status != http.StatusTooManyRequests {
+		return d
+	}
+	var latest time.Duration
+	for _, name := range anthropicLimits {
+		prefix := "anthropic-ratelimit-" + name
+		if strings.TrimSpace(h.Get(prefix+"-remaining")) != "0" {
+			continue
+		}
+		v := strings.TrimSpace(h.Get(prefix + "-reset"))
+		if at, err := time.Parse(time.RFC3339, v); err == nil {
+			if d := untilPositive(at); d > latest {
+				latest = d
+			}
+		}
+	}
+	return latest
+}
+
+// untilPositive is the time left until at, or 0 once it has passed.
+func untilPositive(at time.Time) time.Duration {
+	if d := at.Sub(timeNow()); d > 0 {
+		return d
 	}
 	return 0
 }
@@ -177,3 +233,7 @@ func (p *KeyPool) MarkSuccess(key string) {
 		}
 	}
 }
+
+// timeNow is the clock HTTP-date and reset-time headers are measured against.
+// Replaced in tests.
+var timeNow = time.Now

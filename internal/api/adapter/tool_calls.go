@@ -17,13 +17,3 @@ func CloneToolCalls(calls []ToolCall) []ToolCall {
 	copy(out, calls)
 	return out
 }
-
-// HasParseError reports whether any tool-call failed argument parsing.
-func HasParseError(calls []ToolCall) bool {
-	for i := range calls {
-		if calls[i].ParseError {
-			return true
-		}
-	}
-	return false
-}

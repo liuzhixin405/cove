@@ -14,6 +14,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -34,6 +35,8 @@ type mockResponse struct {
 	toolCalls []api.ToolCall
 	err       error
 	delay     time.Duration // simulate API latency
+	// inputTokens is the prompt size the provider reports for this call.
+	inputTokens int
 }
 
 func (m *mockProvider) Name() string        { return "mock" }
@@ -62,9 +65,10 @@ func (m *mockProvider) Chat(ctx context.Context, req api.ChatRequest) (*api.Chat
 		return nil, resp.err
 	}
 	return &api.ChatResponse{
-		Content:    resp.content,
-		ToolCalls:  resp.toolCalls,
-		StopReason: "stop",
+		Content:     resp.content,
+		ToolCalls:   resp.toolCalls,
+		StopReason:  "stop",
+		InputTokens: resp.inputTokens,
 	}, nil
 }
 
@@ -97,9 +101,10 @@ func (m *mockProvider) ChatStream(ctx context.Context, req api.ChatRequest, hand
 		handler(api.StreamEvent{Type: "delta", Delta: resp.content})
 	}
 	return &api.ChatResponse{
-		Content:    resp.content,
-		ToolCalls:  resp.toolCalls,
-		StopReason: "stop",
+		Content:     resp.content,
+		ToolCalls:   resp.toolCalls,
+		StopReason:  "stop",
+		InputTokens: resp.inputTokens,
 	}, nil
 }
 
@@ -185,7 +190,21 @@ func newTestEngine(provider *mockProvider, tools ...tool.Tool) *Engine {
 	// this package directory before every write call. Tests about checkpoints
 	// create their own manager under a temporary HOME.
 	eng.cpMgr = nil
+	// Saving the session is two fsync'd atomic writes per turn, most of a
+	// test turn's time on Windows. Tests about saving use mustSessionStore.
+	eng.store = nil
 	return eng
+}
+
+// mustSessionStore opens a session store under the current HOME, for tests
+// that check what a turn saves (newTestEngine leaves the engine without one).
+func mustSessionStore(t *testing.T) *session.Store {
+	t.Helper()
+	st, err := session.NewStore()
+	if err != nil {
+		t.Fatalf("session store: %v", err)
+	}
+	return st
 }
 
 // ===========================================================================

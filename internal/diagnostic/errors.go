@@ -93,6 +93,9 @@ const (
 	ErrPermDenied     ErrorCode = "E3001"
 	ErrPermNoPrompt   ErrorCode = "E3002"
 	ErrPermFileAccess ErrorCode = "E3003"
+	// ErrPermPolicyLoad: policies.json exists but could not be read or
+	// parsed, so its persisted rules (deny rules included) are not applied.
+	ErrPermPolicyLoad ErrorCode = "E3004"
 )
 
 // Tool errors (E4xxx)
@@ -114,6 +117,8 @@ const (
 	ErrEngineCompact    ErrorCode = "E5003"
 	ErrEnginePanic      ErrorCode = "E5004"
 	ErrEngineNoProvider ErrorCode = "E5005"
+	// ErrEngineDreamFailed: the last background memory consolidation failed.
+	ErrEngineDreamFailed ErrorCode = "E5006"
 )
 
 // Session/FS errors (E6xxx)
@@ -164,6 +169,7 @@ func init() {
 	// Permission errors
 	register(&ErrorDef{ErrPermDenied, CatPermission, SevInfo, "操作被拒绝", "用户拒绝了 %s 的执行", "这是正常的安全行为，Agent 会尝试替代方案", false, false})
 	register(&ErrorDef{ErrPermNoPrompt, CatPermission, SevError, "无法显示权限提示", "PermissionPrompt 回调未设置", "非交互模式下无法请求权限确认，已自动切换为 auto 模式", true, true})
+	register(&ErrorDef{ErrPermPolicyLoad, CatPermission, SevError, "权限规则文件无法加载", "%s", "修正 policies.json 的 JSON 语法（或删除该文件）后重启 cove；在修好之前其中的规则（包括 deny 规则）都不生效", false, false})
 	register(&ErrorDef{ErrPermFileAccess, CatFileSystem, SevError, "文件访问被拒", "无法访问 %s: 权限不足", "检查文件权限，或以管理员身份运行", false, false})
 
 	// Tool errors
@@ -181,6 +187,7 @@ func init() {
 	register(&ErrorDef{ErrEngineCtxCancel, CatEngine, SevInfo, "操作被中断", "用户取消了当前操作", "可以重新输入继续，之前的上下文保留", false, false})
 	register(&ErrorDef{ErrEngineCompact, CatEngine, SevInfo, "上下文已压缩", "对话超过 %d tokens，已自动压缩", "这是正常行为，较早的细节可能丢失", false, false})
 	register(&ErrorDef{ErrEnginePanic, CatEngine, SevFatal, "引擎内部崩溃", "未捕获的异常: %v", "引擎已自动恢复，当前对话可继续使用", false, false})
+	register(&ErrorDef{ErrEngineDreamFailed, CatEngine, SevWarning, "后台记忆整理失败", "%s", "通常是临时的 API 错误，下次满足门槛时会自动重试；也可以用 /dream run 立即重试", false, false})
 	register(&ErrorDef{ErrEngineNoProvider, CatEngine, SevFatal, "未初始化 Provider", "engine 缺少 provider 实例", "配置错误，请使用 /config provider.name xxx 设置后立即生效", false, false})
 
 	// Session/FS errors

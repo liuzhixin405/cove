@@ -3,7 +3,6 @@ package notes
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -23,7 +22,7 @@ func TestFlushOverCapKeepsNewestEntries(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	path := filepath.Join(projectDir, ".cove", "session_notes.md")
+	path := s.path
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

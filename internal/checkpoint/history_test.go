@@ -8,22 +8,18 @@ import (
 	"testing"
 )
 
-// isolatedGit points HOME at a fresh directory and hides every git config, so
-// no user identity is available — the state of a machine where the user never
-// ran `git config --global user.name`.
+// isolatedGit runs a test against the package's shadow store, set up once by
+// TestMain under a fresh HOME with every git config hidden, so no user
+// identity is available — the state of a machine where the user never ran
+// `git config --global user.name`. Each project has its own ref and index
+// file in the store. Creating the store is a "git init" per test otherwise.
+//
+// The tests stay sequential: git processes sharing one store concurrently
+// fail intermittently on Windows (file locks).
 func isolatedGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git not available: %v", err)
-	}
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, "no-gitconfig"))
-	for _, k := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"} {
-		t.Setenv(k, "")
-		os.Unsetenv(k)
 	}
 }
 

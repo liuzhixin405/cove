@@ -7,8 +7,19 @@ const entrypointName = "INDEX.md"
 
 // BuildConsolidationPrompt generates the 4-phase dream prompt used by the
 // forked subagent to consolidate memory files.
-func BuildConsolidationPrompt(memoryRoot, transcriptDir string, sessionIDs []string) string {
-	extra := fmt.Sprintf(`
+//
+// projectMemoryDirs are further memory directories to consolidate: the
+// per-project directory of the project the sessions came from. Facts that
+// only hold for that project belong there, cross-project ones in memoryRoot;
+// each directory keeps its own index.
+func BuildConsolidationPrompt(memoryRoot, transcriptDir string, sessionIDs []string, projectMemoryDirs ...string) string {
+	extra := ""
+	for _, d := range projectMemoryDirs {
+		extra += fmt.Sprintf(`
+**Project memory directory:** %s — memories specific to the current project. Consolidate it the same way (orient, merge, prune, keep its own %s). Keep facts that only hold for this project here and cross-project facts (user preferences, general workflows) in the main memory directory; move misplaced entries between the two.
+`, d, entrypointName)
+	}
+	extra += fmt.Sprintf(`
 **Tool constraints for this run:** Bash is restricted to read-only commands (ls, find, grep, cat, stat, wc, head, tail, and similar). Anything that writes, redirects to a file, or modifies state will be denied.
 
 Sessions since last consolidation (%d):
@@ -23,7 +34,7 @@ You are performing a dream — a reflective pass over your memory files. Synthes
 
 Memory directory: %s
 
-Session transcripts: %s (JSON files — grep narrowly, don't read whole files)
+Session transcripts: %s (<id>.jsonl: a metadata line, then one JSON message per line; older sessions are <id>.json; index.json is only the list index — grep narrowly, don't read whole files)
 
 ---
 

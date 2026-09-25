@@ -125,14 +125,6 @@ func TestDisclosureMarkerReflectsState(t *testing.T) {
 		t.Errorf("an expandable block does not show the closed marker: %q", closed)
 	}
 
-	opened := lines(Expanded(expandable, 80, Styles{}))[0]
-	if !strings.Contains(opened, g.Open) {
-		t.Errorf("an expanded block does not show the open marker: %q", opened)
-	}
-	if strings.Contains(opened, g.Closed) {
-		t.Errorf("an expanded block still shows the closed marker: %q", opened)
-	}
-
 	inert := lines(Collapsed(leaf, 80, Styles{}))[0]
 	if strings.Contains(inert, g.Closed) || strings.Contains(inert, g.Open) {
 		t.Errorf("a block with nothing hidden offers a disclosure marker: %q", inert)
@@ -246,41 +238,6 @@ func TestThinkingWithoutBodyIsNotExpandable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Expanded
-// ---------------------------------------------------------------------------
-
-func TestExpandedShowsFullBodyAndNoSelfHint(t *testing.T) {
-	b := ToolBlock("a4", "bash", "go test ./...", "", "line1\nline2\nline3", false, 0)
-	out := Expanded(b, 80, Styles{})
-
-	for _, want := range []string{"line1", "line2", "line3", "bash", "go test"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("expanded output missing %q:\n%s", want, out)
-		}
-	}
-	// The reprint already shows the content, so advertising "/x a4" again is
-	// noise pointing at itself.
-	if strings.Contains(out, "/x a4") {
-		t.Errorf("expanded form still advertises its own expand hint:\n%s", out)
-	}
-	assertFits(t, out, 80)
-}
-
-func TestExpandedPointsAtSpillFileInsteadOfDumping(t *testing.T) {
-	b := ToolBlock("a4", "bash", "cat huge.log", "", "", false, 0)
-	b.FullPath = `C:\Users\x\.cove\runs\s1\a4.txt`
-	out := Expanded(b, 80, Styles{})
-
-	if !strings.Contains(out, "a4.txt") {
-		t.Errorf("expanded form does not point at the spill file:\n%s", out)
-	}
-	if n := len(lines(out)); n > 3 {
-		t.Errorf("spilled block rendered %d lines, want a short pointer:\n%s", n, out)
-	}
-	assertFits(t, out, 80)
-}
-
-// ---------------------------------------------------------------------------
 // Width and CJK
 // ---------------------------------------------------------------------------
 
@@ -317,7 +274,6 @@ func TestNarrowWidthDoesNotPanic(t *testing.T) {
 		if !utf8.ValidString(out) {
 			t.Errorf("width=%d produced invalid UTF-8", w)
 		}
-		_ = Expanded(b, w, Styles{})
 	}
 }
 
@@ -340,14 +296,6 @@ func TestStylesAreApplied(t *testing.T) {
 	}
 	if !strings.Contains(styled, "<S>") {
 		t.Errorf("Summary style not applied:\n%s", styled)
-	}
-
-	// Hint survives for the one place that still uses it: the path line of a
-	// block whose output was spilled to disk.
-	b.FullPath = "/tmp/a1.txt"
-	exp := Expanded(b, 80, Styles{Hint: func(s string) string { return "<H>" + s + "</H>" }})
-	if !strings.Contains(exp, "<H>") {
-		t.Errorf("Hint style not applied to the spill path:\n%s", exp)
 	}
 }
 

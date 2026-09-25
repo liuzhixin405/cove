@@ -14,9 +14,7 @@ import (
 // reviewEngine returns an engine whose memory store lives in a temporary HOME.
 func reviewEngine(t *testing.T, prov *mockProvider) *Engine {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
+	isolateHome(t) // HOME, USERPROFILE and COVE_CONFIG_DIR
 	eng := newTestEngine(prov)
 	eng.memStore = memory.NewStore()
 	eng.skillMgr = skills.NewManager()
@@ -44,21 +42,6 @@ func TestNoAutoStopsBackgroundReview(t *testing.T) {
 	prov.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("provider called %d times with --no-auto, want only the turn itself", calls)
-	}
-}
-
-// Every learned memory was saved under the same name, so each one replaced
-// the previous one.
-func TestReviewKeepsEarlierMemories(t *testing.T) {
-	eng := reviewEngine(t, &mockProvider{})
-	eng.applyReview("MEMORY: 用户偏好用 tab 缩进")
-	eng.applyReview("MEMORY: 提交信息用中文")
-	var all string
-	for _, e := range eng.memStore.All() {
-		all += e.Content + "\n"
-	}
-	if !strings.Contains(all, "tab 缩进") || !strings.Contains(all, "提交信息用中文") {
-		t.Fatalf("memories after two reviews:\n%s\nwant both", all)
 	}
 }
 

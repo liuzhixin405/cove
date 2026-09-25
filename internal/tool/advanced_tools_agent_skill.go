@@ -88,7 +88,7 @@ func NewAgentTool() Tool {
 	return &AgentToolI{baseTool{def: Def{
 		Name: "agent", Aliases: []string{"Agent"},
 		Description: "Spawn a sub-agent to handle complex multi-step tasks independently.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"type":{"type":"string","description":"Agent type: general, explore, plan, review, test"},"prompt":{"type":"string","description":"Task description for the sub-agent"}},"required":["type","prompt"]}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"type":{"type":"string","enum":["general","explore","plan","review","test"],"description":"Agent type: general (can edit), explore/plan/review (read-only), test"},"prompt":{"type":"string","description":"Task description for the sub-agent"}},"required":["type","prompt"]}`),
 		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Agent",
 	}}}
 }
@@ -101,12 +101,32 @@ func (t *AgentToolI) Call(ctx context.Context, input Input, tctx Context) (Resul
 			if err != nil {
 				return Result{Data: fmt.Sprintf("Sub-agent error: %v", err), IsError: true}, nil
 			}
-			return Result{Data: fmt.Sprintf("Sub-agent [%s] result:\n%s\nCost: $%.4f | Steps: %d | Success: %v",
-				agentType, result.Output, result.Cost, result.Steps, result.Success)}, nil
+			return Result{Data: fmt.Sprintf("%s\nSub-agent [%s] result:\n%s\nCost: $%.4f | Steps: %d | Success: %v",
+				agentExitLine(result), agentType, result.Output, result.Cost, result.Steps, result.Success)}, nil
 		}
 	}
 	return Result{Data: fmt.Sprintf("Sub-agent runner unavailable. Requested [%s]: %s", agentType, truncateStr(task, 300)), IsError: true}, nil
 }
+
+// agentExitLine is the first line of the agent tool's result, so the model
+// sees at a glance whether the sub-agent finished or stopped early, e.g.
+// "[exit: max_iterations, steps: 60, truncated: yes]". A runner that does not
+// report an exit reason gets one derived from Success.
+func agentExitLine(r *api.AgentRunResult) string {
+	reason := r.ExitReason
+	if reason == "" {
+		reason = "error"
+		if r.Success {
+			reason = "completed"
+		}
+	}
+	truncated := "no"
+	if r.Truncated {
+		truncated = "yes"
+	}
+	return fmt.Sprintf("[exit: %s, steps: %d, truncated: %s]", reason, r.Steps, truncated)
+}
+
 func (t *AgentToolI) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("agent spawning is safe")
 }

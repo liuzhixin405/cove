@@ -12,6 +12,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/state"
 )
 
@@ -55,8 +56,8 @@ func assertContinuesSession(t *testing.T, eng *engine.Engine, id string) {
 		t.Fatalf("saved session %s has %d messages, want 3", id, len(r.Messages))
 	}
 	home, _ := os.UserHomeDir()
-	files, _ := filepath.Glob(filepath.Join(home, ".cove", "sessions", "*.json"))
-	if len(files) != 1 {
+	files, _ := session.ListSessionFiles(filepath.Join(home, ".cove", "sessions"))
+	if len(files) != 1 || files[0] != id+".jsonl" {
 		t.Fatalf("session files = %v, want only the resumed one", files)
 	}
 }

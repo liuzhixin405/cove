@@ -23,11 +23,26 @@ const (
 	// MaxEntryBytes is the maximum size in bytes per memory entry.
 	MaxEntryBytes = 25 * 1024 // 25KB
 	// MaxTotalBytes is the maximum total size across all memory files.
-	MaxTotalBytes = 100 * 1024 // 100KB
+	MaxTotalBytes = 300 * 1024 // 300KB
+)
+
+// Entry sources, shown by /memory.
+const (
+	SourceInstructions = "instructions" // CLAUDE.md / AGENTS.md / .cove.md
+	SourceProject      = "project"      // ~/.cove/projects/<hash>/memory
+	SourceGlobal       = "global"       // ~/.cove/memory
 )
 
 type Store struct {
 	dirs []string
+	// projectDirs is how many leading entries of dirs are per-project memory
+	// directories (their entries are SourceProject; the rest SourceGlobal).
+	projectDirs int
+	// cwd overrides the working directory used to find instruction files
+	// (tests); empty means os.Getwd.
+	cwd string
+	// instrTruncated is set by All when the instruction files were clipped.
+	instrTruncated bool
 
 	// Cache to avoid repeated disk reads on every system prompt build
 	mu          sync.Mutex
@@ -75,6 +90,28 @@ func NewStore() *Store {
 		cacheTTL:    30 * time.Second,
 		promptDirty: true,
 	}
+}
+
+// NewStoreForDirs is a Store over the given directories instead of
+// ~/.cove/memory (the first one is where Save and RecordExtraction write).
+func NewStoreForDirs(dirs ...string) *Store {
+	return &Store{dirs: dirs, cacheTTL: 30 * time.Second, promptDirty: true}
+}
+
+// NewStoreForProject is a Store over a per-project memory directory and the
+// global one. Entries in the project directory win over global entries of the
+// same name, and Save writes into the project directory. The old global
+// directory is read as before and never migrated.
+func NewStoreForProject(projectDir, globalDir string) *Store {
+	return &Store{dirs: []string{projectDir, globalDir}, projectDirs: 1, cacheTTL: 30 * time.Second, promptDirty: true}
+}
+
+// PrimaryDir is the directory Save (and extraction) writes into.
+func (s *Store) PrimaryDir() string {
+	if len(s.dirs) == 0 {
+		return ""
+	}
+	return s.dirs[0]
 }
 
 func (s *Store) AddDir(dir string) {
@@ -191,7 +228,12 @@ func (s *Store) All() []Entry {
 
 	var entries []Entry
 	seen := map[string]bool{}
-	for _, dir := range s.dirs {
+	seenName := map[string]bool{}
+	for di, dir := range s.dirs {
+		source := SourceGlobal
+		if di < s.projectDirs {
+			source = SourceProject
+		}
 		files, _ := os.ReadDir(dir)
 		for _, f := range files {
 			if f.IsDir() {
@@ -211,26 +253,33 @@ func (s *Store) All() []Entry {
 				continue
 			}
 			path := filepath.Join(dir, f.Name())
-			if seen[path] {
+			if seen[pathKey(path)] || seenName[f.Name()] {
+				// Same file, or a same-named entry from a higher-priority
+				// (project) directory already loaded.
 				continue
 			}
-			seen[path] = true
+			seen[pathKey(path)] = true
 			data, err := os.ReadFile(path)
 			if err != nil {
 				continue
 			}
+			seenName[f.Name()] = true
 			entries = append(entries, Entry{
 				Name:    f.Name(),
 				Path:    path,
 				Content: string(data),
+				Source:  source,
 			})
 		}
 	}
 
-	cwd, _ := os.Getwd()
+	cwd := s.cwd
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	s.instrTruncated = false
 	if cwd != "" {
-		s.loadCLAUDEMD(cwd, &entries, &seen)
-		s.loadCLAUDEMD(filepath.Join(cwd, ".claude"), &entries, &seen)
+		s.instrTruncated = loadInstructionFiles(cwd, &entries, seen)
 	}
 
 	s.cachedAll = entries
@@ -239,24 +288,9 @@ func (s *Store) All() []Entry {
 	return entries
 }
 
-func (s *Store) loadCLAUDEMD(dir string, entries *[]Entry, seen *map[string]bool) {
-	path := filepath.Join(dir, "CLAUDE.md")
-	if (*seen)[path] {
-		return
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	(*seen)[path] = true
-	*entries = append(*entries, Entry{
-		Name:    "CLAUDE.md",
-		Path:    path,
-		Content: string(data),
-		Project: true,
-	})
-}
-
+// BuildPrompt renders the memory block without a query: instruction files
+// and memories in full while they fit InlineBudgetBytes, otherwise an index.
+// The result is cached until the store changes.
 func (s *Store) BuildPrompt() string {
 	entries := s.All()
 	if len(entries) == 0 {
@@ -271,41 +305,7 @@ func (s *Store) BuildPrompt() string {
 	}
 	s.mu.Unlock()
 
-	var project, auto []Entry
-	autoBytes := 0
-	for _, e := range entries {
-		if e.Project {
-			project = append(project, e)
-			continue
-		}
-		auto = append(auto, e)
-		autoBytes += len(e.Content)
-	}
-
-	var sb strings.Builder
-	sb.WriteString("\n\n<user_memories>\n")
-	// Project instruction files (CLAUDE.md) are always included in full.
-	for _, e := range project {
-		writeMemory(&sb, e)
-	}
-	if autoBytes <= InlineBudgetBytes {
-		for _, e := range auto {
-			writeMemory(&sb, e)
-		}
-	} else {
-		// Past the budget, pasting every memory would crowd out the rest of
-		// the context on every request. List them instead; the model reads
-		// the ones relevant to the task with its read tool.
-		sb.WriteString("<memory_index>\n")
-		sb.WriteString("Saved memories (too many to include in full). Read the file of any entry relevant to the current task before relying on it:\n")
-		for _, e := range auto {
-			fmt.Fprintf(&sb, "- %s (%s): %s\n", e.Name, e.Path, firstLine(e.Content))
-		}
-		sb.WriteString("</memory_index>\n")
-	}
-	sb.WriteString("</user_memories>\n")
-
-	result := sb.String()
+	result := s.render(entries, "")
 	s.mu.Lock()
 	s.promptCache = result
 	s.promptDirty = false
@@ -313,9 +313,129 @@ func (s *Store) BuildPrompt() string {
 	return result
 }
 
+// PromptFor is BuildPrompt ranked for query: when the saved memories exceed
+// InlineBudgetBytes, the BM25 top RelevantTopK matches for query are included
+// in full (within InlineBudgetBytes) and the rest are listed in an index.
+// Under the budget it equals BuildPrompt.
+func (s *Store) PromptFor(query string) string {
+	entries := s.All()
+	if len(entries) == 0 {
+		return ""
+	}
+	if strings.TrimSpace(query) == "" || autoBytes(entries) <= InlineBudgetBytes {
+		return s.BuildPrompt()
+	}
+	return s.render(entries, query)
+}
+
+// RelevantMemoriesFor returns only the memories ranked for query that the
+// query-less prompt (BuildPrompt) does not already carry in full, wrapped in
+// <relevant_memories>. Empty when every memory is inlined anyway or nothing
+// matches. Meant for a per-turn injection next to the user message.
+func (s *Store) RelevantMemoriesFor(query string) string {
+	entries := s.All()
+	if strings.TrimSpace(query) == "" || autoBytes(entries) <= InlineBudgetBytes {
+		return ""
+	}
+	top := s.rankedFullText(query)
+	if len(top) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<relevant_memories>\n")
+	for _, e := range top {
+		writeMemory(&sb, e)
+	}
+	sb.WriteString("</relevant_memories>\n")
+	return sb.String()
+}
+
+// RelevantTopK is how many ranked memories PromptFor includes in full.
+const RelevantTopK = 8
+
+func autoBytes(entries []Entry) int {
+	n := 0
+	for _, e := range entries {
+		if !e.Project {
+			n += len(e.Content)
+		}
+	}
+	return n
+}
+
+// rankedFullText returns up to RelevantTopK non-instruction memories ranked
+// for query, skipping any that would push their combined size past
+// InlineBudgetBytes.
+func (s *Store) rankedFullText(query string) []Entry {
+	var out []Entry
+	used := 0
+	// Ask for extra: instruction files take part in Search and are skipped.
+	for _, m := range s.Search(query, RelevantTopK*2) {
+		if m.Entry.Project {
+			continue
+		}
+		if used+len(m.Entry.Content) > InlineBudgetBytes {
+			continue
+		}
+		used += len(m.Entry.Content)
+		out = append(out, m.Entry)
+		if len(out) == RelevantTopK {
+			break
+		}
+	}
+	return out
+}
+
+func (s *Store) render(entries []Entry, query string) string {
+	var project, auto []Entry
+	for _, e := range entries {
+		if e.Project {
+			project = append(project, e)
+			continue
+		}
+		auto = append(auto, e)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n<user_memories>\n")
+	// Project instruction files (CLAUDE.md, AGENTS.md, ...) are always
+	// included in full (within MaxInstructionBytes).
+	for _, e := range project {
+		writeMemory(&sb, e)
+	}
+	if autoBytes(entries) <= InlineBudgetBytes {
+		for _, e := range auto {
+			writeMemory(&sb, e)
+		}
+	} else {
+		full := map[string]bool{}
+		if query != "" {
+			for _, e := range s.rankedFullText(query) {
+				writeMemory(&sb, e)
+				full[e.Path] = true
+			}
+		}
+		// Past the budget, pasting every memory would crowd out the rest of
+		// the context on every request. List them instead; the model reads
+		// the ones relevant to the task with its read tool.
+		sb.WriteString("<memory_index>\n")
+		sb.WriteString("Saved memories (too many to include in full). Read the file of any entry relevant to the current task before relying on it:\n")
+		for _, e := range auto {
+			if full[e.Path] {
+				continue
+			}
+			fmt.Fprintf(&sb, "- %s (%s): %s\n", e.Name, e.Path, firstLine(e.Content))
+		}
+		sb.WriteString("</memory_index>\n")
+	}
+	sb.WriteString("</user_memories>\n")
+	return sb.String()
+}
+
 // InlineBudgetBytes is the total size of saved memories that BuildPrompt still
-// includes in full; beyond it the prompt carries an index instead.
-const InlineBudgetBytes = 8 * 1024
+// includes in full; beyond it the prompt carries an index instead (PromptFor
+// additionally inlines the top matches for the current query).
+const InlineBudgetBytes = 24 * 1024
 
 func writeMemory(sb *strings.Builder, e Entry) {
 	sb.WriteString("<memory>\n")
@@ -421,6 +541,11 @@ type Stats struct {
 	TotalLines    int
 	MaxEntryBytes int
 	MaxTotalBytes int
+	// LastExtractedAt and LastExtractedCount describe the last automatic
+	// memory extraction (RecordExtraction): when it finished and how many
+	// memories it saved. Zero time means none is on record.
+	LastExtractedAt    time.Time
+	LastExtractedCount int
 }
 
 // Stats returns aggregate statistics over all memory entries.
@@ -438,6 +563,8 @@ func (s *Store) Stats() Stats {
 		st.TotalBytes += len(e.Content)
 		st.TotalLines += strings.Count(e.Content, "\n") + 1
 	}
+	rec := s.lastExtraction()
+	st.LastExtractedAt, st.LastExtractedCount = rec.At, rec.Count
 	return st
 }
 
@@ -445,7 +572,10 @@ type Entry struct {
 	Name    string
 	Path    string
 	Content string
+	// Project marks a project instruction file (CLAUDE.md, AGENTS.md, ...).
 	Project bool
+	// Source is SourceInstructions, SourceProject or SourceGlobal.
+	Source string
 }
 
 // validName reports whether name is a plain file name inside the memory
@@ -476,23 +606,21 @@ func (s *Store) Save(name, content string) error {
 		return fmt.Errorf("memory entry %q exceeds max lines (%d > %d)", name, lines, MaxIndexLines)
 	}
 
-	var dir string
-	for _, d := range s.dirs {
-		if _, err := os.Stat(d); err == nil {
-			dir = d
-			break
-		}
-	}
+	// Always the primary directory: with a per-project store that is the
+	// project directory, which wins over the global one on load.
+	dir := s.PrimaryDir()
 	if dir == "" {
-		dir = s.dirs[0]
-		_ = os.MkdirAll(dir, 0700)
+		return fmt.Errorf("memory store has no directory")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
 	}
 
 	// Check total size would not exceed limit
 	totalSize := 0
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
-		if e.IsDir() || fsatomic.IsTempName(e.Name()) {
+		if e.IsDir() || fsatomic.IsTempName(e.Name()) || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		info, err := e.Info()

@@ -54,7 +54,7 @@ Cove 是一个用 **Go 语言** 编写的 **AI 编程助手（Coding Agent）**�
 ```
 语言:          Go 1.22+
 HTTP 客户端:   net/http（标准库）
-终端 UI:       Bubble Tea TUI（交互）+ Headless（非交互）
+终端 UI:       行式交互 REPL（internal/repl 行编辑器 + termui）+ Headless（非交互）
 数据存储:      内存 + JSON 文件持久化（未来可能扩展 SQLite）
 AI API:        Anthropic API（主）/ OpenAI 兼容 API
 测试:          Go 标准 testing 包
@@ -80,17 +80,16 @@ cove/agent/
 │   └── cove/
 │       ├── main.go                 # 程序入口（949行，核心启动逻辑）
 │       ├── app_bootstrap.go        # 应用启动引导（196行）
-│       ├── repl_tui.go             # runTUI() + useTUI() + 队列桥接（853行）
+│       ├── interactive.go          # useInteractiveShell()：选择 REPL 或 headless
+│       ├── repl_loop.go            # runREPL() 交互主循环
+│       ├── repl_tasks.go           # REPL 任务队列（排队/取消/失败重试）
 │       ├── headless.go             # runHeadless() 非交互前端
 │       ├── chat_interaction.go     # 单次交互处理（151行）
 │       └── registry.go             # 工具注册（102行）
 │
 ├── internal/                       # 内部包（核心实现）
-│   ├── tui/                        # ★ 全屏 TUI（当前默认交互模式）
-│   │   ├── tui.go                  # Bubble Tea 模型（814行）
-│   │   ├── app.go                  # 程序包装器 + Bridge Helpers（79行）
-│   │   └── styles.go               # 样式 & 布局渲染（363行）
-│   │   ├── theme/                   # 主题系统（5套内置主题，20+语义化颜色令牌）
+│   ├── repl/                       # ★ 行编辑器（默认交互模式的输入行、历史、补全）
+│   ├── render/                     # 工具块渲染 + Markdown 渐进渲染（markdown.go）
 │   │
 │   ├── api/                        # AI API 抽象层
 │   │   ├── provider.go             # 统一 Provider 接口
@@ -227,17 +226,17 @@ cove/agent/
 ┌─────────────────────────────────────────────────────────┐
 │                    CLI Entry (main.go)                    │
 │  - 解析参数、加载配置、初始化所有子系统                      │
-│  - 调用 useTUI() 判断交互模式                              │
+│  - 调用 useInteractiveShell() 判断交互模式                 │
 └───────┬───────────────────────────────┬─────────────────┘
-        │ TUI (默认)                     │ Headless (fallback)
+        │ REPL (默认)                    │ Headless (fallback)
         ▼                               ▼
 ┌───────────────────┐   ┌─────────────────────────────────┐
-│ runTUI()          │   │ runHeadless()                   │
-│ (repl_tui.go)     │   │ (headless.go)                   │
-│ - Bubble Tea 全屏 │   │ - 无 UI，逐行 stdin 处理         │
-│ - 结构化 turn     │   │ - stdout/stderr 脚本友好输出     │
-│ - 覆盖层/鼠标     │   │ - 仅管道/--no-tui/              │
-│ - Bridge Helpers  │   │   COVE_TUI=0 时触发             │
+│ runREPL()         │   │ runHeadless()                   │
+│ (repl_loop.go)    │   │ (headless.go)                   │
+│ - 行编辑器输入    │   │ - 无 UI，逐行 stdin 处理         │
+│ - 输出在输入行上方│   │ - stdout/stderr 脚本友好输出     │
+│ - Markdown 渲染   │   │ - 仅管道/--no-tui/              │
+│ - 任务队列        │   │   COVE_TUI=0 时触发             │
 └───────┬───────────┘   └────────┬────────────────────────┘
         │                        │
         └────────┬───────────────┘
@@ -246,7 +245,7 @@ cove/agent/
 │                  Engine (engine.go)                       │
 │  - 核心编排器：管理消息历史，调用 AI，执行工具               │
 │  - 通过回调 onDelta/onReasoning/onEngineOutput 推送输出    │
-│  - TUI 通过 App.Send* bridge, REPL 直接 fmt.Print         │
+│  - REPL 经 termui 打印在输入行上方，headless 直接写 stdout │
 └───────┬───────┬───────┬───────┬─────────┬──────────────┘
         │       │       │       │         │
    ┌────▼──┐ ┌─▼──┐ ┌──▼──┐ ┌─▼───┐ ┌───▼──────┐
@@ -730,12 +729,12 @@ func (e *Engine) executeToolCalls(toolCalls []api.ToolCall) []tool.Result {
 #### 5.5.1 权限模式（permission.go）
 
 ```go
-type Mode int
+type Mode string
 const (
-    Default  Mode = iota  // 默认：写操作需确认
-    Auto                  // 自动：全部允许
-    Strict                // 严格：全部需确认
-    Yolo                  // 极宽松：仅危险操作需确认
+    Default Mode = "default" // 只读工具 + 整行只读的 shell 命令自动放行，其余询问
+    Plan    Mode = "plan"    // 只读工具；bash 与写入一律拒绝
+    Auto    Mode = "auto"    // Default + 构建/测试命令 + 项目内 write/edit；git 写/安装/网络/未知命令仍询问
+    Bypass  Mode = "bypass"  // 全部放行（灾难命令仍由引擎硬拦截）
 )
 ```
 
@@ -968,8 +967,8 @@ type Session struct {
 ```
 
 **持久化策略**:
-- 存储为 JSON 文件：`~/.cove/sessions/{id}.json`
-- 每次对话回合后自动保存
+- 存储为 JSONL：`~/.cove/sessions/{id}.jsonl`（首行元数据，之后每行一条消息）+ `index.json` 列表索引；旧版 `{id}.json` 仍可加载，下次保存时迁移
+- 每次对话回合后自动保存（只追加新增消息；历史被替换时整文件原子重写）
 - 启动时可恢复上次会话
 
 ---
@@ -1047,286 +1046,37 @@ type Browser struct {
 
 ---
 
-### 5.12 TUI 全屏交互层（★ 当前默认交互模式）
+### 5.12 交互式 REPL（★ 当前默认交互模式）
 
-**文件**: `internal/tui/tui.go`（814行）+ `app.go`（79行）+ `styles.go`（363行）+ `cli/cove/repl_tui.go`（853行，TUI 启动与桥接）
+**文件**: `cli/cove/interactive.go`（模式选择）、`cli/cove/repl_loop.go`（`runREPL()` 主循环）、`cli/cove/repl_tasks.go`（任务队列）、`cli/cove/permission_prompt.go`（授权提示）、`internal/repl/readline.go`（行编辑器）、`internal/render/markdown.go`（Markdown 渐进渲染）
 
-#### 5.12.1 设计动机
-
-旧 REPL 使用手写 ANSI 转义序列驱动终端，依赖原地擦除/重绘（in-place erase/redraw）。这种行式模型在同时处理流式输出、异步任务、窗口大小变化和 Windows 控制台时，**无法可靠地支持分割布局**。
-
-TUI 包用 **全屏交替屏幕 + 整帧重绘（Model-Update-View）** 模型替代了旧方案，每帧重新计算完整布局。
-
-**核心依赖**: Bubble Tea v2（`charm.land/bubbletea/v2`） + Lipgloss v2（`charm.land/lipgloss/v2`） + Bubbles v2（textarea, textinput, viewport）
-
-#### 5.12.2 启用逻辑（`repl_tui.go`: `useTUI()`）
+#### 5.12.1 启用逻辑（`interactive.go`: `useInteractiveShell()`）
 
 ```go
-func useTUI() bool {
-    if noTUI || os.Getenv("COVE_TUI") == "0" { return false }     // 显式禁用 → headless
-    if tuiMode || os.Getenv("COVE_TUI") == "1" { return true }    // 显式启用 → TUI
+func useInteractiveShell() bool {
+    if noTUI || os.Getenv("COVE_TUI") == "0" { return false }   // 显式禁用 → headless
+    if tuiMode || os.Getenv("COVE_TUI") == "1" { return true }  // 显式启用 → REPL
+    // 默认：stdin 和 stdout 都是终端 → REPL；管道/重定向 → headless
     return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
-    // 默认：stdin 和 stdout 都是终端 → TUI；管道/重定向 → headless
 }
 ```
 
-命令行控制：`--tui` / `--no-tui`，环境变量 `COVE_TUI=0/1`
+命令行控制：`--tui` / `--no-tui`，环境变量 `COVE_TUI=0/1`（名称沿用自早期的全屏界面，该界面已移除）。
 
-#### 5.12.3 核心数据结构
+#### 5.12.2 结构
 
-**`turn` — 结构化对话轮次**（每个回合不是扁平文本，而是结构化对象）:
+- **行编辑器**（`repl.New(completer)`）：输入行、历史、Tab 补全（`completion.go`）；`termui.SetConsole(reader)` 与 `log.SetWriter` 让所有输出打印在输入行上方，不会覆盖正在编辑的内容。
+- **任务队列**（`replTaskRunner`）：普通消息入队串行执行，相似任务合并；Ctrl+C / `/stop` 取消当前任务；失败后输入“继续”重试。
+- **流式输出**：`onDelta` 经 `render.MarkdownStream` 渐进渲染（标题/粗体/行内代码/围栏代码块/列表/引用），每次新请求或重试时重置状态；不支持 Unicode 的控制台降级为 ASCII（`COVE_TUI_ASCII=1` 可强制）。
+- **授权提示**：`askToolPermission` 显示授权框与 `[y] 允许 / [a] 本次会话总是允许 / [p] 永久允许（本项目） / [n] 拒绝`，回答经 `repl.TakePermInputCh` 从主循环转发；15 分钟无回答视为拒绝。`-p` 模式不安装提示器，需要询问的调用直接拒绝。
 
-```go
-type turn struct {
-    user      string           // 用户输入（空表示系统轮次）
-    reasoning strings.Builder  // 流式思考过程（可折叠，dim 样式渲染）
-    answer    strings.Builder  // 流式回答 + 工具/引擎诊断行
-    expanded  bool             // 用户是否点击展开了思考头部
-    system    bool             // 是否为独立引擎输出（不可折叠，不显示用户输入）
-}
-```
-
-**`Model` — 根 Bubble Tea 模型**（持有全部 UI 状态）:
-
-```go
-type Model struct {
-    vp     viewport.Model    // 对话正文滚轮视口
-    ta     textarea.Model    // 底部输入框
-    width  int
-    height int
-    ready  bool
-
-    // 结构化对话转录
-    turns     []*turn
-    streaming bool            // 正在流式接收中
-    curTurn   int             // 当前活跃交换轮次（-1 表示无）
-    streamTurn int            // 正在接收流式增量的轮次（-1 表示无）
-    clickMap  map[int]int     // 包装行 → 轮次索引（用于鼠标点击折叠）
-
-    status   StatusInfo       // 顶部状态栏数据
-    task     TaskInfo         // 后台任务队列快照
-    history  []HistoryItem    // 历史会话列表
-    commands []CommandItem    // / 命令面板目录
-    activity string           // 当前活动提示行
-
-    // Git 面板
-    gitExpanded bool
-
-    // 模态覆盖层
-    overlay    int            // overlayNone / overlayHistory / overlayCommand / overlayPermission
-    search     textinput.Model
-    overlayIdx int
-
-    // 权限弹窗
-    permTool  string
-    permDesc  string
-    permReply chan PermDecision  // 阻塞的 worker goroutine 等待回复的通道
-
-    // 回调
-    onSubmit    func(string)     // 用户提交输入
-    onResume    func(string)     // 用户从历史恢复会话
-    onInterrupt func()           // Ctrl+C 中断当前任务
-    quitting    bool
-}
-```
-
-**`App` — UI 程序包装器**（`app.go`），暴露线程安全的 Bridge Helpers:
-
-```go
-type App struct {
-    model   *Model
-    program *tea.Program
-}
-
-// 后台 goroutine 通过 app.Send* 推送消息到 UI goroutine
-func (a *App) BeginStream(echo string)
-func (a *App) Delta(s string)             // 流式回答增量
-func (a *App) Reasoning(s string)         // 流式思考增量（dim 样式）
-func (a *App) EngineLine(s string)        // 引擎诊断行
-func (a *App) EndStream()
-func (a *App) SetTask(info TaskInfo)
-func (a *App) SetStatus(info StatusInfo)
-func (a *App) SetHistory(items []HistoryItem)
-func (a *App) SetActivity(s string)
-func (a *App) RequestPermission(tool, desc string) PermDecision  // 阻塞式权限弹窗
-```
-
-#### 5.12.4 布局哲学
-
-```
-┌────────────────────────────────────────────┐
-│  顶部状态栏 (statusH=1)                     │  cove v6.2.1 · model · provider · main* · ⏵ default    运行中 ⚡
-├────────────────────────────────────────────┤
-│  Git 面板（可选，有变更时显示）               │  ▾ 工作区[main]变动文件列表 (共3个)
-│                                            │    M file1.go
-│                                            │    A file2.go
-├────────────────────────────────────────────┤
-│                                            │
-│  对话正文 (viewport, midH = h - 全部chrome) │  › 用户: 帮我读取 main.go
-│                                            │
-│                                            │  ▸ 思考过程（点击展开）
-│                                            │
-│                                            │  好的，main.go 的内容是...
-│                                            │
-├────────────────────────────────────────────┤
-│  活动/排队行 (transientH=1，始终保留)        │  ⚙ 执行 bash                                 +2 排队
-├────────────────────────────────────────────┤
-│  底部状态行 (bottomH=1)                     │  1234 tokens · $0.005 · 3.2s    Ctrl+R 历史 · / 命令 · Ctrl+C 退出
-├────────────────────────────────────────────┤
-│  ──────────────────────────────────────    │
-│  > 用户输入框 (inputH=2)                    │
-└────────────────────────────────────────────┘
-```
-
-**设计原则**: 对话正文占满全宽，只有薄薄的 chrome 环绕周围——顶部状态栏、中部的 Git 面板（可变）、可选一行活动区、底部状态行 + 分割线 + 输入框。**不使用侧边栏和嵌套框架**，布局由 `layout()` 方法每帧计算。
-
-布局中的 `transientH=1` **始终保留**（即使是空行），防止触发命令时对话正文高度突变导致输入框上下跳动。
-
-#### 5.12.5 交互特性
-
-| 快捷键 | 功能 |
-|--------|------|
-| **输入** | `Enter` 提交（空行不提交），`Ctrl+J` 插入换行符 |
-| **思考折叠** | 鼠标点击 `▸ 思考过程` / `▾ 思考过程` 头部展开/折叠 |
-| **鼠标滚轮** | 滚动对话正文视口 |
-| **Ctrl+R** | 打开历史会话搜索覆盖层 |
-| **`/`**（空输入时）| 打开命令面板覆盖层（模糊过滤） |
-| **Ctrl+G** | 展开/折叠 Git 状态面板 |
-| **Ctrl+C** | 任务运行时：取消当前任务；空闲时：退出程序 |
-| **权限弹窗** | 鼠标点击按钮或键盘 `y`（允许）、`n`（拒绝）、`a`（始终允许） |
-
-#### 5.12.6 覆盖层系统（Overlay）
-
-三种模态覆盖层，绘制在对话正文之上：
-
-1. **历史搜索**（`overlayHistory`）：`Ctrl+R` 打开，模糊搜索会话标题，`Enter` 恢复
-2. **命令面板**（`overlayCommand`）：`/` 打开，模糊搜索命令名称和描述，`Enter` 执行
-3. **权限确认**（`overlayPermission`）：工具需要授权时弹出，三个按钮（允许/拒绝/始终允许），work goroutine 被通道阻塞等待用户决策
-
-覆盖层激活时，输入框失去焦点（`ta.Blur()`），搜索框获得焦点。关闭覆盖层后焦点归还输入框。
-
-#### 5.12.7 流式数据流（Engine → TUI）
-
-```
-Engine (worker goroutine)
-    │
-    ├─ onDelta → app.Delta(s) → streamDeltaMsg → Model.Update()
-    │              └─ turns[streamTurn].answer 追加增量
-    │              └─ refreshViewport(true)  ← 重渲染 + 滚到底部
-    │
-    ├─ onReasoning → app.Reasoning(s) → streamReasoningMsg
-    │              └─ turns[streamTurn].reasoning 追加
-    │              └─ refreshViewport(true)
-    │
-    ├─ onEngineOutput → app.EngineLine(s) → engineLineMsg
-    │              └─ 追加到 streamTurn（在流中）/ curTurn（有当前轮次）/ appendSystem（系统轮次）
-    │
-    ├─ 开始流:     app.BeginStream("") → streamBeginMsg → streaming=true, 创建新 turn
-    └─ 结束流:     app.EndStream()     → streamEndMsg   → streaming=false
-```
-
-**关键设计**: 思考过程（reasoning）在**回答内容到达前**实时渲染为展开状态；一旦回答内容出现（或流结束），思考过程折叠为一行 `▸ 思考过程（点击展开）`，用户可点击再次打开。
-
-#### 5.12.8 任务队列（`tuiJobQueue`）
-
-FIFO 队列 + 条件变量阻塞，保证用户提交和引擎调用串行化：
-
-```go
-type tuiJobQueue struct {
-    mu     sync.Mutex
-    cond   *sync.Cond
-    items  []string
-    closed bool
-}
-```
-
-- `push(s)`: 追加到队尾，`cond.Signal()` 唤醒 worker
-- `pushFront(s)`: 插入队首（用户中断后重新提交）
-- `pop()`: 阻塞等待，返回当前项 + 剩余队列快照（用于侧边栏）
-
-单 worker goroutine 从队列弹出并串行处理每个提交。
-
-#### 5.12.9 `runTUI()` 启动流程（`repl_tui.go:101`）
-
-```
-1. 创建 tuiJobQueue
-2. 创建 tui.App：绑定 onSubmit（入队用户输入）、onResume（恢复历史会话）、onInterrupt（取消正在运行的任务）
-3. 设置 eng.PermissionPrompt → app.RequestPermission()（阻塞式权限弹窗）
-4. 启动后台 goroutine：
-   - Git 状态刷新（每 2 秒）
-   - 历史会话列表加载（Ctrl+R 覆盖层数据源）
-5. 启动 worker goroutine：
-   - 循环 pop 队列
-   - / 命令？→ 同步执行（与引擎调用串行，避免状态竞争）
-   - 普通输入？→ 预算/API Key 预检 → eng.RunMessageWithStream() → 流式桥接
-   - 自动保存会话
-6. 启动种子 goroutine：将 banner + 诊断信息 + 草稿提示写入对话正文
-7. app.Run() 进入 Bubble Tea 事件循环（阻塞直到退出）
-```
-
-#### 5.12.10 样式系统（`styles.go`）
-
-```go
-statusBarStyle  // 顶部状态栏：暗色文字 + 青色背景（与 Cove Logo 同色）
-userStyle       // 用户输入：青色粗体
-dimStyle        // 次要文本/思考过程：灰色
-thinkHeaderStyle // 可点击折叠头部：灰色斜体
-activityStyle   // 活动指示行：青色
-overlayBoxStyle // 覆盖层：圆角边框 + 青色边框色
-selectedStyle   // 覆盖层选中项：白色文字 + 青色背景
-btnAllowStyle   // 权限「允许」按钮：白色 + 绿色背景
-btnDenyStyle    // 权限「拒绝」按钮：白色 + 红色背景
-btnAlwaysStyle  // 权限「始终允许」按钮：白色 + 琥珀背景
-```
-
-光标使用**真实终端光标**（`ta.SetVirtualCursor(false)`），这使 CJK IME 能在正确位置绘制预编辑文本（拼音等）。
-
----
-
-#### 5.12.11 主题系统（`internal/tui/theme/`）
-
-**新增于 v8.0.0**
-
-TUI 主题系统为全屏终端界面提供了一套完整的语义化配色方案，支持运行时热切换。
-
-##### 目录结构
-
-```
-internal/tui/theme/
-├── theme.go        # Theme 接口定义（20+ 颜色令牌）
-├── catppuccin.go   # Catppuccin Mocha 暖色调主题
-├── dracula.go      # Dracula 经典暗色主题
-├── gruvbox.go      # Gruvbox 复古暖色主题
-├── onedark.go      # OneDark Atom 编辑器风格
-└── tokyonight.go   # TokyoNight 夜间蓝紫主题
-```
-
-##### 颜色令牌
-
-`theme.go` 定义 `Theme` 接口，提供以下语义化颜色令牌：
-
-- **Text** / **SubText**: 普通文本与次要文本
-- **Accent**: 强调色（消息高亮）
-- **Success** / **Warning** / **Error**: 状态颜色
-- **Border**: 边框颜色
-- **Scrollbar**: 滚动条颜色
-- **Selection**: 选中区域颜色
-- 以及 Tab、Overlay、Command Bar 等专用颜色
-
-##### 集成方式
-
-- `styles.go` 中的样式函数现在从 `Theme` 实例获取颜色，而非硬编码 ANSI 码
-- 用户可通过 `F5` 快捷键或配置的默认主题切换
-- 所有主题在启动时加载，切换即时生效
-
-
-### 5.13 REPL 交互层（★ 降级为 Fallback）
+### 5.13 终端输出层
 
 #### 5.13.1 颜色工具（color.go）
 
 **文件**: `internal/termui/style.go` + `internal/termui/io.go`（输出样式与终端打印）
 
-> **注意**: 交互层已收敛到 Bubble Tea TUI；fallback 为 headless 无 UI 模式。终端样式输出统一由 `internal/termui` 提供。
+> **注意**: 交互层为行式 REPL；fallback 为 headless 无 UI 模式。终端样式输出统一由 `internal/termui` 提供。
 
 ANSI 颜色和样式定义：
 
@@ -1407,11 +1157,9 @@ type Config struct {
     Model          string          // AI 模型名称
     Provider       ProviderConfig  // Provider 配置
     Tools          []tool.Tool     // 工具列表
-    PermissionMode string          // "default" / "auto" / "strict"
+    PermissionMode string          // "default" / "plan" / "auto" / "bypass"
     MaxBudget      float64         // 最大费用预算（美元）
     MaxSteps       int             // 最大工具调用步数
-    TUI            bool            // 是否启用 TUI 模式
-    NoTUI          bool            // 是否禁用 TUI 模式
     // ...
 }
 ```

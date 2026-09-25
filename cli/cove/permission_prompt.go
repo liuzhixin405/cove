@@ -41,12 +41,23 @@ type permissionRuleAdder interface {
 	AddPermissionRule(permission.Decision, permission.Rule)
 }
 
+// permissionRulePersister is implemented by *engine.Engine: it writes allow
+// rules to the policies file (engine.PolicyFilePath) in one save, scoped to
+// the engine's project root, and on success installs them for this session as
+// rules loaded from policies.json (so /cd drops them). The "[p]" option is
+// only offered when the adder can persist.
+type permissionRulePersister interface {
+	PersistPermissionRules(rules []permission.Rule, scope string) error
+	PermissionScope() string
+}
+
 // askToolPermission renders the approval box, waits for the answer line that
 // the REPL loop relays through repl.TakePermInputCh, and reports the decision.
 //
 // Answers: "y"/"yes" allow this call once, "a"/"always" additionally remember
 // the scope from alwaysAllowScope for the rest of the session (an engine-wide
-// policy rule), anything else denies.
+// policy rule), "p"/"permanent" also write that rule to the policies file
+// (engine.PolicyFilePath) for this project, anything else denies.
 func askToolPermission(eng permissionRuleAdder, toolName string, input map[string]any, reason string) bool {
 	if !replInteractive {
 		// Nothing is reading answer lines (e.g. a -p one-shot run), so deny
@@ -55,13 +66,23 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	}
 
 	rules, scope, canRemember := alwaysAllowScope(toolName, input)
-	options := "[y] 允许   [n] 拒绝"
+	persister, canPersist := eng.(permissionRulePersister)
+	canPersist = canPersist && canRemember
+	options := "[y] 允许"
 	if canRemember {
 		options += "   [a] 本次会话总是允许"
 		if scope != "" {
 			options += " " + scope
 		}
 	}
+	if canPersist {
+		options += "   [p] 永久允许"
+		if scope != "" {
+			options += " " + scope
+		}
+		options += "（本项目）"
+	}
+	options += "   [n] 拒绝"
 
 	answerCh := make(chan string, 1)
 	repl.SetPermInputCh(answerCh)
@@ -86,12 +107,35 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	// TakePermInputCh already unregisters the channel when the loop relays a
 	// line; ClearPermInputCh only matters for the timeout path above.
 	repl.ClearPermInputCh()
+	if answer == promptInterrupt {
+		// Ctrl+C: a denial, not an answer the user typed.
+		return false
+	}
 
-	switch allow, always := permissionAnswerDecision(answer); {
+	allow, always, persist := permissionAnswerDecision(answer)
+	switch {
 	case allow && always && !canRemember:
-		// "a" was typed although it was not offered: honour the allow, but
+		// "a"/"p" was typed although it was not offered: honour the allow, but
 		// remembering a wider scope than the user saw would be a surprise.
 		termui.PrintAbove("  " + termui.Styled(termui.Dim, "此命令无法按前缀记住，仅允许本次") + "\n")
+		return true
+	case allow && persist && canPersist:
+		what := toolName
+		if scope != "" {
+			what += " 中 " + scope
+		}
+		root := persister.PermissionScope()
+		// A successful persist installs the rules itself, registered as
+		// rules loaded from policies.json so /cd to another project drops
+		// them; adding a session copy here would outlive the /cd.
+		if err := persister.PersistPermissionRules(rules, root); err != nil {
+			for _, r := range rules {
+				eng.AddPermissionRule(permission.DAllow, r)
+			}
+			termui.PrintAbove("  " + termui.Styled(termui.Dim, "已允许 "+what+"；未能写入，仅本次会话有效（policies.json: "+err.Error()+"）") + "\n")
+			return true
+		}
+		termui.PrintAbove("  " + termui.Styled(termui.Dim, "已永久允许 "+what+"（项目 "+root+"，已写入 "+policiesFileForDisplay()+"）") + "\n")
 		return true
 	case allow && always:
 		// The engine consults its own manager (e.perm), so the rules have to be
@@ -138,7 +182,7 @@ func alwaysAllowScope(toolName string, input map[string]any) (rules []permission
 		return []permission.Rule{{ToolPattern: toolName}}, "", true
 	}
 	command, _ := input["command"].(string)
-	prefixes, ok := permission.CommandPrefixes(command)
+	prefixes, ok := permission.CommandPrefixesFor(command, permission.ToolShellKind(toolName))
 	if !ok {
 		return nil, "", false
 	}
@@ -152,15 +196,18 @@ func alwaysAllowScope(toolName string, input map[string]any) (rules []permission
 
 // permissionAnswerDecision maps a raw answer line to a decision: allow reports
 // whether the call is permitted, always requests a session-wide rule for the
-// tool. Anything unrecognised denies, so a stray keypress fails closed.
-func permissionAnswerDecision(answer string) (allow, always bool) {
+// tool, persist additionally asks for that rule to be saved for this project.
+// Anything unrecognised denies, so a stray keypress fails closed.
+func permissionAnswerDecision(answer string) (allow, always, persist bool) {
 	switch strings.ToLower(strings.TrimSpace(answer)) {
 	case "y", "yes", "是", "允许":
-		return true, false
+		return true, false, false
 	case "a", "always", "总是":
-		return true, true
+		return true, true, false
+	case "p", "permanent", "永久":
+		return true, true, true
 	default:
-		return false, false
+		return false, false, false
 	}
 }
 
@@ -177,3 +224,19 @@ func permissionPromptDescription(input map[string]any, reason string) string {
 	}
 	return reason
 }
+
+// policiesFileForDisplay names the policies file a "[p]" rule was written to:
+// policies.json in the config directory, which COVE_CONFIG_DIR moves away
+// from ~/.cove.
+func policiesFileForDisplay() string {
+	if p, err := engine.PolicyFilePath(); err == nil {
+		return p
+	}
+	return "policies.json"
+}
+
+// PolicyLoadError forwards Engine.PolicyLoadError to the commands, so /cd can
+// warn when policies.json failed to reload for the new project. It sits here
+// with the rest of the permission plumbing rather than beside the other
+// replEngineAdapter forwarders in main.go.
+func (a replEngineAdapter) PolicyLoadError() error { return a.eng.PolicyLoadError() }

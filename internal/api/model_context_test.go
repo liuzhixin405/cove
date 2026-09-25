@@ -77,9 +77,8 @@ func TestStaticContextBudget_CeilingForHugeWindow(t *testing.T) {
 }
 
 func TestStaticContextBudget_LowerThanCompactionBudgetForSameModel(t *testing.T) {
-	// Static context and compaction budget are complementary shares (0.3
-	// vs 0.7) of the same effective window, so for any given model the
-	// static share must be smaller.
+	// Static context is a 0.3 share of the same effective window the
+	// compaction budget spans, so for any given model it must be smaller.
 	model := "deepseek-v4-pro"
 	static := StaticContextBudget(model)
 	compaction := EffectiveCompactionBudget(model)
@@ -89,9 +88,10 @@ func TestStaticContextBudget_LowerThanCompactionBudgetForSameModel(t *testing.T)
 }
 
 func TestEffectiveCompactionBudget_MatchesFormula(t *testing.T) {
-	// docs/中等模型平替优化建议.md §2.3: budget = window * utilization * 0.7.
+	// budget = window * utilization. The former extra × 0.7 reserve for the
+	// system prompt and tools is gone: the engine's count now includes them.
 	model := "qwen-turbo" // window=32000 (default bucket), ratio=0.85
-	want := int(float64(32000) * 0.85 * 0.7)
+	want := int(float64(32000) * 0.85)
 	if got := EffectiveCompactionBudget(model); got != want {
 		t.Fatalf("EffectiveCompactionBudget(%q) = %d, want %d", model, got, want)
 	}

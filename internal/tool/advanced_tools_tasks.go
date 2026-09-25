@@ -104,7 +104,7 @@ func NewExecutePlanTool() Tool {
 			"type":"object",
 			"properties":{
 				"parallel":{"type":"boolean","description":"Run independent tasks concurrently when true"},
-				"max_agents":{"type":"integer","description":"Maximum concurrent agents (default 4)"}
+				"max_agents":{"type":"integer","minimum":1,"maximum":8,"description":"Maximum concurrent agents when parallel=true (1-8, default 4)"}
 			},
 			"required":[]
 		}`),
@@ -114,9 +114,13 @@ func NewExecutePlanTool() Tool {
 
 func (t *ExecutePlanTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	parallel, _ := input["parallel"].(bool)
+	maxAgents := DefaultMaxAgents
+	if v, ok := input["max_agents"].(float64); ok {
+		maxAgents = int(v)
+	}
 
 	if tctx.Runtime != nil && tctx.Runtime.PlanExecuteFunc != nil {
-		result, err := tctx.Runtime.PlanExecuteFunc(ctx, parallel)
+		result, err := tctx.Runtime.PlanExecuteFunc(WithMaxAgents(ctx, maxAgents), parallel)
 		if err != nil {
 			return Result{Data: err.Error(), IsError: true}, nil
 		}

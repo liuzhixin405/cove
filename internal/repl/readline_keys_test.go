@@ -2,6 +2,7 @@ package repl
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -140,7 +141,7 @@ func TestUnbracketedPasteIsOneMessage(t *testing.T) {
 // loop treats as "reinitialise and read again" — forever, at full CPU,
 // printing the same error line.
 func TestEndOfInputEndsTheSession(t *testing.T) {
-	if _, err := editOnce(t, ""); err != ErrExit {
+	if _, err := editOnce(t, ""); !errors.Is(err, ErrExit) {
 		t.Fatalf("err = %v, want ErrExit", err)
 	}
 	line, err := editOnce(t, "last words")

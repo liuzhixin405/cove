@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -14,7 +15,9 @@ func toolHeavyHistory(n, charsEach int) []api.Message {
 		id := string(rune('a' + i%26))
 		msgs = append(msgs,
 			api.Message{Role: "assistant", ToolCalls: []api.ToolCall{{ID: id, Name: "read"}}},
-			api.Message{Role: "tool", ToolCallID: id, Name: "read", Content: strings.Repeat("x", charsEach)})
+			api.Message{Role: "tool", ToolCallID: id, Name: "read",
+				// Distinct per call so tool-result dedupe leaves the disk masker work to do.
+				Content: strconv.Itoa(i) + strings.Repeat("x", charsEach)})
 	}
 	return append(msgs, api.Message{Role: "user", Content: "continue"})
 }

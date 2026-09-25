@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/liuzhixin405/cove/internal/engine"
@@ -54,11 +55,26 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 		return true
 	case input == "/compact":
 		withInterrupt(func(ctx context.Context) {
-			eng.Compact(ctx)
-			outln("上下文窗口已压缩。")
+			outln(compactReportLine(eng.Compact(ctx)))
 		})
 		return true
 	default:
 		return false
+	}
+}
+
+// compactReportLine is what /compact prints: the token counts around a real
+// compaction, or why nothing was compressed (it used to print "已压缩"
+// whatever happened).
+func compactReportLine(r engine.CompactReport) string {
+	switch {
+	case r.Summarized:
+		return fmt.Sprintf("已压缩：压缩前 %d tokens → 压缩后 %d tokens。", r.BeforeTokens, r.AfterTokens)
+	case r.Compressed:
+		return fmt.Sprintf("仅部分压缩（%s）：压缩前 %d tokens → 压缩后 %d tokens。", r.Reason, r.BeforeTokens, r.AfterTokens)
+	case r.Reason != "":
+		return fmt.Sprintf("未压缩：%s（当前 %d tokens）。", r.Reason, r.BeforeTokens)
+	default:
+		return fmt.Sprintf("未压缩（当前 %d tokens）。", r.BeforeTokens)
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/liuzhixin405/cove/internal/log"
 )
@@ -26,11 +28,29 @@ type Pool struct {
 	servers map[string]*ManagedServer
 	mu      sync.RWMutex
 	dial    func(name string, cfg ServerConfig) (Transport, error)
+	// reconnected records servers that already used their one automatic
+	// reconnect this session (guarded by mu).
+	reconnected map[string]bool
+	// version counts changes to the tool list (see Version).
+	version atomic.Int64
 }
 
+// Version is a counter that changes whenever the pool's tool list may have
+// changed: a server connected, disconnected or announced
+// notifications/tools/list_changed. The engine folds it into its tool
+// definition cache key so the model sees new MCP tools.
+func (p *Pool) Version() int64 { return p.version.Load() }
+
 func NewPool() *Pool {
-	return &Pool{servers: make(map[string]*ManagedServer)}
+	return &Pool{servers: make(map[string]*ManagedServer), reconnected: make(map[string]bool)}
 }
+
+// reconnectDelay is the pause before the one automatic reconnect after a
+// server's connection drops (a variable for tests).
+var reconnectDelay = 2 * time.Second
+
+// reconnectTimeout bounds that reconnect and a tools/list refresh.
+const reconnectTimeout = 30 * time.Second
 
 // Connect brings up one server and registers it in the pool.
 //
@@ -105,7 +125,71 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 	}
 	p.servers[name] = ms
 	p.mu.Unlock()
+	p.version.Add(1)
+	go p.watch(name, cfg, ms)
 	return nil
+}
+
+// watch follows one connected server: notifications/tools/list_changed
+// refreshes its tool list, and the first time its connection drops on its
+// own (not through Disconnect) it is reconnected once after reconnectDelay.
+// Later drops are left to /mcp connect, so a crash-looping server cannot
+// respawn forever.
+func (p *Pool) watch(name string, cfg ServerConfig, ms *ManagedServer) {
+	c := ms.Client
+	for {
+		select {
+		case n := <-c.Notifications():
+			if n != nil && n.Method == "notifications/tools/list_changed" {
+				p.refreshTools(name, ms)
+			}
+		case <-c.Done():
+			if c.ClosedByUser() {
+				return
+			}
+			p.mu.Lock()
+			current := p.servers[name] == ms
+			retry := current && !p.reconnected[name]
+			if retry {
+				p.reconnected[name] = true
+			}
+			p.mu.Unlock()
+			if !retry {
+				return
+			}
+			logF("MCP: %s: connection lost, reconnecting in %s", name, reconnectDelay)
+			time.Sleep(reconnectDelay)
+			p.mu.RLock()
+			still := p.servers[name] == ms
+			p.mu.RUnlock()
+			if !still {
+				return // disconnected or replaced meanwhile
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), reconnectTimeout)
+			if err := p.Connect(ctx, name, cfg); err != nil {
+				logF("MCP: %s: reconnect failed: %v", name, err)
+			}
+			cancel()
+			return
+		}
+	}
+}
+
+// refreshTools re-reads a server's tool list after it announced a change.
+func (p *Pool) refreshTools(name string, ms *ManagedServer) {
+	ctx, cancel := context.WithTimeout(context.Background(), reconnectTimeout)
+	defer cancel()
+	tools, err := ms.Client.ListTools(ctx)
+	if err != nil {
+		logF("MCP: %s: tools/list after list_changed: %v", name, err)
+		return
+	}
+	p.mu.Lock()
+	if p.servers[name] == ms {
+		ms.Tools = tools
+		p.version.Add(1)
+	}
+	p.mu.Unlock()
 }
 
 // recordFailure keeps a server that failed to connect in the pool, marked not
@@ -193,6 +277,7 @@ func (p *Pool) Disconnect(name string) {
 	}
 	p.mu.Unlock()
 	if ok {
+		p.version.Add(1)
 		s.Close()
 	}
 }
@@ -205,6 +290,9 @@ func (p *Pool) DisconnectAll() {
 		delete(p.servers, name)
 	}
 	p.mu.Unlock()
+	if len(doomed) > 0 {
+		p.version.Add(1)
+	}
 
 	// Shut the servers down concurrently and outside the lock. Serially under
 	// the lock, N unresponsive servers would each burn the full close grace

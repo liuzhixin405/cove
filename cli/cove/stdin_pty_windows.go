@@ -19,13 +19,14 @@ func stdinIsMSYSPty() bool {
 	}
 	// FILE_NAME_INFO: a uint32 byte length followed by the UTF-16 name.
 	buf := make([]byte, 4+windows.MAX_PATH*2)
+	//nolint:gosec // len(buf) is the fixed size above (a few hundred bytes), never near uint32's range
 	if err := windows.GetFileInformationByHandleEx(h, windows.FileNameInfo, &buf[0], uint32(len(buf))); err != nil {
 		return false
 	}
-	n := *(*uint32)(unsafe.Pointer(&buf[0])) / 2
+	n := *(*uint32)(unsafe.Pointer(&buf[0])) / 2 //nolint:gosec // FILE_NAME_INFO layout requires reinterpreting the byte buffer
 	if n == 0 || int(n) > windows.MAX_PATH {
 		return false
 	}
-	name := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[4])), n)
+	name := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[4])), n) //nolint:gosec // FILE_NAME_INFO layout requires reinterpreting the byte buffer
 	return isMSYSPtyPipeName(windows.UTF16ToString(name))
 }

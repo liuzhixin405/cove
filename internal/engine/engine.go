@@ -10,14 +10,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/checkpoint"
+	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/delegate"
@@ -42,7 +43,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
-const MaxIterations = 200
 const CompactTokenThreshold = 64000
 
 // maxParallelTools caps how many concurrency-safe tool calls run simultaneously
@@ -70,11 +70,33 @@ type Config struct {
 	// default (nil slice = no-op).
 	DoneVerifyCommands []string
 	DoneVerifyAuto     bool
-	Thinking           string
-	Effort             string
+	// DoneVerifyTimeout (config "done_verify_timeout_seconds") bounds each
+	// verification command; 0 keeps the defaults (120 s, dotnet/npm 300 s).
+	DoneVerifyTimeout time.Duration
+	// DoneCheck (config "done_check"): "on", "off" or "auto" (also ""). The
+	// one-time "is the request fully met?" prompt before a turn that changed
+	// files ends; auto applies it to fast-tier models and to every provider
+	// other than anthropic. See doneCheckEnabled.
+	DoneCheck string
+	Thinking  string
+	Effort    string
 	// CustomInstructions (config "system_prompt") are the user's own
 	// standing instructions, added to the built-in system prompt.
 	CustomInstructions string
+	// MaxIterations caps the model calls of one turn (config
+	// "max_iterations"): 0 means DefaultMaxIterations, UnlimitedIterations
+	// none. Interactive front ends are asked at the cap
+	// (IterationLimitPrompt); without a prompt the turn stops there.
+	MaxIterations int
+	// MaxTurnMinutes limits how long one turn runs (config
+	// "max_turn_minutes"); 0 turns the limit off.
+	MaxTurnMinutes int
+	// SubagentMaxIterations caps each sub-agent's model calls (config
+	// "subagent_max_iterations"); 0 means delegate.DefaultMaxIter.
+	SubagentMaxIterations int
+	// MaxSessions is how many saved sessions the store keeps (config
+	// "max_sessions"); older ones are pruned at the end of a turn. <= 0 off.
+	MaxSessions int
 }
 
 type Engine struct {
@@ -116,6 +138,8 @@ type Engine struct {
 	enhancedRepoMap       *repomap.EnhancedGenerator // incremental repo map (P2)
 	iterCount             int                        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex                 // lock for interactive permission prompts
+	policyLoadErr         error                      // why the policies file (PolicyFilePath) failed to load, if it did
+	diskRules             []diskRule                 // rules loadPersistedPolicies gave e.perm, removed again on /cd
 	// out is where every user-facing line and block goes once a front end has
 	// wired one with SetOutput. nil means "not wired", which falls through to
 	// the deprecated OnEngineOutput callback below, and to silence when that is
@@ -142,7 +166,43 @@ type Engine struct {
 	OnPermissionDone  func()                       // called after permission decision to resume
 	OnToolProgress    func(toolName, chunk string) // live output chunks from long-running tools
 	// OnToolStart, if set, is called before each tool execution with the tool name.
-	OnToolStart   func(toolName string)
+	OnToolStart func(toolName string)
+	// IterationLimitPrompt, if set, is asked whether a turn may go on when it
+	// reaches its iteration cap (Reason "iterations"), its time limit
+	// ("time") or looks stuck ("stagnation", once per turn). Continue grants
+	// one more window of the same size; Stop, or no prompt at all (-p,
+	// headless), ends the turn resumably. It runs on the turn's goroutine.
+	IterationLimitPrompt func(stats LimitStats) LimitDecision
+	// OnBackgroundSummary, if set, receives what the turn-end background
+	// work did (memories extracted, the dream gate, a failed session save),
+	// only when BackgroundSummary.Notable. It is called from a background
+	// goroutine, some time after the turn returned. Headless and -p front
+	// ends leave it unset.
+	OnBackgroundSummary func(BackgroundSummary)
+	// OnTurnModel, if set, receives the model a new turn was routed to, when
+	// routing chooses between a fast and a main model (for a one-line
+	// "模型：…" status at the start of the turn).
+	OnTurnModel func(model string)
+	// bg tracks the turn-end background goroutines (WaitBackground).
+	bg sync.WaitGroup
+	// bgPending counts the turn-end jobs e.bg still waits for
+	// (BackgroundPending), since a WaitGroup cannot be asked.
+	bgPending atomic.Int32
+	// reviewBg tracks a running skill review, which WaitBackground does
+	// not wait for.
+	reviewBg sync.WaitGroup
+	// extractSaved counts memories saved by extractions (extract OnSave).
+	extractSaved atomic.Int64
+	// lastSaveErr is the error of the last session save, nil when it
+	// succeeded.
+	lastSaveErr error
+	// bgMu guards what the background summary last saw of the dream gate.
+	bgMu            sync.Mutex
+	dreamSeen       bool
+	lastDreamNeeded int
+	// turnTimeUnit is what one of Config.MaxTurnMinutes lasts (time.Minute;
+	// shortened in tests).
+	turnTimeUnit  time.Duration
 	sessionNotes  *notes.SessionNotes
 	guardrails    *guardrail.Tracker
 	subdirHints   *ctxt.SubdirHints
@@ -155,7 +215,7 @@ type Engine struct {
 	autoLearnOff       bool
 	dreamRunner        *dream.Runner
 	cpMgr              *checkpoint.Manager
-	lastReviewMsgCount int
+	lastReviewMsgCount int                     // guarded by bgMu, with reviewRunning
 	verifyGate         *VerifyGate             // completion verification gate (P0-0, minimal EDCL)
 	verifyAttempts     int                     // how many times the gate has rejected completion this turn
 	fastOutcomes       *fastModelOutcomeWindow // recent fast-model success/failure, feeds router scoring
@@ -185,14 +245,62 @@ type Engine struct {
 	// collectContext re-reads the project state (git, file tree) before each
 	// turn. Replaced in tests.
 	collectContext func() *ctxt.ProjectContext
+	// refreshGit re-reads only the git state (branch, status, log) of the
+	// current project context before each turn. Replaced in tests.
+	refreshGit func(*ctxt.ProjectContext)
 	// lastEnvGit is the git snapshot last sent to the model, so an unchanged
 	// working tree is not repeated every turn.
 	lastEnvGit string
+
+	// toolDefsVersion is an outside version that also invalidates the
+	// cached tool definitions (SetToolDefsVersion); cachedToolDefsExtra is
+	// its value at the last build.
+	toolDefsVersion     func() int
+	cachedToolDefsExtra int
+
+	// verifyAnnounced is set once the gate's commands were shown to the
+	// user (first turn, and again after a working-directory change).
+	verifyAnnounced bool
+	// costNoticeFor is the max budget the 80% spend notice was shown for
+	// (costBudgetNotice); guarded by bgMu.
+	costNoticeFor float64
+	// newMemories are the memories extracted this session that the model
+	// has not been told about yet (takeNewMemoriesNote); guarded by bgMu.
+	newMemories []string
+	// shownMemories are the memory files whose full text a turn note
+	// already carried (relevantMemoriesNote); guarded by bgMu.
+	shownMemories map[string]bool
+	// repoMapExcerpts counts the turns that got an automatic repo map
+	// excerpt (turnRepoMapExcerpt), at most repoMapExcerptsPerSession.
+	repoMapExcerpts int
+	// repoMapMu guards repoMapExcerpts.
+	repoMapMu sync.Mutex
+	// instrTruncNoticed: the "instruction files truncated" notice was shown
+	// this session.
+	instrTruncNoticed bool
+	// reviewRunning is set while a skill review runs (reviewMessages);
+	// guarded by bgMu.
+	reviewRunning bool
+	// turnsSinceReview counts turn ends since the last review that ran
+	// (guarded by bgMu); turnUsedWork is whether the turn that just ended
+	// ran a tool that is not read-only. Both gate reviewMessages.
+	turnsSinceReview int
+	turnUsedWork     bool
+	// nonInteractive marks a process that exits right after its answer
+	// (cove -p, SetNonInteractive): the skill review would be abandoned
+	// at exit after its paid request, so it never starts.
+	nonInteractive bool
 
 	// interrupted records a turn that ended before completing (API error,
 	// cancel, budget, loop). Its completed tool rounds stay in history;
 	// re-sending the same message resumes it.
 	interrupted *interruption
+	// lastWrapUp is the no-tool summary the last stopped turn ended with
+	// (LastWrapUp).
+	lastWrapUp string
+	// interruptMarked: the current interruption already left its history
+	// marker (interrupt); cleared when a turn completes.
+	interruptMarked bool
 
 	// lastRoutedModel is the model the previous turn ran on (routing stickiness).
 	lastRoutedModel string
@@ -200,10 +308,21 @@ type Engine struct {
 	// turnFilesChanged records whether this turn wrote or edited a file, for
 	// the automatic verification gate. Guarded by fileMu.
 	turnFilesChanged bool
+	// turnCheckpointed records that this turn created a checkpoint, for the
+	// "/undo" hint of the summary line. Guarded by fileMu.
+	turnCheckpointed bool
 
 	// injectedSkills are the file-type skills already shown this session.
 	skillMu        sync.Mutex
 	injectedSkills map[string]bool
+
+	// lastInputTokens is the prompt size the provider reported for the last
+	// request, which carried the first usageMsgCount messages; 0 when there
+	// is no usable report. requestOverhead estimates the system prompt and
+	// tool definitions. See token_count.go.
+	lastInputTokens int
+	usageMsgCount   int
+	requestOverhead int
 }
 
 type interruption struct {
@@ -211,6 +330,10 @@ type interruption struct {
 	routedModel string
 	reason      string
 }
+
+// interruptMarkerFmt is the history note an interruption leaves; %s is the
+// reason in English (interruptMarkerReason).
+const interruptMarkerFmt = "[system: The previous turn was interrupted (%s). Commands may have partially executed and files may be half-edited; re-check state before repeating work.]"
 
 const interruptedToolNote = "[系统未执行此工具调用：本轮在执行前被中断。]"
 
@@ -247,13 +370,14 @@ func New(config Config) (*Engine, error) {
 	// loop, sub-agents, memory extraction, background review, consolidation
 	// and compaction summaries alike.
 	metered := api.NewMeteredProvider(provRef, func(model string, resp *api.ChatResponse) {
-		tracker.AddDetailed(model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
+		tracker.AddWithCacheWrite(model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens, resp.PromptCacheWriteTokens)
 	})
 
 	e := &Engine{
 		fallback:       api.NewModelFallback([]api.Provider{metered}),
 		provRef:        provRef,
 		collectContext: ctxt.Collect,
+		refreshGit:     (*ctxt.ProjectContext).RefreshGitAll,
 		modelRouter:    modelRouter,
 		registry:       reg,
 		messages:       make([]api.Message, 0),
@@ -275,6 +399,7 @@ func New(config Config) (*Engine, error) {
 			SkillPrompts:  make(map[string]string),
 		},
 		fileHistory:      make(map[string]bool),
+		turnTimeUnit:     time.Minute,
 		recordingEnabled: recordDir != "",
 		recordingDir:     recordDir,
 		replayEnabled:    replayDir != "",
@@ -306,23 +431,12 @@ func New(config Config) (*Engine, error) {
 	e.policyEngine = permission.NewPolicyEngine()
 
 	verifyCwd, _ := os.Getwd()
-	if len(config.DoneVerifyCommands) > 0 {
-		e.verifyGate = NewVerifyGate(config.DoneVerifyCommands, verifyCwd)
-	} else if config.DoneVerifyAuto {
-		if cmds := detectVerifyCommands(verifyCwd); len(cmds) > 0 {
-			e.verifyGate = newAutoVerifyGate(cmds, verifyCwd)
-		}
-	}
+	e.verifyGate = e.newVerifyGate(verifyCwd)
 
-	// Load permission policies from disk if available
-	if home, err := os.UserHomeDir(); err == nil {
-		policyStore, err := permission.NewFilePolicyStorage(filepath.Join(home, ".cove", "policies.json"))
-		if err == nil {
-			if rules, err := policyStore.Load(); err == nil && len(rules) > 0 {
-				e.policyEngine.LoadRules(rules)
-			}
-		}
-	}
+	// Prefix rules need to know how the bash tool's shell quotes arguments.
+	perm.SetShellKind(permission.ToolShellKind("bash"))
+
+	e.loadPersistedPolicies(verifyCwd)
 
 	if config.SkillManager != nil {
 		for _, s := range config.SkillManager.All() {
@@ -381,13 +495,13 @@ func New(config Config) (*Engine, error) {
 	e.backgroundModel = backgroundModel
 
 	// Initialize extract runner (auto memory extraction)
-	e.extractRunner = extract.NewRunner(metered, backgroundModel)
+	e.setExtractRunner(extract.NewRunner(metered, backgroundModel))
 
 	// Initialize dream runner (periodic memory consolidation)
 	e.dreamRunner = dream.NewRunner(metered, backgroundModel, e.session.ID)
 
 	// Initialize checkpoint manager (git-based file snapshots)
-	if cpMgr, err := checkpoint.New(cwd); err == nil {
+	if cpMgr, err := startupCheckpoints(cwd); err == nil {
 		e.cpMgr = cpMgr
 	} else {
 		log.Debugf("[checkpoint] init failed: %v", err)
@@ -400,6 +514,11 @@ func New(config Config) (*Engine, error) {
 
 	return e, nil
 }
+
+// startupCheckpoints opens the checkpoint store for the directory New starts
+// in. Replaced in tests: nearly every test drops the manager, and opening it
+// under a fresh HOME runs "git init --bare" (about 0.3s on Windows).
+var startupCheckpoints = checkpoint.New
 
 // newSessionID names a new session file. It used to be the Unix second
 // alone, so two `cove -p` runs started in the same second wrote the same
@@ -434,20 +553,20 @@ func (e *Engine) SetWorkingDir(dir string) {
 		e.cpMgr = nil
 		log.Debugf("[checkpoint] init failed for %s: %v", dir, err)
 	}
-	e.verifyGate = nil
-	if len(e.config.DoneVerifyCommands) > 0 {
-		e.verifyGate = NewVerifyGate(e.config.DoneVerifyCommands, dir)
-	} else if e.config.DoneVerifyAuto {
-		if cmds := detectVerifyCommands(dir); len(cmds) > 0 {
-			e.verifyGate = newAutoVerifyGate(cmds, dir)
-		}
-	}
+	e.verifyAnnounced = false
+	e.verifyGate = e.newVerifyGate(dir)
 	if e.sessionNotes != nil {
 		_ = e.sessionNotes.Flush()
 	}
 	e.sessionNotes = notes.New(dir)
 	e.sessionNotes.Load()
+	// Persisted permission rules are scoped to a project root: drop the old
+	// project's and load the new one's.
+	e.loadPersistedPolicies(dir)
 	e.enhancedRepoMap = repomap.NewEnhancedGenerator(dir)
+	e.repoMapMu.Lock()
+	e.repoMapExcerpts = 0
+	e.repoMapMu.Unlock()
 	e.subdirHints = ctxt.NewSubdirHints(dir)
 	if e.collectContext != nil {
 		e.projCtx = e.collectContext()
@@ -473,6 +592,11 @@ func (e *Engine) ResumeSession(r *session.Record) {
 		r.Cwd = session.NormalizeProjectDir(wd)
 	}
 	e.session = r
+	// The dream gate must not count the session in use as one to
+	// consolidate; it was told the ID New started with.
+	if e.dreamRunner != nil {
+		e.dreamRunner.SetCurrentSession(r.ID)
+	}
 }
 
 func (e *Engine) SetProjectContext(pc *ctxt.ProjectContext) { e.projCtx = pc }
@@ -635,6 +759,173 @@ func (e *Engine) AddPermissionRule(decision permission.Decision, rule permission
 	e.perm.AddRule(decision, rule)
 }
 
+// PersistPermissionRule writes an allow rule to the policies file
+// (PolicyFilePath) so it applies to later sessions started in the project
+// whose root is scope ("" for every project), and installs it for this
+// session as a disk rule (see PersistPermissionRules). A rule with the same
+// ID and scope is replaced; rules of other projects in the file are kept.
+func (e *Engine) PersistPermissionRule(rule permission.Rule, scope string) error {
+	return e.PersistPermissionRules([]permission.Rule{rule}, scope)
+}
+
+// PersistPermissionRules persists several allow rules with a single write, so
+// a "[p]" answer covering several command prefixes is saved all or nothing.
+//
+// On success the rules that apply to the engine's current project (scope ""
+// or this project's root) are also given to the session manager and
+// registered as disk rules, exactly as if loadPersistedPolicies had read them:
+// /cd to another project removes them again instead of leaving a session copy
+// behind. Callers must not add a separate session rule. On error nothing is
+// installed; the caller decides whether to fall back to a session rule.
+func (e *Engine) PersistPermissionRules(rules []permission.Rule, scope string) error {
+	path, err := policyFilePath()
+	if err != nil {
+		return fmt.Errorf("locate config directory: %w", err)
+	}
+	store, err := permission.NewFilePolicyStorage(path)
+	if err != nil {
+		return err
+	}
+	if err := permission.AppendAllowRules(store, rules, scope); err != nil {
+		return err
+	}
+	if scope != "" && !permission.SameProject(scope, e.PermissionScope()) {
+		return nil
+	}
+	for _, rule := range rules {
+		if e.hasDiskRule(permission.DAllow, rule) {
+			continue
+		}
+		e.perm.AddRule(permission.DAllow, rule)
+		e.diskRules = append(e.diskRules, diskRule{decision: permission.DAllow, rule: rule})
+	}
+	return nil
+}
+
+// hasDiskRule reports whether rule is already installed as a disk rule under
+// decision, so persisting the same rule twice keeps one copy in e.perm.
+func (e *Engine) hasDiskRule(decision permission.Decision, rule permission.Rule) bool {
+	for _, d := range e.diskRules {
+		if d.decision == decision && permission.SameRule(d.rule, rule) {
+			return true
+		}
+	}
+	return false
+}
+
+// diskRule is a rule loaded from policies.json into the session manager,
+// with the decision it was added under.
+type diskRule struct {
+	decision permission.Decision
+	rule     permission.Rule
+}
+
+// loadPersistedPolicies loads policies.json for the project containing cwd.
+// Rules persisted for another project (non-empty scope that is not this
+// project's root) are skipped. Enabled allow, deny and ask rules the session
+// manager can express are also given to it, so "[p] 永久允许" prefix rules
+// match exactly like "[a]" ones, and deny / ask rules take precedence over
+// bypass mode and the read-only auto-allow (Manager.Check evaluates deny
+// first and ask before the mode default). Rules loaded for a previous
+// project are removed first, so /cd does not carry them along.
+func (e *Engine) loadPersistedPolicies(cwd string) {
+	// Load and parse the file first. Only once that succeeds do we remove
+	// the previously loaded disk rules and install the new set; otherwise
+	// deny/ask rules from a good load would be dropped just because a
+	// later load hit a corrupt file (fail-open).
+	policyPath, err := policyFilePath()
+	if err != nil {
+		return
+	}
+	policyStore, err := permission.NewFilePolicyStorage(policyPath)
+	if err != nil {
+		e.policyLoadErr = fmt.Errorf("open %s: %w", policyPath, err)
+		log.Warnf("[permission] %v", e.policyLoadErr)
+		return
+	}
+	rules, err := policyStore.Load()
+	if err != nil {
+		// Deny rules in an unreadable file would silently stop applying;
+		// say so, and leave the file (and the currently loaded rules) for
+		// the user to fix, instead of dropping the rules already in effect.
+		e.policyLoadErr = fmt.Errorf("load %s: %w", policyStore.Path(), err)
+		log.Warnf("[permission] permission policies not applied: %v", e.policyLoadErr)
+		return
+	}
+
+	for _, d := range e.diskRules {
+		e.perm.RemoveRules(d.decision, []permission.Rule{d.rule})
+	}
+	e.diskRules = nil
+	e.policyLoadErr = nil
+	if e.policyEngine != nil {
+		e.policyEngine.LoadRules(nil)
+	}
+	if len(rules) == 0 {
+		return
+	}
+	root := permission.ProjectRoot(cwd)
+	inScope := make([]permission.PolicyRule, 0, len(rules))
+	for _, r := range rules {
+		if r.Scope != "" && !permission.SameProject(r.Scope, root) {
+			continue
+		}
+		inScope = append(inScope, r)
+		if !r.Enabled {
+			continue
+		}
+		var decision permission.Decision
+		switch r.Action {
+		case permission.ActionAllow:
+			decision = permission.DAllow
+		case permission.ActionDeny:
+			decision = permission.DDeny
+		case permission.ActionAsk:
+			decision = permission.DAsk
+		default:
+			continue
+		}
+		if rule, ok := r.ToRule(); ok {
+			e.perm.AddRule(decision, rule)
+			e.diskRules = append(e.diskRules, diskRule{decision: decision, rule: rule})
+		}
+	}
+	if e.policyEngine != nil {
+		e.policyEngine.LoadRules(inScope)
+	}
+}
+
+// policyFilePath is where persisted permission policies live: policies.json
+// in the config directory config.json is read from (COVE_CONFIG_DIR, else
+// ~/.cove). It used to be ~/.cove regardless, so COVE_CONFIG_DIR moved the
+// config but not the policies, and tests could not keep a developer's real
+// policies.json from applying to them.
+func policyFilePath() (string, error) {
+	return PolicyFilePath()
+}
+
+// PolicyFilePath is where persisted permission policies are read from and
+// written to, for front ends that tell the user where a rule went.
+func PolicyFilePath() (string, error) {
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "policies.json"), nil
+}
+
+// PermissionScope is the project root persisted rules are scoped to: the
+// root of the engine's project directory (projectCwd, falling back to the
+// process working directory before a turn has collected context). It is the
+// same root persisted rules are compared against when they are loaded.
+func (e *Engine) PermissionScope() string {
+	return permission.ProjectRoot(e.projectCwd())
+}
+
+// PolicyLoadError reports why the policies file (PolicyFilePath) could not be loaded at
+// startup (nil when it loaded or does not exist), for /doctor and diagnostics.
+func (e *Engine) PolicyLoadError() error { return e.policyLoadErr }
+
 func (e *Engine) Registry() *tool.Registry { return e.registry }
 func (e *Engine) Runtime() *tool.Runtime   { return e.runtime }
 func (e *Engine) ListCheckpoints() []string {
@@ -739,9 +1030,9 @@ Available tools (full definitions are provided separately): `)
 	// silently crowd out the repo map, or vice versa, with no ordering or
 	// ceiling. It now competes for a single model-aware token budget via
 	// contextBudgeter instead: matched skills / retrieved memories are
-	// "relevant" (already scoped to the task) and go first, the repo map
-	// and file tree are "on-demand" (the model can re-derive them with a
-	// tool call), and session notes are pure overflow. See
+	// "relevant" (already scoped to the task) and go first, the project
+	// outline is "on-demand" (the model can re-derive it with a tool
+	// call), and session notes are pure overflow. See
 	// internal/engine/context_budget.go.
 	budgeter := newContextBudgeter(api.StaticContextBudget(e.config.Model))
 
@@ -752,20 +1043,24 @@ Available tools (full definitions are provided separately): `)
 	}
 	if e.memStore != nil {
 		if mp := e.memStore.BuildPrompt(); mp != "" {
-			budgeter.add(layerRelevant, mp)
+			budgeter.add(layerRelevant, capMemoryIndex(mp))
+		}
+		// CLAUDE.md/AGENTS.md/.cove.md past memory.MaxInstructionBytes are
+		// clipped; say so once per session instead of silently.
+		if !e.instrTruncNoticed && e.memStore.InstructionFilesTruncated() {
+			e.instrTruncNoticed = true
+			e.engineOutput("  \x1b[2m项目指令文件超过 32KB，已截断（保留前 32KB）\x1b[0m")
 		}
 	}
+	// The full repo map (38.6KB of a 51.7KB prompt on this repository) and
+	// the file tree used to sit here, re-sent with every request, chat turns
+	// included. The prompt now carries a small project outline; the first
+	// task-like turn gets a relevant repo map excerpt in its turn note
+	// (turnRepoMapExcerpt) and the model queries the rest with the repo_map
+	// tool.
 	if e.projCtx != nil {
-		// Use enhanced incremental repo map when available
-		if e.enhancedRepoMap != nil {
-			if mapText, _ := e.enhancedRepoMap.GenerateIncremental(200); mapText != "" {
-				budgeter.add(layerOnDemand, fmt.Sprintf("\n<repo_map>\n%s\n</repo_map>\n", mapText))
-			}
-		} else if e.projCtx.RepoMap != "" {
-			budgeter.add(layerOnDemand, fmt.Sprintf("\nRepository Micro-Map (Defined API structures/schemas):\n%s", e.projCtx.RepoMap))
-		}
-		if e.projCtx.FileTree != "" {
-			budgeter.add(layerOnDemand, fmt.Sprintf("\nProject structure:\n%s", e.projCtx.FileTree))
+		if outline := repomap.Outline(e.repoMapRoot()); outline != "" {
+			budgeter.add(layerOnDemand, "\n"+outline)
 		}
 	}
 	// Inject session notes for context continuity
@@ -823,10 +1118,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
 	}
 
-	// Re-read the project state so this turn's context note is current. The
-	// system prompt is deliberately not rebuilt here (see SystemPrompt).
-	if e.projCtx != nil && e.collectContext != nil {
-		e.projCtx = e.collectContext()
+	// Re-read the git state so this turn's context note is current. Only git
+	// is refreshed: the project outline lives in the system prompt,
+	// which is deliberately not rebuilt here (see SystemPrompt), so rescanning
+	// the whole project before every message bought nothing.
+	if e.projCtx != nil && e.refreshGit != nil {
+		e.refreshGit(e.projCtx)
 	}
 
 	// Stall monitor: surfaces which stage is stuck if the run appears to hang.
@@ -846,9 +1143,14 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	// A turn that was interrupted is resumed when its message is sent again —
 	// the "继续" command and the automatic retry both re-send it — instead of
 	// appending the request a second time and redoing every completed step.
+	e.lastWrapUp = ""
 	resume := e.interrupted
 	e.interrupted = nil
 	resuming := resume != nil && sameRequest(resume.user, userMessage)
+	if !resuming {
+		// A new request: its own interruption, if any, leaves a new marker.
+		e.interruptMarked = false
+	}
 	if resume != nil && !resuming {
 		e.messages = append(e.messages, newSyntheticUserMsg(fmt.Sprintf(
 			"[system: 上一轮任务被中断（%s），以上是中断前已完成的操作。]", resume.reason)))
@@ -860,17 +1162,21 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		e.messages = append(e.messages, userMessage)
 		e.fileMu.Lock()
 		e.turnFilesChanged = false
+		e.turnCheckpointed = false
 		e.fileMu.Unlock()
 	}
 	e.saveSession()
 
+	e.announceVerifyGate()
+
 	// Cache system prompt and tool defs across iterations (stable within a run)
 	sp := e.SystemPrompt()
 	toolDefs := e.buildAPIToolDefs()
+	e.setRequestOverhead(sp, toolDefs)
 
 	// Reset loop detector at the start of each turn
 	if e.loopDetector != nil {
-		e.loopDetector.Reset()
+		e.loopDetector.ResetTurn()
 	}
 	// The guardrail counts failures and repeats within a turn. Never reset,
 	// a tool that failed eight times anywhere in the session stayed blocked
@@ -909,9 +1215,12 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			}
 			log.Debugf("model routing: %s (source=%s, reason=%s)", decision.Model, decision.Source, decision.Reason)
 		}
+		if e.OnTurnModel != nil && e.modelRouter != nil && e.modelRouter.RoutedModelLabel() != "" {
+			e.OnTurnModel(routedModel)
+		}
 		// Changing state (git) and per-turn guidance travel with the turn,
 		// after the user's message, so the cached prefix stays intact.
-		if note := e.turnContextNote(); note != "" {
+		if note := e.turnContextNote(userMessage.Content); note != "" {
 			e.messages = append(e.messages, newSyntheticUserMsg(note))
 		}
 	}
@@ -919,7 +1228,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 	// compactedForLength limits the context-length recovery to one retry.
 	compactedForLength := false
-	for iter := 0; iter < MaxIterations; iter++ {
+	// The iteration cap, the time limit and the stagnation prompt are soft:
+	// an interactive front end is asked whether to go on (see
+	// IterationLimitPrompt); -p and headless runs stop.
+	limits := e.newTurnLimits()
+	for iter := 0; ; iter++ {
 		e.iterCount = iter + 1
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
 		if ctx.Err() != nil {
@@ -932,6 +1245,11 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		if e.costTracker.OverBudget() {
 			e.interrupt(userMessage, routedModel, "预算已用尽")
 			return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
+		}
+		if reason, err := e.checkTurnLimits(limits, iter); err != nil {
+			e.drainPendingSteer() // discard pending steer on a limit stop
+			e.stopWithWrapUp(ctx, userMessage, routedModel, reason, onDelta)
+			return "", err
 		}
 		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
 			iter, len(e.messages), e.totalTokens, len(toolDefs), e.config.Model, e.costTracker.Summary())
@@ -965,7 +1283,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			Messages:   reqMessages,
 			SystemBase: sp,
 			Tools:      toolDefs,
-			MaxTokens:  64000,
+			MaxTokens:  api.MaxOutputTokensForModel(modelName),
 			Thinking:   e.config.Thinking,
 			Effort:     e.config.Effort,
 		}
@@ -1020,7 +1338,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// the turn and leaving the user to run /compact and resend.
 			compactedForLength = true
 			before := e.totalTokens
-			e.compactIfNeeded(ctx, e.totalTokens/2)
+			e.compact(ctx, e.totalTokens/2)
 			if e.totalTokens < before {
 				e.engineOutput("  上下文超出模型上限，已压缩对话历史后重试")
 				continue
@@ -1036,6 +1354,10 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			return "", fmt.Errorf("api: %w", err)
 		}
 
+		// The provider's prompt size is the real context size; later counts
+		// build on it (see token_count.go).
+		e.recordUsage(resp.InputTokens, len(reqMessages))
+
 		// Live calls are billed by the metered provider (see New). Replayed
 		// responses never reach a provider, so they are billed here.
 		if e.replayEnabled {
@@ -1043,8 +1365,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			if billedModel == "" {
 				billedModel = modelName
 			}
-			e.costTracker.AddDetailed(billedModel, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens)
+			e.costTracker.AddWithCacheWrite(billedModel, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens, resp.PromptCacheWriteTokens)
 		}
+		e.costBudgetNotice()
 
 		// Update rate limit tracking
 		if e.rateLimits != nil && resp.RateLimitHeaders != nil {
@@ -1065,6 +1388,17 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		if !hasToolCalls(resp) {
+			// Post-stop self-checks (nudges.go): an empty reply, an announced
+			// but untaken next step, a degenerate ending, the one-time done
+			// check. Each is capped per turn; past the cap the reply stands.
+			if nudge, keep := e.stopNudge(ctx, limits, iter, resp, routedModel); nudge != "" {
+				if keep {
+					e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
+				}
+				e.emitSeparator(onDelta, nudge == nudgeDoneCheckText)
+				e.messages = append(e.messages, newSyntheticUserMsg(nudge))
+				continue
+			}
 			// Completion verification gate (minimal EDCL "done contract"): if
 			// the user configured done_verify_commands, don't accept the
 			// model's self-reported "done" (no more tool calls) until those
@@ -1074,14 +1408,19 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// turns that claim into something checked instead of trusted.
 			gaveUpUnresolved := false
 			if e.verifyGate.Enabled() && (!e.verifyGate.onlyWhenFilesChanged || e.filesChangedThisTurn()) {
-				results, passed := e.verifyGate.Run(ctx)
-				if !passed {
+				results, passed := e.verifyGate.Run(ctx, limits.verifyPassed)
+				if !passed && TimedOut(results) {
+					// Too slow to tell: not the model's failure. No retry,
+					// no escalation; the turn ends normally.
+					e.engineOutput("  \x1b[2m" + Summary(results) + "\x1b[0m")
+				} else if !passed {
 					if e.verifyAttempts < e.verifyGate.MaxRetries() {
 						e.verifyAttempts++
 						e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
 						e.engineOutput(fmt.Sprintf("  \x1b[33m! verify_gate rejected completion (attempt %d/%d)\x1b[0m", e.verifyAttempts, e.verifyGate.MaxRetries()))
 						e.messages = append(e.messages, newSyntheticUserMsg(Summary(results)))
 						routedModel = e.escalate(routedModel, "完成校验未通过")
+						e.emitSeparator(onDelta, false)
 						continue
 					}
 					e.engineOutput("  \x1b[31m! verify_gate: still failing after max retries, returning control to user\x1b[0m")
@@ -1097,6 +1436,8 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
 			e.saveSession()
+			e.interruptMarked = false
+			e.turnUsedWork = limits.usedTools
 			// Turn-end pipeline (all run in background)
 			e.runTurnEndPipeline()
 			// Auto-track decisions and discoveries
@@ -1109,8 +1450,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 
 		// Safety net: warn before the hard iteration cap, so the user knows the
 		// agent is about to stop for a reason other than task completion.
-		if e.iterCount >= MaxIterations-5 {
-			e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, MaxIterations))
+		// Only when the cap is hard: an interactive front end asks at the cap.
+		if e.IterationLimitPrompt == nil && limits.iterWindow > 0 && e.iterCount >= limits.iterCap-5 {
+			e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, limits.iterCap))
 		}
 
 		// Loop detection (enhanced 3-layer, P0-1).
@@ -1124,22 +1466,31 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				log.Warnf("loop detected (layer %d): %s", lr.Layer, lr.Reason)
 				if lr.Fatal {
 					e.engineOutput("? " + lr.Reason)
-					e.interrupt(userMessage, routedModel, "检测到操作循环")
+					e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环", onDelta)
 					return "", fmt.Errorf("loop detection: %s", lr.Reason)
 				}
-				// This batch is not going to run, so every tool_use in the
-				// assistant message above still needs a tool_result before the
-				// guidance can be appended — see syntheticToolResults.
-				e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
-				// Non-fatal: inject guidance asking the model to change approach
-				e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
-				// Reset fingerprint history so the model gets a fresh start
-				// after seeing the guidance, preventing old history from
-				// immediately triggering another detection.
-				e.loopDetector.ResetFingerprintHistory()
-				// Skip executing this repeated tool-call batch; ask the model
-				// to pick a new strategy on the next iteration.
-				continue
+				switch e.onLoopHit(limits, iter+1, lr) {
+				case loopHitStop:
+					e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
+					e.drainPendingSteer()
+					e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
+					return "", errLoopStopped
+				case loopHitGuide:
+					// This batch is not going to run, so every tool_use in the
+					// assistant message above still needs a tool_result before the
+					// guidance can be appended — see syntheticToolResults.
+					e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
+					// Non-fatal: inject guidance asking the model to change approach
+					e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
+					// Reset fingerprint history so the model gets a fresh start
+					// after seeing the guidance, preventing old history from
+					// immediately triggering another detection.
+					e.loopDetector.ResetFingerprintHistory()
+					// Skip executing this repeated tool-call batch; ask the model
+					// to pick a new strategy on the next iteration.
+					continue
+				}
+				// loopHitIgnore: the user chose to go on; the batch runs.
 			}
 		} else {
 			// Fallback: simple loop detection (kept for backward compatibility)
@@ -1184,11 +1535,24 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// claimedWritePaths holds the file paths already spoken for by a
 			// write or edit earlier in this batch. The first call to a path may
 			// be parallelized; a later call to the same path may not, and has to
-			// wait for the batch to drain. Running it in the inline branch
-			// instead would not serialize it — that branch executes immediately,
-			// racing the very goroutine it is meant to follow.
+			// wait for the batch to drain.
 			claimedWritePaths := make(map[string]bool)
+			// deferred holds same-file duplicates. They run once nothing else
+			// is in flight: at the next serial call (before it, since it may
+			// depend on them) or after the batch.
 			var deferred []int
+			runDeferred := func() {
+				for _, i := range deferred {
+					tc := resp.ToolCalls[i]
+					if e.OnToolStart != nil {
+						e.OnToolStart(tc.Name)
+					}
+					started := time.Now()
+					res := e.runToolRecovered(ctx, tc)
+					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
+				}
+				deferred = nil
+			}
 			// Bound concurrency so a single response with many tool calls cannot
 			// spawn an unbounded number of goroutines.
 			sem := make(chan struct{}, maxParallelTools)
@@ -1235,27 +1599,32 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Input: tcall.Input, Content: res, Elapsed: time.Since(started)}
 					}(i, tc)
 				} else {
+					// A serial call is a barrier: everything before it
+					// finishes first, and nothing after it starts until it
+					// is done. Running it inline without waiting overlapped
+					// it with the goroutines already started ([read(slow),
+					// bash] ran bash during the read); running it after the
+					// whole parallel group reordered side effects ([bash
+					// "mkdir d", write d/f] wrote before the mkdir). Same-file
+					// duplicates held back so far run before it too, and paths
+					// claimed before the barrier are free again after it.
+					wg.Wait()
+					runDeferred()
+					claimedWritePaths = make(map[string]bool)
 					if e.OnToolStart != nil {
 						e.OnToolStart(tc.Name)
 					}
 					started := time.Now()
-					res := e.executeTool(ctx, tc)
+					res := e.runToolRecovered(ctx, tc)
 					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
 				}
 			}
 			wg.Wait()
 
-			// Same-file duplicates run only now, once nothing else is in
-			// flight, so they cannot overlap the first write to their path.
-			for _, i := range deferred {
-				tc := resp.ToolCalls[i]
-				if e.OnToolStart != nil {
-					e.OnToolStart(tc.Name)
-				}
-				started := time.Now()
-				res := e.executeTool(ctx, tc)
-				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
-			}
+			// Same-file duplicates since the last serial call run only now,
+			// once nothing else is in flight, so they cannot overlap the first
+			// write to their path.
+			runDeferred()
 		} else {
 			for i, tc := range resp.ToolCalls {
 				if !e.config.Debug {
@@ -1271,7 +1640,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 					e.OnToolStart(tc.Name)
 				}
 				started := time.Now()
-				res := e.executeTool(ctx, tc)
+				res := e.runToolRecovered(ctx, tc)
 				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
 			}
 		}
@@ -1281,18 +1650,16 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// the tool_result run (assistant → tool → user → tool), which the
 		// provider rejects for the same reason as the Layer-1 case above.
 		var pendingLoopGuidance string
+		// loopStopped: the user stopped the turn at the loop prompt (Layer 2).
+		loopStopped := false
 
 		for _, r := range results {
+			limits.addStep(r.Name)
+			e.noteVerifyEvidence(limits, r.Name, r.Input, r.Content)
 			isErr := strings.HasPrefix(r.Content, "Error:")
 			if !e.config.Debug {
 				e.activity("")
 				e.emitToolResult(r.Name, r.Input, r.Content, isErr, r.Elapsed)
-			}
-			// Session notes capture (always, regardless of debug mode)
-			if e.sessionNotes != nil {
-				if isErr {
-					e.sessionNotes.AddError(fmt.Sprintf("%s: %s", r.Name, summarizeResult(r.Content)))
-				}
 			}
 			if isErr {
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
@@ -1302,25 +1669,44 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
 			})
 			// Feed loop detector with tool output (Layer 2: content hash)
-			if e.loopDetector != nil && !isErr {
+			if e.loopDetector != nil && !isErr && !loopStopped {
 				if lr := e.loopDetector.RecordOutput(r.Content); lr.Detected {
 					log.Warnf("loop detected (layer 2): %s", lr.Reason)
 					if lr.Fatal {
 						e.engineOutput("? " + lr.Reason)
-						e.interrupt(userMessage, routedModel, "检测到操作循环")
+						e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环", onDelta)
 						return "", fmt.Errorf("loop detection: %s", lr.Reason)
 					}
-					// Non-fatal: queue guidance asking the model to change
-					// approach; appended once the tool_result run is complete.
-					if pendingLoopGuidance == "" {
-						pendingLoopGuidance = injectLoopGuidance(lr.Reason)
+					switch e.onLoopHit(limits, iter+1, lr) {
+					case loopHitStop:
+						// The rest of the batch already ran: its results go in
+						// first, then the turn stops.
+						loopStopped = true
+					case loopHitGuide:
+						// Non-fatal: queue guidance asking the model to change
+						// approach; appended once the tool_result run is complete.
+						if pendingLoopGuidance == "" {
+							pendingLoopGuidance = injectLoopGuidance(lr.Reason)
+						}
+						// Reset fingerprint history so the model gets a fresh start
+						e.loopDetector.ResetFingerprintHistory()
 					}
-					// Reset fingerprint history so the model gets a fresh start
-					e.loopDetector.ResetFingerprintHistory()
 				}
 			}
 		}
 
+		if loopStopped {
+			e.drainPendingSteer()
+			e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
+			return "", errLoopStopped
+		}
+		if n := e.budgetNotice(limits, iter+1); n != "" {
+			if last := len(e.messages) - 1; last >= 0 && e.messages[last].Role == "tool" {
+				// Once per window, on the latest tool result: tell the
+				// model how much of the window is left (budgetNotice).
+				e.messages[last].Content += "\n\n" + n
+			}
+		}
 		if pendingLoopGuidance != "" {
 			e.messages = append(e.messages, newSyntheticUserMsg(pendingLoopGuidance))
 		}
@@ -1352,24 +1738,29 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		} else {
 			e.consecutiveErrors = 0
 		}
-		e.totalTokens = countTokens(e.messages)
+		e.updateTokenCount()
 		// Compression is handled by checkAndCompress at iteration start (line ~465).
 		// Record iteration for stagnation detection (Layer 3).
-		// L3 is log-only -- no file activity doesn't mean the model is stuck
-		// (research, reading, search are legitimate non-file workflows).
+		// L3 never aborts on its own -- no file activity doesn't mean the
+		// model is stuck (research, reading, search are legitimate non-file
+		// workflows). An interactive front end is asked once per turn; -p
+		// and headless runs only log it.
 		if e.loopDetector != nil {
 			if lr := e.loopDetector.RecordIteration(); lr.Detected {
 				log.Warnf("stagnation (layer 3): %s", lr.Reason)
-				// L3 is advisory-only: never abort the task on this signal.
-				// The model may be doing legitimate research/reading with no writes.
-				e.debugOutput("  \x1b[2m(note) " + lr.Reason + "\x1b[0m")
+				if e.IterationLimitPrompt != nil && !limits.stagnation {
+					limits.stagnation = true
+					if e.askLimit(e.limitStats(limits, iter+1, LimitReasonStagnation, 0)) != LimitContinue {
+						e.drainPendingSteer()
+						e.stopWithWrapUp(ctx, userMessage, routedModel, "疑似停滞，用户选择停止", onDelta)
+						return "", errStagnationStopped
+					}
+				} else {
+					e.debugOutput("  \x1b[2m(note) " + lr.Reason + "\x1b[0m")
+				}
 			}
 		}
 	}
-
-	e.drainPendingSteer() // discard pending steer on max iterations
-	e.interrupt(userMessage, routedModel, "达到单轮最大迭代次数")
-	return "", fmt.Errorf("max iterations (%d) reached, cost: %s", MaxIterations, e.costTracker.Summary())
 }
 
 // shouldShowWalkingIndicator reports whether the engine may draw the legacy
@@ -1386,6 +1777,20 @@ func (e *Engine) shouldShowWalkingIndicator(iter int) bool {
 		return false
 	}
 	return e.OnEngineOutput == nil && e.out == nil
+}
+
+// runToolRecovered is executeTool for the calls the turn runs on its own
+// goroutine (a single call, a serial barrier call, a deferred same-file
+// write). A panicking tool becomes that call's error result, as it already
+// did on the parallel path; before, it took the whole process down.
+func (e *Engine) runToolRecovered(ctx context.Context, tc api.ToolCall) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warnf("tool %s panicked: %v", tc.Name, r)
+			out = fmt.Sprintf("Error: tool panicked: %v", r)
+		}
+	}()
+	return e.executeTool(ctx, tc)
 }
 
 func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string) {
@@ -1483,7 +1888,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	tctx := tool.Context{
 		Cwd:              cwd,
 		ToolUseID:        tc.ID,
-		PermissionMode:   toolPermissionMode(e.perm.Mode()),
+		PermissionMode:   toolPermissionMode(e.perm.Mode(), tc.Name, tc.Input, cwd),
 		IsNonInteractive: e.runtime == nil || e.runtime.AskUser == nil,
 		Debug:            e.config.Debug,
 		Runtime:          e.runtime,
@@ -1498,14 +1903,27 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		},
 	}
 
-	if e.classifier != nil && tc.Name == "bash" {
+	if e.classifier != nil && permission.IsShellTool(tc.Name) {
 		cmd, _ := tc.Input["command"].(string)
-		cat := e.classifier.Classify(cmd)
-		if cat == permission.CatDangerous {
+		if e.classifier.ClassifyLine(cmd) == permission.CatDangerous {
 			return fmt.Sprintf("Error: dangerous command blocked: %s", cmd)
 		}
-		if e.perm.Mode() == permission.Auto && e.classifier.ShouldAutoApprove(cmd) {
-			tctx.PermissionMode = "auto"
+		// Mode tiers for shell lines: default runs read-only lines unasked,
+		// auto additionally runs build/test lines. "auto" in tctx is the
+		// engine's pre-approval; deny and ask rules are still applied by
+		// authorizeToolCall.
+		kind := e.perm.ShellKindFor(tc.Name)
+		switch e.perm.Mode() {
+		case permission.Default:
+			if e.classifier.IsReadOnlyLineFor(cmd, kind) {
+				tctx.PermissionMode = "auto"
+				log.Debugf("[permission] %s auto-allowed: read-only command", tc.Name)
+			}
+		case permission.Auto:
+			if e.classifier.AutoApproveLineFor(cmd, kind) {
+				tctx.PermissionMode = "auto"
+				log.Debugf("[permission] %s auto-allowed: read-only or build command", tc.Name)
+			}
 		}
 	}
 
@@ -1527,13 +1945,13 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 				if e.guardrails != nil {
 					e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
 				}
-				return fmt.Sprintf("Error (after retry): %v", err)
+				return token.TruncateKeepTail(fmt.Sprintf("Error (after retry): %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
 			}
 		} else {
 			if e.guardrails != nil {
 				e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
 			}
-			return fmt.Sprintf("Error: %v", err)
+			return token.TruncateKeepTail(fmt.Sprintf("Error: %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
 		}
 	}
 	if !result.IsError {
@@ -1558,43 +1976,50 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if !result.IsError {
 		// Adaptive truncation: code/read results get more space than bash
 		// output, and every limit grows with the model's context window.
-		if tc.Name == "bash" || tc.Name == "powershell" {
+		limit := toolOutputLimit(tc.Name, e.currentModel())
+		// The read tool's continuation marker stays the last line, after any
+		// hints appended below, so the model always finds where to go on.
+		var readMarker string
+		switch tc.Name {
+		case "bash", "powershell":
 			// stderr and the exit code come last; keep both ends.
-			output = token.TruncateMiddle(output, toolOutputLimit(tc.Name, e.currentModel()))
-		} else {
-			output = token.TruncateToTokens(output, toolOutputLimit(tc.Name, e.currentModel()))
+			output = token.TruncateMiddle(output, limit)
+		case "read":
+			output, readMarker = truncateReadResult(output, limit)
+		default:
+			output = token.TruncateToTokens(output, limit)
 		}
+		defer func() {
+			if readMarker != "" && !strings.HasPrefix(toolOutput, "Error") {
+				toolOutput += "\n" + readMarker
+			}
+		}()
 		if isExternalTool(tc.Name) {
 			output = wrapExternalContent(tc.Name, output)
 		}
 
-		// Conditional skills: a matching file-type skill is shown once per session.
-		if filePath, ok := tc.Input["filePath"].(string); ok {
-			output += e.newSkillPrompts(filePath)
-		}
-		// Subdirectory hints: inject context from discovered AGENTS.md files
-		if e.subdirHints != nil {
-			var hint string
-			if path, ok := tc.Input["filePath"].(string); ok {
-				hint = e.subdirHints.CheckPath(path)
-			} else if cmd, ok := tc.Input["command"].(string); ok {
-				hint = e.subdirHints.CheckCommand(cmd)
-			}
-			if hint != "" {
-				output += hint
-			}
-		}
+		// File-type skills and subdirectory AGENTS.md hints the call's
+		// paths bring in (each shown once until the next compaction).
+		output += e.toolContextHints(tc)
 	}
 	if result.IsError {
 		// The engine recognises failures by this prefix (circuit breaker,
 		// router failure signal, is_error on the wire).
-		if !strings.HasPrefix(result.Data, "Error") {
-			return "Error: " + result.Data
+		out := result.Data
+		if !strings.HasPrefix(out, "Error") {
+			out = "Error: " + out
 		}
-		return result.Data
+		// A failing tool can print as much as a succeeding one (a compiler
+		// listing thousands of errors); keep the first line and the last
+		// few, where the outcome is.
+		return token.TruncateKeepTail(out, toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
 	}
 	return output
 }
+
+// errorTailLines is how many closing lines of a truncated error result are
+// kept verbatim (final failure, exit status).
+const errorTailLines = 10
 
 // isTransientError checks if an error is likely transient and worth retrying
 func isTransientError(err error) bool {
@@ -1614,13 +2039,26 @@ func isTransientError(err error) bool {
 	return false
 }
 
-func toolPermissionMode(mode permission.Mode) string {
+// toolPermissionMode is the mode a tool sees in tool.Context. Bypass and plan
+// pass through. In auto mode a write or edit whose target lies inside the
+// project working directory gets "auto" (pre-approved); every other call sees
+// "default" and asks unless a rule or the shell classifier allows it.
+func toolPermissionMode(mode permission.Mode, toolName string, input map[string]any, cwd string) string {
 	switch mode {
 	case permission.Bypass, permission.Plan:
 		return string(mode)
-	default:
-		return string(permission.Default)
+	case permission.Auto:
+		switch strings.ToLower(toolName) {
+		case "write", "edit":
+			if cwd == "" {
+				cwd, _ = os.Getwd()
+			}
+			if target := permission.TargetPath(input); target != "" && permission.PathInside(cwd, target) {
+				return string(permission.Auto)
+			}
+		}
 	}
+	return string(permission.Default)
 }
 
 // projectCwd returns the working directory tools resolve relative paths
@@ -1650,7 +2088,21 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 	}
 
 	toolDecision := t.CheckPermissions(tc.Input, tctx)
-	decision, reason := e.perm.Check(tc.Name, tc.Input, mapToolDecision(toolDecision.Decision))
+	defaultDecision := mapToolDecision(toolDecision.Decision)
+	// tctx "auto" is the engine's own pre-approval (a read-only shell line, a
+	// build line in auto mode, an in-project write/edit in auto mode). Tools
+	// such as edit ask whatever the mode, so the pre-approval is applied here;
+	// deny and ask rules in e.perm still take precedence over it.
+	if tctx.PermissionMode == string(permission.Auto) && defaultDecision == permission.DAsk {
+		defaultDecision = permission.DAllow
+	}
+	decision, reason := e.perm.Check(tc.Name, tc.Input, defaultDecision)
+	if decision == permission.DAllow && e.policyEngine != nil &&
+		e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode) == permission.ActionDeny {
+		// A deny rule in policies.json still wins over the mode tiers'
+		// automatic allowance (read-only / build lines, in-project writes).
+		return policyDenied(tc.Name)
+	}
 	if decision == permission.DAllow || decision == permission.DBypass {
 		return nil
 	}
@@ -1661,25 +2113,30 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 		reason = "permission denied"
 	}
 	if decision != permission.DAsk {
-		return fmt.Errorf("permission denied for %s: %s", tc.Name, reason)
+		return permissionDenied(tc.Name, reason)
 	}
 
-	// Policy engine override: check rules before interactive prompt
+	// Policy engine override: check rules before interactive prompt. When an
+	// ask rule in e.perm asked (reason ReasonAskRule), a policies.json allow
+	// must not silence it; only a deny may still change the outcome.
 	if e.policyEngine != nil {
+		askedByRule := reason == permission.ReasonAskRule
 		switch e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode) {
 		case permission.ActionAllow:
-			return nil // skip interactive prompt
+			if !askedByRule {
+				return nil // skip interactive prompt
+			}
 		case permission.ActionDeny:
-			return fmt.Errorf("denied by policy for %s", tc.Name)
+			return policyDenied(tc.Name)
 		}
 	}
 
 	if e.PermissionPrompt == nil {
 		// No interactive handler is installed, so this call can never be approved.
 		// Say so plainly instead of blaming the user for a rejection they never saw.
-		return fmt.Errorf(
-			"permission denied for %s: no interactive approval handler is installed (reason: %s); run /mode bypass or add an allow rule",
-			tc.Name, reason)
+		return &deniedError{text: fmt.Sprintf(
+			"permission denied for %s: no interactive approval handler is installed (reason: %s); run /mode bypass or add an allow rule.",
+			tc.Name, reason)}
 	}
 	if e.OnPermissionPause != nil {
 		e.OnPermissionPause()
@@ -1697,10 +2154,31 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 		e.OnPermissionDone()
 	}
 	if !approved {
-		return fmt.Errorf("permission denied for %s: user rejected", tc.Name)
+		return permissionDenied(tc.Name, "user rejected")
 	}
 	return nil
 }
+
+// permissionDenied is the error of a denied call. The model reads it as the
+// tool result ("Error: " + text), so it says what to do next: a weaker model
+// otherwise retries the denied call with the same input.
+func permissionDenied(toolName, reason string) error {
+	return &deniedError{text: fmt.Sprintf("permission denied for %s (%s).", toolName, reason)}
+}
+
+// policyDenied is the error of a call a policies.json deny rule blocked.
+func policyDenied(toolName string) error {
+	return &deniedError{text: "denied by policy for " + toolName + "."}
+}
+
+// deniedNextStep follows every denial the model reads.
+const deniedNextStep = " Do not call this tool again with the same input; explain the situation to the user or choose a different approach."
+
+// deniedError carries a denial text for the model. It is a full sentence
+// pair, not a wrappable Go error phrase, so it ends with punctuation.
+type deniedError struct{ text string }
+
+func (e *deniedError) Error() string { return e.text + deniedNextStep }
 
 func mapToolDecision(decision tool.PermissionResult) permission.Decision {
 	switch decision {
@@ -1732,9 +2210,6 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 		e.turnFilesChanged = true
 		if path, ok := tc.Input["filePath"].(string); ok {
 			e.fileHistory[path] = true
-			if e.sessionNotes != nil {
-				e.sessionNotes.AddTask(fmt.Sprintf("File: %s", filepath.Base(path)))
-			}
 			// Notify loop detector of file activity (Layer 3 stagnation tracking)
 			if e.loopDetector != nil {
 				e.loopDetector.RecordFileActivity(path, tc.Name == "write")
@@ -1778,10 +2253,34 @@ func resolvePath(p, cwd string) (string, bool) {
 	return "", false
 }
 
-// Compact compresses the message history on demand (e.g. via /compact command).
-// Delegates to the ChatCompressor's two-layer pipeline.
-func (e *Engine) Compact(ctx context.Context) {
-	e.compactIfNeeded(ctx, compactionThreshold(e.config.Model))
+// CompactReport is what an on-demand compaction (/compact) did, for the
+// line the command prints.
+type CompactReport struct {
+	// Compressed reports that the history was rewritten at all.
+	Compressed bool
+	// Summarized reports that older history was replaced by a summary.
+	Summarized bool
+	// BeforeTokens and AfterTokens are the context size around the call.
+	BeforeTokens, AfterTokens int
+	// Reason says why nothing, or only a fallback, was done.
+	Reason string
+}
+
+// Compact compresses the message history on demand (the /compact command).
+// It forces the summary layer (limit 0) whatever the context size: the user
+// asked for it, and a threshold check used to make /compact report success
+// for a history it never summarized.
+func (e *Engine) Compact(ctx context.Context) CompactReport {
+	e.updateTokenCount()
+	rep := CompactReport{BeforeTokens: e.totalTokens}
+	res := e.compact(ctx, 0)
+	rep.AfterTokens = e.totalTokens
+	if res == nil {
+		rep.Reason = "未启用上下文压缩"
+		return rep
+	}
+	rep.Compressed, rep.Summarized, rep.Reason = res.Compressed, res.Summarized, res.Reason
+	return rep
 }
 
 // checkAndCompress runs the compressor at the start of each iteration as a
@@ -1800,8 +2299,9 @@ func (e *Engine) checkAndCompress(ctx context.Context, model string) {
 			// Earlier messages changed, so every thinking block after them is
 			// bound to a prefix that no longer exists.
 			stripThinkingBlocks(e.messages)
+			e.invalidateUsage()
 		}
-		e.totalTokens = countTokens(e.messages)
+		e.updateTokenCount()
 	}
 
 	if e.compressor == nil {
@@ -1814,21 +2314,39 @@ func (e *Engine) checkAndCompress(ctx context.Context, model string) {
 	e.compactIfNeeded(ctx, threshold)
 }
 
-// compactionThreshold resolves the model-aware compaction budget, falling
+// compactionThreshold resolves the model-aware compaction trigger, falling
 // back to the legacy fixed constant when no model is known (e.g. routing
 // disabled or called from a context without a routing decision).
 func compactionThreshold(model string) int {
 	if model == "" {
 		return CompactTokenThreshold
 	}
-	return api.EffectiveCompactionBudget(model)
+	return api.CompactionTrigger(model)
 }
 
 // compactIfNeeded runs the full two-layer compression pipeline against the
-// given (model-aware) token threshold.
+// given (model-aware) token threshold and tells the user in one line when it
+// rewrote the history (automatic compaction used to be silent).
 func (e *Engine) compactIfNeeded(ctx context.Context, threshold int) {
-	if e.compressor == nil {
+	before := e.totalTokens
+	res := e.compact(ctx, threshold)
+	if res == nil || !res.Compressed {
 		return
+	}
+	how := "已裁剪旧工具输出"
+	if res.Summarized {
+		how = "已摘要早期对话"
+	} else if res.Reason != "" {
+		how = res.Reason
+	}
+	e.engineOutput(fmt.Sprintf("  \x1b[2m已压缩上下文：%d → %d tokens（%s）\x1b[0m", before, e.totalTokens, how))
+}
+
+// compact runs the compression pipeline against threshold (0 forces the
+// summary layer) and returns what it did; nil without a compressor.
+func (e *Engine) compact(ctx context.Context, threshold int) *CompressResult {
+	if e.compressor == nil {
+		return nil
 	}
 	if e.sessionNotes != nil {
 		e.sessionNotes.AddDecision(fmt.Sprintf("Context compacted at %d tokens, %d messages", e.totalTokens, len(e.messages)))
@@ -1852,14 +2370,22 @@ func (e *Engine) compactIfNeeded(ctx context.Context, threshold int) {
 		// the one moment the snapshotted parts of the system prompt (repo map,
 		// memories, notes) can be refreshed for free.
 		e.systemPrompt = ""
-		e.totalTokens = countTokens(e.messages)
+		e.resetShownContext()
+		e.clearNewMemories()
+		e.invalidateUsage()
+		e.updateTokenCount()
 		log.Debugf("agent compacted: %d tokens/%d msgs -> %d tokens/%d msgs",
 			result.OldCount, result.NewCount, e.totalTokens, len(e.messages))
 	}
+	return result
 }
 
 func (e *Engine) buildAPIToolDefs() []api.ToolDef {
-	if e.cachedToolDefs != nil && e.cachedToolDefsVersion == e.registry.Version() {
+	extra := 0
+	if e.toolDefsVersion != nil {
+		extra = e.toolDefsVersion()
+	}
+	if e.cachedToolDefs != nil && e.cachedToolDefsVersion == e.registry.Version() && e.cachedToolDefsExtra == extra {
 		return e.cachedToolDefs
 	}
 	var defs []api.ToolDef
@@ -1872,12 +2398,23 @@ func (e *Engine) buildAPIToolDefs() []api.ToolDef {
 	}
 	e.cachedToolDefs = defs
 	e.cachedToolDefsVersion = e.registry.Version()
+	e.cachedToolDefsExtra = extra
 	return defs
+}
+
+// SetToolDefsVersion adds v to the tool-definition cache key. The cache
+// followed only the registry's version, so the MCP proxy's description,
+// which lists the connected servers' tools, stayed stale after /mcp connect
+// or a tools/list_changed notification; the front end passes the MCP pool's
+// version here.
+func (e *Engine) SetToolDefsVersion(v func() int) {
+	e.toolDefsVersion = v
 }
 
 func (e *Engine) LoadMessages(msgs []api.Message) {
 	e.messages = msgs
-	e.totalTokens = countTokens(msgs)
+	e.invalidateUsage()
+	e.updateTokenCount()
 }
 
 func (e *Engine) Messages() []api.Message { return e.messages }
@@ -1958,7 +2495,10 @@ func (e *Engine) saveSession() {
 			e.session.Title = title
 		}
 	}
-	_ = e.store.Save(e.session)
+	e.lastSaveErr = e.store.Save(e.session)
+	if e.lastSaveErr != nil {
+		log.Warnf("session save failed: %v", e.lastSaveErr)
+	}
 }
 
 // readOnlyShell classifies shell commands for shellMayWrite.
@@ -1969,12 +2509,18 @@ var readOnlyShell = permission.NewClassifier()
 // undo while checkpoints were only taken before write/edit. Commands the
 // classifier knows to be read-only (ls, cat, git status...) are skipped: they
 // are most shell calls, and each snapshot is a git add of the whole tree.
-func shellMayWrite(tc api.ToolCall) bool {
+// The whole line is classified, with the shell's quoting rules, so a compound
+// line of read-only commands ("git status && git diff") is read-only too.
+func (e *Engine) shellMayWrite(tc api.ToolCall) bool {
 	if tc.Name != "bash" && tc.Name != "powershell" {
 		return false
 	}
 	cmd, _ := tc.Input["command"].(string)
-	return readOnlyShell.Classify(cmd) != permission.CatSafe
+	var kind permission.ShellKind
+	if e.perm != nil {
+		kind = e.perm.ShellKindFor(tc.Name)
+	}
+	return !readOnlyShell.IsReadOnlyLineFor(cmd, kind)
 }
 
 // delegates reports whether a call hands work to sub-agents. Their tool calls
@@ -2011,11 +2557,16 @@ func (e *Engine) checkpointBefore(calls []api.ToolCall) {
 		return
 	}
 	for _, tc := range calls {
-		if tc.Name == "write" || tc.Name == "edit" || shellMayWrite(tc) || delegates(tc) {
+		if tc.Name == "write" || tc.Name == "edit" || e.shellMayWrite(tc) || delegates(tc) {
 			if hash, err := e.cpMgr.Create("auto-" + tc.Name); err != nil {
 				log.Warnf("[checkpoint] %v", err)
-			} else if len(hash) >= 8 {
-				log.Debugf("[checkpoint] %s", hash[:8])
+			} else {
+				if len(hash) >= 8 {
+					log.Debugf("[checkpoint] %s", hash[:8])
+				}
+				e.fileMu.Lock()
+				e.turnCheckpointed = true
+				e.fileMu.Unlock()
 			}
 			return
 		}
@@ -2046,9 +2597,6 @@ func looksSynthetic(m api.Message) bool {
 		"[Context truncated",
 		"[用户指引]",
 		"[Continue the task",
-		"run slow tool",
-		"do something",
-		"slow response",
 	}
 	for _, p := range knownPrefixes {
 		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {
@@ -2087,26 +2635,6 @@ func (e *Engine) SessionID() string {
 		return ""
 	}
 	return e.session.ID
-}
-
-func countTokens(msgs []api.Message) int {
-	n := 0
-	for i := range msgs {
-		n += len(msgs[i].Content)/4 + 1 // fast approximation: ~4 chars per token
-		for j := range msgs[i].ToolCalls {
-			tc := &msgs[i].ToolCalls[j]
-			n += len(tc.Name)/4 + 1
-			for k, v := range tc.Input {
-				n += len(k)/4 + 1
-				if val, ok := v.(string); ok {
-					n += len(val) / 4
-				} else {
-					n += 10
-				}
-			}
-		}
-	}
-	return n
 }
 
 func parseSchema(raw json.RawMessage) map[string]any {
@@ -2258,76 +2786,30 @@ func (e *Engine) runTurnEndPipeline() {
 	if e.sessionNotes != nil {
 		_ = e.sessionNotes.Flush()
 	}
-	if e.autoLearnOff {
-		return
+	// Session pruning, memory extraction (async, throttled internally), the
+	// skill review, the auto-dream check and the summary line run on one
+	// tracked goroutine, which cove -p waits for (WaitBackground). The dream check follows the
+	// extraction, so a consolidation sees this turn's memories.
+	job := backgroundJob{
+		learn:     !e.autoLearnOff,
+		saved:     e.lastSaveErr == nil,
+		sessionID: e.SessionID(),
+		keep:      e.config.MaxSessions,
 	}
-	// Extract durable memories from recent conversation (async, throttled internally)
-	if e.extractRunner != nil && len(e.messages) > 0 {
-		// Snapshot the slice so the background goroutine never reads e.messages
-		// while a subsequent turn appends to it (data race).
-		msgs := append([]api.Message(nil), e.messages...)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warnf("[extractMemories] panic: %v", r)
-				}
-			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			e.extractRunner.Extract(ctx, msgs)
-		}()
+	if job.learn {
+		job.review = e.reviewMessages()
 	}
-	// Background review: auto-create skills/memories from conversation patterns
-	e.backgroundReview()
-	// Fire auto-dream consolidation if conditions met (async, throttled internally)
-	if e.dreamRunner != nil {
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warnf("[autoDream] panic: %v", r)
-				}
-			}()
-			// The 5-minute bound is owned by ExecuteAutoDream's detached context,
-			// not here: this goroutine returns as soon as the dream is spawned, so
-			// cancelling a context here would abort the dream immediately.
-			e.dreamRunner.ExecuteAutoDream(context.Background())
-		}()
+	e.fileMu.Lock()
+	job.checkpointed = e.turnFilesChanged && e.turnCheckpointed
+	e.fileMu.Unlock()
+	if job.learn && e.extractRunner != nil && len(e.messages) > 0 {
+		// Snapshot the slice so the background goroutine never reads
+		// e.messages while a subsequent turn appends to it (data race).
+		job.msgs = append([]api.Message(nil), e.messages...)
 	}
-}
-
-// decision/discovery patterns for auto-tracking in session notes
-var (
-	decisionPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(?:use|using|we.ll use|go with|let.s use|switch to|prefer|stick with)\s+(.+?)(?:\.|$)`),
-		regexp.MustCompile(`(?i)(?:I prefer|I like|I want|let.s go with)\s+(.+?)(?:\.|$)`),
-	}
-	discoveryPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(?:I found|discovered|the issue is|the reason is|it turns out)\s+(.+?)(?:\.|$)`),
-		regexp.MustCompile(`(?i)(?:fixed by|resolved by|solved by)\s+(.+?)(?:\.|$)`),
-	}
-)
-
-// recordSignals scans user/assistant messages for decisions and discoveries, saving to session notes.
-func (e *Engine) recordSignals(userMsg, assistantMsg string) {
-	if e.sessionNotes == nil {
-		return
-	}
-	for _, p := range decisionPatterns {
-		if m := p.FindStringSubmatch(userMsg); len(m) > 1 {
-			text := strings.TrimSpace(m[1])
-			if len(text) > 3 && len(text) < 200 {
-				e.sessionNotes.AddDecision(text)
-			}
-		}
-	}
-	for _, p := range discoveryPatterns {
-		if m := p.FindStringSubmatch(assistantMsg); len(m) > 1 {
-			text := strings.TrimSpace(m[1])
-			if len(text) > 3 && len(text) < 200 {
-				e.sessionNotes.AddDiscovery(text)
-			}
-		}
-	}
+	e.bg.Add(1)
+	e.bgPending.Add(1)
+	go e.runBackgroundWork(job)
 }
 
 // SetAutoExtract enables/disables the background learning that follows each
@@ -2429,6 +2911,7 @@ func (e *Engine) WirePlanExecutor() {
 		// limits and untrusted-content marking — exactly like top-level ones.
 		d.SetExecutor(func(ctx context.Context, tc api.ToolCall) string { return e.executeTool(ctx, tc) })
 		d.SetBudgetCheck(e.costTracker.OverBudget)
+		d.SetMaxIter(e.config.SubagentMaxIterations)
 		pe := plan.NewPlanExecutor(d, e.runtime)
 		e.runtime.PlanExecuteFunc = func(ctx context.Context, parallel bool) (string, error) {
 			pl, err := plan.FromRuntime("plan", e.runtime)

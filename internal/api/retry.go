@@ -50,7 +50,7 @@ func retryConnectHTTP(
 			if attempt == cfg.MaxRetries {
 				return resp, nil
 			}
-			retryAfter := ParseRetryAfter(resp.Header)
+			retryAfter := RetryAfterFor(resp.StatusCode, resp.Header)
 			_ = resp.Body.Close()
 			select {
 			case <-ctx.Done():

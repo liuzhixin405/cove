@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -104,10 +105,16 @@ func retryAfterOf(err error) time.Duration {
 // a turn for minutes; beyond this the fallback's cooldown takes over.
 const maxRetryAfter = 60 * time.Second
 
-// retryDelay is the wait before retry number attempt+1: exponential backoff,
-// or the server's Retry-After when that is longer.
+// retryJitter returns a value in [0, 1) that spreads the backoff. Replaced in
+// tests.
+var retryJitter = rand.Float64
+
+// retryDelay is the wait before retry number attempt+1: exponential backoff
+// scaled by a random factor in [0.5, 1.5), or the server's Retry-After when
+// that is longer. Without the jitter every client that hit the same 429 or
+// 5xx retried in lockstep and collided again.
 func retryDelay(cfg retryConfig, attempt int, retryAfter time.Duration) time.Duration {
-	delay := time.Duration(1<<attempt) * cfg.BaseDelay
+	delay := time.Duration(float64(time.Duration(1<<attempt)*cfg.BaseDelay) * (0.5 + retryJitter()))
 	if retryAfter > maxRetryAfter {
 		retryAfter = maxRetryAfter
 	}
@@ -124,11 +131,15 @@ func retryDelay(cfg retryConfig, attempt int, retryAfter time.Duration) time.Dur
 func IsContextLengthError(err error) bool {
 	found := false
 	walkErrors(err, func(e error) bool {
-		switch v := e.(type) {
-		case *StatusError:
-			found = isContextLengthText(v.Status, v.Msg)
-		case *RetryableError:
-			found = isContextLengthText(v.Status, v.Msg)
+		// walkErrors visits every layer, so each StatusError and
+		// RetryableError in the chain is the first match of its own visit.
+		var se *StatusError
+		var re *RetryableError
+		switch {
+		case errors.As(e, &se):
+			found = isContextLengthText(se.Status, se.Msg)
+		case errors.As(e, &re):
+			found = isContextLengthText(re.Status, re.Msg)
 		}
 		return found
 	})
@@ -167,7 +178,7 @@ func walkErrors(err error, visit func(error) bool) bool {
 	if visit(err) {
 		return true
 	}
-	switch u := err.(type) {
+	switch u := any(err).(type) {
 	case interface{ Unwrap() error }:
 		return walkErrors(u.Unwrap(), visit)
 	case interface{ Unwrap() []error }:

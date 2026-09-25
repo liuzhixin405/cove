@@ -85,6 +85,9 @@ type LoopDetector struct {
 	stallCount         int // consecutive iterations without new file activity
 	stallThresh        int // iterations before stagnation detection (default 25)
 
+	// disabled turns Layers 1 and 2 off for the rest of the turn: the user
+	// chose to go on at the loop prompt (DisableForTurn). Layer 3 stays on.
+	disabled bool
 }
 
 // LoopResult describes what was detected.
@@ -186,7 +189,7 @@ func extractToolPatterns(fp string) string {
 // Read-only tools (read, grep, glob, etc.) are exempt from loop detection
 // because repeatedly reading/searching is legitimate multi-step work.
 func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
-	if fp == "" {
+	if fp == "" || ld.disabled {
 		return LoopResult{}
 	}
 
@@ -270,7 +273,7 @@ func (ld *LoopDetector) RecordToolCalls(fp string) LoopResult {
 // produces DIFFERENT outputs each time, it's making progress — retroactively
 // clear the Layer 1b history to prevent false positives.
 func (ld *LoopDetector) RecordOutput(output string) LoopResult {
-	if len(output) == 0 {
+	if len(output) == 0 || ld.disabled {
 		return LoopResult{}
 	}
 	// "No changes" style outputs are common in idempotent workflows and should
@@ -639,4 +642,15 @@ func injectLoopGuidance(reason string) string {
 		"[系统检测到重复操作循环]\n%s\n\n请立刻停下来审视当前情况。尝试完全不同的方法，如果实在无法推进请向用户说明问题。",
 		strings.TrimSpace(reason),
 	)
+}
+
+// DisableForTurn turns tool-call and output loop detection (Layers 1 and 2)
+// off until ResetTurn: the user saw the loop prompt and chose to go on.
+func (ld *LoopDetector) DisableForTurn() { ld.disabled = true }
+
+// ResetTurn starts a new turn: all history is cleared (Reset) and detection
+// is enabled again.
+func (ld *LoopDetector) ResetTurn() {
+	ld.Reset()
+	ld.disabled = false
 }

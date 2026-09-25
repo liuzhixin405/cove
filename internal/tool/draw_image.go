@@ -315,7 +315,7 @@ func parseColor(shape map[string]any, key string) (color.Color, error) {
 			g, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
 			b, _ := strconv.Atoi(strings.TrimSpace(parts[2]))
 			a, _ := strconv.Atoi(strings.TrimSpace(parts[3]))
-			return color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)}, nil
+			return color.RGBA{clampByte(r), clampByte(g), clampByte(b), clampByte(a)}, nil
 		}
 	}
 
@@ -372,10 +372,23 @@ func parseColor(shape map[string]any, key string) (color.Color, error) {
 		r, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
 		g, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
 		b, _ := strconv.Atoi(strings.TrimSpace(parts[2]))
-		return color.RGBA{uint8(r), uint8(g), uint8(b), 255}, nil
+		return color.RGBA{clampByte(r), clampByte(g), clampByte(b), 255}, nil
 	}
 
 	return color.Black, nil
+}
+
+// clampByte clamps an integer color component parsed from user input (which
+// may be out of the 0-255 range or negative) to a valid uint8 instead of
+// silently wrapping on conversion.
+func clampByte(n int) uint8 {
+	if n < 0 {
+		return 0
+	}
+	if n > 255 {
+		return 255
+	}
+	return uint8(n)
 }
 
 func (t *DrawImageTool) Validate(input Input) string {

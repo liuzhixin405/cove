@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -38,6 +39,10 @@ func runChatInteraction(ctx context.Context, runner chatRunner, input string) (s
 }
 
 func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg api.Message) (string, error) {
+	// A background summary arriving while this turn streams (the previous
+	// turn's extraction outlived it) waits until the turn's output is done.
+	bgSummaries.beginTurn()
+	defer bgSummaries.endTurn()
 	termui.BeginOutput()
 	defer termui.EndOutput()
 	var totalOutput strings.Builder
@@ -61,11 +66,13 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			// memory/skill extraction notices) through the printer so they appear
 			// in the conversation area.
 			eng.OnEngineOutput = p.engineLine
+			eng.OnTurnModel = func(model string) { p.engineLine(turnModelLine(model)) }
 			defer func() {
 				eng.OnPermissionPause = nil
 				eng.OnPermissionDone = nil
 				eng.OnToolProgress = nil
 				eng.OnEngineOutput = nil
+				eng.OnTurnModel = nil
 			}()
 		}
 
@@ -108,18 +115,33 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 	}
 
 	if finalErr == nil {
+		noteTurnCompleted() // the session_end dream counts this process's turns
 		if missing := missingStreamedSuffix(reply, totalOutput.String()); missing != "" {
 			p.delta(missing)
 			totalOutput.WriteString(missing)
 		}
 	}
 	if finalErr != nil {
-		errMsg := fmt.Sprintf("\nRequest failed: %s", p.errorText(finalErr))
-		p.system(termui.Red + errMsg + termui.Reset)
+		errMsg, color := turnErrorLine(finalErr, p.errorText(finalErr))
+		p.system(color + errMsg + termui.Reset)
 		totalOutput.WriteString(errMsg)
 	}
 	totalOutput.WriteString("\r\n\r\n")
 	return totalOutput.String(), finalErr
+}
+
+// turnErrorLine is the line that ends a failed turn, and its color. A turn
+// stopped at its limit (the user answered "s", or the prompt timed out) did
+// not fail, so it gets a neutral prefix instead of "Request failed".
+func turnErrorLine(err error, text string) (string, string) {
+	var le *engine.LimitError
+	if errors.As(err, &le) {
+		if le.Reason == engine.LimitReasonStagnation {
+			return "\n" + text, termui.Yellow // the text says it was stopped
+		}
+		return "\n本轮已停止：" + text, termui.Yellow
+	}
+	return fmt.Sprintf("\nRequest failed: %s", text), termui.Red
 }
 
 // turnPrinter owns the terminal while one turn streams: the spinner, the
@@ -154,6 +176,11 @@ type turnPrinter struct {
 	// One sanitiser per stream, so a sequence split across two chunks of
 	// the same stream is reassembled rather than half-printed.
 	text, thought, progress render.StreamSanitizer
+
+	// md renders the answer's Markdown as it streams (headings, bold, code
+	// blocks, bullets). It runs after the sanitiser, so the only escapes it
+	// sees are the model's own colour codes.
+	md *render.MarkdownStream
 }
 
 // outputKind is the source of the last thing printed.
@@ -170,7 +197,9 @@ const (
 
 // newTurnPrinter returns a printer for a turn. termui.BeginOutput has just
 // moved to a fresh row, so the cursor starts at the beginning of one.
-func newTurnPrinter() *turnPrinter { return &turnPrinter{atLineStart: true} }
+func newTurnPrinter() *turnPrinter {
+	return &turnPrinter{atLineStart: true, md: render.NewMarkdownStream()}
+}
 
 // beginAttempt starts the "思考中" spinner for a new request attempt.
 func (p *turnPrinter) beginAttempt() {
@@ -179,6 +208,12 @@ func (p *turnPrinter) beginAttempt() {
 	if p.spinner != nil {
 		p.spinner.Stop()
 	}
+	// A reply cut off inside a code fence (truncated, or failed and retried)
+	// must not leave the next answer drawn as code: print what the renderer
+	// still holds, end its row, and start the attempt with a fresh renderer.
+	p.flushHeldTextLocked()
+	p.ensureLineStartLocked()
+	p.md = render.NewMarkdownStream()
 	p.spinner = termui.NewSpinner("思考中...")
 	p.textStarted = false
 	p.reasoningChars = 0
@@ -210,9 +245,35 @@ func (p *turnPrinter) stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stopSpinnerLocked()
+	// Unconditionally: a reply that was only a held-back marker printed
+	// nothing, so the printer never switched to text.
+	p.flushHeldTextLocked()
 	if p.last == outReasoning {
 		termui.StreamPrint(termui.Reset)
 	}
+}
+
+// flushTextLocked prints what the Markdown renderer still holds back (a
+// possible marker at the end of the last chunk) and closes the styles of the
+// line it was on, so the next source does not inherit bold or reverse video.
+func (p *turnPrinter) flushTextLocked() {
+	p.printLocked(p.md.Flush())
+}
+
+// flushHeldTextLocked is flushTextLocked for the end of an attempt or turn,
+// where the printer may not have switched to text yet: held-back text (a
+// reply that was only "*", or its last marker) is text, so the printer
+// switches to it first. Printed straight after a reasoning trace, it used to
+// share the trace's row and, until the closing reset, its style.
+func (p *turnPrinter) flushHeldTextLocked() {
+	held := p.md.Flush()
+	if held == "" {
+		return
+	}
+	if render.StripControls(held) != "" {
+		p.switchToLocked(outText)
+	}
+	p.printLocked(held)
 }
 
 func (p *turnPrinter) gotDelta() bool {
@@ -247,6 +308,9 @@ func (p *turnPrinter) switchToLocked(k outputKind) {
 	if prev == k {
 		return
 	}
+	if prev == outText {
+		p.flushTextLocked()
+	}
 	p.last = k
 	if prev == outReasoning {
 		termui.StreamPrint(termui.Reset)
@@ -265,7 +329,7 @@ func (p *turnPrinter) delta(s string) {
 	}
 	p.textStarted = true
 	p.anyDelta = true
-	out := p.text.Write(s)
+	out := p.md.Write(p.text.Write(s))
 	if out == "" {
 		return
 	}
@@ -342,7 +406,7 @@ func (p *turnPrinter) system(s string) {
 // errorText is an error for display. A provider's error body is echoed in
 // it, so it is untrusted like any other text from the network.
 func (p *turnPrinter) errorText(err error) string {
-	return render.StripControls(err.Error())
+	return render.StripControls(interactiveErrorText(err))
 }
 
 func (p *turnPrinter) permissionPause() { p.stopSpinner() }
@@ -403,4 +467,111 @@ var showReasoning bool
 // reasoningStatus is the status-line text shown while a model is reasoning.
 func reasoningStatus(chars int) string {
 	return fmt.Sprintf("思考中… 已推理 %d 字", chars)
+}
+
+// installBackgroundSummary shows, after a turn, one dim line about the
+// background work that followed it (backgroundSummaryLine), only when stdout
+// is a terminal: -p and headless runs never install it, and a redirected
+// stdout must not collect status lines.
+func installBackgroundSummary(eng *engine.Engine, stdoutIsTerminal bool) {
+	if eng == nil || !stdoutIsTerminal {
+		return
+	}
+	eng.OnBackgroundSummary = printBackgroundSummary
+}
+
+// printBackgroundSummary shows the summary line above the input line. It is
+// called from the engine's background goroutine, usually seconds after the
+// turn it describes: between turns it prints at once, during a turn it is held
+// until that turn's output ends (bgSummaries), so it never lands inside a
+// streaming answer.
+func printBackgroundSummary(s engine.BackgroundSummary) {
+	if line := backgroundSummaryLine(s); line != "" {
+		bgSummaries.deliver("  " + termui.Styled(termui.Dim, line) + "\n")
+	}
+}
+
+// summaryQueue holds background summary lines while a turn is printing.
+type summaryQueue struct {
+	mu      sync.Mutex
+	active  int // turns printing (runChatInteractionMessage calls in flight)
+	pending []string
+}
+
+// bgSummaries is the queue printBackgroundSummary goes through.
+var bgSummaries = &summaryQueue{}
+
+func (q *summaryQueue) deliver(line string) {
+	q.mu.Lock()
+	if q.active > 0 {
+		q.pending = append(q.pending, line)
+		q.mu.Unlock()
+		return
+	}
+	q.mu.Unlock()
+	termui.PrintAbove(line)
+}
+
+func (q *summaryQueue) beginTurn() {
+	q.mu.Lock()
+	q.active++
+	q.mu.Unlock()
+}
+
+// endTurn prints what arrived during the turn, before the prompt returns.
+func (q *summaryQueue) endTurn() {
+	q.mu.Lock()
+	if q.active > 0 {
+		q.active--
+	}
+	var lines []string
+	if q.active == 0 {
+		lines, q.pending = q.pending, nil
+	}
+	q.mu.Unlock()
+	for _, l := range lines {
+		termui.PrintAbove(l)
+	}
+}
+
+// turnModelLine is the dim status line naming the model a turn was routed
+// to (shown only when routing chooses between a fast and a main model).
+func turnModelLine(model string) string {
+	return "  " + termui.Styled(termui.Dim, "模型："+model)
+}
+
+// backgroundSummaryLine is e.g. "已提取 2 条记忆 · dream 还差 2 个会话": the
+// memories saved, the dream gate when it moved, old sessions max_sessions
+// pruning deleted, a failed session save. ""
+// when there is nothing to say.
+func backgroundSummaryLine(s engine.BackgroundSummary) string {
+	var parts []string
+	if s.MemoriesExtracted > 0 {
+		parts = append(parts, fmt.Sprintf("已提取 %d 条记忆", s.MemoriesExtracted))
+	}
+	if s.DreamChanged {
+		st := s.DreamStatus
+		switch {
+		case s.DreamFired || st.Running:
+			parts = append(parts, "dream 已开始整理记忆")
+		case st.SessionsNeeded() > 0:
+			parts = append(parts, fmt.Sprintf("dream 还差 %d 个会话", st.SessionsNeeded()))
+		case st.HoursNeeded() > 0:
+			parts = append(parts, fmt.Sprintf("dream 还差 %.1f 小时", st.HoursNeeded()))
+		}
+	}
+	if s.SessionsPruned > 0 {
+		parts = append(parts, fmt.Sprintf("已清理 %d 个旧会话（max_sessions=%d）", s.SessionsPruned, s.MaxSessions))
+	}
+	if len(s.NewSkills) > 0 {
+		parts = append(parts, "新增技能 "+strings.Join(s.NewSkills, "、"))
+	}
+	if len(s.UpdatedSkills) > 0 {
+		parts = append(parts, "更新技能 "+strings.Join(s.UpdatedSkills, "、"))
+	}
+	parts = append(parts, s.Extra...)
+	if !s.SessionSaved {
+		parts = append(parts, "会话保存失败（详见日志）")
+	}
+	return strings.Join(parts, " · ")
 }

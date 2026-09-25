@@ -76,9 +76,7 @@ func TestSetWorkingDirMovesSessionAndCheckpoints(t *testing.T) {
 func TestResumeSessionKeepsTheSessionID(t *testing.T) {
 	isolatedHome(t)
 	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "continued"}}})
-	if eng.store == nil {
-		t.Skip("engine has no session store")
-	}
+	eng.store = mustSessionStore(t)
 	old := &session.Record{
 		ID:       "session-original",
 		Title:    "parser work",

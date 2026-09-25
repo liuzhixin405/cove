@@ -9,11 +9,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove/internal/memory"
 )
 
 // fakeProvider is a counting api.Provider stand-in. Chat returns a canned
@@ -26,6 +26,10 @@ type fakeProvider struct {
 	requests    []api.ChatRequest
 	response    string
 	err         error
+	// entered, when set, receives once per Chat call on entry; Chat then
+	// waits for release (a nil release does not wait).
+	entered chan struct{}
+	release chan struct{}
 }
 
 func (f *fakeProvider) Name() string        { return "fake" }
@@ -37,7 +41,14 @@ func (f *fakeProvider) Chat(ctx context.Context, req api.ChatRequest) (*api.Chat
 	f.calls++
 	f.requests = append(f.requests, req)
 	resp, err := f.response, f.err
+	entered, release := f.entered, f.release
 	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+		if release != nil {
+			<-release
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +143,22 @@ func TestNewRunnerUsesHomeMemoryDir(t *testing.T) {
 	}
 }
 
-func TestExtractThrottlesBackToBackCalls(t *testing.T) {
+// Extraction runs every turn: two turns in a row, no time between them,
+// are both extracted.
+func TestExtractRunsEveryTurnWithoutInterval(t *testing.T) {
+	p := &fakeProvider{response: "NONE"}
+	r, _ := newTestRunner(t, p)
+
+	r.Extract(context.Background(), conversation(6))
+	r.Extract(context.Background(), conversation(8))
+
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider called %d times for two consecutive turns, want 2 (no time throttle)", got)
+	}
+}
+
+// A turn that added no message has nothing new to extract.
+func TestExtractSkipsTurnWithoutNewMessages(t *testing.T) {
 	p := &fakeProvider{response: "NONE"}
 	r, _ := newTestRunner(t, p)
 	msgs := conversation(6)
@@ -142,7 +168,41 @@ func TestExtractThrottlesBackToBackCalls(t *testing.T) {
 	r.Extract(context.Background(), msgs)
 
 	if got := p.callCount(); got != 1 {
-		t.Fatalf("provider called %d times for three back-to-back Extracts, want 1 (%v throttle)", got, minExtractInterval)
+		t.Fatalf("provider called %d times for the same history three times, want 1", got)
+	}
+	// A shorter history (compaction, /clear) is a different history.
+	r.Extract(context.Background(), conversation(5))
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider called %d times after the history changed, want 2", got)
+	}
+}
+
+// While an extraction is still running, the next turn's is skipped.
+func TestExtractSkipsWhileOneIsInFlight(t *testing.T) {
+	p := &fakeProvider{response: "NONE", entered: make(chan struct{}, 1), release: make(chan struct{})}
+	r, _ := newTestRunner(t, p)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Extract(context.Background(), conversation(6))
+	}()
+	<-p.entered // the first extraction is inside its model call
+
+	r.Extract(context.Background(), conversation(8))
+	if got := p.callCount(); got != 1 {
+		t.Fatalf("provider called %d times with an extraction in flight, want 1", got)
+	}
+	close(p.release)
+	<-done
+
+	// Once it finished, the next turn extracts again.
+	p.mu.Lock()
+	p.entered, p.release = nil, nil
+	p.mu.Unlock()
+	r.Extract(context.Background(), conversation(10))
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider called %d times after the in-flight run ended, want 2", got)
 	}
 }
 
@@ -158,7 +218,7 @@ func TestExtractConcurrentCallsClaimExactlyOneSlot(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			<-start // maximise the overlap on the throttle check
+			<-start // maximise the overlap on the claim
 			r.Extract(context.Background(), msgs)
 		}()
 	}
@@ -166,28 +226,7 @@ func TestExtractConcurrentCallsClaimExactlyOneSlot(t *testing.T) {
 	wg.Wait()
 
 	if got := p.callCount(); got != 1 {
-		t.Fatalf("provider called %d times for %d concurrent Extracts, want 1; the throttle claim is not atomic", got, goroutines)
-	}
-}
-
-func TestExtractRunsAgainOnceIntervalElapsed(t *testing.T) {
-	p := &fakeProvider{response: "NONE"}
-	r, _ := newTestRunner(t, p)
-	msgs := conversation(6)
-
-	r.Extract(context.Background(), msgs)
-	if got := p.callCount(); got != 1 {
-		t.Fatalf("first Extract made %d calls, want 1", got)
-	}
-
-	// Rewind the claim instead of sleeping for two minutes.
-	r.mu.Lock()
-	r.lastExtract = time.Now().Add(-minExtractInterval - time.Second)
-	r.mu.Unlock()
-
-	r.Extract(context.Background(), msgs)
-	if got := p.callCount(); got != 2 {
-		t.Fatalf("Extract made %d calls after the interval elapsed, want 2", got)
+		t.Fatalf("provider called %d times for %d concurrent Extracts of one history, want 1; the claim is not atomic", got, goroutines)
 	}
 }
 
@@ -339,9 +378,28 @@ func TestExtractNoneResponseWritesNothing(t *testing.T) {
 	r, dir := newTestRunner(t, p)
 	r.Extract(context.Background(), conversation(6))
 
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("a NONE response created the memory dir (stat err = %v)", err)
+	// The run itself is recorded (a hidden bookkeeping file, see
+	// memory.RecordExtraction); no memory file may be written.
+	if names := memoryFiles(t, dir); len(names) != 0 {
+		t.Errorf("a NONE response wrote memory files: %v", names)
 	}
+}
+
+// memoryFiles lists dir's memory entries, skipping hidden bookkeeping files
+// (the extraction record, the dream lock) exactly as memory.Store.All does.
+func memoryFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".") {
+			names = append(names, e.Name())
+		}
+	}
+	return names
 }
 
 func TestExtractClipsEntryAt5KBOnRuneBoundary(t *testing.T) {
@@ -377,43 +435,69 @@ func TestExtractClipsEntryAt5KBOnRuneBoundary(t *testing.T) {
 	}
 }
 
-func TestExtractClipsFileAt10KBOnRuneBoundary(t *testing.T) {
-	const maxBytes = 10240
-	const suffix = "\n... [truncated to 10KB]"
+// Appending past the 10KB per-file cap used to clip the file and silently drop
+// the newest content. It now rolls over to name-2.md and keeps the old file.
+func TestExtractRollsOverPast10KB(t *testing.T) {
+	existing := strings.Repeat("已有记忆", 750) // 9000 bytes
+	incoming := "新的记忆: 使用 pnpm 构建"
 
-	for pad := 0; pad < 3; pad++ {
-		t.Run(fmt.Sprintf("pad=%d", pad), func(t *testing.T) {
-			// Existing file is ~9KB of Chinese; appending another clipped entry
-			// pushes the total past the 10KB per-file cap.
-			existing := strings.Repeat("x", pad) + strings.Repeat("已有记忆", 750) // pad + 9000 bytes
-			incoming := strings.Repeat("新的记忆内容", 400)                          // 7200 bytes, clipped to 5KB first
+	p := &fakeProvider{response: memoryBlock("grow.md", "append", incoming)}
+	r, dir := newTestRunner(t, p)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	big := existing + strings.Repeat("x", 2000)
+	if err := os.WriteFile(filepath.Join(dir, "grow.md"), []byte(big), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
 
-			p := &fakeProvider{response: memoryBlock("grow.md", "append", incoming)}
-			r, dir := newTestRunner(t, p)
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				t.Fatalf("mkdir: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(dir, "grow.md"), []byte(existing), 0644); err != nil {
-				t.Fatalf("seed: %v", err)
-			}
+	r.Extract(context.Background(), conversation(6))
 
-			r.Extract(context.Background(), conversation(6))
+	if got := readMemory(t, dir, "grow.md"); got != big {
+		t.Fatalf("original file changed (len %d -> %d)", len(big), len(got))
+	}
+	if got := readMemory(t, dir, "grow-2.md"); got != incoming {
+		t.Fatalf("rolled file = %q, want %q", got, incoming)
+	}
+	assertNoTempFiles(t, dir)
+}
 
-			data, err := os.ReadFile(filepath.Join(dir, "grow.md"))
-			if err != nil {
-				t.Fatalf("read: %v", err)
-			}
-			if !utf8.Valid(data) {
-				t.Fatalf("memory file is not valid UTF-8 after the 10KB file clip (len=%d); the cap split a rune", len(data))
-			}
-			if !strings.HasSuffix(string(data), suffix) {
-				t.Fatalf("clipped file does not end with the 10KB marker; tail = %q", lastRunes(string(data), 30))
-			}
-			body := len(data) - len(suffix)
-			if body > maxBytes || body < maxBytes-2 {
-				t.Fatalf("clipped body is %d bytes, want %d..%d", body, maxBytes-2, maxBytes)
-			}
-		})
+// Extraction writes go through memory.Store.Save, so the total-size limit
+// applies to them too.
+func TestExtractHonoursStoreTotalLimit(t *testing.T) {
+	p := &fakeProvider{response: memoryBlock("more.md", "write", "one more durable fact")}
+	r, _ := newTestRunner(t, p)
+	dir := t.TempDir()
+	filler := strings.Repeat(strings.Repeat("f", 99)+"\n", 150) // ~15KB
+	for i := 0; i <= memory.MaxTotalBytes/len(filler); i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("fill%02d.md", i)), []byte(filler), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.SetRecorder(memory.NewStoreForDirs(dir))
+
+	r.Extract(context.Background(), conversation(6))
+
+	if _, err := os.Stat(filepath.Join(dir, "more.md")); !os.IsNotExist(err) {
+		t.Fatalf("write past the total limit was not refused (stat err: %v)", err)
+	}
+}
+
+// With a store as recorder, extraction writes into the store's primary
+// (per-project) directory.
+func TestExtractWritesIntoStorePrimaryDir(t *testing.T) {
+	p := &fakeProvider{response: memoryBlock("facts.md", "write", "the build uses go 1.25")}
+	r, homeDir := newTestRunner(t, p)
+	proj, glob := t.TempDir(), t.TempDir()
+	r.SetRecorder(memory.NewStoreForProject(proj, glob))
+
+	r.Extract(context.Background(), conversation(6))
+
+	if got := readMemory(t, proj, "facts.md"); got != "the build uses go 1.25" {
+		t.Fatalf("facts.md = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, "facts.md")); !os.IsNotExist(err) {
+		t.Fatal("runner still wrote to its own default dir")
 	}
 }
 
@@ -608,15 +692,12 @@ func TestSanitizedNameIsActuallyWritable(t *testing.T) {
 
 	r.Extract(context.Background(), conversation(6))
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
+	entries := memoryFiles(t, dir)
 	if len(entries) != 1 {
 		t.Fatalf("memory dir holds %d entries, want 1", len(entries))
 	}
-	if entries[0].Name() != "secret.md" {
-		t.Errorf("wrote %q, want %q", entries[0].Name(), "secret.md")
+	if entries[0] != "secret.md" {
+		t.Errorf("wrote %q, want %q", entries[0], "secret.md")
 	}
 	if got := readMemory(t, dir, "secret.md"); got != "should stay inside the memory dir" {
 		t.Errorf("content = %q", got)
@@ -797,5 +878,28 @@ func TestMinHelper(t *testing.T) {
 	}
 	if got := min(-2, -9); got != -9 {
 		t.Errorf("min(-2, -9) = %d, want -9", got)
+	}
+}
+
+// The extraction prompt lists global memories too, and an append to a name
+// that exists only globally keeps the global content.
+func TestExtractAppendOverGlobalMemory(t *testing.T) {
+	p := &fakeProvider{response: memoryBlock("user-preferences.md", "append", "Replies in Chinese.")}
+	r, _ := newTestRunner(t, p)
+	proj, glob := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(glob, "user-preferences.md"), []byte("Prefers tabs."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := memory.NewStoreForProject(proj, glob)
+	r.SetRecorder(st)
+
+	r.Extract(context.Background(), conversation(6))
+
+	if prompt := p.lastRequest(t).Messages[0].Content; !strings.Contains(prompt, "user-preferences.md") {
+		t.Fatalf("extraction prompt does not list the global memory:\n%s", prompt)
+	}
+	got := readMemory(t, proj, "user-preferences.md")
+	if !strings.Contains(got, "Prefers tabs.") || !strings.Contains(got, "Replies in Chinese.") {
+		t.Fatalf("project copy = %q", got)
 	}
 }

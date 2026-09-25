@@ -67,10 +67,10 @@ func (t *mcpToolProxy) Def() Def {
 			textutil.ClipBytes(tr.Tool.Description, maxMCPToolDescription, "..."))
 		if len(tr.Tool.InputSchema) > 0 {
 			// json.Marshal sorts map keys, so this is deterministic too.
-			if schema, err := json.Marshal(tr.Tool.InputSchema); err == nil {
-				sb.WriteString("\n    arguments schema: ")
-				sb.WriteString(textutil.ClipBytes(string(schema), maxMCPToolSchema, "..."))
-			}
+			// Oversized schemas lose their descriptions first and are never
+			// clipped mid-JSON (compactMCPSchema).
+			sb.WriteString("\n    arguments schema: ")
+			sb.WriteString(compactMCPSchema(tr.Tool.InputSchema, maxMCPToolSchema))
 		}
 	}
 	d.Description = sb.String()

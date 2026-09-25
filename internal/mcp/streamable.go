@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,7 +111,7 @@ func (t *streamableHTTPTransport) readStream(body io.ReadCloser) {
 	err := readSSE(body, t.deliverEvent)
 	// Our own shutdown cancels the stream; that is not worth a warning, and a
 	// WARN is shown to the user on every /mcp disconnect and at exit.
-	if err != nil && err != io.EOF && t.ctx.Err() == nil {
+	if err != nil && !errors.Is(err, io.EOF) && t.ctx.Err() == nil {
 		log.Warnf("streamablehttp: read error: %v", err)
 	}
 }

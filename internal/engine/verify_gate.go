@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/shell"
 )
 
@@ -22,6 +24,36 @@ type VerifyResult struct {
 	ExitCode int
 	Output   string
 	Duration time.Duration
+	// Skipped: the command already passed earlier in this turn (the model ran
+	// it itself), so the gate took that run as the evidence.
+	Skipped bool
+	// TimedOut: the command did not finish within Timeout. It is not Passed,
+	// but it is not a failure either: a slow build (a cold dotnet restore, a
+	// large npm build) says nothing about the model's work, so the gate
+	// neither rejects the completion nor escalates the model.
+	TimedOut bool
+	Timeout  time.Duration
+}
+
+// Default verification timeouts: most checks finish well within
+// verifyTimeoutDefault; dotnet and npm builds (restores, bundlers) get
+// verifyTimeoutSlow.
+const (
+	verifyTimeoutDefault = 120 * time.Second
+	verifyTimeoutSlow    = 300 * time.Second
+)
+
+// defaultVerifyTimeout is the timeout of cmd when none is configured.
+func defaultVerifyTimeout(cmd string) time.Duration {
+	if f := strings.Fields(cmd); len(f) > 0 {
+		name := strings.ToLower(filepath.Base(f[0]))
+		name = strings.TrimSuffix(strings.TrimSuffix(name, ".exe"), ".cmd")
+		switch name {
+		case "dotnet", "npm":
+			return verifyTimeoutSlow
+		}
+	}
+	return verifyTimeoutDefault
 }
 
 // VerifyGate runs a small, user-configured list of shell commands (e.g.
@@ -45,11 +77,16 @@ type VerifyGate struct {
 	commands   []string
 	workDir    string
 	maxRetries int
+	// timeout, when positive, bounds every command (config
+	// done_verify_timeout_seconds); 0 uses defaultVerifyTimeout.
 	timeout    time.Duration
 	ledgerPath string
 	// onlyWhenFilesChanged limits the gate to turns that wrote or edited a
 	// file. Set for automatically detected commands (newAutoVerifyGate).
 	onlyWhenFilesChanged bool
+	// runner executes one command; nil means runVerifyCommand (replaced in
+	// tests).
+	runner func(ctx context.Context, cmd, workDir string) (string, int, error)
 }
 
 // NewVerifyGate creates a gate for the given commands. An empty commands
@@ -64,9 +101,28 @@ func NewVerifyGate(commands []string, workDir string) *VerifyGate {
 		commands:   commands,
 		workDir:    workDir,
 		maxRetries: 2,
-		timeout:    120 * time.Second,
 		ledgerPath: ledger,
 	}
+}
+
+// SetTimeout sets one timeout for every command; 0 or less restores the
+// per-command defaults (defaultVerifyTimeout).
+func (g *VerifyGate) SetTimeout(d time.Duration) {
+	if g == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	g.timeout = d
+}
+
+// timeoutFor is the timeout cmd runs under.
+func (g *VerifyGate) timeoutFor(cmd string) time.Duration {
+	if g.timeout > 0 {
+		return g.timeout
+	}
+	return defaultVerifyTimeout(cmd)
 }
 
 // Enabled reports whether any verification commands are configured.
@@ -86,15 +142,29 @@ func (g *VerifyGate) MaxRetries() int {
 // is broken). It never returns an error itself — a command that can't even
 // start is recorded as a failed result, not a Go-level error, since from the
 // gate's point of view that's just as much "not verified" as a nonzero exit.
-func (g *VerifyGate) Run(ctx context.Context) (results []VerifyResult, allPassed bool) {
+//
+// alreadyPassed, when non-nil, names commands the model already ran with
+// success this turn, after its last change (see noteVerifyEvidence): those
+// are not run again and count as passed.
+func (g *VerifyGate) Run(ctx context.Context, alreadyPassed func(cmd string) bool) (results []VerifyResult, allPassed bool) {
 	if !g.Enabled() {
 		return nil, true
 	}
+	runner := g.runner
+	if runner == nil {
+		runner = runVerifyCommand
+	}
 	allPassed = true
 	for _, cmdStr := range g.commands {
+		if alreadyPassed != nil && alreadyPassed(cmdStr) {
+			results = append(results, VerifyResult{Command: cmdStr, Passed: true, Skipped: true})
+			continue
+		}
 		start := time.Now()
-		runCtx, cancel := context.WithTimeout(ctx, g.timeout)
-		out, exitCode, runErr := runVerifyCommand(runCtx, cmdStr, g.workDir)
+		limit := g.timeoutFor(cmdStr)
+		runCtx, cancel := context.WithTimeout(ctx, limit)
+		out, exitCode, runErr := runner(runCtx, cmdStr, g.workDir)
+		deadlineHit := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		if runErr != nil {
 			out = out + "\n[verify_gate] failed to run command: " + runErr.Error()
@@ -104,6 +174,7 @@ func (g *VerifyGate) Run(ctx context.Context) (results []VerifyResult, allPassed
 		res := VerifyResult{
 			Command: cmdStr, Passed: passed, ExitCode: exitCode,
 			Output: out, Duration: time.Since(start),
+			TimedOut: !passed && deadlineHit, Timeout: limit,
 		}
 		results = append(results, res)
 		g.appendLedger(res)
@@ -115,11 +186,23 @@ func (g *VerifyGate) Run(ctx context.Context) (results []VerifyResult, allPassed
 	return results, allPassed
 }
 
+// TimedOut reports whether the check stopped at a command that did not
+// finish in time (the last result): not a failure, so the gate neither
+// retries nor escalates.
+func TimedOut(results []VerifyResult) bool {
+	return len(results) > 0 && results[len(results)-1].TimedOut
+}
+
 // Summary renders the check results as guidance to hand back to the model:
 // which command(s) ran, which one failed, its exit code, and a truncated
 // tail of its output (the part most likely to contain the actual error).
 func Summary(results []VerifyResult) string {
 	var sb strings.Builder
+	if TimedOut(results) {
+		r := results[len(results)-1]
+		fmt.Fprintf(&sb, "[verify_gate] %s: verification did not finish within %d s; not counted as a failure.", r.Command, int(r.Timeout.Seconds()))
+		return sb.String()
+	}
 	sb.WriteString("[verify_gate] Your completion was not accepted because a verification command failed. Results:\n")
 	for _, r := range results {
 		if r.Passed {
@@ -152,6 +235,7 @@ func (g *VerifyGate) appendLedger(r VerifyResult) {
 		"time":        time.Now().Format(time.RFC3339),
 		"command":     r.Command,
 		"passed":      r.Passed,
+		"timed_out":   r.TimedOut,
 		"exit_code":   r.ExitCode,
 		"duration_ms": r.Duration.Milliseconds(),
 		"output_tail": truncateTail(r.Output, 500),
@@ -172,6 +256,9 @@ func runVerifyCommand(ctx context.Context, cmdStr string, workDir string) (outpu
 		cmd.Dir = workDir
 	}
 	cmd.Env = shell.Env(os.Environ())
+	// On timeout only the outer shell is killed; a build child that keeps the
+	// output pipes open would otherwise make Run wait for it indefinitely.
+	cmd.WaitDelay = 5 * time.Second
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -185,16 +272,70 @@ func runVerifyCommand(ctx context.Context, cmdStr string, workDir string) (outpu
 	if runErr == nil {
 		return out, 0, nil
 	}
-	if exitErr, ok := runErr.(*exec.ExitError); ok {
+	if exitErr := (*exec.ExitError)(nil); errors.As(runErr, &exitErr) {
 		return out, exitErr.ExitCode(), nil
 	}
 	// Could not even start the command (bad shell, timeout before start, etc).
 	return out, -1, runErr
 }
 
-func truncateTail(s string, max int) string {
-	if len(s) <= max {
+func truncateTail(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
 		return s
 	}
-	return "... (truncated)\n" + s[len(s)-max:]
+	return "... (truncated)\n" + s[len(s)-maxBytes:]
+}
+
+// normalizeCommand collapses runs of whitespace, so "go  build ./... " and
+// "go build ./..." are the same command. Nothing else is equivalent: a
+// compound line ("go build ./... && go test ./...") is its own command.
+func normalizeCommand(cmd string) string {
+	return strings.Join(strings.Fields(cmd), " ")
+}
+
+// shellResultPassed reports whether a shell tool result is a success: no
+// nonzero exit code, no error, not timed out or cancelled.
+func shellResultPassed(out string) bool {
+	return !strings.Contains(out, "[exit code:") && !strings.Contains(out, "Error") &&
+		!strings.Contains(out, "[timed out") && !strings.Contains(out, "[cancelled]") &&
+		!strings.HasPrefix(out, "BLOCKED")
+}
+
+// noteVerifyEvidence updates the turn's record of shell commands that passed
+// since the last change to the workspace, from one tool result. A passing
+// run is evidence only until something may have changed files after it: a
+// write-capable tool, or a shell line that is not read-only or a build/test
+// line. Read-only tools leave the evidence alone.
+func (e *Engine) noteVerifyEvidence(l *turnLimits, name string, input map[string]any, result string) {
+	e.noteWorkTool(l, name, result)
+	if permission.IsShellTool(name) {
+		cmd, _ := input["command"].(string)
+		cmd = normalizeCommand(cmd)
+		if cmd == "" {
+			return
+		}
+		autoOK := e.classifier != nil && e.classifier.AutoApproveLineFor(cmd, e.perm.ShellKindFor(name))
+		if !autoOK {
+			l.passedCmds = nil // the line may have changed files
+		}
+		if shellResultPassed(result) {
+			if l.passedCmds == nil {
+				l.passedCmds = map[string]bool{}
+			}
+			l.passedCmds[cmd] = true
+		} else {
+			delete(l.passedCmds, cmd)
+		}
+		return
+	}
+	if t, ok := e.registry.Find(name); ok && t.Def().IsReadOnly {
+		return
+	}
+	l.passedCmds = nil
+}
+
+// verifyPassed reports whether cmd passed this turn after the last change
+// (noteVerifyEvidence).
+func (l *turnLimits) verifyPassed(cmd string) bool {
+	return l.passedCmds[normalizeCommand(cmd)]
 }
