@@ -2,7 +2,7 @@
 
 # 🤖 cove
 
-**Go-powered AI Coding Assistant for the Terminal**
+**单文件 Go 编写的终端 AI 代码助手——顺带也能操作你的电脑**
 
 [![CI](https://github.com/liuzhixin405/cove/actions/workflows/ci.yml/badge.svg)](https://github.com/liuzhixin405/cove/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/liuzhixin405/cove?include_prereleases)](https://github.com/liuzhixin405/cove/releases)
@@ -10,16 +10,133 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[English](#english) | [中文](#chinese)
+[中文](#chinese) | [English](#english)
 
 </div>
+
+---
+
+<a name="chinese"></a>
+## 中文
+
+cove 是一个**终端 AI 代码助手**——本质是写代码。因为它本地运行、自带 shell/浏览器/文件/MCP 等真实工具，所以顺带也能操作电脑、完成各类自动化。单文件 Go 二进制，本地运行，API key 完全由你掌控，并把 **DeepSeek / GLM / Kimi / Qwen / Doubao** 当作一等公民深度适配，而不是「兼容接口凑合用」。
+
+> **它是给谁的？** 给那些想要「单文件零依赖 + 便宜的国内模型 + 本地自学习记忆 + 数据自主」的人——以写代码为主，顺带自动化操作电脑，而不想被绑死在某一家厂商 agent 上。
+>
+> 诚实说明：[cove vs Claude Code](docs/COMPARISON.md) · [为什么用 Go](docs/WHY_GO.md)
+
+### ✨ 特性
+
+- 🎯 **单文件二进制** — 零依赖，下载即用
+- 🌐 **多提供商** — Anthropic、OpenAI、DeepSeek 及 10+ 个兼容接口
+- 🖥️ **跨平台** — Windows、macOS (Intel & Apple Silicon)、Linux
+- 🎨 **交互式 REPL** — 25+ 个斜杠命令，异步任务队列，会话管理
+- 🔧 **灵活工具集** — 文件操作、shell/PowerShell、代码搜索、网页抓取/搜索、headless 浏览器
+- 🧠 **自学习系统** — 自动记忆提取、技能创建、跨会话整合 (Dream)
+- 📋 **计划执行器** — 声明式多步骤任务计划，依赖 DAG + 并行子智能体执行
+- 👥 **多智能体与团队** — 子智能体生成、团队创建与消息传递
+- 🔌 **MCP 支持** — Model Context Protocol 服务器集成 (stdio + SSE + Streamable HTTP)
+- 🎭 **分层权限模式** — `default`（只读工具与只读命令自动放行）· `auto`（另放行构建/测试命令与项目内写入）· `bypass`（全部放行）· `plan`（只读）；`[p]` 永久允许按项目写入 `~/.cove/policies.json`
+- 🛡️ **护栏保护** — 工具循环检测、快速失败断路器、幂等结果检测
+- 🔄 **检查点** — 写入前自动 Git 快照，支持撤消回退
+- 🩺 **诊断系统** — 30+ 错误码，启动检查，热修复无需重启
+- 📦 **插件与技能** — 可扩展架构，内置 12 个技能（按需加载），支持自定义和覆盖
+- 💰 **费用追踪** — 实时 token 计数、成本估算、预算上限、速率限制感知
+- 📱 **CovePhone**（实验性）— Android 手机 AI 助手应用
+
+### 📥 安装
+
+#### 下载预编译二进制
+
+前往 [Releases](https://github.com/liuzhixin405/cove/releases) 下载对应平台的压缩包：
+
+| 平台 | 文件 |
+|------|------|
+| Windows (amd64) | `cove-v*-windows-amd64.zip` |
+| macOS (Intel) | `cove-v*-darwin-amd64.tar.gz` |
+| macOS (Apple Silicon) | `cove-v*-darwin-arm64.tar.gz` |
+| Linux (amd64) | `cove-v*-linux-amd64.tar.gz` |
+| Windows (arm64) | `cove-v*-windows-arm64.zip` |
+| Linux (arm64) | `cove-v*-linux-arm64.tar.gz` |
+
+解压运行：
+
+```bash
+# macOS / Linux
+tar -xzf cove-v*-linux-amd64.tar.gz
+./cove
+
+# Windows (PowerShell)
+Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
+.\cove.exe
+```
+
+建议将程序目录添加到 `PATH` 以便全局使用。
+
+#### 从源码构建
+
+```bash
+git clone https://github.com/liuzhixin405/cove.git
+cd cove
+go build -o cove ./cli/cove
+./cove --version
+```
+
+需要 `go.mod` 中声明的 Go 版本。
+
+### 🚀 快速开始
+
+```bash
+# 交互式 REPL
+cove
+
+# 单次查询（无法回答授权询问：完全无人值守需 bypass 模式或已持久化的允许规则）
+cove -p "定位并修复 pkg/engine 里偶发失败的测试，并补一个回归测试"
+
+# 单次查询最多调用模型 50 次（0 不限制；默认取配置 max_iterations = 200）
+cove -p "修复失败的测试" --max-turns 50
+
+# 查看版本
+cove --version
+
+# 系统诊断
+cove --doctor
+```
+
+首次运行时，cove 会引导你配置 API key。也可以直接设置：
+
+```bash
+# 在 REPL 中
+/api-key sk-your-key-here
+
+# 或通过环境变量
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+### 📱 CovePhone (Android，实验性)
+
+次要的伴侣应用，不是主产品：[covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk)（约 47MB），源码在 [`mobile/`](mobile/)。它通过 `gomobile` 复用同一套 Go 引擎。
+
+### 📄 许可证
+
+MIT — 详见 [LICENSE](LICENSE)。
+
+### ⭐ Star History
+
+如果这个项目对你有帮助，请给我们一个 Star ⭐！
+
+[![Star History Chart](https://api.star-history.com/svg?repos=liuzhixin405/cove&type=Date)](https://star-history.com/#liuzhixin405/cove&Date)
 
 ---
 
 <a name="english"></a>
 ## English
 
-cove is a pure CLI AI programming assistant, implemented as a single-file Go binary. It runs in your terminal, supports multiple AI providers, and is designed for local development, scripting, and portable distribution.
+cove is a **terminal AI coding assistant** — first and foremost for writing code. Because it runs locally with real tools (shell, browser, files, MCP), it can also drive your computer for general automation as a bonus. A single-file Go binary that keeps your API keys under your control, and treats **DeepSeek / GLM / Kimi / Qwen / Doubao** as first-class citizens, not compatibility afterthoughts.
+
+> **Who is this for?** People who want a single zero-dependency binary, cheap domestic models, local self-learning memory, and full control over their keys — to write code, with the option to automate their computer on the side — rather than being locked into one vendor's agent.
+>
+> Honest framing: [cove vs Claude Code](docs/COMPARISON.md) · [why Go](docs/WHY_GO.md)
 
 ### ✨ Features
 
@@ -37,7 +154,7 @@ cove is a pure CLI AI programming assistant, implemented as a single-file Go bin
 - 💰 **Cost Tracking** — Real-time token counting, cost estimation, budget caps, rate-limit awareness
 - 🔄 **Checkpoints** — Auto Git snapshots before write/edit, undo support
 - 🩺 **Diagnostic System** — 30+ error codes, startup checks, hot-fixable without restart
-- 📱 **CovePhone** — Android mobile app with native Go AI engine
+- 📱 **CovePhone** *(experimental)* — Android mobile app with native Go AI engine
 
 ### 📥 Installation
 
@@ -87,19 +204,6 @@ python scripts/release_build.py v2.0.0
 
 Artifacts are output to `dist/v2.0.0/`.
 
-### 📱 CovePhone (Android)
-
-CovePhone is an **Android companion app** for cove, bringing AI assistant capabilities to your mobile device.
-
-- 🧠 **Native Go Engine** — Real AI engine (not mock) powered by `cove-core.aar`, a Go module compiled via `gomobile`
-- 💬 **Full Chat UI** — Message list with thinking display, smooth scrolling, batch-rendered thinking blocks
-- ⚙️ **Settings & Config** — API key, model selection, provider choice, persistent via SharedPreferences
-- 🔌 **DeepSeek API** — Connects to DeepSeek (or other compatible providers) directly from your phone
-
-**Download:** [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (Android, ~47MB)
-
-**Source:** [`mobile/`](mobile/) — Lightweight Go engine for mobile.
-
 ### 🚀 Quick Start
 
 ```bash
@@ -108,7 +212,7 @@ cove
 
 # One-shot query (cannot answer permission prompts: use bypass mode or
 # persisted allow rules for fully unattended runs)
-cove -p "Create a snake game in HTML"
+cove -p "Find and fix the flaky test in pkg/engine, then add a regression test"
 
 # Cap the one-shot turn at 50 model calls (0 = no limit; default max_iterations = 200)
 cove -p "Fix the failing tests" --max-turns 50
@@ -304,125 +408,10 @@ cove/
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+### 📱 CovePhone (Android, experimental)
+
+A secondary companion, not the main product: [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (~47MB), source in [`mobile/`](mobile/). It reuses the same Go engine via `gomobile`.
+
 ### 📄 License
 
 MIT — see [LICENSE](LICENSE) for details.
-
----
-
-<a name="chinese"></a>
-## 中文
-
-cove 是一个纯 CLI 的 AI 编程助手，以单文件 Go 二进制形式发布。它运行在终端中，支持多种 AI 提供商，专为本地开发、脚本调用和便携分发而设计。
-
-### ✨ 特性
-
-- 🎯 **单文件二进制** — 零依赖，下载即用
-- 🌐 **多提供商** — Anthropic、OpenAI、DeepSeek 及 10+ 个兼容接口
-- 🖥️ **跨平台** — Windows、macOS (Intel & Apple Silicon)、Linux
-- 🎨 **交互式 REPL** — 25+ 个斜杠命令，异步任务队列，会话管理
-- 🔧 **灵活工具集** — 文件操作、shell/PowerShell、代码搜索、网页抓取/搜索、headless 浏览器
-- 🧠 **自学习系统** — 自动记忆提取、技能创建、跨会话整合 (Dream)
-- 📋 **计划执行器** — 声明式多步骤任务计划，依赖 DAG + 并行子智能体执行
-- 👥 **多智能体与团队** — 子智能体生成、团队创建与消息传递
-- 🔌 **MCP 支持** — Model Context Protocol 服务器集成 (stdio + SSE + Streamable HTTP)
-- 🎭 **分层权限模式** — `default`（只读工具与只读命令自动放行）· `auto`（另放行构建/测试命令与项目内写入）· `bypass`（全部放行）· `plan`（只读）；`[p]` 永久允许按项目写入 `~/.cove/policies.json`
-- 🛡️ **护栏保护** — 工具循环检测、快速失败断路器、幂等结果检测
-- 🔄 **检查点** — 写入前自动 Git 快照，支持撤消回退
-- 🩺 **诊断系统** — 30+ 错误码，启动检查，热修复无需重启
-- 📦 **插件与技能** — 可扩展架构，内置 12 个技能（按需加载），支持自定义和覆盖
-- 💰 **费用追踪** — 实时 token 计数、成本估算、预算上限、速率限制感知
-- 📱 **CovePhone** — Android 手机 AI 助手应用
-
-### 📥 安装
-
-#### 下载预编译二进制
-
-前往 [Releases](https://github.com/liuzhixin405/cove/releases) 下载对应平台的压缩包：
-
-| 平台 | 文件 |
-|------|------|
-| Windows (amd64) | `cove-v*-windows-amd64.zip` |
-| macOS (Intel) | `cove-v*-darwin-amd64.tar.gz` |
-| macOS (Apple Silicon) | `cove-v*-darwin-arm64.tar.gz` |
-| Linux (amd64) | `cove-v*-linux-amd64.tar.gz` |
-| Windows (arm64) | `cove-v*-windows-arm64.zip` |
-| Linux (arm64) | `cove-v*-linux-arm64.tar.gz` |
-
-解压运行：
-
-```bash
-# macOS / Linux
-tar -xzf cove-v*-linux-amd64.tar.gz
-./cove
-
-# Windows (PowerShell)
-Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
-.\cove.exe
-```
-
-建议将程序目录添加到 `PATH` 以便全局使用。
-
-#### 从源码构建
-
-```bash
-git clone https://github.com/liuzhixin405/cove.git
-cd cove
-go build -o cove ./cli/cove
-./cove --version
-```
-
-需要 `go.mod` 中声明的 Go 版本。
-
-### 📱 CovePhone (Android)
-
-CovePhone 是 cove 的 **Android 手机伴侣应用**，将 AI 助手能力带到你的手机上。
-
-- 🧠 **原生 Go 引擎** — 基于 `cove-core.aar`（通过 `gomobile` 编译的 Go 模块）的真实 AI 引擎
-- 💬 **完整聊天界面** — 消息列表带思考过程显示，平滑滚动，批量渲染的 thinking 块
-- ⚙️ **设置与配置** — API key、模型选择、提供商选择，通过 SharedPreferences 持久化
-- 🔌 **DeepSeek API** — 直接从手机连接 DeepSeek（或其他兼容提供商）
-
-**下载:** [covephone-v4.0.5.apk](dist/v4.0.5/covephone-v4.0.5.apk) (Android, ~47MB)
-
-**源码:** [`mobile/`](mobile/) — 移动端轻量 Go 引擎。
-
-### 🚀 快速开始
-
-```bash
-# 交互式 REPL
-cove
-
-# 单次查询（无法回答授权询问：完全无人值守需 bypass 模式或已持久化的允许规则）
-cove -p "创建一个贪吃蛇 HTML 游戏"
-
-# 单次查询最多调用模型 50 次（0 不限制；默认取配置 max_iterations = 200）
-cove -p "修复失败的测试" --max-turns 50
-
-# 查看版本
-cove --version
-
-# 系统诊断
-cove --doctor
-```
-
-首次运行时，cove 会引导你配置 API key。也可以直接设置：
-
-```bash
-# 在 REPL 中
-/api-key sk-your-key-here
-
-# 或通过环境变量
-export DEEPSEEK_API_KEY="sk-..."
-```
-
-### 📄 许可证
-
-MIT — 详见 [LICENSE](LICENSE)。
-
-### ⭐ Star History
-
-如果这个项目对你有帮助，请给我们一个 Star ⭐！
-
-[![Star History Chart](https://api.star-history.com/svg?repos=liuzhixin405/cove&type=Date)](https://star-history.com/#liuzhixin405/cove&Date)
-

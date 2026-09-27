@@ -41,7 +41,7 @@
 cove
 
 # 单次查询
-cove -p "创建一个贪吃蛇 HTML 游戏"
+cove -p "定位并修复 pkg/engine 里偶发失败的测试，并补一个回归测试"
 
 # 带附件查询
 cove -p "分析这张图片" --image screenshot.png

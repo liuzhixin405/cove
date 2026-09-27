@@ -1,6 +1,8 @@
 # Cove 文档目录
 
 - [使用手册 (User Manual)](USER_MANUAL.md) — 完整的中文使用手册，覆盖所有功能
+- [cove vs Claude Code](COMPARISON.md) — 诚实对比：什么时候选 cove，什么时候不选
+- [为什么 cove 用 Go](WHY_GO.md) — 语言选型的全面分析（Go vs Python/TS/Rust/Java/C++）
 - [需求说明书](需求说明书.md) — 从现有实现反向推导的产品需求说明
 - [全流程图（端到端）](全流程图-端到端.md) — 总流程 + 各模块内部流程图
 - [项目 README](../README.md) — 中英双语项目总览
