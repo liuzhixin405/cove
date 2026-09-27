@@ -36,7 +36,9 @@ func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEnt
 		cmdEntry{Name: "/help", Desc: "显示帮助", Type: "builtin"},
 		cmdEntry{Name: "/exit", Desc: "退出", Type: "builtin"},
 		cmdEntry{Name: "/history", Desc: "查看和继续历史会话", Type: "builtin"},
-		cmdEntry{Name: "/history clean", Desc: "清洗历史会话噪音并备份", Type: "builtin"},
+		cmdEntry{Name: "/history clear", Desc: "清空本项目历史会话（需 confirm）", Type: "builtin"},
+		cmdEntry{Name: "/history delete", Desc: "删除一个历史会话（编号或 ID）", Type: "builtin"},
+		cmdEntry{Name: "/history clean", Desc: "修复历史文件（标题/标记，不删除）并备份", Type: "builtin"},
 		cmdEntry{Name: "/tasks", Desc: "查看运行中/排队的后台任务", Type: "builtin"},
 		cmdEntry{Name: "/stop", Desc: "取消当前运行的任务", Type: "builtin"},
 	)

@@ -43,6 +43,19 @@ func RepairToolArguments(raw string) (map[string]any, bool) {
 		}
 	}
 
+	// Unescaped quotes inside a string value (a shell command quoting a
+	// path) are the other way a local model breaks its own JSON.
+	if fixed := escapeUnescapedQuotes(strings.TrimSpace(raw)); fixed != raw {
+		if args, ok := tryUnmarshalObject(fixed); ok {
+			return args, true
+		}
+		if extracted := extractBalancedObject(fixed); extracted != "" {
+			if args, ok := tryUnmarshalObject(extracted); ok {
+				return args, true
+			}
+		}
+	}
+
 	return nil, false
 }
 

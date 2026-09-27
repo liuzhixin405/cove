@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/cost"
@@ -340,7 +341,8 @@ func handleHistory(eng *engine.Engine, all bool) {
 		termui.PrintSafe("  查看详情: /history detail <编号>\n")
 		termui.PrintSafe("  所有项目: /history all\n\n")
 	}
-	termui.PrintSafe("  清洗历史: /history clean\n\n")
+	termui.PrintSafe("  删除会话: /history delete <编号>    清空本项目历史: /history clear\n")
+	termui.PrintSafe("  修复历史文件（不删除）: /history clean\n\n")
 	if draft != nil {
 		termui.PrintSafe("  中断详情: /history detail interrupted\n\n")
 	}
@@ -945,4 +947,88 @@ func isLowSignalResumeInput(s string) bool {
 		return true
 	}
 	return isTrivialResumePrompt(v)
+}
+
+// findDuplicateSession returns the most recently updated record whose first
+// user message is the same request as input (spacing and punctuation
+// aside) and which did not finish, with its 1-based position in records (the
+// number /history shows). Re-sending the request after a restart continues
+// that session instead of opening another copy; a finished session is not
+// matched, since asking again means doing it again. Trivial inputs match
+// nothing.
+func findDuplicateSession(records []session.Record, input string) (*session.Record, int) {
+	want := normalizeTaskForMerge(input)
+	if want == "" || isTrivialResumePrompt(input) || utf8.RuneCountInString(want) < minMergeRunes {
+		return nil, 0
+	}
+	var best *session.Record
+	bestIdx := 0
+	for i := range records {
+		rec := &records[i]
+		first := ""
+		for _, m := range rec.Messages {
+			if m.Role == "user" && !isSyntheticMessage(m) {
+				first = m.Content
+				break
+			}
+		}
+		if first == "" || normalizeTaskForMerge(first) != want || !sessionUnfinished(*rec) {
+			continue
+		}
+		if best == nil || rec.UpdatedAt.After(best.UpdatedAt) {
+			best, bestIdx = rec, i+1
+		}
+	}
+	return best, bestIdx
+}
+
+// sessionUnfinished reports whether a session stopped before its last turn
+// was answered: it ends in a request or a tool result, or its last turn was
+// marked interrupted.
+func sessionUnfinished(rec session.Record) bool {
+	if len(rec.Messages) == 0 {
+		return false
+	}
+	last := rec.Messages[len(rec.Messages)-1]
+	if last.Role != "assistant" || len(last.ToolCalls) > 0 {
+		return true
+	}
+	return strings.Contains(last.Content, "The previous turn was interrupted")
+}
+
+// isSyntheticMessage reports whether m is a message cove wrote for the model
+// rather than one the person typed.
+func isSyntheticMessage(m api.Message) bool {
+	return strings.HasPrefix(strings.TrimSpace(m.Content), "[system:") || strings.HasPrefix(strings.TrimSpace(m.Content), "[用户指引]")
+}
+
+// resumeDuplicateSession looks for an unfinished session of this project that
+// started with the same request and, when there is one, resumes it. It
+// returns the record and its /history number, or nil.
+func resumeDuplicateSession(eng *engine.Engine, input string) (*session.Record, int) {
+	if eng == nil || eng.Store() == nil {
+		return nil, 0
+	}
+	all, err := eng.Store().List()
+	if err != nil {
+		return nil, 0
+	}
+	records := session.FilterByProject(all, currentProjectDir())
+	loaded := make([]session.Record, 0, len(records))
+	for i, meta := range records {
+		if i >= 30 {
+			break
+		}
+		rec, err := eng.Store().Load(meta.ID)
+		if err != nil {
+			continue
+		}
+		loaded = append(loaded, *rec)
+	}
+	rec, idx := findDuplicateSession(loaded, input)
+	if rec == nil {
+		return nil, 0
+	}
+	eng.ResumeSession(rec)
+	return rec, idx
 }

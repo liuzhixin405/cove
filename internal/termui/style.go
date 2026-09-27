@@ -62,31 +62,39 @@ func PermissionPrompt(toolName, desc string) string {
 	var sb strings.Builder
 	sb.WriteString("\r\x1b[K")
 	sb.WriteString("\a")
-	fmt.Fprintf(&sb, "\n  %s╭── 需要授权 ──────────────────────╮%s\n", Yellow, Reset)
-	fmt.Fprintf(&sb, "  %s│%s  工具: %s%s%s\n", Yellow, Reset, Cyan, render.StripControls(toolName), Reset)
+	// A left gutter instead of a box: the box had a fixed 34-column top rule
+	// and a right border only in name, so a command longer than that showed
+	// as a short title tab over a left bar with nothing on the right. The
+	// gutter never breaks, whatever the width of the command or of the
+	// terminal. The header names the tool, the rows under it carry the
+	// description, and an empty gutter row separates them from the answer
+	// line the caller appends (indented to the same content column, see
+	// PromptContentIndent).
+	//
 	// The description is the command or path being approved, written by the
 	// model, so it is shown whole and inert. It used to be clipped to 60
-	// runes, which hid the tail of a long command ("echo <padding> ; rm -rf ~"
-	// showed only the echo), and printed raw, so a \r or a cursor move in it
-	// made the text on screen differ from what would run. Only something
+	// runes, which hid the tail of a long command ("echo <padding> ; rm -rf
+	// ~" showed only the echo), and printed raw, so a \r or a cursor move in
+	// it made the text on screen differ from what would run. Only something
 	// enormous is shortened, from the middle and with a marker, so both ends
 	// stay visible and the omission is stated.
+	tool := render.StripControls(toolName)
+	gutter := "  " + Yellow + "┃" + Reset
+	fmt.Fprintf(&sb, "\n%s %s需要授权%s  %s%s%s\n", gutter, Bold, Reset, Cyan, tool, Reset)
 	d := strings.TrimRight(render.StripControls(desc), "\n")
 	if strings.TrimSpace(d) != "" {
 		d = textutil.ClipMiddleBytes(d, maxPromptDescBytes)
-		label := "说明: "
 		for _, line := range strings.Split(d, "\n") {
-			fmt.Fprintf(&sb, "  %s│%s  %s%s\n", Yellow, Reset, label, line)
-			label = "      " // continuation rows align under the first
+			fmt.Fprintf(&sb, "%s %s\n", gutter, line)
 		}
 	}
-	// 34 rules, not 35: the top rule's title is CJK, so its 32 runes occupy 36
-	// display columns (每个汉字两列). An all-rule bottom row therefore needs 34
-	// rules to reach the same 36 columns; with 35 it rendered one column wider
-	// than the top and the box looked visibly crooked in the terminal.
-	fmt.Fprintf(&sb, "  %s╰──────────────────────────────────╯%s\n", Yellow, Reset)
+	sb.WriteString(gutter + "\n")
 	return sb.String()
 }
+
+// PromptContentIndent is the column the permission prompt's content starts
+// at, as spaces, so the answer line under it lines up with the command.
+const PromptContentIndent = "    "
 
 func Banner(version, model, provider, mode, cwd, gitBranch, gitStatus string, toolCount int, isGit bool) string {
 	var sb strings.Builder

@@ -33,6 +33,11 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 			*historyPickPending = false
 			return true
 		}
+		if all, confirm, ok := parseHistoryClear(histID); ok {
+			handleHistoryClear(eng, all, confirm)
+			*historyPickPending = false
+			return true
+		}
 		// "/history all ..." addresses the all-projects list; without it,
 		// numbers index the current project's list.
 		all := false
@@ -47,6 +52,11 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 		}
 		if strings.HasPrefix(strings.ToLower(histID), "detail ") {
 			handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng, all)
+			*historyPickPending = false
+			return true
+		}
+		if strings.HasPrefix(strings.ToLower(histID), "delete ") {
+			handleHistoryDelete(strings.TrimSpace(histID[len("delete "):]), eng, all)
 			*historyPickPending = false
 			return true
 		}

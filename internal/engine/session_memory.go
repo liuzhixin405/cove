@@ -144,9 +144,10 @@ func (e *Engine) turnMemoryNote(query string) string {
 	if learned != "" {
 		learned += "\n"
 	}
-	budget := turnMemoryNoteMaxBytes - len(open) - len(closing) - len(learned)
-	if budget > relevantMemoryNoteMaxBytes {
-		budget = relevantMemoryNoteMaxBytes
+	// Both caps scale with the model's window (window_budget.go).
+	budget := turnMemoryBudget(e.config.Model) - len(open) - len(closing) - len(learned)
+	if rel := relevantMemoryBudget(e.config.Model); budget > rel {
+		budget = rel
 	}
 	relevant := e.relevantMemoriesNote(query, budget)
 	if learned == "" && relevant == "" {

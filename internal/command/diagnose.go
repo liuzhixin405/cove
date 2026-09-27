@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/diagnostic"
+	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -23,7 +24,8 @@ func (c *diagnoseCmd) Help() string {
 /diagnose quick  仅运行快速检查（跳过网络）
 /diagnose errors 查看运行时记录的错误/卡顿及修复建议
 /diagnose archive 修复完成后归档错误日志，开始新的记录周期
-/diagnose codes  列出所有已知错误代码`
+/diagnose codes  列出所有诊断码，带处置器的标注 (有处置器)
+/diagnose trace [N] 查看最近 N 条交互轨迹（模型调用、工具调用、压缩，默认 30 条）`
 }
 
 func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) {
@@ -38,6 +40,8 @@ func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) 
 	switch mode {
 	case "codes":
 		return c.listCodes()
+	case "trace":
+		return c.showTrace(input.Args[1:])
 	case "errors", "log", "recent":
 		return c.showRuntimeErrors()
 	case "archive", "fixed", "clear":
@@ -48,9 +52,6 @@ func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) 
 	default:
 		report := checker.RunAll(ctx)
 		msg := report.Format()
-		if report.AutoFixed > 0 {
-			msg += "\n\x1b[32m所有修复已热加载到当前进程，无需重启 exe。\x1b[0m\n"
-		}
 		// Append a runtime-error reminder so recurring hangs/failures from this
 		// session (and previous ones) surface alongside the static checks.
 		msg += webSearchHint(cfg)
@@ -59,35 +60,60 @@ func (c *diagnoseCmd) Execute(ctx context.Context, input Input) (Output, error) 
 	}
 }
 
-// showRuntimeErrors lists problems recorded while the agent was running, merged
-// with persisted events from previous runs, each paired with a fix suggestion.
+// showRuntimeErrors lists problems recorded while the agent was running,
+// merged with persisted events from previous runs: one line per coded
+// problem and model (or per uncoded message), with count, latest time, the
+// catalogue's hint and what a remedy did.
 func (c *diagnoseCmd) showRuntimeErrors() (Output, error) {
-	events := diagnostic.RecentRuntime()
-	if len(events) == 0 {
-		events = diagnostic.LoadRuntimeLog()
-	}
+	// Both the persisted log (earlier runs) and this session's buffer, once
+	// each: the start-up hint points here for the log's problems, so the
+	// log must be shown even when this session already recorded something.
+	events := diagnostic.MergeEvents(diagnostic.LoadRuntimeLog(), diagnostic.RecentRuntime())
 	if len(events) == 0 {
 		return Output{Message: "\x1b[32m✓ 没有记录到运行时错误或卡顿。\x1b[0m\n"}, nil
 	}
 	summaries := diagnostic.SummarizeRuntime(events)
 	const reset = "\x1b[0m"
-	msg := fmt.Sprintf("\x1b[1m运行时问题记录\x1b[0m (共 %d 条，按严重程度排序)\n\n", len(events))
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\x1b[1m运行时问题记录\x1b[0m (共 %d 条，按严重程度排序)\n\n", len(events))
 	for _, s := range summaries {
 		count := ""
 		if s.Count > 1 {
 			count = fmt.Sprintf(" \x1b[2m×%d\x1b[0m", s.Count)
 		}
-		msg += fmt.Sprintf(" %s[%s]%s %s%s\n", s.Severity.Color(), s.Severity.String(), reset, s.Message, count)
-		if s.Recovery != "" {
-			tag := "💡"
-			if s.Fixable {
-				tag = "🔧 可自动修复:"
+		last := ""
+		if !s.Last.IsZero() {
+			last = fmt.Sprintf("   \x1b[2m最近 %s\x1b[0m", s.Last.Format("01-02 15:04"))
+		}
+		code := ""
+		if s.Code != "" {
+			code = string(s.Code) + " "
+		}
+		fmt.Fprintf(&sb, " %s[%s]%s %s%s%s%s\n", s.Severity.Color(), s.Severity.String(), reset, code, s.Message, count, last)
+		if s.Code != "" {
+			ctx := ""
+			if s.Model != "" {
+				ctx = "模型 " + s.Model
 			}
-			msg += fmt.Sprintf("    \x1b[33m%s %s\x1b[0m\n", tag, s.Recovery)
+			if s.Detail != "" {
+				if ctx != "" {
+					ctx += " · "
+				}
+				ctx += textutil.ClipRunes(s.Detail, 100)
+			}
+			if ctx != "" {
+				fmt.Fprintf(&sb, "    \x1b[2m%s\x1b[0m\n", ctx)
+			}
+		}
+		if s.Recovery != "" {
+			fmt.Fprintf(&sb, "    \x1b[33m💡 %s\x1b[0m\n", s.Recovery)
+		}
+		for _, a := range s.Applied {
+			fmt.Fprintf(&sb, "    \x1b[32m✓ 已处置：%s\x1b[0m\n", a)
 		}
 	}
-	msg += "\n\x1b[2m日志文件: ~/.cove/errors.log\x1b[0m\n"
-	return Output{Message: msg}, nil
+	sb.WriteString("\n\x1b[2m日志文件: ~/.cove/errors.log · 处理完可用 /diagnose archive 归档\x1b[0m\n")
+	return Output{Message: sb.String()}, nil
 }
 
 // archiveRuntimeLog archives the current error log and starts a fresh cycle,
@@ -97,6 +123,7 @@ func (c *diagnoseCmd) archiveRuntimeLog() (Output, error) {
 	if err != nil {
 		return Output{Message: fmt.Sprintf("\x1b[31m归档失败: %s\x1b[0m\n", err.Error())}, nil
 	}
+	diagnostic.ResetRemedyState()
 	if dest == "" {
 		return Output{Message: "\x1b[32m✓ 当前没有需要归档的错误日志，已开始新的记录周期。\x1b[0m\n"}, nil
 	}
@@ -125,7 +152,11 @@ func (c *diagnoseCmd) runtimeReminder() string {
 		if s.Count > 1 {
 			count = fmt.Sprintf(" ×%d", s.Count)
 		}
-		msg += fmt.Sprintf("  %s%s%s %s%s\n", s.Severity.Color(), s.Severity.String(), reset, s.Message, count)
+		code := ""
+		if s.Code != "" {
+			code = string(s.Code) + " "
+		}
+		msg += fmt.Sprintf("  %s%s%s %s%s%s\n", s.Severity.Color(), s.Severity.String(), reset, code, s.Message, count)
 		shown++
 	}
 	return msg
@@ -166,10 +197,8 @@ func (c *diagnoseCmd) listCodes() (Output, error) {
 		for _, code := range codes {
 			def := all[code]
 			fixable := ""
-			if def.AutoFixable && def.HotFixable {
-				fixable = " \x1b[32m(自动修复+即时生效)\x1b[0m"
-			} else if def.AutoFixable {
-				fixable = " \x1b[32m(可自动修复)\x1b[0m"
+			if def.Remedy != nil {
+				fixable = " \x1b[32m(有处置器)\x1b[0m"
 			}
 			msg += fmt.Sprintf("    %s  %s%s\n", code, def.Message, fixable)
 		}

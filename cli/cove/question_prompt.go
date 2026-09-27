@@ -35,7 +35,7 @@ func askUserQuestion(prompt string) string {
 		return ""
 	}
 	answerCh := make(chan string, 1)
-	repl.SetPermInputCh(answerCh)
+	repl.SetPromptInput(answerCh, nil, "模型在等你回答上面的问题：输入选项编号或直接输入回答")
 	repl.BeginPromptInput()
 	termui.PrintAbove(termui.Styled(termui.Bold, strings.TrimRight(prompt, "\n")) + "\n  " +
 		termui.Styled(termui.Dim, "输入选项编号或直接输入回答") + "\n")

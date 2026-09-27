@@ -46,23 +46,72 @@ var streamingActive bool
 var streamMidLine bool
 var permInputCh chan<- string
 
-func SetPermInputCh(ch chan<- string) {
+// permAccepts says which typed lines answer the waiting prompt (nil: any
+// non-empty line) and permHint is what to show for a line that does not.
+var permAccepts func(string) bool
+var permHint string
+
+// SetPermInputCh registers a prompt that takes any non-empty line as its
+// answer. See SetPromptInput.
+func SetPermInputCh(ch chan<- string) { SetPromptInput(ch, nil, "") }
+
+// SetPromptInput registers the channel a waiting prompt reads its answer
+// from, with the test for what counts as an answer and the hint to show for
+// a line that does not. Only answers are relayed: the person may be typing
+// the next instruction when a prompt appears, and that line used to be
+// swallowed as a refusal.
+func SetPromptInput(ch chan<- string, accepts func(string) bool, hint string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	permInputCh = ch
+	permAccepts = accepts
+	permHint = hint
+}
+
+// PromptInputState is what TakePromptInputFor found for a typed line.
+type PromptInputState int
+
+const (
+	// PromptNone: no prompt is waiting; the line is ordinary input.
+	PromptNone PromptInputState = iota
+	// PromptAnswer: the line answers the waiting prompt; send it on the
+	// returned channel, which is now unregistered.
+	PromptAnswer
+	// PromptNotAnswer: a prompt is waiting but the line is not an answer to
+	// it; the prompt keeps waiting and the line is the caller's to handle.
+	PromptNotAnswer
+)
+
+// TakePromptInputFor decides what a typed line is for the prompt that may be
+// waiting; hint is the prompt's hint when the line is not an answer.
+func TakePromptInputFor(line string) (ch chan<- string, state PromptInputState, hint string) {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	if permInputCh == nil {
+		return nil, PromptNone, ""
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || (permAccepts != nil && !permAccepts(trimmed)) {
+		return nil, PromptNotAnswer, permHint
+	}
+	ch = permInputCh
+	permInputCh, permAccepts, permHint = nil, nil, ""
+	return ch, PromptAnswer, ""
 }
 
 func ClearPermInputCh() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	permInputCh = nil
+	permInputCh, permAccepts, permHint = nil, nil, ""
 }
 
+// TakePermInputCh takes the waiting prompt's channel unconditionally (Ctrl+C
+// answers every prompt); TakePromptInputFor is the typed-line path.
 func TakePermInputCh() chan<- string {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	ch := permInputCh
-	permInputCh = nil
+	permInputCh, permAccepts, permHint = nil, nil, ""
 	return ch
 }
 
@@ -82,22 +131,7 @@ func New(completer Completer) *LineReader {
 // ANSI escape sequences are skipped so the width reflects only visible cells.
 func (lr *LineReader) SetPrompt(p string) {
 	lr.prompt = p
-	w := 0
-	inAnsi := false
-	for _, r := range p {
-		if r == '\x1b' {
-			inAnsi = true
-			continue
-		}
-		if inAnsi {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inAnsi = false
-			}
-			continue
-		}
-		w += runeCellWidth(r)
-	}
-	lr.promptWidth = w
+	lr.promptWidth = promptVisibleWidth(p)
 }
 
 func PrintSafe(format string, args ...any) {
@@ -121,9 +155,10 @@ func PrintAbove(s string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 
-	// While a task is streaming we never keep an editable input line on screen,
-	// so print inline without erasing/redrawing (which would corrupt partial
-	// streamed lines that don't end in a newline).
+	// While a task is streaming the input line is either off screen or pinned
+	// to the last row outside the scroll region, so print inline without
+	// erasing/redrawing (which would corrupt partial streamed lines that
+	// don't end in a newline).
 	if streamingActive {
 		breakStreamLineLocked()
 		printOutputLocked(s, !strings.HasSuffix(s, "\r\n"))
@@ -185,27 +220,43 @@ func PrintTransientStatus(s string) {
 	fmt.Print("\x1b[0m\x1b[?25h\r\x1b[K" + s)
 }
 
+// BeginOutput starts a turn's streaming. With an editor on screen and a
+// terminal that can say where its cursor is, the input line moves to the
+// last row and stays there (see pinned.go); otherwise there is no input line
+// on screen until EndOutput, as before.
 func BeginOutput() {
 	consoleMu.Lock()
-	defer consoleMu.Unlock()
+	lr := activeReader
 	// Erase any idle input line BEFORE marking streaming active (eraseLineLocked
 	// is a no-op once streamingActive is set).
-	if activeReader != nil && activeReader.reading {
-		activeReader.eraseLineLocked()
+	if lr != nil && lr.reading {
+		lr.eraseLineLocked()
 	}
 	streamingActive = true
 	streamMidLine = false
-	fmt.Print("\n")
+	canPin := !pinned && lr != nil && lr.reading && pinEnabled()
+	if !canPin {
+		fmt.Print("\n")
+		consoleMu.Unlock()
+		return
+	}
+	consoleMu.Unlock()
+	// The cursor query needs the key loop to relay the answer, which takes
+	// consoleMu, so it runs unlocked. Nothing streams before this returns:
+	// the turn that called BeginOutput is waiting on it.
+	pinAtCursor(true)
 }
 
 // BeginPromptInput temporarily suspends streaming-output suppression so an
 // interactive prompt (e.g. a permission y/n/a question) can draw and echo the
-// input line normally. The engine is blocked awaiting the answer, so no
-// streaming output is produced meanwhile. Pair with EndPromptInput.
+// input line normally, in the flow of the output. The engine is blocked
+// awaiting the answer, so no streaming output is produced meanwhile. A pinned
+// input row is released first. Pair with EndPromptInput.
 func BeginPromptInput() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	breakStreamLineLocked()
+	unpinLocked()
 	streamingActive = false
 	if activeReader != nil && activeReader.reading {
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
@@ -213,19 +264,25 @@ func BeginPromptInput() {
 }
 
 // EndPromptInput restores streaming-output suppression after an interactive
-// prompt has been answered.
+// prompt has been answered, pinning the input row again when it can.
 func EndPromptInput() {
 	consoleMu.Lock()
-	defer consoleMu.Unlock()
-	if activeReader != nil && activeReader.reading {
-		activeReader.eraseLineLocked()
+	lr := activeReader
+	if lr != nil && lr.reading {
+		lr.eraseLineLocked()
 	}
 	streamingActive = true
+	canPin := !pinned && lr != nil && lr.reading && pinEnabled()
+	consoleMu.Unlock()
+	if canPin {
+		pinAtCursor(false)
+	}
 }
 
 func EndOutput() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
+	unpinLocked()
 	streamingActive = false
 	streamMidLine = false
 	printOutputLocked("\r\n", false)
@@ -333,6 +390,7 @@ func (lr *LineReader) editLine() (string, error) {
 	var buf []rune
 	cursor := 0
 	lr.redraw(buf, cursor)
+	pinIfStreaming()
 
 	for {
 		r, err := readInputRune(lr.rawReader)
@@ -372,9 +430,18 @@ func (lr *LineReader) editLine() (string, error) {
 			consoleMu.Lock()
 			lr.eraseLineLocked()
 			// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容。
-			// 但在流式输出进行中（盲打补充输入）时不要回显，否则会把提示符+内容插进流式文本里造成错乱。
-			if !streamingActive {
+			// 流式输出进行中：输入行钉在底部时，把内容回显到上方的输出流里（先另起一行，
+			// 不接在模型未完成的句子后面），让排队的指令在记录里可见；没有钉住时不回显，
+			// 否则会把提示符+内容插进流式文本里造成错乱。
+			switch {
+			case !streamingActive:
 				fmt.Print(lr.prompt + normalizeOutputNewlines(line) + "\r\n")
+			case pinned && line != "":
+				// An empty Enter is ignored by the main loop, so it leaves
+				// no trace here either; it used to print a bare prompt row
+				// into the model's output at every press.
+				breakStreamLineLocked()
+				fmt.Print(PromptRunning() + normalizeOutputNewlines(line) + "\r\n")
 			}
 			consoleMu.Unlock()
 
@@ -492,7 +559,8 @@ func runeCellWidth(r rune) int {
 	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) {
 		return 0
 	}
-	if (r >= 0x1100 && r <= 0x115F) ||
+	if r == 0x26A1 || // ⚡, East Asian Wide; the running prompt uses it
+		(r >= 0x1100 && r <= 0x115F) ||
 		(r >= 0x2329 && r <= 0x232A) ||
 		(r >= 0x2E80 && r <= 0xA4CF) ||
 		(r >= 0xAC00 && r <= 0xD7A3) ||
@@ -647,6 +715,21 @@ func readCSI(r *bufio.Reader) (params string, final rune, err error) {
 	}
 }
 
+// parseCursorReport reads the "row;col" parameters of a cursor position
+// report. A missing column is column 1.
+func parseCursorReport(params string) (cursorPos, bool) {
+	rowS, colS, _ := strings.Cut(params, ";")
+	row := csiKey(rowS)
+	if row < 1 {
+		return cursorPos{}, false
+	}
+	col := csiKey(colS)
+	if col < 1 {
+		col = 1
+	}
+	return cursorPos{row: row, col: col}, true
+}
+
 // csiKey returns the first numeric parameter of a sequence ("1;5" -> 1), or
 // -1 when there is none.
 func csiKey(params string) int {
@@ -669,6 +752,15 @@ func csiKey(params string) int {
 // than typing ";5D". Keys the editor has no use for do nothing.
 func (lr *LineReader) applyKey(buf *[]rune, cursor *int, params string, final rune) {
 	switch final {
+	case 'R':
+		// CSI row ; col R is the terminal's cursor position report, the
+		// answer to queryCursorPos; SS3 R (F3) has no parameters.
+		if pos, ok := parseCursorReport(params); ok {
+			select {
+			case cprCh <- pos:
+			default:
+			}
+		}
 	case 'A':
 		lr.historyUp(buf, cursor)
 	case 'B':
@@ -757,8 +849,9 @@ func (lr *LineReader) redraw(buf []rune, cursor int) {
 }
 
 func (lr *LineReader) eraseLineLocked() {
-	// While streaming, the input line is never drawn, so the current terminal
-	// line holds streamed output; erasing it would corrupt the stream.
+	// While streaming, the input line is not on the current terminal line
+	// (it is off screen or pinned to the last row), so that line holds
+	// streamed output; erasing it would corrupt the stream.
 	if streamingActive {
 		lr.lineDrawn = false
 		return
@@ -771,6 +864,9 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	lr.renderBuf = append(lr.renderBuf[:0], buf...)
 	lr.renderCursor = cursor
 	if streamingActive {
+		if pinned {
+			lr.drawPinnedLocked()
+		}
 		return
 	}
 	// Draw on the current line.

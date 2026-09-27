@@ -10,13 +10,15 @@ import (
 var persistMu sync.Mutex
 
 // PersistedRuleID is the policies.json ID of an allow rule granted from the
-// prompt, e.g. "allow-bash-git commit", "allow-write",
+// prompt, e.g. "allow-bash-git commit", "allow-bash-group-git", "allow-write",
 // "allow-mcp-github-create_issue" (InputEquals values in key order).
 func PersistedRuleID(rule Rule) string {
 	id := "allow-" + rule.ToolPattern
 	switch {
 	case rule.CommandPrefix != "":
 		id += "-" + rule.CommandPrefix
+	case rule.CommandGroup != "":
+		id += "-group-" + rule.CommandGroup
 	case len(rule.InputEquals) > 0:
 		keys := make([]string, 0, len(rule.InputEquals))
 		for k := range rule.InputEquals {
@@ -57,6 +59,7 @@ next:
 			Action:        ActionAllow,
 			Enabled:       true,
 			CommandPrefix: rule.CommandPrefix,
+			CommandGroup:  rule.CommandGroup,
 			InputEquals:   rule.InputEquals,
 			Scope:         scope,
 		}

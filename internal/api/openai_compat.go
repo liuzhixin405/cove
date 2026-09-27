@@ -29,6 +29,14 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 		cfg.BaseURL = DefaultBaseURL(cfg.Name)
 	}
 	transport := defaultHTTPTransport()
+	clientTimeout := 180 * time.Second
+	if IsLocalBaseURL(cfg.BaseURL) {
+		// A local server prefilling a long prompt can take minutes before
+		// its first byte; the compaction summary call used to time out at
+		// the cloud-sized 180s and the history was truncated instead.
+		transport = localHTTPTransport()
+		clientTimeout = localClientTimeout
+	}
 	var pool *KeyPool
 	if len(cfg.APIKeys) > 1 {
 		pool = NewKeyPool(cfg.APIKeys)
@@ -41,7 +49,7 @@ func newOpenAICompatProvider(cfg ProviderConfig) *openAICompatProvider {
 		keyPool: pool,
 		baseURL: normalizeOpenAIBaseURL(cfg.BaseURL),
 		client: &http.Client{
-			Timeout:   180 * time.Second,
+			Timeout:   clientTimeout,
 			Transport: transport,
 		},
 		// Streaming client: no global Timeout so reading SSE body won't be killed

@@ -1,6 +1,9 @@
 package api
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 // contextWindowPattern maps a case-insensitive substring of a model name to
 // its approximate context window size, in tokens. These are deliberately
@@ -56,11 +59,66 @@ var contextWindowPatterns = []contextWindowPattern{
 // history sooner rather than risking an over-budget request.
 const defaultContextWindow = 32000
 
+// contextOverrides holds windows learned or configured for a model this
+// session (SetModelContextWindow), keyed by lower-cased name. They beat the
+// name-based guesses: a local server answering with its n_ctx knows better
+// than a substring table.
+var (
+	contextOverridesMu sync.RWMutex
+	contextOverrides   = map[string]int{}
+)
+
+// SetModelContextWindow records model's real context window for this
+// session; tokens <= 0 removes the record.
+func SetModelContextWindow(model string, tokens int) {
+	key := strings.ToLower(strings.TrimSpace(model))
+	contextOverridesMu.Lock()
+	defer contextOverridesMu.Unlock()
+	if tokens <= 0 {
+		delete(contextOverrides, key)
+		return
+	}
+	contextOverrides[key] = tokens
+}
+
+// ClearModelContextWindows forgets every SetModelContextWindow record.
+func ClearModelContextWindows() {
+	contextOverridesMu.Lock()
+	defer contextOverridesMu.Unlock()
+	contextOverrides = map[string]int{}
+}
+
+// ContextWindowKnown reports whether model's window is known (set this
+// session or matched by name) rather than the defaultContextWindow guess.
+// Decisions that cut capability for small windows (fewer tools) act only on
+// a known window; the guess is not evidence.
+func ContextWindowKnown(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	contextOverridesMu.RLock()
+	_, ok := contextOverrides[lower]
+	contextOverridesMu.RUnlock()
+	if ok {
+		return true
+	}
+	for _, p := range contextWindowPatterns {
+		if strings.Contains(lower, p.pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // ContextWindowForModel returns an approximate context window size (in
-// tokens) for the given model name, based on substring matching against
-// known model families.
+// tokens) for the given model name: a window set for it this session, else
+// a substring match against known model families, else defaultContextWindow.
 func ContextWindowForModel(model string) int {
-	lower := strings.ToLower(model)
+	lower := strings.ToLower(strings.TrimSpace(model))
+	contextOverridesMu.RLock()
+	w, ok := contextOverrides[lower]
+	contextOverridesMu.RUnlock()
+	if ok {
+		return w
+	}
 	for _, p := range contextWindowPatterns {
 		if strings.Contains(lower, p.pattern) {
 			return p.window

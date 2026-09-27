@@ -3,8 +3,10 @@ package diagnostic
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -23,7 +25,14 @@ type RuntimeEvent struct {
 	Severity Severity  `json:"severity"`
 	Category Category  `json:"category"`
 	Message  string    `json:"message"`
-	Code     ErrorCode `json:"code,omitempty"` // set when matched to a known error
+	Code     ErrorCode `json:"code,omitempty"` // set when classified
+	// Model, Provider and Tool are the call's context when known.
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Tool     string `json:"tool,omitempty"`
+	// Source says how the event was made: "report" (a classified error),
+	// "remedy" (what a remedy did), "log" (a Warn/Error log line).
+	Source string `json:"source,omitempty"`
 }
 
 const maxRuntimeEvents = 200
@@ -72,18 +81,15 @@ func resolveRuntimeLogPath() {
 	runtimePath = filepath.Join(dir, "errors.log")
 }
 
-// RecordRuntime captures a runtime problem: it is appended to the in-memory
-// ring buffer and to the persistent log file. The message is matched against
-// the known-error catalogue so fixable problems can be surfaced later.
+// RecordRuntime captures a free-form runtime problem (a Warn/Error log line)
+// in memory and in the persistent log. It is uncoded: codes come from
+// Report, which classifies the error itself instead of guessing from text.
 func RecordRuntime(sev Severity, cat Category, message string) {
-	ev := RuntimeEvent{
-		Time:     time.Now(),
-		Severity: sev,
-		Category: cat,
-		Message:  message,
-		Code:     matchKnownCode(cat, message),
-	}
+	record(RuntimeEvent{Time: time.Now(), Severity: sev, Category: cat, Message: message, Source: "log"})
+}
 
+// record appends ev to the ring buffer and the persistent log.
+func record(ev RuntimeEvent) {
 	runtimeMu.Lock()
 	runtimeEvents = append(runtimeEvents, ev)
 	if len(runtimeEvents) > maxRuntimeEvents {
@@ -127,22 +133,6 @@ func AttachToLogger() {
 	})
 }
 
-// matchKnownCode does a best-effort match of a free-form message to a known
-// error definition by scanning category-matching defs for keyword overlap.
-func matchKnownCode(cat Category, message string) ErrorCode {
-	msg := strings.ToLower(message)
-	for code, def := range registry {
-		if def.Category != cat {
-			continue
-		}
-		key := strings.ToLower(def.Message)
-		if key != "" && strings.Contains(msg, key) {
-			return code
-		}
-	}
-	return ""
-}
-
 // RecentRuntime returns a copy of the recorded runtime events, newest last.
 func RecentRuntime() []RuntimeEvent {
 	runtimeMu.Lock()
@@ -164,56 +154,95 @@ func LoadRuntimeLog() []RuntimeEvent {
 		return nil
 	}
 	defer func() { _ = f.Close() }()
+	return parseRuntimeLog(f)
+}
+
+// parseRuntimeLog reads JSON-lines events from r. A line that is not an
+// event, or is too long to be one, is skipped and reading goes on: a
+// bufio.Scanner used to stop at the first oversized line and every event
+// after it was lost.
+func parseRuntimeLog(r io.Reader) []RuntimeEvent {
 	var events []RuntimeEvent
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		var ev RuntimeEvent
-		if json.Unmarshal(sc.Bytes(), &ev) == nil {
-			events = append(events, ev)
-		}
-	}
-	return events
-}
-
-// RuntimeSummary groups recent runtime events and pairs each recurring problem
-// with a fix suggestion drawn from the known-error catalogue. It is used by the
-// self-check reminder ("提醒要修复") so users see actionable next steps.
-type RuntimeSummary struct {
-	Message  string
-	Count    int
-	Severity Severity
-	Recovery string // fix hint if the problem matched a known auto/manual fix
-	Fixable  bool   // a known auto-fix exists for this problem
-}
-
-// SummarizeRuntime aggregates the given events by message and attaches recovery
-// hints, ordered by severity then frequency (most actionable first).
-func SummarizeRuntime(events []RuntimeEvent) []RuntimeSummary {
-	type agg struct {
-		sum RuntimeSummary
-	}
-	byMsg := map[string]*agg{}
-	for _, ev := range events {
-		a, ok := byMsg[ev.Message]
-		if !ok {
-			a = &agg{sum: RuntimeSummary{Message: ev.Message, Severity: ev.Severity}}
-			if ev.Code != "" {
-				if def := registry[ev.Code]; def != nil {
-					a.sum.Recovery = def.Recovery
-					a.sum.Fixable = def.AutoFixable
-				}
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 && len(line) <= maxRuntimeLogBytes {
+			var ev RuntimeEvent
+			if json.Unmarshal(line, &ev) == nil && !ev.Time.IsZero() {
+				events = append(events, ev)
 			}
-			byMsg[ev.Message] = a
 		}
-		a.sum.Count++
-		if ev.Severity > a.sum.Severity {
-			a.sum.Severity = ev.Severity
+		if err != nil {
+			return events
 		}
 	}
-	out := make([]RuntimeSummary, 0, len(byMsg))
-	for _, a := range byMsg {
-		out = append(out, a.sum)
+}
+
+// RuntimeSummary is one line of /diagnose errors: a coded problem for one
+// model (or an uncoded message), how often and how recently it happened,
+// the catalogue's hint, and what a remedy did about it.
+type RuntimeSummary struct {
+	Code      ErrorCode
+	Message   string // the catalogue title when coded, else the normalised text
+	Model     string
+	Count     int
+	Last      time.Time
+	Severity  Severity
+	Recovery  string
+	Applied   []string // remedy results, oldest first
+	Detail    string   // the latest event's own text (coded entries)
+	HasRemedy bool
+}
+
+// SummarizeRuntime aggregates events for display: coded events by code and
+// model, whatever their numbers say; uncoded ones by their text with
+// numbers and paths blanked, so one problem is one line. Recovered events
+// attach to the entry of the same code and model. Ordered by severity then
+// frequency; an entry that only holds remedy results sorts first, since
+// SevRecovered is the highest value.
+func SummarizeRuntime(events []RuntimeEvent) []RuntimeSummary {
+	byKey := map[string]*RuntimeSummary{}
+	var order []string
+	get := func(key string, ev RuntimeEvent) *RuntimeSummary {
+		s, ok := byKey[key]
+		if !ok {
+			s = &RuntimeSummary{Code: ev.Code, Model: ev.Model, Severity: SevInfo}
+			if ev.Severity != SevRecovered {
+				s.Severity = ev.Severity
+			}
+			if def := registry[ev.Code]; ev.Code != "" && def != nil {
+				s.Message, s.Recovery, s.HasRemedy = def.Message, def.Recovery, def.Remedy != nil
+			} else {
+				s.Message = normaliseMessage(ev.Message)
+			}
+			byKey[key] = s
+			order = append(order, key)
+		}
+		return s
+	}
+	for _, ev := range events {
+		key := string(ev.Code) + "|" + ev.Model
+		if ev.Code == "" {
+			key = "|" + normaliseMessage(ev.Message)
+		}
+		s := get(key, ev)
+		if ev.Severity == SevRecovered {
+			s.Applied = append(s.Applied, ev.Message)
+			continue
+		}
+		s.Count++
+		if ev.Time.After(s.Last) {
+			s.Last, s.Detail = ev.Time, ev.Message
+		}
+		if ev.Severity > s.Severity {
+			s.Severity = ev.Severity
+		}
+	}
+	out := make([]RuntimeSummary, 0, len(order))
+	for _, k := range order {
+		if s := byKey[k]; s.Count > 0 || len(s.Applied) > 0 {
+			out = append(out, *s)
+		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Severity != out[j].Severity {
@@ -221,6 +250,48 @@ func SummarizeRuntime(events []RuntimeEvent) []RuntimeSummary {
 		}
 		return out[i].Count > out[j].Count
 	})
+	return out
+}
+
+var (
+	// pathRe matches a file path: a drive or root followed by at least one
+	// separator-delimited segment, ASCII path characters only, so the
+	// Chinese words glued to a path's end survive and "/diagnose" (one
+	// segment, no separator) is not a path.
+	pathRe = regexp.MustCompile(`(?:[A-Za-z]:\\|/|\\\\)[A-Za-z0-9_.~-]+(?:[\\/][A-Za-z0-9_.~-]+)+`)
+	// countRe matches the numbers that vary between occurrences of one
+	// problem: long ones (token counts, byte sizes, ids) and any number
+	// followed by a unit; three-digit HTTP statuses and version digits stay.
+	countRe = regexp.MustCompile(`\d{4,}|\d+(?:\.\d+)?\s*(?:tokens?|bytes?|ms|s|秒|次|条|行|个|times?|KB|MB|GB)\b`)
+)
+
+// normaliseMessage blanks the parts of a free-form message that differ
+// between occurrences of one problem: paths, then counts.
+func normaliseMessage(s string) string {
+	s = pathRe.ReplaceAllString(s, "#")
+	s = countRe.ReplaceAllString(s, "#")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// MergeEvents joins the persisted log's events with this session's, once
+// each (an event this session wrote is in both), in time order.
+func MergeEvents(logged, inMemory []RuntimeEvent) []RuntimeEvent {
+	seen := map[string]bool{}
+	key := func(ev RuntimeEvent) string {
+		return ev.Time.Format(time.RFC3339Nano) + "|" + string(ev.Code) + "|" + ev.Message
+	}
+	out := make([]RuntimeEvent, 0, len(logged)+len(inMemory))
+	for _, list := range [][]RuntimeEvent{logged, inMemory} {
+		for _, ev := range list {
+			k := key(ev)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, ev)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	return out
 }
 
@@ -266,4 +337,33 @@ func ArchiveRuntimeLog() (string, error) {
 	runtimeEvents = nil
 	runtimeMu.Unlock()
 	return dest, nil
+}
+
+// UnresolvedFromLog counts, in the persisted log, the coded problems of
+// severity ERROR or worse that have a hint; the start-up hint points at
+// /diagnose errors when it is not 0. A remedy's result does not settle a
+// problem here: remedies act for one session (a learned window is gone at
+// the next start), so what they fixed is exactly what the person still has
+// to make permanent.
+func UnresolvedFromLog() int { return unresolvedIn(LoadRuntimeLog()) }
+
+func unresolvedIn(events []RuntimeEvent) int {
+	type key struct {
+		code  ErrorCode
+		model string
+	}
+	open := map[key]bool{}
+	for _, ev := range events {
+		if ev.Code == "" {
+			continue
+		}
+		k := key{ev.Code, ev.Model}
+		// SevRecovered sorts above SevFatal, so it is excluded explicitly.
+		if ev.Severity >= SevError && ev.Severity != SevRecovered {
+			if def := registry[ev.Code]; def != nil && def.Recovery != "" {
+				open[k] = true
+			}
+		}
+	}
+	return len(open)
 }

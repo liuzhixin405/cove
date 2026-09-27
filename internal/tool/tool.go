@@ -40,6 +40,10 @@ type Context struct {
 	// long-running tool (e.g. bash/powershell) executes. It lets the UI show
 	// live output and lets the stall monitor know the tool is still alive.
 	OnProgress func(chunk string)
+	// SetWaiting, when set, tells the engine the tool is waiting on the
+	// person (the question tool at AskUser), so the stall monitor does not
+	// call the wait a hang. Call it with true before waiting, false after.
+	SetWaiting func(waiting bool)
 }
 
 type Runtime struct {

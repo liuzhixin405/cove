@@ -557,6 +557,42 @@ func (s *Store) Prune(keep int, protect ...string) (int, error) {
 	return removed, errors.Join(errs...)
 }
 
+// Delete removes the session id from disk (its .jsonl and any legacy .json)
+// and from index.json. It reports fs.ErrNotExist when no such session is
+// stored, so a caller counting deletions does not count a miss.
+func (s *Store) Delete(id string) error {
+	key := fileKey(id)
+	if strings.TrimSpace(key) == "" || key == "." {
+		return fmt.Errorf("delete session: %w", fs.ErrNotExist)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	var errs []error
+	for _, name := range []string{key + jsonlExt, key + legacyExt} {
+		err := os.Remove(filepath.Join(s.dir, name))
+		switch {
+		case err == nil:
+			found = true
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	delete(s.persisted, key)
+	if err := s.updateIndex(func(idx *indexFile) { delete(idx.Sessions, key) }); err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("delete session %s: %w", id, fs.ErrNotExist)
+	}
+	return nil
+}
+
 // projectGroup is the per-project prune bucket for a session directory: the
 // key of its repository root (memory.ProjectRoot), as the per-project memory
 // directory uses, so sessions started in subdirectories of one repository

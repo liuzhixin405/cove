@@ -7,8 +7,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove/internal/diagnostic"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/repl"
@@ -24,6 +26,9 @@ type replTaskRunner struct {
 	pendingFailedMsg *api.Message
 	current          api.Message
 	currentStart     time.Time
+	// closing is set by CancelForExit: the program is leaving, so a task
+	// that ends now neither reclaims its steer nor starts the next one.
+	closing bool
 }
 
 // TaskSnapshot is a read-only view of the runner state for /tasks.
@@ -33,6 +38,9 @@ type TaskSnapshot struct {
 	Elapsed      time.Duration
 	Queued       []string
 	PendingRetry string
+	// PendingSteer previews guidance steered into the running task that its
+	// next model call has not picked up yet.
+	PendingSteer string
 }
 
 func taskPreview(msg api.Message) string {
@@ -56,6 +64,10 @@ func (r *replTaskRunner) Snapshot() TaskSnapshot {
 	if r.running {
 		snap.Current = taskPreview(r.current)
 		snap.Elapsed = time.Since(r.currentStart)
+		if r.eng != nil {
+			text, _ := r.eng.PendingSteer()
+			snap.PendingSteer = taskPreview(api.Message{Content: text})
+		}
 	}
 	for _, m := range r.queue {
 		snap.Queued = append(snap.Queued, taskPreview(m))
@@ -80,6 +92,12 @@ func canMergeQueuedTask(existing, incoming api.Message) bool {
 	}
 	if a == b {
 		return true
+	}
+	// A short input is not "the same task" as a long one that happens to
+	// contain it: "run" was merged into "run pytest and fix the failures"
+	// and dropped, while the feedback said it had been added.
+	if utf8.RuneCountInString(a) < minMergeRunes || utf8.RuneCountInString(b) < minMergeRunes {
+		return false
 	}
 	if strings.Contains(a, b) || strings.Contains(b, a) {
 		return true
@@ -145,6 +163,9 @@ func formatTaskSnapshot(s TaskSnapshot) string {
 	var sb strings.Builder
 	if s.Running {
 		fmt.Fprintf(&sb, "当前任务 (已运行 %s):\n  %s\n", s.Elapsed.Truncate(time.Second), s.Current)
+		if s.PendingSteer != "" {
+			fmt.Fprintf(&sb, "待生效指引: %s\n", s.PendingSteer)
+		}
 	} else {
 		sb.WriteString("当前没有运行中的任务\n")
 	}
@@ -166,7 +187,19 @@ func newREPLTaskRunner(eng *engine.Engine) *replTaskRunner {
 		queue: make([]api.Message, 0),
 	}
 	r.cond = sync.NewCond(&r.mu)
+	if eng != nil {
+		eng.OnSteerConsumed = r.steerConsumed
+	}
 	return r
+}
+
+// steerConsumed runs on the task goroutine when the engine hands steered
+// guidance to the model. The count shown on the pinned row is re-read from
+// the engine rather than zeroed, since a line steered between the engine's
+// drain and this call is still pending.
+func (r *replTaskRunner) steerConsumed() {
+	_, n := r.eng.PendingSteer()
+	repl.SetSteerCount(n)
 }
 
 func (r *replTaskRunner) IsRunning() bool {
@@ -186,6 +219,16 @@ func (r *replTaskRunner) CancelRunning() bool {
 	return running
 }
 
+// CancelForExit is CancelRunning for the exit path: guidance the cancelled
+// task had not consumed is dropped instead of becoming a new task, and
+// nothing queued starts, since the program is leaving.
+func (r *replTaskRunner) CancelForExit() bool {
+	r.mu.Lock()
+	r.closing = true
+	r.mu.Unlock()
+	return r.CancelRunning()
+}
+
 func (r *replTaskRunner) PendingFailed() *api.Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -198,15 +241,83 @@ func (r *replTaskRunner) ClearPendingFailed() {
 	r.pendingFailedMsg = nil
 }
 
+// Enqueue hands msg to the runner: it starts at once when nothing is
+// running, otherwise it joins the queue (merged into a similar queued task
+// when there is one). It returns the number of queued tasks ahead of it and
+// whether it was merged.
 func (r *replTaskRunner) Enqueue(msg api.Message) (int, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	queuedAhead, merged, _ := r.enqueueLocked(msg)
+	return queuedAhead, merged
+}
 
+// EnqueueWithFeedback is Enqueue plus the line to show the user for msg (see
+// enqueueFeedback): "" when it started right away, otherwise where it waits.
+// The decision is made inside the lock: an idle runner starts msg before
+// Enqueue returns, so asking IsRunning afterwards always answered "running"
+// and the line called the message just typed queued behind itself.
+func (r *replTaskRunner) EnqueueWithFeedback(msg api.Message) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return enqueueFeedback(r.enqueueLocked(msg))
+}
+
+// SubmitWithFeedback hands a typed message to the right place and returns
+// the line to show for it. While a task runs, plain text is steered into that
+// task (engine.Steer): the model sees it as guidance at its next call, the
+// way a correction typed mid-task is meant. It used to be queued as a new
+// task behind the running one, so "别改那个文件" only ran after the file had
+// been changed. Idle, or with attachments (which cannot travel as guidance
+// text), the message goes through Enqueue as before.
+func (r *replTaskRunner) SubmitWithFeedback(msg api.Message) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running && r.eng != nil && len(msg.Parts) == 0 && strings.TrimSpace(msg.Content) != "" {
+		r.eng.Steer(msg.Content)
+		_, n := r.eng.PendingSteer()
+		repl.SetSteerCount(n)
+		return steerFeedback
+	}
+	return enqueueFeedback(r.enqueueLocked(msg))
+}
+
+// reclaimSteerLocked moves guidance the finished task never consumed to the
+// front of the queue as a task of its own, and reports whether it did. The
+// user typed it for "now", so it goes ahead of anything queued earlier. It
+// does nothing while the program is leaving (CancelForExit). Callers hold
+// r.mu.
+func (r *replTaskRunner) reclaimSteerLocked() bool {
+	if r.eng == nil {
+		return false
+	}
+	steer := r.eng.TakePendingSteer()
+	repl.SetSteerCount(0)
+	if r.closing || strings.TrimSpace(steer) == "" {
+		return false
+	}
+	// On its own the guidance names nothing ("只要llama不要其他的" showed up
+	// in /history as a task and a draft), so the new request says which task
+	// it was meant for; r.current is still that task here.
+	content := steer
+	if prev := taskPreview(r.current); prev != "" {
+		content = steer + "\n\n（这是在上一个任务「" + prev + "」运行期间补充的指引，该任务已结束，请在它的结果基础上继续。）"
+	}
+	r.queue = append([]api.Message{{Role: "user", Content: content}}, r.queue...)
+	repl.SetQueuedCount(len(r.queue))
+	return true
+}
+
+// enqueueLocked is Enqueue's body. wasRunning reports that a task was
+// already running when msg arrived, so msg waits. Callers hold r.mu.
+func (r *replTaskRunner) enqueueLocked(msg api.Message) (queuedAhead int, merged, wasRunning bool) {
+	defer func() { repl.SetQueuedCount(len(r.queue)) }()
+	wasRunning = r.running
 	if r.running && len(r.queue) > 0 {
 		for i := len(r.queue) - 1; i >= 0; i-- {
 			if canMergeQueuedTask(r.queue[i], msg) {
 				r.queue[i] = mergeQueuedTask(r.queue[i], msg)
-				return i, true
+				return i, true, true
 			}
 		}
 	}
@@ -214,13 +325,10 @@ func (r *replTaskRunner) Enqueue(msg api.Message) (int, bool) {
 	r.queue = append(r.queue, msg)
 	queueSize := len(r.queue)
 	r.startNextLocked()
-	if r.running {
-		if queueSize > 0 {
-			return queueSize - 1, false
-		}
-		return 0, false
+	if wasRunning {
+		return queueSize - 1, false, true
 	}
-	return 0, false
+	return 0, false, false
 }
 
 func (r *replTaskRunner) WaitIdleUntil(deadline time.Time) bool {
@@ -243,11 +351,12 @@ func (r *replTaskRunner) WaitIdleUntil(deadline time.Time) bool {
 }
 
 func (r *replTaskRunner) startNextLocked() {
-	if r.running || len(r.queue) == 0 {
+	if r.running || r.closing || len(r.queue) == 0 {
 		return
 	}
 	msg := r.queue[0]
 	r.queue = r.queue[1:]
+	repl.SetQueuedCount(len(r.queue))
 	r.running = true
 	r.current = msg
 	r.currentStart = time.Now()
@@ -267,13 +376,28 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 			_ = saveInterruptedDraft(userMsg, fmt.Errorf("internal panic: %v", recovered))
 			r.finishLocked()
 			repl.PrintAbove(fmt.Sprintf("\r\n%s任务执行出现内部异常，已恢复输入。可输入“继续”重试。%s\r\n", repl.Red, repl.Reset))
+			if r.reclaimSteerLocked() {
+				repl.PrintAbove(steerReclaimedFeedback + "\r\n")
+			}
 			r.startNextLocked()
 			r.mu.Unlock()
 		}
 	}()
 
 	_, reqErr := runChatInteractionMessage(ctx, r.eng, userMsg)
+	r.afterRun(userMsg, reqErr)
+}
 
+// afterRun settles a finished task: the retry bookkeeping, what happens to
+// guidance the task never consumed, and the next task.
+//
+// Guidance is kept pending when the task failed or was cancelled: the
+// interrupted turn is what /continue resumes, and the guidance reaches the
+// model at that turn's first call. Starting it as a new task here used to
+// clear the interrupted turn and made the "/continue 可继续" hint printed a
+// moment earlier a lie. After a normal completion there is nothing to
+// continue, so the guidance runs as the next task.
+func (r *replTaskRunner) afterRun(userMsg api.Message, reqErr error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -288,17 +412,29 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 				repl.PrintAbove(hint + "\n")
 			}
 		}
+		if r.eng != nil {
+			if _, n := r.eng.PendingSteer(); n > 0 && !r.closing {
+				repl.PrintAbove(steerKeptFeedback + "\r\n")
+			}
+		}
 	} else {
 		r.pendingFailedMsg = nil
 		_ = clearInterruptedDraft()
+		// Guidance typed too late for this task (it completed before its
+		// next model call) runs as the next task instead of vanishing.
+		if r.reclaimSteerLocked() {
+			repl.PrintAbove(steerReclaimedFeedback + "\r\n")
+		}
 	}
-
 	r.finishLocked()
 	r.startNextLocked()
 }
 
 func (r *replTaskRunner) finishLocked() {
 	r.running = false
+	if r.cancel != nil {
+		r.cancel() // release the task's context; it used to leak one per task
+	}
 	r.cancel = nil
 	r.current = api.Message{}
 	r.currentStart = time.Time{}
@@ -310,6 +446,14 @@ func (r *replTaskRunner) finishLocked() {
 // still works too).
 const interruptedTaskHint = "输入 /continue 可从中断处继续刚才的任务。"
 
+// contextOverflowHint follows a task whose request did not fit the model's
+// context window even after the engine's compact-and-retry. The generic hint
+// left the user guessing whether /continue could possibly work; it can,
+// because the resumed turn compacts first, and when even that is not enough
+// the model's window itself has to grow.
+const contextOverflowHint = "上下文超出模型窗口。输入 /continue 会先压缩对话历史再重试；若仍失败，需要调大模型的上下文长度" +
+	"（llama-server 加 -c 65536、LM Studio 的 Context Length、Ollama 的 num_ctx），cove 的系统提示词和工具定义本身约占 13K token。"
+
 // taskErrorHint is the line shown after a task that ended with err. A turn
 // stopped at its limit gets none: the stop line already says /continue
 // resumes it (three hints in a row used to follow an "s").
@@ -318,5 +462,17 @@ func taskErrorHint(err error) string {
 	if errors.As(err, &le) {
 		return ""
 	}
-	return interruptedTaskHint
+	hint := interruptedTaskHint
+	if api.IsContextLengthError(err) {
+		hint = contextOverflowHint
+	}
+	// The same E-number /diagnose errors shows, so the two can be matched up.
+	if code, _ := diagnostic.Classify(err, diagnostic.Context{}); code != "" {
+		hint = "[" + string(code) + "] " + hint
+	}
+	return hint
 }
+
+// minMergeRunes is the shortest normalised message that may be merged into
+// a queued task by similarity rather than equality.
+const minMergeRunes = 8

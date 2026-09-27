@@ -164,9 +164,15 @@ func (e *Engine) turnRepoMapExcerpt(query string) string {
 	if len(terms) == 0 || root == "" {
 		return ""
 	}
+	// A task about another directory (a path outside this repository in
+	// the request) gets no excerpt of this one: it would only be noise,
+	// and in a small window expensive noise.
+	if queryTargetsOtherDirectory(query, root) {
+		return ""
+	}
 	const open = "<repo_map_excerpt>\nRepository map entries likely relevant to this request (path, symbols, :line). Call the repo_map tool for other parts of the code.\n"
 	const closing = "</repo_map_excerpt>"
-	body := repomap.Query(root, terms, repoMapExcerptMaxBytes-len(open)-len(closing))
+	body := repomap.Query(root, terms, repoMapExcerptBudget(e.config.Model)-len(open)-len(closing))
 	if body == "" {
 		return ""
 	}
@@ -373,7 +379,13 @@ func toolOutputLimit(toolName, model string) int {
 	if scale > maxOutputScale {
 		scale = maxOutputScale
 	}
-	return int(float64(limit) * scale)
+	limit = int(float64(limit) * scale)
+	// And down: on a small window one result may not take more than the
+	// window's tool result budget (window_budget.go).
+	if budget := toolResultBudgetTokens(model); limit > budget {
+		limit = budget
+	}
+	return limit
 }
 
 // ---------------------------------------------------------------------------

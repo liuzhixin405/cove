@@ -83,7 +83,7 @@ func TestPermanentAnswerAddsNoSessionCopy(t *testing.T) {
 	dir := t.TempDir()
 	m := permission.NewManager(permission.Default)
 	rules := &persistingRules{managerRules: managerRules{m}, scope: permission.ProjectRoot(dir)}
-	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "go test ./..."}, "p"); !allow {
+	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "pytest ./..."}, "p"); !allow {
 		t.Fatal("answer \"p\" must allow the current call")
 	}
 	if rules.added != 0 {
@@ -95,14 +95,14 @@ func TestPermanentAnswerAddsNoSessionCopy(t *testing.T) {
 func TestPermanentAnswerPersistFailureFallsBackToSessionRule(t *testing.T) {
 	m := permission.NewManager(permission.Default)
 	rules := &persistingRules{managerRules: managerRules{m}, scope: "/p", err: errors.New("disk full")}
-	allow, out := answerPrompt(t, rules, "bash", map[string]any{"command": "go test ./..."}, "p")
+	allow, out := answerPrompt(t, rules, "bash", map[string]any{"command": "pytest ./..."}, "p")
 	if !allow {
 		t.Fatal("answer \"p\" must allow the current call")
 	}
 	if rules.added != 1 {
 		t.Fatalf("session fallback rules added = %d, want 1", rules.added)
 	}
-	if d := checkCommand(m, "bash", "go test ./x"); d != permission.DAllow {
+	if d := checkCommand(m, "bash", "pytest ./x"); d != permission.DAllow {
 		t.Errorf("session fallback rule missing: %v", d)
 	}
 	if !strings.Contains(out, "未能写入，仅本次会话有效") || !strings.Contains(out, "disk full") {
@@ -120,21 +120,21 @@ func TestPermanentAnswerPersistsRuleForThisProject(t *testing.T) {
 	t.Chdir(dir)
 	m := permission.NewManager(permission.Default)
 	rules := &persistingRules{managerRules: managerRules{m}, scope: permission.ProjectRoot(dir)}
-	allow, out := answerPrompt(t, rules, "bash", map[string]any{"command": "go test ./..."}, "p")
+	allow, out := answerPrompt(t, rules, "bash", map[string]any{"command": "pytest ./..."}, "p")
 	if !allow {
 		t.Fatal("answer \"p\" must allow the current call")
 	}
-	if !strings.Contains(out, "[p] 永久允许") {
+	if !strings.Contains(out, "[p] 本项目记住") {
 		t.Errorf("prompt does not offer [p]:\n%s", out)
 	}
-	if !strings.Contains(out, "[a] 本次会话总是允许") || !strings.Contains(out, "[n] 拒绝") {
+	if !strings.Contains(out, "[a] 本会话记住") || !strings.Contains(out, "[n] 拒绝") {
 		t.Errorf("prompt lost the [a]/[n] options:\n%s", out)
 	}
-	if d := checkCommand(m, "bash", "go test -run X ./pkg"); d != permission.DAllow {
+	if d := checkCommand(m, "bash", "pytest -run X ./pkg"); d != permission.DAllow {
 		t.Errorf("session rule missing after \"p\": %v", d)
 	}
-	if len(rules.persisted) != 1 || rules.persisted[0].CommandPrefix != "go test" || rules.persisted[0].ToolPattern != "bash" {
-		t.Fatalf("persisted = %+v, want one bash/go test rule", rules.persisted)
+	if len(rules.persisted) != 1 || rules.persisted[0].CommandPrefix != "pytest" || rules.persisted[0].ToolPattern != "bash" {
+		t.Fatalf("persisted = %+v, want one bash/pytest rule", rules.persisted)
 	}
 	if want := permission.ProjectRoot(dir); !permission.SameProject(rules.scopes[0], want) {
 		t.Errorf("scope = %q, want project root %q", rules.scopes[0], want)
@@ -149,7 +149,7 @@ func TestPermanentAnswerNamesTheActualPoliciesFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	rules := &persistingRules{managerRules: managerRules{permission.NewManager(permission.Default)}, scope: permission.ProjectRoot(dir)}
-	_, out := answerPrompt(t, rules, "bash", map[string]any{"command": "go test ./..."}, "p")
+	_, out := answerPrompt(t, rules, "bash", map[string]any{"command": "pytest ./..."}, "p")
 	if want := filepath.Join(cfgDir, "policies.json"); !strings.Contains(out, want) {
 		t.Fatalf("confirmation does not name %s:\n%s", want, out)
 	}
@@ -162,15 +162,15 @@ func TestPermanentAnswerNamesTheActualPoliciesFile(t *testing.T) {
 // once or for the session; nothing is written.
 func TestPermanentAnswerWithoutPersisterFallsBackToSession(t *testing.T) {
 	m := permission.NewManager(permission.Default)
-	allow, _ := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "go test ./..."}, "p")
+	allow, _ := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "pytest ./..."}, "p")
 	if !allow {
 		t.Fatal("answer \"p\" must allow the current call")
 	}
-	if d := checkCommand(m, "bash", "go test ./x"); d != permission.DAllow {
+	if d := checkCommand(m, "bash", "pytest ./x"); d != permission.DAllow {
 		t.Errorf("session rule missing: %v", d)
 	}
 	rules := &persistingRules{managerRules: managerRules{permission.NewManager(permission.Default)}}
-	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "sudo go test"}, "p"); !allow {
+	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "sudo pytest"}, "p"); !allow {
 		t.Fatal("\"p\" on an unscopable command must still allow once")
 	}
 	if len(rules.persisted) != 0 {
@@ -292,6 +292,27 @@ type managerRules struct{ *permission.Manager }
 
 func (m managerRules) AddPermissionRule(d permission.Decision, r permission.Rule) { m.AddRule(d, r) }
 
+func (m managerRules) ExplainPermissionGap(tool string, input map[string]any) string {
+	return m.ExplainUncovered(tool, input)
+}
+
+// A prompt for a line the remembered rules do not cover says why, so the
+// person sees the cause rather than "asked again".
+func TestPromptExplainsWhyRememberedRulesDidNotApply(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	m.SetShellKind(permission.ShellPOSIX)
+	m.AddRule(permission.DAllow, permission.Rule{ToolPattern: "bash", CommandPrefix: "mkdir"})
+	_, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "mkdir a && dotnet new sln"}, "n")
+	if !strings.Contains(out, "未覆盖这一行") || !strings.Contains(out, "dotnet new") {
+		t.Fatalf("prompt does not explain the gap:\n%s", out)
+	}
+	fresh := permission.NewManager(permission.Default)
+	_, out = answerPrompt(t, managerRules{fresh}, "bash", map[string]any{"command": "rm -rf build"}, "n")
+	if strings.Contains(out, "未覆盖") {
+		t.Fatalf("nothing remembered, yet an explanation was shown:\n%s", out)
+	}
+}
+
 // answerPrompt runs one prompt for toolName/input, answers it and returns the
 // decision together with everything the prompt printed.
 func answerPrompt(t *testing.T, rules permissionRuleAdder, toolName string, input map[string]any, answer string) (bool, string) {
@@ -328,20 +349,24 @@ func checkCommand(m *permission.Manager, tool, cmd string) permission.Decision {
 // without a prompt.
 func TestAlwaysAnswerScopesShellToolsToCommandPrefix(t *testing.T) {
 	m := permission.NewManager(permission.Default)
-	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "go test ./..."}, "a")
+	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "pytest ./..."}, "a")
 	if !allow {
 		t.Fatal("answer \"a\" must allow the current call")
 	}
-	if !strings.Contains(out, `"go test" 开头的命令`) {
+	if !strings.Contains(out, `记住范围: bash 中 "pytest" 开头的命令`) {
 		t.Errorf("prompt output does not name the remembered prefix:\n%s", out)
 	}
-
-	if d := checkCommand(m, "bash", "go test -run TestX ./pkg"); d != permission.DAllow {
-		t.Errorf("later go test = %v, want allow", d)
+	// The scope is stated once, below the options, not inside them.
+	if strings.Contains(out, `[a] 本会话记住 "pytest"`) || strings.Contains(out, `[p] 本项目记住 "pytest"`) {
+		t.Errorf("options repeat the scope:\n%s", out)
 	}
-	for _, cmd := range []string{"rm -rf src", "go test ./... && rm -rf x", "sudo go test"} {
+
+	if d := checkCommand(m, "bash", "pytest -run TestX ./pkg"); d != permission.DAllow {
+		t.Errorf("later pytest = %v, want allow", d)
+	}
+	for _, cmd := range []string{"rm -rf src", "pytest ./... && rm -rf x", "sudo pytest"} {
 		if d := checkCommand(m, "bash", cmd); d != permission.DAsk {
-			t.Errorf("%q after allowing go test = %v, want ask", cmd, d)
+			t.Errorf("%q after allowing pytest = %v, want ask", cmd, d)
 		}
 	}
 }
@@ -361,18 +386,59 @@ func TestAlwaysAnswerKeepsWholeToolScopeForOtherTools(t *testing.T) {
 // remembered, and the prompt says so instead of offering a scope it lacks.
 func TestAlwaysAnswerForUnscopableCommandAllowsOnlyOnce(t *testing.T) {
 	m := permission.NewManager(permission.Default)
-	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "sudo go test"}, "a")
+	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "sudo pytest"}, "a")
 	if !allow {
 		t.Fatal("answer \"a\" must still allow the current call")
 	}
-	if strings.Contains(out, "总是允许") {
+	if strings.Contains(out, "记住范围") || strings.Contains(out, "[a]") {
 		t.Errorf("prompt offered an always-allow scope for an unscopable command:\n%s", out)
 	}
-	if d := checkCommand(m, "bash", "sudo go test"); d != permission.DAsk {
-		t.Errorf("sudo go test after \"a\" = %v, want ask", d)
+	if d := checkCommand(m, "bash", "sudo pytest"); d != permission.DAsk {
+		t.Errorf("sudo pytest after \"a\" = %v, want ask", d)
 	}
 	if d := checkCommand(m, "bash", "ls"); d != permission.DAsk {
-		t.Errorf("ls after \"a\" on sudo go test = %v, want ask", d)
+		t.Errorf("ls after \"a\" on sudo pytest = %v, want ask", d)
+	}
+}
+
+// A routine git write is remembered as the git group, and the read-only
+// companions the model chains around it (cd, echo, git log) are not listed:
+// the transcript this came from offered `"cd"、"git push"、"echo"、"git
+// log"、"git status" 开头的命令` for a line whose only question was the push.
+func TestAlwaysAnswerRemembersGitRoutineGroup(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	m.SetShellKind(permission.ShellPOSIX)
+	cmd := `cd G:/x && git push && echo "=== push done ===" && git log --oneline -2 && git status --short`
+	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": cmd}, "a")
+	if !allow {
+		t.Fatal("answer \"a\" must allow the current call")
+	}
+	if !strings.Contains(out, "记住范围: bash 中 git 常规操作") {
+		t.Errorf("prompt does not offer the git group:\n%s", out)
+	}
+	for _, noise := range []string{`"cd"`, `"echo"`, `"git log"`, `"git status"`, `"git push"`} {
+		if strings.Contains(out, noise) {
+			t.Errorf("prompt lists %s although it needs no approval:\n%s", noise, out)
+		}
+	}
+	for _, later := range []string{"git add -A && git commit -m x", "git push --set-upstream origin main", "cd G:/x && git remote -v && git pull"} {
+		if d := checkCommand(m, "bash", later); d != permission.DAllow {
+			t.Errorf("%q after remembering the git group = %v, want allow", later, d)
+		}
+	}
+	for _, still := range []string{"git push --force", "git reset --hard", "rm -rf x"} {
+		if d := checkCommand(m, "bash", still); d != permission.DAsk {
+			t.Errorf("%q after remembering the git group = %v, want ask", still, d)
+		}
+	}
+}
+
+// Whole-tool rules say what they cover too.
+func TestAlwaysAnswerNamesWholeToolScope(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	_, out := answerPrompt(t, managerRules{m}, "write", map[string]any{"file_path": "a.go"}, "a")
+	if !strings.Contains(out, "记住范围: 工具 write 的所有调用") {
+		t.Errorf("whole-tool scope not stated:\n%s", out)
 	}
 }
 
@@ -396,7 +462,7 @@ func waitForPermInputCh(t *testing.T) chan<- string {
 func TestPermanentAnswerPersistsAllPrefixesInOneCall(t *testing.T) {
 	m := permission.NewManager(permission.Default)
 	rules := &persistingRules{managerRules: managerRules{m}, scope: "/engine/project"}
-	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "go test ./... | tee out.txt"}, "p"); !allow {
+	if allow, _ := answerPrompt(t, rules, "bash", map[string]any{"command": "pytest ./... | tee out.txt"}, "p"); !allow {
 		t.Fatal("answer \"p\" must allow the call")
 	}
 	if rules.calls != 1 || len(rules.persisted) != 2 {

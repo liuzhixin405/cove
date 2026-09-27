@@ -7,6 +7,15 @@ import (
 	"strings"
 )
 
+// outsideWorkingDirectoryError is the refusal for a path outside root. The
+// first line is what the engine parses (window_shrink.go, outsideDirRe) to
+// tell the user; the second tells the model what to do instead of trying
+// the same path through bash or powershell, which is what a real session
+// spent 90 minutes on.
+func outsideWorkingDirectoryError(path, root string) error {
+	return fmt.Errorf("path outside working directory: %s\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it.", path, root)
+}
+
 func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) {
 	if !filepath.IsAbs(path) && tctx.Cwd != "" {
 		path = filepath.Join(tctx.Cwd, path)
@@ -52,7 +61,7 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 			// else on the machine is not the cwd, and symlinks/junctions into the
 			// cwd were already resolved by EvalSymlinks above, so a legitimate
 			// in-project path can never land here.
-			return "", fmt.Errorf("path on different drive: %s (cwd is on %s)", path, volRoot)
+			return "", fmt.Errorf("path on different drive: %s (cwd is on %s)\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it.", path, volRoot, root)
 		}
 		// Same drive but Rel still failed; try case-insensitive prefix matching.
 		lowerRoot := strings.ToLower(filepath.Clean(root))
@@ -60,10 +69,10 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 		if strings.HasPrefix(lowerPath, lowerRoot+string(os.PathSeparator)) || lowerPath == lowerRoot {
 			return path, nil
 		}
-		return "", fmt.Errorf("path outside working directory: %s", path)
+		return "", outsideWorkingDirectoryError(path, root)
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("path outside working directory: %s", path)
+		return "", outsideWorkingDirectoryError(path, root)
 	}
 	return path, nil
 }

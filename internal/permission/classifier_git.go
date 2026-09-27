@@ -15,28 +15,38 @@ var gitReadOnly = map[string]bool{
 	"version": true, "show-branch": true,
 }
 
-// classifyGit rates a git invocation by its subcommand. Only -C <dir>,
-// --no-pager, -P and --no-optional-locks may come before it; -c (and any
-// other global option) can set config such as core.fsmonitor or core.pager
-// that runs arbitrary programs, so it is CatUnknown.
-func (c *Classifier) classifyGit(args []string) CmdCategory {
+// gitSubcommand splits a git invocation's arguments into the subcommand and
+// what follows it. Only -C <dir>, --no-pager, -P and --no-optional-locks may
+// come before the subcommand; ok is false for any other global option (-c can
+// set config such as core.fsmonitor or core.pager that runs arbitrary
+// programs) and when no subcommand is left.
+func gitSubcommand(args []string) (sub string, rest []string, ok bool) {
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
 		switch args[0] {
 		case "-C":
 			if len(args) < 2 {
-				return CatUnknown
+				return "", nil, false
 			}
 			args = args[2:]
 		case "--no-pager", "-P", "--no-optional-locks":
 			args = args[1:]
 		default:
-			return CatUnknown
+			return "", nil, false
 		}
 	}
 	if len(args) == 0 {
+		return "", nil, false
+	}
+	return args[0], args[1:], true
+}
+
+// classifyGit rates a git invocation by its subcommand; see gitSubcommand
+// for the global options it tolerates.
+func (c *Classifier) classifyGit(args []string) CmdCategory {
+	sub, rest, ok := gitSubcommand(args)
+	if !ok {
 		return CatUnknown
 	}
-	sub, rest := args[0], args[1:]
 	for _, a := range rest {
 		if a == "--output" || strings.HasPrefix(a, "--output=") {
 			return CatUnknown

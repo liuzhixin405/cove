@@ -60,6 +60,18 @@ type ModelFallback struct {
 	currentIdx  int
 	cooldownDur time.Duration
 	maxFails    int
+	// onUnavailable, when set, is told once each time a provider is marked
+	// unavailable (SetOnUnavailable); the engine routes it to diagnostics.
+	onUnavailable func(provider string, fails int, cause error)
+}
+
+// SetOnUnavailable registers the callback told when a provider is marked
+// unavailable after repeated failures. It runs after the chain's lock is
+// released, on the calling goroutine, so it may print and take other locks.
+func (mf *ModelFallback) SetOnUnavailable(fn func(provider string, fails int, cause error)) {
+	mf.mu.Lock()
+	defer mf.mu.Unlock()
+	mf.onUnavailable = fn
 }
 
 // NewModelFallback creates a fallback chain from a list of providers.
@@ -119,6 +131,16 @@ func (mf *ModelFallback) try(
 	startIdx := mf.currentIdx
 	tried := 0
 	called := false
+	// unavailable is the onUnavailable call to make once the lock is
+	// released: the callback prints and takes other locks, so it must not
+	// run under mf.mu.
+	var unavailable func()
+	fire := func() {
+		if unavailable != nil {
+			unavailable()
+			unavailable = nil
+		}
+	}
 
 	for tried < len(mf.providers) {
 		idx := (startIdx + tried) % len(mf.providers)
@@ -141,6 +163,7 @@ func (mf *ModelFallback) try(
 		// Release lock during the actual API call to avoid blocking status reads
 		called = true
 		mf.mu.Unlock()
+		fire()
 		resp, err := call(pw.Provider)
 		mf.mu.Lock()
 
@@ -148,6 +171,7 @@ func (mf *ModelFallback) try(
 			pw.FailCount = 0
 			mf.currentIdx = idx
 			mf.mu.Unlock()
+			fire()
 			return resp, pw.Provider, nil
 		}
 
@@ -156,7 +180,17 @@ func (mf *ModelFallback) try(
 		// blacklist a working provider.
 		if ctx.Err() != nil {
 			mf.mu.Unlock()
+			fire()
 			return nil, nil, err
+		}
+
+		// A request that does not fit the model's window is the request's
+		// fault, not the provider's: counted, three of them marked the only
+		// provider unavailable and reported that instead of the overflow.
+		if IsContextLengthError(err) {
+			pw.LastError = err
+			tried++
+			continue
 		}
 
 		// Handle failure (under lock)
@@ -172,8 +206,16 @@ func (mf *ModelFallback) try(
 			pw.CoolUntil = time.Now().Add(mf.cooldownDur)
 			log.Warnf("provider %s temporary error, cooling: %v", pw.Provider.Name(), err)
 		} else if pw.FailCount >= mf.maxFails || isPermanent(err) {
+			wasUnavailable := pw.Status == ProviderUnavailable
 			pw.Status = ProviderUnavailable
-			log.Errorf("provider %s marked unavailable after %d failures: %v", pw.Provider.Name(), pw.FailCount, err)
+			// Debug, not Error: the diagnostic layer records this through
+			// onUnavailable with a code and a hint; an Errorf would land in
+			// the same log a second time, uncoded, via the log sink.
+			log.Debugf("provider %s marked unavailable after %d failures: %v", pw.Provider.Name(), pw.FailCount, err)
+			if fn := mf.onUnavailable; fn != nil && !wasUnavailable {
+				name, fails, cause := pw.Provider.Name(), pw.FailCount, err
+				unavailable = func() { fn(name, fails, cause) }
+			}
 		}
 
 		tried++
@@ -187,6 +229,7 @@ func (mf *ModelFallback) try(
 	if !called {
 		pw := mf.providers[startIdx]
 		mf.mu.Unlock()
+		fire()
 		resp, err := call(pw.Provider)
 		mf.mu.Lock()
 		if err == nil {
@@ -206,6 +249,7 @@ func (mf *ModelFallback) try(
 	if len(mf.providers) == 1 && mf.providers[0].LastError != nil {
 		err := mf.providers[0].LastError
 		mf.mu.Unlock()
+		fire()
 		return nil, nil, err
 	}
 	var msgs []string
@@ -217,6 +261,7 @@ func (mf *ModelFallback) try(
 		}
 	}
 	mf.mu.Unlock()
+	fire()
 	return nil, nil, &allProvidersError{
 		msg:    fmt.Sprintf("all %d providers failed: %s", len(mf.providers), strings.Join(msgs, "; ")),
 		causes: causes,

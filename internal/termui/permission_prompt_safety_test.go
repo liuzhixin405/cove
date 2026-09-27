@@ -7,23 +7,29 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// promptBody is the part of the prompt built from the caller's text: every
-// row after the tool line and before the bottom rule.
+// promptBody is the part of the prompt built from the caller's text: the
+// gutter rows between the header (which names the tool) and the empty spacer
+// row, one per line of the command.
 func promptBody(t *testing.T, prompt string) []string {
 	t.Helper()
-	rows := strings.Split(prompt, "\n")
 	var body []string
-	for _, r := range rows {
+	header := true
+	for _, r := range strings.Split(prompt, "\n") {
 		plain := ansi.Strip(r)
-		if strings.Contains(plain, "说明") || (len(body) > 0 && !strings.Contains(plain, "╰")) {
-			body = append(body, r)
+		if !strings.HasPrefix(plain, "  ┃") {
+			continue
 		}
-		if strings.Contains(plain, "╰") {
+		if header {
+			header = false
+			continue
+		}
+		if plain == "  ┃" {
 			break
 		}
+		body = append(body, r)
 	}
 	if len(body) == 0 {
-		t.Fatalf("no 说明 rows in %q", prompt)
+		t.Fatalf("no body rows in %q", prompt)
 	}
 	return body
 }
@@ -51,7 +57,7 @@ func TestPermissionPromptNeutralisesControlsInTheCommand(t *testing.T) {
 		if strings.Contains(body, "\r") {
 			t.Errorf("carriage return reached the prompt for %q: %q", cmd, body)
 		}
-		// The box's own colour codes are the only escapes allowed.
+		// The prompt's own colour codes (gutter) are the only escapes allowed.
 		if rest := strings.NewReplacer(Yellow, "", Reset, "").Replace(body); strings.ContainsAny(rest, "\x1b\a") {
 			t.Errorf("control sequence from the command reached the prompt for %q: %q", cmd, rest)
 		}
@@ -72,8 +78,8 @@ func TestPermissionPromptKeepsEveryCommandLineInsideTheBox(t *testing.T) {
 		t.Fatalf("want 3 description rows, got %d: %q", len(body), body)
 	}
 	for _, r := range body {
-		if !strings.HasPrefix(ansi.Strip(r), "  │") {
-			t.Errorf("row is outside the box: %q", ansi.Strip(r))
+		if !strings.HasPrefix(ansi.Strip(r), "  ┃ ") {
+			t.Errorf("row is outside the gutter: %q", ansi.Strip(r))
 		}
 	}
 }

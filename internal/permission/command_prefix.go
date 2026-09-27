@@ -35,6 +35,12 @@ func CommandPrefixes(command string) ([]string, bool) {
 // given shell: under POSIX shells and PowerShell a fully quoted word may hold
 // operator characters (a commit message such as "fix(api): x; y"), under cmd
 // (and the zero ShellKind) it may not.
+//
+// Read-only commands in the line (cd, echo, git log, ...) yield no prefix:
+// they run unasked in every mode and a prefix rule treats them as covered
+// (see commandCovered), so remembering them only lengthened the prompt. A
+// line made only of them offers nothing. Under ShellCmd no command is trusted
+// to be read-only, so every one is remembered there.
 func CommandPrefixesFor(command string, kind ShellKind) ([]string, bool) {
 	cmds, ok := coverableCommands(command, kind)
 	if !ok {
@@ -43,6 +49,9 @@ func CommandPrefixesFor(command string, kind ShellKind) ([]string, bool) {
 	var out []string
 	seen := map[string]bool{}
 	for _, words := range cmds {
+		if prefixClassifier.readOnlyCommandWords(words, kind) {
+			continue
+		}
 		p, ok := commandPrefix(words)
 		if !ok {
 			return nil, false
@@ -52,7 +61,53 @@ func CommandPrefixesFor(command string, kind ShellKind) ([]string, bool) {
 			out = append(out, p)
 		}
 	}
+	if len(out) == 0 {
+		return nil, false
+	}
 	return out, true
+}
+
+// prefixClassifier rates the commands of a line for the prefix machinery.
+var prefixClassifier = NewClassifier()
+
+// ShellRememberRules returns the allow rules an "always allow" answer for a
+// shell tool call should add: one GroupGitRoutine rule when the line holds a
+// routine git write (see gitRoutine), and one CommandPrefix rule per other
+// command that needed approval, in order of first appearance. Read-only
+// commands add nothing. It reports false when some command cannot be
+// remembered safely (CommandPrefixesFor lists the reasons) or nothing is
+// left to remember; the rules it returns always cover command.
+func ShellRememberRules(toolName, command string, kind ShellKind) ([]Rule, bool) {
+	cmds, ok := coverableCommands(command, kind)
+	if !ok {
+		return nil, false
+	}
+	var rules []Rule
+	seen := map[string]bool{}
+	for _, words := range cmds {
+		if prefixClassifier.readOnlyCommandWords(words, kind) {
+			continue
+		}
+		if id := routineGroupOf(words); id != "" {
+			if !seen["group:"+id] {
+				seen["group:"+id] = true
+				rules = append(rules, Rule{ToolPattern: toolName, CommandGroup: id})
+			}
+			continue
+		}
+		p, ok := commandPrefix(words)
+		if !ok {
+			return nil, false
+		}
+		if !seen["prefix:"+p] {
+			seen["prefix:"+p] = true
+			rules = append(rules, Rule{ToolPattern: toolName, CommandPrefix: p})
+		}
+	}
+	if len(rules) == 0 {
+		return nil, false
+	}
+	return rules, true
 }
 
 var (
@@ -124,22 +179,49 @@ func programName(exe string) string { return safety.ProgramName(exe) }
 //     the line is preceded by a backslash (\" in bash). Under cmd, where a
 //     single quote is an ordinary character, such a word never matches.
 //   - Here-document and here-string bodies are stdin data, not commands.
+//   - A read-only command (cd, echo, git status; see readOnlyCommandWords)
+//     counts as covered without a rule, except under cmd.exe: it would run
+//     unasked on its own, so chaining it to an allowed command changes
+//     nothing.
 //
 // Anything refused here simply falls back to asking the user again.
 func commandCovered(command string, prefixes [][]string, kind ShellKind) bool {
-	cmds, ok := coverableCommands(command, kind)
+	return lineCovered(command, coverage{prefixes: prefixes, kind: kind})
+}
+
+// coverage is what a pool of allow rules vouches for: command prefixes
+// (hasWordPrefix), command groups (groupCovers) and, implicitly, read-only
+// commands under a shell whose kind is trusted.
+type coverage struct {
+	prefixes [][]string
+	groups   []string
+	kind     ShellKind
+}
+
+func (c coverage) empty() bool { return len(c.prefixes) == 0 && len(c.groups) == 0 }
+
+func (c coverage) covers(words []string) bool {
+	for _, p := range c.prefixes {
+		if hasWordPrefix(words, p) {
+			return true
+		}
+	}
+	for _, g := range c.groups {
+		if groupCovers(g, words) {
+			return true
+		}
+	}
+	return prefixClassifier.readOnlyCommandWords(words, c.kind)
+}
+
+// lineCovered is commandCovered for a pool of prefixes and groups.
+func lineCovered(command string, cov coverage) bool {
+	cmds, ok := coverableCommands(command, cov.kind)
 	if !ok {
 		return false
 	}
 	for _, words := range cmds {
-		matched := false
-		for _, p := range prefixes {
-			if hasWordPrefix(words, p) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
+		if !cov.covers(words) {
 			return false
 		}
 	}

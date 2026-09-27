@@ -135,6 +135,10 @@ func TestIsContextLengthError(t *testing.T) {
 		&StatusError{Status: 400, Msg: `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}`},
 		&StatusError{Status: 413, Msg: `{"type":"error","error":{"type":"request_too_large"}}`},
 		fmt.Errorf("api: %w", &StatusError{Status: 400, Msg: "input length exceeds the context window"}),
+		// llama.cpp / LM Studio: neither "context length" nor "context window"
+		// appears, so a local model's overflow was not recognised at all and
+		// the turn failed without the compact-and-retry.
+		&StatusError{Status: 400, Msg: `{"error":{"code":400,"message":"request (17964 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":17964,"n_ctx":16384}}`},
 	}
 	for _, err := range yes {
 		if !IsContextLengthError(err) {

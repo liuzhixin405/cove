@@ -53,6 +53,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 		log.Warnf("config migrate: %v", err)
 	}
 	diagnostic.AttachToLogger()
+	installDiagnostics(cfg, interactive)
 	if debugMode {
 		log.SetLevel(log.Debug)
 	}
@@ -201,7 +202,12 @@ func runStartupDiagnostics(cfg *config.Config, debugMode bool) {
 // stderr) and the full-screen TUI (seeded into the transcript) can show them.
 func startupDiagnosticsText(cfg *config.Config, debugMode bool) string {
 	if issues := diagnostic.QuickCheck(cfg); len(issues) > 0 {
-		return "\n  \x1b[90m⚠️  系统检测到潜在环境或配置异常，建议输入 \x1b[36m/diagnose\x1b[90m 查看并进行一键修复。\x1b[0m\n"
+		return "\n  \x1b[90m⚠️  系统检测到潜在环境或配置异常，建议输入 \x1b[36m/diagnose\x1b[90m 查看。\x1b[0m\n"
+	}
+	// Coded problems from earlier runs that no remedy resolved: the person
+	// may not have seen the hint when the turn failed.
+	if n := diagnostic.UnresolvedFromLog(); n > 0 {
+		return fmt.Sprintf("\n  \x1b[90m⚠️  错误日志里有 %d 类未处理的问题，输入 \x1b[36m/diagnose errors\x1b[90m 查看建议，处理完可用 /diagnose archive 归档。\x1b[0m\n", n)
 	}
 	return ""
 }

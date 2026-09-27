@@ -280,6 +280,9 @@ go build -o cove ./cli/cove
 | `/checkpoints` | 列出所有检查点 |
 | `/history` | 查看和恢复历史会话 |
 | `/history detail <id>` | 查看某次会话详情 |
+| `/history delete <编号\|id>` | 删除一个历史会话（当前会话不能删） |
+| `/history clear` | 清空当前项目的历史会话：先显示将删除的数量，输入 `/history clear confirm` 才真正删除；`/history clear all confirm` 清空所有项目 |
+| `/history clean` | 修复历史文件（补标题、标记注入消息）并备份，**不删除**任何会话 |
 | `/resume [id]` | 恢复已保存的会话 |
 | `/continue` | 从中断处继续上一轮（因上限停止、Ctrl+C、API 错误等中断后），已完成的工具步骤不会重做 |
 | `/export` | 导出当前对话 |
@@ -319,7 +322,7 @@ go build -o cove ./cli/cove
 | `/plugin` | 插件管理 |
 | `/skills` | 列出可用技能 |
 | `/doctor` | 快速检查：git、ripgrep、供应商与 API key，末尾附“后台学习”“权限规则文件”两项 |
-| `/diagnose [quick\|errors\|archive\|codes]` | 完整系统诊断与错误分析（含“后台学习”“权限规则文件”） |
+| `/diagnose [quick\|errors\|archive\|codes\|trace N]` | 完整系统诊断与错误分析（含“后台学习”“权限规则文件”）；`trace` 查看最近 N 条交互轨迹 |
 | `/status` | 查看代理状态与会话信息 |
 | `/stats` | 查看消息数与费用统计 |
 | `/permissions` | 查看当前权限模式 |
@@ -463,7 +466,7 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 - `auto` 模式的“项目内写入”按真实路径判断：会解析符号链接与 Windows junction（`mklink /J`），项目内指向项目外的链接及其下的新文件视为项目外；链接超过 40 跳或成环也视为项目外。
 - `-p` 单次查询没有人回答询问，“仍需确认”的调用会被直接拒绝；要无人值守地执行这些操作，用 `bypass` 模式，或事先用 `[p]` / `policies.json` 持久化允许规则（见[启动参数](#启动参数)下的 `-p` 说明）。
 
-**“只读命令”如何判定**：按分词结果逐条判断，一行里的所有简单命令都必须只读。出现 `$(`、反引号、`<(`、`>(`、`${`，或任一命令把输出重定向到真实文件（`/dev/null`、`NUL`、`$null` 除外）即不算只读。`env`/`sudo`/`xargs`/`time`/`nohup` 包裹、带路径的可执行文件（`./ls`）、`VAR=1 cmd` 前缀都不算只读。git 只认 `status`/`log`/`diff`/`show`/`blame`/`ls-files`/`rev-parse` 等只读子命令；`git branch newname`、`git tag v1`、`git stash`、`git config k v`、带 `--output=` 的命令以及任何 `git -c …` 都不算只读。`find` 带 `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`/`-fprint*`/`-fls` 不算只读。
+**“只读命令”如何判定**：按分词结果逐条判断，一行里的所有简单命令都必须只读。出现 `$(`、反引号、`<(`、`>(`、`${`，或任一命令把输出重定向到真实文件（`/dev/null`、`NUL`、`$null` 除外）即不算只读。`env`/`sudo`/`xargs`/`time`/`nohup` 包裹、带路径的可执行文件（`./ls`）、`VAR=1 cmd` 前缀都不算只读。`cd`/`pushd`/`popd`/`Set-Location` 本身算只读（切换目录不改变任何东西，之后的命令各自判定），所以 `cd proj && git status` 整行只读。git 只认 `status`/`log`/`diff`/`show`/`blame`/`ls-files`/`rev-parse` 等只读子命令；`git branch newname`、`git tag v1`、`git stash`、`git config k v`、带 `--output=` 的命令以及任何 `git -c …` 都不算只读。`find` 带 `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`/`-fprint*`/`-fls` 不算只读。
 
 切换方式：
 ```
@@ -472,27 +475,38 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 ### 授权提示
 
-需要确认时，提示行形如：
+需要确认时，提示形如：
 
 ```
-[y] 允许   [a] 本次会话总是允许 "git commit" 开头的命令   [p] 永久允许 "git commit" 开头的命令（本项目）   [n] 拒绝
+  ┃ 需要授权  bash
+  ┃ git push
+  ┃
+    [y] 允许   [a] 本会话记住   [p] 本项目记住   [n] 拒绝
+        记住范围: bash 中 git 常规操作（add/commit/push/pull/switch 等，不含 --force、reset、clean、checkout）
 ```
+
+左侧竖条样式没有右边框，命令再长也不会把框撑破；多行命令（heredoc）每行都在竖条之后。
 
 - `y` / `yes` — 只允许这一次
-- `a` / `always` / `总是` — 本次会话内总是允许（不写文件，退出 cove 即失效）
+- `a` / `always` / `总是` — 本次会话内记住“记住范围”一行所写的内容（不写文件，退出 cove 即失效）
 - `p` / `permanent` / `永久` — 本次会话生效，并写入 `~/.cove/policies.json`（设置了 `COVE_CONFIG_DIR` 时位于该目录下），**只对当前项目生效**（项目根 = 从启动目录向上找到的含 `.git` 的目录，找不到时为启动目录）。之后在同一项目启动 cove 不再询问。成功时提示会显示实际写入的文件路径，写入的规则作为本项目的磁盘规则装入本会话：用 `/cd` 切换到其他项目时与其他 `policies.json` 规则一起卸下，同一命令会重新询问，按新项目的规则判断。写入失败时提示“未能写入，仅本次会话有效”，规则退化为会话规则
 - `n` 或其他输入 — 拒绝
 - 15 分钟内没有回答视为拒绝（提示“授权超时”）
 
-`a` 和 `p` 对 `bash`/`powershell` 只记住**命令前缀**，提示里会写明，例如 `"go test" 开头的命令`：
+“记住范围”只列**真正需要授权**的那部分。`cd`、`echo`、`git status`、`git log` 这类只读命令在任何模式下都自动放行，所以既不出现在范围里，也不需要单独记住：`cd proj && git remote -v` 这样整行只读的命令直接执行，不再因为 `cd` 而询问。
 
-- 前缀取法：`git`、`go`、`npm`、`docker`、`kubectl`、`dotnet`、`cargo`、`pip` 等带子命令的工具取“程序 + 子命令”（`git status`、`go test`、`npm run`、`docker compose`），其他程序只取程序名（`ls`、`cat`）。复合命令会为其中每条命令各记一个前缀（`cd src && go test ./...` 一次回答记住 `cd` 和 `go test`）
-- 之后一行命令里的**每一条**命令（`&&`、`||`、`;`、`&`、管道、换行、子 shell 分隔的都算）都必须以已允许的前缀开头才免询问，按词比较：允许 `go test` 后，`go test ./... && rm -rf x`、`go test ./... | tee out.txt`（除非也允许了 `tee`）、`sudo go test`、`FOO=1 go test`、`go vet` 仍会询问
+**git 常规操作一组**：一行里出现 `add`、`commit`、`push`、`pull`、`fetch`、`switch`、`merge`、`rebase`、`stash`、`branch`、`tag`、`cherry-pick`、`mv` 这些子命令的常规用法时，`a`/`p` 记住的是整组“git 常规操作”，所以“暂存 → 提交 → 推送”只问一次。下面这些不在组内、照常询问（记住整组之后也一样）：`push --force`/`-f`/`--force-with-lease`/`--delete`/`--mirror`/`origin :branch`/`origin +branch`（`+` 引用规格即强推）；`reset`、`clean`、`rm`、`restore`、**`checkout`**（整体不在组内：`checkout <路径>` 会丢弃工作区改动，而路径和分支名无法区分，请让模型用 `switch`）；`branch -D`/`-M`/`-C`、`tag -d`；`switch --discard-changes`；`stash drop`/`clear`；`rebase -i`/`--exec`/`--edit-todo`、`pull --rebase=interactive`；任何子命令的 `--interactive`/`--patch`/`--edit`（`-i`/`-p`/`-e`，会挂住非交互 shell）、`--force`/`-f`（`add -f` 除外）、`--receive-pack`/`--upload-pack`（会执行程序）；没有 `-m`/`-F`/`-C`/`--no-edit` 的 `commit` 和没有 `-m`/`-F` 的 `tag -a`/`-s`（会打开编辑器）；长选项按 git 的唯一前缀规则匹配，`--force-w`、`--del`、`--disc` 这类缩写同样被拒；`git -c …` 等 `-C <dir>`/`--no-pager` 以外的全局选项。不在组内的 git 写操作仍按“程序 + 子命令”前缀记住，例如 `"git push" 开头的命令`（记住后 `git push --force` 也会放行，请留意）。`policies.json` 里对应 `"command_group": "git"`，规则 ID 为 `allow-bash-group-git`。
+
+其他命令对 `bash`/`powershell` 只记住**命令前缀**，范围里写作 `"go test" 开头的命令`：
+
+- 前缀取法：`git`、`go`、`npm`、`docker`、`kubectl`、`dotnet`、`cargo`、`pip` 等带子命令的工具取“程序 + 子命令”（`go test`、`npm run`、`docker compose`），其他程序只取程序名（`rm`、`sed`）。复合命令会为其中每条需要授权的命令各记一个前缀（`cd src && go test ./... | tee out.txt` 一次回答记住 `go test` 和 `tee`）
+- 之后一行命令里的**每一条**命令（`&&`、`||`、`;`、`&`、管道、换行、子 shell 分隔的都算）都必须以已允许的前缀开头、属于已记住的组、或本身只读，才免询问，按词比较：允许 `go test` 后，`go test ./... && rm -rf x`、`go test ./... | tee out.txt`（除非也允许了 `tee`）、`sudo go test`、`FOO=1 go test`、`go vet` 仍会询问；`cd src && go test ./... && echo done` 放行
 - **引号内的参数**：在 Git Bash / sh 和 PowerShell 下，整词位于引号内的参数可以包含 `; & | < > ( )`，所以 `git commit -m "fix(api): handle 429; retry"`、`git commit -m 'a && b'` 能被 `git commit` 前缀覆盖。**cmd.exe** 下保持严格：单引号在 cmd 中不是引号，任何含这些字符的参数都不被覆盖（照常询问）。行内出现 `\"` 或 `\'` 时不信任引号；PowerShell 下未加引号的 `$变量` 参数不覆盖（`$x.Method()` 会执行代码）
 - **heredoc**：`<<EOF`、`<<'EOF'`、`<<-EOF` 与 here-string `<<<` 的内容是 stdin 数据，不参与前缀判断，所以 `git commit -F- <<'EOF' … EOF` 能被 `git commit` 前缀覆盖
 - 仍然不会被前缀规则放行、照常询问的情况：任意位置出现 `$(`、反引号、`${`、`<(`、`>(`（引号内也算）；输出重定向到文件（`/dev/null`、`NUL`、`$null` 除外）
-- `sudo`、`env`、`xargs`、`bash -c`、`VAR=值` 开头，或 `git -C dir …` 这类取不到子命令的命令无法安全地记住前缀，提示中不提供 `[a]`/`[p]`；此时输入 `a` 或 `p` 只允许本次
-- 其他工具（`write`、`edit` 等）选 `a`/`p` 对整个工具生效；MCP 调用按“服务器 + 工具名”记住
+- `sudo`、`env`、`xargs`、`bash -c`、`VAR=值` 开头，或 `git -C dir …` 这类取不到子命令的命令无法安全地记住前缀，提示中不提供 `[a]`/`[p]`；此时输入 `a` 或 `p` 只允许本次。整行只读却仍被询问的命令（`ask` 规则命中、cmd.exe 回退）同样没有可记住的范围
+- Windows 上 `bash` 回退到 cmd.exe 时不信任任何只读判定：复合命令里的每一条（包括 `cd`）都会被记成前缀，也都必须被前缀覆盖
+- 其他工具（`write`、`edit` 等）选 `a`/`p` 对整个工具生效（范围写作 `工具 write 的所有调用`）；MCP 调用按“服务器 + 工具名”记住
 - plan 模式下这些规则不起作用，非只读工具照样被拒绝
 - 以上逐词比较只针对**允许**规则（`[a]`/`[p]`/`allow`）；`deny`/`ask` 规则按归一化后的命令匹配，见下一节
 
@@ -650,10 +664,12 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | `system_prompt` | string | 你自己的长期指令（如"提交信息用英文"），会**追加**到内置系统提示词末尾，不会替换内置规则 |
 | `thinking_tokens` | number | 已不再生效：新版 Claude 模型不接受固定的思考 token 预算，请改用 `thinking` + `effort` |
 | `debug` | boolean | 调试模式（开启详细日志） |
-| `verbose` | boolean | 详细输出；可在 profile 中单独设置 |
+| `verbose` | boolean | 预留字段，当前版本没有任何行为；可在 profile 中保存但不会改变输出 |
 | `mcp_servers` | object | MCP 服务器配置（支持 stdio/SSE/Streamable HTTP 传输） |
 | `profiles` | object | 具名配置组，可覆盖 `model`、`model_fast`、`provider`、`permission_mode`、`max_budget_usd`、`thinking_tokens`、`debug`、`verbose`、`system_prompt`；用 `/profile save/switch` 管理 |
 | `active_profile` | string | 启动时应用的 profile 名称（`--profile` 参数优先）；名称不存在时会给出警告并使用基础配置 |
+| `context_window` | number | 当前 `model` 的上下文窗口（token）。用于 cove 认不出的模型（本地 llama.cpp、LM Studio 等），决定压缩触发点与每次请求的输出上限；0 或不设按模型名估算（认不出时按 32K）。E2008 的处置会自动把学到的值写进 `model_context_windows`（见[自动处置](#自动处置)） |
+| `model_context_windows` | object | 按模型名记录的上下文窗口，如 `{"qwen3.6-27b": 16384}`。E2008 处置从服务端报错学到真实窗口后自动写入，下次启动直接生效；按模型名区分，切换 profile 不会把一个模型的窗口套到另一个上。窗口已知且小于 48K 时，cove 只向模型发送核心工具（读写编辑、shell、搜索、待办、提问、repo_map、skill、webfetch），repo map 摘录、记忆注入和单个工具结果的上限也按窗口比例缩小 |
 | `experimental_tools` | boolean | 默认 `false`。开启后才注册实验性协作工具 `task`、`task_*`、`team_*`、`send_message`、`brief`、`sleep`（见[工具注册条件](#工具注册条件)） |
 | `web_search` | object | `{"provider": "tavily\|brave\|duckduckgo", "api_key": "..."}`。配置了 `provider` 时以它为准，`api_key` 留空时读对应环境变量（`TAVILY_API_KEY` / `BRAVE_API_KEY` / `BRAVE_SEARCH_API_KEY`）；未配置时仍按环境变量选择；都没有则抓取 DuckDuckGo。`/diagnose` 与 `/diagnose quick` 末尾会提示未配置或缺 key |
 | `memory_embedding` | object | 可选：`{"base_url", "api_key", "model"}`，为记忆检索启用远程语义向量；留空的字段沿用主 provider 的值。不配置则只用关键词检索，不产生额外请求 |
@@ -825,13 +841,29 @@ Cove 的 REPL 支持异步任务执行：
 
 - **主 REPL** 循环中，用户输入被转换为任务放入队列
 - 后台 goroutine 取出任务异步执行
-- 用户可以在当前任务执行时继续输入（新输入排队）
+- 用户可以在当前任务执行时继续输入：输入的文本**作为指引送进当前任务**，下一次模型调用时生效，回车后提示 `[已插入] 已作为指引送入当前任务，下一步模型调用时生效`；连续输入多条会一起送入。若任务在用到指引之前就结束了（完成、`/stop`、Ctrl+C、撞上迭代/时间上限或出错），未生效的指引会自动作为新任务排到队首执行，并提示 `[已排队] 当前任务已结束，刚插入的指引将作为新任务执行`。带附件（`/attach`）的消息不能作为指引，仍排队等待。空闲时输入的指令直接开始执行，不打提示
 - `/tasks` 查看运行中和排队任务（仅交互式 REPL 维护队列）
 - `/stop` 取消当前任务（仅交互式 REPL；headless 为同步执行）
 
+### 运行中插入指引
+
+任务运行时直接输入并回车，就像在旁边给正在干活的助手递纸条：文本会在下一次模型调用前以 `[用户指引]` 消息追加进对话，模型据此调整后续步骤，不会打断正在执行的工具调用。典型用法：“别改测试文件”“先看 internal/api 目录”“用表驱动测试”。多条指引在同一次模型调用前会合并成一条消息，按输入顺序排列。
+
+指引不会静默丢失：如果任务在下一次模型调用前就结束了（无论是正常完成还是取消、撞上限、出错），这些指引会作为一条新任务立刻开始执行。这时它是独立请求，模型看不到“上一任务的中途”这一语境，如有需要可再补一句说明。`exit` 退出时未生效的指引会直接丢弃。
+
+`/tasks` 会在当前任务下方显示 `待生效指引: <预览>`；固定输入行的行末显示 `已插入 N 条指引`，模型消费后清零。以 `/` 开头的命令、授权提示与提问工具的回答不走这条路径，行为不变。
+
+### 任务运行中的输入行
+
+任务运行时，输入行固定在终端**最后一行**，上方一条暗色横线把它和输出流分开。输入行显示 `⚡ ❯` 与正在输入的内容（光标位置以反色标出），空白时提示“任务运行中，可直接输入指引，回车后送入当前任务”；有未生效指引时行末显示 `已插入 N 条指引`，有排队任务时显示 `已排队 N 条`，两者同时存在时用 ` · ` 连接；模型输出和工具结果只在横线上方滚动，不会把输入行刷走。回车后输入的内容会回显到上方的输出流里，便于在记录中看到插入了什么。
+
+实现上用的是终端自己的滚动区域（DECSTBM）加一次光标位置查询（`ESC[6n`），不靠程序数行，所以折行、宽字符、spinner 都不影响定位。以下情况自动退回旧行为（运行期间不显示输入行，回车后只排队不回显）：终端不回应光标位置查询（首次超时 300 ms 后本进程内不再尝试）、stdout 不是终端、窗口不足 8 行、设置了 `COVE_PIN_INPUT=0`。授权提示出现时输入行临时回到输出流中答题，答完再钉回底部。
+
+长时间运行的 `bash`/`powershell` 命令的实时输出，会先打一行 `▸ bash <命令>  实时输出:`，输出内容缩进在它下面；命令结束后照常出现工具摘要行（`✓ Command: … · 共 N 行`）。
+
 ### 任务合并
 
-当排队任务与新输入的内容相似或重叠时，系统会自动合并任务，避免重复执行。
+当排队任务与新输入的内容相似或重叠时，系统会自动合并任务，避免重复执行。任务合并只作用于排队中的任务（例如带附件的消息、`/continue` 恢复的任务）；运行中输入的普通文本作为指引送入当前任务，不参与合并。
 
 ### 失败重试
 
@@ -1089,12 +1121,14 @@ depends:task-1,task-2 实现用户登录功能
 
 Cove 在对话过程中自动提取记忆、学习技能，并在对话结束后整理记忆。`--no-auto` 关闭全部后台学习；所有后台模型调用都计费并受 `max_budget_usd` 约束。
 
+**本地模型例外**：provider 的 `base_url` 指向本机（`127.0.0.1`、`localhost`、`[::1]`、`host.docker.internal`）时，每轮结束后的记忆提取、对话复盘和 dream 整理都不运行。本地服务一次只处理一个请求，这些调用会把你的下一轮排在后面，而且 30 秒超时在本地大模型上几乎必超。会话保存与自动清理照常。
+
 ### 记忆提取 (Extract)
 
 **每个回合结束后都会运行**（不再有时间节流，快速会话的最后几个回合也不会被漏掉），用后台（fast）模型分析最近 20 条消息，把值得长期保存的事实写入记忆。保留的保护：
 
 - 上一次提取还在运行时，本回合跳过；
-- 自上次提取以来没有新消息时跳过（压缩、`/clear` 使历史变短也算新历史）；
+- 自上次提取以来没有新消息时跳过（压缩使历史变短也算新历史）；
 - 少于 4 条消息不提取。
 
 每次提取（包括没找到值得保存内容的）都会记录时间和条数，可用 `/memory stats` 查看；交互模式下提取到记忆时会显示在[回合结束摘要行](#回合结束摘要行)里。`cove -p` 回答后最多等待 20 秒让本轮提取完成再退出。
@@ -1337,7 +1371,7 @@ API 请求失败重试时，退避时间为 `基准 × 2^n × [0.5, 1.5)` 的随
 | `index.json` | 会话列表索引（标题、目录、轮数、消息数、预览、时间、模型、用量、文件大小与修改时间） |
 | `<id>.json` | 旧版格式（整个会话一个 JSON）。仍可加载和列出；该会话下次保存时自动迁移为 `.jsonl` 并删除旧文件 |
 
-- 每次保存只**追加**新增的消息并原子更新 `index.json`；历史被整体替换（压缩、`/clear`、文件被外部修改）时整文件原子重写。
+- 每次保存只**追加**新增的消息并原子更新 `index.json`；历史被整体替换（压缩、文件被外部修改）时整文件原子重写。
 - 列会话只读 `index.json`，不解析消息体；索引与文件大小/修改时间对不上（例如崩溃或外部编辑）时自动重扫该文件修复索引，`index.json` 丢失时自动重建。
 - 追加中途崩溃留下的半行在加载时跳过，下次保存时被清掉。
 - `cove -r <id>` / `--resume` 接受 `<id>`、`<id>.jsonl` 或 `<id>.json`。
@@ -1371,6 +1405,9 @@ cove --list-sessions all   # 命令行列出所有项目的会话
 /resume <id>       # 恢复指定会话（可跨项目，会提示）
 /history           # 查看当前项目的历史会话
 /history <编号|id> # 恢复历史会话并美化显式
+/history delete <编号|id>   # 删除一个会话
+/history clear              # 清空当前项目历史（显示数量，需再输入 /history clear confirm）
+/history clean              # 修复历史文件，不删除
 ```
 
 #### 🛡️ 历史记录智能降噪
@@ -1470,16 +1507,18 @@ Cove 的会话管理具备低信噪比排除算法。当会自动为您保存的
 
 ### 诊断码体系
 
-30+ 诊断码，覆盖 6 大类：
+30+ 诊断码，按子系统分组：
 
-| 类别 | 码段 | 范围 |
+| 码段 | 类别 | 范围 |
 |------|------|------|
-| E1xxx | 配置 | API Key、配置文件 |
-| E2xxx | API | 认证、响应格式 |
-| E3xxx | 网络 | 连接、超时 |
-| E4xxx | 模型 | 不支持功能、速率限制 |
-| E5xxx | Shell | 命令执行 |
-| E6xxx | 数据目录 | 权限、空间 |
+| E1xxx | 配置 | API Key、配置文件、模型名、权限模式 |
+| E2xxx | API / 网络 | 不可达、超时、限流、认证、400、5xx、流中断；**E2008 上下文超出模型窗口**、**E2009 供应商已被标记不可用** |
+| E3xxx | 权限 | 拒绝、无授权回调、policies.json 无法加载、文件访问 |
+| E4xxx | 工具 | 未注册、超时、崩溃、shell 缺失、Git Bash/WSL、git 缺失；**E4009 工具参数非法 JSON** |
+| E5xxx | 引擎 | 迭代上限、取消、压缩、崩溃、后台整理失败；**E5007 模型调用无进展** |
+| E6xxx | 会话 / 文件系统 | 会话损坏、保存失败、权限、磁盘空间 |
+
+运行期错误在产生处**按类型归类**得到诊断码（HTTP 状态码、上下文超长、限流、传输错误、工具参数非法、卡住、供应商不可用），不是靠错误文本猜；归不了类的错误按原文记录、无码。
 
 ### 使用
 
@@ -1487,9 +1526,15 @@ Cove 的会话管理具备低信噪比排除算法。当会自动为您保存的
 /doctor             # 快速检查：git、ripgrep、供应商与 API key，外加“后台学习”“权限规则文件”
 /diagnose           # 完整诊断（含网络检测）
 /diagnose quick     # 快速检查（跳过网络）
-/diagnose errors    # 查看运行时记录的错误/卡顿及修复建议
-/diagnose archive   # 修复后归档错误日志，开始新的记录周期
-/diagnose codes     # 列出所有诊断码
+/diagnose errors    # 查看运行时记录的错误/卡顿：按诊断码和模型聚合，显示次数、最近时间、建议、已执行的处置
+/diagnose archive   # 处理完后归档错误日志，开始新的记录周期（处置器的计数一并清零）
+/diagnose trace [N] # 查看最近 N 条交互轨迹（默认 30）：每次模型调用的消息数、估算 token、耗时、结束原因或错误类别，每次工具调用的耗时、结果大小、是否出错，每次压缩的前后 token 数，超长重试的处理
+```
+
+交互轨迹写在 `~/.cove/trace.jsonl`（超过 4MB 轮转为 `trace.jsonl.1`），只记录大小、名称和错误开头，不记录消息正文。任务"跑了很久没结果"时，先看它。
+
+```
+/diagnose codes     # 列出所有诊断码，带处置器的标注 (有处置器)
 ```
 
 `/doctor` 与 `/diagnose` 都包含以下两项（读取当前会话的实际状态）：
@@ -1499,11 +1544,18 @@ Cove 的会话管理具备低信噪比排除算法。当会自动为您保存的
 
 `/diagnose` 与 `/diagnose quick` 末尾还会提示网络搜索未配置 `web_search` 或缺少对应 API key。
 
-所有修复都是 **HotFixable**，无需重启即可应用。
+### 自动处置
+
+运行期错误归类后记入 `~/.cove/errors.log`；`/diagnose errors` 按诊断码和模型聚合显示。部分诊断码带**处置器**：错误发生时自动执行并提示一行（`⚙ …`），只改本会话的运行策略与参数，不改代码、不改 `config.json`，并且只有真的执行了才在记录里写一条「已处置」：
+
+- **E2008 上下文超出模型窗口**：从服务端报错里解析真实窗口（llama.cpp 的 `n_ctx`、`context size (N tokens)`、OpenAI 的 `maximum context length is N`、Anthropic 的 `N maximum`），小于 cove 按模型名估算的值时当场改为该值，并写入 `config.json` 的 `model_context_windows`，下次启动直接生效；后续压缩按真实窗口触发。超长时的重试真正会变小：历史太短、压缩器无从摘要时，改为移除本轮附加的 repo map 摘录与记忆注入、裁剪最大的工具结果，再重试一次；重发同一请求时「上一次执行被中断」标记只保留一条，不再每次多一条。压缩（摘要或截断）后的第一条消息始终带 `<original_request>` 原始需求原文，模型不会在不知道任务是什么的状态下继续。
+- **E4009 工具参数非法 JSON**：同一模型第 3 次出现时提示换模型或降低 temperature，之后每 5 次提示一次。
+
+静态检查（`/diagnose`）里只有「会话完整性」会自动清理损坏的会话文件，其余检查给出建议。
 
 ### 启动时诊断
 
-`diagnostic.QuickCheck()` 在启动时自动运行，检测常见问题。
+`diagnostic.QuickCheck()` 在启动时自动运行，检测常见配置问题；此外若错误日志里有带建议、且未被处置的错误，提示一行「错误日志里有 N 类未处理的问题，输入 /diagnose errors 查看建议」。
 
 ---
 

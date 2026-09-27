@@ -110,7 +110,12 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 	signal.Notify(taskSigCh, syscall.SIGINT)
 
-	defer signal.Stop(taskSigCh)
+	// Stop delivers no further signals once it returns, so closing the
+	// channel ends the handler goroutine; it used to outlive the loop.
+	defer func() {
+		signal.Stop(taskSigCh)
+		close(taskSigCh)
+	}()
 
 	go func() {
 
@@ -120,6 +125,10 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			// byte), so this only fires during task execution / cooked mode.
 
+			// A prompt waiting on its answer channel does not see the
+			// cancelled context; answer it too, or the next typed line is
+			// taken as its answer.
+			denyPendingPermissionPrompt()
 			if tasks.CancelRunning() {
 
 				repl.PrintAbove(fmt.Sprintf("\r\n%s[已中断] 正在停止当前任务…输入 /continue 可继续%s\r\n", repl.Yellow, repl.Reset))
@@ -202,18 +211,34 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		// instead of processing it as a task.
 
-		if ch := repl.TakePermInputCh(); ch != nil {
-
-			ch <- input
-
-			continue
-
+		if ch, state, hint := repl.TakePromptInputFor(input); state != repl.PromptNone {
+			if state == repl.PromptAnswer {
+				ch <- input
+				continue
+			}
+			// Not an answer: the prompt keeps waiting. An empty line just
+			// repeats the hint; anything else is the next instruction and is
+			// handled as usual (steered into the task or run as a command).
+			if strings.TrimSpace(input) == "" {
+				repl.PrintAbove("  \x1b[2m" + hint + "\x1b[0m\r\n")
+				continue
+			}
+			repl.PrintAbove("  \x1b[2m提示仍在等待回答（" + hint + "）；这一行按普通输入处理\x1b[0m\r\n")
 		}
 
 		if input == "" {
 
 			continue
 
+		}
+
+		// Commands that rewrite the engine's state (the history, the working
+		// directory, the provider) cannot run while the task goroutine is
+		// appending to that same state: /compact mid-turn split a tool round
+		// and the next request was rejected.
+		if tasks.IsRunning() && commandMutatesEngine(input) {
+			repl.PrintAbove(fmt.Sprintf("[提示] 任务运行中不能执行 %s：它会改写正在使用的会话状态。请等任务结束，或先 /stop。\r\n", strings.Fields(input)[0]))
+			continue
 		}
 
 		if historyPickPending && !strings.HasPrefix(input, "/") {
@@ -238,7 +263,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			// Wait briefly for the task goroutine to finish its cleanup (save draft)
 
-			if tasks.CancelRunning() {
+			if tasks.CancelForExit() {
 
 				_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
 
@@ -377,8 +402,16 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 		case input == "/stop" || input == "/cancel":
 
 			if tasks.IsRunning() {
+				denyPendingPermissionPrompt()
 				if tasks.CancelRunning() {
-					repl.PrintAbove("[已取消] 当前任务已终止\r\n")
+					// Cancelling asks the task to stop; it is gone only once
+					// its goroutine has returned, and saying "terminated" a
+					// moment early made the next /continue answer "still running".
+					if tasks.WaitIdleUntil(time.Now().Add(1500 * time.Millisecond)) {
+						repl.PrintAbove("[已取消] 当前任务已终止，输入 /continue 可从中断处继续\r\n")
+					} else {
+						repl.PrintAbove("[已中断] 正在停止当前任务…结束后可用 /continue 继续\r\n")
+					}
 				}
 			} else {
 				repl.PrintAbove("[提示] 当前没有运行中的任务\r\n")
@@ -540,13 +573,27 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			}
 
-			queuedAhead, merged := tasks.Enqueue(userMsg)
-
-			if msg := enqueueFeedback(queuedAhead, merged, tasks.IsRunning()); msg != "" {
+			// The same request sent again into a fresh session (after a
+			// restart, typically) continues the unfinished session it started,
+			// instead of opening one more copy of it in /history.
+			if len(eng.Messages()) == 0 && !tasks.IsRunning() && len(userMsg.Parts) == 0 {
+				if rec, idx := resumeDuplicateSession(eng, userMsg.Content); rec != nil {
+					repl.PrintAbove(fmt.Sprintf("[已恢复] 这条请求与会话 #%d（%s，%d 条消息）相同且该会话未完成，已在它上面继续，不再新建会话。\r\n", idx, rec.UpdatedAt.Format("01-02 15:04"), len(rec.Messages)))
+					userMsg = api.Message{Role: "user", Content: "继续"}
+				}
+			}
+			// A request naming a directory outside the working directory
+			// cannot be done with the file tools; say so before the model
+			// spends an hour finding out.
+			if hint := outsideCwdHint(userMsg.Content, currentProjectDir()); hint != "" {
+				repl.PrintAbove(hint + "\r\n")
+			}
+			if msg := tasks.SubmitWithFeedback(userMsg); msg != "" {
 				repl.PrintAbove(msg + "\r\n")
 			}
 
-			// Don't block: tasks run in the background, user can type again immediately.
+			// Don't block: tasks run in the background, user can type again
+			// immediately; typed while a task runs, the text steers that task.
 
 		}
 
@@ -554,26 +601,44 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 }
 
+// steerFeedback is the line shown for text typed while a task runs: it was
+// steered into that task (SubmitWithFeedback) and takes effect at the task's
+// next model call.
+const steerFeedback = "[已插入] 已作为指引送入当前任务，下一步模型调用时生效"
+
+// steerReclaimedFeedback follows a task that ended before its next model call
+// could pick up the guidance typed during it: the runner queues that
+// guidance as a task of its own (reclaimSteerLocked).
+const steerReclaimedFeedback = "[已排队] 当前任务已结束，刚插入的指引将作为新任务执行"
+
+// steerKeptFeedback follows a task that failed or was cancelled with
+// guidance still pending: it stays for the resumed turn (/continue), whose
+// first model call is where it lands.
+const steerKeptFeedback = "[已保留] 刚插入的指引未生效，将在 /continue 继续或下一次模型调用时送入"
+
 // enqueueFeedback is the line shown after a typed message was handed to the
-// task runner. queuedAhead and merged are Enqueue's results; running is
-// whether a task is running afterwards. "" means say nothing.
+// task runner: queuedAhead, merged and wasRunning are enqueueLocked's
+// results. "" means say nothing, which is the case for a message that
+// started right away: its output follows.
 //
 // A merge always lands in a task that is still queued — Enqueue only looks at
 // the queue, never at the running task. The feedback used to say
 // "已合并进当前处理任务", so the user expected the running task to pick the
 // correction up, when it only runs after that task finishes.
-func enqueueFeedback(queuedAhead int, merged, running bool) string {
+func enqueueFeedback(queuedAhead int, merged, wasRunning bool) string {
 	if merged {
 		return fmt.Sprintf("[已补充] 已合并进排队中的第 %d 个任务，当前任务结束后执行", queuedAhead+1)
 	}
 	if queuedAhead > 0 {
 		return fmt.Sprintf("[任务排队中] 前方排队数: %d", queuedAhead)
 	}
-	if !running {
-		// Brief feedback only when this is the first and only task
-		return "[输入已接收]"
+	if !wasRunning {
+		return ""
 	}
-	return ""
+	// Typed while a task runs: say where it went. It used to say nothing,
+	// and with the input line off screen during streaming the text seemed
+	// to have been swallowed.
+	return "[已排队] 当前任务结束后执行"
 }
 
 // denyPendingPermissionPrompt answers a waiting approval prompt with a denial
@@ -664,8 +729,7 @@ func handlePluginCommand(input string, pluginMgr *plugin.Manager, tasks *replTas
 	// name; it used to be appended instead, leaving the placeholder literal.
 	prompt := command.ExpandArguments(cmd.Prompt, strings.TrimPrefix(input, parts[0]))
 	repl.PrintAbove(fmt.Sprintf("[插件命令: /%s (%s)]\r\n", name, cmd.Plugin))
-	queuedAhead, merged := tasks.Enqueue(api.Message{Role: "user", Content: prompt})
-	if msg := enqueueFeedback(queuedAhead, merged, tasks.IsRunning()); msg != "" {
+	if msg := tasks.EnqueueWithFeedback(api.Message{Role: "user", Content: prompt}); msg != "" {
 		repl.PrintAbove(msg + "\r\n")
 	}
 	return true
@@ -746,4 +810,25 @@ func continueInterruptedTurn(src interruptedTurnSource, running bool, enqueue fu
 	}
 	enqueue(msg)
 	return "[继续] 正在从上一轮中断处继续…"
+}
+
+// commandMutatesEngine reports whether a typed command rewrites the engine's
+// state — the history, the working directory and its rules, the provider —
+// and so must not run while a task is using that state.
+func commandMutatesEngine(input string) bool {
+	fields := strings.Fields(input)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return false
+	}
+	switch fields[0] {
+	case "/compact", "/cd", "/resume", "/model", "/provider", "/api-key":
+		return true
+	case "/history":
+		// "/history N" resumes a session; a bare /history only lists them.
+		return len(fields) > 1 && isPositiveNumber(fields[1])
+	case "/profile":
+		// switching or deleting a profile reloads the provider; save/show do not.
+		return len(fields) > 1 && (fields[1] == "switch" || fields[1] == "use" || fields[1] == "delete")
+	}
+	return false
 }

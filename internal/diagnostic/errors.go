@@ -86,6 +86,12 @@ const (
 	ErrAPIBadRequest   ErrorCode = "E2005"
 	ErrAPIServerError  ErrorCode = "E2006"
 	ErrAPIStreamBroken ErrorCode = "E2007"
+	// ErrAPIContextLength: the request did not fit the model's context
+	// window, even after the engine compacted and retried.
+	ErrAPIContextLength ErrorCode = "E2008"
+	// ErrAPIProviderUnavailable: the fallback chain stopped preferring a
+	// provider after repeated failures.
+	ErrAPIProviderUnavailable ErrorCode = "E2009"
 )
 
 // Permission errors (E3xxx)
@@ -108,6 +114,9 @@ const (
 	ErrToolNoGitBash  ErrorCode = "E4006"
 	ErrToolShellWSL   ErrorCode = "E4007"
 	ErrToolGitMissing ErrorCode = "E4008"
+	// ErrToolArgsInvalid: a model's tool call carried arguments that were
+	// not JSON even after repair.
+	ErrToolArgsInvalid ErrorCode = "E4009"
 )
 
 // Engine errors (E5xxx)
@@ -119,6 +128,8 @@ const (
 	ErrEngineNoProvider ErrorCode = "E5005"
 	// ErrEngineDreamFailed: the last background memory consolidation failed.
 	ErrEngineDreamFailed ErrorCode = "E5006"
+	// ErrEngineStall: a stage made no progress for stallThreshold.
+	ErrEngineStall ErrorCode = "E5007"
 )
 
 // Session/FS errors (E6xxx)
@@ -131,14 +142,17 @@ const (
 
 // ErrorDef defines a known error type with its metadata and recovery info.
 type ErrorDef struct {
-	Code        ErrorCode
-	Category    Category
-	Severity    Severity
-	Message     string // User-facing summary (Chinese)
-	Detail      string // Technical detail template
-	Recovery    string // What user can do
-	AutoFixable bool   // Whether the diagnostic system can auto-fix this
-	HotFixable  bool   // Whether fix takes effect immediately without restart
+	Code     ErrorCode
+	Category Category
+	Severity Severity
+	Message  string // User-facing summary (Chinese)
+	Detail   string // Technical detail template
+	Recovery string // What the user can do
+	// Remedy, when set, is an action the diagnostic layer may take at run
+	// time when an event with this code is reported (see report.go). It
+	// changes run-time strategy or session-level parameters only, never
+	// code or config files, and says what it did.
+	Remedy RemedyFunc
 }
 
 // registry holds all known error definitions.
@@ -149,52 +163,60 @@ func init() {
 	// ErrConfigMissing is a warning, not fatal: cove runs on defaults plus an
 	// API key from the environment. The old hint sent users to /init, which
 	// writes CLAUDE.md, and the old "auto-fix" wrote a placeholder API key.
-	register(&ErrorDef{ErrConfigMissing, CatConfig, SevWarning, "配置文件不存在", "找不到配置文件: %s", "设置对应的 API Key 环境变量（如 DEEPSEEK_API_KEY），或用 /provider <名称> 和 /api-key <密钥> 保存到配置文件", false, false})
-	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevError, "配置文件格式错误", "JSON解析失败: %s", "按提示的位置修正 JSON 语法；在修好之前该文件中的设置不会生效，/model 等命令也不会覆盖它", false, false})
-	register(&ErrorDef{ErrConfigAPIKeyPlaceholder, CatConfig, SevFatal, "API Key 是占位符", "provider.api_key 仍是示例值 %s（旧版诊断自动写入）", "用 /api-key <密钥> 设置真实密钥，或删除该字段改用环境变量", false, false})
-	register(&ErrorDef{ErrConfigModelInvalid, CatConfig, SevError, "模型名无效", "模型 '%s' 不被当前 provider 支持", "使用 /model 命令切换模型，或在配置中设置有效模型名", true, true})
-	register(&ErrorDef{ErrConfigProviderEmpty, CatConfig, SevFatal, "未配置 Provider", "provider.name 为空", "在配置中设置 provider.name (如 deepseek, openai, anthropic)", false, false})
-	register(&ErrorDef{ErrConfigAPIKeyMissing, CatConfig, SevFatal, "API Key 未设置", "provider '%s' 需要 API Key", "设置环境变量 LLM_API_KEY 或在配置中设置 provider.api_key", false, false})
-	register(&ErrorDef{ErrConfigPermMode, CatConfig, SevWarning, "权限模式无效", "permission_mode '%s' 不是有效值", "有效值: default, plan, auto, bypass。当前按 default 模式运行", false, false})
+	register(&ErrorDef{ErrConfigMissing, CatConfig, SevWarning, "配置文件不存在", "找不到配置文件: %s", "设置对应的 API Key 环境变量（如 DEEPSEEK_API_KEY），或用 /provider <名称> 和 /api-key <密钥> 保存到配置文件", nil})
+	register(&ErrorDef{ErrConfigInvalid, CatConfig, SevError, "配置文件格式错误", "JSON解析失败: %s", "按提示的位置修正 JSON 语法；在修好之前该文件中的设置不会生效，/model 等命令也不会覆盖它", nil})
+	register(&ErrorDef{ErrConfigAPIKeyPlaceholder, CatConfig, SevFatal, "API Key 是占位符", "provider.api_key 仍是示例值 %s（旧版诊断自动写入）", "用 /api-key <密钥> 设置真实密钥，或删除该字段改用环境变量", nil})
+	register(&ErrorDef{ErrConfigModelInvalid, CatConfig, SevError, "模型名无效", "模型 '%s' 不被当前 provider 支持", "使用 /model 命令切换模型，或在配置中设置有效模型名", nil})
+	register(&ErrorDef{ErrConfigProviderEmpty, CatConfig, SevFatal, "未配置 Provider", "provider.name 为空", "在配置中设置 provider.name (如 deepseek, openai, anthropic)", nil})
+	register(&ErrorDef{ErrConfigAPIKeyMissing, CatConfig, SevFatal, "API Key 未设置", "provider '%s' 需要 API Key", "设置环境变量 LLM_API_KEY 或在配置中设置 provider.api_key", nil})
+	register(&ErrorDef{ErrConfigPermMode, CatConfig, SevWarning, "权限模式无效", "permission_mode '%s' 不是有效值", "有效值: default, plan, auto, bypass。当前按 default 模式运行", nil})
 
 	// Network/API errors
-	register(&ErrorDef{ErrAPIUnreachable, CatNetwork, SevError, "API 服务不可达", "无法连接到 %s", "检查网络连接和代理设置，确认 base_url 正确", false, false})
-	register(&ErrorDef{ErrAPITimeout, CatNetwork, SevWarning, "API 请求超时", "请求超过 %s 未响应", "网络可能不稳定，将自动重试。如果持续超时，检查代理设置", false, false})
-	register(&ErrorDef{ErrAPIRateLimit, CatAPI, SevWarning, "触发速率限制", "API 返回 429: %s", "等待片刻后自动重试。如频繁触发，考虑降低请求频率或升级 API 套餐", false, false})
-	register(&ErrorDef{ErrAPIAuth, CatAPI, SevFatal, "认证失败", "API 返回 401/403: %s", "检查 API Key 是否正确且未过期", false, false})
-	register(&ErrorDef{ErrAPIBadRequest, CatAPI, SevError, "请求参数错误", "API 返回 400: %s", "可能是模型名不正确或请求格式不兼容，已自动调整", true, true})
-	register(&ErrorDef{ErrAPIServerError, CatAPI, SevWarning, "API 服务端错误", "API 返回 5xx: %s", "服务端临时问题，将自动重试", false, false})
-	register(&ErrorDef{ErrAPIStreamBroken, CatNetwork, SevWarning, "流式连接中断", "SSE 流读取失败: %s", "网络波动导致连接断开，将自动重试", false, false})
+	register(&ErrorDef{ErrAPIUnreachable, CatNetwork, SevError, "API 服务不可达", "无法连接到 %s", "检查网络连接和代理设置，确认 base_url 正确", nil})
+	register(&ErrorDef{ErrAPITimeout, CatNetwork, SevWarning, "API 请求超时", "请求超过 %s 未响应", "服务端在超时前没有回应：本地模型常见于模型加载或显存不足，云端服务检查网络与代理；稍后重试或 /continue", nil})
+	register(&ErrorDef{ErrAPIRateLimit, CatAPI, SevWarning, "触发速率限制", "API 返回 429: %s", "等待片刻后重试或 /continue；如频繁触发，考虑降低请求频率或升级 API 套餐", nil})
+	register(&ErrorDef{ErrAPIAuth, CatAPI, SevFatal, "认证失败", "API 返回 401/403: %s", "检查 API Key 是否正确且未过期", nil})
+	register(&ErrorDef{ErrAPIBadRequest, CatAPI, SevError, "请求参数错误", "API 返回 400: %s", "检查模型名与请求格式；若是本地服务，确认其兼容 OpenAI 接口", nil})
+	register(&ErrorDef{ErrAPIContextLength, CatAPI, SevError, "上下文超出模型窗口", "%s",
+		"输入 /continue 会先压缩对话历史再重试；若仍失败，需调大模型的上下文长度（llama-server 加 -c 65536、LM Studio 的 Context Length、Ollama 的 num_ctx），cove 的系统提示词和工具定义本身约占 13K token", nil})
+	register(&ErrorDef{ErrAPIProviderUnavailable, CatAPI, SevError, "供应商已被标记不可用", "%s",
+		"连续 3 次失败后本会话不再优先尝试该供应商；只有一个供应商时仍会继续尝试它，修好原因（如调大模型上下文）后成功一次即自动复位；有多个供应商时可用 /provider <名称> 切换", nil})
+	register(&ErrorDef{ErrAPIServerError, CatAPI, SevWarning, "API 服务端错误", "API 返回 5xx: %s", "服务端临时问题，稍后重试或 /continue；持续出现时检查服务状态", nil})
+	register(&ErrorDef{ErrAPIStreamBroken, CatNetwork, SevWarning, "流式连接中断", "SSE 流读取失败: %s", "连接在回复中途断开，输入 /continue 从中断处继续；持续出现时检查网络与代理", nil})
 
 	// Permission errors
-	register(&ErrorDef{ErrPermDenied, CatPermission, SevInfo, "操作被拒绝", "用户拒绝了 %s 的执行", "这是正常的安全行为，Agent 会尝试替代方案", false, false})
-	register(&ErrorDef{ErrPermNoPrompt, CatPermission, SevError, "无法显示权限提示", "PermissionPrompt 回调未设置", "非交互模式下无法请求权限确认，已自动切换为 auto 模式", true, true})
-	register(&ErrorDef{ErrPermPolicyLoad, CatPermission, SevError, "权限规则文件无法加载", "%s", "修正 policies.json 的 JSON 语法（或删除该文件）后重启 cove；在修好之前其中的规则（包括 deny 规则）都不生效", false, false})
-	register(&ErrorDef{ErrPermFileAccess, CatFileSystem, SevError, "文件访问被拒", "无法访问 %s: 权限不足", "检查文件权限，或以管理员身份运行", false, false})
+	register(&ErrorDef{ErrPermDenied, CatPermission, SevInfo, "操作被拒绝", "用户拒绝了 %s 的执行", "这是正常的安全行为，Agent 会尝试替代方案", nil})
+	register(&ErrorDef{ErrPermNoPrompt, CatPermission, SevError, "无法显示权限提示", "PermissionPrompt 回调未设置", "非交互模式下无法请求权限确认，请用 bypass 模式或事先在 policies.json 写好 allow 规则", nil})
+	register(&ErrorDef{ErrPermPolicyLoad, CatPermission, SevError, "权限规则文件无法加载", "%s", "修正 policies.json 的 JSON 语法（或删除该文件）后重启 cove；在修好之前其中的规则（包括 deny 规则）都不生效", nil})
+	register(&ErrorDef{ErrPermFileAccess, CatFileSystem, SevError, "文件访问被拒", "无法访问 %s: 权限不足", "检查文件权限，或以管理员身份运行", nil})
 
 	// Tool errors
-	register(&ErrorDef{ErrToolNotFound, CatTool, SevWarning, "工具未注册", "找不到工具: %s", "可能是 Agent 请求了不存在的工具名，会自动重试", false, false})
-	register(&ErrorDef{ErrToolTimeout, CatTool, SevWarning, "工具执行超时", "%s 执行超过 %s", "命令可能挂起，已被终止。可以设置更长的 timeout 参数", false, false})
-	register(&ErrorDef{ErrToolPanic, CatTool, SevError, "工具执行崩溃", "%s 发生了内部错误: %v", "这是一个 Bug，请反馈到项目 Issue", false, false})
-	register(&ErrorDef{ErrToolExecFailed, CatTool, SevWarning, "命令执行失败", "%s 退出码 %d", "命令返回了错误，Agent 会分析输出并调整", false, false})
-	register(&ErrorDef{ErrToolShellMiss, CatTool, SevError, "Shell 不可用", "找不到 %s", "确保系统 PATH 中有可用的 shell (bash/powershell)", false, false})
-	register(&ErrorDef{ErrToolNoGitBash, CatTool, SevWarning, "未找到 Git Bash", "命令将由 %s 执行，模型写出的 bash 语法可能失败", "安装 Git for Windows (https://git-scm.com/download/win)，重启 cove 后会自动使用其中的 bash", false, false})
-	register(&ErrorDef{ErrToolShellWSL, CatTool, SevError, "Shell 是 WSL 启动器", "%s 会把命令交给 WSL 发行版执行，而不是 Windows 工具链", "安装 Git for Windows，或把 Git 的 bin 目录放到 PATH 中 System32 之前", false, false})
-	register(&ErrorDef{ErrToolGitMissing, CatTool, SevWarning, "未找到 git", "PATH 中没有 git", "安装 git 后重启 cove；检查点 (/rewind) 和工作树等功能依赖 git", false, false})
+	register(&ErrorDef{ErrToolNotFound, CatTool, SevWarning, "工具未注册", "找不到工具: %s", "可能是 Agent 请求了不存在的工具名，会自动重试", nil})
+	register(&ErrorDef{ErrToolTimeout, CatTool, SevWarning, "工具执行超时", "%s 执行超过 %s", "命令可能挂起，已被终止。可以设置更长的 timeout 参数", nil})
+	register(&ErrorDef{ErrToolPanic, CatTool, SevError, "工具执行崩溃", "%s 发生了内部错误: %v", "这是一个 Bug，请反馈到项目 Issue", nil})
+	register(&ErrorDef{ErrToolExecFailed, CatTool, SevWarning, "命令执行失败", "%s 退出码 %d", "命令返回了错误，Agent 会分析输出并调整", nil})
+	register(&ErrorDef{ErrToolShellMiss, CatTool, SevError, "Shell 不可用", "找不到 %s", "确保系统 PATH 中有可用的 shell (bash/powershell)", nil})
+	register(&ErrorDef{ErrToolNoGitBash, CatTool, SevWarning, "未找到 Git Bash", "命令将由 %s 执行，模型写出的 bash 语法可能失败", "安装 Git for Windows (https://git-scm.com/download/win)，重启 cove 后会自动使用其中的 bash", nil})
+	register(&ErrorDef{ErrToolShellWSL, CatTool, SevError, "Shell 是 WSL 启动器", "%s 会把命令交给 WSL 发行版执行，而不是 Windows 工具链", "安装 Git for Windows，或把 Git 的 bin 目录放到 PATH 中 System32 之前", nil})
+	register(&ErrorDef{ErrToolGitMissing, CatTool, SevWarning, "未找到 git", "PATH 中没有 git", "安装 git 后重启 cove；检查点 (/rewind) 和工作树等功能依赖 git", nil})
+	register(&ErrorDef{ErrToolArgsInvalid, CatTool, SevWarning, "工具参数非法 JSON", "%s",
+		"模型输出的工具参数无法解析；同一模型反复出现说明它不适合工具调用，考虑换模型或降低 temperature", nil})
 
 	// Engine errors
-	register(&ErrorDef{ErrEngineMaxIter, CatEngine, SevWarning, "达到最大迭代次数", "Agent 执行了 %d 次迭代未完成", "任务可能过于复杂，尝试拆分为更小的子任务", false, false})
-	register(&ErrorDef{ErrEngineCtxCancel, CatEngine, SevInfo, "操作被中断", "用户取消了当前操作", "可以重新输入继续，之前的上下文保留", false, false})
-	register(&ErrorDef{ErrEngineCompact, CatEngine, SevInfo, "上下文已压缩", "对话超过 %d tokens，已自动压缩", "这是正常行为，较早的细节可能丢失", false, false})
-	register(&ErrorDef{ErrEnginePanic, CatEngine, SevFatal, "引擎内部崩溃", "未捕获的异常: %v", "引擎已自动恢复，当前对话可继续使用", false, false})
-	register(&ErrorDef{ErrEngineDreamFailed, CatEngine, SevWarning, "后台记忆整理失败", "%s", "通常是临时的 API 错误，下次满足门槛时会自动重试；也可以用 /dream run 立即重试", false, false})
-	register(&ErrorDef{ErrEngineNoProvider, CatEngine, SevFatal, "未初始化 Provider", "engine 缺少 provider 实例", "配置错误，请使用 /config provider.name xxx 设置后立即生效", false, false})
+	register(&ErrorDef{ErrEngineMaxIter, CatEngine, SevWarning, "达到最大迭代次数", "Agent 执行了 %d 次迭代未完成", "任务可能过于复杂，尝试拆分为更小的子任务", nil})
+	register(&ErrorDef{ErrEngineCtxCancel, CatEngine, SevInfo, "操作被中断", "用户取消了当前操作", "可以重新输入继续，之前的上下文保留", nil})
+	register(&ErrorDef{ErrEngineCompact, CatEngine, SevInfo, "上下文已压缩", "对话超过 %d tokens，已自动压缩", "这是正常行为，较早的细节可能丢失", nil})
+	register(&ErrorDef{ErrEnginePanic, CatEngine, SevFatal, "引擎内部崩溃", "未捕获的异常: %v", "引擎已自动恢复，当前对话可继续使用", nil})
+	register(&ErrorDef{ErrEngineDreamFailed, CatEngine, SevWarning, "后台记忆整理失败", "%s", "通常是临时的 API 错误，下次满足门槛时会自动重试；也可以用 /dream run 立即重试", nil})
+	register(&ErrorDef{ErrEngineNoProvider, CatEngine, SevFatal, "未初始化 Provider", "engine 缺少 provider 实例", "配置错误，请使用 /config provider.name xxx 设置后立即生效", nil})
+	register(&ErrorDef{ErrEngineStall, CatEngine, SevWarning, "模型调用无进展", "%s",
+		"长时间无响应可按 Ctrl+C 中断；本地模型常见于上下文接近上限或显存不足", nil})
 
 	// Session/FS errors
-	register(&ErrorDef{ErrSessionCorrupt, CatSession, SevWarning, "会话数据损坏", "无法加载会话 %s", "损坏的会话将被跳过，可以使用 /new 开始新会话", true, true})
-	register(&ErrorDef{ErrSessionSave, CatSession, SevWarning, "会话保存失败", "写入失败: %s", "可能是磁盘空间不足或权限问题", false, false})
-	register(&ErrorDef{ErrFSPermission, CatFileSystem, SevError, "文件系统权限错误", "无法写入 %s", "检查目录权限，或尝试其他路径", false, false})
-	register(&ErrorDef{ErrFSDiskFull, CatFileSystem, SevFatal, "磁盘空间不足", "写入失败，可用空间: %s", "请清理磁盘空间，清理后可继续使用无需重启", false, false})
+	register(&ErrorDef{ErrSessionCorrupt, CatSession, SevWarning, "会话数据损坏", "无法加载会话 %s", "损坏的会话已跳过；重启 cove 即开始新会话，/history 可查看其余可恢复的会话", nil})
+	register(&ErrorDef{ErrSessionSave, CatSession, SevWarning, "会话保存失败", "写入失败: %s", "可能是磁盘空间不足或权限问题", nil})
+	register(&ErrorDef{ErrFSPermission, CatFileSystem, SevError, "文件系统权限错误", "无法写入 %s", "检查目录权限，或尝试其他路径", nil})
+	register(&ErrorDef{ErrFSDiskFull, CatFileSystem, SevFatal, "磁盘空间不足", "写入失败，可用空间: %s", "请清理磁盘空间，清理后可继续使用无需重启", nil})
 }
 
 func register(def *ErrorDef) {

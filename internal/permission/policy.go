@@ -17,10 +17,10 @@ const (
 
 // PolicyRule defines a single permission rule with optional parameter matching.
 //
-// Rules persisted by the "[p] 永久允许" prompt answer use CommandPrefix (shell
-// tools), InputEquals (the MCP proxy) or neither (a whole tool), and Scope:
-// the absolute project root they were granted in. The engine ignores a rule
-// whose non-empty Scope is a different project.
+// Rules persisted by the "[p] 本项目记住" prompt answer use CommandPrefix or
+// CommandGroup (shell tools), InputEquals (the MCP proxy) or none of them (a
+// whole tool), and Scope: the absolute project root they were granted in.
+// The engine ignores a rule whose non-empty Scope is a different project.
 type PolicyRule struct {
 	ID          string            `json:"id"`
 	Description string            `json:"description"`
@@ -32,6 +32,9 @@ type PolicyRule struct {
 	// CommandPrefix scopes a shell-tool rule to commands starting with these
 	// words, with the same semantics as Rule.CommandPrefix.
 	CommandPrefix string `json:"command_prefix,omitempty"`
+	// CommandGroup scopes a shell-tool rule to the commands of a named group
+	// (GroupGitRoutine), with the same semantics as Rule.CommandGroup.
+	CommandGroup string `json:"command_group,omitempty"`
 	// InputEquals requires each input field to equal this string exactly.
 	InputEquals map[string]string `json:"input_equals,omitempty"`
 	// Scope is the project root the rule applies to; empty means everywhere.
@@ -40,19 +43,22 @@ type PolicyRule struct {
 
 // ToRule converts the rule to the session Manager's form, so persisted allow
 // rules are enforced by the same matcher (prefix pooling, plan mode) as
-// session ones. A rule with a CommandPrefix and no tool defaults to bash. It
-// reports false for rules the Manager cannot express: glob tool patterns
-// other than "*", ParamMatch, or no tool at all. The Decision is left for
-// Manager.AddRule to set.
+// session ones. A rule with a CommandPrefix or CommandGroup and no tool
+// defaults to bash. It reports false for rules the Manager cannot express:
+// glob tool patterns other than "*", ParamMatch, an unknown group, or no tool
+// at all. The Decision is left for Manager.AddRule to set.
 func (r PolicyRule) ToRule() (Rule, bool) {
 	tool := r.ToolPattern
-	if tool == "" && r.CommandPrefix != "" {
+	if tool == "" && (r.CommandPrefix != "" || r.CommandGroup != "") {
 		tool = "bash"
 	}
 	if tool == "" || len(r.ParamMatch) > 0 || (tool != "*" && strings.Contains(tool, "*")) {
 		return Rule{}, false
 	}
-	out := Rule{ToolPattern: tool, CommandPrefix: r.CommandPrefix}
+	if r.CommandGroup != "" && !KnownGroup(r.CommandGroup) {
+		return Rule{}, false
+	}
+	out := Rule{ToolPattern: tool, CommandPrefix: r.CommandPrefix, CommandGroup: r.CommandGroup}
 	if len(r.InputEquals) > 0 {
 		out.InputEquals = make(map[string]string, len(r.InputEquals))
 		for k, v := range r.InputEquals {
@@ -85,6 +91,16 @@ func (r *PolicyRule) Match(toolName string, params map[string]any) bool {
 				return false
 			}
 		} else if !anyCommandHasPrefixNormalized(command, prefix) {
+			return false
+		}
+	}
+	if r.CommandGroup != "" {
+		command, _ := params["command"].(string)
+		if r.Action == ActionAllow {
+			if !lineCovered(command, coverage{groups: []string{r.CommandGroup}}) {
+				return false
+			}
+		} else if !groupMatchesAny(r.CommandGroup, command) {
 			return false
 		}
 	}

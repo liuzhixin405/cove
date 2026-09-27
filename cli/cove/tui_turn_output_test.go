@@ -176,6 +176,36 @@ func TestToolProgressKeepsColourButDropsControlSequences(t *testing.T) {
 	}
 }
 
+// Live output used to appear before anything named the command producing
+// it (the tool's block is printed when the call ends), so "10.0.302" and a
+// directory listing showed up as loose lines. Now a header opens the output
+// and the lines are indented under it, however the chunks split them.
+func TestToolOutputStartHeadsAndIndentsTheLiveOutput(t *testing.T) {
+	buf := captureTurnOutput(t)
+	p := newTurnPrinter()
+	p.toolOutputStart("bash", "dotnet --version && dotnet --list-sdks")
+	p.toolProgress("bash", "10.0.302\n8.0.4")
+	p.toolProgress("bash", "13 [C:\\sdk]\ntotal 4\n")
+	p.stop()
+
+	out := buf.String()
+	head := strings.Index(out, "▸ bash dotnet --version && dotnet --list-sdks")
+	first := strings.Index(out, "10.0.302")
+	if head < 0 || first < 0 || head > first {
+		t.Fatalf("header %d must come before the output %d: %q", head, first, out)
+	}
+	// Each line starts indented, including the one whose start came in the
+	// first chunk and whose rest came in the second.
+	for _, start := range []string{"10.0.302", "8.0.4", "total 4"} {
+		if !strings.Contains(out, toolProgressIndent+start) {
+			t.Errorf("output line %q is not indented under the header: %q", start, out)
+		}
+	}
+	if strings.Contains(out, toolProgressIndent+"13 [C:") {
+		t.Errorf("a line split across chunks was indented in the middle: %q", out)
+	}
+}
+
 // A provider error body is echoed in "Request failed: ..."; it is untrusted.
 func TestRequestFailureMessageIsSanitised(t *testing.T) {
 	buf := captureTurnOutput(t)

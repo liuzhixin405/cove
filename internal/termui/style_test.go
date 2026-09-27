@@ -140,10 +140,9 @@ func TestToolResultWithAlreadyStyledSummary(t *testing.T) {
 func TestPermissionPromptExactOutput(t *testing.T) {
 	got := PermissionPrompt("Bash", "ls -la")
 	want := "\r\x1b[K\a" +
-		"\n  \x1b[33m╭── 需要授权 ──────────────────────╮\x1b[0m\n" +
-		"  \x1b[33m│\x1b[0m  工具: \x1b[36mBash\x1b[0m\n" +
-		"  \x1b[33m│\x1b[0m  说明: ls -la\n" +
-		"  \x1b[33m╰──────────────────────────────────╯\x1b[0m\n"
+		"\n  \x1b[33m┃\x1b[0m \x1b[1m需要授权\x1b[0m  \x1b[36mBash\x1b[0m\n" +
+		"  \x1b[33m┃\x1b[0m ls -la\n" +
+		"  \x1b[33m┃\x1b[0m\n"
 	if got != want {
 		t.Errorf("PermissionPrompt\ngot:  %q\nwant: %q", got, want)
 	}
@@ -156,43 +155,46 @@ func TestPermissionPromptExactOutput(t *testing.T) {
 
 func TestPermissionPromptOmitsDescriptionLineWhenEmpty(t *testing.T) {
 	got := PermissionPrompt("Read", "")
-	if strings.Contains(got, "说明") {
-		t.Errorf("empty description should not render a 说明 line: %q", got)
-	}
 	plain := ansi.Strip(got)
-	if n := strings.Count(plain, "│"); n != 1 {
-		t.Errorf("want exactly 1 body line (the tool line), got %d: %q", n, plain)
+	// Header and the empty spacer row only: no description row.
+	if n := strings.Count(plain, "┃"); n != 2 {
+		t.Errorf("want header + spacer gutter rows, got %d: %q", n, plain)
 	}
-	if !strings.Contains(plain, "工具: Read") {
-		t.Errorf("tool line missing: %q", plain)
+	if !strings.Contains(plain, "┃ 需要授权  Read\n  ┃\n") {
+		t.Errorf("header or spacer wrong: %q", plain)
 	}
 }
 
-// TestPermissionPromptBoxBordersAlign is a display-width invariant: a drawn box
-// whose top and bottom rules differ by even one column is visibly crooked in
-// the terminal. Measured with ansi.StringWidth because the top rule contains
-// double-width CJK in its title and len() would be meaningless.
-func TestPermissionPromptBoxBordersAlign(t *testing.T) {
-	plain := ansi.Strip(PermissionPrompt("Bash", "ls"))
+// Every row of a multi-line description sits behind the gutter, at the same
+// content column as the first.
+func TestPermissionPromptAlignsContinuationRows(t *testing.T) {
+	plain := ansi.Strip(PermissionPrompt("bash", "git commit -m \"x\" -m \"- a\n- b\""))
+	if !strings.Contains(plain, "  ┃ git commit -m \"x\" -m \"- a\n  ┃ - b\"\n  ┃\n") {
+		t.Errorf("description rows not aligned behind the gutter: %q", plain)
+	}
+}
 
-	var top, bottom string
-	for _, line := range strings.Split(plain, "\n") {
-		trimmed := strings.TrimLeft(line, " \r\a")
-		switch {
-		case strings.HasPrefix(trimmed, "╭"):
-			top = trimmed
-		case strings.HasPrefix(trimmed, "╰"):
-			bottom = trimmed
+// The prompt used to be a box with a fixed 34-column top rule: a command
+// longer than that broke its right side and the top read as a short tab.
+// Now every row starts with the same gutter, whatever the command's width,
+// so nothing can be misaligned.
+func TestPermissionPromptEveryRowStartsWithTheGutter(t *testing.T) {
+	long := "dotnet --version 2>/dev/null && dotnet --list-sdks 2>/dev/null || echo \"dotnet not found\""
+	plain := ansi.Strip(PermissionPrompt("bash", long))
+	rows := strings.Split(strings.TrimSuffix(strings.TrimPrefix(plain, "\r\a\n"), "\n"), "\n")
+	if len(rows) != 3 {
+		t.Fatalf("want header, command, spacer; got %d rows: %q", len(rows), plain)
+	}
+	for _, r := range rows {
+		if !strings.HasPrefix(r, "  ┃") {
+			t.Errorf("row without the gutter: %q", r)
 		}
 	}
-	if top == "" || bottom == "" {
-		t.Fatalf("could not find both box rules in %q", plain)
+	if !strings.Contains(plain, "┃ "+long+"\n") {
+		t.Errorf("long command was not shown whole on its row: %q", plain)
 	}
-
-	topW, bottomW := ansi.StringWidth(top), ansi.StringWidth(bottom)
-	if topW != bottomW {
-		t.Errorf("box rules are misaligned: top %q is %d columns, bottom %q is %d columns",
-			top, topW, bottom, bottomW)
+	if strings.ContainsAny(plain, "╭╮╰╯│") {
+		t.Errorf("box drawing survived: %q", plain)
 	}
 }
 
@@ -250,15 +252,25 @@ func TestPermissionPromptLeavesShortDescriptionIntact(t *testing.T) {
 	}
 }
 
-// descriptionLine pulls the text after "说明: " out of a rendered prompt.
+// descriptionLine pulls the first description row (the gutter row after the
+// header) out of a rendered prompt.
 func descriptionLine(t *testing.T, prompt string) string {
 	t.Helper()
+	header := true
 	for _, line := range strings.Split(ansi.Strip(prompt), "\n") {
-		if i := strings.Index(line, "说明: "); i >= 0 {
-			return line[i+len("说明: "):]
+		if !strings.HasPrefix(line, "  ┃") {
+			continue
 		}
+		if header {
+			header = false
+			continue
+		}
+		if line == "  ┃" {
+			break // the spacer: no description row
+		}
+		return strings.TrimPrefix(line, "  ┃ ")
 	}
-	t.Fatalf("no 说明 line in prompt %q", prompt)
+	t.Fatalf("no description row in prompt %q", prompt)
 	return ""
 }
 

@@ -41,6 +41,12 @@ type permissionRuleAdder interface {
 	AddPermissionRule(permission.Decision, permission.Rule)
 }
 
+// permissionExplainer is implemented by *engine.Engine: it says why the
+// rules remembered for a tool do not cover the call being asked about.
+type permissionExplainer interface {
+	ExplainPermissionGap(toolName string, input map[string]any) string
+}
+
 // permissionRulePersister is implemented by *engine.Engine: it writes allow
 // rules to the policies file (engine.PolicyFilePath) in one save, scoped to
 // the engine's project root, and on success installs them for this session as
@@ -65,30 +71,42 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 		return false
 	}
 
-	rules, scope, canRemember := alwaysAllowScope(toolName, input)
+	rules, what, canRemember := alwaysAllowScope(toolName, input)
 	persister, canPersist := eng.(permissionRulePersister)
 	canPersist = canPersist && canRemember
+	// Short labels on the answer line; what an "a"/"p" would remember is
+	// stated once, on its own line below, instead of being repeated inside
+	// both options. The line used to read [a] 本次会话总是允许 "cd"、"git
+	// push"、"echo"、"git log" 开头的命令 [p] 永久允许 "cd"、"git push"、… and
+	// had to be read in full before answering.
 	options := "[y] 允许"
 	if canRemember {
-		options += "   [a] 本次会话总是允许"
-		if scope != "" {
-			options += " " + scope
-		}
+		options += "   [a] 本会话记住"
 	}
 	if canPersist {
-		options += "   [p] 永久允许"
-		if scope != "" {
-			options += " " + scope
-		}
-		options += "（本项目）"
+		options += "   [p] 本项目记住"
 	}
 	options += "   [n] 拒绝"
+	// The answer line starts at the prompt's content column, the scope line
+	// one step further in, so the block reads as one indented unit.
+	text := termui.PermissionPrompt(toolName, permissionPromptDescription(input, reason)) +
+		termui.PromptContentIndent + termui.Styled(termui.Bold, options) +
+		"   " + termui.Styled(termui.Dim, "（回车无效，Ctrl+C 拒绝并停止任务）") + "\n"
+	if canRemember {
+		text += termui.PromptContentIndent + "    " + termui.Styled(termui.Dim, "记住范围: "+what) + "\n"
+	}
+	// Rules were remembered but do not cover this line: say why, or the
+	// prompt reads as if remembering had not worked.
+	if ex, ok := eng.(permissionExplainer); ok {
+		if why := ex.ExplainPermissionGap(toolName, input); why != "" {
+			text += termui.PromptContentIndent + "    " + termui.Styled(termui.Yellow, why) + "\n"
+		}
+	}
 
 	answerCh := make(chan string, 1)
-	repl.SetPermInputCh(answerCh)
+	repl.SetPromptInput(answerCh, permissionAnswerAccepted, permissionAnswerHint)
 	repl.BeginPromptInput()
-	termui.PrintAbove(termui.PermissionPrompt(toolName, permissionPromptDescription(input, reason)) +
-		"  " + termui.Styled(termui.Bold, options) + "\n")
+	termui.PrintAbove(text)
 
 	timer := time.NewTimer(permissionPromptTimeout)
 	defer timer.Stop()
@@ -99,7 +117,7 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	case <-timer.C:
 		repl.EndPromptInput()
 		repl.ClearPermInputCh()
-		termui.PrintAbove("  " + termui.Styled(termui.Dim, "授权超时，已拒绝 "+toolName) + "\n")
+		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "授权超时，已拒绝 "+toolName) + "\n")
 		return false
 	}
 
@@ -117,13 +135,9 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	case allow && always && !canRemember:
 		// "a"/"p" was typed although it was not offered: honour the allow, but
 		// remembering a wider scope than the user saw would be a surprise.
-		termui.PrintAbove("  " + termui.Styled(termui.Dim, "此命令无法按前缀记住，仅允许本次") + "\n")
+		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "此命令无法按前缀记住，仅允许本次") + "\n")
 		return true
 	case allow && persist && canPersist:
-		what := toolName
-		if scope != "" {
-			what += " 中 " + scope
-		}
 		root := persister.PermissionScope()
 		// A successful persist installs the rules itself, registered as
 		// rules loaded from policies.json so /cd to another project drops
@@ -132,10 +146,10 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 			for _, r := range rules {
 				eng.AddPermissionRule(permission.DAllow, r)
 			}
-			termui.PrintAbove("  " + termui.Styled(termui.Dim, "已允许 "+what+"；未能写入，仅本次会话有效（policies.json: "+err.Error()+"）") + "\n")
+			termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "已允许 "+what+"；未能写入，仅本次会话有效（policies.json: "+err.Error()+"）") + "\n")
 			return true
 		}
-		termui.PrintAbove("  " + termui.Styled(termui.Dim, "已永久允许 "+what+"（项目 "+root+"，已写入 "+policiesFileForDisplay()+"）") + "\n")
+		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "已记住 "+what+"（项目 "+root+"，已写入 "+policiesFileForDisplay()+"）") + "\n")
 		return true
 	case allow && always:
 		// The engine consults its own manager (e.perm), so the rules have to be
@@ -143,29 +157,43 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 		for _, r := range rules {
 			eng.AddPermissionRule(permission.DAllow, r)
 		}
-		what := toolName
-		if scope != "" {
-			what += " 中 " + scope
-		}
-		termui.PrintAbove("  " + termui.Styled(termui.Dim, "已允许 "+what+"（本次会话）") + "\n")
+		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "已记住 "+what+"（本次会话）") + "\n")
 		return true
 	case allow:
 		return true
 	default:
+		// The result used to reach only the model, as a tool error.
+		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "已拒绝 "+toolName) + "\n")
 		return false
 	}
 }
 
-// alwaysAllowScope decides what an "a" answer remembers. Shell tools get one
-// rule per command prefix in the line (see permission.CommandPrefixes), with
-// scope naming them for the prompt, e.g. `"go test" 开头的命令`; allowing the
-// whole bash tool would let every later command, rm -rf included, run
-// unasked. The MCP proxy gets one rule for the server tool being called, e.g.
-// `MCP 工具 "github/create_issue"`. Other tools keep a whole-tool rule and an
-// empty scope. ok is false when a shell command has no prefix that can be
+// permissionAnswerHint is shown for a typed line that does not answer the
+// prompt.
+const permissionAnswerHint = "授权提示等待回答：y 允许 / a 本会话记住 / p 本项目记住 / n 拒绝"
+
+// permissionAnswerAccepted reports whether line is one of the prompt's
+// answers. Anything else is the person's next instruction, not a refusal.
+func permissionAnswerAccepted(line string) bool {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes", "是", "允许", "a", "always", "总是", "p", "permanent", "永久", "n", "no", "否", "拒绝":
+		return true
+	}
+	return false
+}
+
+// alwaysAllowScope decides what an "a" answer remembers, and describes it
+// for the prompt's 记住范围 line and the confirmation. Shell tools get the
+// rules of permission.ShellRememberRules: the routine git group for a
+// routine git write (`bash 中 git 常规操作（…）`), otherwise one rule per
+// command prefix that needed approval (`bash 中 "go test" 开头的命令`);
+// allowing the whole bash tool would let every later command, rm -rf
+// included, run unasked. The MCP proxy gets one rule for the server tool
+// being called, e.g. `MCP 工具 "github/create_issue"`. Other tools get a
+// whole-tool rule. ok is false when a shell command has no prefix that can be
 // remembered safely (or an MCP call names no server tool), so "a" is not
 // offered at all.
-func alwaysAllowScope(toolName string, input map[string]any) (rules []permission.Rule, scope string, ok bool) {
+func alwaysAllowScope(toolName string, input map[string]any) (rules []permission.Rule, what string, ok bool) {
 	if toolName == "mcp" {
 		// The MCP proxy fronts every tool of every connected server; a
 		// whole-tool rule allowed all of them, destructive ones included, for
@@ -179,19 +207,28 @@ func alwaysAllowScope(toolName string, input map[string]any) (rules []permission
 		return []permission.Rule{rule}, `MCP 工具 "` + server + "/" + name + `"`, true
 	}
 	if !permission.IsShellTool(toolName) {
-		return []permission.Rule{{ToolPattern: toolName}}, "", true
+		return []permission.Rule{{ToolPattern: toolName}}, "工具 " + toolName + " 的所有调用", true
 	}
 	command, _ := input["command"].(string)
-	prefixes, ok := permission.CommandPrefixesFor(command, permission.ToolShellKind(toolName))
+	rules, ok = permission.ShellRememberRules(toolName, command, permission.ToolShellKind(toolName))
 	if !ok {
 		return nil, "", false
 	}
-	quoted := make([]string, len(prefixes))
-	for i, p := range prefixes {
-		rules = append(rules, permission.Rule{ToolPattern: toolName, CommandPrefix: p})
-		quoted[i] = `"` + p + `"`
+	return rules, toolName + " 中 " + describeShellRules(rules), true
+}
+
+// describeShellRules names the rules of ShellRememberRules for a reader.
+func describeShellRules(rules []permission.Rule) string {
+	parts := make([]string, 0, len(rules))
+	for _, r := range rules {
+		switch {
+		case r.CommandGroup != "":
+			parts = append(parts, permission.GroupLabel(r.CommandGroup))
+		case r.CommandPrefix != "":
+			parts = append(parts, `"`+r.CommandPrefix+`" 开头的命令`)
+		}
 	}
-	return rules, strings.Join(quoted, "、") + " 开头的命令", true
+	return strings.Join(parts, "、")
 }
 
 // permissionAnswerDecision maps a raw answer line to a decision: allow reports

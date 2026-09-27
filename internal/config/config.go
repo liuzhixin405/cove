@@ -79,18 +79,29 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	Model          string                     `json:"model"`
-	ModelFast      string                     `json:"model_fast,omitempty"`
-	Provider       ProviderConfig             `json:"provider"`
-	PermissionMode string                     `json:"permission_mode"`
-	MaxBudgetUsd   float64                    `json:"max_budget_usd"`
-	ThinkingTokens int                        `json:"thinking_tokens"`
-	Debug          bool                       `json:"debug"`
-	Verbose        bool                       `json:"verbose"`
-	SystemPrompt   string                     `json:"system_prompt,omitempty"`
-	MCPServers     map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
-	Profiles       map[string]*Profile        `json:"profiles,omitempty"`
-	ActiveProfile  string                     `json:"active_profile,omitempty"`
+	Model          string         `json:"model"`
+	ModelFast      string         `json:"model_fast,omitempty"`
+	Provider       ProviderConfig `json:"provider"`
+	PermissionMode string         `json:"permission_mode"`
+	MaxBudgetUsd   float64        `json:"max_budget_usd"`
+	ThinkingTokens int            `json:"thinking_tokens"`
+	// ContextWindow is the context window of Model in tokens, for servers
+	// cove cannot recognise by model name (a local llama.cpp with -c 16384).
+	// It sizes compaction; 0 keeps the name-based estimate. The E2008
+	// remedy suggests the value to put here.
+	ContextWindow int `json:"context_window,omitempty"`
+	// ModelContextWindows are windows learned per model (lower-cased name →
+	// tokens): the E2008 remedy writes the window a server reported here,
+	// so the next start budgets for it without hitting the wall again. It is
+	// keyed by model, unlike ContextWindow, so switching profiles does not
+	// apply one model's window to another.
+	ModelContextWindows map[string]int             `json:"model_context_windows,omitempty"`
+	Debug               bool                       `json:"debug"`
+	Verbose             bool                       `json:"verbose"`
+	SystemPrompt        string                     `json:"system_prompt,omitempty"`
+	MCPServers          map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
+	Profiles            map[string]*Profile        `json:"profiles,omitempty"`
+	ActiveProfile       string                     `json:"active_profile,omitempty"`
 	// The former "telemetry" key is no longer read (the recorder had no
 	// callers and was removed). Old files that still carry it load fine:
 	// unknown keys are ignored, and Save keeps them on disk.

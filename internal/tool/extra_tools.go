@@ -294,7 +294,13 @@ func (t *QuestionTool) Call(ctx context.Context, input Input, tctx Context) (Res
 			labels = append(labels, label)
 			fmt.Fprintf(&prompt, "  %d. %v: %v\n", idx+1, om["label"], om["description"])
 		}
+		if tctx.SetWaiting != nil {
+			tctx.SetWaiting(true)
+		}
 		raw := tctx.Runtime.AskUser(prompt.String())
+		if tctx.SetWaiting != nil {
+			tctx.SetWaiting(false)
+		}
 		if raw == AskUserCancelled || ctx.Err() != nil {
 			return questionCancelled, nil
 		}

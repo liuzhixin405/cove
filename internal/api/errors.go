@@ -148,7 +148,9 @@ func IsContextLengthError(err error) bool {
 
 // isContextLengthText matches the wordings DeepSeek/OpenAI ("maximum context
 // length", context_length_exceeded), Anthropic ("prompt is too long",
-// request_too_large) and other compatible servers use for an oversized prompt.
+// request_too_large), llama.cpp-based local servers such as llama-server and
+// LM Studio ("exceeds the available context size", exceed_context_size_error,
+// n_ctx) and other compatible servers use for an oversized prompt.
 func isContextLengthText(status int, msg string) bool {
 	if status == http.StatusRequestEntityTooLarge {
 		return true
@@ -161,6 +163,7 @@ func isContextLengthText(status int, msg string) bool {
 		"context_length_exceeded", "maximum context length", "context length",
 		"context window", "prompt is too long", "request_too_large",
 		"input is too long", "too many input tokens",
+		"exceed_context_size", "context size", "n_ctx",
 	} {
 		if strings.Contains(s, p) {
 			return true

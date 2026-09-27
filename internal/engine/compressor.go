@@ -173,7 +173,7 @@ func (cc *ChatCompressor) Compress(
 		truncated := make([]api.Message, 0, 1+keepCount)
 		truncated = append(truncated, api.Message{
 			Role:    "user",
-			Content: "<compress summary=\"context-truncated\">\n[Context truncated due to length. Continue the task.]\n</compress>",
+			Content: "<compress summary=\"context-truncated\">\n" + originalRequestBlock(messages) + "[Context truncated due to length. Continue the task.]\n</compress>",
 		})
 		truncated = append(truncated, messages[splitIdx:]...)
 		return &CompressResult{
@@ -190,7 +190,7 @@ func (cc *ChatCompressor) Compress(
 	compressed := make([]api.Message, 0, 1+keepCount)
 	compressed = append(compressed, api.Message{
 		Role:    "user",
-		Content: "<compress summary=\"conversation-history\">\n" + summary + "\n\n[Continue the task from where you left off.]\n</compress>",
+		Content: "<compress summary=\"conversation-history\">\n" + originalRequestBlock(messages) + summary + "\n\n[Continue the task from where you left off.]\n</compress>",
 	})
 	compressed = append(compressed, messages[splitIdx:]...)
 
@@ -357,6 +357,31 @@ func toolTargetPath(input map[string]any) string {
 // clipRunes truncates s to at most n runes (not bytes), appending "..." if it
 // was shortened. Byte-slicing (s[:n]) would cut multi-byte UTF-8 sequences mid
 // character and corrupt Chinese/emoji text, which this codebase produces heavily.
+// originalRequest is the first genuine (non-synthetic) user message of a
+// history: the task everything since has been about.
+func originalRequest(messages []api.Message) string {
+	for _, m := range messages {
+		if m.Role == "user" && !m.Synthetic && strings.TrimSpace(m.Content) != "" {
+			return strings.TrimSpace(m.Content)
+		}
+	}
+	return ""
+}
+
+// originalRequestBlock is the <original_request> block every compaction
+// message starts with, or "" when the history has no genuine request. A
+// summary can misstate the task and a truncation drops it entirely (a real
+// session continued from "[Context truncated]" alone); the request itself is
+// short and is kept verbatim, so the model can always re-read what it was
+// asked to do.
+func originalRequestBlock(messages []api.Message) string {
+	orig := originalRequest(messages)
+	if orig == "" {
+		return ""
+	}
+	return "<original_request>\n" + clipRunes(orig, summaryFirstUserRunes) + "\n</original_request>\n\n"
+}
+
 func clipRunes(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {

@@ -47,6 +47,10 @@ type Rule struct {
 	// CommandPrefix scopes a bash/powershell rule to command lines built from
 	// commands that start with these words; see commandCovered.
 	CommandPrefix string
+	// CommandGroup scopes a bash/powershell rule to command lines built from
+	// the commands of a named group (GroupGitRoutine); pooled with prefix
+	// rules like CommandPrefix is.
+	CommandGroup string
 	// InputEquals scopes a rule to calls whose input has each of these
 	// fields set to exactly this string, e.g. serverName+toolName for the
 	// MCP proxy tool.
@@ -154,7 +158,8 @@ func SameRule(a, b Rule) bool { return sameRule(a, b) }
 // sameRule reports whether a and b match the same calls; Decision is ignored.
 func sameRule(a, b Rule) bool {
 	if a.ToolPattern != b.ToolPattern || a.ArgPattern != b.ArgPattern ||
-		a.CommandPrefix != b.CommandPrefix || len(a.InputEquals) != len(b.InputEquals) {
+		a.CommandPrefix != b.CommandPrefix || a.CommandGroup != b.CommandGroup ||
+		len(a.InputEquals) != len(b.InputEquals) {
 		return false
 	}
 	for k, v := range a.InputEquals {
@@ -189,13 +194,18 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 			return DAsk, ReasonAskRule
 		}
 	}
-	var prefixes [][]string
+	cov := coverage{kind: shellKindFor(toolName, m.shellKind)}
 	for _, r := range m.allow {
-		if r.CommandPrefix != "" {
-			// Prefix rules are pooled: a compound line is allowed when each of
-			// its commands is covered by some rule, not necessarily the same one.
+		if r.CommandPrefix != "" || r.CommandGroup != "" {
+			// Prefix and group rules are pooled: a compound line is allowed
+			// when each of its commands is covered by some rule, not
+			// necessarily the same one.
 			if toolMatches(r, toolName) {
-				prefixes = append(prefixes, strings.Fields(r.CommandPrefix))
+				if r.CommandPrefix != "" {
+					cov.prefixes = append(cov.prefixes, strings.Fields(r.CommandPrefix))
+				} else {
+					cov.groups = append(cov.groups, r.CommandGroup)
+				}
 			}
 			continue
 		}
@@ -203,7 +213,7 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 			return DAllow, "allowed by policy rule"
 		}
 	}
-	if len(prefixes) > 0 && commandCovered(inputCommand(toolInput), prefixes, shellKindFor(toolName, m.shellKind)) {
+	if !cov.empty() && lineCovered(inputCommand(toolInput), cov) {
 		return DAllow, "allowed by command prefix rule"
 	}
 	switch m.mode {
@@ -230,10 +240,14 @@ func matchRule(r Rule, toolName string, input map[string]any) bool {
 	if !toolMatches(r, toolName) {
 		return false
 	}
-	// Allow rules with a prefix never reach here (Check pools them); for deny
-	// and ask a prefix rule applies when any command in the line matches it.
+	// Allow rules with a prefix or group never reach here (Check pools them);
+	// for deny and ask such a rule applies when any command in the line
+	// matches it.
 	if r.CommandPrefix != "" {
 		return anyCommandHasPrefixNormalized(inputCommand(input), strings.Fields(r.CommandPrefix))
+	}
+	if r.CommandGroup != "" {
+		return groupMatchesAny(r.CommandGroup, inputCommand(input))
 	}
 	for field, want := range r.InputEquals {
 		if got, ok := input[field].(string); !ok || got != want {

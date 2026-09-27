@@ -21,8 +21,10 @@ func isTransientRequestError(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
+	// Timeouts are deliberately absent: the request may have been served
+	// and billed, so the manual promises not to resend it (the user can
+	// /continue). Connection-level failures never reached the model.
 	transientHints := []string{
-		"timeout", "timed out", "awaiting response headers", "deadline exceeded",
 		"connection reset", "broken pipe", "connection refused", "eof",
 		"temporary", "temporarily unavailable", "server error 5", "bad gateway",
 	}
@@ -62,6 +64,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			// user can tell what a slow command is actually doing instead of only
 			// seeing the stall warning.
 			eng.OnToolProgress = p.toolProgress
+			eng.OnToolOutputStart = p.toolOutputStart
 			// Route engine diagnostic lines (tool start/finish, stall warnings,
 			// memory/skill extraction notices) through the printer so they appear
 			// in the conversation area.
@@ -71,6 +74,7 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				eng.OnPermissionPause = nil
 				eng.OnPermissionDone = nil
 				eng.OnToolProgress = nil
+				eng.OnToolOutputStart = nil
 				eng.OnEngineOutput = nil
 				eng.OnTurnModel = nil
 			}()
@@ -358,6 +362,28 @@ func (p *turnPrinter) reasoning(s string) {
 	p.printLocked(termui.ReasoningStyle + out + termui.Reset)
 }
 
+// toolOutputStart opens the live output of a tool call with a dim header
+// naming the command. The engine's own block for the call (the "✓ Command:
+// … · 共 5 行" line) arrives only when the call has finished, so the raw
+// output used to appear first, as loose lines with nothing saying where
+// they came from; now they read as the output of a named command, indented
+// under its header.
+func (p *turnPrinter) toolOutputStart(toolName, header string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopSpinnerLocked()
+	line := "  ▸ " + toolName
+	if h := strings.TrimSpace(render.StripControls(strings.ReplaceAll(header, "\n", " "))); h != "" {
+		line += " " + h
+	}
+	p.switchToLocked(outProgress)
+	p.printLocked(termui.Dim + line + "  实时输出:" + termui.Reset + "\n")
+}
+
+// toolProgressIndent is what live tool output is indented by, under the
+// header toolOutputStart printed.
+const toolProgressIndent = "    "
+
 // toolProgress surfaces live output from long-running tools (bash,
 // powershell) so the user can tell what a slow command is doing. The
 // command's own colour survives; its control sequences do not.
@@ -370,7 +396,26 @@ func (p *turnPrinter) toolProgress(toolName, chunk string) {
 		return
 	}
 	p.switchToLocked(outProgress)
-	p.printLocked(termui.Dim + out + termui.Reset)
+	p.printLocked(termui.Dim + indentLines(out, toolProgressIndent, p.atLineStart) + termui.Reset)
+}
+
+// indentLines puts indent at the start of every line of s: at its beginning
+// when the cursor is at the start of a row, and after every newline that
+// more text follows. Chunks split lines anywhere, so the next chunk's
+// leading indent is decided by where this one left the cursor.
+func indentLines(s, indent string, atLineStart bool) string {
+	var sb strings.Builder
+	if atLineStart {
+		sb.WriteString(indent)
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		sb.WriteByte(c)
+		if c == '\n' && i+1 < len(s) {
+			sb.WriteString(indent)
+		}
+	}
+	return sb.String()
 }
 
 // engineLine prints one of the engine's lines (a tool block, a stall or

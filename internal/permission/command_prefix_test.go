@@ -13,12 +13,13 @@ func TestCommandPrefixesPicksExecutableAndSubcommand(t *testing.T) {
 		want []string
 	}{
 		{"go test ./...", []string{"go test"}},
-		{"git status", []string{"git status"}},
+		{"git push", []string{"git push"}},
 		{"npm run build", []string{"npm run"}},
 		{"docker compose up -d", []string{"docker compose"}},
-		{"ls -la", []string{"ls"}},
-		{"cat a.txt", []string{"cat"}},
-		{"cd src && go test ./...", []string{"cd", "go test"}},
+		{"rm -rf build", []string{"rm"}},
+		{"sed -i s/a/b/ a.txt", []string{"sed"}},
+		// Read-only companions are not remembered (TestCommandPrefixesSkipReadOnlyCommands).
+		{"cd src && go test ./...", []string{"go test"}},
 		{"go test ./a && go test ./b", []string{"go test"}},
 		{"go test ./... | tee out.txt", []string{"go test", "tee"}},
 		{"go test ./... 2>&1", []string{"go test"}},
@@ -39,6 +40,10 @@ func TestCommandPrefixesPicksExecutableAndSubcommand(t *testing.T) {
 func TestCommandPrefixesRefusesLinesThatCannotBeScoped(t *testing.T) {
 	for _, cmd := range []string{
 		"",
+		// Entirely read-only: nothing needed approval, nothing to remember.
+		"git status",
+		"ls -la",
+		"cat a.txt",
 		"sudo go test ./...",
 		"FOO=1 go test",
 		"env go test",

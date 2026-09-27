@@ -166,6 +166,25 @@ func (c *Classifier) IsReadOnlyLineFor(command string, kind ShellKind) bool {
 	return true
 }
 
+// readOnlyCommandWords is IsReadOnlyLineFor for one simple command given as
+// its words: rated CatSafe, not a network fetch, not a PowerShell iterator.
+// Under ShellCmd nothing qualifies, for the reason IsReadOnlyLineFor gives.
+// Callers have already checked the command's redirects and quoting
+// (coverableCommands), which classifyLine does for a whole line.
+func (c *Classifier) readOnlyCommandWords(words []string, kind ShellKind) bool {
+	if kind == ShellCmd || len(words) == 0 {
+		return false
+	}
+	if maybePowerShell(kind) && powerShellIterator(words[0]) {
+		return false
+	}
+	switch programName(words[0]) {
+	case "curl", "wget":
+		return false
+	}
+	return c.classifyWords(words) == CatSafe
+}
+
 // AutoApproveLine is the auto-mode test: every command in the line is
 // read-only or a build/test command.
 func (c *Classifier) AutoApproveLine(command string) bool {
@@ -326,7 +345,10 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 		"which", "where", "whoami", "uname", "uptime", "id", "groups", "grep", "egrep", "fgrep",
 		"locate", "stat", "type", "realpath", "basename", "dirname", "true",
 		"get-childitem", "gci", "get-content", "gc", "get-location", "gl", "select-string", "sls",
-		"test-path", "get-item", "gi", "resolve-path", "get-command", "gcm":
+		"test-path", "get-item", "gi", "resolve-path", "get-command", "gcm",
+		// Changing directory alters nothing by itself; the commands run
+		// there are rated on their own. A UNC target is refused above.
+		"cd", "pushd", "popd", "set-location", "sl":
 		return CatSafe
 	case "date":
 		for _, a := range args {

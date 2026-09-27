@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 
@@ -21,6 +22,13 @@ type mcpPoolView interface {
 }
 
 func NewMCPTool(pool mcpPoolView) Tool {
+	// A typed nil pointer in the interface is not == nil; Def and Call
+	// used to dereference it.
+	if pool != nil {
+		if rv := reflect.ValueOf(pool); rv.Kind() == reflect.Ptr && rv.IsNil() {
+			pool = nil
+		}
+	}
 	return &mcpToolProxy{pool: pool, baseTool: baseTool{def: Def{
 		Name:        "mcp",
 		Description: "Invoke tools from connected MCP servers. Use when you need capabilities provided by external tools.",

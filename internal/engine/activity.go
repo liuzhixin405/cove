@@ -2,8 +2,10 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/diagnostic"
 )
 
@@ -82,6 +84,7 @@ func (e *Engine) runStallMonitor(stop <-chan struct{}) {
 			type stuck struct {
 				label string
 				idle  time.Duration
+				first bool // first notification for this stall
 			}
 			var stuckList []stuck
 			e.actMu.Lock()
@@ -90,25 +93,60 @@ func (e *Engine) runStallMonitor(stop <-chan struct{}) {
 					continue
 				}
 				idle := now.Sub(a.lastProgress)
+				threshold := e.stallThresholdFor(a.label)
 				// Notify once at the threshold, then re-notify every further
 				// threshold so the user sees the elapsed time keep growing.
-				if idle >= stallThreshold && idle-a.lastNotified >= stallThreshold {
+				if idle >= threshold && idle-a.lastNotified >= threshold {
+					first := a.lastNotified == 0
 					a.lastNotified = idle
-					stuckList = append(stuckList, stuck{a.label, idle})
+					stuckList = append(stuckList, stuck{a.label, idle, first})
 				}
 			}
 			e.actMu.Unlock()
 			for _, s := range stuckList {
-				e.engineOutput(fmt.Sprintf(
-					"\r\x1b[K\x1b[33m! still in '%s', no progress for %s (possibly stuck, press Ctrl+C to interrupt)\x1b[0m\n",
-					s.label, s.idle.Round(time.Second)))
-				// Record once to the runtime log. We deliberately do NOT also call
-				// log.Warnf here: the live stderr line above already shows it, and
-				// log.Warnf would be mirrored into the same log via the sink,
-				// producing a duplicate entry.
-				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatEngine,
-					fmt.Sprintf("stage '%s' stalled with no progress for %s", s.label, s.idle.Round(time.Second)))
+				e.reportStall(s.label, s.idle, s.first)
 			}
 		}
 	}
+}
+
+// reportStall shows the stall line for a stage and, on the first
+// notification of a stall, records it as E5007: the later reminders are the
+// same stall, and /diagnose errors counts stalls, not reminders. It does not
+// log it either: a log line would land in errors.log a second time, uncoded,
+// through the log sink.
+func (e *Engine) reportStall(label string, idle time.Duration, record bool) {
+	e.engineOutput(fmt.Sprintf(
+		"\r\x1b[K\x1b[33m! 仍在「%s」阶段，已 %s 无进展（可能卡住，按 Ctrl+C 可中断）\x1b[0m\n",
+		label, idle.Round(time.Second)))
+	if record {
+		diagnostic.ReportError(&diagnostic.Stall{Stage: label, Idle: idle}, e.diagContext("", ""))
+	}
+}
+
+// localModelStallThreshold is the stall threshold for a model call served by
+// a local or self-hosted provider: a CPU-bound llama.cpp spends well over 30
+// seconds on a 13K prompt before its first token, and calling that a hang
+// every 30 seconds was noise.
+const localModelStallThreshold = 90 * time.Second
+
+// stallThresholdFor is the idle time after which the stage named label is
+// called stuck: longer for model calls to a local provider.
+func (e *Engine) stallThresholdFor(label string) time.Duration {
+	if strings.HasPrefix(label, "call model") && e.localProvider() {
+		return localModelStallThreshold
+	}
+	return stallThreshold
+}
+
+// localProvider reports whether the configured provider is a local or
+// self-hosted server: a loopback base URL, or a provider that only exists
+// locally.
+func (e *Engine) localProvider() bool {
+	pc := e.config.Provider
+	switch strings.ToLower(pc.Name) {
+	case "ollama", "lmstudio", "llamacpp", "llama.cpp", "vllm":
+		return true
+	}
+	return api.IsLocalBaseURL(pc.BaseURL)
 }

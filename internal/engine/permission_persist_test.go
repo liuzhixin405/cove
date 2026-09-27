@@ -10,7 +10,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/permission"
 )
 
-// A "[p] 永久允许" answer is written to policies.json and applies to
+// A "[p] 本项目记住" answer is written to policies.json and applies to
 // the next engine started in the same project.
 func TestPersistPermissionRuleSurvivesRestart(t *testing.T) {
 	home := isolateHome(t)

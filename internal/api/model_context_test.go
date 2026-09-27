@@ -96,3 +96,23 @@ func TestEffectiveCompactionBudget_MatchesFormula(t *testing.T) {
 		t.Fatalf("EffectiveCompactionBudget(%q) = %d, want %d", model, got, want)
 	}
 }
+
+// A local server's real window (learned from its error) overrides the
+// name-based guess for the rest of the session, case-insensitively.
+func TestModelContextWindowOverride(t *testing.T) {
+	t.Cleanup(ClearModelContextWindows)
+	if w := ContextWindowForModel("qwen3.6-27b"); w != 32000 {
+		t.Fatalf("baseline guess = %d, want 32000", w)
+	}
+	SetModelContextWindow("Qwen3.6-27B", 16384)
+	if w := ContextWindowForModel("qwen3.6-27b"); w != 16384 {
+		t.Errorf("override ignored: %d", w)
+	}
+	if got := CompactionTrigger("qwen3.6-27b"); got >= 16384 {
+		t.Errorf("compaction trigger %d does not fit a 16384 window", got)
+	}
+	SetModelContextWindow("qwen3.6-27b", 0)
+	if w := ContextWindowForModel("qwen3.6-27b"); w != 32000 {
+		t.Errorf("zero did not clear the override: %d", w)
+	}
+}

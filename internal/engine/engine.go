@@ -40,6 +40,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove/internal/trace"
 	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
@@ -125,6 +126,7 @@ type Engine struct {
 	fileMu                sync.Mutex
 	steerMu               sync.Mutex
 	pendingSteer          string
+	pendingSteerN         int // Steer calls behind pendingSteer (PendingSteer)
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
 	consecutiveErrors     int                        // track consecutive tool failures for circuit breaking
@@ -165,6 +167,11 @@ type Engine struct {
 	OnPermissionPause func()                       // called before permission prompt to pause spinners
 	OnPermissionDone  func()                       // called after permission decision to resume
 	OnToolProgress    func(toolName, chunk string) // live output chunks from long-running tools
+	// OnToolOutputStart, if set, is called once before the first
+	// OnToolProgress chunk of a call, with the call's header (the command,
+	// the path), so a front end can title the live output: the tool's own
+	// block only arrives when the call has finished.
+	OnToolOutputStart func(toolName, header string)
 	// OnToolStart, if set, is called before each tool execution with the tool name.
 	OnToolStart func(toolName string)
 	// IterationLimitPrompt, if set, is asked whether a turn may go on when it
@@ -183,6 +190,10 @@ type Engine struct {
 	// routing chooses between a fast and a main model (for a one-line
 	// "模型：…" status at the start of the turn).
 	OnTurnModel func(model string)
+	// OnSteerConsumed, if set, is called on the turn's goroutine each time
+	// the loop hands pending Steer guidance to the model, so a front end
+	// that counts inserted lines can reset its display.
+	OnSteerConsumed func()
 	// bg tracks the turn-end background goroutines (WaitBackground).
 	bg sync.WaitGroup
 	// bgPending counts the turn-end jobs e.bg still waits for
@@ -323,6 +334,14 @@ type Engine struct {
 	lastInputTokens int
 	usageMsgCount   int
 	requestOverhead int
+	// smallWindowWarned names the models whose window was found too small
+	// for automatic compaction, so the warning is shown once per model.
+	smallWindowWarned map[string]bool
+	// outsideDirHinted names the directories (lower-cased) the user was
+	// already told a tool refused to touch (noteOutsideDirectory).
+	outsideDirHinted map[string]bool
+	// smallToolsNoted: the reduced tool set for a small window was announced.
+	smallToolsNoted bool
 }
 
 type interruption struct {
@@ -405,6 +424,12 @@ func New(config Config) (*Engine, error) {
 		replayEnabled:    replayDir != "",
 		replayDir:        replayDir,
 	}
+	// A provider the chain gives up on is a coded diagnostic (E2009) with
+	// the failure that tipped it, not just a debug log line.
+	e.fallback.SetOnUnavailable(func(provider string, fails int, cause error) {
+		diagnostic.ReportError(&api.ProviderUnavailableError{Provider: provider, Fails: fails, Cause: cause},
+			diagnostic.Context{Provider: provider, Model: e.config.Model})
+	})
 	if e.recordingEnabled {
 		if err := os.MkdirAll(e.recordingDir, 0o755); err != nil {
 			return nil, fmt.Errorf("init recording dir: %w", err)
@@ -611,8 +636,25 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 		e.provRef.Set(prov)
 		e.fallback.Reset()
 	}
+	oldModel := e.config.Model
 	e.config.Provider = cfg
 	e.config.Model = model
+	// The router keeps its own copy of the models; left alone it kept
+	// routing to the model cove started with, so /model and /provider
+	// changed the config and nothing else. A fast model that was never
+	// configured separately (empty, or defaulted to the old main model)
+	// follows the main model, or short messages would still go to the old
+	// name through the fast tier.
+	fast := e.config.ModelFast
+	if fast == "" || fast == oldModel {
+		fast = model
+		if e.config.ModelFast != "" {
+			e.config.ModelFast = model
+		}
+	}
+	if e.modelRouter != nil {
+		e.modelRouter.SetModels(model, fast)
+	}
 	if e.session != nil {
 		e.session.Model = model
 	}
@@ -733,7 +775,30 @@ func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
 func (e *Engine) ProviderName() string       { return e.fallback.Current().DisplayName() }
-func (e *Engine) Provider() api.Provider     { return e.fallback.Current() }
+
+// ExplainPermissionGap says why the rules remembered for toolName do not
+// cover input, for the approval prompt; "" when there is nothing to say.
+func (e *Engine) ExplainPermissionGap(toolName string, input map[string]any) string {
+	if e.perm == nil {
+		return ""
+	}
+	return e.perm.ExplainUncovered(toolName, input)
+}
+
+// diagContext is what the engine tells the diagnostic layer about a call:
+// the model (the routed one, else the configured one), the tool and the
+// current provider.
+func (e *Engine) diagContext(model, tool string) diagnostic.Context {
+	c := diagnostic.Context{Model: model, Tool: tool}
+	if model == "" {
+		c.Model = e.config.Model
+	}
+	if e.fallback != nil {
+		c.Provider = e.fallback.Current().Name()
+	}
+	return c
+}
+func (e *Engine) Provider() api.Provider { return e.fallback.Current() }
 
 // SetProvider replaces the current provider chain with a single-provider fallback.
 // Used primarily by tests to inject mock providers.
@@ -823,8 +888,8 @@ type diskRule struct {
 // loadPersistedPolicies loads policies.json for the project containing cwd.
 // Rules persisted for another project (non-empty scope that is not this
 // project's root) are skipped. Enabled allow, deny and ask rules the session
-// manager can express are also given to it, so "[p] 永久允许" prefix rules
-// match exactly like "[a]" ones, and deny / ask rules take precedence over
+// manager can express are also given to it, so "[p] 本项目记住" prefix and
+// group rules match exactly like "[a]" ones, and deny / ask rules take precedence over
 // bypass mode and the read-only auto-allow (Manager.Check evaluates deny
 // first and ask before the mode default). Rules loaded for a previous
 // project are removed first, so /cd does not carry them along.
@@ -1090,8 +1155,14 @@ func (e *Engine) RunWithStream(ctx context.Context, userMessage string, onDelta 
 
 // Steer injects user guidance into the running agent loop without interrupting.
 // Thread-safe: callable from UI goroutine while RunMessageWithStream is blocking.
-// The text is appended to the last tool result before the next LLM call, so the
-// model sees the guidance at its next iteration.
+// The text goes to the model as its own "[用户指引]" user message before the
+// next LLM call, so the model sees the guidance at its next iteration. Several
+// calls before that join with a newline.
+//
+// Guidance a turn never gets to consume — it ended, was cancelled or hit a
+// limit first — stays pending: the front end decides where it goes with
+// TakePendingSteer (the REPL runs it as a new task). Cancel and limit stops
+// used to discard it, and the user's line vanished without a trace.
 func (e *Engine) Steer(text string) {
 	if text == "" {
 		return
@@ -1103,6 +1174,21 @@ func (e *Engine) Steer(text string) {
 	} else {
 		e.pendingSteer = text
 	}
+	e.pendingSteerN++
+}
+
+// PendingSteer reports the guidance waiting for the next model call and how
+// many Steer calls it came from, without taking it.
+func (e *Engine) PendingSteer() (text string, n int) {
+	e.steerMu.Lock()
+	defer e.steerMu.Unlock()
+	return e.pendingSteer, e.pendingSteerN
+}
+
+// TakePendingSteer returns the guidance no model call has consumed yet and
+// clears it; "" when there is none.
+func (e *Engine) TakePendingSteer() string {
+	return e.drainPendingSteer()
 }
 
 func (e *Engine) drainPendingSteer() string {
@@ -1110,6 +1196,7 @@ func (e *Engine) drainPendingSteer() string {
 	defer e.steerMu.Unlock()
 	s := e.pendingSteer
 	e.pendingSteer = ""
+	e.pendingSteerN = 0
 	return s
 }
 
@@ -1156,8 +1243,16 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			"[system: 上一轮任务被中断（%s），以上是中断前已完成的操作。]", resume.reason)))
 	}
 	if resuming {
-		e.messages = append(e.messages, newSyntheticUserMsg(fmt.Sprintf(
-			"[system: 上一次执行被中断（%s）。上方保留了中断前已完成的操作和结果，请从中断处继续，不要重复已完成的步骤。]", resume.reason)))
+		marker := newSyntheticUserMsg(fmt.Sprintf(
+			"[system: 上一次执行被中断（%s）。上方保留了中断前已完成的操作和结果，请从中断处继续，不要重复已完成的步骤。]", resume.reason))
+		// One marker: the third resend of the same request after the same
+		// overflow used to carry three of them, each retry a little
+		// larger than the last.
+		if n := len(e.messages); n > 0 && e.messages[n-1].Synthetic && isResumeMarker(e.messages[n-1].Content) {
+			e.messages[n-1] = marker
+		} else {
+			e.messages = append(e.messages, marker)
+		}
 	} else {
 		e.messages = append(e.messages, userMessage)
 		e.fileMu.Lock()
@@ -1220,14 +1315,23 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 		// Changing state (git) and per-turn guidance travel with the turn,
 		// after the user's message, so the cached prefix stays intact.
-		if note := e.turnContextNote(userMessage.Content); note != "" {
+		note := e.turnContextNote(userMessage.Content)
+		if note != "" {
 			e.messages = append(e.messages, newSyntheticUserMsg(note))
 		}
+		e.updateTokenCount()
+		trace.Write("turn", map[string]any{"model": routedModel, "user_bytes": len(userMessage.Content), "note_bytes": len(note),
+			"messages": len(e.messages), "est_tokens": e.totalTokens, "overhead_tokens": e.requestOverhead, "window": api.ContextWindowForModel(routedModel)})
 	}
 	e.lastRoutedModel = routedModel
 
 	// compactedForLength limits the context-length recovery to one retry.
 	compactedForLength := false
+	// truncatedEmpty counts consecutive replies cut off by max_tokens with
+	// nothing in them: a reasoning model that spent the whole budget
+	// thinking answers the same way to the same request, so asking again
+	// only bills another full reply.
+	truncatedEmpty := 0
 	// The iteration cap, the time limit and the stagnation prompt are soft:
 	// an interactive front end is asked whether to go on (see
 	// IterationLimitPrompt); -p and headless runs stop.
@@ -1236,7 +1340,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		e.iterCount = iter + 1
 		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
 		if ctx.Err() != nil {
-			e.drainPendingSteer() // discard pending steer on cancel
+			// Pending steer is kept for TakePendingSteer (see Steer).
 			e.interrupt(userMessage, routedModel, "已被用户取消")
 			return "", ctx.Err()
 		}
@@ -1247,7 +1351,6 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
 		}
 		if reason, err := e.checkTurnLimits(limits, iter); err != nil {
-			e.drainPendingSteer() // discard pending steer on a limit stop
 			e.stopWithWrapUp(ctx, userMessage, routedModel, reason, onDelta)
 			return "", err
 		}
@@ -1259,6 +1362,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// where any web page or file could forge the same "[用户指引]" marker.
 		if steer := e.drainPendingSteer(); steer != "" {
 			e.messages = append(e.messages, newSyntheticUserMsg("[用户指引] "+steer))
+			if e.OnSteerConsumed != nil {
+				e.OnSteerConsumed()
+			}
 		}
 
 		// Compress message history if approaching context limits. The
@@ -1288,6 +1394,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			Effort:     e.config.Effort,
 		}
 		e.recordEvent(ctx, "llm_request", map[string]any{"model": modelName, "messages": len(reqMessages), "request": req})
+		callStarted := time.Now()
 
 		var resp *api.ChatResponse
 		var err error
@@ -1324,6 +1431,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			e.endActivity(modelAct)
 		} else {
 			modelAct := e.beginActivity("call model " + modelName)
+			// A non-streaming call reports nothing until it returns; the stall
+			// monitor would call every reply longer than its threshold a hang.
+			e.pauseActivity(modelAct, true)
 			resp, _, err = e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
 			e.endActivity(modelAct)
 		}
@@ -1337,20 +1447,62 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 			// history is the remedy, so do it and retry once, instead of ending
 			// the turn and leaving the user to run /compact and resend.
 			compactedForLength = true
+			// Reported before the retry, so the E2008 remedy learns the
+			// server's window from this very error and the retry compacts to a
+			// target that fits it; reporting only the second failure meant the
+			// turn always failed once first.
+			diagnostic.ReportError(err, e.diagContext(modelName, ""))
 			before := e.totalTokens
-			e.compact(ctx, e.totalTokens/2)
+			target := e.totalTokens / 2
+			if fit := compactionThreshold(modelName); fit < target {
+				target = fit
+			}
+			e.compact(ctx, target)
+			how := "已压缩对话历史"
+			if e.totalTokens >= before || e.totalTokens > target {
+				// Compaction found nothing to summarise (a fresh turn, too
+				// few messages). What is over the window is then what the
+				// engine itself attached and the largest tool results:
+				// drop and cut those (window_shrink.go).
+				if e.shrinkForWindow(target) {
+					how = "已移除本轮附加上下文并裁剪大工具结果"
+				}
+			}
+			trace.Write("overflow", map[string]any{"model": modelName, "tokens_before": before, "tokens_after": e.totalTokens, "retry": e.totalTokens < before})
 			if e.totalTokens < before {
-				e.engineOutput("  上下文超出模型上限，已压缩对话历史后重试")
+				e.engineOutput("  上下文超出模型上限，" + how + "后重试")
 				continue
 			}
+			// Nothing left to trim: the fixed part of the request (system
+			// prompt, tool definitions) is what does not fit. Say so, or the
+			// failure line alone reads like a transient API error.
+			e.engineOutput("  上下文超出模型上限，且对话历史已无法再压缩")
 		}
 		if err != nil {
 			e.recordEvent(ctx, "llm_error", map[string]any{"error": err.Error()})
+			trace.Write("model", map[string]any{"model": modelName, "messages": len(reqMessages), "est_tokens": e.totalTokens,
+				"ms": time.Since(callStarted).Milliseconds(), "error": textutil.ClipRunes(err.Error(), 160), "error_kind": api.Classify(err).String(), "cancelled": ctx.Err() != nil})
+			// Classified and recorded with its code (and remedied when the
+			// diagnostic layer can), so /diagnose errors shows one line with
+			// a hint instead of the raw text; the code is quoted in the
+			// interruption reason the user sees.
+			reason := "模型调用失败: " + textutil.ClipRunes(err.Error(), 120)
+			if ctx.Err() == nil {
+				// A cancelled call is the user's doing, not a problem to record.
+				// An overflow was already reported before the compact-and-retry;
+				// the retry's failure is the same problem, quoted, not recorded.
+				code, _ := diagnostic.Classify(err, diagnostic.Context{})
+				if !(compactedForLength && code == diagnostic.ErrAPIContextLength) {
+					ev := diagnostic.ReportError(err, e.diagContext(modelName, ""))
+					code = ev.Code
+				}
+				if code != "" {
+					reason += " [" + string(code) + "]"
+				}
+			}
 			// Keep the completed tool rounds: their side effects already
 			// happened, and re-sending this message resumes from here.
-			e.interrupt(userMessage, routedModel, "模型调用失败: "+textutil.ClipRunes(err.Error(), 120))
-			diagnostic.RecordRuntime(diagnostic.SevError, diagnostic.CatAPI,
-				fmt.Sprintf("模型调用失败: %s", err.Error()))
+			e.interrupt(userMessage, routedModel, reason)
 			return "", fmt.Errorf("api: %w", err)
 		}
 
@@ -1375,6 +1527,9 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		e.recordEvent(ctx, "llm_response", map[string]any{"model": modelName, "content_len": len(resp.Content), "tool_calls": len(resp.ToolCalls), "stop_reason": resp.StopReason, "response": resp})
+		trace.Write("model", map[string]any{"model": modelName, "messages": len(reqMessages), "est_tokens": e.totalTokens,
+			"ms": time.Since(callStarted).Milliseconds(), "stop": resp.StopReason, "in": resp.InputTokens, "out": resp.OutputTokens,
+			"content_bytes": len(resp.Content), "tool_calls": len(resp.ToolCalls)})
 		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
 			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
 
@@ -1382,6 +1537,15 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		if (resp.StopReason == "max_tokens" || resp.StopReason == "length") && !hasToolCalls(resp) {
 			if resp.Content != "" || len(resp.ThinkingBlocks) > 0 {
 				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ThinkingBlocks: resp.ThinkingBlocks})
+				truncatedEmpty = 0
+			} else {
+				truncatedEmpty++
+				if truncatedEmpty >= maxEmptyTruncations {
+					reason := fmt.Sprintf("回复连续 %d 次被输出上限截断且没有内容（推理可能耗尽了 max_tokens）；请调大模型的输出上限或上下文，或换一个模型", truncatedEmpty)
+					e.engineOutput("  \x1b[33m" + reason + "\x1b[0m")
+					e.interrupt(userMessage, routedModel, reason)
+					return "", fmt.Errorf("%s", reason)
+				}
 			}
 			e.messages = append(e.messages, newSyntheticUserMsg("[system: your previous response was truncated due to length. Please continue, writing one file at a time.]"))
 			continue
@@ -1472,7 +1636,6 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				switch e.onLoopHit(limits, iter+1, lr) {
 				case loopHitStop:
 					e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
-					e.drainPendingSteer()
 					e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
 					return "", errLoopStopped
 				case loopHitGuide:
@@ -1661,12 +1824,25 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				e.activity("")
 				e.emitToolResult(r.Name, r.Input, r.Content, isErr, r.Elapsed)
 			}
-			if isErr {
+			// Unparsable arguments were already recorded as E4009 when the
+			// call was dispatched; a second, uncoded line would show the
+			// same failure twice in /diagnose errors.
+			if _, parseErr := r.Input["_cove_parse_error"]; isErr && !parseErr {
 				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
 					fmt.Sprintf("工具 %s 失败: %s", r.Name, summarizeResult(r.Content)))
 			}
+			if isErr {
+				e.noteOutsideDirectory(r.Content)
+			}
+			toolTrace := map[string]any{"name": r.Name, "ms": r.Elapsed.Milliseconds(), "result_bytes": len(r.Content), "error": isErr}
+			if isErr {
+				toolTrace["head"] = textutil.ClipRunes(r.Content, 160)
+			}
+			trace.Write("tool", toolTrace)
 			e.messages = append(e.messages, api.Message{
-				Role: "tool", ToolCallID: r.ID, Name: r.Name, Content: r.Content,
+				Role: "tool", ToolCallID: r.ID, Name: r.Name,
+				// Cut to what the window can afford; the screen got it in full.
+				Content: capToolResult(routedModel, r.Name, r.Content),
 			})
 			// Feed loop detector with tool output (Layer 2: content hash)
 			if e.loopDetector != nil && !isErr && !loopStopped {
@@ -1696,7 +1872,6 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		}
 
 		if loopStopped {
-			e.drainPendingSteer()
 			e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
 			return "", errLoopStopped
 		}
@@ -1751,7 +1926,6 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 				if e.IterationLimitPrompt != nil && !limits.stagnation {
 					limits.stagnation = true
 					if e.askLimit(e.limitStats(limits, iter+1, LimitReasonStagnation, 0)) != LimitContinue {
-						e.drainPendingSteer()
 						e.stopWithWrapUp(ctx, userMessage, routedModel, "疑似停滞，用户选择停止", onDelta)
 						return "", errStagnationStopped
 					}
@@ -1806,6 +1980,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		if msg == "" {
 			msg = "tool call arguments could not be parsed as JSON"
 		}
+		diagnostic.ReportError(&api.ToolArgsInvalidError{Tool: tc.Name}, e.diagContext("", tc.Name))
 		return fmt.Sprintf("Error: %s. Please resend this tool call with valid JSON arguments (check quote escaping, and avoid truncating long string fields).", msg)
 	}
 
@@ -1885,6 +2060,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if !checkpointed(ctx) {
 		e.checkpointBefore([]api.ToolCall{tc})
 	}
+	outputStarted := false
 	tctx := tool.Context{
 		Cwd:              cwd,
 		ToolUseID:        tc.ID,
@@ -1894,9 +2070,17 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		Runtime:          e.runtime,
 		// Forward live tool output: reset the stall timer so an actively
 		// producing command isn't mislabeled as "stuck", and surface the
-		// chunk to the UI so the user can see what the command is doing.
+		// chunk to the UI so the user can see what the command is doing,
+		// under a header naming the command the first time.
+		SetWaiting: func(waiting bool) { e.pauseActivity(toolAct, waiting) },
 		OnProgress: func(chunk string) {
 			e.progressActivity(toolAct)
+			if !outputStarted {
+				outputStarted = true
+				if e.OnToolOutputStart != nil {
+					e.OnToolOutputStart(tc.Name, toolHeaderFor(tc.Name, tc.Input))
+				}
+			}
 			if e.OnToolProgress != nil {
 				e.OnToolProgress(tc.Name, chunk)
 			}
@@ -2311,8 +2495,28 @@ func (e *Engine) checkAndCompress(ctx context.Context, model string) {
 	if !e.compressor.NeedsCompression(e.totalTokens, threshold) {
 		return
 	}
+	// A window too small for the fixed part of every request (system prompt,
+	// tool definitions) puts the trigger below that overhead: compaction can
+	// never get under it, and used to run a summary call before every model
+	// call. Say so once and leave the history alone; the overflow, if it
+	// comes, is reported with the advice to grow the window.
+	if threshold <= e.requestOverhead+minHistoryRoom {
+		if e.smallWindowWarned == nil {
+			e.smallWindowWarned = map[string]bool{}
+		}
+		if !e.smallWindowWarned[model] {
+			e.smallWindowWarned[model] = true
+			e.engineOutput(fmt.Sprintf("  \x1b[33m模型 %s 的上下文窗口 %d token 装不下 cove 约 %d token 的固定开销加对话，已停用自动压缩；请调大模型上下文（建议 32K 以上）\x1b[0m",
+				model, api.ContextWindowForModel(model), e.requestOverhead))
+		}
+		return
+	}
 	e.compactIfNeeded(ctx, threshold)
 }
+
+// minHistoryRoom is the least history a compaction trigger must leave room
+// for above the request overhead to be worth acting on.
+const minHistoryRoom = 2000
 
 // compactionThreshold resolves the model-aware compaction trigger, falling
 // back to the legacy fixed constant when no model is known (e.g. routing
@@ -2362,7 +2566,12 @@ func (e *Engine) compact(ctx context.Context, threshold int) *CompressResult {
 		return resp, err
 	}
 
+	beforeTokens, beforeMsgs := e.totalTokens, len(e.messages)
 	result, newMsgs := e.compressor.Compress(ctx, e.messages, e.totalTokens, threshold, tryChat)
+	defer func() {
+		trace.Write("compact", map[string]any{"tokens_before": beforeTokens, "tokens_after": e.totalTokens, "msgs_before": beforeMsgs, "msgs_after": len(e.messages),
+			"compressed": result.Compressed, "summarized": result.Summarized, "reason": result.Reason})
+	}()
 	if result.Compressed {
 		e.messages = newMsgs
 		stripThinkingBlocks(e.messages)
@@ -2385,16 +2594,32 @@ func (e *Engine) buildAPIToolDefs() []api.ToolDef {
 	if e.toolDefsVersion != nil {
 		extra = e.toolDefsVersion()
 	}
+	// A small window gets only the core tools (window_budget.go); the
+	// cache key carries that, so /model between a local and a cloud model
+	// rebuilds the list.
+	small := smallWindow(e.config.Model)
+	if small {
+		extra = -extra - 1
+	}
 	if e.cachedToolDefs != nil && e.cachedToolDefsVersion == e.registry.Version() && e.cachedToolDefsExtra == extra {
 		return e.cachedToolDefs
 	}
 	var defs []api.ToolDef
-	for _, t := range e.registry.All() {
+	all := e.registry.All()
+	for _, t := range all {
 		d := t.Def()
+		if small && !smallWindowTools[d.Name] {
+			continue
+		}
 		schema := parseSchema(d.InputSchema)
 		defs = append(defs, api.ToolDef{
 			Name: d.Name, Description: d.Description, InputSchema: schema,
 		})
+	}
+	if small && len(defs) < len(all) && !e.smallToolsNoted {
+		e.smallToolsNoted = true
+		e.engineOutput(fmt.Sprintf("  \x1b[2m模型 %s 的上下文窗口为 %d token，本会话只启用核心工具（%d/%d）；子代理、团队、worktree、浏览器、MCP 等工具不发送。\x1b[0m",
+			e.config.Model, api.ContextWindowForModel(e.config.Model), len(defs), len(all)))
 	}
 	e.cachedToolDefs = defs
 	e.cachedToolDefsVersion = e.registry.Version()
@@ -2796,6 +3021,14 @@ func (e *Engine) runTurnEndPipeline() {
 		sessionID: e.SessionID(),
 		keep:      e.config.MaxSessions,
 	}
+	if job.learn && e.localProvider() {
+		// A local server answers one request at a time: extraction, review
+		// and dream calls after every turn queued the user's next turn
+		// behind them, and timed out at 30s on a 27B model. They are for
+		// remote providers; a local model's time goes to the task.
+		job.learn = false
+		log.Debugf("[turn-end] background learning skipped: local provider")
+	}
 	if job.learn {
 		job.review = e.reviewMessages()
 	}
@@ -2989,3 +3222,7 @@ func (e *Engine) countRecent(fp string, window int) int {
 	}
 	return count
 }
+
+// maxEmptyTruncations is how many consecutive empty, truncated replies end
+// the turn instead of asking the model to continue once more.
+const maxEmptyTruncations = 3

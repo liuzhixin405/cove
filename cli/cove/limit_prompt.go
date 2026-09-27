@@ -34,7 +34,7 @@ func askTurnLimit(stats engine.LimitStats) engine.LimitDecision {
 		return engine.LimitStop
 	}
 	answerCh := make(chan string, 1)
-	repl.SetPermInputCh(answerCh)
+	repl.SetPromptInput(answerCh, limitAnswerAccepted, "上限提示等待回答：c 继续 / s 停止")
 	repl.BeginPromptInput()
 	termui.PrintAbove(limitPromptText(stats))
 
@@ -155,4 +155,13 @@ func printModeIterationLimit(opts cliOptions, configured int) int {
 		return engine.UnlimitedIterations
 	}
 	return opts.maxTurns
+}
+
+// limitAnswerAccepted reports whether line answers the limit prompt.
+func limitAnswerAccepted(line string) bool {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "c", "continue", "继续", "y", "yes", "s", "stop", "停止", "n", "no":
+		return true
+	}
+	return false
 }

@@ -37,6 +37,16 @@ type mockResponse struct {
 	delay     time.Duration // simulate API latency
 	// inputTokens is the prompt size the provider reports for this call.
 	inputTokens int
+	// stopReason overrides the "stop" the mock reports ("length" for a
+	// truncated reply).
+	stopReason string
+}
+
+func (r mockResponse) stop() string {
+	if r.stopReason != "" {
+		return r.stopReason
+	}
+	return "stop"
 }
 
 func (m *mockProvider) Name() string        { return "mock" }
@@ -67,7 +77,7 @@ func (m *mockProvider) Chat(ctx context.Context, req api.ChatRequest) (*api.Chat
 	return &api.ChatResponse{
 		Content:     resp.content,
 		ToolCalls:   resp.toolCalls,
-		StopReason:  "stop",
+		StopReason:  resp.stop(),
 		InputTokens: resp.inputTokens,
 	}, nil
 }

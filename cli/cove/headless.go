@@ -37,6 +37,7 @@ func runHeadless(bannerText string, eng *engine.Engine, cmdReg *command.Registry
 	// turn would be abandoned mid-request like in -p; skip it here too.
 	if eng != nil {
 		eng.SetNonInteractive(true)
+		wireNonInteractiveOutput(eng)
 	}
 	// Banner goes to stderr so stdout carries only assistant/command output.
 	if strings.TrimSpace(bannerText) != "" {
@@ -213,6 +214,7 @@ func runPrintModeSession(eng *engine.Engine, argPrompt, prompt string, debug boo
 	if eng != nil {
 		// The skill review would be abandoned at exit after its paid call.
 		eng.SetNonInteractive(true)
+		wireNonInteractiveOutput(eng)
 	}
 	code := runPrintMode(eng, argPrompt, prompt, debug, attachmentPaths, cfg)
 	if eng != nil {
