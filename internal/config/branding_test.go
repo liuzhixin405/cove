@@ -9,9 +9,11 @@ import (
 
 func TestCoveBranding_NoLegacyClaudeNamesInDemoTree(t *testing.T) {
 	demoRoot := filepath.Clean(filepath.Join("..", ".."))
+	// Identifier-style legacy names only. The spaced product name "Claude Code"
+	// is intentionally not scanned: the honest-comparison docs (README,
+	// docs/COMPARISON.md, docs/WHY_GO.md) reference it as a third-party product.
 	legacyTokens := []string{
 		"claude" + "-code",
-		"claude" + " code",
 		"claude" + "-code-go",
 		"github.com/" + "claude" + "-code-go",
 		"." + "claude" + "-code-go",

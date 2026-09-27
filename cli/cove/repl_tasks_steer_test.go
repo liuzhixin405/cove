@@ -192,6 +192,7 @@ func (p *blockingProvider) requests() []api.ChatRequest {
 func TestSteerTypedTooLateRunsAsTheNextTask(t *testing.T) {
 	captureTurnOutput(t)
 	eng := steerTestEngine(t)
+	eng.SetAutoExtract(false) // no background memory/review/dream calls: the test counts model calls exactly
 	prov := &blockingProvider{firstStarted: make(chan struct{}), release: make(chan struct{})}
 	eng.SetProvider(prov)
 	r := newREPLTaskRunner(eng)
