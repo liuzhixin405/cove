@@ -11,6 +11,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
 // Commands that rewrite engine state must not run while a task goroutine is
@@ -74,7 +75,7 @@ func TestNonInteractiveOutputGoesToStderr(t *testing.T) {
 		t.Fatal(err)
 	}
 	wireNonInteractiveOutput(eng)
-	if eng.OnEngineOutput == nil {
+	if eng.Output() == uiout.Discard {
 		t.Fatal("engine output not wired")
 	}
 	// termui's writer stays on stdout: the answer is printed through it (see

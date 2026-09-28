@@ -141,7 +141,7 @@ func TestSmallWindowToolReductionIsAnnouncedOnce(t *testing.T) {
 	eng := newTestEngine(&mockProvider{}, &mockTool{name: "read", result: "ok"}, &mockTool{name: "agent", result: "ok"})
 	eng.config.Model = "tiny-local"
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.buildAPIToolDefs()
 	eng.buildAPIToolDefs()
 	n := 0

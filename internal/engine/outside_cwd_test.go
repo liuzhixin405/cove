@@ -22,7 +22,7 @@ func TestOutsideWorkingDirectoryRefusalTellsTheUserToChangeDirectory(t *testing.
 	}}
 	eng := newTestEngine(prov, &mockTool{name: "write", safe: true, readOnly: true, result: `Error: path outside working directory: D:\github\agent\a.csproj`})
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 
 	if _, err := eng.RunMessageWithStream(context.Background(), api.Message{Role: "user", Content: `在 D:\github\agent 建项目`}, nil, nil); err != nil {
 		t.Fatalf("turn failed: %v", err)

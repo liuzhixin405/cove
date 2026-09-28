@@ -157,31 +157,3 @@ func TestIsContextLengthError(t *testing.T) {
 		}
 	}
 }
-
-// With one provider there is nothing to fail over to, and the old
-// "all 1 providers failed: name(status): ..." prefix pushed the real reason
-// past what the UI shows. It also flattened the error with %v, so the engine
-// could not recognise its status (errors.As) at all.
-func TestSingleProviderFailureKeepsTheProviderError(t *testing.T) {
-	cause := &StatusError{Status: 402, Msg: "Insufficient Balance"}
-	mf := NewModelFallback([]Provider{&flakyProvider{errs: []error{cause, cause}}})
-	err := tryOnce(mf)
-	if statusOf(err) != 402 {
-		t.Fatalf("statusOf(%v) = %d, want 402", err, statusOf(err))
-	}
-	if strings.Contains(err.Error(), "providers failed") {
-		t.Fatalf("error = %q, want the provider's own error", err)
-	}
-}
-
-func TestMultiProviderFailureStillUnwrapsToCauses(t *testing.T) {
-	a := &flakyProvider{errs: []error{&StatusError{Status: 400, Msg: "prompt is too long: 300000 tokens > 200000 maximum"}}}
-	b := &flakyProvider{errs: []error{&StatusError{Status: 400, Msg: "maximum context length is 131072 tokens"}}}
-	err := tryOnce(NewModelFallback([]Provider{a, b}))
-	if err == nil || !strings.Contains(err.Error(), "providers failed") {
-		t.Fatalf("error = %v, want the combined failure", err)
-	}
-	if !IsContextLengthError(err) {
-		t.Fatalf("IsContextLengthError(%v) = false through the fallback wrapper", err)
-	}
-}

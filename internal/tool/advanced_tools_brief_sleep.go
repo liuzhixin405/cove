@@ -15,7 +15,7 @@ func NewSleepTool() Tool {
 	return &SleepTool{baseTool{def: Def{
 		Name: "sleep", Description: "Pause agent execution for a duration.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"seconds":{"type":"integer"}},"required":["seconds"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Sleep",
+		IsReadOnly:  false, IsConcurrencySafe: true, PlanSafe: true, UserFacingName: "Sleep",
 	}}}
 }
 func (t *SleepTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {

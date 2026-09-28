@@ -58,25 +58,22 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 		p.beginAttempt()
 
 		if eng, ok := runner.(*engine.Engine); ok {
-			eng.OnPermissionPause = p.permissionPause
-			eng.OnPermissionDone = p.permissionDone
-			// Surface live output from long-running tools (bash/powershell) so the
-			// user can tell what a slow command is actually doing instead of only
-			// seeing the stall warning.
-			eng.OnToolProgress = p.toolProgress
-			eng.OnToolOutputStart = p.toolOutputStart
-			// Route engine diagnostic lines (tool start/finish, stall warnings,
-			// memory/skill extraction notices) through the printer so they appear
-			// in the conversation area.
-			eng.OnEngineOutput = p.engineLine
-			eng.OnTurnModel = func(model string) { p.engineLine(turnModelLine(model)) }
+			eng.SetTurnHooks(&engine.TurnHooks{
+				PermissionPause: p.permissionPause,
+				PermissionDone:  p.permissionDone,
+				// Live output from long-running tools (bash/powershell), so the
+				// user can tell what a slow command is doing instead of only
+				// seeing the stall warning.
+				ToolProgress:    p.toolProgress,
+				ToolOutputStart: p.toolOutputStart,
+				TurnModel:       func(model string) { p.engineLine(turnModelLine(model)) },
+			})
+			// Engine diagnostic lines (tool blocks, stall warnings, memory
+			// notices) go through the printer into the conversation area.
+			eng.SetOutput(engine.LineSink(p.engineLine))
 			defer func() {
-				eng.OnPermissionPause = nil
-				eng.OnPermissionDone = nil
-				eng.OnToolProgress = nil
-				eng.OnToolOutputStart = nil
-				eng.OnEngineOutput = nil
-				eng.OnTurnModel = nil
+				eng.SetTurnHooks(nil)
+				eng.SetOutput(nil)
 			}()
 		}
 
@@ -487,10 +484,7 @@ func missingStreamedSuffix(reply, streamed string) string {
 }
 
 func isBudgetExceededError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "budget exceeded")
+	return errors.Is(err, engine.ErrBudgetExceeded)
 }
 
 func budgetExceededRetryHint(tr *cost.Tracker) string {

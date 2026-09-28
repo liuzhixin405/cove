@@ -12,10 +12,10 @@ import (
 	"github.com/liuzhixin405/cove/internal/config"
 	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/mcp"
+	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
 type fakeCostTracker struct{ summary string }
@@ -287,29 +287,37 @@ func TestResumeCmdLoadsSessionMessages(t *testing.T) {
 	}
 }
 
+// statusEngine is a fakeEngine that also reports the live session /status
+// reads (StatusSource).
+type statusEngine struct {
+	fakeEngine
+	model, id string
+	mode      permission.Mode
+}
+
+func (e *statusEngine) Model() string                   { return e.model }
+func (e *statusEngine) PermissionMode() permission.Mode { return e.mode }
+func (e *statusEngine) SessionID() string               { return e.id }
+
 func TestStatusCmdUsesLiveEngineState(t *testing.T) {
-	eng := &fakeEngine{
+	eng := &statusEngine{fakeEngine: fakeEngine{
 		msgs: []api.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}},
 		cost: fakeCostTracker{summary: "10 in | 5 out | $1.23 / $5.00"},
-	}
+	}, model: "gpt-4o", mode: "auto", id: "session-123"}
 	cmd := NewStatusCmd()
 
 	out, err := cmd.Execute(context.Background(), Input{
 		Cwd:    "/tmp/project",
 		Engine: eng,
-		AppState: &state.AppState{
-			SessionID:      "session-123",
-			Model:          "gpt-4o",
-			PermissionMode: "auto",
-			Messages:       0,
-			MaxBudget:      5,
-		},
 	})
 	if err != nil {
 		t.Fatalf("status error: %v", err)
 	}
 	if !strings.Contains(out.Message, "会话: session-123") {
 		t.Fatalf("expected session id in output, got %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "模型: gpt-4o") {
+		t.Fatalf("expected live model in output, got %q", out.Message)
 	}
 	if !strings.Contains(out.Message, "消息数: 2") {
 		t.Fatalf("expected live engine message count, got %q", out.Message)

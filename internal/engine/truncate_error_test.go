@@ -24,7 +24,7 @@ func TestErrorResultIsTruncatedAndKeepsErrorPrefix(t *testing.T) {
 	mt := &mockTool{name: "mytool", readOnly: true, err: errors.New(huge)}
 	eng := newTestEngine(&mockProvider{}, mt)
 
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "mytool", Input: map[string]any{}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "mytool", Input: map[string]any{}})
 	limit := toolOutputLimit("mytool", eng.currentModel())
 	if got := token.Estimate(out); got > limit {
 		t.Fatalf("error result is %d tokens, limit %d", got, limit)
@@ -38,7 +38,7 @@ func TestErrorResultIsTruncatedAndKeepsErrorPrefix(t *testing.T) {
 func TestShortErrorResultUnchanged(t *testing.T) {
 	mt := &mockTool{name: "mytool", readOnly: true, err: errors.New("permission denied")}
 	eng := newTestEngine(&mockProvider{}, mt)
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "mytool", Input: map[string]any{}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "mytool", Input: map[string]any{}})
 	if out != "Error: permission denied" {
 		t.Fatalf("out = %q", out)
 	}
@@ -60,7 +60,7 @@ func TestTruncatedReadKeepsContinuationMarker(t *testing.T) {
 	mt := &mockTool{name: "read", readOnly: true, result: sb.String()}
 	eng := newTestEngine(&mockProvider{}, mt)
 
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "read", Input: map[string]any{}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "read", Input: map[string]any{}})
 	if len(out) >= sb.Len() {
 		t.Fatalf("fixture was not truncated (%d bytes)", len(out))
 	}
@@ -83,7 +83,7 @@ func TestUntruncatedReadMarkerUntouched(t *testing.T) {
 	data := "File: a.go (30 lines total)\n\n1: package a\n2: \n... [showing lines 1-2 of 30]\n[next: offset=3]"
 	mt := &mockTool{name: "read", readOnly: true, result: data}
 	eng := newTestEngine(&mockProvider{}, mt)
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "read", Input: map[string]any{}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "read", Input: map[string]any{}})
 	if out != data {
 		t.Fatalf("out = %q", out)
 	}

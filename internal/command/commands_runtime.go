@@ -109,27 +109,17 @@ func applyConfigLive(in Input, key string) (applied bool, err error) {
 		if err := r.ReloadProvider(pc.Name, cfg.Model, pc.BaseURL, pc.APIKey); err != nil {
 			return false, err
 		}
-		if in.AppState != nil {
-			in.AppState.Model = cfg.Model
-		}
 		return true, nil
 	case "mode", "permission_mode", "permission-mode":
 		mode := permission.Mode(cfg.PermissionMode)
-		if in.PermissionManager != nil {
-			in.PermissionManager.SetMode(mode)
-		}
-		if in.AppState != nil {
-			in.AppState.PermissionMode = cfg.PermissionMode
-		}
 		s, ok := in.Engine.(permissionModeSetter)
 		if ok {
 			s.SetPermissionMode(mode)
+		} else if in.PermissionManager != nil {
+			in.PermissionManager.SetMode(mode)
 		}
 		return ok, nil
 	case "budget", "max_budget_usd", "max-budget-usd":
-		if in.AppState != nil {
-			in.AppState.MaxBudget = cfg.MaxBudgetUsd
-		}
 		s, ok := in.Engine.(budgetSetter)
 		if ok {
 			s.SetMaxBudget(cfg.MaxBudgetUsd)

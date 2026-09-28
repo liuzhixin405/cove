@@ -56,6 +56,18 @@ func (r *Result) WorstSeverity() Severity {
 	return worst
 }
 
+// Warnings returns the findings at Warning severity: shown to the user, not
+// blocking.
+func (r *Result) Warnings() []Finding {
+	var out []Finding
+	for _, f := range r.Findings {
+		if f.Severity == SevWarning {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // BlockingFinding returns the first finding at Error or Critical severity.
 func (r *Result) BlockingFinding() *Finding {
 	for i := range r.Findings {

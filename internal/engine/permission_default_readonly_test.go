@@ -105,7 +105,8 @@ func newPermEngine(t *testing.T, mode permission.Mode, tools ...tool.Tool) (*Eng
 
 func runShell(t *testing.T, eng *Engine, toolName, cmd string) string {
 	t.Helper()
-	return eng.executeTool(context.Background(), api.ToolCall{ID: "t-" + cmd, Name: toolName, Input: map[string]any{"command": cmd}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "t-" + cmd, Name: toolName, Input: map[string]any{"command": cmd}})
+	return out
 }
 
 func TestDefaultModeRunsReadOnlyShellCommandsWithoutAsking(t *testing.T) {

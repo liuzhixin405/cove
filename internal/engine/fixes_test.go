@@ -8,17 +8,17 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 )
 
-func TestClipRunes_NoUTF8Corruption(t *testing.T) {
+func TestKeepRunes_NoUTF8Corruption(t *testing.T) {
 	s := strings.Repeat("中文", 200) // 400 runes, 1200 bytes
-	out := clipRunes(s, 100)
+	out := keepRunes(s, 100)
 	if !utf8.ValidString(out) {
-		t.Fatal("clipRunes produced invalid UTF-8")
+		t.Fatal("keepRunes produced invalid UTF-8")
 	}
 	// 100 runes + "..." — must not cut a multi-byte rune.
 	if got := utf8.RuneCountInString(strings.TrimSuffix(out, "...")); got != 100 {
 		t.Fatalf("want 100 runes kept, got %d", got)
 	}
-	if s2 := clipRunes("short", 100); s2 != "short" {
+	if s2 := keepRunes("short", 100); s2 != "short" {
 		t.Fatalf("short string should be unchanged, got %q", s2)
 	}
 }

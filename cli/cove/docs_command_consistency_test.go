@@ -18,7 +18,7 @@ func TestRegisteredCommandsAreDocumented(t *testing.T) {
 	readmeCmds := extractDocCommands(t, filepath.Join(root, "README.md"))
 	manualCmds := extractDocCommands(t, filepath.Join(root, "docs", "USER_MANUAL.md"))
 
-	reg := registerAllCommands()
+	reg := (&frontend{}).install(registerAllCommands())
 	var missingInReadme []string
 	var missingInManual []string
 	seen := map[string]bool{}
@@ -52,20 +52,14 @@ func TestDocumentedCommandsAreImplemented(t *testing.T) {
 		filepath.Join(root, "docs", "USER_MANUAL.md"),
 	}
 
+	// Every command, the front end's included, is in the registry.
 	implemented := map[string]bool{}
-	reg := registerAllCommands()
+	reg := (&frontend{}).install(registerAllCommands())
 	for _, c := range reg.All() {
 		implemented[c.Name()] = true
-	}
-	for _, name := range []string{
-		"help", "exit", "quit",
-		"attach",
-		"model", "provider", "api-key", "base-url", "mode", "budget",
-		"tasks", "stop", "cancel",
-		"continue",
-		"skill",
-	} {
-		implemented[name] = true
+		for _, a := range c.Aliases() {
+			implemented[a] = true
+		}
 	}
 
 	for _, p := range paths {

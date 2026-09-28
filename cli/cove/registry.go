@@ -43,8 +43,7 @@ func registerToolsFor(mcpPool *mcp.Pool, goos string) *tool.Registry {
 
 // registerToolsWith builds the tool registry. Every registered tool costs
 // prompt tokens on every request, so tools that cannot work here are left
-// out: powershell off Windows, lsp (no language-server runner is wired in),
-// cron (schedules were recorded but never fired), question when nobody can
+// out: powershell off Windows, question when nobody can
 // answer, browser without headless Chrome, and the experimental coordination
 // tools unless experimental_tools is on. Their constructors stay in
 // internal/tool.

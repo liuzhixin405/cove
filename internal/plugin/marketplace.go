@@ -931,5 +931,8 @@ func ensureManifest(pluginDir string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(manifestPath, out, 0644)
+	if err := os.WriteFile(manifestPath, out, 0644); err != nil {
+		// The plugin then loads without a manifest; say why.
+		log.Warnf("plugin manifest %s not written: %v", manifestPath, err)
+	}
 }

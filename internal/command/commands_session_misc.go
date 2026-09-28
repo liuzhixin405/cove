@@ -9,9 +9,10 @@ import (
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
-func (c *CompactCmd) Name() string        { return "compact" }
-func (c *CompactCmd) Aliases() []string   { return nil }
-func (c *CompactCmd) Description() string { return "压缩对话历史" }
+func (c *CompactCmd) Name() string                { return "compact" }
+func (c *CompactCmd) MutatesEngine([]string) bool { return true }
+func (c *CompactCmd) Aliases() []string           { return nil }
+func (c *CompactCmd) Description() string         { return "压缩对话历史" }
 func (c *CompactCmd) Help() string {
 	return "/compact - 总结早期消息以释放上下文窗口"
 }
@@ -30,9 +31,10 @@ func (c *CostCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	return Output{Message: in.Engine.CostTracker().Summary()}, nil
 }
 
-func (c *ResumeCmd) Name() string        { return "resume" }
-func (c *ResumeCmd) Aliases() []string   { return nil }
-func (c *ResumeCmd) Description() string { return "恢复已保存的会话" }
+func (c *ResumeCmd) Name() string                     { return "resume" }
+func (c *ResumeCmd) MutatesEngine(args []string) bool { return len(args) > 0 }
+func (c *ResumeCmd) Aliases() []string                { return nil }
+func (c *ResumeCmd) Description() string              { return "恢复已保存的会话" }
 func (c *ResumeCmd) Help() string {
 	return "/resume [session-id|all] - 列出当前项目目录的会话，或按 ID 恢复会话（可恢复其他项目的会话，会给出提示）；/resume all 列出所有项目的会话"
 }
@@ -71,14 +73,6 @@ func (c *ResumeCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		s.ResumeSession(r)
 	} else if in.Engine != nil {
 		in.Engine.LoadMessages(r.Messages)
-	}
-	if in.AppState != nil {
-		in.AppState.SessionID = r.ID
-		if r.Model != "" {
-			in.AppState.Model = r.Model
-		}
-		in.AppState.Messages = len(r.Messages)
-		in.AppState.BudgetUsed = r.Cost
 	}
 	return Output{Message: warning + fmt.Sprintf("已恢复: %s (%d 条消息, %d tokens)", r.Title, len(r.Messages), r.TokensIn+r.TokensOut)}, nil
 }

@@ -36,14 +36,16 @@ func TestDreamRunReportsSessionCount(t *testing.T) {
 // items too, not only /diagnose.
 func TestDoctorShowsBackgroundAndPolicyItems(t *testing.T) {
 	backgroundHome(t)
-	diagnostic.BackgroundStatusFn = func() diagnostic.BackgroundStatus {
-		return diagnostic.BackgroundStatus{
-			Dream:  dream.Status{Enabled: true, HoursSinceLast: -1, MinHours: 12, MinSessions: 3},
-			Memory: memory.Stats{FileCount: 7},
-		}
-	}
-	diagnostic.PolicyLoadErrorFn = func() error { return errors.New("load x/policies.json: bad") }
-	t.Cleanup(func() { diagnostic.BackgroundStatusFn, diagnostic.PolicyLoadErrorFn = nil, nil })
+	diagnostic.SetSession(&diagnostic.SessionFuncs{
+		Background: func() diagnostic.BackgroundStatus {
+			return diagnostic.BackgroundStatus{
+				Dream:  dream.Status{Enabled: true, HoursSinceLast: -1, MinHours: 12, MinSessions: 3},
+				Memory: memory.Stats{FileCount: 7},
+			}
+		},
+		PolicyErr: func() error { return errors.New("load x/policies.json: bad") },
+	})
+	t.Cleanup(func() { diagnostic.SetSession(nil) })
 
 	out, err := NewDoctorCmd().Execute(context.Background(), Input{})
 	if err != nil {

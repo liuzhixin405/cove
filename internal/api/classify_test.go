@@ -35,7 +35,6 @@ func TestClassifyRecognisesEveryKind(t *testing.T) {
 		{"plain transport", errors.New("read tcp: connection reset by peer"), KindTransport},
 		{"eof", errors.New("unexpected EOF"), KindTransport},
 		{"tool args", &ToolArgsInvalidError{Tool: "bash"}, KindToolArgs},
-		{"provider unavailable wraps context", &ProviderUnavailableError{Provider: "openai-compatible", Fails: 3, Cause: llama}, KindProviderUnavailable},
 		{"unknown", errors.New("boom"), KindUnknown},
 	}
 	for _, c := range cases {
@@ -48,16 +47,5 @@ func TestClassifyRecognisesEveryKind(t *testing.T) {
 func TestErrorKindString(t *testing.T) {
 	if KindContextLength.String() != "context_length" || KindUnknown.String() != "unknown" {
 		t.Errorf("String() = %q / %q", KindContextLength, KindUnknown)
-	}
-}
-
-func TestProviderUnavailableErrorUnwraps(t *testing.T) {
-	cause := &StatusError{Status: 400, Msg: "context size"}
-	err := &ProviderUnavailableError{Provider: "p", Fails: 3, Cause: cause}
-	if !errors.Is(err, cause) {
-		t.Fatal("Unwrap does not reach the cause")
-	}
-	if !IsContextLengthError(err) {
-		t.Fatal("the cause's context-length nature is hidden by the wrapper")
 	}
 }

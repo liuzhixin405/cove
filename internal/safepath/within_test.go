@@ -1,4 +1,4 @@
-package permission
+package safepath
 
 import (
 	"os"
@@ -28,7 +28,7 @@ func linkDir(t *testing.T, target, link string) {
 // through it changes files the "inside the project" auto-allow never meant
 // to cover. Existing files, new files and new subdirectories below the link
 // all count.
-func TestPathInsideFollowsLinksOutOfTheProject(t *testing.T) {
+func TestWithinFollowsLinksOutOfTheProject(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o600); err != nil {
@@ -44,30 +44,30 @@ func TestPathInsideFollowsLinksOutOfTheProject(t *testing.T) {
 		"escape/new.go",
 		"escape/newdir/new.go",
 	} {
-		if PathInside(root, target) {
-			t.Errorf("PathInside(root, %q) = true through a link to %s", target, outside)
+		if Within(root, target) {
+			t.Errorf("Within(root, %q) = true through a link to %s", target, outside)
 		}
 	}
 	for _, target := range []string{"a.go", "sub/new/b.go", "."} {
-		if !PathInside(root, target) {
-			t.Errorf("PathInside(root, %q) = false, want true", target)
+		if !Within(root, target) {
+			t.Errorf("Within(root, %q) = false, want true", target)
 		}
 	}
 }
 
 // A root reached through a link still contains its own files.
-func TestPathInsideRootBehindLink(t *testing.T) {
+func TestWithinRootBehindLink(t *testing.T) {
 	realDir := t.TempDir()
 	link := filepath.Join(t.TempDir(), "proj")
 	linkDir(t, realDir, link)
-	if !PathInside(link, "a.go") || !PathInside(link, filepath.Join(realDir, "a.go")) {
+	if !Within(link, "a.go") || !Within(link, filepath.Join(realDir, "a.go")) {
 		t.Error("files of a linked root must be inside it")
 	}
 }
 
 // A link chain longer than maxLinkHops cannot be followed to its end, so the
 // path is not known to be inside: PathInside fails closed.
-func TestPathInsideLinkChainTooLongIsOutside(t *testing.T) {
+func TestWithinLinkChainTooLongIsOutside(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	const n = maxLinkHops + 1
@@ -76,14 +76,14 @@ func TestPathInsideLinkChainTooLongIsOutside(t *testing.T) {
 	for i := n - 2; i >= 0; i-- {
 		linkDir(t, filepath.Join(root, "l"+strconv.Itoa(i+1)), filepath.Join(root, "l"+strconv.Itoa(i)))
 	}
-	if PathInside(root, "l0/x.go") {
+	if Within(root, "l0/x.go") {
 		t.Fatalf("a %d-link chain ending outside the project was judged inside", n)
 	}
 }
 
 // Same, with the file system faked: a link that points at itself loops
 // until the hop limit, and the result is "outside" (fail closed).
-func TestPathInsideLinkLoopFailsClosed(t *testing.T) {
+func TestWithinLinkLoopFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	loop := filepath.Join(root, "loop")
 	origStat, origRead := linkMode, readLink
@@ -100,10 +100,10 @@ func TestPathInsideLinkLoopFailsClosed(t *testing.T) {
 		}
 		return origRead(p)
 	}
-	if PathInside(root, "loop/x.go") {
+	if Within(root, "loop/x.go") {
 		t.Fatal("a looping link was judged inside the project")
 	}
-	if !PathInside(root, "other/x.go") {
+	if !Within(root, "other/x.go") {
 		t.Fatal("ordinary path must stay inside")
 	}
 }

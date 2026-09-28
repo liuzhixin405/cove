@@ -146,7 +146,7 @@ type Checker struct {
 	lookPath func(string) (string, error)
 
 	// Engine state, replaceable in tests; nil falls back to the package-level
-	// BackgroundStatusFn / PolicyLoadErrorFn, then to what is on disk.
+	// the running session (SetSession), then to what is on disk.
 	background func() BackgroundStatus
 	policyErr  func() error
 }

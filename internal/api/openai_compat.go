@@ -2,7 +2,6 @@ package api
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,6 +67,13 @@ func (p *openAICompatProvider) activeKey() string {
 }
 
 func (p *openAICompatProvider) Name() string { return "openai-compatible" }
+
+// endpoint is the chat completions endpoint through client (p.client, or
+// p.streamClient for a stream).
+func (p *openAICompatProvider) endpoint(client *http.Client) endpoint {
+	return endpoint{url: p.baseURL + "/chat/completions", client: client, key: p.activeKey, pool: p.keyPool,
+		auth: func(h http.Header, key string) { h.Set("Authorization", "Bearer "+key) }}
+}
 func (p *openAICompatProvider) DisplayName() string {
 	if p.name == "" {
 		return "openai-compatible"
@@ -184,29 +190,13 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 	hadImage := oaiReqHasImageURL(body)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
+	httpResp, err := p.endpoint(p.client).post(ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, err
 	}
-	key := p.activeKey()
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+key)
-
-	httpResp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
-	}
-	defer func() { _ = httpResp.Body.Close() }()
-
-	// Update key-pool health so multi-key rotation fails over.
-	p.keyPool.MarkOutcome(key, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
-
-	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
-	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: RetryAfterFor(httpResp.StatusCode, httpResp.Header)}
-	}
-	if httpResp.StatusCode != 200 {
-		return nil, formatOpenAICompatAPIError(httpResp.StatusCode, raw, hadImage)
+	raw, status := httpResp.Body, httpResp.Status
+	if status != http.StatusOK {
+		return nil, formatOpenAICompatAPIError(status, raw, hadImage)
 	}
 
 	var cr oaiResp
@@ -495,30 +485,11 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	streamCtx, markProgress, stopWatchdog := newStreamWatchdog(ctx)
 	defer stopWatchdog()
 
-	// Retry the connection-establishment phase only. Once the body starts
-	// streaming, deltas have already been delivered to the handler so retrying
-	// would duplicate output; we therefore never retry after streaming begins.
-	var streamKey string
-	httpResp, err := retryConnectHTTP(
-		streamCtx,
-		defaultRetry,
-		func(callCtx context.Context) (*http.Response, error) {
-			httpReq, reqErr := http.NewRequestWithContext(callCtx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(data))
-			if reqErr != nil {
-				return nil, reqErr
-			}
-			streamKey = p.activeKey()
-			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("Authorization", "Bearer "+streamKey)
-			return sc.Do(httpReq)
-		},
-		func(statusCode int) bool { return statusCode >= 500 || statusCode == 429 },
-	)
+	httpResp, err := p.endpoint(sc).openStream(streamCtx, data)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
-	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
@@ -530,7 +501,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	scanner := bufio.NewScanner(httpResp.Body)
 	// Default scanner buffer is 64KB — insufficient for large tool call arguments
 	// DeepSeek may send entire file content in a single SSE line
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024) // up to 10MB per line
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSSELineBytes)
 
 	type tcAccum struct {
 		ID      string

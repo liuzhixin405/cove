@@ -9,7 +9,7 @@ import (
 func TestCostBudgetNoticeAtEightyPercentOnce(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.SetMaxBudget(1)
 	eng.costTracker.AddDetailed("deepseek-chat", 0, 0, 0, 0)
 	eng.costBudgetNotice()

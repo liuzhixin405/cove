@@ -18,7 +18,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/state"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -29,8 +28,6 @@ const mcpBootstrapTimeout = 30 * time.Second
 type appBootstrap struct {
 	cfg       *config.Config
 	eng       *engine.Engine
-	permMgr   *permission.Manager
-	appState  *state.AppState
 	mcpPool   *mcp.Pool
 	skillMgr  *skills.Manager
 	memStore  *memory.Store
@@ -60,19 +57,6 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 
 	pc := cfg.EffectiveProvider()
 	projCtx := ctxt.Collect()
-	appState := state.NewState()
-	appState.Model = cfg.Model
-	appState.ModelFast = cfg.ModelFast
-	appState.PermissionMode = cfg.PermissionMode
-	appState.MaxBudget = cfg.MaxBudgetUsd
-	appState.Debug = debugMode
-
-	permMgr := permission.NewManager(permission.Default)
-	if permission.ValidMode(permission.Mode(cfg.PermissionMode)) {
-		permMgr.SetMode(permission.Mode(cfg.PermissionMode))
-	}
-	permMgr.SetBypassAvailable(true)
-
 	classifier := permission.NewClassifier()
 	hookMgr := hooks.NewManager()
 	// User-level hooks only (hooks.json in the config directory): a
@@ -130,7 +114,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 	eng, err := engine.New(engine.Config{
 		Model:          cfg.Model,
 		ModelFast:      cfg.ModelFast,
-		PermissionMode: string(permMgr.Mode()),
+		PermissionMode: cfg.PermissionMode, // engine.New falls back to default for an invalid mode
 		MaxBudget:      cfg.MaxBudgetUsd,
 		Debug:          debugMode || cfg.Debug,
 		RecordingDir:   recordDir,
@@ -168,8 +152,6 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 	return &appBootstrap{
 		cfg:       cfg,
 		eng:       eng,
-		permMgr:   permMgr,
-		appState:  appState,
 		mcpPool:   mcpPool,
 		skillMgr:  skillMgr,
 		memStore:  memStore,
@@ -227,12 +209,14 @@ func loadUserHooks() ([]hooks.HookDef, error) {
 // engine's dream runner and memory store, and why policies.json failed to
 // load. Unset, the checker re-reads the same state from disk.
 func wireDiagnostics(eng *engine.Engine, memStore *memory.Store) {
-	diagnostic.PolicyLoadErrorFn = eng.PolicyLoadError
-	diagnostic.BackgroundStatusFn = func() diagnostic.BackgroundStatus {
-		st := diagnostic.BackgroundStatus{Dream: eng.DreamStatus()}
-		if memStore != nil {
-			st.Memory = memStore.Stats()
-		}
-		return st
-	}
+	diagnostic.SetSession(&diagnostic.SessionFuncs{
+		PolicyErr: eng.PolicyLoadError,
+		Background: func() diagnostic.BackgroundStatus {
+			st := diagnostic.BackgroundStatus{Dream: eng.DreamStatus()}
+			if memStore != nil {
+				st.Memory = memStore.Stats()
+			}
+			return st
+		},
+	})
 }

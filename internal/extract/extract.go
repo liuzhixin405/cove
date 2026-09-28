@@ -17,8 +17,11 @@ import (
 
 // Runner manages automatic memory extraction after each turn.
 type Runner struct {
-	provider  api.Provider
+	provider api.Provider
+	// model is read by background extractions and replaced by SetModel
+	// when the provider or model changes (guarded by modelMu).
 	model     string
+	modelMu   sync.Mutex
 	memoryDir string
 	// mu guards inFlight and lastKey and serializes the memory-file write
 	// phase. Extract runs as a background goroutine after every turn, so
@@ -44,6 +47,19 @@ type Recorder interface {
 // SetRecorder makes the runner report finished extractions to rec (the
 // engine passes its memory store). Without one the record is written straight
 // into the memory directory, which a Store over it reads the same way.
+// SetModel changes the model later extractions ask for.
+func (r *Runner) SetModel(model string) {
+	r.modelMu.Lock()
+	r.model = model
+	r.modelMu.Unlock()
+}
+
+func (r *Runner) currentModel() string {
+	r.modelMu.Lock()
+	defer r.modelMu.Unlock()
+	return r.model
+}
+
 func (r *Runner) SetRecorder(rec Recorder) {
 	r.mu.Lock()
 	r.recorder = rec
@@ -134,7 +150,7 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 	prompt := buildExtractionPrompt(dirs[0], window, dirs[1:]...)
 
 	resp, err := r.provider.Chat(ctx, api.ChatRequest{
-		Model:      r.model,
+		Model:      r.currentModel(),
 		Messages:   []api.Message{{Role: "user", Content: prompt}},
 		SystemBase: extractSystemPrompt,
 		MaxTokens:  4000,

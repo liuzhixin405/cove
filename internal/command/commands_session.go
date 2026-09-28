@@ -30,16 +30,14 @@ func (c *StatusCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	var sb strings.Builder
 	sb.WriteString("=== 代理状态 ===\n")
 	fmt.Fprintf(&sb, "目录: %s\n", in.Cwd)
-	if in.AppState != nil {
-		if in.AppState.SessionID != "" {
-			fmt.Fprintf(&sb, "会话: %s\n", in.AppState.SessionID)
+	if src, ok := in.Engine.(StatusSource); ok {
+		if id := src.SessionID(); id != "" {
+			fmt.Fprintf(&sb, "会话: %s\n", id)
 		}
-		if in.AppState.Model != "" {
-			fmt.Fprintf(&sb, "模型: %s\n", in.AppState.Model)
+		if m := src.Model(); m != "" {
+			fmt.Fprintf(&sb, "模型: %s\n", m)
 		}
-		if in.AppState.PermissionMode != "" {
-			fmt.Fprintf(&sb, "模式: %s\n", in.AppState.PermissionMode)
-		}
+		fmt.Fprintf(&sb, "模式: %s\n", src.PermissionMode())
 	}
 	messageCount := 0
 	costSummary := ""
@@ -48,14 +46,10 @@ func (c *StatusCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		if tracker := in.Engine.CostTracker(); tracker != nil {
 			costSummary = strings.TrimSpace(tracker.Summary())
 		}
-	} else if in.AppState != nil {
-		messageCount = in.AppState.Messages
 	}
 	fmt.Fprintf(&sb, "消息数: %d\n", messageCount)
 	if costSummary != "" {
 		fmt.Fprintf(&sb, "费用: %s\n", costSummary)
-	} else if in.AppState != nil {
-		fmt.Fprintf(&sb, "预算: $%.2f / $%.2f\n", in.AppState.BudgetUsed, in.AppState.MaxBudget)
 	}
 	return Output{Message: sb.String()}, nil
 }
@@ -140,10 +134,11 @@ func (c *SystemCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	return Output{Message: fmt.Sprintf("系统提示词已保存 (%d 字符)，下次启动 cove 时生效", len([]rune(prompt)))}, nil
 }
 
-func (c *CdCmd) Name() string        { return "cd" }
-func (c *CdCmd) Aliases() []string   { return nil }
-func (c *CdCmd) Description() string { return "切换工作目录" }
-func (c *CdCmd) Help() string        { return "/cd <路径> - 切换当前工作目录" }
+func (c *CdCmd) Name() string                { return "cd" }
+func (c *CdCmd) MutatesEngine([]string) bool { return true }
+func (c *CdCmd) Aliases() []string           { return nil }
+func (c *CdCmd) Description() string         { return "切换工作目录" }
+func (c *CdCmd) Help() string                { return "/cd <路径> - 切换当前工作目录" }
 func (c *CdCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	if len(in.Args) == 0 {
 		return Output{Message: fmt.Sprintf("当前: %s", in.Cwd)}, nil

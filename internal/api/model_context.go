@@ -192,10 +192,30 @@ const maxRequestOutputTokens = 64000
 // small the window.
 const minRequestOutputTokens = 4000
 
-// CompactionSafetyMargin is kept free on top of the reply's MaxTokens when
-// deciding where compaction triggers: token counts are partly estimated,
-// and the provider's own framing takes a little room too.
+// CompactionSafetyMargin is the most kept free on top of the reply's
+// MaxTokens when deciding where compaction triggers: token counts are partly
+// estimated, and the provider's own framing takes a little room too.
 const CompactionSafetyMargin = 8000
+
+// minCompactionSafetyMargin is the least of it, however small the window.
+const minCompactionSafetyMargin = 1024
+
+// CompactionSafetyMarginFor is the margin for model's window: an eighth of
+// it, between minCompactionSafetyMargin and CompactionSafetyMargin. The
+// estimate's error grows with the prompt, not with a fixed amount; a flat
+// 8000 took half of a 16K window, put the trigger (4288) below the fixed
+// overhead of every request and turned compaction off for a window that
+// still had ~5.7K tokens of room for the conversation.
+func CompactionSafetyMarginFor(model string) int {
+	m := ContextWindowForModel(model) / 8
+	if m < minCompactionSafetyMargin {
+		m = minCompactionSafetyMargin
+	}
+	if m > CompactionSafetyMargin {
+		m = CompactionSafetyMargin
+	}
+	return m
+}
 
 // compactionFraction is the share of EffectiveCompactionBudget at which the
 // engine compacts. 0.75 of a 200K model's 170K budget is 127.5K: history
@@ -248,11 +268,11 @@ func outputReserve(model string) int {
 // CompactionTrigger is the context size at which the engine compacts the
 // history for model: compactionFraction of EffectiveCompactionBudget, but
 // never so late that the reply (outputReserve, which is at least
-// MaxOutputTokensForModel) plus CompactionSafetyMargin no longer fits the
+// MaxOutputTokensForModel) plus CompactionSafetyMarginFor no longer fits the
 // window.
 func CompactionTrigger(model string) int {
 	trigger := int(compactionFraction * float64(EffectiveCompactionBudget(model)))
-	if room := ContextWindowForModel(model) - outputReserve(model) - CompactionSafetyMargin; room < trigger {
+	if room := ContextWindowForModel(model) - outputReserve(model) - CompactionSafetyMarginFor(model); room < trigger {
 		trigger = room
 	}
 	const floor = 2000 // a window this small cannot hold a useful history anyway

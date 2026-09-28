@@ -190,8 +190,8 @@ func degenerateEnding(content string, usedToolsThisTurn bool) bool {
 // something ran this turn; read-only tools (reading, searching) do not count,
 // so a short answer after a lookup is not taken for a fragment.
 // A call that failed or was blocked changed nothing and does not count.
-func (e *Engine) noteWorkTool(l *turnLimits, name, result string) {
-	if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "BLOCKED") {
+func (e *Engine) noteWorkTool(l *turnLimits, name string, failed bool) {
+	if failed {
 		return
 	}
 	if t, ok := e.registry.Find(name); ok && t.Def().IsReadOnly {
@@ -270,7 +270,7 @@ func (e *Engine) doneCheckEnabled(routedModel string) bool {
 	case "on":
 		return true
 	}
-	return isFastModelName(routedModel) || e.fallback.Current().Name() != "anthropic"
+	return isFastModelName(routedModel) || api.CapabilitiesOf(e.llm).Family != "anthropic"
 }
 
 // doneCheckNote is the dim line shown while the done check runs.

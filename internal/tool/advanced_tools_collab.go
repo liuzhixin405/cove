@@ -4,24 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
 type TeamCreateTool struct{ baseTool }
 type TeamDeleteTool struct{ baseTool }
-type CronTool struct{ baseTool }
 type SendMessageTool struct{ baseTool }
-type LSPTool struct{ baseTool }
 
 func NewTeamCreateTool() Tool {
 	return &TeamCreateTool{baseTool{def: Def{
 		Name: "team_create", Description: "Create a team of agents for parallel work.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"},"members":{"type":"array","items":{"type":"object","properties":{"agent":{"type":"string"},"task":{"type":"string"}}}}},"required":["name","members"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Team Create",
+		IsReadOnly:  false, IsConcurrencySafe: true, PlanSafe: true, UserFacingName: "Team Create",
 	}}}
 }
 func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -65,12 +60,6 @@ func (t *TeamCreateTool) Call(ctx context.Context, input Input, tctx Context) (R
 				fmt.Fprintf(&sb, "- %s [%s]: %d members\n", team.Name, team.Status, len(team.Members))
 			}
 		}
-		if len(tctx.Runtime.CronSchedules) > 0 {
-			fmt.Fprintf(&sb, "Cron schedules: %d\n", len(tctx.Runtime.CronSchedules))
-			for _, cron := range tctx.Runtime.CronSchedules {
-				fmt.Fprintf(&sb, "- %s [%s]: %s -> %s\n", cron.ID, cron.Status, cron.Schedule, cron.Task)
-			}
-		}
 		if len(tctx.Runtime.Messages) > 0 {
 			fmt.Fprintf(&sb, "Messages: %d queued\n", len(tctx.Runtime.Messages))
 		}
@@ -101,7 +90,7 @@ func NewTeamDeleteTool() Tool {
 	return &TeamDeleteTool{baseTool{def: Def{
 		Name: "team_delete", Description: "Delete a previously created agent team.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`),
-		IsReadOnly:  false, UserFacingName: "Team Delete",
+		IsReadOnly:  false, PlanSafe: true, UserFacingName: "Team Delete",
 	}}}
 }
 func (t *TeamDeleteTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -129,52 +118,11 @@ func (t *TeamDeleteTool) CheckPermissions(input Input, tctx Context) PermissionD
 	return Allowed("team deletion is safe in current runtime")
 }
 
-func NewCronTool() Tool {
-	return &CronTool{baseTool{def: Def{
-		Name: "cron", Description: "Schedule a recurring task using cron syntax.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"schedule":{"type":"string"},"task":{"type":"string"}},"required":["schedule","task"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Cron",
-	}}}
-}
-func (t *CronTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-	schedule, _ := input["schedule"].(string)
-	task, _ := input["task"].(string)
-	if strings.TrimSpace(schedule) == "" || strings.TrimSpace(task) == "" {
-		return Result{Data: "schedule and task are required", IsError: true}, nil
-	}
-	if !looksLikeCronSchedule(schedule) {
-		return Result{Data: fmt.Sprintf("invalid cron schedule %q: expected 5 fields or @daily/@hourly/@weekly/@monthly", schedule), IsError: true}, nil
-	}
-	if tctx.Runtime == nil {
-		return Result{Data: "Cron runtime unavailable; schedule was not registered.", IsError: true}, nil
-	}
-	tctx.Runtime.Lock()
-	ensureRuntimeMaps(tctx.Runtime)
-	tctx.Runtime.TaskCounter++
-	id := fmt.Sprintf("cron-%d", tctx.Runtime.TaskCounter)
-	now := time.Now().Format(time.RFC3339)
-	tctx.Runtime.CronSchedules[id] = &CronRecord{ID: id, Schedule: schedule, Task: task, Status: "scheduled", CreatedAt: now}
-	tctx.Runtime.Tasks[id] = &TaskRecord{
-		ID:          id,
-		Title:       fmt.Sprintf("cron %s", schedule),
-		Description: task,
-		Status:      "scheduled",
-		Kind:        "cron",
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-	tctx.Runtime.Unlock()
-	return Result{Data: fmt.Sprintf("Registered local cron schedule [%s] on %s. The current CLI records and tracks the schedule; it does not run detached after process exit.", id, schedule)}, nil
-}
-func (t *CronTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
-	return Asked("cron scheduling requires confirmation")
-}
-
 func NewSendMessageTool() Tool {
 	return &SendMessageTool{baseTool{def: Def{
 		Name: "send_message", Description: "Send a message to another agent or the user.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"to":{"type":"string"},"message":{"type":"string"}},"required":["to","message"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Send Message",
+		IsReadOnly:  false, IsConcurrencySafe: true, PlanSafe: true, UserFacingName: "Send Message",
 	}}}
 }
 func (t *SendMessageTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -233,75 +181,4 @@ func (t *SendMessageTool) Call(ctx context.Context, input Input, tctx Context) (
 }
 func (t *SendMessageTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("messaging is safe")
-}
-
-func NewLSPTool() Tool {
-	return &LSPTool{baseTool{def: Def{
-		Name: "lsp", Description: "Language Server Protocol: diagnostics, hover, references, definitions.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"action":{"type":"string"},"filePath":{"type":"string"}},"required":["action","filePath"]}`),
-		IsReadOnly:  true, IsConcurrencySafe: true, UserFacingName: "LSP",
-	}}}
-}
-func (t *LSPTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
-	action, _ := input["action"].(string)
-	filePath, _ := input["filePath"].(string)
-	if tctx.Runtime != nil && tctx.Runtime.LSPRunner != nil {
-		out, err := tctx.Runtime.LSPRunner.Run(ctx, action, filePath, input)
-		if err != nil {
-			return Result{Data: fmt.Sprintf("LSP %s failed for %s: %v", action, filePath, err), IsError: true}, nil
-		}
-		return Result{Data: out}, nil
-	}
-	if strings.EqualFold(action, "diagnostics") {
-		return runLocalDiagnostics(ctx, filePath, tctx)
-	}
-	return Result{Data: fmt.Sprintf("LSP backend unavailable for %s on %s", action, filePath), IsError: true, ShouldRetry: true}, nil
-}
-func (t *LSPTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
-	return Allowed("lsp is read-only")
-}
-
-func looksLikeCronSchedule(schedule string) bool {
-	schedule = strings.TrimSpace(schedule)
-	switch schedule {
-	case "@hourly", "@daily", "@weekly", "@monthly":
-		return true
-	}
-	return len(strings.Fields(schedule)) == 5
-}
-
-func runLocalDiagnostics(ctx context.Context, filePath string, tctx Context) (Result, error) {
-	if strings.TrimSpace(filePath) == "" {
-		return Result{Data: "filePath is required", IsError: true}, nil
-	}
-	if !filepath.IsAbs(filePath) && tctx.Cwd != "" {
-		filePath = filepath.Join(tctx.Cwd, filePath)
-	}
-	filePath = filepath.Clean(filePath)
-	if _, err := os.Stat(filePath); err != nil {
-		return Result{Data: fmt.Sprintf("diagnostics unavailable: %v", err), IsError: true}, nil
-	}
-	if filepath.Ext(filePath) != ".go" {
-		return Result{Data: fmt.Sprintf("No LSP backend configured. Basic diagnostics checked file existence only: %s", filePath)}, nil
-	}
-	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	// go vet type-checks the file's package (tests included) without running
-	// anything. This used to be `go test ./...`: lsp is read-only and never
-	// asks, even in plan mode or for a read-only sub-agent, so "diagnostics"
-	// ran the project's test code unprompted.
-	cmd := exec.CommandContext(execCtx, "go", "vet", ".")
-	cmd.Dir = filepath.Dir(filePath)
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
-	if err != nil {
-		if text == "" {
-			text = err.Error()
-		}
-		return Result{Data: fmt.Sprintf("Go diagnostics for %s failed:\n%s", filePath, text), IsError: true}, nil
-	}
-	if text == "" {
-		text = "go vet: no problems found"
-	}
-	return Result{Data: fmt.Sprintf("Go diagnostics for %s:\n%s", filePath, text)}, nil
 }

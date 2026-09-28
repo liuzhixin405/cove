@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/liuzhixin405/cove/internal/textutil"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
@@ -220,7 +222,7 @@ func (cc *ChatCompressor) trimOldToolResults(messages []api.Message, keepCount i
 	}
 	for i := 0; i < cutoff; i++ {
 		if messages[i].Role == "tool" && len(messages[i].Content) > 300 {
-			messages[i].Content = clipRunes(messages[i].Content, 100)
+			messages[i].Content = keepRunes(messages[i].Content, 100)
 		}
 	}
 }
@@ -246,16 +248,16 @@ func (cc *ChatCompressor) generateSummary(
 		content := m.Content
 		switch {
 		case m.Role == "tool":
-			content = clipRunes(content, summaryToolRunes)
+			content = keepRunes(content, summaryToolRunes)
 		case m.Role == "user" && !sawRequest && !looksSynthetic(m):
 			// The original request: keep enough of it that the summary
 			// can carry the requirements forward.
 			sawRequest = true
-			content = clipRunes(content, summaryFirstUserRunes)
+			content = keepRunes(content, summaryFirstUserRunes)
 		case m.Role == "user":
-			content = clipRunes(content, summaryUserRunes)
+			content = keepRunes(content, summaryUserRunes)
 		default:
-			content = clipRunes(content, summaryAssistantRunes)
+			content = keepRunes(content, summaryAssistantRunes)
 		}
 		summaryInput.WriteString(content)
 		if len(m.ToolCalls) > 0 {
@@ -263,7 +265,7 @@ func (cc *ChatCompressor) generateSummary(
 				if path, ok := tc.Input["filePath"].(string); ok {
 					fmt.Fprintf(&summaryInput, " → %s(%s)", tc.Name, path)
 				} else if cmd, ok := tc.Input["command"].(string); ok {
-					fmt.Fprintf(&summaryInput, " → bash(%s)", clipRunes(cmd, 60))
+					fmt.Fprintf(&summaryInput, " → bash(%s)", keepRunes(cmd, 60))
 				} else {
 					fmt.Fprintf(&summaryInput, " → %s()", tc.Name)
 				}
@@ -379,15 +381,18 @@ func originalRequestBlock(messages []api.Message) string {
 	if orig == "" {
 		return ""
 	}
-	return "<original_request>\n" + clipRunes(orig, summaryFirstUserRunes) + "\n</original_request>\n\n"
+	return "<original_request>\n" + keepRunes(orig, summaryFirstUserRunes) + "\n</original_request>\n\n"
 }
 
-func clipRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
+// keepRunes keeps the first n runes of s and marks the cut with "...": the
+// summary budgets (summaryFirstUserRunes and the rest) count content kept,
+// so the result is n runes plus the marker. Unlike textutil.ClipRunes, whose
+// limit includes the ellipsis; it was called clipRunes too.
+func keepRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return string(r[:n]) + "..."
+	return textutil.HeadRunes(s, n) + "..."
 }
 
 // countTokens is declared in token_count.go

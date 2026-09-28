@@ -15,6 +15,12 @@ type namedProvider struct {
 
 func (p namedProvider) Name() string { return p.name }
 
+// Capabilities declares the family the name stands for; the engine reads
+// the family, not the name.
+func (p namedProvider) Capabilities() api.Capabilities {
+	return api.Capabilities{Family: p.name, CacheBreakpoints: p.name == "anthropic", ToolsWithToolHistory: p.name == "anthropic"}
+}
+
 // doneCheckRun runs one turn: a write (or read) tool call, then long final
 // answers that trigger no other nudge. It returns the model calls made and
 // how many done-check prompts the history holds.

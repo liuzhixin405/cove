@@ -298,16 +298,19 @@ func TestGitRoutineGroupPersists(t *testing.T) {
 		t.Fatalf("ToRule = %+v, %v; want %+v", back, ok, rule)
 	}
 
-	pr := loaded[0]
-	if !pr.Match("bash", map[string]any{"command": "git commit -m x && git push"}) {
-		t.Error("policy allow group rule does not match a routine line")
+	m := NewManager(Default)
+	m.AddRule(DAllow, back)
+	if d, _ := m.Check("bash", map[string]any{"command": "git commit -m x && git push"}, DAsk); d != DAllow {
+		t.Errorf("policy allow group rule does not cover a routine line: %s", d)
 	}
-	if pr.Match("bash", map[string]any{"command": "git push --force"}) {
-		t.Error("policy allow group rule matches a forced push")
+	if d, _ := m.Check("bash", map[string]any{"command": "git push --force"}, DAsk); d == DAllow {
+		t.Error("policy allow group rule covers a forced push")
 	}
-	deny := PolicyRule{ToolPattern: "bash", Action: ActionDeny, Enabled: true, CommandGroup: GroupGitRoutine}
-	if !deny.Match("bash", map[string]any{"command": "ls && git push"}) {
-		t.Error("policy deny group rule misses git push in a compound line")
+	denyRule, _ := PolicyRule{ToolPattern: "bash", Action: ActionDeny, Enabled: true, CommandGroup: GroupGitRoutine}.ToRule()
+	md := NewManager(Default)
+	md.AddRule(DDeny, denyRule)
+	if d, _ := md.Check("bash", map[string]any{"command": "ls && git push"}, DAsk); d != DDeny {
+		t.Errorf("policy deny group rule misses git push in a compound line: %s", d)
 	}
 	if got, ok := (PolicyRule{ToolPattern: "bash", CommandGroup: "unknown-group"}).ToRule(); ok {
 		t.Errorf("unknown group converted: %+v", got)

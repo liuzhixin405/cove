@@ -23,24 +23,16 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/config"
 
-	ctxt "github.com/liuzhixin405/cove/internal/context"
-
 	"github.com/liuzhixin405/cove/internal/engine"
-
-	"github.com/liuzhixin405/cove/internal/mcp"
-
-	"github.com/liuzhixin405/cove/internal/memory"
 
 	"github.com/liuzhixin405/cove/internal/permission"
 
-	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove/internal/textutil"
 
 	"github.com/liuzhixin405/cove/internal/session"
 
 	"github.com/liuzhixin405/cove/internal/skills"
-
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
 type providerReloader interface {
@@ -54,7 +46,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "11.4.0"
+	Version = "11.5.0"
 
 	BuildTime = "pro"
 
@@ -139,15 +131,9 @@ func main() {
 
 	cfg := app.cfg
 	eng := app.eng
-	permMgr := app.permMgr
-	appState := app.appState
 	mcpPool := app.mcpPool
 	wireToolDefsVersion(eng, mcpPool)
-	skillMgr := app.skillMgr
-	memStore := app.memStore
-	pluginMgr := app.pluginMgr
 	projCtx := app.projCtx
-	toolReg := app.toolReg
 
 	cmdReg := registerAllCommands()
 
@@ -173,7 +159,6 @@ func main() {
 			fmt.Fprint(os.Stderr, warning)
 		}
 		fmt.Fprintf(os.Stderr, "已恢复会话: %s (%d 条消息)\n", shortDesc(effectiveHistoryTitle(*r)), len(r.Messages))
-		appState.Messages = len(r.Messages)
 	}
 
 	// Set up interactive permission prompt for the REPL
@@ -182,7 +167,7 @@ func main() {
 
 	runStartupDiagnostics(cfg, debugMode)
 
-	bannerText := termui.Banner(Version, cfg.Model, eng.ProviderName(), string(permMgr.Mode()), projCtx.Cwd, projCtx.GitBranch, "", len(eng.Registry().All()), projCtx.IsGitRepo)
+	bannerText := termui.Banner(Version, cfg.Model, eng.ProviderName(), string(eng.PermissionMode()), projCtx.Cwd, projCtx.GitBranch, "", len(eng.Registry().All()), projCtx.IsGitRepo)
 
 	if dumpPrompt {
 
@@ -211,7 +196,7 @@ func main() {
 
 		// The interactive shell builds its own command catalogue from the
 		// registry (buildCommandList), so nothing has to be assembled here.
-		runREPL(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
+		runREPL(app, cmdReg, bannerText)
 
 		// The shell's /exit and Ctrl+D paths already saved the session and
 		// recorded its cost (autoSaveSession, which also fires SessionEnd);
@@ -228,7 +213,7 @@ func main() {
 	// frontend. The classic line REPL has been removed; its behavior lives in
 	// the Bubble Tea TUI (interactive) and here (non-interactive).
 	applyUnattendedLimits(eng, opts, cfg)
-	runHeadless(bannerText, eng, cmdReg, toolReg, permMgr, appState, cfg, mcpPool, skillMgr, memStore, pluginMgr, projCtx)
+	runHeadless(app, cmdReg, bannerText)
 
 	finishSession(eng, mcpPool)
 
@@ -542,7 +527,16 @@ func (a replEngineAdapter) SetWorkingDir(dir string) bool {
 
 func (a replEngineAdapter) ResumeSession(r *session.Record) { a.eng.ResumeSession(r) }
 
-func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg *config.Config, eng *engine.Engine, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, permMgr *permission.Manager, projCtx *ctxt.ProjectContext, appState *state.AppState) {
+// Model, PermissionMode and SessionID are what /status shows (command.StatusSource).
+func (a replEngineAdapter) Model() string                   { return a.eng.Model() }
+func (a replEngineAdapter) PermissionMode() permission.Mode { return a.eng.PermissionMode() }
+func (a replEngineAdapter) SessionID() string               { return a.eng.SessionID() }
+
+// execute runs the registered command of the slash line input and prints
+// what it returns.
+func (fe *frontend) execute(ctx context.Context, input string) {
+	reg, cfg, eng, mcpPool := fe.reg, fe.cfg, fe.eng, fe.mcpPool
+	skillMgr, memStore, pluginMgr, projCtx := fe.skillMgr, fe.memStore, fe.pluginMgr, fe.projCtx
 
 	parts := strings.Fields(input)
 
@@ -562,6 +556,8 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 	out, err := c.Execute(ctx, command.Input{
 
+		Raw: input,
+
 		Args: parts[1:],
 
 		Cwd: cwd,
@@ -580,13 +576,11 @@ func handleCommand(ctx context.Context, input string, reg *command.Registry, cfg
 
 		MemoryStore: memStore,
 
-		PermissionManager: permMgr,
+		PermissionManager: eng.Permissions(),
 
 		MCPPool: mcpPool,
 
 		ProjectContext: projCtx,
-
-		AppState: appState,
 	})
 
 	if err != nil {
@@ -963,14 +957,8 @@ REPL 内置命令:
 
 }
 
+// truncateDesc shortens a description to n runes. It cut at byte n, which
+// split a Chinese character and printed mojibake in /help and the plugin list.
 func truncateDesc(s string, n int) string {
-
-	if len(s) <= n {
-
-		return s
-
-	}
-
-	return s[:n-3] + "..."
-
+	return textutil.ClipRunes(s, n)
 }

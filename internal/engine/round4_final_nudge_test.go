@@ -47,7 +47,7 @@ func TestNudgedRepliesAreSeparatedInTheStream(t *testing.T) {
 func TestEmitSeparatorWithoutStreamIsSilent(t *testing.T) {
 	eng := newPatternEngine(t, &seqProvider{}, nil)
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.emitSeparator(nil, true)
 	if len(lines) != 0 {
 		t.Fatalf("engine output without a stream: %q", lines)
@@ -82,15 +82,13 @@ func TestShortCompletionMarkersAreNotDegenerate(t *testing.T) {
 // work for degenerateEnding.
 func TestNoteWorkToolIgnoresFailedCalls(t *testing.T) {
 	eng := newPatternEngine(t, &seqProvider{}, nil, &mockTool{name: "write", result: "written"})
-	for _, res := range []string{"Error: file not found", "BLOCKED: denied by policy"} {
-		l := &turnLimits{}
-		eng.noteWorkTool(l, "write", res)
-		if l.usedTools {
-			t.Errorf("result %q counted as work", res)
-		}
-	}
 	l := &turnLimits{}
-	eng.noteWorkTool(l, "write", "written")
+	eng.noteWorkTool(l, "write", true)
+	if l.usedTools {
+		t.Error("a failed write counted as work")
+	}
+	l = &turnLimits{}
+	eng.noteWorkTool(l, "write", false)
 	if !l.usedTools {
 		t.Fatal("a successful write did not count as work")
 	}

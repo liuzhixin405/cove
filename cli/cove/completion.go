@@ -18,30 +18,21 @@ type cmdEntry struct {
 	ArgHints map[string][]string
 }
 
+// buildCommandList is what completion offers: every registered command
+// (with its argument hints) and every tool. The slash commands used to be a
+// second hand-written table here.
 func buildCommandList(cmdReg *command.Registry, toolReg *tool.Registry) []cmdEntry {
 	var list []cmdEntry
 	for _, c := range cmdReg.All() {
-		list = append(list, cmdEntry{Name: "/" + c.Name(), Desc: c.Description(), Type: "cmd"})
+		e := cmdEntry{Name: "/" + c.Name(), Desc: c.Description(), Type: "cmd"}
+		if commandCategory(c) != "" {
+			e.Type = "builtin"
+		}
+		if h, ok := c.(command.ArgHinter); ok && len(h.ArgHints()) > 0 {
+			e.ArgHints = map[string][]string{"": h.ArgHints()}
+		}
+		list = append(list, e)
 	}
-	list = append(list,
-		cmdEntry{Name: "/model", Desc: "设置模型", Type: "config"},
-		cmdEntry{Name: "/profile", Desc: "管理配置档案 (list/switch/save/delete/show)", Type: "config", ArgHints: map[string][]string{"": {"list", "switch", "save", "delete", "show"}}},
-		cmdEntry{Name: "/provider", Desc: "设置供应商", Type: "config", ArgHints: map[string][]string{"": providerNameSuggestions()}},
-		cmdEntry{Name: "/api-key", Desc: "设置 API 密钥", Type: "config"},
-		cmdEntry{Name: "/base-url", Desc: "设置 API 地址", Type: "config"},
-		cmdEntry{Name: "/record", Desc: "录制会话事件 (status/start/stop)", Type: "config", ArgHints: map[string][]string{"": {"status", "start", "stop"}}},
-		cmdEntry{Name: "/mode", Desc: "设置权限模式 (default|plan|auto|bypass)", Type: "config", ArgHints: map[string][]string{"": {"default", "plan", "auto", "bypass"}}},
-		cmdEntry{Name: "/budget", Desc: "设置预算上限 ($)", Type: "config"},
-		cmdEntry{Name: "/attach", Desc: "挂载图片或文件到后续提问", Type: "builtin", ArgHints: map[string][]string{"": {"list", "clear", "remove", "add"}}},
-		cmdEntry{Name: "/help", Desc: "显示帮助", Type: "builtin"},
-		cmdEntry{Name: "/exit", Desc: "退出", Type: "builtin"},
-		cmdEntry{Name: "/history", Desc: "查看和继续历史会话", Type: "builtin"},
-		cmdEntry{Name: "/history clear", Desc: "清空本项目历史会话（需 confirm）", Type: "builtin"},
-		cmdEntry{Name: "/history delete", Desc: "删除一个历史会话（编号或 ID）", Type: "builtin"},
-		cmdEntry{Name: "/history clean", Desc: "修复历史文件（标题/标记，不删除）并备份", Type: "builtin"},
-		cmdEntry{Name: "/tasks", Desc: "查看运行中/排队的后台任务", Type: "builtin"},
-		cmdEntry{Name: "/stop", Desc: "取消当前运行的任务", Type: "builtin"},
-	)
 	for _, t := range toolReg.All() {
 		d := t.Def()
 		args := toolArgNames(d.InputSchema)

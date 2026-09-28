@@ -17,7 +17,7 @@ var questionPromptTimeout = 15 * time.Minute
 // installQuestionPrompt gives the question tool a way to ask: Runtime.AskUser
 // was never assigned, so the tool always answered "requires interactive
 // mode". It uses the answer relay the permission prompt uses
-// (repl.SetPermInputCh), so only the REPL installs it; -p and headless runs
+// (repl.SetPromptInput), so only the REPL installs it; -p and headless runs
 // do not register the tool at all.
 func installQuestionPrompt(eng *engine.Engine) {
 	if eng == nil || eng.Runtime() == nil {
@@ -34,22 +34,12 @@ func askUserQuestion(prompt string) string {
 	if !replInteractive {
 		return ""
 	}
-	answerCh := make(chan string, 1)
-	repl.SetPromptInput(answerCh, nil, "模型在等你回答上面的问题：输入选项编号或直接输入回答")
-	repl.BeginPromptInput()
-	termui.PrintAbove(termui.Styled(termui.Bold, strings.TrimRight(prompt, "\n")) + "\n  " +
-		termui.Styled(termui.Dim, "输入选项编号或直接输入回答") + "\n")
-
-	timer := time.NewTimer(questionPromptTimeout)
-	defer timer.Stop()
-	var answer string
-	select {
-	case answer = <-answerCh:
-	case <-timer.C:
+	text := termui.Styled(termui.Bold, strings.TrimRight(prompt, "\n")) + "\n  " +
+		termui.Styled(termui.Dim, "输入选项编号或直接输入回答") + "\n"
+	answer, ok := repl.Ask(text, nil, "模型在等你回答上面的问题：输入选项编号或直接输入回答", questionPromptTimeout)
+	if !ok {
 		termui.PrintAbove("  " + termui.Styled(termui.Dim, "等待回答超时，按未回答处理") + "\n")
 	}
-	repl.EndPromptInput()
-	repl.ClearPermInputCh()
 	return answer
 }
 

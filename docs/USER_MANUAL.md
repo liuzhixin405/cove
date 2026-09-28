@@ -265,6 +265,8 @@ go build -o cove ./cli/cove
 | `/api-key <密钥>` | 保存 API 密钥 |
 | `/base-url <地址>` | 设置自定义接口地址 |
 | `/mode <模式>` | 设置权限模式 |
+| `/profile [list\|switch\|save\|delete\|show]` | 管理具名配置档案 |
+| `/record [status\|start\|stop]` | 控制会话事件录制 |
 | `/budget <金额\|auto\|off\|save>` | 设置**本会话**预算上限（$）：`<金额>` 与 `auto`（按历史用量自动调整）只改本会话，`off` 取消本会话上限，`save` 把当前会话预算写入 `config.json`（见[预算管理](#预算管理)） |
 | `/cost` | 查看用量和费用 |
 | `/ratelimit` | 查看 API 速率限制状态 |
@@ -302,6 +304,8 @@ go build -o cove ./cli/cove
 | 命令 | 说明 |
 |------|------|
 | `/tasks` | 查看运行中/排队任务（TUI）；headless 显示同步执行状态 |
+| `/clear` | 清屏并清空回滚区（别名 `/cls`，快捷键 Ctrl+L）；不影响对话上下文 |
+| `/new` | 保存当前会话并开始新会话（清空对话上下文）；旧会话可在 `/history` 找回 |
 | `/stop` 或 `/cancel` | 取消当前任务（TUI）；headless 无后台任务可取消 |
 
 > 表中的“TUI”指默认的交互式 REPL（终端里直接运行 `cove`）。这一叫法沿用自早期的全屏界面，该界面已移除。
@@ -321,6 +325,8 @@ go build -o cove ./cli/cove
 | `/mcp` | MCP 服务器管理 |
 | `/plugin` | 插件管理 |
 | `/skills` | 列出可用技能 |
+| `/skill <名称>` | 查看或调用一个技能（别名 `/skills`） |
+| `/tools` | 列出可用工具 |
 | `/doctor` | 快速检查：git、ripgrep、供应商与 API key，末尾附“后台学习”“权限规则文件”两项 |
 | `/diagnose [quick\|errors\|archive\|codes\|trace N]` | 完整系统诊断与错误分析（含“后台学习”“权限规则文件”）；`trace` 查看最近 N 条交互轨迹 |
 | `/status` | 查看代理状态与会话信息 |
@@ -458,7 +464,7 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | `default` | 只读工具（`read`/`grep`/`glob` 等）；**整行都是只读简单命令**的 `bash`/`powershell` 命令，如 `git status`、`git diff --stat`、`git log --oneline -5`、`ls -la`、`cat go.mod`、`grep -rn foo .`、`git status && git diff` | 其余一切：写文件、编辑、git 写操作、构建、安装、网络请求（`curl`/`wget` 即使只是 GET 也询问） |
 | `auto` | `default` 的全部 + 构建/测试命令（`go build`/`go test`/`go vet`、`cargo test`、`make test` 等）+ 目标路径位于项目工作目录内的 `write`/`edit` | git 写操作（`commit`/`push` 等）、包安装、网络请求、未知命令、项目外写入、MCP 工具、`draw_image`、浏览器截图、`worktree` 等 |
 | `bypass` | 全部（`deny` 规则仍生效） | 无（灾难命令仍被硬拦截，见下文） |
-| `plan` | 只读工具 | 不询问：`bash` 与写入类工具一律拒绝（之前选过的“总是允许”在此模式下不生效） |
+| `plan` | 只读工具；整行只读的 `bash`/`powershell` 命令；只影响会话本身的工具（`todowrite`、`question`、`skill`，以及 `agent`/`execute_plan`，子代理的每个调用照样受 plan 限制） | 不询问：其余工具一律拒绝，不管工具自己怎么回答（之前选过的“总是允许”在此模式下不生效）。模型用 `plan_mode` 自行进入的计划模式同样按此执行；它可以用 `exit_plan_mode` 退出（需你确认），但你用 `/mode plan` 设置的计划模式只能由你切换 |
 
 - 没有任何规则命中时，任何模式下都是“询问”（旧版本 `auto` 模式在无规则命中时直接放行，等于放行一切，已修正）。
 - 用户在 `policies.json` 或本次会话中配置的 `deny` / `ask` 规则优先于上述自动放行，也优先于 `allow` 规则（判定顺序与匹配方式见[规则判定顺序与匹配](#规则判定顺序与匹配)）。
@@ -514,14 +520,15 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 一次工具调用按以下顺序判定，先命中者决定结果：
 
-1. `deny` 规则 → 拒绝（任何模式，包括 `bypass`）
-2. `plan` 模式 → 非只读工具拒绝
-3. `bypass` 模式 → 放行（`ask` 规则在 `bypass` 下不生效，只有 `deny` 与 `plan` 能拦住 `bypass`）
-4. `ask` 规则 → 询问。即使同一命令还被 `[a]`/`[p]`、整工具允许或 `policies.json` 的 `allow` 覆盖，也照样询问
-5. `allow` 规则 → 放行
-6. 权限模式的默认行为（见上表）
+1. 工具自身拒绝 → 拒绝（如 `webfetch`/`browser` 拒绝内网地址、plan 模式下的写入），任何规则和模式都不能覆盖
+2. `deny` 规则 → 拒绝（任何模式，包括 `bypass`，与 `priority` 无关）
+3. `plan` 模式 → 只放行只读工具、整行只读的 shell 命令和只影响会话的工具（见上表）
+4. `bypass` 模式 → 放行（`ask` 规则在 `bypass` 下不生效，只有工具自身拒绝、`deny` 与 `plan` 能拦住 `bypass`）
+5. `ask` 规则 → 询问。即使同一命令还被 `[a]`/`[p]`、整工具允许或 `policies.json` 的 `allow` 覆盖，也照样询问——除非那条 `allow` 的 `priority` 更高
+6. `allow` 规则 → 放行
+7. 权限模式的默认行为（见上表）
 
-`policies.json` 中同一 `priority` 的规则按 `deny` > `ask` > `allow` 取胜，与书写顺序无关；`priority` 更高的 `allow` 仍先于优先级较低的 `ask`。
+`priority` 只在 `ask` 与 `allow` 之间起作用：`priority` 更高的 `allow` 先于优先级较低的 `ask`，同级时 `ask` 取胜，与书写顺序无关；`[a]`/`[p]` 记住的规则优先级为 0。`deny` 不看 `priority`，总是取胜。所有规则（包括通配工具名如 `mcp__*` 与 `param_match`）都按同一顺序判定。
 
 **`deny` / `ask` 前缀规则按归一化后的命令匹配**，换个写法绕不开：
 
@@ -1637,7 +1644,7 @@ CovePhone 是 Cove 的 Android 手机伴侣应用。
 
 ### 特性
 
-- **原生 Go 引擎**：与桌面版使用相同的 Go 引擎，通过 `gomobile` 编译为 `cove-core.aar`
+- **原生 Go 引擎**：与桌面版共用同一套 Go 模型接入层（`internal/api`：各提供商、流式解析、工具参数修复、连接重试），通过 `gomobile` 编译为 `cove-core.aar`；工具调用循环是移动端自己的轻量实现，不包含桌面版的工具系统和权限机制
 - **Thinking 显示**：AI 思考过程带平滑滚动显示
 - **持久化设置**：API Key、模型、提供商自动保存
 - **多轮对话**：会话内完整聊天历史

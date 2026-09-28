@@ -33,26 +33,12 @@ func askTurnLimit(stats engine.LimitStats) engine.LimitDecision {
 	if !replInteractive {
 		return engine.LimitStop
 	}
-	answerCh := make(chan string, 1)
-	repl.SetPromptInput(answerCh, limitAnswerAccepted, "上限提示等待回答：c 继续 / s 停止")
-	repl.BeginPromptInput()
-	termui.PrintAbove(limitPromptText(stats))
-
-	timer := time.NewTimer(limitPromptTimeout)
-	defer timer.Stop()
-
-	var answer string
-	select {
-	case answer = <-answerCh:
-	case <-timer.C:
-		repl.EndPromptInput()
-		repl.ClearPermInputCh()
+	answer, ok := repl.Ask(limitPromptText(stats), limitAnswerAccepted, "上限提示等待回答：c 继续 / s 停止", limitPromptTimeout)
+	if !ok {
 		// The relay is gone: a "c" typed from now on is an ordinary message.
 		termui.PrintAbove("  " + termui.Styled(termui.Yellow, "等待超时，已按停止处理（此后单独输入 c 会作为新消息发送）") + "\n")
 		return engine.LimitStop
 	}
-	repl.EndPromptInput()
-	repl.ClearPermInputCh()
 
 	// A stop needs no line of its own here: the turn then ends with the limit
 	// error, whose line says /continue resumes it (turnErrorLine).

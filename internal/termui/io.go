@@ -112,6 +112,23 @@ func normalizeOutputNewlines(s string) string {
 	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
+// Text writes s the way fmt.Print would, except that while a line editor
+// owns the terminal it goes through the editor, above the input line, like
+// PrintAbove. Without an editor (-p, headless, piped) the bytes are written
+// as they are: stdout there is the answer, and PrintAbove's \r\n
+// conversion would change it.
+func Text(s string) {
+	if c := activeConsole(); c != nil {
+		if strings.HasSuffix(s, "\n") {
+			c.PrintAbove(s)
+		} else {
+			c.StreamPrint(s)
+		}
+		return
+	}
+	write(s)
+}
+
 func PrintSafe(format string, args ...any) {
 	PrintAbove(fmt.Sprintf(format, args...))
 }

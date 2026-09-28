@@ -23,72 +23,32 @@ func TestMatchRule_ArgPatternNilInputNoBypass(t *testing.T) {
 	}
 }
 
-func TestPolicyEngine_EvaluateAndGlob(t *testing.T) {
-	pe := NewPolicyEngine()
-	_ = pe.AddRule(PolicyRule{ID: "a", ToolPattern: "read", Action: ActionAllow, Enabled: true, Priority: 10})
-	_ = pe.AddRule(PolicyRule{ID: "b", ToolPattern: "mcp_*", Action: ActionDeny, Enabled: true, Priority: 5})
-
-	if got := pe.Evaluate("read", nil, "default"); got != ActionAllow {
-		t.Fatalf("read: want allow, got %v", got)
-	}
-	if got := pe.Evaluate("mcp_github_search", nil, "default"); got != ActionDeny {
-		t.Fatalf("glob mcp_*: want deny, got %v", got)
-	}
-	if got := pe.Evaluate("write", nil, "default"); got != ActionAsk {
-		t.Fatalf("unmatched in default mode: want ask, got %v", got)
-	}
-	// No rule matched: ask in every mode. Auto mode's extra allowances are
-	// decided by the engine's mode tiers, not by a blanket policy default.
-	if got := pe.Evaluate("write", nil, "auto"); got != ActionAsk {
-		t.Fatalf("unmatched in auto mode: want ask, got %v", got)
-	}
-}
-
-func TestPolicyEngine_HigherPriorityWins(t *testing.T) {
-	pe := NewPolicyEngine()
-	_ = pe.AddRule(PolicyRule{ID: "low", ToolPattern: "bash", Action: ActionAllow, Enabled: true, Priority: 1})
-	_ = pe.AddRule(PolicyRule{ID: "high", ToolPattern: "bash", Action: ActionDeny, Enabled: true, Priority: 100})
-	if got := pe.Evaluate("bash", nil, "default"); got != ActionDeny {
-		t.Fatalf("higher-priority rule should win: want deny, got %v", got)
-	}
-}
-
-// The "始终允许" flow must survive a restart: a rule added to an engine with a
-// file store should be reloaded by a fresh engine pointed at the same file.
-func TestPolicyEngine_PersistsAcrossRestart(t *testing.T) {
+// Rules written to the policies file are read back by a fresh storage on
+// the same file (a "[p]" answer survives a restart).
+func TestPolicyStoragePersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "policies.json")
 	store, err := NewFilePolicyStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	pe := NewPolicyEngine()
-	pe.SetStorage(store)
-	if err := pe.AddRule(PolicyRule{ID: "user-allow-write", ToolPattern: "write", Action: ActionAllow, Enabled: true, Priority: 100}); err != nil {
+	want := []PolicyRule{{ID: "user-allow-write", ToolPattern: "write", Action: ActionAllow, Enabled: true, Priority: 100}}
+	if err := store.Save(want); err != nil {
 		t.Fatal(err)
 	}
-
-	// Simulate restart: new engine, new store, same file.
 	store2, _ := NewFilePolicyStorage(path)
-	rules, err := store2.Load()
+	got, err := store2.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pe2 := NewPolicyEngine()
-	pe2.LoadRules(rules)
-	if got := pe2.Evaluate("write", nil, "default"); got != ActionAllow {
-		t.Fatalf("persisted rule lost across restart: want allow, got %v", got)
+	if len(got) != 1 || got[0].ID != "user-allow-write" || got[0].Priority != 100 || !got[0].Enabled {
+		t.Fatalf("rules after restart = %+v", got)
 	}
-
-	// Removal must persist too.
-	pe.SetStorage(store) // ensure storage attached
-	if err := pe.RemoveRule("user-allow-write"); err != nil {
+	if err := store2.Save(nil); err != nil {
 		t.Fatal(err)
 	}
 	store3, _ := NewFilePolicyStorage(path)
-	rules3, _ := store3.Load()
-	if len(rules3) != 0 {
-		t.Fatalf("removal not persisted: %d rules remain", len(rules3))
+	if rules, _ := store3.Load(); len(rules) != 0 {
+		t.Fatalf("removal not persisted: %d rules remain", len(rules))
 	}
 }
 
@@ -108,37 +68,67 @@ func TestPolicyRuleToRule(t *testing.T) {
 	if got, ok := (PolicyRule{ToolPattern: "write"}).ToRule(); !ok || got.ToolPattern != "write" {
 		t.Fatalf("whole-tool rule = %+v, %v", got, ok)
 	}
-	// Globs and param matches have no Manager equivalent.
-	for _, r := range []PolicyRule{
-		{ToolPattern: "mcp_*"},
-		{ToolPattern: "bash", ParamMatch: map[string]string{"command": "git *"}},
-		{},
-	} {
-		if got, ok := r.ToRule(); ok {
-			t.Errorf("%+v.ToRule() = %+v, true; want false", r, got)
-		}
+	// Globs, param matches and priorities convert too: the Manager is the
+	// only evaluator, so a rule that did not convert used to be judged by a
+	// second one with different precedence.
+	got, ok = PolicyRule{ToolPattern: "mcp_*", Priority: 3}.ToRule()
+	if !ok || got.ToolPattern != "mcp_*" || got.Priority != 3 {
+		t.Fatalf("glob rule = %+v, %v", got, ok)
+	}
+	got, ok = PolicyRule{ToolPattern: "bash", ParamMatch: map[string]string{"command": "git *"}}.ToRule()
+	if !ok || got.ParamMatch["command"] != "git *" {
+		t.Fatalf("param_match rule = %+v, %v", got, ok)
+	}
+	if got, ok := (PolicyRule{}).ToRule(); ok {
+		t.Errorf("empty rule converted to %+v", got)
 	}
 }
 
-// A persisted prefix rule must not turn into a whole-tool allow inside the
-// policy engine: Match has to respect CommandPrefix and InputEquals.
-func TestPolicyRuleMatchRespectsCommandPrefix(t *testing.T) {
-	r := PolicyRule{ID: "p", ToolPattern: "bash", Action: ActionAllow, Enabled: true, CommandPrefix: "git commit"}
-	if !r.Match("bash", map[string]any{"command": "git commit -m x"}) {
-		t.Error("git commit not matched")
-	}
-	for _, cmd := range []string{"rm -rf x", "git commit -m x && rm -rf y", "git push"} {
-		if r.Match("bash", map[string]any{"command": cmd}) {
-			t.Errorf("allow prefix rule matched %q", cmd)
+// The precedence the manual documents, now in one evaluator: a deny wins
+// whatever its priority; among ask and allow the higher priority wins and a
+// tie goes to ask; a glob tool pattern and param_match apply like any rule.
+func TestManagerPrecedenceWithPolicyRules(t *testing.T) {
+	add := func(m *Manager, d Decision, r PolicyRule) {
+		rule, ok := r.ToRule()
+		if !ok {
+			t.Fatalf("%+v did not convert", r)
 		}
+		m.AddRule(d, rule)
 	}
-	deny := PolicyRule{ID: "d", ToolPattern: "bash", Action: ActionDeny, Enabled: true, CommandPrefix: "rm"}
-	if !deny.Match("bash", map[string]any{"command": "cd x && rm -rf y"}) {
-		t.Error("deny prefix rule missed rm inside a compound line")
+	git := map[string]any{"command": "git push"}
+
+	m := NewManager(Default)
+	add(m, DAllow, PolicyRule{ToolPattern: "bash", CommandPrefix: "git", Priority: 100})
+	add(m, DDeny, PolicyRule{ToolPattern: "bash", Priority: 1})
+	if d, _ := m.Check("bash", git, DAsk); d != DDeny {
+		t.Errorf("a low-priority deny lost to a high-priority allow: %s", d)
 	}
-	mcp := PolicyRule{ID: "m", ToolPattern: "mcp", Action: ActionAllow, Enabled: true, InputEquals: map[string]string{"toolName": "a"}}
-	if mcp.Match("mcp", map[string]any{"toolName": "b"}) || !mcp.Match("mcp", map[string]any{"toolName": "a"}) {
-		t.Error("InputEquals not respected")
+
+	m = NewManager(Default)
+	add(m, DAllow, PolicyRule{ToolPattern: "bash", CommandPrefix: "git push", Priority: 5})
+	add(m, DAsk, PolicyRule{ToolPattern: "bash", CommandPrefix: "git push"})
+	if d, _ := m.Check("bash", git, DAsk); d != DAllow {
+		t.Errorf("a higher-priority allow did not beat a lower ask: %s", d)
+	}
+	m = NewManager(Default)
+	add(m, DAllow, PolicyRule{ToolPattern: "bash", CommandPrefix: "git push"})
+	add(m, DAsk, PolicyRule{ToolPattern: "bash", CommandPrefix: "git push"})
+	if d, _ := m.Check("bash", git, DAsk); d != DAsk {
+		t.Errorf("ask did not win a priority tie: %s", d)
+	}
+
+	m = NewManager(Bypass)
+	m.SetBypassAvailable(true)
+	add(m, DDeny, PolicyRule{ToolPattern: "mcp__*"})
+	if d, _ := m.Check("mcp__github__delete_repo", nil, DAllow); d != DDeny {
+		t.Errorf("a glob deny did not stop bypass: %s", d)
+	}
+	add(m, DDeny, PolicyRule{ToolPattern: "write", ParamMatch: map[string]string{"filePath": "*.env"}})
+	if d, _ := m.Check("write", map[string]any{"filePath": "prod.env"}, DAllow); d != DDeny {
+		t.Errorf("a param_match deny did not apply: %s", d)
+	}
+	if d, _ := m.Check("write", map[string]any{"filePath": "main.go"}, DAllow); d != DBypass {
+		t.Errorf("a param_match deny applied to another file: %s", d)
 	}
 }
 

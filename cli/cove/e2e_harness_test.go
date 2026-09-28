@@ -294,7 +294,7 @@ func startREPL(t *testing.T) *e2eSession {
 	}
 	go func() {
 		defer close(s.done)
-		runREPL("", app.eng, registerAllCommands(), app.toolReg, app.permMgr, app.appState, app.cfg, app.mcpPool, app.skillMgr, app.memStore, app.pluginMgr, app.projCtx)
+		runREPL(app, registerAllCommands(), "")
 	}()
 	t.Cleanup(func() { s.Exit() })
 	return s

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,17 +13,10 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/command"
-	"github.com/liuzhixin405/cove/internal/config"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plugin"
 	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/state"
 	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
@@ -34,7 +26,9 @@ import (
 // 工具由引擎以 fail-closed 方式拒绝（见 Engine.authorizeTool）。
 var replInteractive bool
 
-func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, toolReg *tool.Registry, pm *permission.Manager, as *state.AppState, cfg *config.Config, mcpPool *mcp.Pool, skillMgr *skills.Manager, memStore *memory.Store, pluginMgr *plugin.Manager, projCtx *ctxt.ProjectContext) {
+func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
+	eng, toolReg, cfg, mcpPool := app.eng, app.toolReg, app.cfg, app.mcpPool
+	skillMgr, memStore, pluginMgr, projCtx := app.skillMgr, app.memStore, app.pluginMgr, app.projCtx
 
 	replInteractive = true
 
@@ -49,8 +43,15 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 	installLimitPrompt(eng)
 	installBackgroundSummary(eng, term.IsTerminal(os.Stdout.Fd()))
 
+	tasks := newREPLTaskRunner(eng)
+	fe := &frontend{eng: eng, cfg: cfg, toolReg: toolReg, mcpPool: mcpPool, skillMgr: skillMgr,
+		memStore: memStore, pluginMgr: pluginMgr, projCtx: projCtx, tasks: tasks,
+		print:   func(s string) { repl.PrintAbove(s + "\r\n") },
+		enqueue: func(msg api.Message) { tasks.Enqueue(msg) },
+	}
+	cmdReg = fe.install(cmdReg)
+
 	allCommands := buildCommandList(cmdReg, toolReg)
-	allCommands = append(allCommands, cmdEntry{Name: "/continue", Desc: "从中断处继续上一轮（达到上限、取消或出错后）", Type: "builtin"})
 
 	for name, c := range pluginMgr.CommandPrompts() {
 
@@ -76,12 +77,6 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 	defer termui.SetConsole(nil)
 	log.SetWriter(replLogWriter{})
 	defer log.SetWriter(os.Stderr)
-
-	var attachedFiles []string
-
-	historyPickPending := false
-
-	tasks := newREPLTaskRunner(eng)
 
 	// Print the banner directly to the terminal (inline rendering).
 	outp(bannerText)
@@ -232,28 +227,19 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 		}
 
-		// Commands that rewrite the engine's state (the history, the working
-		// directory, the provider) cannot run while the task goroutine is
-		// appending to that same state: /compact mid-turn split a tool round
-		// and the next request was rejected.
-		if tasks.IsRunning() && commandMutatesEngine(input) {
-			repl.PrintAbove(fmt.Sprintf("[提示] 任务运行中不能执行 %s：它会改写正在使用的会话状态。请等任务结束，或先 /stop。\r\n", strings.Fields(input)[0]))
-			continue
-		}
-
-		if historyPickPending && !strings.HasPrefix(input, "/") {
+		if fe.historyPickPending && !strings.HasPrefix(input, "/") {
 
 			if isPositiveNumber(input) {
 
 				handleHistoryResume(input, eng)
 
-				historyPickPending = false
+				fe.historyPickPending = false
 
 				continue
 
 			}
 
-			historyPickPending = false
+			fe.historyPickPending = false
 
 		}
 
@@ -281,7 +267,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 				repl.PrintAbove("[提示] 当前有任务正在运行，请等待其结束后再重试。\r\n")
 
-				historyPickPending = false
+				fe.historyPickPending = false
 
 				continue
 
@@ -291,7 +277,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
 
-				historyPickPending = false
+				fe.historyPickPending = false
 
 				continue
 
@@ -311,7 +297,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 					resumeAndContinue(eng, tasks)
 
-					historyPickPending = false
+					fe.historyPickPending = false
 
 					continue
 
@@ -333,7 +319,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 				// Don't block: task runs in the background.
 
-				historyPickPending = false
+				fe.historyPickPending = false
 
 				continue
 
@@ -349,7 +335,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 					resumeAndContinue(eng, tasks)
 
-					historyPickPending = false
+					fe.historyPickPending = false
 
 					continue
 
@@ -371,7 +357,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 				// Don't block: task runs in the background.
 
-				historyPickPending = false
+				fe.historyPickPending = false
 
 				continue
 
@@ -379,119 +365,24 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			resumeAndContinue(eng, tasks)
 
-			historyPickPending = false
+			fe.historyPickPending = false
 
 			continue
-
-		case isContinueSlashCommand(input):
-			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
-				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
-				continue
-			}
-			note := continueInterruptedTurn(eng, tasks.IsRunning(), func(msg api.Message) {
-				// The engine resumes the turn when its message is sent again;
-				// the retry bookkeeping of the "继续" path is now stale.
-				tasks.ClearPendingFailed()
-				_ = clearInterruptedDraft()
-				tasks.Enqueue(msg)
-			})
-			repl.PrintAbove(note + "\r\n")
-			historyPickPending = false
-			continue
-
-		case input == "/stop" || input == "/cancel":
-
-			if tasks.IsRunning() {
-				denyPendingPermissionPrompt()
-				if tasks.CancelRunning() {
-					// Cancelling asks the task to stop; it is gone only once
-					// its goroutine has returned, and saying "terminated" a
-					// moment early made the next /continue answer "still running".
-					if tasks.WaitIdleUntil(time.Now().Add(1500 * time.Millisecond)) {
-						repl.PrintAbove("[已取消] 当前任务已终止，输入 /continue 可从中断处继续\r\n")
-					} else {
-						repl.PrintAbove("[已中断] 正在停止当前任务…结束后可用 /continue 继续\r\n")
-					}
-				}
-			} else {
-				repl.PrintAbove("[提示] 当前没有运行中的任务\r\n")
-			}
-			continue
-
-		case input == "/tasks":
-
-			repl.PrintAbove(formatTaskSnapshot(tasks.Snapshot()))
-			continue
-
-		case input == "/tools":
-			printTools(toolReg, pluginMgr)
-			continue
-
-		case input == "/help":
-			printHelp(cmdReg, toolReg, pluginMgr)
 
 		case input == "/":
-
 			showQuickCommands(allCommands)
-
 			continue
 
-		case input == "/doctor":
-
-			runDoctor()
-
-		case input == "/attach" || strings.HasPrefix(input, "/attach "):
-
-			cwd, _ := os.Getwd()
-
-			handleAttachCommand(input, cwd, &attachedFiles)
-
-		case input == "/skill" || strings.HasPrefix(input, "/skill ") || input == "/skills" || strings.HasPrefix(input, "/skills "):
-
-			handleSkill(input, eng)
+		case fe.dispatch(input):
+			if fe.exitRequested {
+				if tasks.CancelForExit() {
+					_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
+				}
+				autoSaveSession(eng)
+				repl.PrintAbove("Goodbye!\r\n")
+				return
+			}
 			continue
-
-		case handleBuiltinConfigCommand(input, cfg, eng, pm, as):
-
-			continue
-
-		case handleSessionCommand(input, eng, &historyPickPending):
-
-			continue
-
-		case strings.HasPrefix(input, "/"):
-
-			name := strings.TrimPrefix(strings.Fields(input)[0], "/")
-			var skillPrompts map[string]string
-			if eng != nil && eng.Runtime() != nil {
-				skillPrompts = eng.Runtime().SkillPrompts
-			}
-			var pluginCmds map[string]plugin.CommandPrompt
-			if pluginMgr != nil {
-				pluginCmds = pluginMgr.CommandPrompts()
-			}
-			target, shadowed := resolveSlashCommand(name, cmdReg, skillPrompts, pluginCmds)
-
-			switch target {
-			case slashSkill:
-				handleSkillInvocation(input, eng)
-				continue
-			case slashPlugin:
-				handlePluginCommand(input, pluginMgr, tasks)
-				continue
-			case slashUnknown:
-				handleUnknownCmd(input, cmdReg)
-				continue
-			}
-			if shadowed != "" {
-				repl.PrintAbove(fmt.Sprintf("[提示] %s 与内置命令同名，已执行内置命令 /%s\r\n", shadowed, name))
-			}
-
-			withInterrupt(func(ctx context.Context) {
-
-				handleCommand(ctx, input, cmdReg, cfg, eng, mcpPool, skillMgr, memStore, pluginMgr, pm, projCtx, as)
-
-			})
 
 		default:
 
@@ -505,7 +396,8 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			}
 
-			if pc.APIKey == "" {
+			// The same test as -p and headless: a --replay run needs no key.
+			if runNeedsAPIKey(pc.APIKey, replayDir != "") {
 
 				repl.PrintAbove(missingAPIKeyMessage(pc.Name) + "\r\n")
 
@@ -515,7 +407,7 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			cwd, _ := os.Getwd()
 
-			userMsg, warnings, err := buildUserMessage(input, cwd, attachedFiles, cfg.Model)
+			userMsg, warnings, err := buildUserMessage(input, cwd, fe.attachedFiles, cfg.Model)
 
 			if err != nil {
 
@@ -533,15 +425,13 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 						cfg.Model = visionModel
 
-						as.Model = visionModel
-
 						return nil
 
 					}); err == nil {
 
 						outf("[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
-						userMsg, warnings, err = buildUserMessage(input, cwd, attachedFiles, cfg.Model)
+						userMsg, warnings, err = buildUserMessage(input, cwd, fe.attachedFiles, cfg.Model)
 
 						if err != nil {
 
@@ -567,16 +457,19 @@ func runREPL(bannerText string, eng *engine.Engine, cmdReg *command.Registry, to
 
 			// Auto-clear attachments after sending (avoids resending images every turn)
 
-			if len(attachedFiles) > 0 {
+			if len(fe.attachedFiles) > 0 {
 
-				attachedFiles = nil
+				fe.attachedFiles = nil
 
 			}
 
 			// The same request sent again into a fresh session (after a
 			// restart, typically) continues the unfinished session it started,
 			// instead of opening one more copy of it in /history.
-			if len(eng.Messages()) == 0 && !tasks.IsRunning() && len(userMsg.Parts) == 0 {
+			// Not after /new: the person asked for a fresh conversation.
+			startedByNew := fe.freshFromNew
+			fe.freshFromNew = false
+			if len(eng.Messages()) == 0 && !tasks.IsRunning() && len(userMsg.Parts) == 0 && !startedByNew {
 				if rec, idx := resumeDuplicateSession(eng, userMsg.Content); rec != nil {
 					repl.PrintAbove(fmt.Sprintf("[已恢复] 这条请求与会话 #%d（%s，%d 条消息）相同且该会话未完成，已在它上面继续，不再新建会话。\r\n", idx, rec.UpdatedAt.Format("01-02 15:04"), len(rec.Messages)))
 					userMsg = api.Message{Role: "user", Content: "继续"}
@@ -785,11 +678,6 @@ func (replLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// isContinueSlashCommand reports whether input is the /continue command.
-func isContinueSlashCommand(input string) bool {
-	return strings.TrimSpace(input) == "/continue"
-}
-
 // interruptedTurnSource is the part of *engine.Engine /continue needs.
 type interruptedTurnSource interface {
 	InterruptedTurn() (api.Message, bool)
@@ -810,25 +698,4 @@ func continueInterruptedTurn(src interruptedTurnSource, running bool, enqueue fu
 	}
 	enqueue(msg)
 	return "[继续] 正在从上一轮中断处继续…"
-}
-
-// commandMutatesEngine reports whether a typed command rewrites the engine's
-// state — the history, the working directory and its rules, the provider —
-// and so must not run while a task is using that state.
-func commandMutatesEngine(input string) bool {
-	fields := strings.Fields(input)
-	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
-		return false
-	}
-	switch fields[0] {
-	case "/compact", "/cd", "/resume", "/model", "/provider", "/api-key":
-		return true
-	case "/history":
-		// "/history N" resumes a session; a bare /history only lists them.
-		return len(fields) > 1 && isPositiveNumber(fields[1])
-	case "/profile":
-		// switching or deleting a profile reloads the provider; save/show do not.
-		return len(fields) > 1 && (fields[1] == "switch" || fields[1] == "use" || fields[1] == "delete")
-	}
-	return false
 }

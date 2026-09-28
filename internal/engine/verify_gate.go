@@ -306,8 +306,8 @@ func shellResultPassed(out string) bool {
 // run is evidence only until something may have changed files after it: a
 // write-capable tool, or a shell line that is not read-only or a build/test
 // line. Read-only tools leave the evidence alone.
-func (e *Engine) noteVerifyEvidence(l *turnLimits, name string, input map[string]any, result string) {
-	e.noteWorkTool(l, name, result)
+func (e *Engine) noteVerifyEvidence(l *turnLimits, name string, input map[string]any, result string, failed bool) {
+	e.noteWorkTool(l, name, failed)
 	if permission.IsShellTool(name) {
 		cmd, _ := input["command"].(string)
 		cmd = normalizeCommand(cmd)
@@ -318,7 +318,7 @@ func (e *Engine) noteVerifyEvidence(l *turnLimits, name string, input map[string
 		if !autoOK {
 			l.passedCmds = nil // the line may have changed files
 		}
-		if shellResultPassed(result) {
+		if !failed && shellResultPassed(result) {
 			if l.passedCmds == nil {
 				l.passedCmds = map[string]bool{}
 			}

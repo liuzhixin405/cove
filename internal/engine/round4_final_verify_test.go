@@ -82,7 +82,7 @@ func TestVerifyGateTimeoutEndsTurnNormally(t *testing.T) {
 		return "", -1, ctx.Err()
 	}
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	got, err := run(t, eng, "do it")
 	if err != nil {
 		t.Fatal(err)

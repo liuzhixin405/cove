@@ -55,7 +55,7 @@ func TestUnparsableToolArgsAreReported(t *testing.T) {
 	clearDiagnostics(t)
 	eng := newTestEngine(&mockProvider{})
 	eng.config.Model = "qwen3.6-27b"
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "bash", ParseError: true,
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "1", Name: "bash", ParseError: true,
 		Input: map[string]any{"_cove_parse_error": "tool call arguments were not valid JSON"}})
 	if !strings.HasPrefix(out, "Error:") {
 		t.Fatalf("result = %q", out)
@@ -63,34 +63,6 @@ func TestUnparsableToolArgsAreReported(t *testing.T) {
 	evs := diagnostic.RecentRuntime()
 	if len(evs) != 1 || evs[0].Code != diagnostic.ErrToolArgsInvalid || evs[0].Tool != "bash" || evs[0].Model != "qwen3.6-27b" {
 		t.Fatalf("events = %+v", evs)
-	}
-}
-
-// The provider chain marking its provider unavailable is E2009, once, with
-// the error that caused it wrapped inside. (A context overflow no longer
-// counts as a provider failure; a rejected model name does.)
-func TestProviderUnavailableIsReported(t *testing.T) {
-	clearDiagnostics(t)
-	bad := &api.StatusError{Status: 400, Msg: `{"error":{"message":"model test-model does not exist, window 16384"}}`}
-	var responses []mockResponse
-	for i := 0; i < 12; i++ {
-		responses = append(responses, mockResponse{err: bad})
-	}
-	eng := newTestEngine(&mockProvider{responses: responses})
-	for i := 0; i < 4; i++ {
-		_, _ = eng.RunMessageWithStream(context.Background(), api.Message{Role: "user", Content: "hi"}, nil, nil)
-	}
-	seen := 0
-	for _, ev := range diagnostic.RecentRuntime() {
-		if ev.Code == diagnostic.ErrAPIProviderUnavailable {
-			seen++
-			if !strings.Contains(ev.Message, "16384") {
-				t.Errorf("E2009 lost its cause: %+v", ev)
-			}
-		}
-	}
-	if seen != 1 {
-		t.Fatalf("E2009 recorded %d times, want 1", seen)
 	}
 }
 

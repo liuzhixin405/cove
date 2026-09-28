@@ -265,6 +265,8 @@ export OPENAI_API_KEY="sk-..."
 | `/api-key <key>` | Set API key |
 | `/base-url <url>` | Custom API endpoint |
 | `/mode <mode>` | Permission mode: `default\|plan\|auto\|bypass` |
+| `/profile [list\|switch\|save\|delete\|show]` | Manage named config profiles |
+| `/record [status\|start\|stop]` | Control session event recording |
 | `/budget <amount\|auto\|off\|save>` | Session-only budget cap ($): `<amount>`/`auto` change this session, `off` removes the cap, `save` writes the current cap to `config.json`; a one-time notice at 80% of the cap |
 | `/cost` | View token usage & cost (session + 24h + 7d + all-time) |
 | `/ratelimit` | View API rate limit status |
@@ -284,6 +286,8 @@ export OPENAI_API_KEY="sk-..."
 | `/dream [status\|run]` | Show memory consolidation (dream) trigger, last result and its token cost; `run` consolidates now in the background |
 | `/hooks` | List hooks loaded from the user-level `hooks.json` (and entries that failed to load) |
 | `/tasks` | View running/queued tasks in the interactive REPL; headless reports sync execution state |
+| `/clear` | Clear the screen and scrollback (alias `/cls`, or Ctrl+L); conversation context is kept |
+| `/new` | Save the current session and start an empty one (clears conversation context; the old one stays in `/history`) |
 | `/stop` / `/cancel` | Cancel current task in the interactive REPL; no background queue in headless |
 | `/commit [msg]` | Git add + commit |
 | `/review` | Review working changes |
@@ -297,6 +301,8 @@ export OPENAI_API_KEY="sk-..."
 | `/mcp` | MCP server management |
 | `/plugin` | Plugin management |
 | `/skills` | Skill listing |
+| `/skill <name>` | View or invoke a skill (alias `/skills`) |
+| `/tools` | List available tools |
 | `/help` | Show help |
 | `/exit` | Exit REPL |
 

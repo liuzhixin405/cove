@@ -26,9 +26,10 @@ func NewMeteredProvider(inner Provider, onUsage UsageFunc) Provider {
 	return &meteredProvider{inner: inner, onUsage: onUsage}
 }
 
-func (m *meteredProvider) Name() string        { return m.inner.Name() }
-func (m *meteredProvider) DisplayName() string { return m.inner.DisplayName() }
-func (m *meteredProvider) Validate() error     { return m.inner.Validate() }
+func (m *meteredProvider) Name() string               { return m.inner.Name() }
+func (m *meteredProvider) Capabilities() Capabilities { return CapabilitiesOf(m.inner) }
+func (m *meteredProvider) DisplayName() string        { return m.inner.DisplayName() }
+func (m *meteredProvider) Validate() error            { return m.inner.Validate() }
 
 func (m *meteredProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	resp, err := m.inner.Chat(ctx, req)
@@ -80,9 +81,10 @@ func (s *SwitchableProvider) current() Provider {
 	return s.inner
 }
 
-func (s *SwitchableProvider) Name() string        { return s.current().Name() }
-func (s *SwitchableProvider) DisplayName() string { return s.current().DisplayName() }
-func (s *SwitchableProvider) Validate() error     { return s.current().Validate() }
+func (s *SwitchableProvider) Name() string               { return s.current().Name() }
+func (s *SwitchableProvider) Capabilities() Capabilities { return CapabilitiesOf(s.current()) }
+func (s *SwitchableProvider) DisplayName() string        { return s.current().DisplayName() }
+func (s *SwitchableProvider) Validate() error            { return s.current().Validate() }
 
 func (s *SwitchableProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	return s.current().Chat(ctx, req)

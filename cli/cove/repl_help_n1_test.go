@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
@@ -12,7 +11,7 @@ import (
 // /history clean stays a command but is no longer advertised in /help.
 func TestHelpDoesNotListHistoryClean(t *testing.T) {
 	buf := captureOut(t)
-	printHelp(command.NewRegistry(), tool.NewRegistry(), nil)
+	printHelp((&frontend{}).install(registerAllCommands()), tool.NewRegistry(), nil)
 	out := buf.String()
 	if strings.Contains(out, "/history clean") {
 		t.Fatalf("/help still lists /history clean:\n%s", out)

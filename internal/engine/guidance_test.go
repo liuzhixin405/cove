@@ -110,11 +110,11 @@ func turnOutputLines(t *testing.T, debug bool) []string {
 	eng := newPatternEngine(t, prov, func(c *Config) { c.Debug = debug }, read)
 	var mu sync.Mutex
 	var lines []string
-	eng.OnEngineOutput = func(line string) {
+	eng.SetOutput(LineSink(func(line string) {
 		mu.Lock()
 		lines = append(lines, line)
 		mu.Unlock()
-	}
+	}))
 	if _, err := run(t, eng, "read a.go"); err != nil {
 		t.Fatal(err)
 	}

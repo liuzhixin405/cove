@@ -17,7 +17,7 @@ func NewTaskCreateTool() Tool {
 		Name: "task", Aliases: []string{"TaskCreate"},
 		Description: "记录一个待办任务，不会执行。Record a to-do item (title + description) in the task list; nothing runs it — do the work yourself, or use agent to delegate it, and update it with task_update.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"}},"required":["title","description"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Task Create",
+		IsReadOnly:  false, IsConcurrencySafe: true, PlanSafe: true, UserFacingName: "Task Create",
 	}}}
 }
 func (t *TaskCreateTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -86,7 +86,7 @@ func NewTaskUpdateTool() Tool {
 		Name: "task_update", Aliases: []string{"TaskUpdate"},
 		Description: "Update a task's status or output.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"taskId":{"type":"string"},"status":{"type":"string","enum":["pending","running","completed","failed","cancelled"]},"output":{"type":"string"}},"required":["taskId","status"]}`),
-		IsReadOnly:  false, UserFacingName: "Task Update",
+		IsReadOnly:  false, PlanSafe: true, UserFacingName: "Task Update",
 	}}}
 }
 func (t *TaskUpdateTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {

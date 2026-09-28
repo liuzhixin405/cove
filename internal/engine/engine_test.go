@@ -155,8 +155,14 @@ func (t *mockTool) CheckPermissions(input tool.Input, tctx tool.Context) tool.Pe
 	return tool.PermissionDecision{Decision: tool.Ask, Reason: "write operation"}
 }
 
+// mockCallMu guards mockTool.callCount: a tool marked safe runs its calls in
+// parallel.
+var mockCallMu sync.Mutex
+
 func (t *mockTool) Call(ctx context.Context, input tool.Input, tctx tool.Context) (tool.Result, error) {
+	mockCallMu.Lock()
 	t.callCount++
+	mockCallMu.Unlock()
 	if t.delay > 0 {
 		select {
 		case <-time.After(t.delay):
@@ -170,7 +176,9 @@ func (t *mockTool) Call(ctx context.Context, input tool.Input, tctx tool.Context
 	if t.err != nil {
 		return tool.Result{Data: t.err.Error(), IsError: true}, nil
 	}
-	return tool.Result{Data: t.result}, nil
+	// A scripted "Error: …" result is a failure, flagged the way every real
+	// tool flags one; the engine no longer guesses failures from the text.
+	return tool.Result{Data: t.result, IsError: strings.HasPrefix(t.result, "Error")}, nil
 }
 
 // ===========================================================================
@@ -780,7 +788,7 @@ func TestExecuteTool_SurfacesGuardrailWarningToModel(t *testing.T) {
 	// failed >= 2 times already, so the first two identical failures
 	// should NOT carry a warning yet.
 	for i := 0; i < 2; i++ {
-		out := eng.executeTool(ctx, tc)
+		out, _ := eng.executeTool(ctx, tc)
 		if !strings.Contains(out, "boom") {
 			t.Fatalf("call %d: expected failure output, got %q", i, out)
 		}
@@ -792,7 +800,7 @@ func TestExecuteTool_SurfacesGuardrailWarningToModel(t *testing.T) {
 	// Third identical call: the guardrail's preflight check now fires a
 	// Warn decision. That must be visible in the tool result the model
 	// sees, not just logged at debug level.
-	out := eng.executeTool(ctx, tc)
+	out, _ := eng.executeTool(ctx, tc)
 	if !strings.Contains(out, "[guardrail:") {
 		t.Fatalf("expected guardrail warning to be surfaced in tool output, got %q", out)
 	}

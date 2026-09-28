@@ -18,7 +18,7 @@ func NewSkillTool() Tool {
 	return &SkillTool{baseTool{def: Def{
 		Name: "skill", Description: "Execute a skill (predefined workflow).",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"},"args":{"type":"object"}},"required":["name"]}`),
-		IsReadOnly:  false, UserFacingName: "Skill",
+		IsReadOnly:  false, PlanSafe: true, UserFacingName: "Skill",
 	}}}
 }
 func (t *SkillTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -89,7 +89,7 @@ func NewAgentTool() Tool {
 		Name: "agent", Aliases: []string{"Agent"},
 		Description: "Spawn a sub-agent to handle complex multi-step tasks independently.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"type":{"type":"string","enum":["general","explore","plan","review","test"],"description":"Agent type: general (can edit), explore/plan/review (read-only), test"},"prompt":{"type":"string","description":"Task description for the sub-agent"}},"required":["type","prompt"]}`),
-		IsReadOnly:  false, IsConcurrencySafe: true, UserFacingName: "Agent",
+		IsReadOnly:  false, IsConcurrencySafe: true, PlanSafe: true, UserFacingName: "Agent",
 	}}}
 }
 func (t *AgentToolI) Call(ctx context.Context, input Input, tctx Context) (Result, error) {

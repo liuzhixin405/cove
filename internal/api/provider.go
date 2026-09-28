@@ -106,6 +106,31 @@ type Provider interface {
 	Validate() error
 }
 
+// Capabilities is what a provider's API needs or offers that the engine has
+// to act on. The engine used to compare Name() with "anthropic" for each of
+// these, which broke silently for a wrapper, an alias, or a second provider
+// with the same trait.
+type Capabilities struct {
+	// CacheBreakpoints: the API caches a prompt prefix only where the
+	// request marks it (Anthropic cache_control), so the engine marks it.
+	CacheBreakpoints bool
+	// ToolsWithToolHistory: a history holding tool calls is rejected unless
+	// the request defines tools, even when none may be called.
+	ToolsWithToolHistory bool
+	// Family names the model family ("anthropic", "openai-compatible") for
+	// policies that depend on it, such as the done check's default.
+	Family string
+}
+
+// CapabilitiesOf is p's Capabilities: those it declares
+// (interface{ Capabilities() Capabilities }), else none of them.
+func CapabilitiesOf(p Provider) Capabilities {
+	if c, ok := p.(interface{ Capabilities() Capabilities }); ok {
+		return c.Capabilities()
+	}
+	return Capabilities{Family: "openai-compatible"}
+}
+
 type ProviderConfig struct {
 	Name    string
 	APIKey  string

@@ -89,7 +89,9 @@ const (
 	// ErrAPIContextLength: the request did not fit the model's context
 	// window, even after the engine compacted and retried.
 	ErrAPIContextLength ErrorCode = "E2008"
-	// ErrAPIProviderUnavailable: the fallback chain stopped preferring a
+	// ErrAPIProviderUnavailable is no longer produced (the provider fallback
+	// chain is gone); it stays registered so old errors.log entries render.
+	// It was: the fallback chain stopped preferring a
 	// provider after repeated failures.
 	ErrAPIProviderUnavailable ErrorCode = "E2009"
 )

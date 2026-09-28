@@ -103,28 +103,11 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 		}
 	}
 
-	answerCh := make(chan string, 1)
-	repl.SetPromptInput(answerCh, permissionAnswerAccepted, permissionAnswerHint)
-	repl.BeginPromptInput()
-	termui.PrintAbove(text)
-
-	timer := time.NewTimer(permissionPromptTimeout)
-	defer timer.Stop()
-
-	var answer string
-	select {
-	case answer = <-answerCh:
-	case <-timer.C:
-		repl.EndPromptInput()
-		repl.ClearPermInputCh()
+	answer, ok := repl.Ask(text, permissionAnswerAccepted, permissionAnswerHint, permissionPromptTimeout)
+	if !ok {
 		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "授权超时，已拒绝 "+toolName) + "\n")
 		return false
 	}
-
-	repl.EndPromptInput()
-	// TakePermInputCh already unregisters the channel when the loop relays a
-	// line; ClearPermInputCh only matters for the timeout path above.
-	repl.ClearPermInputCh()
 	if answer == promptInterrupt {
 		// Ctrl+C: a denial, not an answer the user typed.
 		return false

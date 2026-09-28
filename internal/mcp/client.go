@@ -728,11 +728,3 @@ func ToolName(server, tool string) string {
 	}
 	return tool
 }
-
-func ParseToolName(mcpToolName string) (server, tool string) {
-	parts := strings.SplitN(mcpToolName, "__", 3)
-	if len(parts) == 3 && parts[0] == "mcp" {
-		return parts[1], parts[2]
-	}
-	return "", mcpToolName
-}

@@ -133,17 +133,14 @@ func TestRunningToolIsActivityNotHistory(t *testing.T) {
 	}
 }
 
-func TestUnwiredEngineIsSilentButCallbackStillWorks(t *testing.T) {
-	// out must default to nil, not to uiout.Discard: defaulting to Discard
-	// makes the sink branch always win and silently swallows every diagnostic
-	// on a front end that uses the callback.
+func TestUnwiredEngineIsSilentAndLineSinkRendersBlocks(t *testing.T) {
 	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "hi"}}})
-	if eng.out != nil {
-		t.Fatalf("a fresh engine has a sink installed (%T); the callback path is dead", eng.out)
+	if s := eng.output(); s != nil {
+		t.Fatalf("a fresh engine has a sink installed (%T)", s)
 	}
 
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.emitBlock(render.ToolBlock("1", "bash", "ls", "", "a\nb", false, 0))
 	if len(lines) != 1 {
 		t.Fatalf("the callback received %d lines, want 1", len(lines))

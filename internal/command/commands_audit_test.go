@@ -11,7 +11,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
 // liveEngine is a fakeEngine that also offers the optional live-update hooks
@@ -288,16 +287,12 @@ func TestConfigCmdAppliesModelToRunningEngine(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Provider.Name = "deepseek"
 	eng := &liveEngine{}
-	as := &state.AppState{}
-	_, err := NewConfigCmd().Execute(context.Background(), Input{Args: []string{"model", "deepseek-v4-flash"}, Config: cfg, SaveConfig: noSave, Engine: eng, AppState: as})
+	_, err := NewConfigCmd().Execute(context.Background(), Input{Args: []string{"model", "deepseek-v4-flash"}, Config: cfg, SaveConfig: noSave, Engine: eng})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(eng.reloads) != 1 || !strings.HasPrefix(eng.reloads[0], "deepseek|deepseek-v4-flash|") {
 		t.Fatalf("provider reloads = %v", eng.reloads)
-	}
-	if as.Model != "deepseek-v4-flash" {
-		t.Fatalf("app state model = %q", as.Model)
 	}
 }
 
@@ -309,8 +304,20 @@ func TestConfigCmdAppliesModeToRunningSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pm.mode != permission.Mode("auto") || len(eng.modes) != 1 || eng.modes[0] != permission.Mode("auto") {
-		t.Fatalf("mode not applied live: manager=%s engine=%v", pm.mode, eng.modes)
+	// The engine owns the manager tool calls are decided by; the view's
+	// manager is that same one in the front ends, so it is not set twice.
+	if len(eng.modes) != 1 || eng.modes[0] != permission.Mode("auto") {
+		t.Fatalf("mode not applied to the engine: %v", eng.modes)
+	}
+
+	// An engine view that cannot take the mode still leaves the manager set.
+	pm = &fakePermManager{mode: permission.Default}
+	_, err = NewConfigCmd().Execute(context.Background(), Input{Args: []string{"mode", "plan"}, Config: cfg, SaveConfig: noSave, Engine: &fakeEngine{}, PermissionManager: pm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pm.mode != permission.Plan {
+		t.Fatalf("manager fallback not applied: %s", pm.mode)
 	}
 }
 

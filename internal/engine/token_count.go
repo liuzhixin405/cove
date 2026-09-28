@@ -95,4 +95,4 @@ func estimateToolDefs(tools []api.ToolDef) int {
 }
 
 // compactionSafetyMargin is the room kept free beyond the reply's MaxTokens.
-const compactionSafetyMargin = api.CompactionSafetyMargin
+var compactionSafetyMargin = api.CompactionSafetyMarginFor

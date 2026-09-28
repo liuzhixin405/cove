@@ -116,7 +116,7 @@ func TestAutoCompactionPrintsNotice(t *testing.T) {
 	prov := &mockProvider{responses: []mockResponse{{content: "The user asked for many words and got them; nothing else is pending."}}}
 	eng := newTestEngine(prov)
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.messages = longHistory(20)
 	eng.updateTokenCount()
 	eng.compactIfNeeded(context.Background(), 1)

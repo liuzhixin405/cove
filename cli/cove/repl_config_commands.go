@@ -12,16 +12,15 @@ import (
 	"github.com/liuzhixin405/cove/internal/cost"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
-func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.Engine, pm *permission.Manager, as *state.AppState) bool {
+func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.Engine) bool {
 	switch {
 	case input == "/config":
 		showConfig()
 		return true
 	case input == "/profile" || strings.HasPrefix(input, "/profile "):
-		handleProfileCommand(input, cfg, eng, pm, as)
+		handleProfileCommand(input, cfg, eng)
 		return true
 	case input == "/record" || strings.HasPrefix(input, "/record "):
 		handleRecordCommand(input, eng)
@@ -29,7 +28,6 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 	case strings.HasPrefix(input, "/model "):
 		if err := applyProviderConfigChange(cfg, eng, func() error {
 			cfg.Model = config.ResolveModelForProvider(strings.TrimPrefix(input, "/model "), cfg.Provider.Name)
-			as.Model = cfg.Model
 			return config.Save(cfg)
 		}); err != nil {
 			outf("模型更新失败: %v\n", err)
@@ -48,7 +46,6 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 			oldProvider := cfg.EffectiveProvider().Name
 			cfg.Provider.Name = providerName
 			cfg.Model = providerSwitchModel(oldProvider, providerName, cfg.Model)
-			as.Model = cfg.Model
 			return config.Save(cfg)
 		}); err != nil {
 			outf("供应商更新失败: %v\n", err)
@@ -79,10 +76,8 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 	case strings.HasPrefix(input, "/mode "):
 		m := permission.Mode(strings.TrimPrefix(input, "/mode "))
 		if permission.ValidMode(m) {
-			pm.SetMode(m)
 			eng.SetPermissionMode(m)
 			cfg.PermissionMode = string(m)
-			as.PermissionMode = string(m)
 			saveConfigOrSay(cfg)
 			outf("模式: %s\n", m)
 		} else {
@@ -90,7 +85,7 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 		}
 		return true
 	case input == "/budget" || strings.HasPrefix(input, "/budget "):
-		handleBudgetCommand(input, cfg, eng, as)
+		handleBudgetCommand(input, cfg, eng)
 		return true
 	case input == "/cost":
 		outln("本次会话:", eng.CostTracker().Summary())
@@ -109,7 +104,7 @@ func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.En
 // configured max_budget_usd changes with "/budget save". Every /budget used
 // to rewrite the global config.json, so raising the cap for one expensive
 // task raised it for every later session.
-func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, as *state.AppState) {
+func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine) {
 	arg := strings.TrimSpace(strings.TrimPrefix(input, "/budget"))
 	current := sessionBudget(cfg, eng)
 	switch {
@@ -131,7 +126,7 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 		outf("已把预算 %s 写入配置\n", budgetLabel(current))
 		return
 	case strings.EqualFold(arg, "off"):
-		setSessionBudget(0, eng, as)
+		setSessionBudget(0, eng)
 		outln("已取消本会话的预算上限（/budget save 可写入配置）")
 		return
 	case strings.EqualFold(arg, "auto"):
@@ -144,7 +139,7 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 			}
 		}
 		if b > 0 {
-			setSessionBudget(b, eng, as)
+			setSessionBudget(b, eng)
 			outf("本会话预算已自动调整到: $%.2f（/budget save 可写入配置）\n", b)
 		}
 		return
@@ -156,7 +151,7 @@ func handleBudgetCommand(input string, cfg *config.Config, eng *engine.Engine, a
 		outf("无效预算: %s\n%s\n", arg, budgetUsage)
 		return
 	}
-	setSessionBudget(b, eng, as)
+	setSessionBudget(b, eng)
 	outf("本会话预算: $%.2f（/budget save 可写入配置）\n", b)
 }
 
@@ -171,8 +166,7 @@ func sessionBudget(cfg *config.Config, eng *engine.Engine) float64 {
 	return cfg.MaxBudgetUsd
 }
 
-func setSessionBudget(b float64, eng *engine.Engine, as *state.AppState) {
-	as.MaxBudget = b
+func setSessionBudget(b float64, eng *engine.Engine) {
 	if eng != nil {
 		eng.SetMaxBudget(b)
 	}
@@ -210,7 +204,7 @@ func saveConfigOrSay(cfg *config.Config) {
 
 const budgetUsage = "用法: /budget <金额，美元，大于 0> | /budget auto | /budget off（以上只改本会话）| /budget save（写入配置）"
 
-func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, pm *permission.Manager, as *state.AppState) {
+func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine) {
 	args := strings.Fields(strings.TrimSpace(strings.TrimPrefix(input, "/profile")))
 	if len(args) == 0 || strings.EqualFold(args[0], "list") {
 		names := make([]string, 0, len(cfg.Profiles))
@@ -266,17 +260,12 @@ func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine, 
 		}
 		if err := applyProviderConfigChange(cfg, eng, func() error {
 			*cfg = *loaded
-			as.Model = cfg.Model
-			as.ModelFast = cfg.ModelFast
-			as.MaxBudget = cfg.MaxBudgetUsd
-			as.PermissionMode = cfg.PermissionMode
 			return nil
 		}); err != nil {
 			outf("应用 profile 失败: %v\n", err)
 			return
 		}
 		if mode := permission.Mode(cfg.PermissionMode); permission.ValidMode(mode) {
-			pm.SetMode(mode)
 			eng.SetPermissionMode(mode)
 		}
 		eng.SetMaxBudget(cfg.MaxBudgetUsd)

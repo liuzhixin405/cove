@@ -75,7 +75,7 @@ func TestPermissionDenialTellsModelNotToRetry(t *testing.T) {
 	eng.PermissionPrompt = func(string, map[string]any, string) bool { return false }
 	eng.config.PermissionMode = "default"
 	eng.perm.SetMode(permission.Default)
-	out := eng.executeTool(context.Background(), api.ToolCall{ID: "t1", Name: "write", Input: map[string]any{"filePath": "a.go"}})
+	out, _ := eng.executeTool(context.Background(), api.ToolCall{ID: "t1", Name: "write", Input: map[string]any{"filePath": "a.go"}})
 	for _, want := range []string{
 		"Error: permission denied for write (user rejected).",
 		"Do not call this tool again with the same input",
@@ -86,7 +86,7 @@ func TestPermissionDenialTellsModelNotToRetry(t *testing.T) {
 		}
 	}
 	eng.perm.SetMode(permission.Plan)
-	out = eng.executeTool(context.Background(), api.ToolCall{ID: "t2", Name: "write", Input: map[string]any{"filePath": "a.go"}})
+	out, _ = eng.executeTool(context.Background(), api.ToolCall{ID: "t2", Name: "write", Input: map[string]any{"filePath": "a.go"}})
 	if !strings.Contains(out, "Do not call this tool again") {
 		t.Fatalf("plan-mode denial %q lacks the do-not-retry instruction", out)
 	}

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/liuzhixin405/cove/internal/api"
@@ -60,7 +61,7 @@ func TestVerifyEvidenceMatching(t *testing.T) {
 	for _, c := range cases {
 		l := eng.newTurnLimits()
 		for _, s := range c.steps {
-			eng.noteVerifyEvidence(l, s.tool, s.input, s.result)
+			eng.noteVerifyEvidence(l, s.tool, s.input, s.result, strings.HasPrefix(s.result, "Error"))
 		}
 		if got := l.verifyPassed(c.cmd); got != c.want {
 			t.Errorf("%s: verifyPassed(%q) = %v, want %v", c.name, c.cmd, got, c.want)

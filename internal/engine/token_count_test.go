@@ -117,8 +117,8 @@ func TestCompactionLeavesRoomForTheReply(t *testing.T) {
 		window := api.ContextWindowForModel(model)
 		maxOut := api.MaxOutputTokensForModel(model)
 		trigger := compactionThreshold(model)
-		if trigger > window-maxOut-compactionSafetyMargin {
-			t.Errorf("%s: trigger %d leaves less than MaxTokens %d + %d of its %d window", model, trigger, maxOut, compactionSafetyMargin, window)
+		if margin := compactionSafetyMargin(model); trigger > window-maxOut-margin {
+			t.Errorf("%s: trigger %d leaves less than MaxTokens %d + %d of its %d window", model, trigger, maxOut, margin, window)
 		}
 	}
 	const small = "deepseek-chat" // 64K window

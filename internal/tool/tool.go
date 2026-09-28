@@ -52,11 +52,9 @@ type Runtime struct {
 	WorktreeDir   string
 	Tasks         map[string]*TaskRecord
 	Teams         map[string]*TeamRecord
-	CronSchedules map[string]*CronRecord
 	Messages      []MessageRecord
 	TaskCounter   int
 	AgentRunner   any
-	LSPRunner     LSPRunner
 	SkillManager  any
 	SkillPrompts  map[string]string
 	PluginManager any
@@ -108,10 +106,6 @@ func (r *Runtime) GetWorktreeDir() string {
 	return r.WorktreeDir
 }
 
-type LSPRunner interface {
-	Run(ctx context.Context, action string, filePath string, input Input) (string, error)
-}
-
 type TaskRecord struct {
 	ID          string
 	Title       string
@@ -139,14 +133,6 @@ type TeamMemberRecord struct {
 	Output string
 }
 
-type CronRecord struct {
-	ID        string
-	Schedule  string
-	Task      string
-	Status    string
-	CreatedAt string
-}
-
 type MessageRecord struct {
 	To        string
 	Message   string
@@ -162,7 +148,14 @@ type Def struct {
 	InputSchema       json.RawMessage
 	IsReadOnly        bool
 	IsConcurrencySafe bool
-	UserFacingName    string
+	// PlanSafe lets a tool that is not read-only run in plan mode because
+	// what it changes stays inside the session (a todo list, a question to
+	// the user, a task record) or goes through the permission check again
+	// (a sub-agent's own tool calls). Plan mode allows read-only and
+	// PlanSafe tools only, whatever a tool's CheckPermissions answers: a new
+	// tool that returns Allowed is not a way out of plan mode.
+	PlanSafe       bool
+	UserFacingName string
 }
 
 type Tool interface {

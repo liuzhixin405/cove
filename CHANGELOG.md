@@ -1,4 +1,62 @@
-﻿## [11.4.0] - 2026-09-27
+﻿## [11.5.0] - 2026-09-28
+
+### Added
+- **`/clear`（别名 `/cls`，快捷键 Ctrl+L）**：清屏并清空回滚区，不影响对话上下文；任务输出中不清屏（会抹掉固定输入行与滚动区域），提示任务结束后再试。
+- **`/new`**：保存当前会话并开始新会话（新 ID、空上下文），旧会话可在 `/history` 找回；同时清掉上一轮的中断状态、待重试请求、中断草稿、待发送附件，以及模型已见过的技能/记忆/目录提示；供应商、权限模式与规则、检查点、预算保留。任务运行中拒绝执行。`/new` 后的第一条消息不再被「相同请求自动接回未完成会话」接回旧会话。新增 `Engine.NewSession(ctx)`。
+
+### Security
+- **文件工具可经 Windows junction 写到工作目录之外**：write/edit/read 等文件工具的沙箱用 `filepath.EvalSymlinks` 解析链接，而 Go 1.23 起它不再解析 junction（`mklink /J`，无需管理员权限）。工作目录里只要有一个指向外部的 junction，文件工具就能通过它读写外部文件，bypass 模式下也一样。记忆整理（dream）的写入沙箱完全不解析链接。现在三处"路径是否在目录内"的检查合并为 `safepath.Within`，逐级解析符号链接和 junction。
+
+### Refactored
+- **两个 provider 共用传输层**：OpenAI 兼容与 Anthropic 实现各自复制的"建请求、带重试建连、更新 key 池、按状态码分类"合并为 `internal/api/transport.go`，两个 provider 只保留各自的请求格式和响应解码。副本之间已经不一致的地方统一了：
+  - 客户端超时不再重试。OpenAI 兼容的非流式调用以前会把一个已经超时的请求重发 3 次，每次都等满超时时间。
+  - Anthropic 读取 SSE 的单行长度改为 10MB 上限，以前没有上限。
+- **provider 能力改为自己声明**：engine 不再用 `Name() == "anthropic"` 判断三件不同的事（是否要标记缓存断点、有工具调用历史时请求是否必须带工具定义、done check 的默认值），改为读取 provider 声明的 `Capabilities()`，经过计费层和切换层包装后也能读到。
+- **engine 的回合回调集中到 `TurnHooks`**：6 个回调字段以前由前端每轮赋值、结束时置 nil，现在改为 `SetTurnHooks` 一次性设置，用原子指针保存。其中 `OnToolStart` 从来没有被赋值过，已删除。授权提示和上限提示的"暂停 spinner → 提示 → 恢复 spinner"现在整体放在同一把锁里：以前恢复这一步在锁外，并行调用时，一个提示框还开着，另一个就可能把 spinner 恢复出来。
+- **预算超限改用哨兵错误** `engine.ErrBudgetExceeded`，前端用 `errors.Is` 判断，以前是在错误文本里查找。compressor 里与 `textutil.ClipRunes` 同名但语义不同的 `clipRunes` 改名为 `keepRunes`。
+- **诊断读取运行中会话的入口加了锁**：`diagnostic.BackgroundStatusFn`、`PolicyLoadErrorFn` 两个裸函数变量改为 `diagnostic.SetSession`。
+- **`runREPL`、`runHeadless` 改为接收 `*appBootstrap`**，`handleCommand` 改为前端的方法；以前这三个函数各有 10 个参数。
+- **安全扫描的警告会显示出来**：`git push --force`、`git reset --hard` 这类警告级结果以前算出来就丢掉了，auto 或 bypass 模式下执行时没有任何提示。现在在命令确定要执行时显示一行警告。
+- 插件清单写入失败、会话笔记保存失败时记录警告，以前会被静默忽略。
+- **回合主循环拆分**：`RunMessageWithStream`（约 740 行，所有阶段都读写同一批局部变量）拆成一个 74 行的循环和若干阶段方法（`beginTurn`、`iterationStart`、`callModel`、`handleTruncatedReply`、`finishOrNudge`、`checkToolLoop`、`dispatchTools`、`absorbToolResults`、`afterIteration`，见 `internal/engine/turn_loop.go`）。回合共享的状态收进 `turn` 结构体，每个阶段返回"继续本轮 / 进入下一轮 / 结束回合"。逻辑逐行保持不变。
+- **engine 只有一条输出路径**：删除已废弃的 `OnEngineOutput` 回调，所有输出都经过 `uiout.Sink`（`SetOutput`；按行输出的前端用 `engine.LineSink`）。Sink 改用原子指针保存：前端每轮都会重新设置它，而后台任务同时在写，以前这里有数据竞争。
+- **命令输出不再绕过输入行**：`outf`/`outln`/`outp` 改走 `termui.Text`。有输入行编辑器时经过编辑器输出到输入行上方；没有编辑器时（`-p`、管道）逐字节写出，结果不变。以前任务运行中执行命令，输出可能写到固定输入行上，或者粘在模型还没写完的那一行后面。
+- **提示框共用 `repl.Ask` 并排队**：权限、提问、上限三个提示框以前各自写了一遍等待回答的流程，只有其中两个受引擎的锁保护。并行工具调用时，提问和授权会互相覆盖输入通道，后一个超时时还会把前一个也注销掉。
+- **`internal/repl/readline.go` 按职责拆分**（1150 行 → `readline.go`、`console.go`、`prompt_relay.go`、`keys.go`、`width.go`、`completion.go`，只移动代码）。输入行的字符宽度改用 `textutil` 的算法（East Asian Ambiguous 按 2 列），以前的手写表按 1 列算，中文终端里含 `·`、`…` 的输入行会折行并留下残影。repl 的颜色常量改为引用 termui 的，不再各维护一份。
+
+### Changed（行为变化）
+- **plan 模式按"只读"统一判定**：plan 模式下只放行只读工具、整行只读的 shell 命令，以及声明为 `PlanSafe`（影响只停留在会话内，或像子代理一样每个调用都会再经过权限判定）的工具：`todowrite`、`question`、`skill`、`agent`、`execute_plan`、`sleep` 与实验性协作工具。其余调用一律拒绝，不管工具自己的 `CheckPermissions` 怎么回答。以前是否放行取决于每个工具是否记得拒绝，新工具只要返回"允许"就能在 plan 模式下运行。
+- **`plan_mode` 工具真正生效**：模型调用 `plan_mode` 后会回一句"只允许读操作"，但设置的标志从来没有被读取，实际什么都不限制。现在它与 `/mode plan` 走同一套判定；auto 模式下也不再预批准构建命令。`exit_plan_mode` 只能退出模型自己进入的 plan 模式（需你确认），你用 `/mode plan` 设置的只能由你切换。`/new`、`/resume` 会清除模型进入的 plan 模式。
+- **权限判定只有一条链，顺序与手册一致**：工具自身拒绝 → deny 规则 → plan → bypass → ask/allow（按 priority）→ 模式默认。
+  - 工具自身的拒绝（`webfetch`/`browser` 拒绝内网地址、plan 模式下的写入）不再能被 allow 规则或 bypass 覆盖。
+  - policies.json 的所有规则（含 `mcp__*` 这类通配工具名和 `param_match`）都转换为同一套规则判定。以前转换不了的规则留在第二个求值器里，它的优先级语义不同：同一条 deny 换一种写法，就可能输给高优先级的 allow。
+  - deny 不看 priority，总是取胜；priority 只决定 ask 与 allow 之间谁先生效，同级时 ask 胜。`PolicyEngine` 已删除。
+- **所有斜杠命令由一个注册表分发**：
+  - 前端命令（`/stop`、`/tasks`、`/attach`、`/new`、`/clear`、`/continue`、配置类和会话类命令）也注册为命令；REPL 与 headless 共用同一个分发函数；补全、`/help`、"任务运行中不能执行"的判断都从注册表读取。
+  - 以前命令表分散在五处，两个前端也已经不一致：headless 下不认识 `/continue`、`/clear`，两个前端都不认识不带参数的 `/model`、`/mode`。
+  - README 与手册补上了一直缺失的 `/profile`、`/record`、`/skill`、`/tools`。
+- **移动端复用 `internal/api`**：`mobile/mobileapi`（一份独立的 OpenAI 兼容客户端）已删除。移动端获得桌面版的工具参数修复、建连重试、多 key 轮换、SSE 边界处理和真正可用的 Anthropic。Kotlin 侧的导出 API 不变。provider 为 `openai-compatible` 或不认识的名字、又没填 baseURL 时，仍按旧版连 DeepSeek；已知 provider（如 glm）改用各自正确的地址，旧版会把它们错误地连到 DeepSeek。
+
+### Fixed
+- **工具别名绕过权限规则**：`Write`、`Edit`、`Read`、`PowerShell`、`Agent` 等别名能调用到对应工具，但权限规则按名字精确匹配，安全扫描也只认小写的 `bash`/`powershell`，所以写给 `write` 的 deny/ask 规则拦不住 `Write`，`PowerShell` 跳过了危险命令扫描。现在执行与授权前统一换成正式工具名。
+- **bypass 模式无视 policies.json 的 deny**：手册写的是"deny 规则任何模式都生效"，但 glob 工具模式（如 `mcp__*`）或带 `param_match` 的 deny 规则只存在于策略引擎里，bypass 直接放行了。现在按手册执行。
+- **guardrail 警告让失败被当成成功**：连续失败时 guardrail 的提示被拼在工具结果前面，挤掉了开头的 `Error:`，于是恰好是这些失败被显示成成功，连续失败计数也被清零，熔断和升级模型都不触发。提示改为拼在结果后面。
+- **`/resume` 与 `/new` 不对称**：`/resume` 只替换了消息，上一个会话的中断回合还留着（`/continue` 会接着一个新历史里根本没有的请求），当前会话不先保存，被恢复会话的 token/费用被进程累计值覆盖。两者现在走同一套会话切换逻辑。`/new` 也补齐了漏掉的重置项：技能回顾节流计数（以前 `/new` 后很长一段时间都不会做回顾）和几条"本会话只提示一次"的标记；切换后才结束的后台回顾不再写回旧会话的计数。
+- **切换模型/供应商后后台任务仍用旧模型名**：记忆提取、记忆整理、技能回顾的模型名只在启动时设一次，`/model`、`/provider` 之后仍向新供应商请求旧模型。
+- **REPL 的 `--replay` 仍要求 API Key**：`-p` 和 headless 已经对回放放行，交互式 REPL 用的是另一份判断。
+- **headless 下插件命令能覆盖内置命令**：REPL 是内置命令优先（防止插件的 `commands/status.md` 顶替 `/status`），headless 的判断顺序反了。两个前端现在用同一个解析函数。
+- **`/help` 等处的中文描述被截成乱码**：`truncateDesc` 按字节截断，改为按字符截断。
+- **16K 窗口被误判为装不下、自动压缩被停用**：压缩触发点要在回复预留之外再留一段安全余量，这段余量以前固定 8000 token，在 16384 的窗口里占掉一半，触发点只剩 4288，低于每次请求约 6.5K 的固定开销，于是停用了自动压缩；实际上窗口减去固定开销和回复预留后，还有约 5.7K 可以放对话。安全余量改为窗口的 1/8（下限 1024、上限 8000）：64K 及以上窗口不变，16K 窗口的触发点改为 10240，自动压缩恢复工作。提示文案也改了：以前写「窗口 16384 token 装不下约 6536 token 的固定开销」，前后数字自相矛盾；现在分别列出窗口大小、固定开销、回复预留和剩给对话的 token 数。
+
+### Changed
+- **权限模式只有一份**：以前 CLI 自己另建了一个权限管理器用于显示，再加上 `cfg` 和 `AppState` 里各存一份模式字符串，每次改模式都要同步写四处。现在只保留 engine 里真正用于判定的那个（`Engine.Permissions()`），删除了 `internal/state`（`AppState`）；`/status` 直接从 engine 读取模型、模式和会话 ID。以前会话 ID 在常用路径上从未被设置过，所以一直不显示。
+- **会话级状态集中管理**：属于单个对话的字段收拢进 `engine.conversation`，`/new`、`/resume` 时整体清零；`state_ownership_test.go` 要求 `Engine` 的每个新字段都声明自己的生命周期（会话级、项目级或进程级）。以前重置逻辑分散在四处，新加的字段总有地方漏掉。
+- **工具失败改为显式标记**：`executeTool` 同时返回"是否失败"，失败在发生处直接标记。熔断、连续失败统计、界面上的错误显示、完成校验不再靠 `Error:`/`BLOCKED` 前缀去猜。以前被安全检查拦下的调用会被当成成功。
+- **删除只有一个 provider 的 `ModelFallback`**：它从来只包着一个 provider，既不切换也不重试，只维护一套健康状态，而这套状态曾导致冷却 60 秒的中断和连续 3 次失败后会话报废。现在引擎直接经计费层调用 provider。E2009（供应商已被标记不可用）不再产生，仍保留注册，以便显示旧日志。
+- **删除死代码**：`internal/telemetry`、`session.TaskRunner`、从未注册的 cron/lsp 工具及其 Runtime 字段、`mcp.ParseToolName`、`repl.HasActiveInput`、`repl.SetPermInputCh`。
+- **会话记录只记本会话的用量**：`TokensIn`/`TokensOut`/`Cost` 以前是整个进程的累计值，`/new` 之后的会话会带上前一个会话的用量。
+
+## [11.4.0] - 2026-09-27
 
 ### Added
 - **从真实失败会话修起（16K 本地模型跑不完任务的根因）**：日志显示一个 .NET 任务在 qwen3.6-27b + 16K 窗口下四次撞墙：用户没说第二句话，请求已带 6K 固定开销（系统提示 + 25 个工具定义）、12KB 的 cove-main repo map 摘录（与任务无关）、4 条无关记忆和两份 skill 全文；超长重试原样重发、每次多一条中断标记（17773 → 18041 token）；摘要超时回退截断时把原始需求也截掉；`write` 因目标目录在工作目录之外被拒 7 次，用户只看到「工具失败」。修法：**上下文预算按模型窗口缩放**（窗口已知且 <48K 只发核心工具集；repo map 摘录、记忆注入、单个工具结果上限按窗口比例缩小，请求里提到别的目录时不附本仓库 repo map）；**超长重试真正变小**（压缩无从摘要时移除本轮附加上下文、裁剪最大工具结果；中断标记只留一条）；**压缩永远保留原始需求**（摘要与截断消息都以 `<original_request>` 开头）；**目录外路径**：工具报错第二行明确告诉模型「让用户 /cd，不要用 shell 绕过」，用户侧每个目录提示一次「请输入 /cd <目录>」，发送请求前若请求里就写了工作目录外的已有目录也先提示；**学到的窗口自动写入配置**（`model_context_windows`，下次启动生效，不再只是提示手改）；`MinUsefulContextWindow` 24K → 12K。

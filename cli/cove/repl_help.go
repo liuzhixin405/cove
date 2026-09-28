@@ -38,38 +38,51 @@ func providerEnvHelpLine() string {
 	return "环境变量: LLM_API_KEY | ANTHROPIC_API_KEY | DEEPSEEK_API_KEY | OPENAI_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | OPENROUTER_API_KEY | SILICONFLOW_API_KEY | LLM_BASE_URL"
 }
 
+// genericCategories places the generic commands of internal/command in the
+// /help sections; the front-end commands declare theirs (command.Categorized).
+var genericCategories = map[string]string{
+	"ratelimit": catModel, "undo": catSession, "checkpoints": catSession, "memory": catSession,
+	"status": catSession, "stats": catSession, "system": catSession,
+	"mcp": catSystem, "plugin": catSystem, "hooks": catSystem, "diagnose": catSystem, "permissions": catSystem,
+}
+
+// commandCategory is the /help section of c ("" for the last one, 命令).
+func commandCategory(c command.Command) string {
+	if cc, ok := c.(command.Categorized); ok && cc.Category() != "" {
+		return cc.Category()
+	}
+	return genericCategories[c.Name()]
+}
+
+// printHelp lists every registered command, by section: /help used to be a
+// hand-written list next to the registry, and fell behind it.
 func printHelp(cmdReg *command.Registry, toolReg *tool.Registry, pluginMgr *plugin.Manager) {
 	outln("\n=== cove v" + Version + " ===")
-	outln("\n供应商 / 模型:")
-	outln("  /model <名称>       设置模型")
-	outln("  /profile ...        管理 profile（list/switch/save/delete/show）")
-	outln(providerHelpLine())
-	outln("  /api-key <密钥>     保存 API 密钥")
-	outln("  /base-url <地址>    设置自定义接口地址")
-	outln("  /record ...         控制录制（status/start/stop）")
-	outln("  /mode <模式>        设置权限模式 (default|plan|auto|bypass)")
-	outln("  /budget <金额|auto|off|save> 本会话预算上限 ($)；save 写入配置")
-	outln("  /cost               查看用量和费用")
-	outln("  /ratelimit          查看 API 速率限制状态")
-	outln("  /attach <文件...>   挂载图片或文件；list/remove/clear 管理列表")
-	outln("  /config             查看完整配置")
-	outln("\n会话:")
-	outln("  /compact            压缩对话历史")
-	outln("  /undo               回退到上一个检查点")
-	outln("  /checkpoints        列出所有检查点")
-	outln("  /history            查看和继续历史会话")
-	outln("  /resume [id]        恢复已保存的会话")
-	outln("  /memory             管理持久化记忆")
-	outln("\n后台任务:")
-	outln("  /tasks              查看运行中/排队的任务")
-	outln("  /stop               取消当前运行的任务 (别名 /cancel)")
-	outln("\n系统:")
-	outln("  /mcp                管理 MCP 服务器")
-	outln("  /plugin             管理插件")
-	outln("  /skills             列出技能")
-	outln("\n命令:")
+	sections := map[string][]command.Command{}
 	for _, c := range cmdReg.All() {
-		outf("  /%-16s %s\n", c.Name(), c.Description())
+		cat := commandCategory(c)
+		sections[cat] = append(sections[cat], c)
+	}
+	for _, cat := range append(append([]string(nil), helpCategories...), "") {
+		cmds := sections[cat]
+		if len(cmds) == 0 {
+			continue
+		}
+		title := cat
+		if title == "" {
+			title = "命令"
+		}
+		outln("\n" + title + ":")
+		for _, c := range cmds {
+			name := "/" + c.Name()
+			if a := c.Aliases(); len(a) > 0 {
+				name += " (/" + strings.Join(a, ", /") + ")"
+			}
+			outf("  %-18s %s\n", name, c.Description())
+		}
+		if cat == catModel {
+			outln(providerHelpLine())
+		}
 	}
 	if pluginMgr != nil {
 		if pcmds := pluginMgr.CommandPrompts(); len(pcmds) > 0 {

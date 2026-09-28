@@ -16,7 +16,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/command"
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/state"
 	"github.com/liuzhixin405/cove/internal/termui"
 )
 
@@ -145,7 +144,7 @@ func TestEngineAdapterAppliesConfigBudgetLive(t *testing.T) {
 	cfg := config.DefaultConfig()
 	_, err := command.NewConfigCmd().Execute(context.Background(), command.Input{
 		Args: []string{"budget", "7"}, Config: cfg, SaveConfig: func(*config.Config) error { return nil },
-		Engine: replEngineAdapter{eng: eng}, AppState: &state.AppState{},
+		Engine: replEngineAdapter{eng: eng},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +168,7 @@ func TestBudgetCommandRejectsInvalidAmount(t *testing.T) {
 		buf := captureOut(t)
 		cfg := config.DefaultConfig()
 		cfg.MaxBudgetUsd = 5
-		handleBudgetCommand(in, cfg, nil, &state.AppState{})
+		handleBudgetCommand(in, cfg, nil)
 		if !strings.Contains(buf.String(), "用法") {
 			t.Errorf("%s: expected usage, got %q", in, buf.String())
 		}
@@ -184,7 +183,7 @@ func TestBareBudgetShowsCurrentBudget(t *testing.T) {
 	buf := captureOut(t)
 	cfg := config.DefaultConfig()
 	cfg.MaxBudgetUsd = 2.5
-	if !handleBuiltinConfigCommand("/budget", cfg, nil, nil, &state.AppState{}) {
+	if !handleBuiltinConfigCommand("/budget", cfg, nil) {
 		t.Fatal("/budget was not handled")
 	}
 	if !strings.Contains(buf.String(), "2.50") {

@@ -1,6 +1,7 @@
 package permission
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -33,6 +34,9 @@ type Decision string
 // override) from "the mode default is to ask".
 const ReasonAskRule = "approval required by policy rule"
 
+// ReasonDenyRule is the reason Check gives when a deny rule matched.
+const ReasonDenyRule = "denied by policy rule"
+
 const (
 	DAllow  Decision = "allow"
 	DDeny   Decision = "deny"
@@ -55,6 +59,13 @@ type Rule struct {
 	// fields set to exactly this string, e.g. serverName+toolName for the
 	// MCP proxy tool.
 	InputEquals map[string]string
+	// ParamMatch scopes a rule to calls whose input fields match these glob
+	// patterns (policies.json "param_match").
+	ParamMatch map[string]string
+	// Priority orders ask against allow rules (policies.json "priority";
+	// rules remembered in the session have 0): an ask wins unless an allow
+	// has a strictly higher priority. Deny rules ignore it and always win.
+	Priority int
 }
 
 type Manager struct {
@@ -159,11 +170,17 @@ func SameRule(a, b Rule) bool { return sameRule(a, b) }
 func sameRule(a, b Rule) bool {
 	if a.ToolPattern != b.ToolPattern || a.ArgPattern != b.ArgPattern ||
 		a.CommandPrefix != b.CommandPrefix || a.CommandGroup != b.CommandGroup ||
-		len(a.InputEquals) != len(b.InputEquals) {
+		a.Priority != b.Priority || len(a.InputEquals) != len(b.InputEquals) ||
+		len(a.ParamMatch) != len(b.ParamMatch) {
 		return false
 	}
 	for k, v := range a.InputEquals {
 		if bv, ok := b.InputEquals[k]; !ok || bv != v {
+			return false
+		}
+	}
+	for k, v := range a.ParamMatch {
+		if bv, ok := b.ParamMatch[k]; !ok || bv != v {
 			return false
 		}
 	}
@@ -175,7 +192,7 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	defer m.mu.RUnlock()
 	for _, r := range m.deny {
 		if matchRule(r, toolName, toolInput) {
-			return DDeny, "denied by policy rule"
+			return DDeny, ReasonDenyRule
 		}
 	}
 	// Plan mode is read-only whatever rules were added earlier: an "always
@@ -186,35 +203,49 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	if m.mode == Bypass && m.bypassAvailable {
 		return DBypass, "bypass mode"
 	}
-	// Ask rules come before allow rules: "always ask for git push" must not
-	// be silenced by an earlier "[a]"/"[p]" answer or a whole-tool allow.
+	// Ask and allow rules. An ask wins over an allow unless the allow has a
+	// strictly higher priority: "always ask for git push" is not silenced by
+	// an earlier "[a]"/"[p]" answer or a whole-tool allow (all priority 0),
+	// while a policies.json allow ranked above an ask still applies.
 	// Bypass mode (above) skips them; only deny rules and plan mode stop it.
+	askPri, asked := 0, false
 	for _, r := range m.ask {
-		if matchRule(r, toolName, toolInput) {
-			return DAsk, ReasonAskRule
+		if matchRule(r, toolName, toolInput) && (!asked || r.Priority > askPri) {
+			askPri, asked = r.Priority, true
 		}
 	}
+	allowPri, allowed, allowReason := 0, false, ""
 	cov := coverage{kind: shellKindFor(toolName, m.shellKind)}
+	poolPri, pooling := 0, false
 	for _, r := range m.allow {
 		if r.CommandPrefix != "" || r.CommandGroup != "" {
 			// Prefix and group rules are pooled: a compound line is allowed
 			// when each of its commands is covered by some rule, not
-			// necessarily the same one.
+			// necessarily the same one. The pool ranks as its lowest rule.
 			if toolMatches(r, toolName) {
 				if r.CommandPrefix != "" {
 					cov.prefixes = append(cov.prefixes, strings.Fields(r.CommandPrefix))
 				} else {
 					cov.groups = append(cov.groups, r.CommandGroup)
 				}
+				if !pooling || r.Priority < poolPri {
+					poolPri, pooling = r.Priority, true
+				}
 			}
 			continue
 		}
-		if matchRule(r, toolName, toolInput) {
-			return DAllow, "allowed by policy rule"
+		if matchRule(r, toolName, toolInput) && (!allowed || r.Priority > allowPri) {
+			allowPri, allowed, allowReason = r.Priority, true, "allowed by policy rule"
 		}
 	}
-	if !cov.empty() && lineCovered(inputCommand(toolInput), cov) {
-		return DAllow, "allowed by command prefix rule"
+	if pooling && (!allowed || poolPri > allowPri) && lineCovered(inputCommand(toolInput), cov) {
+		allowPri, allowed, allowReason = poolPri, true, "allowed by command prefix rule"
+	}
+	if asked && (!allowed || allowPri <= askPri) {
+		return DAsk, ReasonAskRule
+	}
+	if allowed {
+		return DAllow, allowReason
 	}
 	switch m.mode {
 	case Auto:
@@ -232,8 +263,11 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	}
 }
 
+// toolMatches compares a rule's tool pattern with a canonical tool name:
+// "*", a glob such as "mcp__*", or a name (case-insensitive, like the
+// policies.json matcher it replaces).
 func toolMatches(r Rule, toolName string) bool {
-	return r.ToolPattern == "*" || r.ToolPattern == toolName
+	return matchGlob(r.ToolPattern, toolName)
 }
 
 func matchRule(r Rule, toolName string, input map[string]any) bool {
@@ -251,6 +285,12 @@ func matchRule(r Rule, toolName string, input map[string]any) bool {
 	}
 	for field, want := range r.InputEquals {
 		if got, ok := input[field].(string); !ok || got != want {
+			return false
+		}
+	}
+	for field, pattern := range r.ParamMatch {
+		got, ok := input[field]
+		if !ok || !matchGlob(pattern, fmt.Sprintf("%v", got)) {
 			return false
 		}
 	}

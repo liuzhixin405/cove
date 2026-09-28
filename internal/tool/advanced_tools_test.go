@@ -84,18 +84,6 @@ func TestSleepTool(t *testing.T) {
 	}
 }
 
-type fakeLSPRunner struct {
-	output string
-	err    error
-}
-
-func (f *fakeLSPRunner) Run(ctx context.Context, action string, filePath string, input Input) (string, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.output, nil
-}
-
 type fakeRuntimeSkillManager struct {
 	skills map[string]skills.Skill
 }
@@ -348,53 +336,6 @@ func TestWorktreeTools(t *testing.T) {
 	perm = tew.CheckPermissions(nil, Context{})
 	if perm.Decision != Ask {
 		t.Errorf("expected Ask, got %v", perm.Decision)
-	}
-}
-
-func TestCronTool(t *testing.T) {
-	tc := NewCronTool()
-	if tc.Def().Name != "cron" {
-		t.Errorf("expected name 'cron', got %q", tc.Def().Name)
-	}
-	perm := tc.CheckPermissions(nil, Context{})
-	if perm.Decision != Ask {
-		t.Errorf("expected Ask, got %v", perm.Decision)
-	}
-
-	rt := &Runtime{Tasks: make(map[string]*TaskRecord)}
-	result, _ := tc.Call(context.Background(), Input{"schedule": "0 9 * * *", "task": "daily sync"}, Context{Runtime: rt})
-	if result.IsError {
-		t.Fatalf("cron failed: %s", result.Data)
-	}
-	if strings.Contains(result.Data, "Cron scheduled:") {
-		t.Fatalf("cron should return runtime-backed record, got %q", result.Data)
-	}
-	if len(rt.Tasks) == 0 {
-		t.Fatal("cron should create a runtime task record")
-	}
-	if len(rt.CronSchedules) != 1 {
-		t.Fatalf("cron should create a schedule record, got %d", len(rt.CronSchedules))
-	}
-}
-
-func TestLSPTool(t *testing.T) {
-	tl := NewLSPTool()
-	if tl.Def().Name != "lsp" {
-		t.Errorf("expected name 'lsp', got %q", tl.Def().Name)
-	}
-
-	result, _ := tl.Call(context.Background(), Input{"action": "hover", "filePath": "test.go"}, Context{})
-	if !result.IsError {
-		t.Fatalf("lsp without backend should surface an error, got %q", result.Data)
-	}
-
-	rt := &Runtime{LSPRunner: &fakeLSPRunner{output: "diagnostics: clean"}}
-	result, _ = tl.Call(context.Background(), Input{"action": "diagnostics", "filePath": "test.go"}, Context{Runtime: rt})
-	if result.IsError {
-		t.Fatalf("lsp with backend should succeed, got %q", result.Data)
-	}
-	if !strings.Contains(result.Data, "diagnostics: clean") {
-		t.Fatalf("expected lsp runner output, got %q", result.Data)
 	}
 }
 

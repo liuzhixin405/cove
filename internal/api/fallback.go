@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -279,50 +278,6 @@ type allProvidersError struct {
 
 func (e *allProvidersError) Error() string   { return e.msg }
 func (e *allProvidersError) Unwrap() []error { return e.causes }
-
-// The three classifiers below decide whether a provider gets cooled down
-// (degraded) or blacklisted (unavailable), so a misclassification takes a
-// healthy provider out of rotation.
-//
-// They therefore consult the HTTP status carried by *StatusError first, and
-// only fall back to matching the message text when no status is available (a
-// transport error, a wrapped error from elsewhere). The bare status digits are
-// deliberately NOT part of the textual fallback: matching "500" or "429" as a
-// substring fires on innocuous messages like "max_tokens must be under 1500",
-// which is exactly how a working provider used to get evicted.
-
-func isRateLimit(err error) bool {
-	if st := statusOf(err); st != 0 {
-		return st == http.StatusTooManyRequests
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "rate_limit") ||
-		strings.Contains(s, "rate limit") ||
-		strings.Contains(s, "too many requests")
-}
-
-func isTemporary(err error) bool {
-	if st := statusOf(err); st != 0 {
-		return st >= 500
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "timeout") ||
-		strings.Contains(s, "deadline exceeded") ||
-		strings.Contains(s, "connection refused") ||
-		strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "no such host") ||
-		strings.Contains(s, "eof") ||
-		strings.Contains(s, "temporary")
-}
-
-func isPermanent(err error) bool {
-	if st := statusOf(err); st != 0 {
-		return st == http.StatusUnauthorized || st == http.StatusForbidden
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "invalid api key") ||
-		strings.Contains(s, "authentication")
-}
 
 // Reset clears every provider's health so a freshly switched provider starts
 // from a clean slate.

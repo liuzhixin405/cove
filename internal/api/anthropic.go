@@ -2,7 +2,6 @@ package api
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,8 +73,22 @@ func (p *anthropicProvider) activeKey() string {
 	return p.apiKey
 }
 
-func (p *anthropicProvider) Name() string        { return "anthropic" }
+func (p *anthropicProvider) Name() string { return "anthropic" }
+func (p *anthropicProvider) Capabilities() Capabilities {
+	return Capabilities{CacheBreakpoints: true, ToolsWithToolHistory: true, Family: "anthropic"}
+}
 func (p *anthropicProvider) DisplayName() string { return "anthropic" }
+
+// endpoint is the messages endpoint through client (p.client, or
+// p.streamClient for a stream).
+func (p *anthropicProvider) endpoint(client *http.Client) endpoint {
+	return endpoint{url: p.baseURL + "/messages", client: client, key: p.activeKey, pool: p.keyPool,
+		auth: func(h http.Header, key string) {
+			h.Set("x-api-key", key)
+			h.Set("anthropic-version", "2023-06-01")
+			h.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
+		}}
+}
 func (p *anthropicProvider) Validate() error {
 	if p.apiKey == "" && p.keyPool.size() == 0 {
 		return fmt.Errorf("API key required (set ANTHROPIC_API_KEY)")
@@ -260,39 +273,13 @@ func (p *anthropicProvider) doChat(ctx context.Context, body anthropicReq) (*Cha
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
+	httpResp, err := p.endpoint(p.client).post(ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, err
 	}
-	key := p.activeKey()
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", key)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
-
-	httpResp, err := p.client.Do(httpReq)
-	if err != nil {
-		if isClientTimeout(err) {
-			// The request went out and the model generated for the whole
-			// timeout. Retrying repeats that wait up to MaxRetries more
-			// times for what is most likely the same outcome.
-			return nil, fmt.Errorf("http: %w", err)
-		}
-		return nil, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
-	}
-	defer func() { _ = httpResp.Body.Close() }()
-
-	// Update the key pool's health for this key (rate-limited / dead / ok) so
-	// multi-key rotation actually fails over.
-	p.keyPool.MarkOutcome(key, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
-
-	raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, 10*1024*1024))
-	// 529 is Anthropic's "overloaded"; it falls under >= 500.
-	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RetryableError{Msg: truncate(string(raw), 500), Status: httpResp.StatusCode, RetryAfter: RetryAfterFor(httpResp.StatusCode, httpResp.Header)}
-	}
-	if httpResp.StatusCode != 200 {
-		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(raw), 500)}
+	raw, status := httpResp.Body, httpResp.Status
+	if status != http.StatusOK {
+		return nil, &StatusError{Status: status, Msg: truncate(string(raw), 500)}
 	}
 
 	var ar anthropicResp
@@ -501,32 +488,11 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	streamCtx, markProgress, stopWatchdog := newStreamWatchdog(ctx)
 	defer stopWatchdog()
 
-	// Retry the connection-establishment phase only. Once the body starts
-	// streaming, deltas have already been delivered to the handler so retrying
-	// would duplicate output.
-	var streamKey string
-	httpResp, err := retryConnectHTTP(
-		streamCtx,
-		defaultRetry,
-		func(callCtx context.Context) (*http.Response, error) {
-			httpReq, reqErr := http.NewRequestWithContext(callCtx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
-			if reqErr != nil {
-				return nil, reqErr
-			}
-			streamKey = p.activeKey()
-			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("x-api-key", streamKey)
-			httpReq.Header.Set("anthropic-version", "2023-06-01")
-			httpReq.Header.Set("anthropic-beta", "token-efficient-tools-2025-11-18,prompt-caching-2024-07-31")
-			return sc.Do(httpReq)
-		},
-		func(statusCode int) bool { return statusCode >= 500 || statusCode == 429 },
-	)
+	httpResp, err := p.endpoint(sc).openStream(streamCtx, data)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
-	p.keyPool.MarkOutcome(streamKey, httpResp.StatusCode, RetryAfterFor(httpResp.StatusCode, httpResp.Header))
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(body), 500)}
@@ -553,7 +519,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	sawStop := false
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readSSELine(reader)
 		if err != nil && err != io.EOF {
 			// Distinguish an idle-watchdog abort from a genuine read error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {

@@ -13,7 +13,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
 // savedSession writes a two-message session with a first engine and returns
@@ -104,7 +103,7 @@ func TestResumeCmdThroughAdapterContinuesSession(t *testing.T) {
 	eng := secondEngine(t)
 	_, err := command.NewResumeCmd().Execute(context.Background(), command.Input{
 		Args: []string{id}, Cwd: currentProjectDir(), SessionStore: eng.Store(),
-		Engine: replEngineAdapter{eng: eng}, AppState: &state.AppState{},
+		Engine: replEngineAdapter{eng: eng},
 	})
 	if err != nil {
 		t.Fatal(err)

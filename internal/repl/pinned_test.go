@@ -226,8 +226,11 @@ func TestPinnedRedrawShowsTheSteerCount(t *testing.T) {
 	restore = captureStdout(t)
 	lr.redraw(nil, 0)
 	out = restore()
-	// Both notes: 15 + 3 (" · ") + 11 = 29 cells, starting at column 91.
-	if !strings.Contains(out, "\x1b[50;91H\x1b[2m已插入 1 条指引 · 已排队 2 条\x1b[0m") {
+	// Both notes: 15 + 4 (" · ", the middle dot being East Asian Ambiguous
+	// and measured 2 like everywhere else) + 11 = 30 cells, starting at
+	// column 90. Measured 1, a CJK terminal drew the row one column over its
+	// width and wrapped it.
+	if !strings.Contains(out, "\x1b[50;90H\x1b[2m已插入 1 条指引 · 已排队 2 条\x1b[0m") {
 		t.Errorf("combined note missing or misplaced: %q", out)
 	}
 }

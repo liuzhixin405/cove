@@ -23,7 +23,7 @@ func findResult(r *Report, name string) (CheckResult, bool) {
 }
 
 // The full report has a "后台学习" item: dream gates, memory count and the
-// last extraction, taken from the injectable BackgroundStatusFn.
+// last extraction, taken from the running session (SetSession).
 func TestRunAllReportsBackgroundLearning(t *testing.T) {
 	// A nil config skips the network probe.
 	c, _ := newTestChecker(t, nil)
@@ -119,9 +119,11 @@ func TestPolicyFileItemDefaultParsesFile(t *testing.T) {
 // The package-level hooks are what the engine sets; NewChecker picks them up.
 func TestNewCheckerUsesInjectedFunctions(t *testing.T) {
 	called := 0
-	PolicyLoadErrorFn = func() error { called++; return nil }
-	BackgroundStatusFn = func() BackgroundStatus { called++; return BackgroundStatus{} }
-	t.Cleanup(func() { PolicyLoadErrorFn, BackgroundStatusFn = nil, nil })
+	SetSession(&SessionFuncs{
+		PolicyErr:  func() error { called++; return nil },
+		Background: func() BackgroundStatus { called++; return BackgroundStatus{} },
+	})
+	t.Cleanup(func() { SetSession(nil) })
 	c, _ := newTestChecker(t, config.DefaultConfig())
 	c.checkPolicyFile(t.Context())
 	c.checkBackgroundLearning(t.Context())

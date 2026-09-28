@@ -1,6 +1,16 @@
 // Package covemobile exposes a lightweight AI engine for Android phone control.
-// It wraps the multi-provider AI layer and a tool-calling loop that delegates
-// phone operations (tap, swipe, screenshot) to the Kotlin side via callback.
+// It wraps the desktop's provider layer (internal/api) and a tool-calling loop
+// that delegates phone operations (tap, swipe, screenshot) to the Kotlin side
+// via callback.
+//
+// gomobile bind only restricts the EXPORTED API of this package (the types
+// and signatures below must stay gomobile-bindable and unchanged for the
+// Kotlin side); the implementation may import any package of the module.
+// Using internal/api directly means mobile gets the same tool-argument JSON
+// repair, connection-setup retry, SSE handling and Anthropic support as the
+// desktop instead of a drifting copy. Only the provider layer is shared: the
+// desktop engine (internal/engine: tools, permissions, compaction) is not
+// part of the mobile build.
 package covemobile
 
 import (
@@ -11,11 +21,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/mobile/mobileapi"
+	"github.com/liuzhixin405/cove/internal/api"
 )
 
 // ---------- exported types for gomobile / Kotlin ----------
-// ToolDef describes a phone-operation tool available to the AI.
+
 // ToolDef describes a phone-operation tool available to the AI.
 type ToolDef struct {
 	Name        string
@@ -40,9 +50,9 @@ type StreamCallback interface {
 // No cost tracking, no non-streaming Chat - only what the phone needs.
 type MobileEngine struct {
 	mu          sync.Mutex
-	provider    mobileapi.Provider
+	provider    api.Provider
 	model       string
-	messages    []mobileapi.Message
+	messages    []api.Message
 	toolDefs    []ToolDef
 	initialized bool
 }
@@ -52,16 +62,15 @@ func (e *MobileEngine) Init(apiKey string, model string, provider string, baseUR
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	providerCfg := mobileapi.ProviderConfig{
-		Name:    provider,
+	prov := api.NewProvider(api.ProviderConfig{
+		Name:    resolveProviderName(provider, model),
 		APIKey:  apiKey,
-		BaseURL: baseURL,
-	}
-	prov := mobileapi.DetectProvider(model, providerCfg)
+		BaseURL: mobileBaseURL(provider, baseURL),
+	})
 
 	e.provider = prov
 	e.model = model
-	e.messages = make([]mobileapi.Message, 0)
+	e.messages = make([]api.Message, 0)
 	e.toolDefs = make([]ToolDef, 0)
 	e.initialized = true
 }
@@ -81,7 +90,7 @@ func (e *MobileEngine) AddTool(name string, description string, inputSchema stri
 func (e *MobileEngine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.messages = make([]mobileapi.Message, 0)
+	e.messages = make([]api.Message, 0)
 }
 
 // ChatStream sends a message and streams the response via callback.
@@ -111,17 +120,17 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 		callback.OnError("engine not initialized, call Init() first")
 		return
 	}
-	e.messages = append(e.messages, mobileapi.Message{Role: "user", Content: message})
+	e.messages = append(e.messages, api.Message{Role: "user", Content: message})
 
 	toolDefs := e.buildAPIToolDefs()
 	sp := e.buildSystemPrompt()
 	prov := e.provider
 	model := e.model
-	msgs := make([]mobileapi.Message, len(e.messages))
+	msgs := make([]api.Message, len(e.messages))
 	copy(msgs, e.messages)
 	e.mu.Unlock()
 
-	req := mobileapi.ChatRequest{
+	req := api.ChatRequest{
 		Model:      model,
 		Messages:   msgs,
 		SystemBase: sp,
@@ -137,7 +146,7 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 			return
 		}
 
-		resp, err := prov.ChatStream(ctx, req, func(event mobileapi.StreamEvent) {
+		resp, err := prov.ChatStream(ctx, req, func(event api.StreamEvent) {
 			if event.Delta != "" {
 				callback.OnDelta(event.Delta)
 			}
@@ -149,6 +158,10 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 			callback.OnError(fmt.Sprintf("API error: %v", err))
 			return
 		}
+		if resp == nil {
+			callback.OnError("API error: empty response")
+			return
+		}
 
 		if resp.Content != "" {
 			fullResponse.WriteString(resp.Content)
@@ -158,28 +171,28 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 		// it showed every thought twice.
 
 		if len(resp.ToolCalls) > 0 {
-			// Add assistant message with tool calls to history
-			assistantMsg := mobileapi.Message{
-				Role:      "assistant",
-				Content:   resp.Content,
-				ToolCalls: make([]mobileapi.ToolCall, len(resp.ToolCalls)),
+			// Add assistant message with tool calls to history. The reasoning
+			// and thinking blocks go with it: DeepSeek thinking mode requires
+			// reasoning_content to be sent back on a tool-calling turn, and
+			// Anthropic requires its thinking blocks back verbatim.
+			assistantMsg := api.Message{
+				Role:             "assistant",
+				Content:          resp.Content,
+				ReasoningContent: resp.ReasoningContent,
+				ThinkingBlocks:   resp.ThinkingBlocks,
+				ToolCalls:        make([]api.ToolCall, len(resp.ToolCalls)),
 			}
-			for i, tc := range resp.ToolCalls {
-				assistantMsg.ToolCalls[i] = mobileapi.ToolCall{
-					ID: tc.ID, Name: tc.Name, Input: tc.Input,
-				}
-			}
+			copy(assistantMsg.ToolCalls, resp.ToolCalls)
 			e.mu.Lock()
 			e.messages = append(e.messages, assistantMsg)
 			e.mu.Unlock()
 
 			// Execute each tool via Kotlin callback, collect results
 			for _, tc := range resp.ToolCalls {
-				inputJSON, _ := json.Marshal(tc.Input)
-				result := callback.OnToolCall(tc.Name, string(inputJSON))
+				result := runTool(tc, callback)
 
 				e.mu.Lock()
-				e.messages = append(e.messages, mobileapi.Message{
+				e.messages = append(e.messages, api.Message{
 					Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: result,
 				})
 				e.mu.Unlock()
@@ -187,7 +200,7 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 
 			// Update request with full history for next LLM iteration
 			e.mu.Lock()
-			req.Messages = make([]mobileapi.Message, len(e.messages))
+			req.Messages = make([]api.Message, len(e.messages))
 			copy(req.Messages, e.messages)
 			e.mu.Unlock()
 			continue
@@ -195,7 +208,7 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 
 		// Final text response - no tool calls
 		e.mu.Lock()
-		e.messages = append(e.messages, mobileapi.Message{Role: "assistant", Content: resp.Content})
+		e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
 		e.mu.Unlock()
 
 		callback.OnDone(fullResponse.String())
@@ -207,16 +220,80 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 
 // ---------- internal helpers ----------
 
-func (e *MobileEngine) buildAPIToolDefs() []mobileapi.ToolDef {
-	defs := make([]mobileapi.ToolDef, 0, len(e.toolDefs))
+// resolveProviderName keeps the mobile engine's provider selection for an
+// empty provider name: claude models go to Anthropic, deepseek models to
+// DeepSeek and everything else to OpenAI. (api.DetectProvider falls back to
+// Anthropic for an unknown model, which would change what an app that only
+// sets a model gets.) A non-empty name is passed through; api.NewProvider
+// normalizes aliases and treats unknown names as OpenAI-compatible.
+// legacyMobileBaseURL is where the mobile client this package replaced sent
+// a provider it had no address for.
+const legacyMobileBaseURL = "https://api.deepseek.com/v1"
+
+// mobileBaseURL keeps the address an installed app's settings point at. The
+// old client sent "openai-compatible", or a provider name it did not know,
+// to DeepSeek when no base URL was set; internal/api would send them to
+// OpenAI, and such an app (typically a DeepSeek key under
+// "openai-compatible") stopped working after an update. Known providers get
+// their own address, which the old client got wrong (glm went to DeepSeek).
+func mobileBaseURL(provider, baseURL string) string {
+	if strings.TrimSpace(baseURL) != "" || strings.TrimSpace(provider) == "" {
+		return baseURL
+	}
+	if api.NormalizeProviderName(provider) == "openai-compatible" || !api.IsKnownProvider(provider) {
+		return legacyMobileBaseURL
+	}
+	return baseURL
+}
+
+func resolveProviderName(provider, model string) string {
+	if strings.TrimSpace(provider) != "" {
+		return provider
+	}
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "claude"):
+		return "anthropic"
+	case strings.Contains(m, "deepseek"):
+		return "deepseek"
+	default:
+		return "openai"
+	}
+}
+
+// runTool executes one model tool call through the Kotlin callback. A call
+// whose arguments internal/api could not parse even after JSON repair, or one
+// without a tool name, is answered with an error for the model instead of
+// dispatching garbage to the phone (same contract as the desktop engine).
+func runTool(tc api.ToolCall, callback StreamCallback) string {
+	if tc.ParseError {
+		msg, _ := tc.Input["_cove_parse_error"].(string)
+		if msg == "" {
+			msg = "tool call arguments could not be parsed as JSON"
+		}
+		return fmt.Sprintf("Error: %s. Please resend this tool call with valid JSON arguments (check quote escaping, and avoid truncating long string fields).", msg)
+	}
+	if strings.TrimSpace(tc.Name) == "" {
+		return "Error: tool call has no tool name. Please resend it naming one of the available tools."
+	}
+	input := tc.Input
+	if input == nil {
+		input = map[string]any{}
+	}
+	inputJSON, _ := json.Marshal(input)
+	return callback.OnToolCall(tc.Name, string(inputJSON))
+}
+
+func (e *MobileEngine) buildAPIToolDefs() []api.ToolDef {
+	defs := make([]api.ToolDef, 0, len(e.toolDefs))
 	for _, td := range e.toolDefs {
 		schema := map[string]any{"type": "object", "properties": map[string]any{}}
 		if td.InputSchema != "" {
-			if err := json.Unmarshal([]byte(td.InputSchema), &schema); err != nil {
+			if err := json.Unmarshal([]byte(td.InputSchema), &schema); err != nil || schema == nil {
 				schema = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
 		}
-		defs = append(defs, mobileapi.ToolDef{
+		defs = append(defs, api.ToolDef{
 			Name:        td.Name,
 			Description: td.Description,
 			InputSchema: schema,

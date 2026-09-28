@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,8 +16,27 @@ import (
 // Ctrl+C while the question tool waits on its first of two questions ends
 // the tool at once; the second question never takes the input relay, so the
 // user's next line is not swallowed as an answer.
+// lockedBuffer is a bytes.Buffer the test reads while a tool's goroutine
+// writes to it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestInterruptCancelsMultiQuestion(t *testing.T) {
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	termui.SetWriter(&buf)
 	oldInteractive := replInteractive
 	replInteractive = true

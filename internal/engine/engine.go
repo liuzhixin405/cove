@@ -36,7 +36,6 @@ import (
 	"github.com/liuzhixin405/cove/internal/safety"
 	"github.com/liuzhixin405/cove/internal/session"
 	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/textutil"
 	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
@@ -101,10 +100,16 @@ type Config struct {
 }
 
 type Engine struct {
-	// fallback wraps the single AI provider. The struct is called "ModelFallback"
-	// but multi-provider failover is not used -- the engine always initializes it
-	// with exactly one provider (multi-provider fallback is user-rejected).
-	fallback              *api.ModelFallback
+	// conversation is the state that belongs to one conversation and is
+	// cleared as a whole when it is switched (/new, /resume). See
+	// conversation_state.go.
+	conversation
+
+	// llm is the provider every model call goes through: the metered
+	// wrapper around provRef (so /model and /provider switches and billing
+	// reach every caller). It used to sit behind a one-provider "fallback
+	// chain" whose health bookkeeping only ever caused outages.
+	llm                   api.Provider
 	modelRouter           *api.ModelRouter
 	registry              *tool.Registry
 	messages              []api.Message
@@ -129,51 +134,32 @@ type Engine struct {
 	pendingSteerN         int // Steer calls behind pendingSteer (PendingSteer)
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
-	consecutiveErrors     int                        // track consecutive tool failures for circuit breaking
-	loopHistory           []string                   // recent tool-call fingerprints for loop detection
 	loopDetector          *LoopDetector              // enhanced 2-layer loop detection (P0)
 	compressor            *ChatCompressor            // AI-powered conversation compression (P0-3)
 	masker                *ToolOutputMasker          // tool output masking to save context (P1)
 	safetyChecker         *safety.Checker            // security scan before tool execution (P1)
-	policyEngine          *permission.PolicyEngine   // rule-based permission policies (P2)
 	sessionView           *session.SessionView       // snapshot for change tracking (P2)
 	enhancedRepoMap       *repomap.EnhancedGenerator // incremental repo map (P2)
-	iterCount             int                        // track how many tool/LLM loops have run
 	promptMu              sync.Mutex                 // lock for interactive permission prompts
 	policyLoadErr         error                      // why the policies file (PolicyFilePath) failed to load, if it did
 	diskRules             []diskRule                 // rules loadPersistedPolicies gave e.perm, removed again on /cd
-	// out is where every user-facing line and block goes once a front end has
-	// wired one with SetOutput. nil means "not wired", which falls through to
-	// the deprecated OnEngineOutput callback below, and to silence when that is
-	// unset too.
+	// out holds the sink every user-facing line and block goes to (SetOutput);
+	// empty means silence. It is the engine's only output path: the
+	// deprecated OnEngineOutput callback it used to fall back to is gone.
+	// Front ends set it per turn while background work (memory extraction,
+	// the review) may be writing, hence the atomic.
 	//
-	// What is deliberately gone is the old os.Stderr fallback. It was the single
-	// most dangerous write in the codebase: a front end with a live region keeps
-	// the input box pinned by tracking how many rows it drew, and a stray stderr
-	// write invalidates that bookkeeping and leaves the prompt drifting. Silence
-	// when unwired is strictly better.
-	//
-	// It must default to nil rather than uiout.Discard: defaulting to Discard
-	// makes the sink branch always win, which silently swallowed every engine
-	// diagnostic on both front ends (neither calls SetOutput yet).
-	out uiout.Sink
+	// There is deliberately no os.Stderr fallback: a front end that keeps
+	// its input row pinned by counting what it drew is desynchronised by a
+	// stray write, so silence when unwired is strictly better.
+	out atomic.Pointer[sinkBox]
+	// hooks is what the front end shows while a turn runs (SetTurnHooks).
+	// Front ends set it per turn while tool goroutines read it, hence the
+	// atomic; it replaced six callback fields assigned and cleared around
+	// every turn.
+	hooks atomic.Pointer[TurnHooks]
 
-	// OnEngineOutput, if set, receives engine diagnostic lines
-	// (tool progress, spinner, etc.). Deprecated: set a Sink with SetOutput
-	// instead. Kept so the existing front ends keep working during the
-	// migration; when both are set the Sink wins.
-	OnEngineOutput    func(line string)
-	PermissionPrompt  func(toolName string, input map[string]any, reason string) bool
-	OnPermissionPause func()                       // called before permission prompt to pause spinners
-	OnPermissionDone  func()                       // called after permission decision to resume
-	OnToolProgress    func(toolName, chunk string) // live output chunks from long-running tools
-	// OnToolOutputStart, if set, is called once before the first
-	// OnToolProgress chunk of a call, with the call's header (the command,
-	// the path), so a front end can title the live output: the tool's own
-	// block only arrives when the call has finished.
-	OnToolOutputStart func(toolName, header string)
-	// OnToolStart, if set, is called before each tool execution with the tool name.
-	OnToolStart func(toolName string)
+	PermissionPrompt func(toolName string, input map[string]any, reason string) bool
 	// IterationLimitPrompt, if set, is asked whether a turn may go on when it
 	// reaches its iteration cap (Reason "iterations"), its time limit
 	// ("time") or looks stuck ("stagnation", once per turn). Continue grants
@@ -186,10 +172,6 @@ type Engine struct {
 	// goroutine, some time after the turn returned. Headless and -p front
 	// ends leave it unset.
 	OnBackgroundSummary func(BackgroundSummary)
-	// OnTurnModel, if set, receives the model a new turn was routed to, when
-	// routing chooses between a fast and a main model (for a one-line
-	// "模型：…" status at the start of the turn).
-	OnTurnModel func(model string)
 	// OnSteerConsumed, if set, is called on the turn's goroutine each time
 	// the loop hands pending Steer guidance to the model, so a front end
 	// that counts inserted lines can reset its display.
@@ -228,7 +210,6 @@ type Engine struct {
 	cpMgr              *checkpoint.Manager
 	lastReviewMsgCount int                     // guarded by bgMu, with reviewRunning
 	verifyGate         *VerifyGate             // completion verification gate (P0-0, minimal EDCL)
-	verifyAttempts     int                     // how many times the gate has rejected completion this turn
 	fastOutcomes       *fastModelOutcomeWindow // recent fast-model success/failure, feeds router scoring
 	recordingEnabled   bool
 	recordingDir       string
@@ -259,9 +240,6 @@ type Engine struct {
 	// refreshGit re-reads only the git state (branch, status, log) of the
 	// current project context before each turn. Replaced in tests.
 	refreshGit func(*ctxt.ProjectContext)
-	// lastEnvGit is the git snapshot last sent to the model, so an unchanged
-	// working tree is not repeated every turn.
-	lastEnvGit string
 
 	// toolDefsVersion is an outside version that also invalidates the
 	// cached tool definitions (SetToolDefsVersion); cachedToolDefsExtra is
@@ -269,9 +247,6 @@ type Engine struct {
 	toolDefsVersion     func() int
 	cachedToolDefsExtra int
 
-	// verifyAnnounced is set once the gate's commands were shown to the
-	// user (first turn, and again after a working-directory change).
-	verifyAnnounced bool
 	// costNoticeFor is the max budget the 80% spend notice was shown for
 	// (costBudgetNotice); guarded by bgMu.
 	costNoticeFor float64
@@ -286,9 +261,6 @@ type Engine struct {
 	repoMapExcerpts int
 	// repoMapMu guards repoMapExcerpts.
 	repoMapMu sync.Mutex
-	// instrTruncNoticed: the "instruction files truncated" notice was shown
-	// this session.
-	instrTruncNoticed bool
 	// reviewRunning is set while a skill review runs (reviewMessages);
 	// guarded by bgMu.
 	reviewRunning bool
@@ -297,24 +269,14 @@ type Engine struct {
 	// ran a tool that is not read-only. Both gate reviewMessages.
 	turnsSinceReview int
 	turnUsedWork     bool
+	// conversationGen counts conversation switches (/new, /resume), so
+	// background work that outlives one does not write into the next
+	// (guarded by bgMu).
+	conversationGen int
 	// nonInteractive marks a process that exits right after its answer
 	// (cove -p, SetNonInteractive): the skill review would be abandoned
 	// at exit after its paid request, so it never starts.
 	nonInteractive bool
-
-	// interrupted records a turn that ended before completing (API error,
-	// cancel, budget, loop). Its completed tool rounds stay in history;
-	// re-sending the same message resumes it.
-	interrupted *interruption
-	// lastWrapUp is the no-tool summary the last stopped turn ended with
-	// (LastWrapUp).
-	lastWrapUp string
-	// interruptMarked: the current interruption already left its history
-	// marker (interrupt); cleared when a turn completes.
-	interruptMarked bool
-
-	// lastRoutedModel is the model the previous turn ran on (routing stickiness).
-	lastRoutedModel string
 
 	// turnFilesChanged records whether this turn wrote or edited a file, for
 	// the automatic verification gate. Guarded by fileMu.
@@ -337,11 +299,9 @@ type Engine struct {
 	// smallWindowWarned names the models whose window was found too small
 	// for automatic compaction, so the warning is shown once per model.
 	smallWindowWarned map[string]bool
-	// outsideDirHinted names the directories (lower-cased) the user was
-	// already told a tool refused to touch (noteOutsideDirectory).
-	outsideDirHinted map[string]bool
-	// smallToolsNoted: the reduced tool set for a small window was announced.
-	smallToolsNoted bool
+	// costBase is the tracker's totals when the current session started
+	// (NewSession); the session record stores only what was spent since.
+	costBase cost.Totals
 }
 
 type interruption struct {
@@ -393,7 +353,7 @@ func New(config Config) (*Engine, error) {
 	})
 
 	e := &Engine{
-		fallback:       api.NewModelFallback([]api.Provider{metered}),
+		llm:            metered,
 		provRef:        provRef,
 		collectContext: ctxt.Collect,
 		refreshGit:     (*ctxt.ProjectContext).RefreshGitAll,
@@ -410,12 +370,11 @@ func New(config Config) (*Engine, error) {
 		hookMgr:        config.HookManager,
 		classifier:     config.Classifier,
 		runtime: &tool.Runtime{
-			Tasks:         make(map[string]*tool.TaskRecord),
-			Teams:         make(map[string]*tool.TeamRecord),
-			CronSchedules: make(map[string]*tool.CronRecord),
-			Messages:      make([]tool.MessageRecord, 0),
-			SkillManager:  config.SkillManager,
-			SkillPrompts:  make(map[string]string),
+			Tasks:        make(map[string]*tool.TaskRecord),
+			Teams:        make(map[string]*tool.TeamRecord),
+			Messages:     make([]tool.MessageRecord, 0),
+			SkillManager: config.SkillManager,
+			SkillPrompts: make(map[string]string),
 		},
 		fileHistory:      make(map[string]bool),
 		turnTimeUnit:     time.Minute,
@@ -424,12 +383,6 @@ func New(config Config) (*Engine, error) {
 		replayEnabled:    replayDir != "",
 		replayDir:        replayDir,
 	}
-	// A provider the chain gives up on is a coded diagnostic (E2009) with
-	// the failure that tipped it, not just a debug log line.
-	e.fallback.SetOnUnavailable(func(provider string, fails int, cause error) {
-		diagnostic.ReportError(&api.ProviderUnavailableError{Provider: provider, Fails: fails, Cause: cause},
-			diagnostic.Context{Provider: provider, Model: e.config.Model})
-	})
 	if e.recordingEnabled {
 		if err := os.MkdirAll(e.recordingDir, 0o755); err != nil {
 			return nil, fmt.Errorf("init recording dir: %w", err)
@@ -453,7 +406,6 @@ func New(config Config) (*Engine, error) {
 	e.compressor = NewChatCompressor()
 	e.masker = NewToolOutputMasker()
 	e.safetyChecker = safety.New()
-	e.policyEngine = permission.NewPolicyEngine()
 
 	verifyCwd, _ := os.Getwd()
 	e.verifyGate = e.newVerifyGate(verifyCwd)
@@ -581,7 +533,9 @@ func (e *Engine) SetWorkingDir(dir string) {
 	e.verifyAnnounced = false
 	e.verifyGate = e.newVerifyGate(dir)
 	if e.sessionNotes != nil {
-		_ = e.sessionNotes.Flush()
+		if err := e.sessionNotes.Flush(); err != nil {
+			log.Warnf("session notes not saved: %v", err)
+		}
 	}
 	e.sessionNotes = notes.New(dir)
 	e.sessionNotes.Load()
@@ -599,31 +553,6 @@ func (e *Engine) SetWorkingDir(dir string) {
 	e.systemPrompt = ""
 }
 
-// ResumeSession continues a saved session: its messages are loaded and later
-// turns are saved under its ID. Resuming used to load the messages into a new
-// session, so every resume left a copy and the original never grew.
-func (e *Engine) ResumeSession(r *session.Record) {
-	if r == nil {
-		return
-	}
-	e.LoadMessages(r.Messages)
-	if e.store == nil {
-		return
-	}
-	if r.Cwd == "" {
-		// A session saved before sessions recorded their project joins the
-		// one it is continued in.
-		wd, _ := os.Getwd()
-		r.Cwd = session.NormalizeProjectDir(wd)
-	}
-	e.session = r
-	// The dream gate must not count the session in use as one to
-	// consolidate; it was told the ID New started with.
-	if e.dreamRunner != nil {
-		e.dreamRunner.SetCurrentSession(r.ID)
-	}
-}
-
 func (e *Engine) SetProjectContext(pc *ctxt.ProjectContext) { e.projCtx = pc }
 func (e *Engine) SetSystemOverride(prompt string)           { e.systemOverride = prompt }
 func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
@@ -634,7 +563,6 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 	}
 	if prov != nil {
 		e.provRef.Set(prov)
-		e.fallback.Reset()
 	}
 	oldModel := e.config.Model
 	e.config.Provider = cfg
@@ -657,6 +585,21 @@ func (e *Engine) ReloadProvider(provider, model, baseURL, apiKey string) error {
 	}
 	if e.session != nil {
 		e.session.Model = model
+	}
+	// Extraction, consolidation and review were given the model name once,
+	// at startup; after a switch they kept asking the new provider for it.
+	bg := e.config.ModelFast
+	if bg == "" {
+		bg = model
+	}
+	e.bgMu.Lock()
+	e.backgroundModel = bg
+	e.bgMu.Unlock()
+	if e.extractRunner != nil {
+		e.extractRunner.SetModel(bg)
+	}
+	if e.dreamRunner != nil {
+		e.dreamRunner.SetModel(bg)
 	}
 	return nil
 }
@@ -774,7 +717,7 @@ func (e *Engine) nextReplayResponse(useStream bool, onDelta func(string), onReas
 func (e *Engine) Store() *session.Store      { return e.store }
 func (e *Engine) Session() *session.Record   { return e.session }
 func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
-func (e *Engine) ProviderName() string       { return e.fallback.Current().DisplayName() }
+func (e *Engine) ProviderName() string       { return e.llm.DisplayName() }
 
 // ExplainPermissionGap says why the rules remembered for toolName do not
 // cover input, for the approval prompt; "" when there is nothing to say.
@@ -793,19 +736,30 @@ func (e *Engine) diagContext(model, tool string) diagnostic.Context {
 	if model == "" {
 		c.Model = e.config.Model
 	}
-	if e.fallback != nil {
-		c.Provider = e.fallback.Current().Name()
+	if e.llm != nil {
+		c.Provider = e.llm.Name()
 	}
 	return c
 }
-func (e *Engine) Provider() api.Provider { return e.fallback.Current() }
+func (e *Engine) Provider() api.Provider { return e.llm }
 
 // SetProvider replaces the current provider chain with a single-provider fallback.
 // Used primarily by tests to inject mock providers.
 func (e *Engine) SetProvider(p api.Provider) {
 	e.provRef.Set(p)
-	e.fallback.Reset()
 }
+
+// Permissions is the permission manager every tool call is decided by. The
+// front ends used to build a second one for display, so each mode change had
+// to be written to both (and to two more copies of the mode string).
+func (e *Engine) Permissions() *permission.Manager { return e.perm }
+
+// PermissionMode is the mode tool calls are decided in.
+func (e *Engine) PermissionMode() permission.Mode { return e.perm.Mode() }
+
+// Model is the main model the session talks to.
+func (e *Engine) Model() string { return e.config.Model }
+
 func (e *Engine) SetPermissionMode(mode permission.Mode) {
 	if permission.ValidMode(mode) {
 		e.perm.SetMode(mode)
@@ -923,19 +877,14 @@ func (e *Engine) loadPersistedPolicies(cwd string) {
 	}
 	e.diskRules = nil
 	e.policyLoadErr = nil
-	if e.policyEngine != nil {
-		e.policyEngine.LoadRules(nil)
-	}
 	if len(rules) == 0 {
 		return
 	}
 	root := permission.ProjectRoot(cwd)
-	inScope := make([]permission.PolicyRule, 0, len(rules))
 	for _, r := range rules {
 		if r.Scope != "" && !permission.SameProject(r.Scope, root) {
 			continue
 		}
-		inScope = append(inScope, r)
 		if !r.Enabled {
 			continue
 		}
@@ -954,9 +903,6 @@ func (e *Engine) loadPersistedPolicies(cwd string) {
 			e.perm.AddRule(decision, rule)
 			e.diskRules = append(e.diskRules, diskRule{decision: decision, rule: rule})
 		}
-	}
-	if e.policyEngine != nil {
-		e.policyEngine.LoadRules(inScope)
 	}
 }
 
@@ -1200,743 +1146,6 @@ func (e *Engine) drainPendingSteer() string {
 	return s
 }
 
-func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Message, onDelta func(delta string), onReasoning func(reasoning string)) (string, error) {
-	if e.costTracker.OverBudget() {
-		return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
-	}
-
-	// Re-read the git state so this turn's context note is current. Only git
-	// is refreshed: the project outline lives in the system prompt,
-	// which is deliberately not rebuilt here (see SystemPrompt), so rescanning
-	// the whole project before every message bought nothing.
-	if e.projCtx != nil && e.refreshGit != nil {
-		e.refreshGit(e.projCtx)
-	}
-
-	// Stall monitor: surfaces which stage is stuck if the run appears to hang.
-	stopMonitor := make(chan struct{})
-	go e.runStallMonitor(stopMonitor)
-	defer close(stopMonitor)
-
-	// Whatever stage the turn ends in — answered, errored, cancelled — the
-	// transient status must not outlive it, or a front end is left showing
-	// "思考中…" over an idle prompt.
-	defer e.activity("")
-
-	if userMessage.Role == "" {
-		userMessage.Role = "user"
-	}
-
-	// A turn that was interrupted is resumed when its message is sent again —
-	// the "继续" command and the automatic retry both re-send it — instead of
-	// appending the request a second time and redoing every completed step.
-	e.lastWrapUp = ""
-	resume := e.interrupted
-	e.interrupted = nil
-	resuming := resume != nil && sameRequest(resume.user, userMessage)
-	if !resuming {
-		// A new request: its own interruption, if any, leaves a new marker.
-		e.interruptMarked = false
-	}
-	if resume != nil && !resuming {
-		e.messages = append(e.messages, newSyntheticUserMsg(fmt.Sprintf(
-			"[system: 上一轮任务被中断（%s），以上是中断前已完成的操作。]", resume.reason)))
-	}
-	if resuming {
-		marker := newSyntheticUserMsg(fmt.Sprintf(
-			"[system: 上一次执行被中断（%s）。上方保留了中断前已完成的操作和结果，请从中断处继续，不要重复已完成的步骤。]", resume.reason))
-		// One marker: the third resend of the same request after the same
-		// overflow used to carry three of them, each retry a little
-		// larger than the last.
-		if n := len(e.messages); n > 0 && e.messages[n-1].Synthetic && isResumeMarker(e.messages[n-1].Content) {
-			e.messages[n-1] = marker
-		} else {
-			e.messages = append(e.messages, marker)
-		}
-	} else {
-		e.messages = append(e.messages, userMessage)
-		e.fileMu.Lock()
-		e.turnFilesChanged = false
-		e.turnCheckpointed = false
-		e.fileMu.Unlock()
-	}
-	e.saveSession()
-
-	e.announceVerifyGate()
-
-	// Cache system prompt and tool defs across iterations (stable within a run)
-	sp := e.SystemPrompt()
-	toolDefs := e.buildAPIToolDefs()
-	e.setRequestOverhead(sp, toolDefs)
-
-	// Reset loop detector at the start of each turn
-	if e.loopDetector != nil {
-		e.loopDetector.ResetTurn()
-	}
-	// The guardrail counts failures and repeats within a turn. Never reset,
-	// a tool that failed eight times anywhere in the session stayed blocked
-	// for good: each blocked call counts as one more failure.
-	if e.guardrails != nil && !resuming {
-		e.guardrails.Reset()
-	}
-	// Reset the verify-gate retry counter at the start of each turn so a
-	// prior turn's rejections don't eat into this turn's retry budget.
-	e.verifyAttempts = 0
-	// Snapshot session for change tracking this turn
-	e.sessionView = session.NewSessionView(e.messages, e.totalTokens)
-
-	// Scan user input for safety issues (injection, secrets)
-	if e.safetyChecker != nil {
-		if result := e.safetyChecker.Scan(userMessage.Content, "user_input"); result != nil {
-			if blocking := result.BlockingFinding(); blocking != nil {
-				e.engineOutput(fmt.Sprintf("  \x1b[31m! safety: %s\x1b[0m", blocking.Message))
-				// Warn but don't block -- user input is from the actual user
-				log.Warnf("safety finding in user input: %s", blocking.Message)
-			}
-		}
-	}
-
-	// Route the user message to determine which model to use
-	routedModel := e.config.Model // default fallback
-	if resuming {
-		routedModel = resume.routedModel
-	} else {
-		if e.modelRouter != nil {
-			decision := e.modelRouter.Route(ctx, userMessage.Content)
-			routedModel = decision.Model
-			if decision.Source != "override" && e.keepPremiumForFollowUp(routedModel, userMessage.Content) {
-				routedModel = e.modelRouter.DefaultModel()
-				log.Debugf("model routing: short follow-up kept on %s", routedModel)
-			}
-			log.Debugf("model routing: %s (source=%s, reason=%s)", decision.Model, decision.Source, decision.Reason)
-		}
-		if e.OnTurnModel != nil && e.modelRouter != nil && e.modelRouter.RoutedModelLabel() != "" {
-			e.OnTurnModel(routedModel)
-		}
-		// Changing state (git) and per-turn guidance travel with the turn,
-		// after the user's message, so the cached prefix stays intact.
-		note := e.turnContextNote(userMessage.Content)
-		if note != "" {
-			e.messages = append(e.messages, newSyntheticUserMsg(note))
-		}
-		e.updateTokenCount()
-		trace.Write("turn", map[string]any{"model": routedModel, "user_bytes": len(userMessage.Content), "note_bytes": len(note),
-			"messages": len(e.messages), "est_tokens": e.totalTokens, "overhead_tokens": e.requestOverhead, "window": api.ContextWindowForModel(routedModel)})
-	}
-	e.lastRoutedModel = routedModel
-
-	// compactedForLength limits the context-length recovery to one retry.
-	compactedForLength := false
-	// truncatedEmpty counts consecutive replies cut off by max_tokens with
-	// nothing in them: a reasoning model that spent the whole budget
-	// thinking answers the same way to the same request, so asking again
-	// only bills another full reply.
-	truncatedEmpty := 0
-	// The iteration cap, the time limit and the stagnation prompt are soft:
-	// an interactive front end is asked whether to go on (see
-	// IterationLimitPrompt); -p and headless runs stop.
-	limits := e.newTurnLimits()
-	for iter := 0; ; iter++ {
-		e.iterCount = iter + 1
-		// Bail out immediately if the context has been cancelled (e.g. user pressed Ctrl+C)
-		if ctx.Err() != nil {
-			// Pending steer is kept for TakePendingSteer (see Steer).
-			e.interrupt(userMessage, routedModel, "已被用户取消")
-			return "", ctx.Err()
-		}
-		// The budget is enforced between iterations, not just when a turn
-		// starts: one turn can run up to MaxIterations model calls.
-		if e.costTracker.OverBudget() {
-			e.interrupt(userMessage, routedModel, "预算已用尽")
-			return "", fmt.Errorf("budget exceeded: %s", e.costTracker.Summary())
-		}
-		if reason, err := e.checkTurnLimits(limits, iter); err != nil {
-			e.stopWithWrapUp(ctx, userMessage, routedModel, reason, onDelta)
-			return "", err
-		}
-		log.Debugf("agent iter=%d msgs=%d tokens=%d tools=%d model=%s cost=%s",
-			iter, len(e.messages), e.totalTokens, len(toolDefs), e.config.Model, e.costTracker.Summary())
-
-		// Guidance the user sent while the agent was working goes in as its own
-		// user-side message. It used to be appended to the last tool result,
-		// where any web page or file could forge the same "[用户指引]" marker.
-		if steer := e.drainPendingSteer(); steer != "" {
-			e.messages = append(e.messages, newSyntheticUserMsg("[用户指引] "+steer))
-			if e.OnSteerConsumed != nil {
-				e.OnSteerConsumed()
-			}
-		}
-
-		// Compress message history if approaching context limits. The
-		// threshold is model-aware (internal/api/model_context.go) rather
-		// than a single global constant, since mid-tier/fast models both
-		// tend to have smaller context windows and make less effective use
-		// of whatever window they do have.
-		e.checkAndCompress(ctx, routedModel)
-
-		// Apply prompt cache breakpoints for Anthropic
-		reqMessages := e.messages
-		if e.fallback.Current().Name() == "anthropic" {
-			reqMessages = api.InjectCacheBreakpoints(e.messages)
-		}
-
-		modelName := routedModel
-		if modelName == "" {
-			modelName = e.config.Model
-		}
-		req := api.ChatRequest{
-			Model:      modelName,
-			Messages:   reqMessages,
-			SystemBase: sp,
-			Tools:      toolDefs,
-			MaxTokens:  api.MaxOutputTokensForModel(modelName),
-			Thinking:   e.config.Thinking,
-			Effort:     e.config.Effort,
-		}
-		e.recordEvent(ctx, "llm_request", map[string]any{"model": modelName, "messages": len(reqMessages), "request": req})
-		callStarted := time.Now()
-
-		var resp *api.ChatResponse
-		var err error
-		useStream := onDelta != nil
-
-		// Show walking indicator while waiting for API (iter > 0; first call uses main spinner).
-		// When an external UI is rendering status lines (e.g. Bubble Tea TUI via
-		// OnEngineOutput), never print the legacy transient indicator directly to
-		// the terminal, or the two renderers will overwrite each other.
-		var walker *termui.WalkingIndicator
-		if e.shouldShowWalkingIndicator(iter) {
-			walker = termui.NewWalkingIndicator("thinking...")
-			walker.Start()
-		}
-		// A front end with a sink gets the same information as transient
-		// status, which it renders inside its own frame.
-		e.activity("思考中…")
-
-		callbacks := streamCallbacks{onDelta: onDelta, onReasoning: onReasoning}
-		if e.replayEnabled {
-			resp, err = e.nextReplayResponse(useStream, onDelta, onReasoning)
-		} else if useStream {
-			firstDelta := true
-			modelAct := e.beginActivity("call model " + modelName)
-			resp, _, err = e.fallback.TryChatStream(ctx, func(p api.Provider) api.ChatRequest { return req }, func(ev api.StreamEvent) {
-				e.progressActivity(modelAct)
-				if firstDelta && walker != nil {
-					walker.Stop()
-					walker = nil
-					firstDelta = false
-				}
-				emitStreamEvent(callbacks, ev)
-			})
-			e.endActivity(modelAct)
-		} else {
-			modelAct := e.beginActivity("call model " + modelName)
-			// A non-streaming call reports nothing until it returns; the stall
-			// monitor would call every reply longer than its threshold a hang.
-			e.pauseActivity(modelAct, true)
-			resp, _, err = e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
-			e.endActivity(modelAct)
-		}
-
-		if walker != nil {
-			walker.Stop()
-		}
-
-		if err != nil && !compactedForLength && api.IsContextLengthError(err) {
-			// The request no longer fits the model's window. Compacting the
-			// history is the remedy, so do it and retry once, instead of ending
-			// the turn and leaving the user to run /compact and resend.
-			compactedForLength = true
-			// Reported before the retry, so the E2008 remedy learns the
-			// server's window from this very error and the retry compacts to a
-			// target that fits it; reporting only the second failure meant the
-			// turn always failed once first.
-			diagnostic.ReportError(err, e.diagContext(modelName, ""))
-			before := e.totalTokens
-			target := e.totalTokens / 2
-			if fit := compactionThreshold(modelName); fit < target {
-				target = fit
-			}
-			e.compact(ctx, target)
-			how := "已压缩对话历史"
-			if e.totalTokens >= before || e.totalTokens > target {
-				// Compaction found nothing to summarise (a fresh turn, too
-				// few messages). What is over the window is then what the
-				// engine itself attached and the largest tool results:
-				// drop and cut those (window_shrink.go).
-				if e.shrinkForWindow(target) {
-					how = "已移除本轮附加上下文并裁剪大工具结果"
-				}
-			}
-			trace.Write("overflow", map[string]any{"model": modelName, "tokens_before": before, "tokens_after": e.totalTokens, "retry": e.totalTokens < before})
-			if e.totalTokens < before {
-				e.engineOutput("  上下文超出模型上限，" + how + "后重试")
-				continue
-			}
-			// Nothing left to trim: the fixed part of the request (system
-			// prompt, tool definitions) is what does not fit. Say so, or the
-			// failure line alone reads like a transient API error.
-			e.engineOutput("  上下文超出模型上限，且对话历史已无法再压缩")
-		}
-		if err != nil {
-			e.recordEvent(ctx, "llm_error", map[string]any{"error": err.Error()})
-			trace.Write("model", map[string]any{"model": modelName, "messages": len(reqMessages), "est_tokens": e.totalTokens,
-				"ms": time.Since(callStarted).Milliseconds(), "error": textutil.ClipRunes(err.Error(), 160), "error_kind": api.Classify(err).String(), "cancelled": ctx.Err() != nil})
-			// Classified and recorded with its code (and remedied when the
-			// diagnostic layer can), so /diagnose errors shows one line with
-			// a hint instead of the raw text; the code is quoted in the
-			// interruption reason the user sees.
-			reason := "模型调用失败: " + textutil.ClipRunes(err.Error(), 120)
-			if ctx.Err() == nil {
-				// A cancelled call is the user's doing, not a problem to record.
-				// An overflow was already reported before the compact-and-retry;
-				// the retry's failure is the same problem, quoted, not recorded.
-				code, _ := diagnostic.Classify(err, diagnostic.Context{})
-				if !(compactedForLength && code == diagnostic.ErrAPIContextLength) {
-					ev := diagnostic.ReportError(err, e.diagContext(modelName, ""))
-					code = ev.Code
-				}
-				if code != "" {
-					reason += " [" + string(code) + "]"
-				}
-			}
-			// Keep the completed tool rounds: their side effects already
-			// happened, and re-sending this message resumes from here.
-			e.interrupt(userMessage, routedModel, reason)
-			return "", fmt.Errorf("api: %w", err)
-		}
-
-		// The provider's prompt size is the real context size; later counts
-		// build on it (see token_count.go).
-		e.recordUsage(resp.InputTokens, len(reqMessages))
-
-		// Live calls are billed by the metered provider (see New). Replayed
-		// responses never reach a provider, so they are billed here.
-		if e.replayEnabled {
-			billedModel := resp.Model
-			if billedModel == "" {
-				billedModel = modelName
-			}
-			e.costTracker.AddWithCacheWrite(billedModel, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens, resp.PromptCacheWriteTokens)
-		}
-		e.costBudgetNotice()
-
-		// Update rate limit tracking
-		if e.rateLimits != nil && resp.RateLimitHeaders != nil {
-			e.rateLimits.Update(resp.RateLimitHeaders)
-		}
-
-		e.recordEvent(ctx, "llm_response", map[string]any{"model": modelName, "content_len": len(resp.Content), "tool_calls": len(resp.ToolCalls), "stop_reason": resp.StopReason, "response": resp})
-		trace.Write("model", map[string]any{"model": modelName, "messages": len(reqMessages), "est_tokens": e.totalTokens,
-			"ms": time.Since(callStarted).Milliseconds(), "stop": resp.StopReason, "in": resp.InputTokens, "out": resp.OutputTokens,
-			"content_bytes": len(resp.Content), "tool_calls": len(resp.ToolCalls)})
-		log.Debugf("agent text=%d tools=%d in=%d out=%d stop=%s",
-			len(resp.Content), len(resp.ToolCalls), resp.InputTokens, resp.OutputTokens, resp.StopReason)
-
-		// If response was truncated and no complete tool calls survived, ask model to continue
-		if (resp.StopReason == "max_tokens" || resp.StopReason == "length") && !hasToolCalls(resp) {
-			if resp.Content != "" || len(resp.ThinkingBlocks) > 0 {
-				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ThinkingBlocks: resp.ThinkingBlocks})
-				truncatedEmpty = 0
-			} else {
-				truncatedEmpty++
-				if truncatedEmpty >= maxEmptyTruncations {
-					reason := fmt.Sprintf("回复连续 %d 次被输出上限截断且没有内容（推理可能耗尽了 max_tokens）；请调大模型的输出上限或上下文，或换一个模型", truncatedEmpty)
-					e.engineOutput("  \x1b[33m" + reason + "\x1b[0m")
-					e.interrupt(userMessage, routedModel, reason)
-					return "", fmt.Errorf("%s", reason)
-				}
-			}
-			e.messages = append(e.messages, newSyntheticUserMsg("[system: your previous response was truncated due to length. Please continue, writing one file at a time.]"))
-			continue
-		}
-
-		if !hasToolCalls(resp) {
-			// Post-stop self-checks (nudges.go): an empty reply, an announced
-			// but untaken next step, a degenerate ending, the one-time done
-			// check. Each is capped per turn; past the cap the reply stands.
-			if nudge, keep := e.stopNudge(ctx, limits, iter, resp, routedModel); nudge != "" {
-				if keep {
-					e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
-				}
-				e.emitSeparator(onDelta, nudge == nudgeDoneCheckText)
-				e.messages = append(e.messages, newSyntheticUserMsg(nudge))
-				continue
-			}
-			// Completion verification gate (minimal EDCL "done contract"): if
-			// the user configured done_verify_commands, don't accept the
-			// model's self-reported "done" (no more tool calls) until those
-			// commands actually pass. This matters far more for mid-tier
-			// models than top-tier ones, since "I'm done" self-reports are
-			// exactly the kind of claim they get wrong more often  - this
-			// turns that claim into something checked instead of trusted.
-			gaveUpUnresolved := false
-			if e.verifyGate.Enabled() && (!e.verifyGate.onlyWhenFilesChanged || e.filesChangedThisTurn()) {
-				results, passed := e.verifyGate.Run(ctx, limits.verifyPassed)
-				if !passed && TimedOut(results) {
-					// Too slow to tell: not the model's failure. No retry,
-					// no escalation; the turn ends normally.
-					e.engineOutput("  \x1b[2m" + Summary(results) + "\x1b[0m")
-				} else if !passed {
-					if e.verifyAttempts < e.verifyGate.MaxRetries() {
-						e.verifyAttempts++
-						e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
-						e.engineOutput(fmt.Sprintf("  \x1b[33m! verify_gate rejected completion (attempt %d/%d)\x1b[0m", e.verifyAttempts, e.verifyGate.MaxRetries()))
-						e.messages = append(e.messages, newSyntheticUserMsg(Summary(results)))
-						routedModel = e.escalate(routedModel, "完成校验未通过")
-						e.emitSeparator(onDelta, false)
-						continue
-					}
-					e.engineOutput("  \x1b[31m! verify_gate: still failing after max retries, returning control to user\x1b[0m")
-					gaveUpUnresolved = true
-				}
-			}
-			// Feed the router's failure-rate signal (api.FailureRateSignal):
-			// a clean pass/no-gate counts as success, exhausting verify
-			// retries counts as failure, for whichever model this turn used.
-			if isFastModelName(routedModel) {
-				e.fastOutcomes.Record(gaveUpUnresolved)
-			}
-
-			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
-			e.saveSession()
-			e.interruptMarked = false
-			e.turnUsedWork = limits.usedTools
-			// Turn-end pipeline (all run in background)
-			e.runTurnEndPipeline()
-			// Auto-track decisions and discoveries
-			e.recordSignals(userMessage.Content, resp.Content)
-			return resp.Content, nil
-		}
-
-		assistantMsg := assistantMessageFromResponse(resp)
-		e.messages = append(e.messages, assistantMsg)
-
-		// Safety net: warn before the hard iteration cap, so the user knows the
-		// agent is about to stop for a reason other than task completion.
-		// Only when the cap is hard: an interactive front end asks at the cap.
-		if e.IterationLimitPrompt == nil && limits.iterWindow > 0 && e.iterCount >= limits.iterCap-5 {
-			e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, limits.iterCap))
-		}
-
-		// Loop detection (enhanced 3-layer, P0-1).
-		// Layer 1a: exact tool-call fingerprint in sliding window (14/10 for non-fast, 12/8 for fast).
-		// Layer 1b: fuzzy tool+param pattern in sliding window (12/9 for non-fast, 10/7 for fast).
-		// Layer 2: output content hash in sliding window (40/8 for non-fast, 30/8 for fast).
-		// Layer 3: stagnation detection after N iterations without file activity.
-		loopFp := e.fingerprintToolCalls(resp.ToolCalls)
-		if e.loopDetector != nil {
-			if lr := e.loopDetector.RecordToolCalls(loopFp); lr.Detected {
-				log.Warnf("loop detected (layer %d): %s", lr.Layer, lr.Reason)
-				if lr.Fatal {
-					e.engineOutput("? " + lr.Reason)
-					e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环", onDelta)
-					return "", fmt.Errorf("loop detection: %s", lr.Reason)
-				}
-				switch e.onLoopHit(limits, iter+1, lr) {
-				case loopHitStop:
-					e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
-					e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
-					return "", errLoopStopped
-				case loopHitGuide:
-					// This batch is not going to run, so every tool_use in the
-					// assistant message above still needs a tool_result before the
-					// guidance can be appended — see syntheticToolResults.
-					e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
-					// Non-fatal: inject guidance asking the model to change approach
-					e.messages = append(e.messages, newSyntheticUserMsg(injectLoopGuidance(lr.Reason)))
-					// Reset fingerprint history so the model gets a fresh start
-					// after seeing the guidance, preventing old history from
-					// immediately triggering another detection.
-					e.loopDetector.ResetFingerprintHistory()
-					// Skip executing this repeated tool-call batch; ask the model
-					// to pick a new strategy on the next iteration.
-					continue
-				}
-				// loopHitIgnore: the user chose to go on; the batch runs.
-			}
-		} else {
-			// Fallback: simple loop detection (kept for backward compatibility)
-			e.loopHistory = append(e.loopHistory, loopFp)
-			if len(e.loopHistory) > 10 {
-				e.loopHistory = e.loopHistory[1:]
-			}
-			if loopFp != "" && e.countRecent(loopFp, 5) >= 3 {
-				log.Warnf("loop detected: %s", loopFp)
-				// Close out the pending tool calls first, then inject guidance,
-				// then skip the batch. Appending the user message inline and
-				// falling through produced assistant(tool_use) → user → tool,
-				// which the provider rejects with a 400.
-				e.messages = append(e.messages, syntheticToolResults(resp.ToolCalls, loopAbortToolNote)...)
-				e.messages = append(e.messages, newSyntheticUserMsg("[system: 检测到重复循环 - 模型连续多次调用相同的工具和参数。请尝试完全不同的方法，如果卡住了可以向用户寻求帮助。]"))
-				e.loopHistory = nil // reset after injecting guidance
-				continue
-			}
-		}
-
-		// Input and Elapsed exist so the result can be turned into a
-		// render.Block after the batch drains rather than at the call site.
-		// Emitting from inside the parallel branch would interleave headers and
-		// summaries of concurrent calls unpredictably; the loop below keeps the
-		// transcript in tool-call order regardless of completion order.
-		type toolResult struct {
-			ID      string
-			Name    string
-			Input   map[string]any
-			Content string
-			Elapsed time.Duration
-		}
-		results := make([]toolResult, len(resp.ToolCalls))
-
-		e.checkpointBefore(resp.ToolCalls)
-		ctx := withCheckpointed(ctx)
-
-		if len(resp.ToolCalls) > 1 {
-			// Partition tool calls into concurrent-safe and serial groups.
-			// Additionally, write/edit calls targeting different files can run in parallel.
-			var wg sync.WaitGroup
-			// claimedWritePaths holds the file paths already spoken for by a
-			// write or edit earlier in this batch. The first call to a path may
-			// be parallelized; a later call to the same path may not, and has to
-			// wait for the batch to drain.
-			claimedWritePaths := make(map[string]bool)
-			// deferred holds same-file duplicates. They run once nothing else
-			// is in flight: at the next serial call (before it, since it may
-			// depend on them) or after the batch.
-			var deferred []int
-			runDeferred := func() {
-				for _, i := range deferred {
-					tc := resp.ToolCalls[i]
-					if e.OnToolStart != nil {
-						e.OnToolStart(tc.Name)
-					}
-					started := time.Now()
-					res := e.runToolRecovered(ctx, tc)
-					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
-				}
-				deferred = nil
-			}
-			// Bound concurrency so a single response with many tool calls cannot
-			// spawn an unbounded number of goroutines.
-			sem := make(chan struct{}, maxParallelTools)
-
-			for i, tc := range resp.ToolCalls {
-				t, _ := e.registry.Find(tc.Name)
-				safe := t != nil && t.Def().IsConcurrencySafe
-
-				// write/edit to distinct files can also be parallelized.
-				// The path must be read through toolTargetPath, which honors
-				// every key alias the tools themselves accept (file_path, path,
-				// filepath, file) and normalizes the spelling. Looking only at
-				// "filePath" meant a call using an alias reported no path at
-				// all, fell through as non-parallelizable, and — worse — never
-				// claimed its path, so a sibling call to the same file was not
-				// serialized against it.
-				if !safe && (tc.Name == "write" || tc.Name == "edit") {
-					if fp := toolTargetPath(tc.Input); fp != "" {
-						if claimedWritePaths[fp] {
-							deferred = append(deferred, i)
-							continue
-						}
-						claimedWritePaths[fp] = true
-						safe = true // first call to this path, safe to parallelize
-					}
-				}
-
-				if safe {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(idx int, tcall api.ToolCall) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						started := time.Now()
-						defer func() {
-							if r := recover(); r != nil {
-								results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Input: tcall.Input, Content: fmt.Sprintf("Error: tool panicked: %v", r), Elapsed: time.Since(started)}
-							}
-						}()
-						if e.OnToolStart != nil {
-							e.OnToolStart(tcall.Name)
-						}
-						res := e.executeTool(ctx, tcall)
-						results[idx] = toolResult{ID: tcall.ID, Name: tcall.Name, Input: tcall.Input, Content: res, Elapsed: time.Since(started)}
-					}(i, tc)
-				} else {
-					// A serial call is a barrier: everything before it
-					// finishes first, and nothing after it starts until it
-					// is done. Running it inline without waiting overlapped
-					// it with the goroutines already started ([read(slow),
-					// bash] ran bash during the read); running it after the
-					// whole parallel group reordered side effects ([bash
-					// "mkdir d", write d/f] wrote before the mkdir). Same-file
-					// duplicates held back so far run before it too, and paths
-					// claimed before the barrier are free again after it.
-					wg.Wait()
-					runDeferred()
-					claimedWritePaths = make(map[string]bool)
-					if e.OnToolStart != nil {
-						e.OnToolStart(tc.Name)
-					}
-					started := time.Now()
-					res := e.runToolRecovered(ctx, tc)
-					results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
-				}
-			}
-			wg.Wait()
-
-			// Same-file duplicates since the last serial call run only now,
-			// once nothing else is in flight, so they cannot overlap the first
-			// write to their path.
-			runDeferred()
-		} else {
-			for i, tc := range resp.ToolCalls {
-				if !e.config.Debug {
-					// Transient "running X…" notice. It is Activity, not history:
-					// the previous code wrote it as a diagnostic line prefixed
-					// with a bare CR, expecting the terminal to overwrite it a
-					// moment later. That only works when nothing else writes in
-					// between, and it is precisely the kind of cursor-steering
-					// byte a front end with a live region must never receive.
-					e.activity(fmt.Sprintf("执行 %s…", tc.Name))
-				}
-				if e.OnToolStart != nil {
-					e.OnToolStart(tc.Name)
-				}
-				started := time.Now()
-				res := e.runToolRecovered(ctx, tc)
-				results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Elapsed: time.Since(started)}
-			}
-		}
-
-		// Layer-2 guidance is collected here and appended only after every
-		// tool_result has been emitted. Appending it from inside the loop split
-		// the tool_result run (assistant → tool → user → tool), which the
-		// provider rejects for the same reason as the Layer-1 case above.
-		var pendingLoopGuidance string
-		// loopStopped: the user stopped the turn at the loop prompt (Layer 2).
-		loopStopped := false
-
-		for _, r := range results {
-			limits.addStep(r.Name)
-			e.noteVerifyEvidence(limits, r.Name, r.Input, r.Content)
-			isErr := strings.HasPrefix(r.Content, "Error:")
-			if !e.config.Debug {
-				e.activity("")
-				e.emitToolResult(r.Name, r.Input, r.Content, isErr, r.Elapsed)
-			}
-			// Unparsable arguments were already recorded as E4009 when the
-			// call was dispatched; a second, uncoded line would show the
-			// same failure twice in /diagnose errors.
-			if _, parseErr := r.Input["_cove_parse_error"]; isErr && !parseErr {
-				diagnostic.RecordRuntime(diagnostic.SevWarning, diagnostic.CatTool,
-					fmt.Sprintf("工具 %s 失败: %s", r.Name, summarizeResult(r.Content)))
-			}
-			if isErr {
-				e.noteOutsideDirectory(r.Content)
-			}
-			toolTrace := map[string]any{"name": r.Name, "ms": r.Elapsed.Milliseconds(), "result_bytes": len(r.Content), "error": isErr}
-			if isErr {
-				toolTrace["head"] = textutil.ClipRunes(r.Content, 160)
-			}
-			trace.Write("tool", toolTrace)
-			e.messages = append(e.messages, api.Message{
-				Role: "tool", ToolCallID: r.ID, Name: r.Name,
-				// Cut to what the window can afford; the screen got it in full.
-				Content: capToolResult(routedModel, r.Name, r.Content),
-			})
-			// Feed loop detector with tool output (Layer 2: content hash)
-			if e.loopDetector != nil && !isErr && !loopStopped {
-				if lr := e.loopDetector.RecordOutput(r.Content); lr.Detected {
-					log.Warnf("loop detected (layer 2): %s", lr.Reason)
-					if lr.Fatal {
-						e.engineOutput("? " + lr.Reason)
-						e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环", onDelta)
-						return "", fmt.Errorf("loop detection: %s", lr.Reason)
-					}
-					switch e.onLoopHit(limits, iter+1, lr) {
-					case loopHitStop:
-						// The rest of the batch already ran: its results go in
-						// first, then the turn stops.
-						loopStopped = true
-					case loopHitGuide:
-						// Non-fatal: queue guidance asking the model to change
-						// approach; appended once the tool_result run is complete.
-						if pendingLoopGuidance == "" {
-							pendingLoopGuidance = injectLoopGuidance(lr.Reason)
-						}
-						// Reset fingerprint history so the model gets a fresh start
-						e.loopDetector.ResetFingerprintHistory()
-					}
-				}
-			}
-		}
-
-		if loopStopped {
-			e.stopWithWrapUp(ctx, userMessage, routedModel, "检测到操作循环，用户选择停止", onDelta)
-			return "", errLoopStopped
-		}
-		if n := e.budgetNotice(limits, iter+1); n != "" {
-			if last := len(e.messages) - 1; last >= 0 && e.messages[last].Role == "tool" {
-				// Once per window, on the latest tool result: tell the
-				// model how much of the window is left (budgetNotice).
-				e.messages[last].Content += "\n\n" + n
-			}
-		}
-		if pendingLoopGuidance != "" {
-			e.messages = append(e.messages, newSyntheticUserMsg(pendingLoopGuidance))
-		}
-
-		// Circuit breaker: if tools keep failing, hint the model to change approach
-		allFailed := true
-		for _, r := range results {
-			if !strings.HasPrefix(r.Content, "Error:") {
-				allFailed = false
-				break
-			}
-		}
-		if allFailed && len(results) > 0 {
-			e.consecutiveErrors++
-			if e.consecutiveErrors >= 3 {
-				e.messages = append(e.messages, api.Message{
-					Role:    "user",
-					Content: "[system: The last 3+ tool calls all failed. Please try a different approach or ask the user for clarification. Do not repeat the same failing pattern.]",
-				})
-				e.consecutiveErrors = 0
-				// Feed the router's failure-rate signal: this turn visibly
-				// struggled on the currently-routed model.
-				if isFastModelName(routedModel) {
-					e.fastOutcomes.Record(true)
-				}
-				// And act on it now rather than only on later turns.
-				routedModel = e.escalate(routedModel, "连续工具调用失败")
-			}
-		} else {
-			e.consecutiveErrors = 0
-		}
-		e.updateTokenCount()
-		// Compression is handled by checkAndCompress at iteration start (line ~465).
-		// Record iteration for stagnation detection (Layer 3).
-		// L3 never aborts on its own -- no file activity doesn't mean the
-		// model is stuck (research, reading, search are legitimate non-file
-		// workflows). An interactive front end is asked once per turn; -p
-		// and headless runs only log it.
-		if e.loopDetector != nil {
-			if lr := e.loopDetector.RecordIteration(); lr.Detected {
-				log.Warnf("stagnation (layer 3): %s", lr.Reason)
-				if e.IterationLimitPrompt != nil && !limits.stagnation {
-					limits.stagnation = true
-					if e.askLimit(e.limitStats(limits, iter+1, LimitReasonStagnation, 0)) != LimitContinue {
-						e.stopWithWrapUp(ctx, userMessage, routedModel, "疑似停滞，用户选择停止", onDelta)
-						return "", errStagnationStopped
-					}
-				} else {
-					e.debugOutput("  \x1b[2m(note) " + lr.Reason + "\x1b[0m")
-				}
-			}
-		}
-	}
-}
-
 // shouldShowWalkingIndicator reports whether the engine may draw the legacy
 // in-terminal spinner itself.
 //
@@ -1950,24 +1159,30 @@ func (e *Engine) shouldShowWalkingIndicator(iter int) bool {
 	if iter <= 0 || e.config.Debug {
 		return false
 	}
-	return e.OnEngineOutput == nil && e.out == nil
+	return e.output() == nil
 }
 
 // runToolRecovered is executeTool for the calls the turn runs on its own
 // goroutine (a single call, a serial barrier call, a deferred same-file
 // write). A panicking tool becomes that call's error result, as it already
 // did on the parallel path; before, it took the whole process down.
-func (e *Engine) runToolRecovered(ctx context.Context, tc api.ToolCall) (out string) {
+func (e *Engine) runToolRecovered(ctx context.Context, tc api.ToolCall) (out string, failed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Warnf("tool %s panicked: %v", tc.Name, r)
 			out = fmt.Sprintf("Error: tool panicked: %v", r)
+			failed = true
 		}
 	}()
 	return e.executeTool(ctx, tc)
 }
 
-func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string) {
+// executeTool runs one tool call through the pipeline and returns what the
+// model is shown, and whether the call failed: an error, a denial, a block,
+// invalid input. The flag is set where the failure happens; callers used to
+// tell a failure by an "Error:" or "BLOCKED" prefix, which a guardrail note
+// or any wrapper in front of the text silently defeated.
+func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput string, failed bool) {
 	// If the provider layer could not parse this call's arguments as JSON
 	// even after best-effort repair (internal/api/tool_repair.go), don't
 	// dispatch garbage input to the real tool. Return a normal "Error: ..."
@@ -1981,21 +1196,28 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 			msg = "tool call arguments could not be parsed as JSON"
 		}
 		diagnostic.ReportError(&api.ToolArgsInvalidError{Tool: tc.Name}, e.diagContext("", tc.Name))
-		return fmt.Sprintf("Error: %s. Please resend this tool call with valid JSON arguments (check quote escaping, and avoid truncating long string fields).", msg)
+		return fmt.Sprintf("Error: %s. Please resend this tool call with valid JSON arguments (check quote escaping, and avoid truncating long string fields).", msg), true
 	}
 
 	t, ok := e.registry.Find(tc.Name)
 	if !ok {
-		return fmt.Sprintf("Error: unknown tool %q", tc.Name)
+		return fmt.Sprintf("Error: unknown tool %q", tc.Name), true
 	}
+	// An alias ("Write", "PowerShell") finds the tool, but every later layer
+	// compares names its own way: permission rules exactly, the safety scan
+	// by the lower-case shell names. A deny or ask rule on "write" did not
+	// apply to "Write", and "PowerShell" skipped the dangerous-command scan.
+	tc.Name = t.Def().Name
 
 	// Run safety checks before executing the tool
+	var safetyWarnings []safety.Finding
 	if e.safetyChecker != nil {
 		result := e.safetyChecker.ScanToolCall(tc.Name, tc.Input)
 		if blocking := result.BlockingFinding(); blocking != nil {
 			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", blocking.Message))
-			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message)
+			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message), true
 		}
+		safetyWarnings = result.Warnings()
 	}
 
 	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
@@ -2018,7 +1240,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 				msg = "blocked by pre-tool-use hook"
 			}
 			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", msg))
-			return fmt.Sprintf("BLOCKED by hook: %s", msg)
+			return fmt.Sprintf("BLOCKED by hook: %s", msg), true
 		}
 	}
 	// Guardrail check before execution. guardrailWarning, if set, is spliced
@@ -2042,15 +1264,19 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		decision := e.guardrails.BeforeCall(tc.Name, tc.Input)
 		switch decision.Action {
 		case guardrail.Block:
-			return fmt.Sprintf("Error: %s", decision.Message)
+			return fmt.Sprintf("Error: %s", decision.Message), true
 		case guardrail.Warn:
 			guardrailWarning = decision.Message
 			log.Debugf("guardrail warn: %s %s", tc.Name, decision.Message)
 		}
 	}
 	if guardrailWarning != "" {
+		// Appended, not prepended: the turn loop tells a failed call by its
+		// "Error:" prefix. Guardrail warns only after repeated failures, so a
+		// prepended note turned exactly those failures into "successes" —
+		// shown as OK and resetting the consecutive-error breaker.
 		defer func() {
-			toolOutput = fmt.Sprintf("[guardrail: %s]\n%s", guardrailWarning, toolOutput)
+			toolOutput = fmt.Sprintf("%s\n[guardrail: %s]", toolOutput, guardrailWarning)
 		}()
 	}
 
@@ -2064,7 +1290,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	tctx := tool.Context{
 		Cwd:              cwd,
 		ToolUseID:        tc.ID,
-		PermissionMode:   toolPermissionMode(e.perm.Mode(), tc.Name, tc.Input, cwd),
+		PermissionMode:   toolPermissionMode(e.effectiveMode(), tc.Name, tc.Input, cwd),
 		IsNonInteractive: e.runtime == nil || e.runtime.AskUser == nil,
 		Debug:            e.config.Debug,
 		Runtime:          e.runtime,
@@ -2077,12 +1303,12 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 			e.progressActivity(toolAct)
 			if !outputStarted {
 				outputStarted = true
-				if e.OnToolOutputStart != nil {
-					e.OnToolOutputStart(tc.Name, toolHeaderFor(tc.Name, tc.Input))
+				if h := e.turnHooks(); h.ToolOutputStart != nil {
+					h.ToolOutputStart(tc.Name, toolHeaderFor(tc.Name, tc.Input))
 				}
 			}
-			if e.OnToolProgress != nil {
-				e.OnToolProgress(tc.Name, chunk)
+			if h := e.turnHooks(); h.ToolProgress != nil {
+				h.ToolProgress(tc.Name, chunk)
 			}
 		},
 	}
@@ -2090,14 +1316,14 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if e.classifier != nil && permission.IsShellTool(tc.Name) {
 		cmd, _ := tc.Input["command"].(string)
 		if e.classifier.ClassifyLine(cmd) == permission.CatDangerous {
-			return fmt.Sprintf("Error: dangerous command blocked: %s", cmd)
+			return fmt.Sprintf("Error: dangerous command blocked: %s", cmd), true
 		}
 		// Mode tiers for shell lines: default runs read-only lines unasked,
 		// auto additionally runs build/test lines. "auto" in tctx is the
 		// engine's pre-approval; deny and ask rules are still applied by
 		// authorizeToolCall.
 		kind := e.perm.ShellKindFor(tc.Name)
-		switch e.perm.Mode() {
+		switch e.effectiveMode() { // plan pre-approves nothing: a build line writes
 		case permission.Default:
 			if e.classifier.IsReadOnlyLineFor(cmd, kind) {
 				tctx.PermissionMode = "auto"
@@ -2112,11 +1338,18 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	}
 
 	if errMsg := t.Validate(tc.Input); errMsg != "" {
-		return fmt.Sprintf("Error: invalid %s input: %s", tc.Name, errMsg)
+		return fmt.Sprintf("Error: invalid %s input: %s", tc.Name, errMsg), true
 	}
 
 	if err := e.authorizeToolCall(tc, tctx, func(waiting bool) { e.pauseActivity(toolAct, waiting) }); err != nil {
-		return "Error: " + err.Error()
+		return "Error: " + err.Error(), true
+	}
+	// Warning-level findings (git push --force, git reset --hard) do not stop
+	// a call; they are shown once the call is really going to run. They used
+	// to be computed and dropped, so in auto or bypass mode such a command
+	// ran without a word.
+	for _, w := range safetyWarnings {
+		e.engineOutput(fmt.Sprintf("  \x1b[33m! %s\x1b[0m", w.Message))
 	}
 
 	result, err := t.Call(ctx, tc.Input, tctx)
@@ -2129,13 +1362,13 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 				if e.guardrails != nil {
 					e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
 				}
-				return token.TruncateKeepTail(fmt.Sprintf("Error (after retry): %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
+				return token.TruncateKeepTail(fmt.Sprintf("Error (after retry): %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines), true
 			}
 		} else {
 			if e.guardrails != nil {
 				e.guardrails.AfterCall(tc.Name, tc.Input, err.Error(), true)
 			}
-			return token.TruncateKeepTail(fmt.Sprintf("Error: %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
+			return token.TruncateKeepTail(fmt.Sprintf("Error: %v", err), toolOutputLimit(tc.Name, e.currentModel()), errorTailLines), true
 		}
 	}
 	if !result.IsError {
@@ -2174,7 +1407,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 			output = token.TruncateToTokens(output, limit)
 		}
 		defer func() {
-			if readMarker != "" && !strings.HasPrefix(toolOutput, "Error") {
+			if readMarker != "" && !failed {
 				toolOutput += "\n" + readMarker
 			}
 		}()
@@ -2187,8 +1420,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		output += e.toolContextHints(tc)
 	}
 	if result.IsError {
-		// The engine recognises failures by this prefix (circuit breaker,
-		// router failure signal, is_error on the wire).
+		// The prefix is for the model; the engine reads the returned flag.
 		out := result.Data
 		if !strings.HasPrefix(out, "Error") {
 			out = "Error: " + out
@@ -2196,9 +1428,9 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		// A failing tool can print as much as a succeeding one (a compiler
 		// listing thousands of errors); keep the first line and the last
 		// few, where the outcome is.
-		return token.TruncateKeepTail(out, toolOutputLimit(tc.Name, e.currentModel()), errorTailLines)
+		return token.TruncateKeepTail(out, toolOutputLimit(tc.Name, e.currentModel()), errorTailLines), true
 	}
-	return output
+	return output, false
 }
 
 // errorTailLines is how many closing lines of a truncated error result are
@@ -2270,8 +1502,29 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 	if !ok {
 		return fmt.Errorf("unknown tool %q", tc.Name)
 	}
+	tc.Name = t.Def().Name // rules are written against the canonical name
 
+	// One decision chain, in the order the manual documents:
+	//  1. the tool's own refusal (plan-mode writes, private URLs): final,
+	//     no rule or mode overrides it — an "always allow webfetch" used to;
+	//  2. plan mode (planModeGate);
+	//  3. e.perm.Check: deny rules → plan → bypass → ask/allow rules by
+	//     priority → the mode's default. Every policies.json rule lives in
+	//     e.perm; a second evaluator consulted before and after it, with its
+	//     own precedence, is gone.
 	toolDecision := t.CheckPermissions(tc.Input, tctx)
+	if toolDecision.Decision == tool.Deny {
+		reason := toolDecision.Reason
+		if reason == "" {
+			reason = "refused by the tool"
+		}
+		return permissionDenied(tc.Name, reason)
+	}
+	if e.effectiveMode() == permission.Plan {
+		if err := e.planModeGate(t.Def(), toolDecision); err != nil {
+			return err
+		}
+	}
 	defaultDecision := mapToolDecision(toolDecision.Decision)
 	// tctx "auto" is the engine's own pre-approval (a read-only shell line, a
 	// build line in auto mode, an in-project write/edit in auto mode). Tools
@@ -2281,38 +1534,25 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 		defaultDecision = permission.DAllow
 	}
 	decision, reason := e.perm.Check(tc.Name, tc.Input, defaultDecision)
-	if decision == permission.DAllow && e.policyEngine != nil &&
-		e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode) == permission.ActionDeny {
-		// A deny rule in policies.json still wins over the mode tiers'
-		// automatic allowance (read-only / build lines, in-project writes).
-		return policyDenied(tc.Name)
-	}
-	if decision == permission.DAllow || decision == permission.DBypass {
+	switch decision {
+	case permission.DAllow, permission.DBypass:
 		return nil
+	case permission.DAsk:
+		// prompt below
+	default:
+		if reason == permission.ReasonDenyRule {
+			return policyDenied(tc.Name)
+		}
+		if reason == "" {
+			reason = "permission denied"
+		}
+		return permissionDenied(tc.Name, reason)
 	}
 	if reason == "" {
 		reason = toolDecision.Reason
 	}
 	if reason == "" {
 		reason = "permission denied"
-	}
-	if decision != permission.DAsk {
-		return permissionDenied(tc.Name, reason)
-	}
-
-	// Policy engine override: check rules before interactive prompt. When an
-	// ask rule in e.perm asked (reason ReasonAskRule), a policies.json allow
-	// must not silence it; only a deny may still change the outcome.
-	if e.policyEngine != nil {
-		askedByRule := reason == permission.ReasonAskRule
-		switch e.policyEngine.Evaluate(tc.Name, tc.Input, e.config.PermissionMode) {
-		case permission.ActionAllow:
-			if !askedByRule {
-				return nil // skip interactive prompt
-			}
-		case permission.ActionDeny:
-			return policyDenied(tc.Name)
-		}
 	}
 
 	if e.PermissionPrompt == nil {
@@ -2322,21 +1562,25 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 			"permission denied for %s: no interactive approval handler is installed (reason: %s); run /mode bypass or add an allow rule.",
 			tc.Name, reason)}
 	}
-	if e.OnPermissionPause != nil {
-		e.OnPermissionPause()
+	// Pause, prompt and resume under one lock: with the resume outside it, a
+	// parallel call's prompt finishing restarted the spinner over a prompt
+	// that was still open.
+	e.promptMu.Lock()
+	hooks := e.turnHooks()
+	if hooks.PermissionPause != nil {
+		hooks.PermissionPause()
 	}
 	if setWaiting != nil {
 		setWaiting(true)
 	}
-	e.promptMu.Lock()
 	approved := e.PermissionPrompt(tc.Name, tc.Input, reason)
-	e.promptMu.Unlock()
 	if setWaiting != nil {
 		setWaiting(false)
 	}
-	if e.OnPermissionDone != nil {
-		e.OnPermissionDone()
+	if hooks.PermissionDone != nil {
+		hooks.PermissionDone()
 	}
+	e.promptMu.Unlock()
 	if !approved {
 		return permissionDenied(tc.Name, "user rejected")
 	}
@@ -2346,6 +1590,40 @@ func (e *Engine) authorizeToolCall(tc api.ToolCall, tctx tool.Context, setWaitin
 // permissionDenied is the error of a denied call. The model reads it as the
 // tool result ("Error: " + text), so it says what to do next: a weaker model
 // otherwise retries the denied call with the same input.
+// effectiveMode is the mode a tool call is decided in: plan while the model
+// is in plan mode (the plan_mode tool), whatever the user's mode. The flag
+// plan_mode set was read by nothing, so "Plan mode active. Read-only
+// operations only." restricted nothing.
+func (e *Engine) effectiveMode() permission.Mode {
+	if e.runtime != nil && e.runtime.IsPlanMode() {
+		return permission.Plan
+	}
+	return e.perm.Mode()
+}
+
+// planModeGate decides what plan mode allows, in one place and from what a
+// tool declares: read-only tools, PlanSafe tools, and a shell line the shell
+// tool itself judged read-only. Every other call is refused whatever the
+// tool's CheckPermissions answered; plan mode used to depend on each tool
+// remembering to refuse, so any tool answering Allowed ran in it.
+//
+// exit_plan_mode is the way out of the model's own plan mode and asks the
+// user as usual; plan mode the user set (/mode plan) only the user leaves.
+func (e *Engine) planModeGate(d tool.Def, toolDecision tool.PermissionDecision) error {
+	switch {
+	case d.Name == "exit_plan_mode":
+		if e.perm.Mode() == permission.Plan {
+			return &deniedError{text: "plan mode was set by the user (/mode plan) and only they can leave it: finish the plan and ask them to switch the mode."}
+		}
+		return nil
+	case d.IsReadOnly || d.PlanSafe:
+		return nil
+	case permission.IsShellTool(d.Name) && toolDecision.Decision == tool.Allow:
+		return nil
+	}
+	return permissionDenied(d.Name, "plan mode - only read operations allowed")
+}
+
 func permissionDenied(toolName, reason string) error {
 	return &deniedError{text: fmt.Sprintf("permission denied for %s (%s).", toolName, reason)}
 }
@@ -2506,12 +1784,26 @@ func (e *Engine) checkAndCompress(ctx context.Context, model string) {
 		}
 		if !e.smallWindowWarned[model] {
 			e.smallWindowWarned[model] = true
-			e.engineOutput(fmt.Sprintf("  \x1b[33m模型 %s 的上下文窗口 %d token 装不下 cove 约 %d token 的固定开销加对话，已停用自动压缩；请调大模型上下文（建议 32K 以上）\x1b[0m",
-				model, api.ContextWindowForModel(model), e.requestOverhead))
+			e.engineOutput(smallWindowNotice(model, e.requestOverhead))
 		}
 		return
 	}
 	e.compactIfNeeded(ctx, threshold)
+}
+
+// smallWindowNotice explains why compaction is off for model. It used to say
+// the window "cannot hold" the overhead while printing a window larger than
+// it ("16384 token 装不下约 6536 token"): what does not fit is the overhead
+// plus the reply's reserve plus a useful history.
+func smallWindowNotice(model string, overhead int) string {
+	window := api.ContextWindowForModel(model)
+	reply := api.MaxOutputTokensForModel(model)
+	room := window - overhead - reply
+	if room < 0 {
+		room = 0
+	}
+	return fmt.Sprintf("  \x1b[33m模型 %s 的上下文窗口 %d token：cove 每次请求的固定开销约 %d token（系统提示 + 工具定义），回复预留 %d token，留给对话的只剩约 %d token，压缩也腾不出空间，已停用自动压缩；请调大模型上下文（建议 32K 以上）\x1b[0m",
+		model, window, overhead, reply, room)
 }
 
 // minHistoryRoom is the least history a compaction trigger must leave room
@@ -2562,7 +1854,7 @@ func (e *Engine) compact(ctx context.Context, threshold int) *CompressResult {
 		if e.config.ModelFast != "" {
 			req.Model = e.config.ModelFast
 		}
-		resp, _, err := e.fallback.TryChat(ctx, func(p api.Provider) api.ChatRequest { return req })
+		resp, err := e.llm.Chat(ctx, req)
 		return resp, err
 	}
 
@@ -2709,7 +2001,7 @@ func (e *Engine) saveSession() {
 	// the answer was missing from the session if cove exited uncleanly.
 	now := time.Now()
 	e.session.Messages = e.messages
-	costTotals := e.costTracker.Totals()
+	costTotals := e.sessionTotals()
 	e.session.TokensIn = costTotals.Input
 	e.session.TokensOut = costTotals.Output
 	e.session.Cost = costTotals.Cost
@@ -3009,7 +2301,9 @@ func (e *Engine) runTurnEndPipeline() {
 	}
 	// Flush session notes (sync, fast I/O)
 	if e.sessionNotes != nil {
-		_ = e.sessionNotes.Flush()
+		if err := e.sessionNotes.Flush(); err != nil {
+			log.Warnf("session notes not saved: %v", err)
+		}
 	}
 	// Session pruning, memory extraction (async, throttled internally), the
 	// skill review, the auto-dream check and the summary line run on one
@@ -3076,12 +2370,8 @@ func (e *Engine) debugOutput(line string) {
 }
 
 func (e *Engine) engineOutput(line string) {
-	if e.out != nil {
-		e.out.Line(strings.TrimRight(line, "\r\n"))
-		return
-	}
-	if e.OnEngineOutput != nil {
-		e.OnEngineOutput(line)
+	if out := e.output(); out != nil {
+		out.Line(strings.TrimRight(line, "\r\n"))
 	}
 }
 
@@ -3092,33 +2382,43 @@ func (e *Engine) engineOutput(line string) {
 // without a live region drops it. That is the whole difference from
 // engineOutput, and the reason a "running X…" notice must come through here —
 // as a line it would accumulate one dead row per tool call.
-// It is sink-only on purpose. There is no fallback to a line, because the two
-// front ends without a sink already show progress their own way — the legacy
-// full-screen shell through OnToolStart, the unwired case through the walking
-// indicator — and the previous code's fallback was a "\r"-prefixed line that
-// only looks transient if nothing else writes before the terminal overwrites
-// it. In a piped log it is just garbage.
+// A LineSink drops it: the REPL shows progress with its own spinner, and an
+// unwired engine with the walking indicator. The previous code's fallback was
+// a "\r"-prefixed line that only looks transient if nothing else writes
+// before the terminal overwrites it; in a piped log it is just garbage.
 func (e *Engine) activity(s string) {
-	if e.out != nil {
-		e.out.Activity(s)
+	if out := e.output(); out != nil {
+		out.Activity(s)
 	}
 }
 
+// sinkBox lets an interface value live in an atomic.Pointer.
+type sinkBox struct{ s uiout.Sink }
+
 // SetOutput installs the sink that receives every user-facing line and block.
-//
-// Passing nil unwires it, which falls back to the deprecated OnEngineOutput
-// callback (and to silence when that is unset). It never re-enables a direct
-// terminal write.
+// Passing nil unwires it: silence, never a direct terminal write.
 func (e *Engine) SetOutput(s uiout.Sink) {
-	e.out = s
+	if s == nil {
+		e.out.Store(nil)
+		return
+	}
+	e.out.Store(&sinkBox{s: s})
+}
+
+// output is the installed sink, nil when none is.
+func (e *Engine) output() uiout.Sink {
+	if b := e.out.Load(); b != nil {
+		return b.s
+	}
+	return nil
 }
 
 // Output returns the engine's current sink. Never nil.
 func (e *Engine) Output() uiout.Sink {
-	if e.out == nil {
-		return uiout.Discard
+	if s := e.output(); s != nil {
+		return s
 	}
-	return e.out
+	return uiout.Discard
 }
 
 // WirePlanExecutor sets up the PlanExecuteFunc on the runtime so the
@@ -3131,18 +2431,21 @@ func (e *Engine) WirePlanExecutor() {
 		return
 	}
 
-	if e.fallback != nil && e.fallback.Current() != nil {
+	if e.llm != nil {
 		d := delegate.NewDelegator(nil, "", e.registry.All())
 		// Provider and model are resolved when each task starts: the metered
 		// provider follows /provider switches, and the model is the configured
 		// one (the fallback's CurrentModel was never populated and always
 		// said "unknown", which real APIs reject).
-		d.SetProviderSource(func() (api.Provider, string) { return e.fallback.Current(), e.config.Model })
+		d.SetProviderSource(func() (api.Provider, string) { return e.llm, e.config.Model })
 		// Sub-agent tool calls run through the engine's own tool pipeline —
 		// safety scan, hooks, guardrails, validation, the permission gate
 		// (with the session's current mode and cwd), checkpoints, output
 		// limits and untrusted-content marking — exactly like top-level ones.
-		d.SetExecutor(func(ctx context.Context, tc api.ToolCall) string { return e.executeTool(ctx, tc) })
+		d.SetExecutor(func(ctx context.Context, tc api.ToolCall) string {
+			out, _ := e.executeTool(ctx, tc)
+			return out
+		})
 		d.SetBudgetCheck(e.costTracker.OverBudget)
 		d.SetMaxIter(e.config.SubagentMaxIterations)
 		pe := plan.NewPlanExecutor(d, e.runtime)

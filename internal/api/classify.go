@@ -23,7 +23,6 @@ const (
 	KindServerError
 	KindTransport
 	KindToolArgs
-	KindProviderUnavailable
 	// KindUnreachable: the server could not be reached at all (connection
 	// refused, unknown host); KindTimeout: it did not answer in time.
 	KindUnreachable
@@ -48,8 +47,6 @@ func (k ErrorKind) String() string {
 		return "transport"
 	case KindToolArgs:
 		return "tool_args"
-	case KindProviderUnavailable:
-		return "provider_unavailable"
 	case KindUnreachable:
 		return "unreachable"
 	case KindTimeout:
@@ -68,30 +65,11 @@ func (e *ToolArgsInvalidError) Error() string {
 	return "tool call arguments for " + e.Tool + " were not valid JSON"
 }
 
-// ProviderUnavailableError says the fallback chain marked a provider
-// unavailable after repeated failures; Cause is the failure that tipped it.
-type ProviderUnavailableError struct {
-	Provider string
-	Fails    int
-	Cause    error
-}
-
-func (e *ProviderUnavailableError) Error() string {
-	return "provider " + e.Provider + " marked unavailable: " + e.Cause.Error()
-}
-
-func (e *ProviderUnavailableError) Unwrap() error { return e.Cause }
-
-// Classify rates err. The typed errors come first, so a provider marked
-// unavailable because of a context overflow is KindProviderUnavailable, and
-// a cancellation is never mistaken for a transport error.
+// Classify rates err. The typed errors come first, so a cancellation is
+// never mistaken for a transport error.
 func Classify(err error) ErrorKind {
 	if err == nil {
 		return KindUnknown
-	}
-	var pu *ProviderUnavailableError
-	if errors.As(err, &pu) {
-		return KindProviderUnavailable
 	}
 	var ta *ToolArgsInvalidError
 	if errors.As(err, &ta) {
@@ -133,4 +111,37 @@ func Classify(err error) ErrorKind {
 		return KindTransport
 	}
 	return KindUnknown
+}
+
+func isRateLimit(err error) bool {
+	if st := statusOf(err); st != 0 {
+		return st == http.StatusTooManyRequests
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "rate_limit") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "too many requests")
+}
+
+func isTemporary(err error) bool {
+	if st := statusOf(err); st != 0 {
+		return st >= 500
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "temporary")
+}
+
+func isPermanent(err error) bool {
+	if st := statusOf(err); st != 0 {
+		return st == http.StatusUnauthorized || st == http.StatusForbidden
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid api key") ||
+		strings.Contains(s, "authentication")
 }

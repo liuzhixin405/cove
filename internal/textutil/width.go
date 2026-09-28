@@ -42,6 +42,9 @@ var termWidth = displaywidth.Options{
 // sequences count as zero.
 func Width(s string) int { return termWidth.String(s) }
 
+// RuneWidth is the display width of r, measured the way Width measures.
+func RuneWidth(r rune) int { return termWidth.Rune(r) }
+
 // TruncateWidth clips s to at most width columns, appending tail when it had
 // to cut. The result including tail never exceeds width.
 //

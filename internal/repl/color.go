@@ -6,37 +6,33 @@ import (
 	"sync"
 	"time"
 
+	"github.com/liuzhixin405/cove/internal/termui"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
-// ANSI color codes
+// ANSI color codes: termui's, so the two packages cannot drift apart (they
+// were two copies of the same table).
 const (
-	Reset     = "\x1b[0m"
-	Bold      = "\x1b[1m"
-	Dim       = "\x1b[2m"
-	Italic    = "\x1b[3m"
-	Underline = "\x1b[4m"
-
-	// Foreground colors
-	Black   = "\x1b[30m"
-	Red     = "\x1b[31m"
-	Green   = "\x1b[32m"
-	Yellow  = "\x1b[33m"
-	Blue    = "\x1b[34m"
-	Magenta = "\x1b[35m"
-	Cyan    = "\x1b[36m"
-	White   = "\x1b[37m"
-	Gray    = "\x1b[90m"
-
-	// Bright foreground
-	BrightRed    = "\x1b[91m"
-	BrightGreen  = "\x1b[92m"
-	BrightYellow = "\x1b[93m"
-	BrightBlue   = "\x1b[94m"
-	BrightCyan   = "\x1b[96m"
-
-	// Reasoning
-	ReasoningStyle = "\x1b[2;3m\x1b[90m" // Dim + Italic + Gray
+	Reset          = termui.Reset
+	Bold           = termui.Bold
+	Dim            = termui.Dim
+	Italic         = termui.Italic
+	Underline      = termui.Underline
+	Black          = termui.Black
+	Red            = termui.Red
+	Green          = termui.Green
+	Yellow         = termui.Yellow
+	Blue           = termui.Blue
+	Magenta        = termui.Magenta
+	Cyan           = termui.Cyan
+	White          = termui.White
+	Gray           = termui.Gray
+	BrightRed      = termui.BrightRed
+	BrightGreen    = termui.BrightGreen
+	BrightYellow   = termui.BrightYellow
+	BrightBlue     = termui.BrightBlue
+	BrightCyan     = termui.BrightCyan
+	ReasoningStyle = termui.ReasoningStyle
 )
 
 // Styled returns colored text

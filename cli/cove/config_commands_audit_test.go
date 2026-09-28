@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/state"
 )
 
 func TestProviderSwitchModel(t *testing.T) {
@@ -47,13 +45,12 @@ func TestProviderCommandMovesDefaultModelAndSavesIt(t *testing.T) {
 	cfg.Provider.Name = "anthropic"
 	cfg.Provider.APIKey = "placeholder"
 	cfg.Model = config.DefaultModelForProvider("anthropic")
-	as := &state.AppState{}
 
-	handleBuiltinConfigCommand("/provider deepseek", cfg, eng, permission.NewManager(permission.Default), as)
+	handleBuiltinConfigCommand("/provider deepseek", cfg, eng)
 
 	want := config.DefaultModelForProvider("deepseek")
-	if cfg.Model != want || as.Model != want {
-		t.Fatalf("model = %q (app state %q), want %q", cfg.Model, as.Model, want)
+	if cfg.Model != want || eng.Model() != want {
+		t.Fatalf("model = %q (engine %q), want %q", cfg.Model, eng.Model(), want)
 	}
 	if saved := savedConfig(t); !strings.Contains(saved, want) {
 		t.Fatalf("saved config does not carry the new model:\n%s", saved)
@@ -73,7 +70,7 @@ func TestConfigCommandsReportSaveFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 		buf := captureOut(t)
-		handleBuiltinConfigCommand(in, config.DefaultConfig(), eng, permission.NewManager(permission.Default), &state.AppState{})
+		handleBuiltinConfigCommand(in, config.DefaultConfig(), eng)
 		if !strings.Contains(buf.String(), "保存失败") {
 			t.Errorf("%s: save failure not reported, output %q", in, buf.String())
 		}

@@ -16,6 +16,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/fsatomic"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove/internal/safepath"
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
 
@@ -27,7 +28,8 @@ type Runner struct {
 	mu             sync.Mutex
 	lastScanAt     time.Time
 	provider       api.Provider
-	model          string
+	model          string // guarded by modelMu, not mu: SetModel must not wait for a run
+	modelMu        sync.Mutex
 	currentSession string
 	memoryRoot     string
 	// projectMemory is the memory directory of the project the run belongs
@@ -71,6 +73,19 @@ func NewRunner(provider api.Provider, model string, sessionID string) *Runner {
 // SetProjectRoot makes the runner consolidate root's project memory
 // directory (config.ProjectDataDir(root)/memory) as well as the global one.
 // An empty root leaves only the global directory.
+// SetModel changes the model later consolidation runs ask for.
+func (r *Runner) SetModel(model string) {
+	r.modelMu.Lock()
+	r.model = model
+	r.modelMu.Unlock()
+}
+
+func (r *Runner) currentModel() string {
+	r.modelMu.Lock()
+	defer r.modelMu.Unlock()
+	return r.model
+}
+
 func (r *Runner) SetProjectRoot(root string) {
 	dir := ""
 	if root != "" {
@@ -262,7 +277,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		}
 
 		req := api.ChatRequest{
-			Model:      r.model,
+			Model:      r.currentModel(),
 			Messages:   messages,
 			SystemBase: systemPrompt,
 			Tools:      toolDefs,
@@ -280,7 +295,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 		model := resp.Model
 		if model == "" {
-			model = r.model
+			model = r.currentModel()
 		}
 		meter.AddWithCacheWrite(model, resp.InputTokens, resp.OutputTokens, resp.PromptCacheHitTokens, resp.PromptCacheMissTokens, resp.PromptCacheWriteTokens)
 		tot := meter.Totals()
@@ -530,24 +545,12 @@ func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
 	return grepFiles(pattern, path)
 }
 
-// isInsideMemoryDir checks if the given absolute path is inside the memory directory.
-//
-// The comparison must be on whole path segments. A plain string prefix check
-// let any sibling directory whose name merely starts with the memory root
-// through — with the root at ~/.cove/memory, the path ~/.cove/memory-evil/x
-// passed, so the dream agent's write/edit sandbox could be stepped out of by
-// naming a directory carefully.
+// isInsideMemoryDir checks if the given absolute path is inside the memory
+// directory: on whole path segments (a prefix check let ~/.cove/memory-evil
+// through), with links and junctions resolved (a link inside the memory
+// directory pointing elsewhere is outside). See safepath.Within.
 func isInsideMemoryDir(absPath, memRoot string) bool {
-	absMemRoot, err := filepath.Abs(memRoot)
-	if err != nil {
-		return false
-	}
-	root := strings.ToLower(filepath.Clean(absMemRoot))
-	target := strings.ToLower(filepath.Clean(absPath))
-	if target == root {
-		return true
-	}
-	return strings.HasPrefix(target, root+string(os.PathSeparator))
+	return safepath.Within(memRoot, absPath)
 }
 
 // buildDreamSystemPrompt returns a minimal system prompt for the dream agent.

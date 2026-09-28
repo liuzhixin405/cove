@@ -157,14 +157,16 @@ func (e *Engine) askLimit(stats LimitStats) LimitDecision {
 	if e.IterationLimitPrompt == nil {
 		return LimitStop
 	}
-	if e.OnPermissionPause != nil {
-		e.OnPermissionPause()
-	}
+	// Pause, prompt and resume under one lock, like the permission prompt.
 	e.promptMu.Lock()
+	defer e.promptMu.Unlock()
+	hooks := e.turnHooks()
+	if hooks.PermissionPause != nil {
+		hooks.PermissionPause()
+	}
 	d := e.IterationLimitPrompt(stats)
-	e.promptMu.Unlock()
-	if e.OnPermissionDone != nil {
-		e.OnPermissionDone()
+	if hooks.PermissionDone != nil {
+		hooks.PermissionDone()
 	}
 	return d
 }
@@ -233,7 +235,7 @@ var errWrapUpSkipped = errors.New("wrap-up skipped")
 
 // wrapUpSummary asks the turn's model, with no tools offered, for a short
 // status report: what was completed, what remains, what to do next. It is
-// one metered call through e.fallback, skipped when the context is done, the
+// one metered call through e.llm, skipped when the context is done, the
 // budget is exhausted or the turn is a replay. The prompt is not kept in
 // history.
 func (e *Engine) wrapUpSummary(ctx context.Context, routedModel, reason string) (string, error) {
@@ -249,7 +251,7 @@ func (e *Engine) wrapUpSummary(ctx context.Context, routedModel, reason string) 
 	}
 	msgs := append(append([]api.Message(nil), e.messages...), newSyntheticUserMsg(fmt.Sprintf(wrapUpPromptFmt, reason)))
 	var tools []api.ToolDef
-	if e.fallback.Current().Name() == "anthropic" {
+	if api.CapabilitiesOf(e.llm).ToolsWithToolHistory {
 		// Anthropic rejects a history with tool_use blocks when the request
 		// defines no tools; the prompt still says not to call any, and any
 		// call in the reply is dropped.
@@ -267,7 +269,7 @@ func (e *Engine) wrapUpSummary(ctx context.Context, routedModel, reason string) 
 		Thinking: "disabled",
 	}
 	act := e.beginActivity("wrap-up summary " + model)
-	resp, _, err := e.fallback.TryChat(ctx, func(api.Provider) api.ChatRequest { return req })
+	resp, err := e.llm.Chat(ctx, req)
 	e.endActivity(act)
 	if err != nil {
 		log.Debugf("wrap-up summary failed: %v", err)

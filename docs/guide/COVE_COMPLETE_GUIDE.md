@@ -252,10 +252,8 @@ cove/agent/
 │       └── browser.go              #   chromedp headless 浏览器
 │
 ├── mobile/                         # ★ 移动端引擎（Android）
-│   ├── cove.go                     #   MobileEngine (203行)
-│   └── mobileapi/
-│       ├── mobileapi.go            #   自包含 API 层（不依赖 internal）(356行)
-│       └── mobileapi_test.go
+│   ├── cove.go                     #   MobileEngine：工具循环，模型调用走 internal/api
+│   └── cove_test.go
 │
 ├── testdata/                       # 测试数据
 ├── scripts/                        # 辅助脚本
@@ -1197,20 +1195,20 @@ type SessionDiff struct {
 
 ### 5.14 移动端引擎 (mobile)
 
-**文件**: `mobile/cove.go` + `mobile/mobileapi/`
+**文件**: `mobile/cove.go`
 
 为 Android 设计的轻量引擎。通过 **gomobile** 编译为 AAR，在 Kotlin 中调用。
 
 **关键设计**：
-- `mobileapi` 包**完全自包含**，不依赖 `internal/` 任何包
+- 模型调用复用桌面版的 `internal/api`（工具参数修复、建连重试、多 key 轮换、SSE 边界处理与 Anthropic 支持都与桌面版一致）；gomobile 只限制绑定包对外导出的类型，实现可以引用同一模块的 internal 包。不包含 `internal/engine`（没有权限系统、压缩、检查点）
 - 工具执行通过 `StreamCallback.OnToolCall()` 委托给 Kotlin 层
-- 简化版 API 层（anthropic/openai 直接在 mobileapi 内实现）
+- 对外导出的类型（`ToolDef`、`StreamCallback`、`MobileEngine` 的方法）保持 gomobile 可绑定，内部与 `api.Message` 等互相转换
 
 ```go
 type MobileEngine struct {
-    provider mobileapi.Provider
+    provider api.Provider
     model    string
-    messages []mobileapi.Message
+    messages []api.Message
     toolDefs []ToolDef
 }
 
@@ -1926,8 +1924,8 @@ A: 编辑 `engine.go` 的 `SystemPrompt()` 方法，或在 `~/.cove/config.json`
 **Q: 怎么添加对新的 AI 模型的支持？**
 A: 如果模型兼容 OpenAI API，只需在 `config.json` 中设置 `provider.base_url`。如果完全不兼容，参考 7.3 节添加新 Provider。
 
-**Q: 为什么移动端引擎是独立的包？**
-A: gomobile 对依赖有限制。`mobile/mobileapi/` 自包含，不引用 `internal/` 包，确保 Android 编译成功。
+**Q: 移动端引擎和桌面版是什么关系？**
+A: gomobile 只限制被绑定包（`covemobile`）**导出的** API 必须是 gomobile 可绑定的类型；实现部分可以引用同一模块内的任何包。`mobile/cove.go` 直接使用桌面版的模型接入层 `internal/api`（Provider、SSE 流式解析、工具参数 JSON 修复、连接重试、Anthropic 支持），因此 `internal/api` 的修复会同步到移动端。移动端没有使用桌面版的 `internal/engine`（工具系统、权限、上下文压缩），工具调用循环由 `covemobile` 自己实现，手机操作通过 Kotlin 回调执行。`internal/api` 不依赖 cgo，可用 `GOOS=android CGO_ENABLED=0` 交叉编译。
 
 **Q: 循环检测会不会误判？**
 A: Layer 1 只检测完全相同的工具+参数组合（如反复写同一个文件）。批量操作中每次参数不同，不会触发。Layer 2 的阈值 10/50 足够高，正常重复不会触发。

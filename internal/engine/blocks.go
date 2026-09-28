@@ -14,6 +14,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/textmode"
 	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
 // Structured conversation events.
@@ -50,7 +51,7 @@ func nextBlockID() string {
 }
 
 // legacyBlockWidth is the fallback width for rendering a block back down to a
-// line for the deprecated OnEngineOutput callback, used when the terminal's
+// line for LineSink, used when the terminal's
 // width is unknown (output piped, no console) or implausibly narrow. The ID is
 // stripped first so no expand hint is right-aligned against a width that is
 // not the real one.
@@ -122,13 +123,22 @@ func newBlockStyles() render.Styles {
 // later. A front end still on the deprecated callback gets the collapsed
 // rendering as a line, because that is all its interface can carry.
 func (e *Engine) emitBlock(b render.Block) {
-	if e.out != nil {
-		e.out.Block(b)
-		return
+	if out := e.output(); out != nil {
+		out.Block(b)
 	}
-	if e.OnEngineOutput != nil {
-		e.OnEngineOutput(render.Collapsed(withoutID(b), blockRenderWidth(), currentBlockStyles()) + "\n")
-	}
+}
+
+// LineSink is the Sink of a front end that prints lines: a block is rendered
+// collapsed at the terminal's width (an expand hint needs a front end that
+// can expand, so the ID is dropped), a line is passed on as it is, and
+// activity is left to the front end's own progress display.
+func LineSink(line func(string)) uiout.Sink {
+	return uiout.NewFuncs(uiout.Funcs{
+		OnBlock: func(b render.Block) {
+			line(render.Collapsed(withoutID(b), blockRenderWidth(), currentBlockStyles()) + "\n")
+		},
+		OnLine: line,
+	})
 }
 
 func withoutID(b render.Block) render.Block {

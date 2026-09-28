@@ -15,7 +15,7 @@ func NewTaskStopTool() Tool {
 		Name: "task_stop", Aliases: []string{"TaskStop"},
 		Description: "Stop a running background task.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"taskId":{"type":"string"}},"required":["taskId"]}`),
-		IsReadOnly:  false, UserFacingName: "Task Stop",
+		IsReadOnly:  false, PlanSafe: true, UserFacingName: "Task Stop",
 	}}}
 }
 func (t *TaskStopTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
@@ -108,7 +108,7 @@ func NewExecutePlanTool() Tool {
 			},
 			"required":[]
 		}`),
-		IsReadOnly: false, IsConcurrencySafe: false, UserFacingName: "Execute Plan",
+		IsReadOnly: false, IsConcurrencySafe: false, PlanSafe: true, UserFacingName: "Execute Plan",
 	}}}
 }
 

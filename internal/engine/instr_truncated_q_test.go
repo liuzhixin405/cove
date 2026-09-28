@@ -23,7 +23,7 @@ func TestInstructionFilesTruncatedNoticeOnce(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	eng.memStore = memory.NewStoreForDirs(t.TempDir())
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 
 	for i := 0; i < 2; i++ {
 		eng.systemPrompt = ""
@@ -51,7 +51,7 @@ func TestInstructionFilesNotTruncatedNoNotice(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	eng.memStore = memory.NewStoreForDirs(t.TempDir())
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	eng.systemPrompt = ""
 	_ = eng.SystemPrompt()
 	for _, l := range lines {

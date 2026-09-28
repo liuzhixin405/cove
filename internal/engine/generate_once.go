@@ -30,7 +30,7 @@ func (e *Engine) GenerateOnce(ctx context.Context, system, prompt string) (strin
 		Messages:   []api.Message{{Role: "user", Content: prompt}},
 		MaxTokens:  generateOnceMaxTokens,
 	}
-	resp, _, err := e.fallback.TryChat(ctx, func(api.Provider) api.ChatRequest { return req })
+	resp, err := e.llm.Chat(ctx, req)
 	if err != nil {
 		return "", err
 	}

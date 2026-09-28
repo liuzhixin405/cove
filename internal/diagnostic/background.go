@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/liuzhixin405/cove/internal/dream"
 	"github.com/liuzhixin405/cove/internal/memory"
@@ -22,20 +23,39 @@ type BackgroundStatus struct {
 	Memory memory.Stats
 }
 
-// BackgroundStatusFn, when set, supplies the background-learning state of the
-// running session (the engine sets it to its dream runner and memory store).
-// Unset, the checker reads the same state from disk, which is what a process
-// with no engine (cove doctor) can see.
-var BackgroundStatusFn func() BackgroundStatus
+// SessionFuncs is the running session the checks read, when there is one:
+// its background-learning state (the engine's dream runner and memory store)
+// and why it could not load policies.json (nil when it loaded or does not
+// exist). Without it, or with a nil function, the checks read the same state
+// from disk, which is what a process with no engine (cove doctor) can see.
+type SessionFuncs struct {
+	Background func() BackgroundStatus
+	PolicyErr  func() error
+}
 
-// PolicyLoadErrorFn, when set, reports why the running engine could not load
-// policies.json (nil when it loaded or does not exist). Unset, the checker
-// parses the file in the config directory itself.
-var PolicyLoadErrorFn func() error
+// The session is set at startup and read by /diagnose and /doctor from
+// command goroutines; it used to be two bare function variables.
+var (
+	sessionMu     sync.RWMutex
+	sessionSource *SessionFuncs
+)
+
+// SetSession installs the running session's sources; nil removes them.
+func SetSession(f *SessionFuncs) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	sessionSource = f
+}
+
+func currentSession() *SessionFuncs {
+	sessionMu.RLock()
+	defer sessionMu.RUnlock()
+	return sessionSource
+}
 
 // BackgroundSummary renders the "后台学习" and "权限规则文件" items as they
 // appear in the full report, for /doctor (which does not run the other,
-// slower checks). It honors BackgroundStatusFn and PolicyLoadErrorFn.
+// slower checks). It reads the running session when one is set (SetSession).
 func BackgroundSummary() string {
 	c := NewChecker(nil)
 	ctx := context.Background()
@@ -49,8 +69,8 @@ func (c *Checker) backgroundStatus() BackgroundStatus {
 	switch {
 	case c.background != nil:
 		return c.background()
-	case BackgroundStatusFn != nil:
-		return BackgroundStatusFn()
+	case currentSession() != nil && currentSession().Background != nil:
+		return currentSession().Background()
 	}
 	var st BackgroundStatus
 	if r := dream.Current(); r != nil {
@@ -66,8 +86,8 @@ func (c *Checker) policyLoadError() error {
 	switch {
 	case c.policyErr != nil:
 		return c.policyErr()
-	case PolicyLoadErrorFn != nil:
-		return PolicyLoadErrorFn()
+	case currentSession() != nil && currentSession().PolicyErr != nil:
+		return currentSession().PolicyErr()
 	}
 	// The same parse the engine does at startup (permission.FilePolicyStorage
 	// .Load), without creating the directory.

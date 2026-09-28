@@ -73,6 +73,30 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 	}
 }
 
+// startNewSession is /new: the current conversation is saved and the engine
+// starts an empty one. The REPL's own leftovers of the old conversation go
+// with it — the failed request "继续" would retry, the interrupted-turn draft
+// and the pending attachments. It returns the saved session's ID ("" when
+// there was nothing to save).
+func startNewSession(eng *engine.Engine, tasks *replTaskRunner, attachedFiles *[]string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), exitBackgroundWait)
+	defer cancel()
+	saved := eng.NewSession(ctx)
+	if tasks != nil {
+		tasks.ClearPendingFailed()
+	}
+	_ = clearInterruptedDraft()
+	*attachedFiles = nil
+	return saved
+}
+
+func newSessionNotice(saved string) string {
+	if saved == "" {
+		return "[新会话] 已开始新会话"
+	}
+	return fmt.Sprintf("[新会话] 已开始新会话；上一个会话已保存（%s），可用 /history 找回", saved)
+}
+
 // compactReportLine is what /compact prints: the token counts around a real
 // compaction, or why nothing was compressed (it used to print "已压缩"
 // whatever happened).

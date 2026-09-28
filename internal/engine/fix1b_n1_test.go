@@ -45,7 +45,7 @@ func TestGenerateOnce(t *testing.T) {
 func TestOnTurnModel(t *testing.T) {
 	var got []string
 	eng := newPatternEngine(t, &seqProvider{}, func(c *Config) { c.ModelFast = "test-fast" })
-	eng.OnTurnModel = func(m string) { got = append(got, m) }
+	eng.SetTurnHooks(&TurnHooks{TurnModel: func(m string) { got = append(got, m) }})
 	if _, err := run(t, eng, "hi"); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestOnTurnModel(t *testing.T) {
 
 	var none []string
 	eng2 := newPatternEngine(t, &seqProvider{}, nil)
-	eng2.OnTurnModel = func(m string) { none = append(none, m) }
+	eng2.SetTurnHooks(&TurnHooks{TurnModel: func(m string) { none = append(none, m) }})
 	if _, err := run(t, eng2, "hi"); err != nil {
 		t.Fatal(err)
 	}

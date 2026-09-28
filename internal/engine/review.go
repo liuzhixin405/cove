@@ -80,6 +80,9 @@ func (e *Engine) runReview(msgs []api.Message) reviewResult {
 		e.reviewRunning = false
 		e.bgMu.Unlock()
 	}()
+	e.bgMu.Lock()
+	gen := e.conversationGen
+	e.bgMu.Unlock()
 	if e.costTracker != nil && e.costTracker.OverBudget() {
 		return reviewResult{}
 	}
@@ -89,14 +92,18 @@ func (e *Engine) runReview(msgs []api.Message) reviewResult {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reviewTimeout)
 	defer cancel()
-	resp, _, err := e.fallback.TryChat(ctx, func(api.Provider) api.ChatRequest { return e.reviewRequest(snapshot) })
+	resp, err := e.llm.Chat(ctx, e.reviewRequest(snapshot))
 	if err != nil {
 		log.Warnf("background review failed: %v", err)
 		return reviewResult{}
 	}
 	e.bgMu.Lock()
-	e.lastReviewMsgCount = len(msgs)
-	e.turnsSinceReview = 0
+	// A review outlives the wait of /new and /resume; the conversation it
+	// counted is gone by then and its count would throttle the next one.
+	if e.conversationGen == gen {
+		e.lastReviewMsgCount = len(msgs)
+		e.turnsSinceReview = 0
+	}
 	e.bgMu.Unlock()
 	return e.applyReview(resp.Content)
 }
@@ -124,7 +131,9 @@ const backgroundMaxTokens = 4000
 // on the background (fast) model, like extraction and consolidation; it used
 // to run on the premium model for a job that only writes one-line notes.
 func (e *Engine) reviewRequest(snapshot string) api.ChatRequest {
+	e.bgMu.Lock()
 	model := e.backgroundModel
+	e.bgMu.Unlock()
 	if model == "" {
 		model = e.config.Model
 	}
@@ -302,7 +311,7 @@ func buildReviewSnapshot(msgs []api.Message) string {
 
 	var sb strings.Builder
 	for _, m := range msgs {
-		content := clipRunes(m.Content, 200)
+		content := keepRunes(m.Content, 200)
 		switch m.Role {
 		case "user":
 			sb.WriteString("用户: " + content + "\n")
@@ -312,7 +321,7 @@ func buildReviewSnapshot(msgs []api.Message) string {
 				if path, ok := tc.Input["filePath"].(string); ok {
 					sb.WriteString("  → " + tc.Name + "(" + path + ")\n")
 				} else if cmd, ok := tc.Input["command"].(string); ok {
-					sb.WriteString("  → bash(" + clipRunes(cmd, 80) + ")\n")
+					sb.WriteString("  → bash(" + keepRunes(cmd, 80) + ")\n")
 				}
 			}
 		case "tool":

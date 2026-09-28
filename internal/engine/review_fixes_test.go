@@ -27,7 +27,7 @@ func TestSmallWindowDoesNotCompactEveryTurn(t *testing.T) {
 			api.Message{Role: "assistant", Content: fmt.Sprintf("answer %d about the parser and its many edge cases", i)})
 	}
 	var lines []string
-	eng.OnEngineOutput = func(line string) { lines = append(lines, line) }
+	eng.SetOutput(LineSink(func(line string) { lines = append(lines, line) }))
 
 	eng.checkAndCompress(context.Background(), "test-model")
 	eng.checkAndCompress(context.Background(), "test-model")
@@ -101,7 +101,7 @@ func TestStallRecordedOncePerStage(t *testing.T) {
 	clearDiagnostics(t)
 	eng := newTestEngine(&mockProvider{})
 	var lines []string
-	eng.OnEngineOutput = func(line string) { lines = append(lines, line) }
+	eng.SetOutput(LineSink(func(line string) { lines = append(lines, line) }))
 	eng.reportStall("call model qwen", 30*time.Second, true)
 	eng.reportStall("call model qwen", 60*time.Second, false)
 	if len(lines) != 2 {

@@ -85,8 +85,6 @@ func Classify(err error, c Context) (ErrorCode, string) {
 	switch api.Classify(err) {
 	case api.KindContextLength:
 		return ErrAPIContextLength, err.Error()
-	case api.KindProviderUnavailable:
-		return ErrAPIProviderUnavailable, err.Error()
 	case api.KindToolArgs:
 		return ErrToolArgsInvalid, err.Error()
 	case api.KindRateLimit:

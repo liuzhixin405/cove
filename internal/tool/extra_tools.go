@@ -258,7 +258,7 @@ func NewQuestionTool() Tool {
 			"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}}}},
 			"multiple":{"type":"boolean"}
 		}}},"required":["questions"]}`),
-		IsConcurrencySafe: false, UserFacingName: "Question",
+		IsConcurrencySafe: false, PlanSafe: true, UserFacingName: "Question",
 	}}}
 }
 
@@ -327,7 +327,7 @@ func NewTodoWriteTool() Tool {
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{
 			"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}
 		},"required":["content","status","priority"]}}},"required":["todos"]}`),
-		IsReadOnly: false, IsConcurrencySafe: false, UserFacingName: "TodoWrite",
+		IsReadOnly: false, IsConcurrencySafe: false, PlanSafe: true, UserFacingName: "TodoWrite",
 	}}}
 }
 func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {

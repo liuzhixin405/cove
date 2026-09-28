@@ -38,7 +38,6 @@ func TestClassifyGivesEachErrorItsCode(t *testing.T) {
 		want ErrorCode
 	}{
 		{fmt.Errorf("api: %w", overflow), ErrAPIContextLength},
-		{&api.ProviderUnavailableError{Provider: "openai-compatible", Fails: 3, Cause: overflow}, ErrAPIProviderUnavailable},
 		{&api.ToolArgsInvalidError{Tool: "bash"}, ErrToolArgsInvalid},
 		{&Stall{Stage: "call model qwen3.6-27b", Idle: 33 * time.Second}, ErrEngineStall},
 		{&api.StatusError{Status: 429, Msg: "x"}, ErrAPIRateLimit},

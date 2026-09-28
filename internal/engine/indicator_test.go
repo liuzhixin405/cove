@@ -19,7 +19,7 @@ func TestShouldShowWalkingIndicator(t *testing.T) {
 	}
 
 	eng.config.Debug = false
-	eng.OnEngineOutput = func(string) {}
+	eng.SetOutput(LineSink(func(string) {}))
 	if eng.shouldShowWalkingIndicator(1) {
 		t.Fatal("external output handler should suppress walking indicator")
 	}

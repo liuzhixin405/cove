@@ -27,11 +27,13 @@ import (
 // startup failure happens before any front end exists.
 func outw() io.Writer { return termui.Writer() }
 
-// outf is the fmt.Printf replacement.
-func outf(format string, args ...any) { _, _ = fmt.Fprintf(outw(), format, args...) }
+// outf, outln and outp are fmt.Printf, Println and Print through
+// termui.Text: above the input line while the REPL's editor is on screen,
+// verbatim otherwise. They used to write to termui.Writer() directly, past
+// the editor, so a command's output typed while a task ran could land on
+// the pinned input row or glue itself to the model's unfinished line.
+func outf(format string, args ...any) { termui.Text(fmt.Sprintf(format, args...)) }
 
-// outln is the fmt.Println replacement.
-func outln(args ...any) { _, _ = fmt.Fprintln(outw(), args...) }
+func outln(args ...any) { termui.Text(fmt.Sprintln(args...)) }
 
-// outp is the fmt.Print replacement.
-func outp(args ...any) { _, _ = fmt.Fprint(outw(), args...) }
+func outp(args ...any) { termui.Text(fmt.Sprint(args...)) }

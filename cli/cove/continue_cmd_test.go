@@ -42,14 +42,6 @@ func TestContinueWhileRunning(t *testing.T) {
 	}
 }
 
-func TestIsContinueSlashCommand(t *testing.T) {
-	for in, want := range map[string]bool{"/continue": true, " /continue ": true, "/continue x": false, "/cont": false, "继续": false} {
-		if got := isContinueSlashCommand(in); got != want {
-			t.Fatalf("isContinueSlashCommand(%q) = %v, want %v", in, got, want)
-		}
-	}
-}
-
 // The notice after an interrupted task points at /continue, which resumes it.
 func TestInterruptedTaskHintPointsAtContinue(t *testing.T) {
 	if !strings.Contains(interruptedTaskHint, "/continue") {

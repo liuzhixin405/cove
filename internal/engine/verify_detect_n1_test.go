@@ -48,7 +48,7 @@ func TestAutoVerifyCommandsAnnouncedOnce(t *testing.T) {
 	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "a"}, {content: "b"}}})
 	eng.verifyGate = newAutoVerifyGate([]string{"go build ./..."}, t.TempDir())
 	var lines []string
-	eng.OnEngineOutput = func(s string) { lines = append(lines, s) }
+	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	run(t, eng, "hi")
 	run(t, eng, "again")
 	n := strings.Count(strings.Join(lines, "\n"), "完成校验命令：go build ./...")

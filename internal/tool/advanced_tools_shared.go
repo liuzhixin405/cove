@@ -9,9 +9,6 @@ func ensureRuntimeMaps(rt *Runtime) {
 	if rt.Teams == nil {
 		rt.Teams = make(map[string]*TeamRecord)
 	}
-	if rt.CronSchedules == nil {
-		rt.CronSchedules = make(map[string]*CronRecord)
-	}
 }
 
 // truncateStr limits s to at most n runes. The former s[:n-3] both split
