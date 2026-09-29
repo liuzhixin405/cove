@@ -161,8 +161,9 @@ func commandPrefix(words []string) (string, bool) {
 // case-insensitive on Windows, directory and .exe dropped.
 func programName(exe string) string { return safety.ProgramName(exe) }
 
-// commandCovered reports whether every simple command in command starts with
-// one of prefixes. This is the whole policy for prefix allow rules:
+// The rules the allow-rule pool applies. coverage is what it vouches for:
+// command prefixes (hasWordPrefix), command groups (groupCovers) and,
+// implicitly, read-only commands under a shell whose kind is trusted.
 //
 //   - Each command of a compound line (&& || ; & | newlines, subshells) must
 //     match on its own, so "go test ./... | tee out.txt" also needs "tee".
@@ -185,20 +186,11 @@ func programName(exe string) string { return safety.ProgramName(exe) }
 //     nothing.
 //
 // Anything refused here simply falls back to asking the user again.
-func commandCovered(command string, prefixes [][]string, kind ShellKind) bool {
-	return lineCovered(command, coverage{prefixes: prefixes, kind: kind})
-}
-
-// coverage is what a pool of allow rules vouches for: command prefixes
-// (hasWordPrefix), command groups (groupCovers) and, implicitly, read-only
-// commands under a shell whose kind is trusted.
 type coverage struct {
 	prefixes [][]string
 	groups   []string
 	kind     ShellKind
 }
-
-func (c coverage) empty() bool { return len(c.prefixes) == 0 && len(c.groups) == 0 }
 
 func (c coverage) covers(words []string) bool {
 	for _, p := range c.prefixes {

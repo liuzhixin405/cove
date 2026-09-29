@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 
 	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
@@ -25,8 +24,7 @@ import (
 // to os.Stderr directly. On the headless path there is no program to corrupt
 // and stderr is the correct channel — it keeps stdout clean for piping — and a
 // startup failure happens before any front end exists.
-func outw() io.Writer { return termui.Writer() }
-
+//
 // outf, outln and outp are fmt.Printf, Println and Print through
 // termui.Text: above the input line while the REPL's editor is on screen,
 // verbatim otherwise. They used to write to termui.Writer() directly, past

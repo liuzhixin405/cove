@@ -288,9 +288,6 @@ func gitRoutineCheck(sub string, positional []string, shortFlags string, hasLong
 	return true
 }
 
-// gitRoutine reports whether a git invocation is a routine write.
-func gitRoutine(args []string) bool { return routineGroups[GroupGitRoutine].routine(args) }
-
 // optionName is a long option without its "=value" part.
 func optionName(a string) string {
 	if i := strings.IndexByte(a, '='); i > 0 {
