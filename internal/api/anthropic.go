@@ -520,7 +520,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 
 	for {
 		line, err := readSSELine(reader)
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			// Distinguish an idle-watchdog abort from a genuine read error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {
 				return nil, fmt.Errorf("stream stalled: no data received for %s", streamIdleTimeout)
@@ -602,7 +602,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				}
 			}
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 	}

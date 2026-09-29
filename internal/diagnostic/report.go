@@ -1,6 +1,7 @@
 package diagnostic
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -79,7 +80,10 @@ func Classify(err error, c Context) (ErrorCode, string) {
 	if err == nil {
 		return "", ""
 	}
-	if st, ok := err.(*Stall); ok {
+	// errors.As, not a type assertion: a Stall wrapped by the layer that
+	// retried or re-reported it is still a stall.
+	var st *Stall
+	if errors.As(err, &st) {
 		return ErrEngineStall, st.Error()
 	}
 	switch api.Classify(err) {

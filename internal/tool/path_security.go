@@ -14,7 +14,7 @@ import (
 // the same path through bash or powershell, which is what a real session
 // spent 90 minutes on.
 func outsideWorkingDirectoryError(path, root string) error {
-	return fmt.Errorf("path outside working directory: %s\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it.", path, root)
+	return fmt.Errorf("path outside working directory: %s\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it", path, root)
 }
 
 func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) {
@@ -40,7 +40,7 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 		// fall back to "allow if the target sits inside any git repository",
 		// which defeated the sandbox: with cwd on D:, any repository on C:
 		// was writable.
-		return "", fmt.Errorf("path on different drive: %s (cwd is on %s)\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it.", path, volRoot, root)
+		return "", fmt.Errorf("path on different drive: %s (cwd is on %s)\nThe file tools only work inside the working directory %s. Do not work around this with shell commands: tell the user the path is outside the working directory and that they can run /cd <directory> (or start cove there) to work on it", path, volRoot, root)
 	}
 	// Links and junctions are resolved component by component, so a path
 	// through a junction inside the project that points elsewhere is

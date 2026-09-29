@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,11 +55,11 @@ func TestReadSSELine(t *testing.T) {
 	if l, err := readSSELine(r); l != "data: a\n" || err != nil {
 		t.Fatalf("first line = %q, %v", l, err)
 	}
-	if l, err := readSSELine(r); l != "data: b" || err != io.EOF {
+	if l, err := readSSELine(r); l != "data: b" || !errors.Is(err, io.EOF) {
 		t.Fatalf("last line = %q, %v", l, err)
 	}
 	long := bufio.NewReaderSize(strings.NewReader("data: "+strings.Repeat("x", maxSSELineBytes)+"\n"), 4096)
-	if _, err := readSSELine(long); err == nil || err == io.EOF {
+	if _, err := readSSELine(long); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("an over-long line was accepted: %v", err)
 	}
 }

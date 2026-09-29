@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -121,7 +122,7 @@ func readSSELine(r *bufio.Reader) (string, error) {
 		if len(line) > maxSSELineBytes {
 			return "", fmt.Errorf("SSE line longer than %d bytes", maxSSELineBytes)
 		}
-		if err == bufio.ErrBufferFull {
+		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
 		return string(line), err

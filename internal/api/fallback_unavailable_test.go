@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func TestFallbackReportsProviderUnavailableOnce(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("callback called %d times, want once", len(got))
 	}
-	if got[0].fails != 3 || got[0].cause != cause {
+	if got[0].fails != 3 || !errors.Is(got[0].cause, cause) {
 		t.Errorf("event = %+v", got[0])
 	}
 }
