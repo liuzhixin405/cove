@@ -1,5 +1,30 @@
 ﻿## [Unreleased]
 
+## [11.7.0] - 2026-09-30
+
+### Added
+- **仓库更名为 cove-agent**：GitHub 仓库、Go 模块路径（`github.com/liuzhixin405/cove-agent`）、
+  文档与徽章链接、技能市场 RegistryURL 全部统一；旧地址 301 重定向，但
+  `raw.githubusercontent.com` 不重定向，因此代码里的地址必须同步改。
+- README 插入两张真实会话截图，并补回命令行速查表（此前改版时被删，但
+  "每个已注册命令都要出现在 README 与 USER_MANUAL" 的检查一直要求它在）。
+
+### Fixed
+- **编译回归**：go.mod 的模块路径被上一次改名误写成 `cove-agent-agent`（重复
+  `-agent`），与 741 个 Go 文件的 import 不一致，`go build ./...` 全报
+  "no required module provides package"，CI 的 Test 三平台与 Build Check 全红。
+- **CI Lint 从未真正运行**：钉住的 golangci-lint v2.1.6 是用 Go 1.24 构建的，
+  面对 go 1.25.0 的模块直接以 exit 3 退出；升到 v2.4.0 并修掉它报出的 26 条
+  问题（死代码、errorlint、遮蔽内建标识符、G115 整数转换等）。
+- **repl 里与 os.Stdout 的数据竞争**：分离的 pin goroutine（pinIfStreaming /
+  pinAtCursor）此前没有任何可等待的边界，-race 下在 ubuntu/macOS 上必然报错；
+  现在经 pinWG 归口，waitForPin() 可等待。
+- **三平台测试假设**：依赖 Windows 路径形态（`D:\...`）、符号链接权限、以及
+  "整行以绝对路径开头" 的用例，改为按平台成立；checkpoint 的周期性 GC 测试
+  不再依赖后台 goroutine 的调度时机（macOS runner 上偶发失败）。
+- NO_COLOR 相关用例不再受外部环境影响：Cove 给工具 shell 设的就是
+  `NO_COLOR=1`，此前在 Cove 会话里跑 `go test ./...` 必红。
+
 ### Changed
 - **repo map 改为增量索引 + 引用图 PageRank**：
   - 新增 `repomap.Index`，每个工作区一份，repo_map 工具、首轮 excerpt 和 `/context` 共用。每次查询都重新遍历目录，但只重新解析 mtime 或大小变了的文件。
