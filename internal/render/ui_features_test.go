@@ -8,8 +8,8 @@ import (
 
 func TestDiff(t *testing.T) {
 	old := "a\nb\nc\nd\ne\nf\ng\nh\n"
-	new := "a\nb\nC\nd\ne\nf\ng\nh\ni\n"
-	d := Diff(old, new)
+	newText := "a\nb\nC\nd\ne\nf\ng\nh\ni\n"
+	d := Diff(old, newText)
 	if d.Added != 2 || d.Removed != 1 {
 		t.Fatalf("+%d -%d, want +2 -1:\n%s", d.Added, d.Removed, d.Text)
 	}

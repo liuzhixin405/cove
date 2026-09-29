@@ -45,12 +45,12 @@ func SetRetryNotifier(f func(string)) {
 	retryNotify.Store(&f)
 }
 
-// noticeRetryMin: shorter waits are not announced.
-const noticeRetryMin = 5 * time.Second
+// noticeRetryThreshold: shorter waits are not announced.
+const noticeRetryThreshold = 5 * time.Second
 
-func announceRetry(status int, wait time.Duration, attempt, max int) {
+func announceRetry(status int, wait time.Duration, attempt, maxAttempts int) {
 	f := retryNotify.Load()
-	if f == nil || wait < noticeRetryMin {
+	if f == nil || wait < noticeRetryThreshold {
 		return
 	}
 	why := "请求失败"
@@ -60,7 +60,7 @@ func announceRetry(status int, wait time.Duration, attempt, max int) {
 	case status >= 500:
 		why = fmt.Sprintf("服务端错误（%d）", status)
 	}
-	(*f)(fmt.Sprintf("%s，%d 秒后自动重试（第 %d/%d 次）", why, int(wait.Round(time.Second)/time.Second), attempt+1, max))
+	(*f)(fmt.Sprintf("%s，%d 秒后自动重试（第 %d/%d 次）", why, int(wait.Round(time.Second)/time.Second), attempt+1, maxAttempts))
 }
 
 func retryWithBackoff[T any](ctx context.Context, cfg retryConfig, operation func() (T, error)) (T, error) {

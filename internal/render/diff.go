@@ -28,12 +28,12 @@ const (
 	diffMaxCells = 4_000_000
 )
 
-// Diff computes the line diff from old to new.
-func Diff(old, new string) LineDiff {
-	if old == new {
+// Diff computes the line diff from old to newText.
+func Diff(old, newText string) LineDiff {
+	if old == newText {
 		return LineDiff{}
 	}
-	a, b := splitDiffLines(old), splitDiffLines(new)
+	a, b := splitDiffLines(old), splitDiffLines(newText)
 
 	// Common prefix and suffix need no table.
 	pre := 0

@@ -487,7 +487,7 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 			// An overflow was already reported before the compact-and-retry;
 			// the retry's failure is the same problem, quoted, not recorded.
 			code, _ := diagnostic.Classify(err, diagnostic.Context{})
-			if !(t.compactedForLength && code == diagnostic.ErrAPIContextLength) {
+			if !t.compactedForLength || code != diagnostic.ErrAPIContextLength {
 				ev := diagnostic.ReportError(err, e.diagContext(modelName, ""))
 				code = ev.Code
 			}

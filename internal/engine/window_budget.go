@@ -29,8 +29,8 @@ func windowScale(model string) float64 {
 	return float64(w) / float64(injectionReferenceWindow)
 }
 
-func scaledBytes(max, floor int, model string) int {
-	n := int(float64(max) * windowScale(model))
+func scaledBytes(limit, floor int, model string) int {
+	n := int(float64(limit) * windowScale(model))
 	if n < floor {
 		n = floor
 	}

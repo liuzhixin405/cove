@@ -124,8 +124,8 @@ func TestToolOutputLimitShrinksForSmallWindows(t *testing.T) {
 	api.ClearModelContextWindows()
 	t.Cleanup(api.ClearModelContextWindows)
 	api.SetModelContextWindow("tiny-local", 16384)
-	if got, max := toolOutputLimit("read", "tiny-local"), toolResultBudgetTokens("tiny-local"); got > max {
-		t.Fatalf("read limit %d exceeds the window's tool result budget %d", got, max)
+	if got, budget := toolOutputLimit("read", "tiny-local"), toolResultBudgetTokens("tiny-local"); got > budget {
+		t.Fatalf("read limit %d exceeds the window's tool result budget %d", got, budget)
 	}
 	if got := toolOutputLimit("read", "unknown-model"); got != 6000 {
 		t.Fatalf("read limit for the default window = %d, want the tuned 6000", got)

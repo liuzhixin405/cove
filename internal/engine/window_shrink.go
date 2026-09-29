@@ -46,13 +46,13 @@ func (e *Engine) shrinkForWindow(target int) bool {
 	e.updateTokenCount()
 
 	if e.totalTokens > target {
-		cap := toolResultBudgetTokens(model) / 4
-		if cap < 300 {
-			cap = 300
+		capTokens := toolResultBudgetTokens(model) / 4
+		if capTokens < 300 {
+			capTokens = 300
 		}
 		idx := make([]int, 0, len(e.messages))
 		for i, m := range e.messages {
-			if m.Role == "tool" && token.Estimate(m.Content) > cap {
+			if m.Role == "tool" && token.Estimate(m.Content) > capTokens {
 				idx = append(idx, i)
 			}
 		}
@@ -62,8 +62,8 @@ func (e *Engine) shrinkForWindow(target int) bool {
 		for _, i := range idx {
 			m := &e.messages[i]
 			est := token.Estimate(m.Content)
-			m.Content = token.TruncateMiddle(m.Content, cap) +
-				"\n[tool result cut from about " + itoa(est) + " to " + itoa(cap) + " tokens to fit the context window; re-run the tool with a narrower range if the cut part matters.]"
+			m.Content = token.TruncateMiddle(m.Content, capTokens) +
+				"\n[tool result cut from about " + itoa(est) + " to " + itoa(capTokens) + " tokens to fit the context window; re-run the tool with a narrower range if the cut part matters.]"
 			e.updateTokenCount()
 			if e.totalTokens <= target {
 				break

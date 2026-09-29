@@ -49,7 +49,8 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		print:   func(s string) { outln(s) },
 		enqueue: func(msg api.Message) { runHeadlessTurn(eng, msg) },
 	}
-	cmdReg = fe.install(cmdReg)
+	// 前端已持有该注册表并由它分发；返回值是同一个注册表，此路径其后不再使用。
+	fe.install(cmdReg)
 
 	first := true
 	for scanner.Scan() {

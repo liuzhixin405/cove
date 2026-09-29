@@ -2,6 +2,7 @@ package repl
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -79,7 +80,7 @@ var (
 // SetQueuedCount records how many tasks are queued behind the running one
 // and redraws the pinned row so the note changes at once.
 func SetQueuedCount(n int) {
-	queuedCount.Store(int32(n))
+	queuedCount.Store(counterFrom(n))
 	redrawPinned()
 }
 
@@ -87,8 +88,22 @@ func SetQueuedCount(n int) {
 // task and await its next model call, and redraws the pinned row: the note
 // used to linger until the next keystroke after the model consumed them.
 func SetSteerCount(n int) {
-	steerCount.Store(int32(n))
+	steerCount.Store(counterFrom(n))
 	redrawPinned()
+}
+
+// counterFrom narrows a caller's count to the int32 the pinned row's atomics
+// hold. The values come from a task list and from keypresses, so saturation is
+// theoretical — the clamp is here because the conversion is otherwise
+// unchecked.
+func counterFrom(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(n)
 }
 
 // redrawPinned redraws the pinned row when there is one. Callers hold no
