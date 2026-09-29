@@ -120,9 +120,11 @@ func TestWriteThroughSymlinkKeepsTheLink(t *testing.T) {
 	}
 }
 
-// A dangling link inside the project can point anywhere, including outside it;
-// the path check cannot resolve it, so write must not follow it.
-func TestWriteRefusesDanglingSymlink(t *testing.T) {
+// A dangling link inside the project can point anywhere, including outside
+// it: the sandbox resolves the link as far as it exists, sees the target
+// outside, and refuses before the write tool's own check. Either way the link
+// must not be followed, or write would create a file outside the project.
+func TestWriteRefusesDanglingSymlinkOutOfTheProject(t *testing.T) {
 	dir := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "planted.txt")
 	link := filepath.Join(dir, "a.txt")
@@ -131,10 +133,30 @@ func TestWriteRefusesDanglingSymlink(t *testing.T) {
 	}
 
 	res := callTool(t, NewWriteTool(), Input{"filePath": link, "content": "x\n"}, Context{Cwd: dir})
+	if !res.IsError || !strings.Contains(res.Data, "path outside working directory") {
+		t.Fatalf("write through a dangling link = %q, want the sandbox refusal", res.Data)
+	}
+	if _, err := os.Stat(outside); err == nil {
+		t.Fatal("the link target was created")
+	}
+}
+
+// A dangling link whose target sits inside the project passes the sandbox, so
+// replaceFile's own check is what refuses it: following the link would create
+// the file it names, where the user asked to write the link.
+func TestWriteRefusesDanglingSymlinkInsideTheProject(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "missing.txt")
+	link := filepath.Join(dir, "a.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	res := callTool(t, NewWriteTool(), Input{"filePath": link, "content": "x\n"}, Context{Cwd: dir})
 	if !res.IsError || !strings.Contains(res.Data, "symbolic link") {
 		t.Fatalf("write through a dangling link = %q, want it refused", res.Data)
 	}
-	if _, err := os.Stat(outside); err == nil {
+	if _, err := os.Stat(target); err == nil {
 		t.Fatal("the link target was created")
 	}
 }

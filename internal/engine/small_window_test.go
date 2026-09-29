@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 
@@ -101,15 +102,27 @@ func TestToolResultsAreCappedToTheWindow(t *testing.T) {
 }
 
 // The automatic repo map excerpt describes the current repository; a task
-// that names a directory elsewhere gets none of it.
+// that names a directory elsewhere gets none of it. The paths are the flavour
+// this platform's filepath recognises: off Windows a "D:\..." root is a
+// relative name, and nothing under it can be "inside".
 func TestRepoMapExcerptSkippedWhenTheTaskTargetsAnotherDirectory(t *testing.T) {
-	root := `D:\github\cove-main`
+	root := "/home/me/cove-main"
 	cases := map[string]bool{
-		`D:\github\agent 在该目录写一个netcore的agent框架的项目`:              true,
-		`把 D:\github\cove-main\internal\engine\engine.go 里的函数拆开`: false,
-		`/home/me/other-project 下建一个脚本`:                          true,
-		`修复 internal/engine/turn.go 的报错`:                         false,
-		`d:\GitHub\Cove-Main\docs 目录整理一下`:                        false,
+		`/home/me/agent 在该目录写一个 netcore 的 agent 框架的项目`:          true,
+		`把 /home/me/cove-main/internal/engine/engine.go 里的函数拆开`: false,
+		`/home/me/cove-main/docs 目录整理一下`:                        false,
+		`/opt/other-project 下建一个脚本`:                             true,
+		`修复 internal/engine/turn.go 的报错`:                        false,
+	}
+	if runtime.GOOS == "windows" {
+		root = `D:\github\cove-main`
+		cases = map[string]bool{
+			`D:\github\agent 在该目录写一个 netcore 的 agent 框架的项目`:          true,
+			`把 D:\github\cove-main\internal\engine\engine.go 里的函数拆开`: false,
+			`d:\GitHub\Cove-Main\docs 目录整理一下`:                        false, // case-insensitive on Windows
+			`E:\other-project 下建一个脚本`:                                true,
+			`修复 internal/engine/turn.go 的报错`:                         false,
+		}
 	}
 	for q, want := range cases {
 		if got := queryTargetsOtherDirectory(q, root); got != want {

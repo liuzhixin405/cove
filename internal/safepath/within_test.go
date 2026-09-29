@@ -84,7 +84,14 @@ func TestWithinLinkChainTooLongIsOutside(t *testing.T) {
 // Same, with the file system faked: a link that points at itself loops
 // until the hop limit, and the result is "outside" (fail closed).
 func TestWithinLinkLoopFailsClosed(t *testing.T) {
-	root := t.TempDir()
+	// The faked link is matched by its exact path, so the path handed to
+	// Within must be the one the file system reports. On macOS t.TempDir()
+	// lives under /var, which is a symlink to /private/var: without this the
+	// fake never fires and the loop is never seen.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	loop := filepath.Join(root, "loop")
 	origStat, origRead := linkMode, readLink
 	t.Cleanup(func() { linkMode, readLink = origStat, origRead })

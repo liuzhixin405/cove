@@ -203,7 +203,10 @@ func TestE2E_OutsideDirectoryRequestGetsACdHintUpFront(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := startREPL(t)
-	s.Type(other + " 在该目录写一个 netcore 的 agent 框架")
+	// The path must not open the line: off Windows the temporary home is an
+	// absolute path, and a line starting with "/" is read as a slash command
+	// ("未知命令: /var/...") instead of a request naming a directory.
+	s.Type("请在 " + other + " 这个目录写一个 netcore 的 agent 框架")
 	s.WaitFor("/cd "+other, e2eTimeout)
 	s.WaitFor("请先切换目录", e2eTimeout)
 }
