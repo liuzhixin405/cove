@@ -3,7 +3,7 @@ package engine
 import (
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 func TestTouchPathsFor(t *testing.T) {

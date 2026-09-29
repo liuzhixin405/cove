@@ -19,7 +19,7 @@ import (
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // chromeAvailable reports whether headless Chrome rendering is compiled in.

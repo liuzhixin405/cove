@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 func TestAnnouncedNextStepWithoutAction(t *testing.T) {

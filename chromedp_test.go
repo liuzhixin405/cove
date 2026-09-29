@@ -5,7 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/liuzhixin405/cove/internal/browser"
+	"github.com/liuzhixin405/cove-agent/internal/browser"
 	"time"
 )
 

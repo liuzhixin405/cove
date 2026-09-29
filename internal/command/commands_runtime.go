@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 func (c *DoctorCmd) Name() string        { return "doctor" }

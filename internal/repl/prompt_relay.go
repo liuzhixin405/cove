@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 var permInputCh chan<- string

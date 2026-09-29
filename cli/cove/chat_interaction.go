@@ -9,12 +9,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/render"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/uiout"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/uiout"
 )
 
 func isTransientRequestError(err error) bool {

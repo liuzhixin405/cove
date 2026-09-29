@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	ctxt "github.com/liuzhixin405/cove/internal/context"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
 )
 
 // Collect no longer builds the file tree and repo map; /context computes them

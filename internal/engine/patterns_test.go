@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // ===========================================================================

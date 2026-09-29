@@ -3,7 +3,7 @@ package render
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/textmode"
+	"github.com/liuzhixin405/cove-agent/internal/textmode"
 )
 
 // Streaming Markdown for the model's answer.

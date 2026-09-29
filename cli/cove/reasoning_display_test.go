@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // reasoningRunner streams a long reasoning trace and then a short answer, the

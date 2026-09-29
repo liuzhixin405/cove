@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 type State int

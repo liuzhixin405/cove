@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/delegate"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/delegate"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // DepPrefix is the convention used in todowrite "content" fields

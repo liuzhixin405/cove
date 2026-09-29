@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/command"
-	"github.com/liuzhixin405/cove/internal/plugin"
+	"github.com/liuzhixin405/cove-agent/internal/command"
+	"github.com/liuzhixin405/cove-agent/internal/plugin"
 )
 
 type stubCommand struct{ name string }

@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api/adapter"
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/api/adapter"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 type anthropicProvider struct {

@@ -3,7 +3,7 @@ package permission
 import (
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // countTokenize swaps the classifier's tokenizer for a counting wrapper.

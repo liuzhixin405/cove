@@ -3,7 +3,7 @@
 package main
 
 import (
-	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
 )
 
 func main() {

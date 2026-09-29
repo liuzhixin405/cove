@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // EmbeddingProvider returns vector embeddings for given texts.

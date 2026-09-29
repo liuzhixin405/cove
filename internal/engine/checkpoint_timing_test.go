@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/checkpoint"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/checkpoint"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // fileWriteTool is a "write" that really writes, immediately, to its path.

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // firstLineMeta decodes the .jsonl first line — the fallback metadata used

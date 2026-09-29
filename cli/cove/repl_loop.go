@@ -12,15 +12,15 @@ import (
 
 	"github.com/charmbracelet/x/term"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/command"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/command"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/plugin"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // replInteractive 为 true 时表示处于交互式 REPL，主循环会经 TakePermInputCh

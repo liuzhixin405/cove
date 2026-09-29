@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safeurl"
+	"github.com/liuzhixin405/cove-agent/internal/safeurl"
 )
 
 // shouldBlockRequest reports whether headless Chrome must refuse a request the

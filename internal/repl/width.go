@@ -5,7 +5,7 @@ package repl
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // runeCellWidth is how many terminal columns r takes on the input line: the

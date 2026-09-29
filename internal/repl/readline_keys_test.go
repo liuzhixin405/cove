@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // captureStdout swaps os.Stdout (every write in this package goes through

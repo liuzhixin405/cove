@@ -9,8 +9,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 // newTestNotes builds a SessionNotes rooted in a temp project dir. HOME and

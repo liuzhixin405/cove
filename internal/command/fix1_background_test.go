@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 // Fix round 1 (item 2): the start notice used to count sessions after the

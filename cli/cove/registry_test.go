@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
 )
 
 func registeredNames(goos string) map[string]bool {

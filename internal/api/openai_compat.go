@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api/adapter"
+	"github.com/liuzhixin405/cove-agent/internal/api/adapter"
 )
 
 type openAICompatProvider struct {

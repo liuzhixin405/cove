@@ -8,7 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // Per-turn caps of every prompt the engine injects on its own ("nudges").

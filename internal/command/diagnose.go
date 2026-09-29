@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/textutil"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 type diagnoseCmd struct{}

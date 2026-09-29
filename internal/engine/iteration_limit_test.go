@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // alwaysToolProvider asks for one read_tool call on every request until

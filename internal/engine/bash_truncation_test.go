@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // The bash tool appends stderr and the exit code after stdout. Keeping only

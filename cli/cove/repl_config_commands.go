@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 func handleBuiltinConfigCommand(input string, cfg *config.Config, eng *engine.Engine) bool {

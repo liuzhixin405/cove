@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 // reviewEngine returns an engine whose memory store lives in a temporary HOME.

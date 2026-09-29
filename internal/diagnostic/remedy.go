@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // Remedies: the actions the diagnostic layer takes itself when an error is

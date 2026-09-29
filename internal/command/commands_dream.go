@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
 )
 
 func (c *DreamCmd) Name() string        { return "dream" }

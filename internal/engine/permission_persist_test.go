@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 // A "[p] 本项目记住" answer is written to policies.json and applies to

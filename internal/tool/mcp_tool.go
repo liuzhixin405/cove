@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 type mcpPoolView interface {

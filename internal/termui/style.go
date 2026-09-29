@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/render"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // maxPromptDescBytes bounds the description in the permission box. It is far

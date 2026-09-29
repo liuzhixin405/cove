@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // A request over the model's context window used to end the turn with an

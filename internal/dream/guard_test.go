@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 func TestDreamWriteRefusesInjectedContent(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // manualFlags returns the flags in the first column of USER_MANUAL's 启动参数

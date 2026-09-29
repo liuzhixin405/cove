@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
 )
 
 // stallThreshold is how long a single stage may go without making progress

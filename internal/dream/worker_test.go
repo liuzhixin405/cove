@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // fakeProvider answers every Chat from a script; once the script runs out it

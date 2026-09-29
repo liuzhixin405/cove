@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 )
 
 // A local llama.cpp with -c 16384 rejects the first request. The person

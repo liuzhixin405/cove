@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 // policies.json lives in the config directory, like config.json: with

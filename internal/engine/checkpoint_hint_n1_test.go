@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/checkpoint"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/checkpoint"
 )
 
 // A turn that wrote a file under a fresh checkpoint says so in the summary

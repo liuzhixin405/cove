@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 )
 
 // This file used to hold TestCheckConfigExistsCreatesRicherDefaultConfig,

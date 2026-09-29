@@ -11,11 +11,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 func handleExport(input string, eng *engine.Engine) {

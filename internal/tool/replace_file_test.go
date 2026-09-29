@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 func assertNoTempFiles(t *testing.T, dir string) {

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 // VerifyResult captures the outcome of running one configured verification

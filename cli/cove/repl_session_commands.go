@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
 )
 
 func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *bool) bool {

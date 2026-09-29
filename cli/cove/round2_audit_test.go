@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/uiout"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/uiout"
 )
 
 // Commands that rewrite engine state must not run while a task goroutine is

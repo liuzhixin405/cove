@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // execute_plan's max_agents reaches the executor through the context and caps

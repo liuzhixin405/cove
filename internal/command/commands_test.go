@@ -8,14 +8,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/plugin"
+	"github.com/liuzhixin405/cove-agent/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 type fakeCostTracker struct{ summary string }

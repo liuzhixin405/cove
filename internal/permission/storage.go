@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 // FilePolicyStorage persists policy rules to a JSON file.

@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/plugin"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 func (c *McpCmd) Name() string        { return "mcp" }

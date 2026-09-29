@@ -3,7 +3,7 @@ package permission
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // Command groups: one "always allow" answer covers a tool's everyday

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 const testWrapUp = "已完成：读取了三个文件。未完成：修改。建议下一步：继续修改。"

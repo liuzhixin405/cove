@@ -3,10 +3,10 @@ package main
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // diagRuntime is what the diagnostic layer's remedies may do in the

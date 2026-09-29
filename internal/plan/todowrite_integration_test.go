@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 func todowrite(t *testing.T, rt *tool.Runtime, todos ...map[string]any) string {

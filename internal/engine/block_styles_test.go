@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 // The glyph set used to be chosen during package initialization, which runs

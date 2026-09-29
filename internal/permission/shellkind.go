@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 // ShellKind is the quoting family of the interpreter a shell tool runs its

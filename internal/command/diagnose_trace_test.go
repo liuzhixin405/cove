@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/trace"
+	"github.com/liuzhixin405/cove-agent/internal/trace"
 )
 
 func TestFormatTraceEventRendersEachKindOnOneLine(t *testing.T) {

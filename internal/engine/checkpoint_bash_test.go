@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/checkpoint"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/checkpoint"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // fakeShellTool is a "bash" whose commands are interpreted in-process: "rm X"

@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 )
 
 func TestNewError(t *testing.T) {

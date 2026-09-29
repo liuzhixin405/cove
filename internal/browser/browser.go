@@ -22,8 +22,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/safeurl"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/safeurl"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // ErrChromeUnavailable is returned by headless rendering when the binary was

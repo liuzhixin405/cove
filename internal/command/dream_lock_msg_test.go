@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
 )
 
 // Final fix (Minor 6): the lock a completed run leaves behind is this

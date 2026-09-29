@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 // MaskingResult holds metrics about an output masking operation.

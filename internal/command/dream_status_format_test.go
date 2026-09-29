@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
 )
 
 // /dream shows the trigger mode and the last session-end worker's result;

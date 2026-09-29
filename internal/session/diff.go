@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // SessionView is a lightweight snapshot of a conversation at a point in time.

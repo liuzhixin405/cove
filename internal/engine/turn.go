@@ -13,11 +13,11 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/delegate"
-	"github.com/liuzhixin405/cove/internal/repomap"
-	"github.com/liuzhixin405/cove/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/delegate"
+	"github.com/liuzhixin405/cove-agent/internal/repomap"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // ---------------------------------------------------------------------------

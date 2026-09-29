@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // User-facing stdout output for the CLI.

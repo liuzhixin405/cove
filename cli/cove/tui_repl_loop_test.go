@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
 )
 
 // Ctrl+C while the approval box was up cancelled the task's context, but the

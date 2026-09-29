@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 // gitCommand builds a git invocation for plugin and marketplace work.

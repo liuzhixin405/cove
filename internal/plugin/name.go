@@ -1,6 +1,6 @@
 package plugin
 
-import "github.com/liuzhixin405/cove/internal/safepath"
+import "github.com/liuzhixin405/cove-agent/internal/safepath"
 
 // maxPluginNameLen is re-exported for tests that assert the boundary.
 const maxPluginNameLen = safepath.MaxNameLen

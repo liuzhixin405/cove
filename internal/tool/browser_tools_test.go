@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/browser"
+	"github.com/liuzhixin405/cove-agent/internal/browser"
 )
 
 // TestBrowserCaptureAliasAsksLikeScreenshot: Call accepts "capture" as an

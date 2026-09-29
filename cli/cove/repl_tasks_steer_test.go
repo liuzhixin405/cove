@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
 )
 
 // steerTestEngine is a real engine whose files all land in temp dirs; the

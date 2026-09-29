@@ -3,7 +3,7 @@ package permission
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // simpleCommands is the tokenizer the classifier uses; a variable so a test

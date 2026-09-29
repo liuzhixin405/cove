@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safepath"
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
 )
 
 // TargetPath returns the file a write/edit call targets, trying the keys the

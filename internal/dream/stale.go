@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Stale-reference check: before each consolidation, every memory of the

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/uiout"
+	"github.com/liuzhixin405/cove-agent/internal/uiout"
 )
 
 // A finished edit shows "+N −M" and carries its diff for /x.

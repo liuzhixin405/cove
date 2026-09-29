@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 )
 
 // recordingProvider answers from a script and records every request.

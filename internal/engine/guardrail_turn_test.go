@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // The guardrail counters were never reset, so a tool that failed eight times

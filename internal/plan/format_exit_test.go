@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/delegate"
+	"github.com/liuzhixin405/cove-agent/internal/delegate"
 )
 
 func TestFormatResultSummarisesByExitReason(t *testing.T) {

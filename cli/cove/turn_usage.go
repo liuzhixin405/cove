@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
 )
 
 // turnUsage is what one turn has taken so far: the spinner shows it live

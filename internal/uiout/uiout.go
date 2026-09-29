@@ -27,7 +27,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 // Sink receives everything destined for the user's terminal.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 // Nobody can type into a command the model runs. `git commit` without -m used

@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 func chooseCompressionSplitAssistant(messages []api.Message, keepCount int) int {

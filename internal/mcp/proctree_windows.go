@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // procTree ties a stdio server and everything it spawns to a job object.

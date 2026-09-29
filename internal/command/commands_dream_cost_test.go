@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
 )
 
 func TestFormatDreamCost(t *testing.T) {

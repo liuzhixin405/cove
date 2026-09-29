@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // HintFiles that are looked for in subdirectories.

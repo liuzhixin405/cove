@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/liuzhixin405/cove/internal/permission"
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 )
 
 // Optional engine capabilities. EngineView stays small so tests and other

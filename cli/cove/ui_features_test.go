@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 func TestCompleteAtPath(t *testing.T) {

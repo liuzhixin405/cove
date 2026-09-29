@@ -10,14 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/fsatomic"
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/safepath"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // scanThrottle: when time-gate passes but session-gate doesn't, avoid scanning every turn.

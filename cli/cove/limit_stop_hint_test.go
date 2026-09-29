@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // Final fix (Minor 1): after the user answers "s" at the limit prompt the

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/extract"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/extract"
 )
 
 // panicProvider panics on every call.

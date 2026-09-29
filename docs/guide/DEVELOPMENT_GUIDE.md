@@ -61,7 +61,7 @@ AI API:        Anthropic API（主）/ OpenAI 兼容 API
 ```
 
 **核心依赖（来自 go.mod）**:
-- `github.com/liuzhixin405/cove` — 模块根路径
+- `github.com/liuzhixin405/cove-agent` — 模块根路径
 - Go 标准库为主，外部依赖极少（设计原则：最小依赖）
 
 ---

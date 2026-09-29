@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 // Everything the engine adds to a request on its own (repo map excerpt,

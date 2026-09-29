@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 func TestMemoryListShowsSource(t *testing.T) {

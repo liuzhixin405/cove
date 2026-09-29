@@ -8,9 +8,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/delegate"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/delegate"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // scriptedProvider is an api.Provider that answers every Chat with no tool

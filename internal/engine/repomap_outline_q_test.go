@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
-	"github.com/liuzhixin405/cove/internal/repomap"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/repomap"
 )
 
 func thisRepoRoot(t *testing.T) string {

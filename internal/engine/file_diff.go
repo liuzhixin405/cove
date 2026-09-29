@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 // What an edit or a write changed, for its tool block: the summary "+12 −3"

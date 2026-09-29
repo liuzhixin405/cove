@@ -73,7 +73,7 @@ Cove 是一个**在终端中运行的 AI 编程助手**。你输入自然语言�
 
 ```bash
 # 1. 克隆
-git clone https://github.com/liuzhixin405/cove
+git clone https://github.com/liuzhixin405/cove-agent
 cd cove/agent
 
 # 2. 配置 API Key（二选一）
@@ -1565,7 +1565,7 @@ package command
 
 import (
     "fmt"
-    "github.com/liuzhixin405/cove/internal/engine"
+    "github.com/liuzhixin405/cove-agent/internal/engine"
 )
 
 type statsCmd struct{}
@@ -1775,7 +1775,7 @@ func (a *Auditor) All() []Entry {
 
 `internal/engine/engine.go`:
 ```go
-import "github.com/liuzhixin405/cove/internal/audit"
+import "github.com/liuzhixin405/cove-agent/internal/audit"
 
 type Engine struct {
     // ... 现有字段
@@ -1877,7 +1877,7 @@ COVE_DEBUG=1 ./cove
 ### 在代码中加日志
 
 ```go
-import "github.com/liuzhixin405/cove/internal/log"
+import "github.com/liuzhixin405/cove-agent/internal/log"
 
 log.Debugf("variable = %v", value)
 log.Warnf("something suspicious: %v", err)

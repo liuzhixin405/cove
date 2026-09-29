@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // Important 1: when a nudge keeps the turn going, the second reply is

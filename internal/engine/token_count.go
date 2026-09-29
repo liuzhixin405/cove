@@ -3,8 +3,8 @@ package engine
 import (
 	"encoding/json"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 // Context-size accounting.

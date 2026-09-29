@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 func gbkBytes(t *testing.T, s string) []byte {

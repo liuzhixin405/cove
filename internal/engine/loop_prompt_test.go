@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // loopingEngine repeats the same mutating call until finishAfter requests

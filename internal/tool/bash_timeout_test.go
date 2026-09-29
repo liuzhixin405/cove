@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 

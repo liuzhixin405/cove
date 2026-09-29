@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 // replaceFile writes data to path for write and edit. It used to be a plain

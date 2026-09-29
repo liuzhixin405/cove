@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Context is what the place that saw an error knows about the call; every

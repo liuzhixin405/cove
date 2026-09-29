@@ -5,10 +5,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/extract"
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/extract"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // BackgroundSummary is what the turn-end background work did, for the one

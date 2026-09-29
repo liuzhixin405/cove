@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/repomap"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/repomap"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // subAgentContext is the project context every sub-agent (the agent tool and

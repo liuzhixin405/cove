@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 func TestContextBudgeter_EmptyContentIgnored(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // GenerateOnce is one tool-less call that stays out of the session history.

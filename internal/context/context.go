@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/repomap"
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/repomap"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 type ProjectContext struct {

@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/render"
-	"github.com/liuzhixin405/cove/internal/uiout"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/uiout"
 )
 
 func TestToolCallReachesTheSinkAsAnExpandableBlock(t *testing.T) {

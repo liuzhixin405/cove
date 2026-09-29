@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 func anyMessageContains(reqs []api.ChatRequest, text string) bool {

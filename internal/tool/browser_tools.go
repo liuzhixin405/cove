@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/browser"
+	"github.com/liuzhixin405/cove-agent/internal/browser"
 )
 
 // BrowserTool drives a (optionally headless-Chrome) browser to fetch

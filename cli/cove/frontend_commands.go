@@ -7,17 +7,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/command"
-	"github.com/liuzhixin405/cove/internal/config"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/plugin"
-	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/command"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/plugin"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // frontend is what the slash commands of an interactive or headless front

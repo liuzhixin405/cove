@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // New skills and the engine's extra lines (the checkpoint hint) are in the

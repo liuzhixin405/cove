@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
 )
 
 func TestCommandPrefixesPicksExecutableAndSubcommand(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/hooks"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/hooks"
 )
 
 // slowPending is a pendingWaiter whose background work takes delay.

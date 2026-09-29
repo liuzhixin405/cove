@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 func TestPlanModeTool(t *testing.T) {

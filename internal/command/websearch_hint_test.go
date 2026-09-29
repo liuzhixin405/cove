@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 )
 
 func TestWebSearchHint(t *testing.T) {

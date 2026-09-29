@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/extract"
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/extract"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 // A memory extracted at the end of one turn reaches the model on the next

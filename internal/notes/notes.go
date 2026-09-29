@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/fsatomic"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // SessionNotes maintains an auto-updating session_notes.md file that tracks

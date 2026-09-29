@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 // readNextMarkerRe matches the read tool's last line on a partial read.

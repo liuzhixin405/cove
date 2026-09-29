@@ -1,6 +1,6 @@
 package tool
 
-import "github.com/liuzhixin405/cove/internal/textutil"
+import "github.com/liuzhixin405/cove-agent/internal/textutil"
 
 func ensureRuntimeMaps(rt *Runtime) {
 	if rt.Tasks == nil {

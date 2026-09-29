@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // Kind classifies a block so the renderer can pick its gutter symbol and

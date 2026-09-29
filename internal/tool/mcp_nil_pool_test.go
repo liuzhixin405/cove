@@ -3,7 +3,7 @@ package tool
 import (
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
 )
 
 // A typed nil *mcp.Pool stored in the interface used to pass the nil check

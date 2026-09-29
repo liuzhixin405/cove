@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/token"
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
 // shrinkForWindow is the last resort when a request is over the model's

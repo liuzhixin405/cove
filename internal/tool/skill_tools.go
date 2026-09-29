@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/skills"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // --- skills_list ---

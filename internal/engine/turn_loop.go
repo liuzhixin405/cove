@@ -7,13 +7,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/textutil"
-	"github.com/liuzhixin405/cove/internal/trace"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/trace"
 )
 
 // One turn of the agent loop. RunMessageWithStream used to be one function

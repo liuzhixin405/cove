@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
 )
 
 // grep and glob name the directory they search with "path"; that touches the

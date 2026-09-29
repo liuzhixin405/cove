@@ -4,9 +4,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/hooks"
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/hooks"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 func TestParseDreamProjectFlag(t *testing.T) {

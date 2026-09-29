@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/safepath"
-	"github.com/liuzhixin405/cove/internal/safeurl"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
+	"github.com/liuzhixin405/cove-agent/internal/safeurl"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 type Skill struct {

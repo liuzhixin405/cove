@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 // WaitBackground (what cove -p calls before exiting) does not wait for the

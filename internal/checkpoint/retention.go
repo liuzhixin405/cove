@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Retention: each project keeps its newest keepCheckpoints checkpoints. The

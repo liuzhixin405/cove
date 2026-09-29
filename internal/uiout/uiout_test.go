@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 func TestWriterSinkRendersBlocksCollapsed(t *testing.T) {

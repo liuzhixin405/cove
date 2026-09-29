@@ -1,6 +1,6 @@
 package engine
 
-import "github.com/liuzhixin405/cove/internal/api"
+import "github.com/liuzhixin405/cove-agent/internal/api"
 
 // touchPathsFor returns the filesystem paths a tool call gives the model new
 // information about.

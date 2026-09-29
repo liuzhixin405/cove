@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/repl"
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // Ctrl+C while the question tool waits on its first of two questions ends

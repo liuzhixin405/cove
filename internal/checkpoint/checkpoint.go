@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Manager handles file system checkpoints using a git shadow store.

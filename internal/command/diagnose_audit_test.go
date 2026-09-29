@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
 )
 
 // /diagnose codes grouped the codes by category but listed each group in Go's

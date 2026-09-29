@@ -1,6 +1,6 @@
 package engine
 
-import "github.com/liuzhixin405/cove/internal/api"
+import "github.com/liuzhixin405/cove-agent/internal/api"
 
 // hasToolCalls reports whether the model requested one or more tool calls.
 func hasToolCalls(resp *api.ChatResponse) bool {

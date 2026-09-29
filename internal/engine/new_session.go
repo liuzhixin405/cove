@@ -5,9 +5,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/cost"
-	"github.com/liuzhixin405/cove/internal/guardrail"
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/guardrail"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 )
 
 // resumeBackgroundWait bounds how long ResumeSession waits for the previous

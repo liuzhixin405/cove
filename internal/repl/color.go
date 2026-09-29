@@ -1,6 +1,6 @@
 package repl
 
-import "github.com/liuzhixin405/cove/internal/termui"
+import "github.com/liuzhixin405/cove-agent/internal/termui"
 
 // ANSI color codes: termui's, so the two packages cannot drift apart (they
 // were two copies of the same table). The spinner, walking indicator,

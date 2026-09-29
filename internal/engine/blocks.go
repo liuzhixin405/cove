@@ -12,10 +12,10 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/liuzhixin405/cove/internal/render"
-	"github.com/liuzhixin405/cove/internal/textmode"
-	"github.com/liuzhixin405/cove/internal/textutil"
-	"github.com/liuzhixin405/cove/internal/uiout"
+	"github.com/liuzhixin405/cove-agent/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/textmode"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/uiout"
 )
 
 // Structured conversation events.

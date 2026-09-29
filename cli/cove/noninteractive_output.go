@@ -5,8 +5,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 // wireNonInteractiveOutput gives a -p or headless run the engine's own

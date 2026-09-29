@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/repomap"
+	"github.com/liuzhixin405/cove-agent/internal/repomap"
 )
 
 // repoMapToolMaxBytes caps one repo_map result.

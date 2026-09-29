@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // A reasoning model spends part of max_tokens thinking before it answers. At

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	ctxt "github.com/liuzhixin405/cove/internal/context"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
 )
 
 // A turn only needs fresh git state for its <environment> note; the file tree

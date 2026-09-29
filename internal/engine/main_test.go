@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/checkpoint"
+	"github.com/liuzhixin405/cove-agent/internal/checkpoint"
 )
 
 // TestMain gives the package a throwaway home and config directory, so New,

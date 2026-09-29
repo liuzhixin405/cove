@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 // "a" for the MCP proxy tool used to add {ToolPattern: "mcp"}, which allowed

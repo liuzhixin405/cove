@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // IsShellTool reports whether a tool runs its "command" input through a shell,

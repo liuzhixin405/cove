@@ -3,7 +3,7 @@ package render
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // Code blocks in answers are coloured line by line: keywords, strings,

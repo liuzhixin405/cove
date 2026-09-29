@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/textmode"
+	"github.com/liuzhixin405/cove-agent/internal/textmode"
 )
 
 var consoleMu sync.Mutex

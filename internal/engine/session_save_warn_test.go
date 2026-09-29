@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/log"
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 )
 
 // A failed session save is logged, not dropped: the conversation would

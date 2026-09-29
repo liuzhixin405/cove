@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 type Price struct {

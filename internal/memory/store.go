@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
-	"github.com/liuzhixin405/cove/internal/safety"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/safety"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 const (

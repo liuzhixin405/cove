@@ -3,10 +3,10 @@ package main
 import (
 	"runtime"
 
-	"github.com/liuzhixin405/cove/internal/command"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/mcp"
-	"github.com/liuzhixin405/cove/internal/tool"
+	"github.com/liuzhixin405/cove-agent/internal/command"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
 
 // toolOptions decides which optional tools are registered.

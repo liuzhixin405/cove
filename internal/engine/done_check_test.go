@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // namedProvider is a seqProvider reporting another provider name.

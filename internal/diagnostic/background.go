@@ -11,9 +11,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 )
 
 // BackgroundStatus is what the "后台学习" item reports: the auto-dream gates

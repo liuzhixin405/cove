@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // gc must not use --prune=now: objects of a checkpoint being written (added,

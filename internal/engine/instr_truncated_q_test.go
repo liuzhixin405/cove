@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
 )
 
 // Project instruction files over memory.MaxInstructionBytes are clipped; the

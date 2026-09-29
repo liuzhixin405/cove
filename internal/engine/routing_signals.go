@@ -3,7 +3,7 @@ package engine
 import (
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/cost"
+	"github.com/liuzhixin405/cove-agent/internal/cost"
 )
 
 // fastModelOutcomeWindow is a small ring buffer recording whether recent

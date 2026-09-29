@@ -17,22 +17,22 @@ import (
 
 	"syscall"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 
-	"github.com/liuzhixin405/cove/internal/command"
+	"github.com/liuzhixin405/cove-agent/internal/command"
 
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 
-	"github.com/liuzhixin405/cove/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
 
-	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 
-	"github.com/liuzhixin405/cove/internal/termui"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 
-	"github.com/liuzhixin405/cove/internal/skills"
+	"github.com/liuzhixin405/cove-agent/internal/skills"
 )
 
 type providerReloader interface {

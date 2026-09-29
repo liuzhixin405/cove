@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/safepath"
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
 )
 
 // outsideWorkingDirectoryError is the refusal for a path outside root. The

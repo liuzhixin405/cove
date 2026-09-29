@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/dream"
-	"github.com/liuzhixin405/cove/internal/session"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/dream"
+	"github.com/liuzhixin405/cove-agent/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // cliAction is a flag that does one thing and exits instead of starting a

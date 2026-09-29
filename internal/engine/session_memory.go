@@ -3,8 +3,8 @@ package engine
 import (
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/memory"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // sessionMemoryNoteMaxBytes caps the note that carries this session's new

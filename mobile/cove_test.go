@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // fakeProvider streams a fixed reasoning and answer, the way the real

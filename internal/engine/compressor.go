@@ -3,13 +3,13 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // CompressResult holds metrics about a compression operation.

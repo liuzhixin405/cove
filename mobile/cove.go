@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // ---------- exported types for gomobile / Kotlin ----------

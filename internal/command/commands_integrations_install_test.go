@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/mcp"
 )
 
 // TestMcpListShowsWhyAServerFailed: connection errors are only logged at debug

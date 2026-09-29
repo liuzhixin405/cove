@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 )
 
 // IsSessionFile reports whether name (a base name in the sessions directory)

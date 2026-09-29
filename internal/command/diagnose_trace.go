@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuzhixin405/cove/internal/trace"
+	"github.com/liuzhixin405/cove-agent/internal/trace"
 )
 
 // showTrace is "/diagnose trace [N]": the last N events of the interaction

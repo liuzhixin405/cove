@@ -1,6 +1,6 @@
 package engine
 
-import "github.com/liuzhixin405/cove/internal/api"
+import "github.com/liuzhixin405/cove-agent/internal/api"
 
 // streamCallbacks bundles optional stream event callbacks.
 type streamCallbacks struct {

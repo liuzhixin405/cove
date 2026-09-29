@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	ctxt "github.com/liuzhixin405/cove/internal/context"
+	ctxt "github.com/liuzhixin405/cove-agent/internal/context"
 )
 
 func (c *PermissionsCmd) Name() string        { return "permissions" }

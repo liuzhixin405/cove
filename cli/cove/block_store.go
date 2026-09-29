@@ -5,8 +5,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/engine"
-	"github.com/liuzhixin405/cove/internal/render"
+	"github.com/liuzhixin405/cove-agent/internal/engine"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 )
 
 // blockStore keeps the recent tool blocks of the session so "/x <id>" can

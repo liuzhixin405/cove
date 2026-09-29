@@ -16,8 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/liuzhixin405/cove/internal/shell"
-	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove-agent/internal/shell"
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 const (

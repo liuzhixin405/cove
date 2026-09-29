@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/session"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 )
 
 func saveHistoryRecord(t *testing.T, store *session.Store, id, cwd string) {

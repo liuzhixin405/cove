@@ -458,7 +458,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 const llamaOverflow = `{"error":{"code":400,"message":"request (17964 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":17964,"n_ctx":16384}}`
@@ -829,8 +829,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/log"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Context is what the place that saw an error knows about the call; every
@@ -1019,7 +1019,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 type stubRuntime struct {
@@ -1171,7 +1171,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/liuzhixin405/cove/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/api"
 )
 
 // Remedies: the actions the diagnostic layer takes itself when an error is
@@ -1288,8 +1288,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
 )
 
 // A turn that dies of context overflow leaves exactly one coded E2008 event
@@ -1506,10 +1506,10 @@ Expected: PASS。
 package main
 
 import (
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
-	"github.com/liuzhixin405/cove/internal/diagnostic"
-	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/diagnostic"
+	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
 
 // diagRuntime is what the diagnostic layer's remedies may do in the
@@ -1545,8 +1545,8 @@ package main
 import (
 	"testing"
 
-	"github.com/liuzhixin405/cove/internal/api"
-	"github.com/liuzhixin405/cove/internal/config"
+	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 )
 
 // context_window in config.json sizes compaction for a model cove cannot
@@ -1631,7 +1631,7 @@ func TestDiagnoseErrorsAcceptsOldLogLines(t *testing.T) {
 }
 ```
 
-`import` 增加 `"encoding/json"`, `"fmt"`, `"github.com/liuzhixin405/cove/internal/api"`, `"github.com/liuzhixin405/cove/internal/diagnostic"`。
+`import` 增加 `"encoding/json"`, `"fmt"`, `"github.com/liuzhixin405/cove-agent/internal/api"`, `"github.com/liuzhixin405/cove-agent/internal/diagnostic"`。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -1698,7 +1698,7 @@ func (c *diagnoseCmd) showRuntimeErrors() (Output, error) {
 }
 ```
 
-`runtimeReminder` 的每行改为同样带 `s.Code` 前缀（`code + s.Message`）；其余不变。`import` 增加 `"github.com/liuzhixin405/cove/internal/textutil"`。`archiveRuntimeLog` 在归档成功后调用 `diagnostic.ResetRemedyState()`。
+`runtimeReminder` 的每行改为同样带 `s.Code` 前缀（`code + s.Message`）；其余不变。`import` 增加 `"github.com/liuzhixin405/cove-agent/internal/textutil"`。`archiveRuntimeLog` 在归档成功后调用 `diagnostic.ResetRemedyState()`。
 
 - [ ] **Step 4: 运行 command 包**
 
