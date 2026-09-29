@@ -133,8 +133,11 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the shipped example config does not load: %v", err)
 	}
-	if cfg.Provider.Name != "anthropic" || cfg.MaxBudgetUsd != 10 {
-		t.Fatalf("example settings not applied: provider=%q budget=%v", cfg.Provider.Name, cfg.MaxBudgetUsd)
+	// The example ships active_profile "deepseek"; Load must resolve that
+	// profile's provider/model rather than leaving the built-in defaults.
+	if cfg.Provider.Name != "deepseek" || cfg.Model != "deepseek-v4-pro" || cfg.MaxBudgetUsd != 10 {
+		t.Fatalf("example settings not applied: provider=%q model=%q budget=%v",
+			cfg.Provider.Name, cfg.Model, cfg.MaxBudgetUsd)
 	}
 }
 
