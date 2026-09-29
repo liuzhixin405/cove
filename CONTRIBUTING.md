@@ -10,14 +10,14 @@
 
 ### 报告 Bug
 
-1. 在 [Issues](https://github.com/liuzhixin405/cove-agent/issues) 中搜索是否已有相同问题
+1. 在 [Issues](https://github.com/liuzhixin405/cove/issues) 中搜索是否已有相同问题
 2. 使用 **Bug Report** 模板创建新 issue
 3. 提供详细的复现步骤、期望行为和实际行为
 4. 附上 `cove --doctor` 的诊断输出（如适用）
 
 ### 功能请求
 
-1. 在 [Issues](https://github.com/liuzhixin405/cove-agent/issues) 中搜索类似请求
+1. 在 [Issues](https://github.com/liuzhixin405/cove/issues) 中搜索类似请求
 2. 使用 **Feature Request** 模板
 3. 描述使用场景和期望的解决方案
 
@@ -45,7 +45,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/liuzhixin405/cove-agent.git
+git clone https://github.com/liuzhixin405/cove.git
 cd cove
 
 # 运行测试
