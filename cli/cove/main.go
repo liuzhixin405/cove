@@ -490,6 +490,9 @@ func (a replEngineAdapter) SystemPrompt() string { return a.eng.SystemPrompt() }
 
 func (a replEngineAdapter) CostTracker() command.CostTrackerView { return a.eng.CostTracker() }
 
+// ContextUsage forwards Engine.ContextUsage for /context.
+func (a replEngineAdapter) ContextUsage() (tokens, window int) { return a.eng.ContextUsage() }
+
 // The commands look for these by type assertion on the view they are given.
 // The adapter used to forward only the five EngineView methods, so /undo,
 // /checkpoints and /ratelimit always answered "不可用" in the real program

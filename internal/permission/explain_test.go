@@ -16,23 +16,35 @@ func TestExplainUncovered(t *testing.T) {
 	m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandPrefix: "mkdir"})
 	m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandGroup: GroupGitRoutine})
 
-	cases := map[string]string{
-		"dotnet build":              "dotnet build",     // not remembered: names the command
-		"mkdir a && dotnet new sln": "dotnet new",       // the uncovered one of a compound line
-		"mkdir $(date +%F)":         "命令替换",             // substitution
-		"mkdir a > log.txt":         "重定向",              // writes a file
-		"sudo mkdir a":              "sudo",             // runner
-		"git push --force":          "git push --force", // in the group's tool but refused
-		"mkdir a; rm -rf b":         "rm",               // uncovered command named
+	// Each explanation names the remembered rule of a program the line runs,
+	// and only that one.
+	cases := []struct{ cmd, want, rule, notRule string }{
+		{"mkdir a && dotnet new sln", "dotnet new", `"mkdir"`, "git"},   // the uncovered one of a compound line
+		{"mkdir $(date +%F)", "命令替换", `"mkdir"`, "git"},                 // substitution
+		{"mkdir a > log.txt", "重定向", `"mkdir"`, "git"},                  // writes a file
+		{"sudo mkdir a", "sudo", `"mkdir"`, "git"},                      // runner
+		{"git push --force", "git push --force", "git 常规操作", `"mkdir"`}, // in the group's tool but refused
+		{"mkdir a; rm -rf b", "rm", `"mkdir"`, "git"},                   // uncovered command named
 	}
-	for cmd, want := range cases {
-		got := m.ExplainUncovered("bash", map[string]any{"command": cmd})
-		if !strings.Contains(got, want) {
-			t.Errorf("ExplainUncovered(%q) = %q, want it to mention %q", cmd, got, want)
+	for _, c := range cases {
+		got := m.ExplainUncovered("bash", map[string]any{"command": c.cmd})
+		if !strings.Contains(got, c.want) || !strings.Contains(got, c.rule) {
+			t.Errorf("ExplainUncovered(%q) = %q, want it to mention %q and the rule %s", c.cmd, got, c.want, c.rule)
 		}
-		if !strings.Contains(got, "mkdir") || !strings.Contains(got, "git 常规操作") {
-			t.Errorf("ExplainUncovered(%q) = %q does not list what is remembered", cmd, got)
+		if strings.Contains(got, c.notRule) {
+			t.Errorf("ExplainUncovered(%q) = %q names the unrelated rule %s", c.cmd, got, c.notRule)
 		}
+	}
+	// A line that runs none of the remembered programs has no gap to
+	// explain: "sed … > s2.json" was said to fall outside a docref.exe rule.
+	// Only why it cannot be remembered at all is said.
+	m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandPrefix: `C:\Users\u\.cove\plugins\docref\bin\docref.exe`})
+	if got := m.ExplainUncovered("bash", map[string]any{"command": "dotnet build"}); got != "" {
+		t.Errorf("dotnet build = %q, want nothing: no remembered rule concerns it", got)
+	}
+	got := m.ExplainUncovered("bash", map[string]any{"command": `sed "s/a/b/" s.json > s2.json`})
+	if strings.Contains(got, "docref") || strings.Contains(got, "mkdir") || !strings.Contains(got, "重定向") || !strings.Contains(got, "s2.json") {
+		t.Errorf("sed > s2.json = %q, want the redirect named and no unrelated rule", got)
 	}
 	// A covered line has nothing to explain.
 	if got := m.ExplainUncovered("bash", map[string]any{"command": "mkdir a && git commit -m x"}); got != "" {

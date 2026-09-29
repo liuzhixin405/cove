@@ -30,17 +30,28 @@ type LineReader struct {
 	completionList []string
 	completionIdx  int
 	activeHint     string
+	// drawnRows and cursorRow describe a multi-row input drawn below the
+	// output (redrawMultiLocked): how many rows it takes and which one the
+	// cursor is on, so the next redraw or erase can go back to its top.
+	drawnRows int
+	cursorRow int
 }
 
 var ErrExit = fmt.Errorf("exit")
 var ErrInterrupt = fmt.Errorf("interrupt")
 
+// ErrEscape is a bare Esc on an empty input line: the front end interrupts
+// the running task with it (Esc on a line with text clears the text).
+var ErrEscape = fmt.Errorf("escape")
+
 func New(completer Completer) *LineReader {
 	lr := &LineReader{
 		completer:   completer,
-		placeholder: "(按 / 显示命令)",
+		placeholder: "(按 / 显示命令，Ctrl+J 换行)",
 	}
 	lr.SetPrompt(Prompt()) // derives promptWidth correctly (skips ANSI codes)
+	lr.history = loadHistory()
+	lr.histIdx = len(lr.history)
 	return lr
 }
 
@@ -67,7 +78,7 @@ func (lr *LineReader) ReadLine() (string, error) {
 		return lr.fallbackRead()
 	}
 	defer func() {
-		fmt.Print("\x1b[0m\x1b[?25h")
+		termPrint("\x1b[0m\x1b[?25h")
 		_ = term.Restore(int(os.Stdin.Fd()), oldState)
 	}()
 
@@ -80,8 +91,8 @@ func (lr *LineReader) ReadLine() (string, error) {
 	// Bracketed paste makes the terminal wrap pasted text in ESC[200~ …
 	// ESC[201~, so its newlines can be told apart from Enter. Terminals that
 	// do not support it ignore the request.
-	fmt.Print("\x1b[0m\x1b[?25h\x1b[?2004h")
-	defer fmt.Print("\x1b[?2004l")
+	termPrint("\x1b[0m\x1b[?25h\x1b[?2004h")
+	defer termPrint("\x1b[?2004l")
 
 	consoleMu.Lock()
 	activeReader = lr
@@ -117,19 +128,25 @@ func (lr *LineReader) editLine() (string, error) {
 			return lr.endOfInput(buf, err)
 		}
 
+		// A prompt waiting on a one-key answer (y/a/p/n, c/s, an option
+		// number) takes the key itself on an empty line: no Enter needed.
+		if len(buf) == 0 && lr.rawReader.Buffered() == 0 && promptKeyAnswers(r) {
+			return lr.submit([]rune{r}), nil
+		}
+
 		switch r {
 		case 3:
 			consoleMu.Lock()
 			lr.eraseLineLocked()
 			consoleMu.Unlock()
-			fmt.Print("\r\n")
+			termPrint("\r\n")
 			return "", ErrInterrupt
 		case 4:
 			if len(buf) == 0 {
 				consoleMu.Lock()
 				lr.eraseLineLocked()
 				consoleMu.Unlock()
-				fmt.Print("\r\n")
+				termPrint("\r\n")
 				return "", ErrExit
 			}
 		case '\r', '\n':
@@ -145,30 +162,42 @@ func (lr *LineReader) editLine() (string, error) {
 				lr.refresh(buf, cursor)
 				continue
 			}
-			line := string(buf)
-			consoleMu.Lock()
-			lr.eraseLineLocked()
-			// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容。
-			// 流式输出进行中：输入行钉在底部时，把内容回显到上方的输出流里（先另起一行，
-			// 不接在模型未完成的句子后面），让排队的指令在记录里可见；没有钉住时不回显，
-			// 否则会把提示符+内容插进流式文本里造成错乱。
-			switch {
-			case !streamingActive:
-				fmt.Print(lr.prompt + normalizeOutputNewlines(line) + "\r\n")
-			case pinned && line != "":
-				// An empty Enter is ignored by the main loop, so it leaves
-				// no trace here either; it used to print a bare prompt row
-				// into the model's output at every press.
-				breakStreamLineLocked()
-				fmt.Print(PromptRunning() + normalizeOutputNewlines(line) + "\r\n")
+			// Ctrl+J types a newline; so does Enter after a trailing "\"
+			// (shell-style continuation).
+			if r == '\n' {
+				buf, cursor = insertRunes(buf, cursor, []rune{'\n'})
+				lr.refresh(buf, cursor)
+				continue
 			}
-			consoleMu.Unlock()
-
-			if line != "" && (len(lr.history) == 0 || lr.history[len(lr.history)-1] != line) {
-				lr.history = append(lr.history, line)
+			if cursor == len(buf) && cursor > 0 && buf[cursor-1] == '\\' {
+				buf[cursor-1] = '\n'
+				lr.refresh(buf, cursor)
+				continue
 			}
-			lr.histIdx = len(lr.history)
-			return line, nil
+			return lr.submit(buf), nil
+		case 1: // Ctrl+A
+			cursor = 0
+			lr.redraw(buf, cursor)
+		case 5: // Ctrl+E
+			cursor = len(buf)
+			lr.redraw(buf, cursor)
+		case 11: // Ctrl+K: delete to the end
+			buf = buf[:cursor]
+			lr.refresh(buf, cursor)
+		case 21: // Ctrl+U: delete to the start
+			buf = append([]rune(nil), buf[cursor:]...)
+			cursor = 0
+			lr.refresh(buf, cursor)
+		case 23: // Ctrl+W: delete the word before the cursor
+			buf, cursor = deleteWordBack(buf, cursor)
+			lr.refresh(buf, cursor)
+		case 18: // Ctrl+R: search the history
+			if line, ok, err := lr.reverseSearch(buf); err != nil {
+				return lr.endOfInput(buf, err)
+			} else if ok {
+				buf, cursor = []rune(line), len([]rune(line))
+			}
+			lr.redraw(buf, cursor)
 		case 12:
 			// Ctrl+L clears the screen and keeps what is being typed.
 			consoleMu.Lock()
@@ -186,6 +215,20 @@ func (lr *LineReader) editLine() (string, error) {
 			}
 		case 27:
 			lr.resetCompletionCycle()
+			// A key's escape sequence arrives in one read; an ESC with nothing
+			// behind it is the Esc key. It clears the line, or on an empty
+			// line interrupts the running task.
+			if lr.rawReader.Buffered() == 0 && escInterruptEnabled() {
+				if len(buf) > 0 {
+					buf, cursor = nil, 0
+					lr.redraw(buf, cursor)
+					continue
+				}
+				consoleMu.Lock()
+				lr.eraseLineLocked()
+				consoleMu.Unlock()
+				return "", ErrEscape
+			}
 			if err := lr.handleEscape(&buf, &cursor); err != nil {
 				return lr.endOfInput(buf, err)
 			}
@@ -207,6 +250,37 @@ func (lr *LineReader) editLine() (string, error) {
 	}
 }
 
+// submit ends the line: erases the editor, echoes the line into the
+// transcript, records it in the history and returns it.
+func (lr *LineReader) submit(buf []rune) string {
+	line := string(buf)
+	consoleMu.Lock()
+	lr.eraseLineLocked()
+	// 关键点：在按下回车后，先把用户输入的内容打印到终端，使之成为历史可见内容。
+	// 流式输出进行中：输入行钉在底部时，把内容回显到上方的输出流里（先另起一行，
+	// 不接在模型未完成的句子后面），让排队的指令在记录里可见；没有钉住时不回显，
+	// 否则会把提示符+内容插进流式文本里造成错乱。
+	switch {
+	case !streamingActive:
+		termPrint(lr.prompt + normalizeOutputNewlines(line) + "\r\n")
+	case pinned && line != "":
+		// An empty Enter is ignored by the main loop, so it leaves
+		// no trace here either; it used to print a bare prompt row
+		// into the model's output at every press.
+		breakStreamLineLocked()
+		termPrint(PromptRunning() + normalizeOutputNewlines(line) + "\r\n")
+	}
+	consoleMu.Unlock()
+
+	// One-key prompt answers are not worth recalling.
+	if len([]rune(line)) > 1 && (len(lr.history) == 0 || lr.history[len(lr.history)-1] != line) {
+		lr.history = append(lr.history, line)
+		appendHistory(line)
+	}
+	lr.histIdx = len(lr.history)
+	return line
+}
+
 // rawInputBufferSize is large so that a pasted block normally arrives in one
 // buffer fill: the paste heuristic in editLine looks at what is buffered.
 const rawInputBufferSize = 64 * 1024
@@ -223,7 +297,7 @@ func (lr *LineReader) endOfInput(buf []rune, err error) (string, error) {
 	consoleMu.Lock()
 	lr.eraseLineLocked()
 	consoleMu.Unlock()
-	fmt.Print("\r\n")
+	termPrint("\r\n")
 	if len(buf) > 0 {
 		return string(buf), nil
 	}
@@ -270,7 +344,12 @@ func (lr *LineReader) eraseLineLocked() {
 		lr.lineDrawn = false
 		return
 	}
-	fmt.Print("\x1b[0m\x1b[?25h\r\x1b[2K")
+	if lr.drawnRows > 1 {
+		lr.clearRowsLocked()
+	} else {
+		termPrint("\x1b[0m\x1b[?25h\r\x1b[2K")
+		lr.drawnRows, lr.cursorRow = 0, 0
+	}
 	lr.lineDrawn = false
 }
 
@@ -288,22 +367,31 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	if err != nil || w < 20 {
 		w = 80
 	}
-	fmt.Print("\x1b[0m\x1b[?25h\r\x1b[2K")
+	// A multi-line or long input takes several rows (editing.go).
+	if lr.needsMultiRow(buf, w) {
+		lr.redrawMultiLocked(buf, cursor, w)
+		return
+	}
+	if lr.drawnRows > 1 {
+		lr.clearRowsLocked()
+	}
+	lr.drawnRows, lr.cursorRow = 1, 0
+	termPrint("\x1b[0m\x1b[?25h\r\x1b[2K")
 	maxVis := w - lr.promptWidth - 1
 	if maxVis < 1 {
 		maxVis = 1
 	}
 	shown := displayRunes(buf)
 	disp, cells, _, start := inputDisplayWindow(shown, cursor, maxVis)
-	fmt.Print(lr.prompt)
+	termPrint(lr.prompt)
 	if len(buf) == 0 && lr.placeholder != "" {
 		ph, _ := truncateRunesByCells([]rune(lr.placeholder), maxVis)
-		fmt.Print("\x1b[90m" + string(ph) + "\x1b[0m")
+		termPrint("\x1b[90m" + string(ph) + "\x1b[0m")
 	} else {
-		fmt.Print("\x1b[0m" + string(disp) + "\x1b[0m")
+		termPrint("\x1b[0m" + string(disp) + "\x1b[0m")
 		if lr.activeHint != "" {
 			rem := w - lr.promptWidth - cells - 1
-			fmt.Print(truncateAnsi(lr.activeHint, rem))
+			termPrint(truncateAnsi(lr.activeHint, rem))
 		}
 	}
 	// Position the cursor by re-emitting the prompt plus the visible text to the
@@ -311,9 +399,9 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	// width rules. This avoids the half-cell drift that plain column arithmetic
 	// (\x1b[NC) causes with East Asian ambiguous-width glyphs such as the prompt
 	// arrow when running in a CJK terminal.
-	fmt.Print("\r")
+	termPrint("\r")
 	left := shown[start:cursor]
-	fmt.Print(lr.prompt + "\x1b[0m" + string(left))
+	termPrint(lr.prompt + "\x1b[0m" + string(left))
 	lr.lineDrawn = true
 }
 
@@ -345,7 +433,7 @@ func (lr *LineReader) fallbackRead() (string, error) {
 	if lr.fallbackReader == nil {
 		lr.fallbackReader = bufio.NewReader(os.Stdin)
 	}
-	fmt.Print(lr.prompt)
+	termPrint(lr.prompt)
 	line, err := lr.fallbackReader.ReadString('\n')
 	if err != nil {
 		if err == io.EOF {
@@ -353,7 +441,7 @@ func (lr *LineReader) fallbackRead() (string, error) {
 			if trimmed != "" {
 				return trimmed, nil
 			}
-			fmt.Print("\n")
+			termPrint("\n")
 			return "", ErrExit
 		}
 		return "", err

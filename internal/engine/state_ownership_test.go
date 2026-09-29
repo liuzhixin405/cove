@@ -22,13 +22,13 @@ import (
 var (
 	conversationManaged = []string{
 		"messages", "sessionView", "systemPrompt", "totalTokens", "lastInputTokens", "usageMsgCount",
-		"session", "costBase", "fileHistory", "turnFilesChanged", "turnCheckpointed",
+		"session", "costBase", "fileHistory", "turnFilesChanged", "turnChangedFiles", "turnCheckpointed",
 		"pendingSteer", "pendingSteerN", "loopDetector", "guardrails",
 		"lastReviewMsgCount", "turnsSinceReview", "turnUsedWork", "conversationGen",
 		"newMemories", "shownMemories", "repoMapExcerpts", "injectedSkills",
 	}
 	projectScoped = []string{
-		"projCtx", "cpMgr", "verifyGate", "sessionNotes", "enhancedRepoMap", "subdirHints", "diskRules",
+		"projCtx", "cpMgr", "verifyGate", "sessionNotes", "repoIndex", "subdirHints", "diskRules",
 		"policyLoadErr",
 	}
 	processScoped = []string{
@@ -43,7 +43,7 @@ var (
 		"autoLearnOff", "dreamRunner", "fastOutcomes", "recordingEnabled", "recordingDir", "recordingSeq",
 		"recordingReady", "recordingMu", "replayEnabled", "replayDir", "replayResponses", "replayIndex",
 		"actMu", "acts", "actSeq", "provRef", "collectContext", "refreshGit", "costNoticeFor",
-		"repoMapMu", "reviewRunning", "nonInteractive", "skillMu", "requestOverhead", "smallWindowWarned",
+		"fileDiffs", "diffMu", "contextTokens", "turnModelSnap", "repoMapMu", "reviewRunning", "nonInteractive", "skillMu", "requestOverhead", "smallWindowWarned",
 	}
 )
 

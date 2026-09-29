@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/textmode"
 )
 
 var consoleMu sync.Mutex
@@ -104,7 +106,18 @@ func dest() io.Writer {
 func write(s string) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	_, _ = fmt.Fprint(dest(), s)
+	_, _ = fmt.Fprint(dest(), uncolor(s))
+}
+
+// noColor is the NO_COLOR setting, read once.
+var noColor = textmode.NoColor()
+
+// uncolor drops colour sequences from s under NO_COLOR.
+func uncolor(s string) string {
+	if noColor {
+		return textmode.StripSGR(s)
+	}
+	return s
 }
 
 func normalizeOutputNewlines(s string) string {

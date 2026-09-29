@@ -40,7 +40,7 @@ func (c *ProjectContext) RefreshGit() {
 	if c == nil || !c.IsGitRepo || c.GitRoot == "" {
 		return
 	}
-	branch := gitBranch(c.GitRoot)
+	branch := branchOf(c.GitRoot)
 	status := gitStatus(c.GitRoot)
 
 	c.mu.Lock()
@@ -70,7 +70,7 @@ func (c *ProjectContext) RefreshGitAll() {
 	var branch, status, log string
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); branch = gitBranch(c.GitRoot) }()
+	go func() { defer wg.Done(); branch = branchOf(c.GitRoot) }()
 	go func() { defer wg.Done(); status = gitStatus(c.GitRoot) }()
 	go func() { defer wg.Done(); log = gitLog(c.GitRoot) }()
 	wg.Wait()
@@ -130,17 +130,31 @@ func Collect() *ProjectContext {
 		Shell:    shell.Default().Describe(),
 	}
 	c.Cwd, _ = os.Getwd()
-	c.GitRoot = findGitRoot(c.Cwd)
+	// The root, the branch and the main branch are read from .git itself
+	// (gitdir.go). Each was a git process, and on Windows one costs
+	// 0.4–0.6 s: findGitRoot ran before the rest and detectMainBranch ran up
+	// to three in a row, so startup in a repository took about 3 s.
+	gd, root := findGitDir(c.Cwd)
+	if root == "" {
+		root = findGitRoot(c.Cwd) // GIT_DIR and other setups the walk does not see
+	}
+	c.GitRoot = root
 
-	// Collect the git facts in parallel.
+	// The facts only git can give, in parallel.
 	var wg sync.WaitGroup
 	if c.GitRoot != "" {
 		c.IsGitRepo = true
-		wg.Add(5)
-		go func() { defer wg.Done(); c.GitBranch = gitBranch(c.GitRoot) }()
+		if gd != "" {
+			c.GitBranch = headBranch(gd)
+			c.GitMain = mainBranch(gd)
+		} else {
+			wg.Add(2)
+			go func() { defer wg.Done(); c.GitBranch = gitBranch(c.GitRoot) }()
+			go func() { defer wg.Done(); c.GitMain = detectMainBranch(c.GitRoot) }()
+		}
+		wg.Add(3)
 		go func() { defer wg.Done(); c.GitStatus = gitStatus(c.GitRoot) }()
 		go func() { defer wg.Done(); c.GitLog = gitLog(c.GitRoot) }()
-		go func() { defer wg.Done(); c.GitMain = detectMainBranch(c.GitRoot) }()
 		go func() { defer wg.Done(); c.GitUser = gitUser(c.GitRoot) }()
 	}
 

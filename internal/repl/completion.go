@@ -11,6 +11,10 @@ func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {
 	const maxHints = 8
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
+	// Candidates are whole lines; the hint shows only the word being
+	// completed ("@internal/" rather than the sentence before it).
+	line := string(lr.renderBuf)
+	lead := line[:strings.LastIndexAny(line, " \t")+1]
 	printHints := func() string {
 		var sb strings.Builder
 		sb.WriteString("\x1b[90m  ")
@@ -21,6 +25,9 @@ func (lr *LineReader) showInlineSuggestions(suggestions []string, offset int) {
 			text := s
 			if idx := strings.IndexByte(s, '\t'); idx >= 0 {
 				text = s[:idx]
+			}
+			if lead != "" {
+				text = strings.TrimPrefix(text, lead)
 			}
 			sb.WriteString(text + "  ")
 		}

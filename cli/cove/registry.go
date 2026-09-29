@@ -50,9 +50,15 @@ func registerToolsFor(mcpPool *mcp.Pool, goos string) *tool.Registry {
 func registerToolsWith(mcpPool *mcp.Pool, o toolOptions) *tool.Registry {
 	r := tool.NewRegistry()
 
-	// Planning and workspace isolation.
-	r.Register(tool.NewPlanModeTool())
-	r.Register(tool.NewExitPlanModeTool())
+	// Planning and workspace isolation. Plan mode is left out where nobody
+	// can answer a prompt (-p, headless): leaving it takes the user's
+	// approval, so a model that entered it there could only give up — every
+	// edit and command after it was refused and the task ended with code
+	// pasted into the answer.
+	if o.interactive {
+		r.Register(tool.NewPlanModeTool())
+		r.Register(tool.NewExitPlanModeTool())
+	}
 	r.Register(tool.NewEnterWorktreeTool())
 	r.Register(tool.NewExitWorktreeTool())
 

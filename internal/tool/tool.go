@@ -111,6 +111,7 @@ type TaskRecord struct {
 	Title       string
 	Description string
 	Status      string
+	Priority    string // todowrite's priority (high, medium, low)
 	Output      string
 	Kind        string
 	ParentID    string

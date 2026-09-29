@@ -23,6 +23,12 @@ type ToolCall struct {
 	// error asking the model to resend the call with valid JSON, instead of
 	// dispatching garbage input to the real tool.
 	ParseError bool `json:"parse_error,omitempty"`
+	// Extra is provider data that must travel back with the call unchanged:
+	// Gemini's OpenAI-compatible API puts the thought signature of a
+	// Gemini 3 tool call in "extra_content", and rejects the next request
+	// (400 "missing a thought_signature") without it. Persisted with the
+	// session so a resumed conversation keeps working.
+	Extra json.RawMessage `json:"extra,omitempty"`
 }
 
 type MessagePart struct {

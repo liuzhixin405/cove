@@ -263,11 +263,11 @@ func TestE2E_GitRoutineGroupCoversTheWholeCycle(t *testing.T) {
 	}
 }
 
-// A second prompt after "a" is not the rule failing: the line is outside
-// what was remembered, and the prompt says so and offers the build tool's
-// whole routine group, so the .NET scaffold (new/sln/add/build) is one more
-// answer, not five.
-func TestE2E_SecondPromptExplainsItselfAndOffersTheToolGroup(t *testing.T) {
+// A second prompt after "a" is not the rule failing: the line runs other
+// programs, so the "mkdir" rule is not named — a rule for an unrelated
+// program used to be, which read as if the command had something to do with
+// it (a "sed … > s2.json" line was said to fall outside a docref.exe rule).
+func TestE2E_SecondPromptDoesNotNameUnrelatedRules(t *testing.T) {
 	model := newFakeModel(t,
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"mkdir agent"}`}}},
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"cd agent && dotnet --version"}`}}},
@@ -281,10 +281,15 @@ func TestE2E_SecondPromptExplainsItselfAndOffersTheToolGroup(t *testing.T) {
 	s.Type("a")
 	s.WaitFor("已记住 bash 中", e2eTimeout)
 	s.WaitForCount("需要授权", 2, e2eTimeout)
-	s.WaitFor("未覆盖这一行", e2eTimeout)
+	s.WaitFor("cd agent && dotnet --version", e2eTimeout)
+	s.WaitForCount("按键即答", 2, e2eTimeout)
 	out := s.Output()
-	if !strings.Contains(out, "dotnet --version") || !strings.Contains(out, "不在已记住的范围内") {
-		t.Fatalf("second prompt does not name the uncovered command:\n%s", out)
+	second := out[strings.LastIndex(out, "需要授权"):]
+	if !strings.Contains(second, "dotnet --version") {
+		t.Fatalf("second prompt does not show the command:\n%s", out)
+	}
+	if strings.Contains(second, "未覆盖这一行") || strings.Contains(second, `"mkdir"`) {
+		t.Fatalf("second prompt names the unrelated mkdir rule:\n%s", second)
 	}
 	s.Type("y")
 	s.WaitFor("目录和 SDK 都确认过了", e2eTimeout)

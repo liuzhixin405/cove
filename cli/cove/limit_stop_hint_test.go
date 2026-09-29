@@ -48,7 +48,7 @@ func TestLimitStopMentionsContinueOnce(t *testing.T) {
 	if n := strings.Count(all, "/continue"); n != 1 {
 		t.Fatalf("/continue mentioned %d times, want 1:\n%s", n, all)
 	}
-	if strings.Contains(all+out, "Request failed") {
+	if strings.Contains(all+out, "请求失败") {
 		t.Fatalf("a stop the user chose is reported as a failure:\n%s", all)
 	}
 

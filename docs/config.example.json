@@ -17,6 +17,8 @@
     "verbose":  false,
     "done_verify_commands":  [],
     "done_verify_auto":  true,
+    "done_verify_tests":  true,
+    "done_self_review":  "off",
     "thinking":  "",
     "effort":  "",
     "show_reasoning":  false,

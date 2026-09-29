@@ -210,6 +210,12 @@ func (c *ContextCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		branch, status := pc.GetGitInfo()
 		fmt.Fprintf(&sb, "Git: %s (%s)\n", branch, status)
 	}
+	// How full the model's window is: what decides when history is compacted.
+	if cu, ok := in.Engine.(interface{ ContextUsage() (int, int) }); ok {
+		if tokens, window := cu.ContextUsage(); window > 0 {
+			fmt.Fprintf(&sb, "上下文占用: %d / %d tokens（%d%%）\n", tokens, window, tokens*100/window)
+		}
+	}
 	// Startup no longer builds the file tree and repo map; they are built
 	// here on first use, waiting at most contextStructureTimeout.
 	tree, repoMap, ok := pc.Structure(contextStructureTimeout)

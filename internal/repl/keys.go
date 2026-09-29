@@ -37,10 +37,31 @@ func (lr *LineReader) handleEscape(buf *[]rune, cursor *int) error {
 			return err
 		}
 		lr.applyKey(buf, cursor, "", final)
+	case '\r', '\n':
+		// Alt+Enter types a newline.
+		*buf, *cursor = insertRunes(*buf, *cursor, []rune{'\n'})
+		lr.refresh(*buf, *cursor)
+	case 'b', 'B':
+		*cursor = wordLeft(*buf, *cursor)
+		lr.redraw(*buf, *cursor)
+	case 'f', 'F':
+		*cursor = wordRight(*buf, *cursor)
+		lr.redraw(*buf, *cursor)
+	case 127, 8:
+		// Alt+Backspace deletes the word before the cursor.
+		*buf, *cursor = deleteWordBack(*buf, *cursor)
+		lr.refresh(*buf, *cursor)
 	default:
 		_ = lr.rawReader.UnreadRune()
 	}
 	return nil
+}
+
+// wordModifier reports whether a CSI key's parameters carry Ctrl or Alt
+// ("1;5", "1;3"): Ctrl+Left/Right jump by words.
+func wordModifier(params string) bool {
+	_, mod, ok := strings.Cut(params, ";")
+	return ok && (mod == "5" || mod == "3" || mod == "7")
 }
 
 // readCSI reads the rest of a control sequence after "ESC [": parameter
@@ -112,16 +133,26 @@ func (lr *LineReader) applyKey(buf *[]rune, cursor *int, params string, final ru
 			}
 		}
 	case 'A':
-		lr.historyUp(buf, cursor)
+		if !lr.cycleOption(buf, cursor, -1) {
+			lr.historyUp(buf, cursor)
+		}
 	case 'B':
-		lr.historyDown(buf, cursor)
+		if !lr.cycleOption(buf, cursor, 1) {
+			lr.historyDown(buf, cursor)
+		}
 	case 'C':
-		if *cursor < len(*buf) {
+		if wordModifier(params) {
+			*cursor = wordRight(*buf, *cursor)
+			lr.redraw(*buf, *cursor)
+		} else if *cursor < len(*buf) {
 			*cursor = *cursor + 1
 			lr.redraw(*buf, *cursor)
 		}
 	case 'D':
-		if *cursor > 0 {
+		if wordModifier(params) {
+			*cursor = wordLeft(*buf, *cursor)
+			lr.redraw(*buf, *cursor)
+		} else if *cursor > 0 {
 			*cursor = *cursor - 1
 			lr.redraw(*buf, *cursor)
 		}

@@ -130,6 +130,9 @@ func (e *Engine) turnContextNote(query string) string {
 	if mem := e.turnMemoryNote(query); mem != "" {
 		parts = append(parts, mem)
 	}
+	if plan := e.previousPlanNote(query); plan != "" {
+		parts = append(parts, plan)
+	}
 	if ex := e.turnRepoMapExcerpt(query); ex != "" {
 		parts = append(parts, ex)
 	}
@@ -138,7 +141,7 @@ func (e *Engine) turnContextNote(query string) string {
 
 // repoMapRoot is the directory the repo map and project outline describe.
 func (e *Engine) repoMapRoot() string {
-	if root := e.enhancedRepoMap.Root(); root != "" {
+	if root := e.repoIndex.Root(); root != "" {
 		return root
 	}
 	return e.projectCwd()
@@ -262,6 +265,7 @@ func (e *Engine) escalate(model, why string) string {
 	}
 	e.engineOutput(fmt.Sprintf("  \x1b[2m(%s，本轮后续改用 %s)\x1b[0m", why, premium))
 	e.lastRoutedModel = premium
+	e.turnModelSnap.Store(premium)
 	return premium
 }
 
@@ -481,7 +485,11 @@ func (e *Engine) announceVerifyGate() {
 		return
 	}
 	e.verifyAnnounced = true
-	e.engineOutput("  \x1b[2m完成校验命令：" + strings.Join(e.verifyGate.commands, "；") + "\x1b[0m")
+	cmds := append([]string(nil), e.verifyGate.commands...)
+	if e.verifyGate.dynamic != nil {
+		cmds = append(cmds, "本轮改动涉及的测试（go vet/go test、dotnet test、pytest）")
+	}
+	e.engineOutput("  \x1b[2m完成校验命令：" + strings.Join(cmds, "；") + "\x1b[0m")
 }
 
 // newVerifyGate builds the gate for dir from the configuration: the
@@ -491,8 +499,12 @@ func (e *Engine) newVerifyGate(dir string) *VerifyGate {
 	if len(e.config.DoneVerifyCommands) > 0 {
 		g = NewVerifyGate(e.config.DoneVerifyCommands, dir)
 	} else if e.config.DoneVerifyAuto {
-		if cmds := detectVerifyCommands(dir); len(cmds) > 0 {
+		cmds := detectVerifyCommands(dir)
+		if len(cmds) > 0 || e.config.DoneVerifyTests {
 			g = newAutoVerifyGate(cmds, dir)
+		}
+		if g != nil && e.config.DoneVerifyTests {
+			g.dynamic = func() []string { return testCommandsFor(dir, e.changedFilesThisTurn()) }
 		}
 	}
 	g.SetTimeout(e.config.DoneVerifyTimeout)
@@ -556,14 +568,19 @@ func wrapExternalContent(source, output string) string {
 type agentSpec struct {
 	prompt   string
 	readOnly bool
+	// exclude are tools the agent type does not get.
+	exclude []string
 }
+
+// webTools are the tools that reach the network.
+var webTools = []string{"websearch", "webfetch", "browser"}
 
 // builtinAgents are the types the agent tool advertises.
 var builtinAgents = map[string]agentSpec{
 	"general": {prompt: "You are a sub-agent. Complete the assigned task using the tools available, then report what you did and what you found. Be concise."},
 	"explore": {readOnly: true, prompt: "You are a read-only exploration sub-agent. Investigate the codebase or sources to answer the question. Do not modify anything. Report findings with file paths and line references."},
 	"plan":    {readOnly: true, prompt: "You are a read-only planning sub-agent. Study the relevant code and produce a concrete, ordered implementation plan. Do not modify anything."},
-	"review":  {readOnly: true, prompt: "You are a read-only review sub-agent. Examine the specified code for bugs, risks and inconsistencies. Do not modify anything. Report each finding with its location and the reason it is a problem."},
+	"review":  {readOnly: true, exclude: webTools, prompt: "You are a read-only review sub-agent. Examine the specified code for bugs, risks and inconsistencies. Do not modify anything. Report each finding with its location and the reason it is a problem."},
 	"test":    {prompt: "You are a testing sub-agent. Write or run tests for the specified behaviour and report exactly which tests ran and their results."},
 }
 
@@ -602,7 +619,7 @@ func (r *agentRunner) spec(name string) agentSpec {
 func (r *agentRunner) Run(ctx context.Context, name, task string) (*api.AgentRunResult, error) {
 	s := r.spec(name)
 	id := fmt.Sprintf("agent-%s-%d", name, r.seq.Add(1))
-	res := r.d.DelegateWith(ctx, id, task, s.prompt, delegate.Options{ReadOnly: s.readOnly})
+	res := r.d.DelegateWith(ctx, id, task, s.prompt, delegate.Options{ReadOnly: s.readOnly, Exclude: s.exclude})
 
 	price := cost.NewTracker(0)
 	price.AddDetailed(res.Model, res.InputTokens, res.OutputTokens, 0, 0)

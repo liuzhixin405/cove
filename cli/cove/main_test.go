@@ -155,7 +155,7 @@ func TestRunChatInteractionReturnsVisibleError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	if !strings.Contains(out, "Request failed: api: connection refused") {
+	if !strings.Contains(out, "请求失败：api: connection refused") {
 		t.Fatalf("expected visible request failure, got %q", out)
 	}
 }

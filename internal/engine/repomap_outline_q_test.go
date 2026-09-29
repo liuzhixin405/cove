@@ -25,7 +25,7 @@ func TestSystemPromptCarriesOutlineNotRepoMap(t *testing.T) {
 	isolatedHome(t)
 	root := thisRepoRoot(t)
 	eng := newTestEngine(&mockProvider{})
-	eng.enhancedRepoMap = repomap.NewEnhancedGenerator(root)
+	eng.repoIndex = repomap.IndexFor(root)
 	eng.SetProjectContext(&ctxt.ProjectContext{
 		Cwd:      root,
 		FileTree: strings.Repeat("some/dir/file.go\n", 2000),
@@ -59,7 +59,7 @@ func TestProjectOutlineStableAcrossRebuilds(t *testing.T) {
 	isolatedHome(t)
 	root := thisRepoRoot(t)
 	eng := newTestEngine(&mockProvider{})
-	eng.enhancedRepoMap = repomap.NewEnhancedGenerator(root)
+	eng.repoIndex = repomap.IndexFor(root)
 	eng.SetProjectContext(&ctxt.ProjectContext{Cwd: root})
 	eng.systemPrompt = ""
 	a := eng.SystemPrompt()
@@ -125,7 +125,7 @@ func TestRepoMapExcerptOnFirstTaskTurnOnly(t *testing.T) {
 		}
 	}
 	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "hi"}, {content: "done"}, {content: "done again"}}})
-	eng.enhancedRepoMap = repomap.NewEnhancedGenerator(root)
+	eng.repoIndex = repomap.IndexFor(root)
 	eng.SetProjectContext(&ctxt.ProjectContext{Cwd: root})
 
 	run := func(msg string) {
@@ -210,7 +210,7 @@ func TestRepoMapExcerptNeedsSearchTerms(t *testing.T) {
 		t.Fatal(err)
 	}
 	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "a"}, {content: "b"}, {content: "c"}}})
-	eng.enhancedRepoMap = repomap.NewEnhancedGenerator(root)
+	eng.repoIndex = repomap.IndexFor(root)
 	eng.SetProjectContext(&ctxt.ProjectContext{Cwd: root})
 	run := func(msg string) {
 		t.Helper()

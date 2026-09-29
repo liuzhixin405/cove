@@ -216,19 +216,23 @@ func TestEmptyTruncatedRepliesStopTheTurn(t *testing.T) {
 // the stall warning for model calls waits longer there than for a cloud API.
 func TestStallThresholdIsLongerForLocalProviders(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
-	if got := eng.stallThresholdFor("run tool bash"); got != 30*time.Second {
+	if got := eng.stallThresholdFor("执行工具 read"); got != 30*time.Second {
 		t.Errorf("tool threshold = %v, want 30s", got)
 	}
-	if got := eng.stallThresholdFor("call model x"); got != 30*time.Second {
+	// A build or test without output for a minute is normal.
+	if got := eng.stallThresholdFor("执行工具 bash"); got != 2*time.Minute {
+		t.Errorf("shell threshold = %v, want 2m", got)
+	}
+	if got := eng.stallThresholdFor("调用模型 x"); got != 30*time.Second {
 		t.Errorf("cloud model threshold = %v, want 30s", got)
 	}
 	eng.config.Provider.BaseURL = "http://127.0.0.1:1234/v1"
-	if got := eng.stallThresholdFor("call model x"); got != 90*time.Second {
+	if got := eng.stallThresholdFor("调用模型 x"); got != 90*time.Second {
 		t.Errorf("local model threshold = %v, want 90s", got)
 	}
 	eng.config.Provider.BaseURL = ""
 	eng.config.Provider.Name = "ollama"
-	if got := eng.stallThresholdFor("call model x"); got != 90*time.Second {
+	if got := eng.stallThresholdFor("调用模型 x"); got != 90*time.Second {
 		t.Errorf("ollama threshold = %v, want 90s", got)
 	}
 }

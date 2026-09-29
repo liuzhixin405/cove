@@ -1,7 +1,9 @@
 package render
 
 import (
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/liuzhixin405/cove/internal/textutil"
 )
@@ -180,6 +182,11 @@ func Collapsed(b Block, width int, st Styles) string {
 		return clipLine(gutter+apply(st.Thinking, label), width)
 
 	case KindTool:
+		if strings.EqualFold(b.Tool, "todowrite") && !b.IsError {
+			if s, ok := planView(b, width, st); ok {
+				return s
+			}
+		}
 		return collapsedTool(b, width, st)
 	}
 	return ""
@@ -204,6 +211,12 @@ func collapsedTool(b Block, width int, st Styles) string {
 	if b.Header != "" {
 		head += " " + b.Header
 	}
+	// The block's handle for "/x <id>", after the header and never clipped
+	// away: it is the only way to reach the hidden output.
+	if b.Expandable() {
+		tag := " " + apply(st.Hint, "#"+b.ID)
+		head = clipLine(head, width-textutil.Width(tag)) + tag
+	}
 	sb.WriteString(clipLine(head, width))
 
 	// Summary line, with the status glyph so success and failure are
@@ -213,13 +226,64 @@ func collapsedTool(b Block, width int, st Styles) string {
 		if b.IsError {
 			status, style = g.Err, st.Err
 		}
-		cont := contIndent + apply(style, g.Cont+" "+status+" "+b.Summary)
+		summary := b.Summary
+		if b.Duration >= time.Second {
+			summary += " · " + humanDuration(b.Duration)
+		}
+		cont := contIndent + apply(style, g.Cont+" "+status+" "+summary)
 		sb.WriteString("\n")
 		sb.WriteString(clipLine(cont, width))
 	} else {
 		return clipLine(head, width)
 	}
 	return sb.String()
+}
+
+// Expanded renders a block with its hidden output: the collapsed header,
+// then Full indented under it, at most maxLines lines (0 = all). A diff is
+// coloured by line unless plain. Long lines are clipped to width; the end
+// says how many lines were left out and where the full output is when it was
+// spilled to disk.
+func Expanded(b Block, width, maxLines int, st Styles, plain bool) string {
+	if width < minRenderWidth {
+		width = minRenderWidth
+	}
+	head := Collapsed(Block{Kind: b.Kind, Tool: b.Tool, Header: b.Header, Summary: b.Summary, IsError: b.IsError, Duration: b.Duration}, width, st)
+	b = withSafeText(b)
+	body := strings.TrimRight(b.Full, "\n")
+	if body == "" {
+		if b.FullPath != "" {
+			return head + "\n" + contIndent + apply(st.Hint, "完整输出: "+b.FullPath)
+		}
+		return head
+	}
+	lines := strings.Split(body, "\n")
+	omitted := 0
+	if maxLines > 0 && len(lines) > maxLines {
+		omitted = len(lines) - maxLines
+		lines = lines[:maxLines]
+	}
+	text := strings.ReplaceAll(strings.Join(lines, "\n"), "\t", "    ")
+	if b.Diff {
+		text = ColorDiff(text, plain)
+	}
+	var sb strings.Builder
+	sb.WriteString(head)
+	for _, l := range strings.Split(text, "\n") {
+		sb.WriteString("\n")
+		sb.WriteString(clipLine(contIndent+l, width))
+	}
+	if omitted > 0 {
+		note := fmt.Sprintf("… 还有 %d 行", omitted)
+		if b.FullPath != "" {
+			note += "，完整输出: " + b.FullPath
+		}
+		sb.WriteString("\n" + contIndent + apply(st.Hint, note))
+	}
+	if plain {
+		return sb.String()
+	}
+	return sb.String() + "\x1b[0m"
 }
 
 // withSafeText neutralises terminal controls in the block's text fields.

@@ -31,7 +31,7 @@ func TestBlockRenderWidthFollowsTerminal(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	var out strings.Builder
 	eng.SetOutput(LineSink(func(s string) { out.WriteString(s) }))
-	eng.emitToolResult("bash", map[string]any{"command": strings.Repeat("echo long-argument ", 20)}, "ok", false, time.Millisecond)
+	eng.emitToolResult("c1", "bash", map[string]any{"command": strings.Repeat("echo long-argument ", 20)}, "ok", false, time.Millisecond)
 	for _, line := range strings.Split(strings.TrimRight(out.String(), "\n"), "\n") {
 		if w := textutil.Width(ansiRe.ReplaceAllString(line, "")); w > 79 {
 			t.Fatalf("rendered line is %d columns on an 80-column terminal: %q", w, line)

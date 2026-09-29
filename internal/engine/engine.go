@@ -32,6 +32,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/notes"
 	"github.com/liuzhixin405/cove/internal/permission"
 	"github.com/liuzhixin405/cove/internal/plan"
+	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/repomap"
 	"github.com/liuzhixin405/cove/internal/safety"
 	"github.com/liuzhixin405/cove/internal/session"
@@ -73,6 +74,12 @@ type Config struct {
 	// DoneVerifyTimeout (config "done_verify_timeout_seconds") bounds each
 	// verification command; 0 keeps the defaults (120 s, dotnet/npm 300 s).
 	DoneVerifyTimeout time.Duration
+	// DoneVerifyTests (config "done_verify_tests"): the automatic gate also
+	// runs the tests of the packages/projects the turn changed.
+	DoneVerifyTests bool
+	// DoneSelfReview (config "done_self_review"): "on", "auto" or "off".
+	// See selfReview.
+	DoneSelfReview string
 	// DoneCheck (config "done_check"): "on", "off" or "auto" (also ""). The
 	// one-time "is the request fully met?" prompt before a turn that changed
 	// files ends; auto applies it to fast-tier models and to every provider
@@ -134,15 +141,15 @@ type Engine struct {
 	pendingSteerN         int // Steer calls behind pendingSteer (PendingSteer)
 	cachedToolDefs        []api.ToolDef
 	cachedToolDefsVersion int
-	loopDetector          *LoopDetector              // enhanced 2-layer loop detection (P0)
-	compressor            *ChatCompressor            // AI-powered conversation compression (P0-3)
-	masker                *ToolOutputMasker          // tool output masking to save context (P1)
-	safetyChecker         *safety.Checker            // security scan before tool execution (P1)
-	sessionView           *session.SessionView       // snapshot for change tracking (P2)
-	enhancedRepoMap       *repomap.EnhancedGenerator // incremental repo map (P2)
-	promptMu              sync.Mutex                 // lock for interactive permission prompts
-	policyLoadErr         error                      // why the policies file (PolicyFilePath) failed to load, if it did
-	diskRules             []diskRule                 // rules loadPersistedPolicies gave e.perm, removed again on /cd
+	loopDetector          *LoopDetector        // enhanced 2-layer loop detection (P0)
+	compressor            *ChatCompressor      // AI-powered conversation compression (P0-3)
+	masker                *ToolOutputMasker    // tool output masking to save context (P1)
+	safetyChecker         *safety.Checker      // security scan before tool execution (P1)
+	sessionView           *session.SessionView // snapshot for change tracking (P2)
+	repoIndex             *repomap.Index       // shared incremental repo map index of the workspace
+	promptMu              sync.Mutex           // lock for interactive permission prompts
+	policyLoadErr         error                // why the policies file (PolicyFilePath) failed to load, if it did
+	diskRules             []diskRule           // rules loadPersistedPolicies gave e.perm, removed again on /cd
 	// out holds the sink every user-facing line and block goes to (SetOutput);
 	// empty means silence. It is the engine's only output path: the
 	// deprecated OnEngineOutput callback it used to fall back to is gone.
@@ -281,6 +288,18 @@ type Engine struct {
 	// turnFilesChanged records whether this turn wrote or edited a file, for
 	// the automatic verification gate. Guarded by fileMu.
 	turnFilesChanged bool
+	// turnChangedFiles are the absolute paths this turn wrote or edited, for
+	// the tests the verification gate runs and the self-review diff.
+	// Guarded by fileMu.
+	turnChangedFiles map[string]bool
+	// fileDiffs holds the diff of each finished write/edit call by tool call
+	// ID until its block is emitted (file_diff.go). Guarded by diffMu.
+	fileDiffs map[string]render.LineDiff
+	diffMu    sync.Mutex
+	// contextTokens mirrors totalTokens and turnModelSnap the model of the
+	// running turn, for ContextUsage from the status line's goroutine.
+	contextTokens atomic.Int64
+	turnModelSnap atomic.Value
 	// turnCheckpointed records that this turn created a checkpoint, for the
 	// "/undo" hint of the summary line. Guarded by fileMu.
 	turnCheckpointed bool
@@ -442,10 +461,10 @@ func New(config Config) (*Engine, error) {
 	if cwd != "" {
 		e.sessionNotes = notes.New(cwd)
 		e.sessionNotes.Load()
-		e.enhancedRepoMap = repomap.NewEnhancedGenerator(cwd)
+		e.repoIndex = repomap.IndexFor(cwd)
 	} else {
 		e.sessionNotes = notes.NewGlobal()
-		e.enhancedRepoMap = repomap.NewEnhancedGenerator(".")
+		e.repoIndex = repomap.IndexFor(".")
 	}
 
 	// Initialize guardrails (tool loop detection)
@@ -488,6 +507,10 @@ func New(config Config) (*Engine, error) {
 	if e.hookMgr != nil {
 		e.hookMgr.Fire(context.Background(), hooks.SessionStart, "", hooks.HookInput{Event: hooks.SessionStart})
 	}
+
+	// A long retry wait (a 429 asking for 40 s) is said, not left to look
+	// like a hang.
+	api.SetRetryNotifier(func(s string) { e.engineOutput("  \x1b[33m" + s + "\x1b[0m") })
 
 	return e, nil
 }
@@ -542,7 +565,7 @@ func (e *Engine) SetWorkingDir(dir string) {
 	// Persisted permission rules are scoped to a project root: drop the old
 	// project's and load the new one's.
 	e.loadPersistedPolicies(dir)
-	e.enhancedRepoMap = repomap.NewEnhancedGenerator(dir)
+	e.repoIndex = repomap.IndexFor(dir)
 	e.repoMapMu.Lock()
 	e.repoMapExcerpts = 0
 	e.repoMapMu.Unlock()
@@ -1214,7 +1237,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 	if e.safetyChecker != nil {
 		result := e.safetyChecker.ScanToolCall(tc.Name, tc.Input)
 		if blocking := result.BlockingFinding(); blocking != nil {
-			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", blocking.Message))
+			e.engineOutput(fmt.Sprintf("  \x1b[31m! 已拦截：%s\x1b[0m", blocking.Message))
 			return fmt.Sprintf("BLOCKED by safety checker: %s", blocking.Message), true
 		}
 		safetyWarnings = result.Warnings()
@@ -1222,7 +1245,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 
 	// Track this tool as an in-flight stage so a hung tool (e.g. a bash command
 	// or MCP call that ignores ctx) is attributable by the stall monitor.
-	toolAct := e.beginActivity("run tool " + tc.Name)
+	toolAct := e.beginActivity(toolActivity + " " + tc.Name)
 	defer e.endActivity(toolAct)
 
 	// Fire pre-tool-use hooks. The result must be honored: returning
@@ -1239,7 +1262,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 			if msg == "" {
 				msg = "blocked by pre-tool-use hook"
 			}
-			e.engineOutput(fmt.Sprintf("  \x1b[31m! blocked: %s\x1b[0m", msg))
+			e.engineOutput(fmt.Sprintf("  \x1b[31m! 已拦截：%s\x1b[0m", msg))
 			return fmt.Sprintf("BLOCKED by hook: %s", msg), true
 		}
 	}
@@ -1352,7 +1375,19 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		e.engineOutput(fmt.Sprintf("  \x1b[33m! %s\x1b[0m", w.Message))
 	}
 
+	// A write or edit is diffed for its tool block (file_diff.go): the
+	// content before the call is read here, the diff made once it succeeded.
+	var diffPath, diffBefore string
+	diffOK := false
+	if isFileWriteTool(tc.Name) {
+		if diffPath = diffTarget(tc.Input, cwd); diffPath != "" {
+			diffBefore, diffOK = readForDiff(diffPath)
+		}
+	}
 	result, err := t.Call(ctx, tc.Input, tctx)
+	if err == nil && !result.IsError && diffOK {
+		e.recordFileDiff(tc.ID, diffPath, diffBefore)
+	}
 	if err != nil {
 		// Retry once for transient errors (network, timeout, temporary file locks)
 		if isTransientError(err) {
@@ -1672,6 +1707,14 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 		e.turnFilesChanged = true
 		if path, ok := tc.Input["filePath"].(string); ok {
 			e.fileHistory[path] = true
+			if e.turnChangedFiles == nil {
+				e.turnChangedFiles = map[string]bool{}
+			}
+			abs := path
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(e.projectCwd(), abs)
+			}
+			e.turnChangedFiles[filepath.Clean(abs)] = true
 			// Notify loop detector of file activity (Layer 3 stagnation tracking)
 			if e.loopDetector != nil {
 				e.loopDetector.RecordFileActivity(path, tc.Name == "write")
@@ -1866,6 +1909,7 @@ func (e *Engine) compact(ctx context.Context, threshold int) *CompressResult {
 	}()
 	if result.Compressed {
 		e.messages = newMsgs
+		e.todoAfterCompaction()
 		stripThinkingBlocks(e.messages)
 		// The history was rewritten, so the cached prefix is gone anyway:
 		// the one moment the snapshotted parts of the system prompt (repo map,
@@ -1930,6 +1974,7 @@ func (e *Engine) SetToolDefsVersion(v func() int) {
 
 func (e *Engine) LoadMessages(msgs []api.Message) {
 	e.messages = msgs
+	e.restoreTodos(msgs)
 	e.invalidateUsage()
 	e.updateTokenCount()
 }
@@ -2448,6 +2493,10 @@ func (e *Engine) WirePlanExecutor() {
 		})
 		d.SetBudgetCheck(e.costTracker.OverBudget)
 		d.SetMaxIter(e.config.SubagentMaxIterations)
+		d.SetContextSource(e.subAgentContext)
+		d.SetContextBudget(subAgentContextBudget)
+		d.SetProgress(func(line string) { e.engineOutput("  \x1b[2m" + line + "\x1b[0m") })
+		d.SetFallback(e.fallbackModel)
 		pe := plan.NewPlanExecutor(d, e.runtime)
 		e.runtime.PlanExecuteFunc = func(ctx context.Context, parallel bool) (string, error) {
 			pl, err := plan.FromRuntime("plan", e.runtime)

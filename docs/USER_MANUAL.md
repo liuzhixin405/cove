@@ -305,6 +305,8 @@ go build -o cove ./cli/cove
 |------|------|
 | `/tasks` | 查看运行中/排队任务（TUI）；headless 显示同步执行状态 |
 | `/clear` | 清屏并清空回滚区（别名 `/cls`，快捷键 Ctrl+L）；不影响对话上下文 |
+| `/x [编号] [all]` | 展开工具块折叠的输出（编号是工具块标题后的 `#N`，省略则展开最近一个；默认最多 200 行，`all` 显示全部）；edit/write 展开后是改动的 diff。别名 `/expand` |
+| `/keys` | 查看输入快捷键（别名 `/shortcuts`） |
 | `/new` | 保存当前会话并开始新会话（清空对话上下文）；旧会话可在 `/history` 找回 |
 | `/stop` 或 `/cancel` | 取消当前任务（TUI）；headless 无后台任务可取消 |
 
@@ -664,7 +666,9 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | `effort` | string | 推理深度：`low` / `medium` / `high` / `xhigh` / `max`；留空则使用模型默认值 |
 | `done_verify_commands` | string[] | 模型声称完成后必须通过的校验命令（如 `go build ./...`），不通过则打回继续修改 |
 | `done_verify_auto` | boolean | 未配置 `done_verify_commands` 时，按项目自动推断校验命令，且只在本轮改过文件时执行：`go.mod` → `go build ./...`，`Cargo.toml` → `cargo check`，本地安装了 TypeScript → `tsc --noEmit`，单个 `*.sln`（没有 sln 时单个 `*.csproj`）→ `dotnet build --nologo -v q`，`package.json` 有非空 `scripts.build` → `npm run build --if-present`，`pyproject.toml`/`setup.py` → `python -m compileall -q -x "(\.venv\|venv\|node_modules\|\.git\|__pycache__)" .`（PATH 上只有 `python3` 时用它）。首轮开始时打印一次“完成校验命令：…”（`/cd` 后再打印一次）。默认开启，设为 `false` 关闭 |
-| `done_verify_timeout_seconds` | int | 每条完成校验命令的超时秒数；`0`（默认）为 120 秒，`dotnet`/`npm` 命令 300 秒。超时的命令只提示“verification did not finish within N s; not counted as a failure”，不算失败：不打回、不升级模型，本轮正常结束 |
+| `done_verify_tests` | boolean | `done_verify_auto` 开启时，在编译检查之后再跑本轮改动涉及的测试：Go 对改动所在的包跑 `go vet` 和 `go test`；.NET 对改动项目所属的测试项目（名字含 Test，或通过 ProjectReference 引用了改动项目）跑 `dotnet test`；Python 对改动的测试文件，以及与改动模块同名的 `test_<模块>.py` 跑 `pytest`（需已安装 pytest）。Rust 和 JS 不支持。默认开启，设为 `false` 关闭 |
+| `done_self_review` | string | 完成前自审：`off`（默认）/ `on` / `auto`。开启后，本轮改过文件并通过校验时，由只读的 review 子代理审一遍本轮 diff，有问题就交回模型修改，每轮最多一次。`auto` 只审改动 40 行及以上的轮次。每次自审多一次子代理调用 |
+| `done_verify_timeout_seconds` | int | 每条完成校验命令的超时秒数；`0`（默认）为 120 秒，`dotnet`/`npm`/`pytest`/`go test` 命令 300 秒。超时的命令只提示“verification did not finish within N s; not counted as a failure”，不算失败：不打回、不升级模型，本轮正常结束 |
 | `done_check` | string | 完成前目标自检：`auto`（默认；空值或未知值也按 auto）/ `on` / `off`。`auto` 只在本轮使用的模型属于快速档（名字含 flash/mini/lite/tiny/fast/haiku/nano）或 provider 不是 anthropic（如 DeepSeek）时启用。见[完成前自检](#完成前自检-done_check)（`config.json` 与 `.cove.json` 可设，profile 暂不支持） |
 | `show_reasoning` | boolean | 是否把思考型模型（如 DeepSeek V4）的完整推理过程实时输出到对话区。默认关闭：推理进度只显示在状态行（"思考中… 已推理 N 字"） |
 | `disabled_skills` | string[] | 不加载的技能名称列表（内置或自定义均可），如 `["spike", "plan"]` |

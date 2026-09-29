@@ -39,6 +39,8 @@ type appBootstrap struct {
 // bootstrapApp builds the session. interactive says whether someone can
 // answer the question tool (main's mode branch: not -p, interactive shell).
 func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, interactive bool) (*appBootstrap, error) {
+	phase := startupPhases()
+	defer phase("total")
 	cfg, err := config.LoadWithProfile(profileName)
 	if err != nil {
 		log.Warnf("config load: %v", err)
@@ -55,8 +57,10 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 		log.SetLevel(log.Debug)
 	}
 
+	phase("config")
 	pc := cfg.EffectiveProvider()
 	projCtx := ctxt.Collect()
+	phase("project context")
 	classifier := permission.NewClassifier()
 	hookMgr := hooks.NewManager()
 	// User-level hooks only (hooks.json in the config directory): a
@@ -70,7 +74,9 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 	skillMgr := skills.NewManager()
 	skills.LoadAll(skillMgr, projCtx.Cwd)
 	skillMgr.Disable(cfg.DisabledSkills...)
+	phase("skills")
 	memStore := newProjectMemoryStore(projCtx.Cwd)
+	phase("memory store")
 	// Masked tool outputs older than a week are never read again.
 	go tool.PruneOldToolOutputs(tool.ToolOutputDir(), tool.ToolOutputMaxAge)
 	if cfg.MemoryEmbedding != nil {
@@ -95,6 +101,7 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 
 	pluginMgr := plugin.NewManager()
 	pluginMgr.Init()
+	phase("plugins")
 
 	mcpPool := mcp.NewPool()
 	if len(cfg.MCPServers) > 0 {
@@ -109,8 +116,10 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 		mcpPool.LoadFromConfig(mcpCtx, servers)
 		cancelMCP()
 	}
+	phase("mcp")
 
 	toolReg := registerAllTools(mcpPool, cfg, interactive)
+	phase("tools")
 	eng, err := engine.New(engine.Config{
 		Model:          cfg.Model,
 		ModelFast:      cfg.ModelFast,
@@ -130,6 +139,8 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 		DoneVerifyCommands: cfg.DoneVerifyCommands,
 		DoneVerifyAuto:     cfg.VerifyAutoEnabled(),
 		DoneVerifyTimeout:  time.Duration(cfg.DoneVerifyTimeoutSeconds) * time.Second,
+		DoneVerifyTests:    cfg.VerifyTestsEnabled(),
+		DoneSelfReview:     cfg.SelfReviewMode(),
 		DoneCheck:          cfg.DoneCheckMode(),
 		Thinking:           cfg.Thinking,
 		Effort:             cfg.Effort,
@@ -143,9 +154,11 @@ func bootstrapApp(debugMode bool, profileName, recordDir, replayDir string, inte
 	if err != nil {
 		return nil, fmt.Errorf("engine start error: %w", err)
 	}
+	phase("engine")
 
 	eng.SetProjectContext(projCtx)
 	eng.WirePlanExecutor()
+	phase("plan executor")
 	wireDiagnostics(eng, memStore)
 	showReasoning = cfg.ShowReasoning
 
@@ -219,4 +232,20 @@ func wireDiagnostics(eng *engine.Engine, memStore *memory.Store) {
 			return st
 		},
 	})
+}
+
+// startupPhases returns a function that logs, at debug level, how long each
+// startup phase took since the previous call ("[startup] skills 12ms").
+func startupPhases() func(name string) {
+	start := time.Now()
+	last := start
+	return func(name string) {
+		now := time.Now()
+		if name == "total" {
+			log.Debugf("[startup] total %v", now.Sub(start).Round(time.Millisecond))
+			return
+		}
+		log.Debugf("[startup] %s %v", name, now.Sub(last).Round(time.Millisecond))
+		last = now
+	}
 }

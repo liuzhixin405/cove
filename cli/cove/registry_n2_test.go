@@ -48,6 +48,19 @@ func TestQuestionOnlyInteractive(t *testing.T) {
 	}
 }
 
+// A model that entered plan mode in -p could never leave it (leaving takes
+// the user's approval) and the task ended with nothing done.
+func TestPlanModeOnlyInteractive(t *testing.T) {
+	for _, name := range []string{"plan_mode", "exit_plan_mode"} {
+		if namesWith(toolOptions{goos: "linux", interactive: false})[name] {
+			t.Errorf("%s registered in non-interactive mode", name)
+		}
+		if !namesWith(toolOptions{goos: "linux", interactive: true})[name] {
+			t.Errorf("%s missing in interactive mode", name)
+		}
+	}
+}
+
 func TestBrowserOnlyWithChrome(t *testing.T) {
 	if namesWith(toolOptions{goos: "linux", interactive: true, chrome: false})["browser"] {
 		t.Error("browser registered without headless Chrome compiled in")

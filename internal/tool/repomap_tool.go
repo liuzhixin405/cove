@@ -22,7 +22,8 @@ func NewRepoMapTool() Tool {
 		Description: "Show the repository map: source files with their types, functions and methods (signature and line), ranked by relevance. " +
 			"query: space-separated path fragments or identifiers (e.g. \"engine turnContextNote\"); matches file paths and symbol names, case-insensitive. " +
 			"path: only files under this directory. Both optional; with neither, lists the most referenced files. Output is capped at 12KB. " +
-			"Maps Go, Python, TypeScript and JavaScript (.go .py .ts .tsx .js .jsx .mjs .cjs); use grep/glob for other languages.",
+			"Files are ranked by PageRank over the cross-file reference graph; a query also lists the files most connected to the matches (their callers and callees). " +
+			"Maps " + repomap.ScannedLanguages + " (.go .py .ts .tsx .js .jsx .mjs .cjs .cs .java .rs); use grep/glob for other languages.",
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -56,7 +57,7 @@ func (t *RepoMapTool) Call(ctx context.Context, input Input, tctx Context) (Resu
 	})
 	out := repomap.QueryIn(root, prefix, terms, repoMapToolMaxBytes)
 	if out == "" {
-		return Result{Data: "No files match the query (only .go/.py/.ts/.js source files are mapped); try other terms, grep or glob."}, nil
+		return Result{Data: "No files match the query (only " + repomap.ScannedLanguages + " source files are mapped); try other terms, grep or glob."}, nil
 	}
 	return Result{Data: out}, nil
 }

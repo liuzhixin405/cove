@@ -350,6 +350,13 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 		// there are rated on their own. A UNC target is refused above.
 		"cd", "pushd", "popd", "set-location", "sl":
 		return CatSafe
+	case "command":
+		// "command -v gh" / "command -V gh" only looks a name up; plain
+		// "command x" runs x.
+		if len(args) >= 2 && (args[0] == "-v" || args[0] == "-V") {
+			return CatSafe
+		}
+		return CatUnknown
 	case "date":
 		for _, a := range args {
 			if a == "-s" || strings.HasPrefix(a, "--set") {

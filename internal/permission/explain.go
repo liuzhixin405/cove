@@ -17,31 +17,49 @@ func (m *Manager) ExplainUncovered(toolName string, input map[string]any) string
 	var remembered []string
 	cov := coverage{kind: shellKindFor(toolName, m.shellKind)}
 	var siblingHas string
+	command := inputCommand(input)
+	programs := linePrograms(command)
 	for _, r := range m.allow {
 		if r.CommandPrefix == "" && r.CommandGroup == "" {
 			continue
 		}
+		// Only a rule for a program this line runs explains anything. Every
+		// remembered rule of the tool used to be named, so a "sed … > f"
+		// line was said to fall outside a rule for docref.exe — a program
+		// the task had nothing to do with.
+		relevant := ruleConcerns(r, programs)
 		if !toolMatches(r, toolName) {
-			if IsShellTool(r.ToolPattern) && IsShellTool(toolName) {
+			if relevant && IsShellTool(r.ToolPattern) && IsShellTool(toolName) {
 				siblingHas = r.ToolPattern
 			}
 			continue
 		}
+		// Coverage is judged against every rule (another program's rule
+		// may cover part of the line); only relevant ones are named.
 		if r.CommandPrefix != "" {
 			cov.prefixes = append(cov.prefixes, strings.Fields(r.CommandPrefix))
-			remembered = append(remembered, `"`+r.CommandPrefix+`"`)
+			if relevant {
+				remembered = append(remembered, `"`+r.CommandPrefix+`"`)
+			}
 		} else {
 			cov.groups = append(cov.groups, r.CommandGroup)
-			remembered = append(remembered, GroupLabel(r.CommandGroup))
+			if relevant {
+				remembered = append(remembered, GroupLabel(r.CommandGroup))
+			}
 		}
 	}
 	if len(remembered) == 0 {
 		if siblingHas != "" {
 			return "已记住的规则属于 " + siblingHas + " 工具，这次模型用的是 " + toolName + " 工具，两者的规则不通用"
 		}
+		// No remembered rule concerns this line, so there is no gap to
+		// explain. What still helps is why the line cannot be remembered
+		// at all (the prompt then offers no [a]).
+		if p := coverabilityProblem(command, cov.kind); p != "" {
+			return "这一行无法按规则记住：" + p + "。按 y 允许本次，n 拒绝"
+		}
 		return ""
 	}
-	command := inputCommand(input)
 	if lineCovered(command, cov) {
 		return ""
 	}
@@ -52,7 +70,43 @@ func (m *Manager) ExplainUncovered(toolName string, input map[string]any) string
 	if reason == "" {
 		reason = "这一行不在已记住的范围内"
 	}
-	return "上次记住的规则（" + strings.Join(remembered, "、") + "）未覆盖这一行：" + reason
+	return "上次记住的规则（" + strings.Join(remembered, "、") + "）未覆盖这一行：" + reason + "。按 y 允许本次，n 拒绝"
+}
+
+// linePrograms is the set of programs (programName) the simple commands of
+// command run, including the one a runner runs ("sudo mkdir" runs mkdir).
+func linePrograms(command string) map[string]bool {
+	out := map[string]bool{}
+	for _, c := range safety.SimpleCommands(command) {
+		if len(c.Words) == 0 {
+			continue
+		}
+		p := programName(c.Words[0])
+		out[p] = true
+		if commandRunners[p] {
+			for _, w := range c.Words[1:] {
+				if !strings.HasPrefix(w, "-") {
+					out[programName(w)] = true
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// ruleConcerns reports whether rule r is about one of programs: its prefix
+// starts with one of them, or its group holds one.
+func ruleConcerns(r Rule, programs map[string]bool) bool {
+	if f := strings.Fields(r.CommandPrefix); len(f) > 0 {
+		return programs[programName(f[0])]
+	}
+	for p := range programs {
+		if r.CommandGroup != "" && groupForProgram(p) == r.CommandGroup {
+			return true
+		}
+	}
+	return false
 }
 
 // coverabilityProblem names what keeps a line from being covered by any

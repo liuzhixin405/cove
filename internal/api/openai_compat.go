@@ -91,6 +91,9 @@ type oaiToolCall struct {
 	ID       string      `json:"id"`
 	Type     string      `json:"type"`
 	Function oaiFuncCall `json:"function"`
+	// ExtraContent carries Gemini's thought signature ("google":
+	// {"thought_signature": …}); it must be sent back with the call.
+	ExtraContent json.RawMessage `json:"extra_content,omitempty"`
 }
 type oaiFuncCall struct {
 	Name      string `json:"name"`
@@ -225,11 +228,12 @@ func (p *openAICompatProvider) doChat(ctx context.Context, body oaiReq) (*ChatRe
 					Name:       tc.Function.Name,
 					Input:      toolArgsParseError(tc.Function.Arguments, stopReason == "length"),
 					ParseError: true,
+					Extra:      tc.ExtraContent,
 				})
 				continue
 			}
 			toolCalls = append(toolCalls, ToolCall{
-				ID: tc.ID, Name: tc.Function.Name, Input: input,
+				ID: tc.ID, Name: tc.Function.Name, Input: input, Extra: tc.ExtraContent,
 			})
 		}
 		return &ChatResponse{
@@ -314,7 +318,8 @@ func (p *openAICompatProvider) convertMessages(in []Message) []oaiMsg {
 				args, _ := json.Marshal(tc.Input)
 				om.ToolCalls = append(om.ToolCalls, oaiToolCall{
 					ID: tc.ID, Type: "function",
-					Function: oaiFuncCall{Name: tc.Name, Arguments: string(args)},
+					Function:     oaiFuncCall{Name: tc.Name, Arguments: string(args)},
+					ExtraContent: tc.Extra,
 				})
 			}
 		}
@@ -437,9 +442,10 @@ type oaiStreamDelta struct {
 }
 
 type oaiStreamTC struct {
-	Index    int         `json:"index"`
-	ID       string      `json:"id,omitempty"`
-	Function oaiFuncCall `json:"function,omitempty"`
+	Index        int             `json:"index"`
+	ID           string          `json:"id,omitempty"`
+	Function     oaiFuncCall     `json:"function,omitempty"`
+	ExtraContent json.RawMessage `json:"extra_content,omitempty"`
 }
 
 func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, handler StreamHandler) (*ChatResponse, error) {
@@ -507,6 +513,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		ID      string
 		Name    string
 		ArgsBuf strings.Builder
+		Extra   json.RawMessage // Gemini's thought signature, on the call's first chunk
 	}
 	// Calls in the order they started; byIndex maps a stream index to the
 	// call currently using it.
@@ -570,6 +577,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 				if tc.Function.Name != "" {
 					acc.Name = tc.Function.Name
 				}
+				if len(tc.ExtraContent) > 0 {
+					acc.Extra = append(json.RawMessage(nil), tc.ExtraContent...)
+				}
 				acc.ArgsBuf.WriteString(tc.Function.Arguments)
 			}
 		}
@@ -610,7 +620,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			}
 			// A tool without parameters may stream no argument text at all;
 			// that is a complete call with an empty input.
-			streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: map[string]any{}})
+			streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: map[string]any{}, Extra: acc.Extra})
 			continue
 		}
 		input, ok := RepairToolArguments(rawArgs)
@@ -620,10 +630,11 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 				Name:       acc.Name,
 				Input:      toolArgsParseError(rawArgs, truncated),
 				ParseError: true,
+				Extra:      acc.Extra,
 			})
 			continue
 		}
-		streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: input})
+		streamAcc.AddToolCall(adapter.ToolCall{ID: acc.ID, Name: acc.Name, Input: input, Extra: acc.Extra})
 	}
 	toolCalls := toAPIToolCalls(streamAcc.ToolCalls())
 
@@ -683,6 +694,7 @@ func toAPIToolCalls(calls []adapter.ToolCall) []ToolCall {
 			Name:       c.Name,
 			Input:      c.Input,
 			ParseError: c.ParseError,
+			Extra:      c.Extra,
 		})
 	}
 	return out

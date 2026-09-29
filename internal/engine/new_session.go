@@ -113,6 +113,9 @@ func (e *Engine) resetConversationState() {
 	// /mode plan is the permission mode and stays.
 	if e.runtime != nil {
 		e.runtime.SetPlanMode(false)
+		// So is its task list: kept, the todo reminders of the old task
+		// followed the user into the new conversation.
+		e.runtime.ClearTodos()
 	}
 	if e.loopDetector != nil {
 		e.loopDetector = NewLoopDetector()
@@ -126,6 +129,7 @@ func (e *Engine) resetConversationState() {
 	e.fileMu.Lock()
 	e.fileHistory = nil
 	e.turnFilesChanged, e.turnCheckpointed = false, false
+	e.turnChangedFiles = nil
 	e.fileMu.Unlock()
 
 	// The skill review is throttled by the message count it last saw; kept

@@ -6,23 +6,9 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
-	"time"
-	"unicode"
-)
-
-type cacheEntry struct {
-	mtime time.Time
-	fm    FileMap
-}
-
-var (
-	parseCache   = make(map[string]cacheEntry)
-	parseCacheMu sync.RWMutex
 )
 
 // Symbol represents a definition found in the code (struct, interface, function).
@@ -38,167 +24,67 @@ type FileMap struct {
 	Path    string // relative path
 	Package string // package name (mainly for Go)
 	Symbols []Symbol
-	Score   int // Rank/importance score based on reference frequency
+	Score   int // PageRank of the file in the reference graph, x1e6
 }
 
-// Generator manages scanning and ranking to produce the Repo Map.
+// Generator produces the ranked repo map of a workspace. It is a thin view
+// over the workspace's shared Index (IndexFor), so every caller — the
+// /context command, the repo_map tool, the per-turn excerpt — reuses the same
+// incremental parse state instead of re-parsing the tree.
 type Generator struct {
 	WorkspaceRoot string
-	IgnoreDirs    map[string]bool
 }
 
 // NewGenerator creates a new Repo Map generator.
 func NewGenerator(root string) *Generator {
-	return &Generator{
-		WorkspaceRoot: root,
-		IgnoreDirs: map[string]bool{
-			".git":         true,
-			"node_modules": true,
-			"vendor":       true,
-			".github":      true,
-			"testdata":     true,
-			"build":        true,
-			"dist":         true,
-		},
-	}
+	return &Generator{WorkspaceRoot: root}
 }
 
-// Generate scans the directory, extracts definitions, ranks them, and outputs a formatted map.
+// Generate returns the formatted map of the maxFiles highest-ranked files.
 func (g *Generator) Generate(maxFiles int) string {
 	return FormatFileMaps(g.BuildRanked(maxFiles))
 }
 
-// BuildRanked scans the workspace, parses each source file into a FileMap
-// (reusing the package-level parseCache, so files unchanged since the last
-// call are not re-parsed), ranks files by how often their symbols are
-// referenced elsewhere in the codebase, and returns the top maxFiles
-// FileMaps re-sorted into path order for stable, readable output.
-//
-// This is split out from Generate so repomap/enhanced.go's incremental
-// generator can reuse the same real parsing+ranking logic instead of
-// falling back to a flat, unranked file list.
+// BuildRanked brings the workspace index up to date (only files whose mtime
+// or size changed are re-parsed), then returns the maxFiles files with the
+// highest reference-graph rank, re-sorted into path order for stable,
+// readable output.
 func (g *Generator) BuildRanked(maxFiles int) []FileMap {
 	if g.WorkspaceRoot == "" {
 		return nil
 	}
+	ix := IndexFor(g.WorkspaceRoot)
+	ix.Refresh()
+	fileMaps := ix.Files()
 
-	var files []string
-	err := filepath.Walk(g.WorkspaceRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			if g.IgnoreDirs[info.Name()] || strings.HasPrefix(info.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if isScannedExt(strings.ToLower(filepath.Ext(path))) {
-			files = append(files, path)
-		}
-		return nil
-	})
-
-	if err != nil || len(files) == 0 {
-		return nil
-	}
-
-	// Phase 1: Parse all files in parallel (parseCache skips re-parsing
-	// files whose mtime hasn't changed since the last call).
-	var wg sync.WaitGroup
-	resultsChan := make(chan FileMap, len(files))
-	for _, fp := range files {
-		wg.Add(1)
-		go func(filePath string) {
-			defer wg.Done()
-			fm := g.parseFile(filePath)
-			if len(fm.Symbols) > 0 {
-				resultsChan <- fm
-			}
-		}(fp)
-	}
-	wg.Wait()
-	close(resultsChan)
-
-	var fileMaps []FileMap
-	for fm := range resultsChan {
-		fileMaps = append(fileMaps, fm)
-	}
-
-	// Phase 2: score each file by how often its symbols are named in other
-	// files' signatures.
-	//
-	// This used to test every symbol against every other file's every
-	// signature with strings.Contains: symbols x files x symbols. An 800-file
-	// repo with 20 types per file took ~29s, and the engine rebuilds the map
-	// on the prompt path after every edit. Indexing the identifiers of each
-	// signature once makes it linear; a reference now means the whole
-	// identifier ("Store" no longer counts inside "StoreOptions").
-	refs := make(map[string]int)                 // identifier -> signatures naming it
-	own := make([]map[string]int, len(fileMaps)) // per file: its own share of refs
-	for i, fm := range fileMaps {
-		own[i] = make(map[string]int)
-		for _, sym := range fm.Symbols {
-			for id := range signatureIdents(sym.Signature) {
-				refs[id]++
-				own[i][id]++
-			}
-		}
-	}
-	for i := range fileMaps {
-		score := 0
-		for _, sym := range fileMaps[i].Symbols {
-			score += refs[sym.Name] - own[i][sym.Name]
-		}
-		fileMaps[i].Score = score
-	}
-
-	// Highest scores first. Ties are broken by path: files are parsed
-	// concurrently and arrive in random order, and sort.Slice is not stable,
-	// so a tie at the maxFiles cut used to pick a different subset on every
-	// run — the map in the system prompt changed with no file changed.
-	sort.Slice(fileMaps, func(i, j int) bool {
+	// Highest rank first; ties are broken by path so the cut at maxFiles
+	// picks the same files on every run.
+	sort.SliceStable(fileMaps, func(i, j int) bool {
 		if fileMaps[i].Score != fileMaps[j].Score {
 			return fileMaps[i].Score > fileMaps[j].Score
 		}
 		return fileMaps[i].Path < fileMaps[j].Path
 	})
-
-	// Limit to maxFiles
 	if len(fileMaps) > maxFiles {
 		fileMaps = fileMaps[:maxFiles]
 	}
-
-	// Sort back alphabetically by path for readable output structure
-	sort.Slice(fileMaps, func(i, j int) bool {
-		return fileMaps[i].Path < fileMaps[j].Path
-	})
-
+	sort.Slice(fileMaps, func(i, j int) bool { return fileMaps[i].Path < fileMaps[j].Path })
 	return fileMaps
 }
 
 // isScannedExt reports whether files with extension ext (lower-case, with the
-// dot) are parsed for symbols. .tsx/.jsx/.mjs/.cjs share the .ts/.js syntax
-// and used to be skipped, so a React project got an empty map.
+// dot) are parsed for symbols.
 func isScannedExt(ext string) bool {
-	switch ext {
-	case ".go", ".py", ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
+	if ext == ".go" {
 		return true
 	}
-	return false
+	_, ok := regexLangs[ext]
+	return ok
 }
 
-// signatureIdents returns the distinct identifiers in a signature.
-func signatureIdents(sig string) map[string]struct{} {
-	ids := make(map[string]struct{})
-	for _, f := range strings.FieldsFunc(sig, func(r rune) bool {
-		return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
-		ids[f] = struct{}{}
-	}
-	return ids
-}
+// ScannedLanguages names the languages the repo map parses, for tool
+// descriptions and hints.
+const ScannedLanguages = "Go, Python, TypeScript, JavaScript, C#, Java and Rust"
 
 // FormatFileMaps renders a compact, LLM-friendly text map from already
 // ranked/selected FileMaps, grouping symbols under each file's path/package.
@@ -210,8 +96,6 @@ func FormatFileMaps(fileMaps []FileMap) string {
 			sb.WriteString(" (package " + fm.Package + ")")
 		}
 		sb.WriteString(":\n")
-
-		// Group symbols by type to be cleaner
 		for _, sym := range fm.Symbols {
 			prefix := "  - "
 			if sym.Type == "method" {
@@ -221,65 +105,43 @@ func FormatFileMaps(fileMaps []FileMap) string {
 		}
 		sb.WriteString("\n")
 	}
-
 	return sb.String()
 }
 
-// parseFile delegates to AST or Regex-based scanners depending on file extension.
-func (g *Generator) parseFile(absPath string) FileMap {
-	relPath, err := filepath.Rel(g.WorkspaceRoot, absPath)
-	if err != nil {
-		relPath = absPath
-	}
-	relPath = filepath.ToSlash(relPath)
+// minRefIdentLen: identifiers shorter than this ("i", "ok", "db") are too
+// common to say anything about which file depends on which.
+const minRefIdentLen = 3
 
-	info, err := os.Stat(absPath)
-	var mtime time.Time
-	if err == nil {
-		mtime = info.ModTime()
-		parseCacheMu.RLock()
-		cached, exists := parseCache[absPath]
-		parseCacheMu.RUnlock()
-		if exists && cached.mtime.Equal(mtime) {
-			fm := cached.fm
-			fm.Path = relPath
-			return fm
-		}
-	}
-
-	ext := strings.ToLower(filepath.Ext(absPath))
+// parseFile extracts the definitions of the file at absPath (relPath is
+// already slash-separated) and the identifiers it references, with counts.
+func parseFile(absPath, relPath, ext string) (FileMap, map[string]int) {
 	fm := FileMap{Path: relPath}
-
 	if ext == ".go" {
-		g.parseGoAST(absPath, &fm)
-	} else {
-		g.parseRegexBased(absPath, ext, &fm)
+		return fm, parseGoAST(absPath, &fm)
 	}
-
-	if err == nil {
-		parseCacheMu.Lock()
-		parseCache[absPath] = cacheEntry{
-			mtime: mtime,
-			fm:    fm,
-		}
-		parseCacheMu.Unlock()
-	}
-
-	return fm
+	return fm, parseRegexBased(absPath, ext, &fm)
 }
 
-// parseGoAST parses Go source code directly via original Go SDK go/parser.
-func (g *Generator) parseGoAST(absPath string, fm *FileMap) {
+// parseGoAST parses Go source with go/parser: type and func declarations
+// become symbols, and every identifier in the file counts as a reference.
+func parseGoAST(absPath string, fm *FileMap) map[string]int {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, absPath, nil, parser.AllErrors)
-	if err != nil {
-		return
+	// A file with syntax errors still yields the declarations before them
+	// (a half-edited file keeps its place in the map), so the error is not
+	// fatal.
+	file, _ := parser.ParseFile(fset, absPath, nil, parser.SkipObjectResolution)
+	if file == nil || file.Name == nil {
+		return nil
 	}
-
 	fm.Package = file.Name.Name
+	refs := map[string]int{}
 
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch decl := n.(type) {
+		case *ast.Ident:
+			if len(decl.Name) >= minRefIdentLen {
+				refs[decl.Name]++
+			}
 		case *ast.TypeSpec:
 			line := fset.Position(decl.Pos()).Line
 			switch decl.Type.(type) {
@@ -303,7 +165,6 @@ func (g *Generator) parseGoAST(absPath string, fm *FileMap) {
 			line := fset.Position(decl.Pos()).Line
 			name := decl.Name.Name
 
-			// Parse parameters to build a compact but descriptive signature
 			var params []string
 			if decl.Type.Params != nil {
 				for _, field := range decl.Type.Params.List {
@@ -320,101 +181,166 @@ func (g *Generator) parseGoAST(absPath string, fm *FileMap) {
 			paramSpec := strings.Join(params, ", ")
 
 			if decl.Recv != nil && len(decl.Recv.List) > 0 {
-				// Method on struct receiver
 				recvField := decl.Recv.List[0]
 				recvType := formatGoType(recvField.Type)
 				recvName := ""
 				if len(recvField.Names) > 0 {
 					recvName = recvField.Names[0].Name + " "
 				}
-				sig := "func (" + recvName + recvType + ") " + name + "(" + paramSpec + ")"
 				fm.Symbols = append(fm.Symbols, Symbol{
 					Name:      name,
 					Type:      "method",
-					Signature: sig,
+					Signature: "func (" + recvName + recvType + ") " + name + "(" + paramSpec + ")",
 					Line:      line,
 				})
 			} else {
-				// Global function
-				sig := "func " + name + "(" + paramSpec + ")"
 				fm.Symbols = append(fm.Symbols, Symbol{
 					Name:      name,
 					Type:      "func",
-					Signature: sig,
+					Signature: "func " + name + "(" + paramSpec + ")",
 					Line:      line,
 				})
 			}
 		}
 		return true
 	})
+	// A file's own declarations name themselves; they are not references.
+	for _, s := range fm.Symbols {
+		if refs[s.Name] > 0 {
+			refs[s.Name]--
+		}
+	}
+	return refs
 }
 
-// parseRegexBased extracts classes and methods from python/typescript/javascript folders with lightweight patterns.
-func (g *Generator) parseRegexBased(absPath string, ext string, fm *FileMap) {
+// defPattern is one kind of definition a regex scanner recognises: group 1
+// is the name, and the whole match (trimmed) is the signature.
+type defPattern struct {
+	re  *regexp.Regexp
+	typ string
+}
+
+// regexLang is how one language's files are scanned without a parser.
+type regexLang struct {
+	defs        []defPattern
+	lineComment string // prefix of a whole-line comment
+	// indentedMethod: an indented function definition is a method (Python).
+	indentedMethod bool
+}
+
+var (
+	pyLang = regexLang{
+		lineComment:    "#",
+		indentedMethod: true,
+		defs: []defPattern{
+			{regexp.MustCompile(`^\s*class\s+([A-Za-z0-9_]+)\s*(?:\([^)]*\))?\s*:`), "class"},
+			{regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z0-9_]+)\s*\((.*?)\)(?:\s*->\s*[^:]+)?\s*:`), "func"},
+		},
+	}
+	jsLang = regexLang{
+		lineComment: "//",
+		defs: []defPattern{
+			{regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z0-9_$]+)`), "class"},
+			{regexp.MustCompile(`^\s*(?:export\s+)?interface\s+([A-Za-z0-9_$]+)`), "interface"},
+			{regexp.MustCompile(`^\s*(?:export\s+)?(?:declare\s+)?(?:type)\s+([A-Za-z0-9_$]+)\s*(?:<[^=]*>)?\s*=`), "type"},
+			{regexp.MustCompile(`^\s*(?:export\s+)?(?:const\s+)?enum\s+([A-Za-z0-9_$]+)`), "enum"},
+			{regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z0-9_$]+)\s*(?:<[^>]*>)?\s*\((.*?)\)`), "func"},
+			{regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let)\s+([A-Za-z0-9_$]+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z0-9_$]+)\s*(?::[^=]+)?=>`), "func"},
+		},
+	}
+	// csMods / javaMods are the modifiers a member declaration starts
+	// with; requiring one keeps statements such as "return Foo(x);" out.
+	csMods = `(?:(?:public|private|protected|internal|static|virtual|override|abstract|async|sealed|partial|readonly|extern|unsafe|new)\s+)`
+	csLang = regexLang{
+		lineComment: "//",
+		defs: []defPattern{
+			{regexp.MustCompile(`^\s*` + csMods + `*(?:record\s+(?:class|struct)|class|interface|struct|record|enum)\s+([A-Za-z0-9_]+)`), "class"},
+			{regexp.MustCompile(`^\s*` + csMods + `+[A-Za-z0-9_<>\[\],.? ]+?\s+([A-Za-z0-9_]+)\s*(?:<[^>()]*>)?\s*\(([^)]*)\)?`), "method"},
+		},
+	}
+	javaMods = `(?:(?:public|private|protected|static|final|abstract|synchronized|default|native)\s+)`
+	javaLang = regexLang{
+		lineComment: "//",
+		defs: []defPattern{
+			{regexp.MustCompile(`^\s*` + javaMods + `*(?:class|interface|enum|record|@interface)\s+([A-Za-z0-9_]+)`), "class"},
+			{regexp.MustCompile(`^\s*` + javaMods + `+(?:<[^>]+>\s+)?[A-Za-z0-9_<>\[\],.? ]+?\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)?`), "method"},
+		},
+	}
+	rustLang = regexLang{
+		lineComment: "//",
+		defs: []defPattern{
+			{regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union)\s+([A-Za-z0-9_]+)`), "struct"},
+			{regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?type\s+([A-Za-z0-9_]+)`), "type"},
+			{regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)?`), "func"},
+		},
+	}
+)
+
+// regexLangs maps the extensions scanned without a parser to their scanner.
+var regexLangs = map[string]*regexLang{
+	".py": &pyLang,
+	".ts": &jsLang, ".tsx": &jsLang, ".js": &jsLang, ".jsx": &jsLang, ".mjs": &jsLang, ".cjs": &jsLang,
+	".cs":   &csLang,
+	".java": &javaLang,
+	".rs":   &rustLang,
+}
+
+var identRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
+
+// maxScanLine: longer lines (minified bundles, data blobs) are skipped.
+const maxScanLine = 4096
+
+// parseRegexBased extracts definitions with the language's patterns and
+// counts every identifier outside whole-line comments as a reference.
+func parseRegexBased(absPath string, ext string, fm *FileMap) map[string]int {
+	lang := regexLangs[ext]
+	if lang == nil {
+		return nil
+	}
 	file, err := os.Open(absPath)
 	if err != nil {
-		return
+		return nil
 	}
 	defer func() { _ = file.Close() }()
 
-	var patterns []*regexp.Regexp
-	switch ext {
-	case ".py":
-		// Python patterns: class, def
-		patterns = []*regexp.Regexp{
-			regexp.MustCompile(`^\s*(class\s+([a-zA-Z0-9_]+)\s*(\([a-zA-Z0-9_,\s]*\))?:)`),
-			regexp.MustCompile(`^\s*(def\s+([a-zA-Z0-9_]+)\s*\((.*?)\):)`),
-		}
-	case ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
-		// TypeScript/JS patterns: export class, function, interface, export function
-		patterns = []*regexp.Regexp{
-			regexp.MustCompile(`^\s*(?:export\s+)?(?:class)\s+([a-zA-Z0-9_]+)`),
-			regexp.MustCompile(`^\s*(?:export\s+)?(?:interface)\s+([a-zA-Z0-9_]+)`),
-			regexp.MustCompile(`^\s*(?:export\s+)?(?:async\s+)?(?:function)\s+([a-zA-Z0-9_]+)\s*\((.*?)\)`),
-		}
-	}
-
+	refs := map[string]int{}
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") {
+		if trimmed == "" || len(line) > maxScanLine || strings.HasPrefix(trimmed, lang.lineComment) ||
+			strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
 			continue
 		}
-
-		for _, pat := range patterns {
-			matches := pat.FindStringSubmatch(line)
-			if len(matches) > 0 {
-				fullMatch := strings.TrimSpace(matches[0])
-				// Clean trailing brackets or colons
-				fullMatch = strings.TrimSuffix(fullMatch, ":")
-				fullMatch = strings.TrimSuffix(fullMatch, " {")
-
-				name := ""
-				if len(matches) > 1 {
-					name = matches[1]
-				}
-				typ := "definition"
-				if strings.Contains(fullMatch, "class") {
-					typ = "class"
-				} else if strings.Contains(fullMatch, "def") || strings.Contains(fullMatch, "function") {
-					typ = "func"
-				} else if strings.Contains(fullMatch, "interface") {
-					typ = "interface"
-				}
-
-				fm.Symbols = append(fm.Symbols, Symbol{
-					Name:      name,
-					Type:      typ,
-					Signature: fullMatch,
-					Line:      lineNum,
-				})
-				break
+		for _, id := range identRe.FindAllString(line, -1) {
+			if len(id) >= minRefIdentLen {
+				refs[id]++
 			}
 		}
+		for _, p := range lang.defs {
+			m := p.re.FindStringSubmatch(line)
+			if m == nil || m[1] == "" {
+				continue
+			}
+			sig := strings.TrimSpace(m[0])
+			sig = strings.TrimSuffix(sig, ":")
+			sig = strings.TrimSuffix(sig, "{")
+			sig = strings.TrimSpace(strings.TrimSuffix(sig, "=>"))
+			typ := p.typ
+			if lang.indentedMethod && typ == "func" && line != trimmed {
+				typ = "method"
+			}
+			fm.Symbols = append(fm.Symbols, Symbol{Name: m[1], Type: typ, Signature: sig, Line: lineNum})
+			if refs[m[1]] > 0 {
+				refs[m[1]]--
+			}
+			break
+		}
 	}
+	return refs
 }
 
 // formatGoType converts ast.Expr to its highly readable compact string format (pointer *, arrays [], selectors, name maps)
@@ -438,6 +364,8 @@ func formatGoType(expr ast.Expr) string {
 		return "func(...)"
 	case *ast.ChanType:
 		return "chan " + formatGoType(t.Value)
+	case *ast.IndexExpr:
+		return formatGoType(t.X) + "[" + formatGoType(t.Index) + "]"
 	default:
 		return "any"
 	}

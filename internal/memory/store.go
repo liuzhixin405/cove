@@ -313,6 +313,22 @@ func (s *Store) BuildPrompt() string {
 	return result
 }
 
+// InstructionsPrompt renders only the project instruction files (CLAUDE.md,
+// AGENTS.md, .cove.md, ...) in a <project_instructions> block; empty when
+// there are none. Sub-agents get it: they follow the project's rules too.
+func (s *Store) InstructionsPrompt() string {
+	var sb strings.Builder
+	for _, e := range s.All() {
+		if e.Project {
+			writeMemory(&sb, e)
+		}
+	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	return "<project_instructions>\n" + sb.String() + "</project_instructions>\n"
+}
+
 // PromptFor is BuildPrompt ranked for query: when the saved memories exceed
 // InlineBudgetBytes, the BM25 top RelevantTopK matches for query are included
 // in full (within InlineBudgetBytes) and the rest are listed in an index.

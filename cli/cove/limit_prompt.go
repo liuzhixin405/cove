@@ -33,7 +33,8 @@ func askTurnLimit(stats engine.LimitStats) engine.LimitDecision {
 	if !replInteractive {
 		return engine.LimitStop
 	}
-	answer, ok := repl.Ask(limitPromptText(stats), limitAnswerAccepted, "上限提示等待回答：c 继续 / s 停止", limitPromptTimeout)
+	answer, ok := repl.AskWith(repl.AskSpec{Text: limitPromptText(stats), Accepts: limitAnswerAccepted,
+		Hint: "上限提示等待回答：c 继续 / s 停止", Timeout: limitPromptTimeout, Keys: "cs"})
 	if !ok {
 		// The relay is gone: a "c" typed from now on is an ordinary message.
 		termui.PrintAbove("  " + termui.Styled(termui.Yellow, "等待超时，已按停止处理（此后单独输入 c 会作为新消息发送）") + "\n")
@@ -73,7 +74,7 @@ func limitPromptText(s engine.LimitStats) string {
 	if s.Detail != "" {
 		b.WriteString("  " + s.Detail + "\n") // what the loop detector saw
 	}
-	b.WriteString("  " + termui.Styled(termui.Bold, cont+"  [s] 停止") + "\n")
+	b.WriteString("  " + termui.Styled(termui.Bold, cont+"  [s] 停止") + "  " + termui.Styled(termui.Dim, "（按键即答）") + "\n")
 	return b.String()
 }
 

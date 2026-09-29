@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/command"
+	"github.com/liuzhixin405/cove/internal/config"
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/plugin"
@@ -63,6 +65,10 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 	skillDescs := buildSkillDescs(skillMgr)
 
+	// Typed lines survive a restart (Up, Ctrl+R).
+	if dir, err := config.ConfigDir(); err == nil {
+		repl.SetHistoryFile(filepath.Join(dir, "input_history.jsonl"))
+	}
 	reader := repl.New(func(input string) []string {
 
 		return complete(input, allCommands, skillDescs)
@@ -172,17 +178,29 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 			}
 
-			repl.PrintAbove("Type /exit or Ctrl+D to exit.\r\n")
+			repl.PrintAbove("输入 /exit 或按 Ctrl+D 退出。\r\n")
 
 			continue
 
+		}
+
+		// Esc on an empty line interrupts the running task, like Ctrl+C;
+		// with nothing running it does nothing.
+		if errors.Is(err, repl.ErrEscape) {
+			if tasks.IsRunning() {
+				denyPendingPermissionPrompt()
+				if tasks.CancelRunning() {
+					repl.PrintAbove(fmt.Sprintf("%s[已中断] 正在停止当前任务…输入 /continue 可继续%s\r\n", repl.Yellow, repl.Reset))
+				}
+			}
+			continue
 		}
 
 		if errors.Is(err, repl.ErrExit) {
 
 			autoSaveSession(eng)
 
-			repl.PrintAbove("Goodbye!\r\n")
+			repl.PrintAbove("再见！\r\n")
 
 			return
 
@@ -257,7 +275,7 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 			autoSaveSession(eng)
 
-			repl.PrintAbove("Goodbye!\r\n")
+			repl.PrintAbove("再见！\r\n")
 
 			return
 
@@ -379,7 +397,7 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 					_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
 				}
 				autoSaveSession(eng)
-				repl.PrintAbove("Goodbye!\r\n")
+				repl.PrintAbove("再见！\r\n")
 				return
 			}
 			continue
@@ -628,40 +646,18 @@ func handlePluginCommand(input string, pluginMgr *plugin.Manager, tasks *replTas
 	return true
 }
 
-func handleSkillInvocation(input string, eng *engine.Engine) {
-
-	parts := strings.Fields(input)
-
-	if len(parts) == 0 {
-
-		return
-
-	}
-
-	name := strings.TrimPrefix(parts[0], "/")
-
-	prompt, ok := eng.Runtime().SkillPrompts[name]
-
+// handleSkillInvocation runs "/<skill> [args]" as a task, the way a plugin
+// command runs (skillInvocationPrompt).
+func handleSkillInvocation(input string, eng *engine.Engine, tasks *replTaskRunner) {
+	prompt, name, ok := skillInvocationPrompt(input, eng)
 	if !ok {
-
-		repl.PrintSafe("未找到配置文件: %s\n", name)
-
+		repl.PrintSafe("未找到技能: %s\n", name)
 		return
-
 	}
-
-	args := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
-
-	repl.PrintSafe("\n[Skill: %s]\n\n%s\n", name, prompt)
-
-	if args != "" {
-
-		repl.PrintSafe("\n无效的参数: %s\n", args)
-
+	repl.PrintAbove(fmt.Sprintf("[技能: /%s]\r\n", name))
+	if msg := tasks.EnqueueWithFeedback(api.Message{Role: "user", Content: prompt}); msg != "" {
+		repl.PrintAbove(msg + "\r\n")
 	}
-
-	repl.PrintSafe("\n")
-
 }
 
 // replLogWriter routes internal/log through the editor.

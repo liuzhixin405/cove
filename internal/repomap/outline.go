@@ -68,7 +68,7 @@ func Outline(root string) string {
 	// The hint goes first so a cut at the cap never drops it.
 	lines := []string{"File symbols are not listed here: call the repo_map tool (query by path or identifier), grep or glob when you need them."}
 	if sc.mapped == 0 {
-		lines[0] = "File symbols are not listed here. repo_map only maps Go, Python, TypeScript and JavaScript, none of which is here: use grep and glob to explore the code."
+		lines[0] = "File symbols are not listed here. repo_map only maps " + ScannedLanguages + ", none of which is here: use grep and glob to explore the code."
 	}
 	if l := languagesLine(sc.langs); l != "" {
 		lines = append(lines, l)

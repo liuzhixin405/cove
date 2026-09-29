@@ -77,6 +77,16 @@ type MarkdownStream struct {
 	started    bool // the line's prefix has been decided and printed
 	kind       mdLine
 	bold, code bool
+
+	// lang is the open code block's language (its info string); codeLine
+	// holds the current code line until its newline, so it can be
+	// highlighted whole (highlight.go).
+	lang     string
+	codeLine strings.Builder
+
+	// table holds the rows of a Markdown table until it ends: its columns
+	// can only be aligned once every row is known.
+	table []string
 }
 
 // NewMarkdownStream returns a renderer that uses ASCII glyphs when
@@ -100,6 +110,14 @@ func (m *MarkdownStream) Write(chunk string) string {
 // line as far as Markdown is concerned; an open code block stays open.
 func (m *MarkdownStream) Flush() string {
 	out := m.render("", true)
+	if m.started && m.kind == mdCode && m.codeLine.Len() > 0 {
+		out += highlightCode(m.codeLine.String(), m.lang)
+		m.codeLine.Reset()
+	}
+	if len(m.table) > 0 {
+		out += renderTable(m.table)
+		m.table = nil
+	}
 	if m.bold || m.code || (m.started && m.kind == mdHeading) {
 		out += sgrReset
 	}
@@ -170,6 +188,19 @@ func (m *MarkdownStream) startLine(out *strings.Builder, line string, hasNL, com
 		return 0, true
 	}
 
+	// A table row is held until the table ends (renderTable).
+	if u != "" && u[0] == '|' {
+		if !complete {
+			return 0, false
+		}
+		m.table = append(m.table, u)
+		return wholeLine, true
+	}
+	if len(m.table) > 0 {
+		out.WriteString(renderTable(m.table))
+		m.table = nil
+	}
+
 	if u == "" {
 		if !complete {
 			return 0, false
@@ -229,6 +260,10 @@ func (m *MarkdownStream) startLine(out *strings.Builder, line string, hasNL, com
 		}
 		out.WriteString(codeGutter + sgrDim + label + sgrDimOff + nl)
 		m.fenceChar, m.fenceLen = c, r
+		m.lang = ""
+		if f := strings.Fields(info); len(f) > 0 {
+			m.lang = strings.ToLower(StripControls(f[0]))
+		}
 		return wholeLine, true
 	case '>':
 		skip := indent + 1
@@ -255,17 +290,22 @@ func (m *MarkdownStream) inline(out *strings.Builder, s string, final bool) stri
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c == '\n' {
+			if m.kind == mdCode {
+				out.WriteString(highlightCode(m.codeLine.String(), m.lang))
+				m.codeLine.Reset()
+			}
 			m.endLine(out)
 			out.WriteByte('\n')
 			return s[i+1:]
 		}
 		if m.kind == mdCode {
+			// Held to the end of the line, then highlighted whole.
 			j := strings.IndexByte(s[i:], '\n')
 			if j < 0 {
-				out.WriteString(s[i:])
+				m.codeLine.WriteString(s[i:])
 				return ""
 			}
-			out.WriteString(s[i : i+j])
+			m.codeLine.WriteString(s[i : i+j])
 			i += j
 			continue
 		}

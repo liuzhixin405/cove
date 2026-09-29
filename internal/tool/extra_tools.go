@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -335,54 +336,124 @@ func (t *TodoWriteTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	if tctx.Runtime != nil {
 		// todowrite is not concurrency-safe, so the engine runs it inline — but
 		// inline means "in the dispatch loop", concurrently with the tool calls
-		// already launched as goroutines from that same response. The map write
-		// below still needs the lock.
-		tctx.Runtime.Lock()
-		defer tctx.Runtime.Unlock()
-		if tctx.Runtime.Tasks == nil {
-			tctx.Runtime.Tasks = make(map[string]*TaskRecord)
-		}
-		for id := range tctx.Runtime.Tasks {
-			if strings.HasPrefix(id, "todo-") {
-				delete(tctx.Runtime.Tasks, id)
-			}
-		}
-		for i, td := range todos {
-			tm, _ := td.(map[string]any)
-			content, _ := tm["content"].(string)
-			status, _ := tm["status"].(string)
-			id := fmt.Sprintf("todo-%d", i+1)
-			// Description is what execute_plan sends a sub-agent as the task and
-			// where it parses the "depends:" prefix. It used to hold only
-			// "priority: high", so every sub-agent got that as its whole task.
-			// (Priority is shown in the summary below; TaskRecord has no field
-			// for it.)
-			tctx.Runtime.Tasks[id] = &TaskRecord{
-				ID:          id,
-				Title:       content,
-				Description: content,
-				Status:      status,
-			}
-		}
+		// already launched as goroutines from that same response. SetTodos
+		// takes the lock.
+		tctx.Runtime.SetTodos(todos)
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Task list (%d items):\n", len(todos))
 	for i, td := range todos {
 		tm, _ := td.(map[string]any)
 		status, _ := tm["status"].(string)
-		mark := "[ ]"
-		switch status {
-		case "completed":
-			mark = "[✓]"
-		case "in_progress":
-			mark = "[>]"
-		case "cancelled":
-			mark = "[x]"
-		}
-		// The ID is what a later todo names in "depends:todo-N", so show it.
-		fmt.Fprintf(&sb, "%s todo-%d. %v [%v]\n", mark, i+1, tm["content"], tm["priority"])
+		content, _ := tm["content"].(string)
+		priority, _ := tm["priority"].(string)
+		writeTodoLine(&sb, i+1, status, content, priority)
 	}
 	return Result{Data: sb.String()}, nil
+}
+
+// writeTodoLine renders one todo as todowrite shows it. The ID is what a
+// later todo names in "depends:todo-N", so it is shown.
+func writeTodoLine(sb *strings.Builder, n int, status, content, priority string) {
+	mark := "[ ]"
+	switch status {
+	case "completed":
+		mark = "[✓]"
+	case "in_progress":
+		mark = "[>]"
+	case "cancelled":
+		mark = "[x]"
+	}
+	fmt.Fprintf(sb, "%s todo-%d. %s [%s]\n", mark, n, content, priority)
+}
+
+// SetTodos replaces the todo list (the todo-N task records) with todos, the
+// "todos" argument of a todowrite call. The engine also calls it on resume,
+// with the last todowrite call of the loaded history.
+func (r *Runtime) SetTodos(todos []any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Tasks == nil {
+		r.Tasks = make(map[string]*TaskRecord)
+	}
+	r.clearTodosLocked()
+	for i, td := range todos {
+		tm, _ := td.(map[string]any)
+		content, _ := tm["content"].(string)
+		status, _ := tm["status"].(string)
+		priority, _ := tm["priority"].(string)
+		id := fmt.Sprintf("todo-%d", i+1)
+		// Description is what execute_plan sends a sub-agent as the task and
+		// where it parses the "depends:" prefix. It used to hold only
+		// "priority: high", so every sub-agent got that as its whole task.
+		r.Tasks[id] = &TaskRecord{
+			ID:          id,
+			Title:       content,
+			Description: content,
+			Status:      status,
+			Priority:    priority,
+		}
+	}
+}
+
+// ClearTodos drops the todo list (a new conversation starts without one).
+func (r *Runtime) ClearTodos() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clearTodosLocked()
+}
+
+func (r *Runtime) clearTodosLocked() {
+	for id := range r.Tasks {
+		if strings.HasPrefix(id, "todo-") {
+			delete(r.Tasks, id)
+		}
+	}
+}
+
+// CompletedTodos returns the content of the todo items marked completed.
+func (r *Runtime) CompletedTodos() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for id, tr := range r.Tasks {
+		if strings.HasPrefix(id, "todo-") && tr.Status == "completed" {
+			out = append(out, tr.Title)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TodoList renders the current todo list as todowrite shows it and counts
+// the items still open (pending or in progress). Empty with no list.
+func (r *Runtime) TodoList() (list string, open int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	type item struct {
+		n  int
+		tr *TaskRecord
+	}
+	var items []item
+	for id, tr := range r.Tasks {
+		n, err := strconv.Atoi(strings.TrimPrefix(id, "todo-"))
+		if err != nil || !strings.HasPrefix(id, "todo-") {
+			continue
+		}
+		items = append(items, item{n, tr})
+	}
+	if len(items) == 0 {
+		return "", 0
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].n < items[j].n })
+	var sb strings.Builder
+	for _, it := range items {
+		writeTodoLine(&sb, it.n, it.tr.Status, it.tr.Title, it.tr.Priority)
+		if it.tr.Status == "pending" || it.tr.Status == "in_progress" {
+			open++
+		}
+	}
+	return sb.String(), open
 }
 func (t *TodoWriteTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("todowrite is local state")

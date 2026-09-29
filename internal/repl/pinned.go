@@ -248,7 +248,7 @@ func queryCursorPos() (cursorPos, bool) {
 	case <-cprCh: // a stale report from an earlier, abandoned query
 	default:
 	}
-	fmt.Print("\x1b[6n")
+	termPrint("\x1b[6n")
 	select {
 	case pos := <-cprCh:
 		return pos, true
@@ -276,7 +276,7 @@ func pinAtCursor(separator bool) {
 	lr := activeReader
 	fallback := func() {
 		if separator {
-			fmt.Print("\n")
+			termPrint("\n")
 		}
 	}
 	if !ok || lr == nil || !lr.reading {
@@ -289,7 +289,7 @@ func pinAtCursor(separator bool) {
 		return
 	}
 	seq, _ := pinSequence(pos, h, separator)
-	fmt.Print(seq)
+	termPrint(seq)
 	if separator {
 		streamMidLine = false
 	}
@@ -316,7 +316,7 @@ func unpinLocked() {
 	if !pinned {
 		return
 	}
-	fmt.Print(unpinSequence(pinRows))
+	termPrint(unpinSequence(pinRows))
 	pinned = false
 }
 
@@ -348,7 +348,7 @@ func (lr *LineReader) drawPinnedLocked() {
 		}
 	}
 	sb.WriteString("\x1b8")
-	fmt.Print(sb.String())
+	termPrint(sb.String())
 	lr.lineDrawn = false
 }
 
@@ -364,7 +364,7 @@ func (lr *LineReader) repinIfResizedLocked(w, h int) bool {
 		pinCols = w
 		return false
 	}
-	fmt.Print(unpinSequence(pinRows))
+	termPrint(unpinSequence(pinRows))
 	pinned = false
 	pinRows, pinCols = 0, 0
 	if lr.reading && streamingActive {

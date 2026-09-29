@@ -12,6 +12,16 @@ type Spinner struct {
 	stopCh  chan struct{}
 	doneCh  chan struct{}
 	message string
+	// suffix, when set, is evaluated on every frame and shown dim after the
+	// message (elapsed time, context use, cost).
+	suffix func() string
+}
+
+// SetSuffix sets the live status shown after the message.
+func (s *Spinner) SetSuffix(f func() string) {
+	s.mu.Lock()
+	s.suffix = f
+	s.mu.Unlock()
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -36,6 +46,7 @@ func (s *Spinner) Start() {
 	go func() {
 		defer close(doneCh)
 		i := 0
+		lastSuffix := ""
 		for {
 			select {
 			case <-stopCh:
@@ -50,8 +61,19 @@ func (s *Spinner) Start() {
 				// (WalkingIndicator below already did this correctly.)
 				s.mu.Lock()
 				msg := s.message
+				suffix := s.suffix
 				s.mu.Unlock()
-				PrintTransientStatus(fmt.Sprintf("  %s%s %s%s", Cyan, frame, msg, Reset))
+				line := fmt.Sprintf("  %s%s %s%s", Cyan, frame, msg, Reset)
+				// The suffix is recomputed every ~0.5s, not every frame.
+				if suffix != nil {
+					if i%6 == 0 || lastSuffix == "" {
+						lastSuffix = suffix()
+					}
+					if lastSuffix != "" {
+						line += "  " + Dim + lastSuffix + Reset
+					}
+				}
+				PrintTransientStatus(line)
 				i++
 				time.Sleep(80 * time.Millisecond)
 			}

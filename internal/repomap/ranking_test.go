@@ -165,17 +165,35 @@ func TestBuildRankedCoversTSXAndModuleJS(t *testing.T) {
 	}
 }
 
-// TestEnhancedGeneratorNoticesModuleJSChanges: the incremental generator only
-// rebuilds when a tracked file changes, so a scanned extension it does not
-// track (.mjs/.cjs) kept a stale map until some other file changed.
-func TestEnhancedGeneratorNoticesModuleJSChanges(t *testing.T) {
+// TestIndexNoticesModuleJSChanges: the index only re-parses files it tracks,
+// so a scanned extension it does not track (.mjs/.cjs) kept a stale map
+// until some other file changed.
+func TestIndexNoticesModuleJSChanges(t *testing.T) {
 	root := t.TempDir()
-	eg := NewEnhancedGenerator(root)
-	_, _ = eg.GenerateIncremental(50)
+	g := NewGenerator(root)
+	_ = g.Generate(50)
 	if err := os.WriteFile(filepath.Join(root, "util.mjs"), []byte("export function fresh(a) {\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, _ := eg.GenerateIncremental(50); !strings.Contains(out, "function fresh(a)") {
+	if out := g.Generate(50); !strings.Contains(out, "function fresh(a)") {
 		t.Fatalf("a new .mjs file did not refresh the map:\n%s", out)
+	}
+}
+
+// TestBuildRankedCountsBodyReferences: the score used to count only names in
+// other files' signatures, so a type used everywhere inside function bodies
+// (but never as a parameter) ranked like one nobody used.
+func TestBuildRankedCountsBodyReferences(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"reg.go":    "package p\ntype Registry struct{}\nfunc NewRegistry() *Registry { return nil }\n",
+		"a.go":      "package p\nfunc A() { r := NewRegistry(); _ = r }\n",
+		"b.go":      "package p\nfunc B() { var r *Registry; _ = r }\n",
+		"c.go":      "package p\nfunc C() { _ = NewRegistry() }\n",
+		"lonely.go": "package p\ntype Lonely struct{}\n",
+	})
+	fms := NewGenerator(root).BuildRanked(1)
+	if len(fms) != 1 || fms[0].Path != "reg.go" {
+		t.Fatalf("top file = %+v, want reg.go", fms)
 	}
 }

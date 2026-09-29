@@ -49,8 +49,12 @@ func defaultVerifyTimeout(cmd string) time.Duration {
 		name := strings.ToLower(filepath.Base(f[0]))
 		name = strings.TrimSuffix(strings.TrimSuffix(name, ".exe"), ".cmd")
 		switch name {
-		case "dotnet", "npm":
+		case "dotnet", "npm", "pytest":
 			return verifyTimeoutSlow
+		case "go":
+			if len(f) > 1 && f[1] == "test" {
+				return verifyTimeoutSlow
+			}
 		}
 	}
 	return verifyTimeoutDefault
@@ -84,6 +88,10 @@ type VerifyGate struct {
 	// onlyWhenFilesChanged limits the gate to turns that wrote or edited a
 	// file. Set for automatically detected commands (newAutoVerifyGate).
 	onlyWhenFilesChanged bool
+	// dynamic, when set, returns further commands for the current turn, run
+	// after the fixed ones (the tests of what the turn changed,
+	// testCommandsFor).
+	dynamic func() []string
 	// runner executes one command; nil means runVerifyCommand (replaced in
 	// tests).
 	runner func(ctx context.Context, cmd, workDir string) (string, int, error)
@@ -126,7 +134,16 @@ func (g *VerifyGate) timeoutFor(cmd string) time.Duration {
 }
 
 // Enabled reports whether any verification commands are configured.
-func (g *VerifyGate) Enabled() bool { return g != nil && len(g.commands) > 0 }
+func (g *VerifyGate) Enabled() bool { return g != nil && (len(g.commands) > 0 || g.dynamic != nil) }
+
+// turnCommands are the commands a check of the current turn runs.
+func (g *VerifyGate) turnCommands() []string {
+	cmds := append([]string(nil), g.commands...)
+	if g.dynamic != nil {
+		cmds = append(cmds, g.dynamic()...)
+	}
+	return cmds
+}
 
 // MaxRetries returns how many times the gate will reject a single turn's
 // completion before giving up and letting it through anyway (to bound cost).
@@ -155,7 +172,7 @@ func (g *VerifyGate) Run(ctx context.Context, alreadyPassed func(cmd string) boo
 		runner = runVerifyCommand
 	}
 	allPassed = true
-	for _, cmdStr := range g.commands {
+	for _, cmdStr := range g.turnCommands() {
 		if alreadyPassed != nil && alreadyPassed(cmdStr) {
 			results = append(results, VerifyResult{Command: cmdStr, Passed: true, Skipped: true})
 			continue

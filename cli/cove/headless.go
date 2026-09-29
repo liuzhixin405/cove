@@ -51,8 +51,16 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 	}
 	cmdReg = fe.install(cmdReg)
 
+	first := true
 	for scanner.Scan() {
-		input := strings.TrimSpace(scanner.Text())
+		line := scanner.Text()
+		if first {
+			// Windows PowerShell pipes text into a program with a UTF-8
+			// byte-order mark: "/context" arrived as BOM + "/context", was
+			// not a command, and went to the model as a message.
+			line, first = strings.TrimPrefix(line, utf8BOM), false
+		}
+		input := strings.TrimSpace(line)
 		if input == "" {
 			continue
 		}

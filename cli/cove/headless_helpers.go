@@ -33,24 +33,30 @@ func skillInvocationRequested(input string, eng *engine.Engine) bool {
 	return ok
 }
 
-// skillInvocationText renders an installed skill's prompt for display,
-// mirroring the classic REPL's handleSkillInvocation.
-func skillInvocationText(input string, eng *engine.Engine) string {
+// skillInvocationPrompt turns "/<skill> [args]" into the user message that
+// runs the skill: its instructions, with the arguments filled in by
+// command.ExpandArguments (in place of $ARGUMENTS, or as the task after
+// them). ok is false when no installed skill has that name.
+//
+// "/<skill> args" used to print the skill's text and "无效的参数" and run
+// nothing: invoking a skill by name did not invoke it.
+func skillInvocationPrompt(input string, eng *engine.Engine) (prompt, name string, ok bool) {
 	parts := strings.Fields(input)
-	if len(parts) == 0 {
-		return ""
+	if len(parts) == 0 || eng == nil || eng.Runtime() == nil {
+		return "", "", false
 	}
-	name := strings.TrimPrefix(parts[0], "/")
-	prompt, ok := eng.Runtime().SkillPrompts[name]
+	name = strings.TrimPrefix(parts[0], "/")
+	body, ok := eng.Runtime().SkillPrompts[name]
 	if !ok {
-		return fmt.Sprintf("未找到配置文件: %s", name)
+		return "", name, false
 	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "[Skill: %s]\n\n%s\n", name, prompt)
-	if args := strings.TrimSpace(strings.TrimPrefix(input, parts[0])); args != "" {
-		fmt.Fprintf(&sb, "\n无效的参数: %s\n", args)
+	args := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+	expanded := command.ExpandArguments(body, args)
+	prompt = fmt.Sprintf("Use the skill %q for this request. Its instructions:\n<skill name=%q>\n%s\n</skill>", name, name, strings.TrimSpace(expanded))
+	if args == "" {
+		prompt += "\n\nApply the skill to the current conversation and project."
 	}
-	return sb.String()
+	return prompt, name, true
 }
 
 // pluginCommandPrompt resolves a "/<plugincmd> [args]" into the plugin

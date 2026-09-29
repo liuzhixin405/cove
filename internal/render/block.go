@@ -79,6 +79,10 @@ type Block struct {
 	// IsError marks a failed tool call or an engine error.
 	IsError bool
 
+	// Diff reports that Full is a unified diff (an edit or a write), which
+	// the expanded form colours by line.
+	Diff bool
+
 	// Duration is how long the step took. Zero means "do not show".
 	Duration time.Duration
 }

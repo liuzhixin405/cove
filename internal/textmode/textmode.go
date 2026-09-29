@@ -28,6 +28,36 @@ func PreferASCII() bool {
 	return consoleNeedsASCIIFallback()
 }
 
+// NoColor reports whether output must carry no colour: the NO_COLOR
+// convention (https://no-color.org), any non-empty value. The glyphs stay.
+func NoColor() bool {
+	return os.Getenv("NO_COLOR") != ""
+}
+
+// StripSGR removes colour and style sequences (ESC [ … m) from s, leaving
+// cursor control alone: what NO_COLOR asks for.
+func StripSGR(s string) string {
+	if !strings.Contains(s, "\x1b[") {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && (s[j] >= '0' && s[j] <= '9' || s[j] == ';' || s[j] == ':') {
+				j++
+			}
+			if j < len(s) && s[j] == 'm' {
+				i = j
+				continue
+			}
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
 func envBool(name string) (bool, bool) {
 	raw, ok := os.LookupEnv(name)
 	if !ok {

@@ -2,7 +2,6 @@ package repomap
 
 import (
 	"fmt"
-	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -48,8 +47,10 @@ func QueryIn(root, pathPrefix string, terms []string, budget int) string {
 		}
 	}
 
+	ix := IndexFor(root)
+	ix.Refresh()
 	var hits []queryHit
-	for _, fm := range NewGenerator(root).BuildRanked(math.MaxInt) {
+	for _, fm := range ix.Files() {
 		if prefix != "" && fm.Path != prefix && !strings.HasPrefix(fm.Path, prefix+"/") {
 			continue
 		}
@@ -126,13 +127,96 @@ func QueryIn(root, pathPrefix string, terms []string, budget int) string {
 		if sb.Len()+len(more) <= budget {
 			sb.WriteString(more)
 		}
+		return sb.String()
+	}
+	if len(terms) > 0 {
+		writeRelated(&sb, ix, hits, prefix, wantTests, budget)
 	}
 	return sb.String()
 }
 
+// Related files: at most this many, each listing at most this many symbols.
+const (
+	queryMaxRelated        = 8
+	queryMaxRelatedSymbols = 10
+	queryMaxSeeds          = 10
+)
+
+// writeRelated appends, within budget, the files most connected to the
+// matching ones in the reference graph (what they call and what calls them)
+// that did not match a term themselves: the part of the code a change to the
+// matches is likely to touch. Their symbols the matches reference come first.
+func writeRelated(sb *strings.Builder, ix *Index, hits []queryHit, prefix string, wantTests bool, budget int) {
+	seeds := map[string]float64{}
+	var seedPaths []string
+	for _, h := range hits {
+		if len(seedPaths) == queryMaxSeeds {
+			break
+		}
+		seeds[h.fm.Path] = float64(h.score)
+		seedPaths = append(seedPaths, h.fm.Path)
+	}
+	pr := ix.PersonalRank(seeds)
+	if len(pr) == 0 {
+		return
+	}
+	byPath := map[string]FileMap{}
+	for _, fm := range ix.Files() {
+		byPath[fm.Path] = fm
+	}
+	var cands []string
+	for p := range pr {
+		fm, ok := byPath[p]
+		if !ok || seeds[p] > 0 || (!wantTests && isTestPath(p)) {
+			continue
+		}
+		if prefix != "" && fm.Path != prefix && !strings.HasPrefix(fm.Path, prefix+"/") {
+			continue
+		}
+		cands = append(cands, p)
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if pr[cands[i]] != pr[cands[j]] {
+			return pr[cands[i]] > pr[cands[j]]
+		}
+		return cands[i] < cands[j]
+	})
+	if len(cands) > queryMaxRelated {
+		cands = cands[:queryMaxRelated]
+	}
+	used := ix.referencedBy(seedPaths)
+	const header = "Related by references (callers/callees of the files above):\n"
+	wroteHeader := false
+	for _, p := range cands {
+		fm := byPath[p]
+		h := queryHit{fm: fm, matched: map[int]bool{}}
+		for i, s := range fm.Symbols {
+			if used[s.Name] {
+				h.matched[i] = true
+			}
+		}
+		block := formatHitN(h, queryMaxRelatedSymbols)
+		add := len(block)
+		if !wroteHeader {
+			add += len(header)
+		}
+		if sb.Len()+add > budget {
+			continue
+		}
+		if !wroteHeader {
+			sb.WriteString(header)
+			wroteHeader = true
+		}
+		sb.WriteString(block)
+	}
+}
+
 // formatHit renders one file like FormatFileMaps, matching symbols first and
 // at most queryMaxSymbolsPerFile of them.
-func formatHit(h queryHit) string {
+func formatHit(h queryHit) string { return formatHitN(h, queryMaxSymbolsPerFile) }
+
+// formatHitN is formatHit listing at most maxSymbols symbols.
+func formatHitN(h queryHit, maxSymbols int) string {
 	var sb strings.Builder
 	sb.WriteString(h.fm.Path)
 	if h.fm.Package != "" {
@@ -151,7 +235,7 @@ func formatHit(h queryHit) string {
 		}
 	}
 	for n, i := range order {
-		if n == queryMaxSymbolsPerFile {
+		if n == maxSymbols {
 			fmt.Fprintf(&sb, "  … %d more symbols\n", len(order)-n)
 			break
 		}

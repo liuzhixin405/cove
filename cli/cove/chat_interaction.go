@@ -14,6 +14,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/termui"
+	"github.com/liuzhixin405/cove/internal/uiout"
 )
 
 func isTransientRequestError(err error) bool {
@@ -54,6 +55,12 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 	maxAttempts := 3
 	p := newTurnPrinter()
 	defer p.stop()
+	turnStart := time.Now()
+	var usage *turnUsage
+	if eng, ok := runner.(*engine.Engine); ok {
+		usage = newTurnUsage(eng, turnStart)
+		p.status = usage.live
+	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		p.beginAttempt()
 
@@ -70,7 +77,14 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 			})
 			// Engine diagnostic lines (tool blocks, stall warnings, memory
 			// notices) go through the printer into the conversation area.
-			eng.SetOutput(engine.LineSink(p.engineLine))
+			// Tool blocks keep their "#id" and are remembered for /x.
+			eng.SetOutput(uiout.NewFuncs(uiout.Funcs{
+				OnBlock: func(b render.Block) {
+					sessionBlocks.add(b)
+					p.engineLine(engine.RenderBlock(b) + "\n")
+				},
+				OnLine: p.engineLine,
+			}))
 			defer func() {
 				eng.SetTurnHooks(nil)
 				eng.SetOutput(nil)
@@ -127,13 +141,20 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 		p.system(color + errMsg + termui.Reset)
 		totalOutput.WriteString(errMsg)
 	}
+	// One dim line of what the turn took: time, tokens, cost, context use.
+	if usage != nil {
+		if line := usage.summary(); line != "" {
+			p.stopSpinner()
+			p.system("\n  " + termui.Styled(termui.Dim, line))
+		}
+	}
 	totalOutput.WriteString("\r\n\r\n")
 	return totalOutput.String(), finalErr
 }
 
 // turnErrorLine is the line that ends a failed turn, and its color. A turn
 // stopped at its limit (the user answered "s", or the prompt timed out) did
-// not fail, so it gets a neutral prefix instead of "Request failed".
+// not fail, so it gets a neutral prefix instead of "请求失败".
 func turnErrorLine(err error, text string) (string, string) {
 	var le *engine.LimitError
 	if errors.As(err, &le) {
@@ -142,7 +163,7 @@ func turnErrorLine(err error, text string) (string, string) {
 		}
 		return "\n本轮已停止：" + text, termui.Yellow
 	}
-	return fmt.Sprintf("\nRequest failed: %s", text), termui.Red
+	return fmt.Sprintf("\n请求失败：%s", text), termui.Red
 }
 
 // turnPrinter owns the terminal while one turn streams: the spinner, the
@@ -182,6 +203,10 @@ type turnPrinter struct {
 	// blocks, bullets). It runs after the sanitiser, so the only escapes it
 	// sees are the model's own colour codes.
 	md *render.MarkdownStream
+
+	// status, when set, is the live status after the spinner's message
+	// (elapsed time, context use, cost: turnUsage.live).
+	status func() string
 }
 
 // outputKind is the source of the last thing printed.
@@ -216,6 +241,9 @@ func (p *turnPrinter) beginAttempt() {
 	p.ensureLineStartLocked()
 	p.md = render.NewMarkdownStream()
 	p.spinner = termui.NewSpinner("思考中...")
+	if p.status != nil {
+		p.spinner.SetSuffix(p.status)
+	}
 	p.textStarted = false
 	p.reasoningChars = 0
 	p.startSpinnerLocked()

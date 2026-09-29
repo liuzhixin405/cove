@@ -290,7 +290,7 @@ func TestBannerExactPlainTextWithGit(t *testing.T) {
 		"  Git: main\n" +
 		"  目录: /tmp/proj\n" +
 		"  工具: 7 个\n\n" +
-		"  提示: 输入 /help 查看命令, Ctrl+C 中断\n\n"
+		"  提示: 输入 /help 查看命令，/keys 查看快捷键，Esc 或 Ctrl+C 中断\n\n"
 	if got != want {
 		t.Errorf("Banner (git)\ngot:  %q\nwant: %q", got, want)
 	}
@@ -303,7 +303,7 @@ func TestBannerOmitsGitLineWhenNotARepo(t *testing.T) {
 		"  模型: gpt-4  │  供应商: openai  │  模式: auto\n" +
 		"  目录: /tmp/proj\n" +
 		"  工具: 7 个\n\n" +
-		"  提示: 输入 /help 查看命令, Ctrl+C 中断\n\n"
+		"  提示: 输入 /help 查看命令，/keys 查看快捷键，Esc 或 Ctrl+C 中断\n\n"
 	if got != want {
 		t.Errorf("Banner (no git)\ngot:  %q\nwant: %q", got, want)
 	}

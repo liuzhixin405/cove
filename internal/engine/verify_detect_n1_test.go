@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,14 +44,26 @@ func TestDetectVerifyCommandsMoreEcosystems(t *testing.T) {
 	}
 }
 
-// The detected commands are announced once, at the first turn.
+// The detected commands are announced once, when a check first runs: a
+// chat turn (nothing changed, nothing checked) says nothing about them.
 func TestAutoVerifyCommandsAnnouncedOnce(t *testing.T) {
-	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "a"}, {content: "b"}}})
+	eng := newTestEngine(&mockProvider{responses: []mockResponse{{content: "a"}, {content: "b"}, {content: "c"}}})
 	eng.verifyGate = newAutoVerifyGate([]string{"go build ./..."}, t.TempDir())
+	eng.verifyGate.ledgerPath = ""
+	eng.verifyGate.runner = func(context.Context, string, string) (string, int, error) { return "", 0, nil }
 	var lines []string
 	eng.SetOutput(LineSink(func(s string) { lines = append(lines, s) }))
 	run(t, eng, "hi")
-	run(t, eng, "again")
+	if strings.Contains(strings.Join(lines, "\n"), "完成校验命令") {
+		t.Fatalf("a chat turn announced the check: %q", lines)
+	}
+	for _, msg := range []string{"edit one", "edit two"} {
+		eng.fileMu.Lock()
+		eng.turnFilesChanged = true
+		eng.fileMu.Unlock()
+		eng.verifyGate.onlyWhenFilesChanged = false // the turn start clears the flag set above
+		run(t, eng, msg)
+	}
 	n := strings.Count(strings.Join(lines, "\n"), "完成校验命令：go build ./...")
 	if n != 1 {
 		t.Fatalf("announced %d times: %q", n, lines)

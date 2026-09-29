@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/liuzhixin405/cove/internal/termui"
 )
@@ -30,6 +31,7 @@ func SetPromptInput(ch chan<- string, accepts func(string) bool, hint string) {
 	permInputCh = ch
 	permAccepts = accepts
 	permHint = hint
+	permKeys, permOptions, permOptionIdx = "", nil, -1
 }
 
 // PromptInputState is what TakePromptInputFor found for a typed line.
@@ -59,14 +61,14 @@ func TakePromptInputFor(line string) (ch chan<- string, state PromptInputState, 
 		return nil, PromptNotAnswer, permHint
 	}
 	ch = permInputCh
-	permInputCh, permAccepts, permHint = nil, nil, ""
+	clearPromptLocked()
 	return ch, PromptAnswer, ""
 }
 
 func ClearPermInputCh() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	permInputCh, permAccepts, permHint = nil, nil, ""
+	clearPromptLocked()
 }
 
 // TakePermInputCh takes the waiting prompt's channel unconditionally (Ctrl+C
@@ -75,8 +77,101 @@ func TakePermInputCh() chan<- string {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	ch := permInputCh
-	permInputCh, permAccepts, permHint = nil, nil, ""
+	clearPromptLocked()
 	return ch
+}
+
+func clearPromptLocked() {
+	permInputCh, permAccepts, permHint = nil, nil, ""
+	permKeys, permOptions, permOptionIdx = "", nil, -1
+}
+
+// permKeys are the keys that answer the waiting prompt on their own, pressed
+// on an empty input line ("yapn"); permOptions are the answers Up/Down cycle
+// through on the input line (a question's options). Guarded by consoleMu.
+var (
+	permKeys      string
+	permOptions   []string
+	permOptionIdx = -1
+)
+
+// promptKeyAnswers reports whether r, typed on an empty line, answers the
+// waiting prompt by itself.
+func promptKeyAnswers(r rune) bool {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	if permInputCh == nil || permKeys == "" || r > 127 {
+		return false
+	}
+	return strings.ContainsRune(permKeys, unicode.ToLower(r))
+}
+
+// cycleOption moves the input line to the previous (-1) or next (1) option
+// of the waiting prompt; false when the prompt has none or the line holds
+// other text (Up/Down then walk the history as usual).
+func (lr *LineReader) cycleOption(buf *[]rune, cursor *int, dir int) bool {
+	consoleMu.Lock()
+	opts := permOptions
+	idx := permOptionIdx
+	ok := permInputCh != nil && len(opts) > 0
+	if ok && len(*buf) > 0 && (idx < 0 || string(*buf) != opts[idx]) {
+		ok = false
+	}
+	if ok {
+		switch {
+		case idx < 0 && dir > 0:
+			idx = 0
+		case idx < 0:
+			idx = len(opts) - 1
+		default:
+			idx = (idx + dir + len(opts)) % len(opts)
+		}
+		permOptionIdx = idx
+	}
+	consoleMu.Unlock()
+	if !ok {
+		return false
+	}
+	*buf = []rune(opts[idx])
+	*cursor = len(*buf)
+	lr.redraw(*buf, *cursor)
+	return true
+}
+
+// AskSpec is a prompt for AskWith.
+type AskSpec struct {
+	Text    string
+	Accepts func(string) bool // nil: any non-empty line
+	Hint    string
+	Timeout time.Duration
+	// Keys answer the prompt on their own on an empty line (no Enter).
+	Keys string
+	// Options are offered on the input line with Up/Down; Enter sends the
+	// one shown.
+	Options []string
+}
+
+// AskWith is Ask with one-key answers and selectable options.
+func AskWith(s AskSpec) (answer string, ok bool) {
+	askMu.Lock()
+	defer askMu.Unlock()
+	ch := make(chan string, 1)
+	SetPromptInput(ch, s.Accepts, s.Hint)
+	consoleMu.Lock()
+	permKeys, permOptions, permOptionIdx = s.Keys, s.Options, -1
+	consoleMu.Unlock()
+	BeginPromptInput()
+	termui.PrintAbove(s.Text)
+	timer := time.NewTimer(s.Timeout)
+	defer timer.Stop()
+	select {
+	case answer = <-ch:
+		ok = true
+	case <-timer.C:
+	}
+	EndPromptInput()
+	ClearPermInputCh()
+	return answer, ok
 }
 
 // askMu serialises prompts: one prompt owns the answer relay at a time. The
@@ -92,20 +187,5 @@ var askMu sync.Mutex
 // for a line that is not one. ok is false on timeout. Either way nothing is
 // registered afterwards, so a later line is an ordinary one.
 func Ask(text string, accepts func(string) bool, hint string, timeout time.Duration) (answer string, ok bool) {
-	askMu.Lock()
-	defer askMu.Unlock()
-	ch := make(chan string, 1)
-	SetPromptInput(ch, accepts, hint)
-	BeginPromptInput()
-	termui.PrintAbove(text)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case answer = <-ch:
-		ok = true
-	case <-timer.C:
-	}
-	EndPromptInput()
-	ClearPermInputCh()
-	return answer, ok
+	return AskWith(AskSpec{Text: text, Accepts: accepts, Hint: hint, Timeout: timeout})
 }

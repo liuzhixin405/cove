@@ -212,6 +212,13 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 				return true
 			}},
 
+		{name: "x", aliases: []string{"expand"}, desc: "展开工具输出：/x [编号] [all]，编号是工具块后的 #N，省略则展开最近一个", category: catSession,
+			hints: []string{"all"},
+			run: func(ctx context.Context, in command.Input) bool {
+				fe.print(expandCommand(in.Args))
+				return true
+			}},
+
 		// Background tasks.
 		{name: "tasks", desc: "查看运行中/排队的后台任务", category: catTasks,
 			run: func(ctx context.Context, in command.Input) bool {
@@ -232,6 +239,11 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 		{name: "help", desc: "显示帮助", category: catSystem,
 			run: func(ctx context.Context, in command.Input) bool {
 				printHelp(fe.reg, fe.toolReg, fe.pluginMgr)
+				return true
+			}},
+		{name: "keys", aliases: []string{"shortcuts"}, desc: "查看输入快捷键", category: catSystem,
+			run: func(ctx context.Context, in command.Input) bool {
+				fe.print(keybindingHelp)
 				return true
 			}},
 		{name: "tools", desc: "列出可用工具", category: catSystem,
@@ -337,9 +349,10 @@ func (fe *frontend) dispatch(input string) bool {
 	switch target {
 	case slashSkill:
 		if fe.interactive() {
-			handleSkillInvocation(input, fe.eng)
-		} else {
-			outln(skillInvocationText(input, fe.eng))
+			handleSkillInvocation(input, fe.eng, fe.tasks)
+		} else if prompt, name, ok := skillInvocationPrompt(input, fe.eng); ok {
+			fmt.Fprintf(os.Stderr, "[技能: /%s]\n", name)
+			fe.enqueue(api.Message{Role: "user", Content: prompt})
 		}
 		return true
 	case slashPlugin:

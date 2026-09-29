@@ -261,7 +261,7 @@ func (e *Engine) stopNudge(ctx context.Context, l *turnLimits, iter int, resp *a
 
 // doneCheckEnabled reports whether the one-time done check applies to a turn
 // on routedModel. "auto" (the default) limits it to the models most
-// likely to stop early: the fast tier (isFastModelName, as weakModelGuidance)
+// likely to stop early: the fast tier (isFastModelName)
 // and any provider other than anthropic.
 func (e *Engine) doneCheckEnabled(routedModel string) bool {
 	switch strings.ToLower(strings.TrimSpace(e.config.DoneCheck)) {

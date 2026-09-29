@@ -119,8 +119,8 @@ func Banner(version, model, provider, mode, cwd, gitBranch, gitStatus string, to
 	fmt.Fprintf(&sb, "  %s目录:%s %s\n", Dim, Reset, cwd)
 	fmt.Fprintf(&sb, "  %s工具:%s %d 个\n", Dim, Reset, toolCount)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "  %s提示: 输入 %s/%s%s 查看命令, %sCtrl+C%s 中断%s\n",
-		Dim, Reset, "help", Dim, Reset, Dim, Reset)
+	fmt.Fprintf(&sb, "  %s提示: 输入 %s/help%s 查看命令，%s/keys%s 查看快捷键，%sEsc%s 或 %sCtrl+C%s 中断%s\n",
+		Dim, Reset, Dim, Reset, Dim, Reset, Dim, Reset, Dim, Reset)
 	sb.WriteString("\n")
 
 	return sb.String()

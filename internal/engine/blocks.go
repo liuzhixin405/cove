@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,6 +142,18 @@ func LineSink(line func(string)) uiout.Sink {
 	})
 }
 
+// RenderBlock renders b collapsed at the terminal's width, keeping its "#id"
+// handle: for a front end that can expand it (/x).
+func RenderBlock(b render.Block) string {
+	return render.Collapsed(b, blockRenderWidth(), currentBlockStyles())
+}
+
+// RenderExpanded renders b with its hidden output, at most maxLines lines of
+// it (0 = all).
+func RenderExpanded(b render.Block, maxLines int) string {
+	return render.Expanded(b, blockRenderWidth(), maxLines, currentBlockStyles(), textmode.NoColor())
+}
+
 func withoutID(b render.Block) render.Block {
 	b.ID = ""
 	return b
@@ -151,16 +164,102 @@ func withoutID(b render.Block) render.Block {
 // summary is left to render.ToolBlock unless the caller knows something better;
 // output is the raw tool result, which the block carries in full so the front
 // end can expand it on demand.
-func (e *Engine) emitToolResult(name string, input map[string]any, output string, isError bool, d time.Duration) {
-	e.emitBlock(render.ToolBlock(
-		nextBlockID(),
-		name,
-		toolHeaderFor(name, input),
-		"",
-		output,
-		isError,
-		d,
-	))
+func (e *Engine) emitToolResult(callID, name string, input map[string]any, output string, isError bool, d time.Duration) {
+	// A shell command that exited non-zero ran, so it is not a failed tool
+	// call, but its block is marked failed: "✓ --- FAIL: TestX" read as a
+	// pass.
+	summary := ""
+	// A read's first line is "File: <absolute path>", which the header
+	// already names; the line count is what is worth saying.
+	if !isError && name == "read" {
+		if n := strings.Count(strings.TrimRight(output, "\n"), "\n"); n > 0 {
+			summary = fmt.Sprintf("%d 行", n)
+		}
+	}
+	// A sub-agent that did not complete is a failed step, whatever the tool
+	// call's own status: "✓ [exit: error, steps: 0]" read as a success.
+	if !isError && name == "agent" {
+		if agentFailed(output) {
+			isError = true
+		}
+		summary = firstOutputLine(output)
+	}
+	if !isError && (name == "bash" || name == "powershell") {
+		if code := shellExitCode(output); code != 0 {
+			isError = true
+			summary = fmt.Sprintf("退出码 %d · %s", code, firstOutputLine(output))
+		} else if first := firstOutputLine(output); first != "" {
+			// The result starts with a "Command: <description>" echo; the
+			// command's own first line is what the summary is for.
+			summary = first
+			if n := outputLines(output); n > 1 {
+				summary += fmt.Sprintf(" · 共 %d 行", n)
+			}
+		}
+	}
+	b := render.ToolBlock(nextBlockID(), name, toolHeaderFor(name, input), summary, output, isError, d)
+	// A write or edit shows what it changed: "+12 −3" on the summary line and
+	// the diff behind /x (file_diff.go).
+	if fd, ok := e.takeFileDiff(callID); ok && !isError {
+		b.Summary = fd.Summary()
+		if fd.Text != "" {
+			b.Full, b.Diff = fd.Text, true
+		} else {
+			b.Summary = "内容未变"
+		}
+	}
+	e.emitBlock(b)
+}
+
+var exitCodeRe = regexp.MustCompile(`\[exit code: (-?\d+)\]`)
+
+// shellExitCode is the exit code a shell tool result reports ("[exit code:
+// N]", the last one), 0 when it reports none.
+func shellExitCode(output string) int {
+	m := exitCodeRe.FindAllStringSubmatch(output, -1)
+	if len(m) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[len(m)-1][1])
+	return n
+}
+
+// firstOutputLine is the first line of output that says something: not
+// empty, not the "Command: …" echo, not a "[stderr]" or "[exit …]" marker.
+// "退出码 127 · [stderr]" hid the "gh: command not found" after the marker.
+func firstOutputLine(output string) string {
+	for _, l := range strings.Split(output, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "Command:") || l == "[stderr]" ||
+			strings.HasPrefix(l, "[exit: ") || exitCodeRe.MatchString(l) {
+			continue
+		}
+		return textutil.ClipRunes(l, 60)
+	}
+	return ""
+}
+
+// agentExitRe is the status line the agent tool starts its result with.
+var agentExitRe = regexp.MustCompile(`^\[exit: ([a-z_]+),`)
+
+// agentFailed reports whether an agent/execute_plan result says the
+// sub-agent did not complete.
+func agentFailed(output string) bool {
+	m := agentExitRe.FindStringSubmatch(strings.TrimSpace(output))
+	return m != nil && m[1] != "completed"
+}
+
+// outputLines counts the non-empty lines of output besides the "Command:"
+// echo and the exit code line.
+func outputLines(output string) int {
+	n := 0
+	for _, l := range strings.Split(output, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.HasPrefix(l, "Command:") && !exitCodeRe.MatchString(l) {
+			n++
+		}
+	}
+	return n
 }
 
 // maxToolHeaderRunes bounds the header the engine derives before render clips

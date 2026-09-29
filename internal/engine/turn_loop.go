@@ -42,6 +42,12 @@ type turn struct {
 	// thinking answers the same way to the same request, so asking again
 	// only bills another full reply.
 	truncatedEmpty int
+	// todoChecked: the model was already asked about the task list's open
+	// items at a finish (todoFinishNudge).
+	todoChecked bool
+	// fellBack: the turn already moved to the other model after an
+	// overload (callModel).
+	fellBack bool
 
 	// reply and err are the turn's result once a stage returns flowEnd.
 	reply string
@@ -168,7 +174,7 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 		// agent is about to stop for a reason other than task completion.
 		// Only when the cap is hard: an interactive front end asks at the cap.
 		if e.IterationLimitPrompt == nil && t.limits.iterWindow > 0 && e.iterCount >= t.limits.iterCap-5 {
-			e.engineOutput(fmt.Sprintf("  \x1b[2m(approaching max iterations: %d/%d)\x1b[0m", e.iterCount, t.limits.iterCap))
+			e.engineOutput(fmt.Sprintf("  \x1b[2m（接近本轮迭代上限：%d/%d）\x1b[0m", e.iterCount, t.limits.iterCap))
 		}
 		switch e.checkToolLoop(t, iter, resp) {
 		case flowNext:
@@ -221,12 +227,11 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 		e.messages = append(e.messages, userMessage)
 		e.fileMu.Lock()
 		e.turnFilesChanged = false
+		e.turnChangedFiles = nil
 		e.turnCheckpointed = false
 		e.fileMu.Unlock()
 	}
 	e.saveSession()
-
-	e.announceVerifyGate()
 
 	t := &turn{ctx: ctx, user: userMessage, onDelta: onDelta, onReasoning: onReasoning}
 	// Cache system prompt and tool defs across iterations (stable within a run)
@@ -247,6 +252,7 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 	// Reset the verify-gate retry counter at the start of each turn so a
 	// prior turn's rejections don't eat into this turn's retry budget.
 	e.verifyAttempts = 0
+	e.selfReviewed = false
 	// Snapshot session for change tracking this turn
 	e.sessionView = session.NewSessionView(e.messages, e.totalTokens)
 
@@ -254,7 +260,7 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 	if e.safetyChecker != nil {
 		if result := e.safetyChecker.Scan(userMessage.Content, "user_input"); result != nil {
 			if blocking := result.BlockingFinding(); blocking != nil {
-				e.engineOutput(fmt.Sprintf("  \x1b[31m! safety: %s\x1b[0m", blocking.Message))
+				e.engineOutput(fmt.Sprintf("  \x1b[31m! 安全检查：%s\x1b[0m", blocking.Message))
 				// Warn but don't block -- user input is from the actual user
 				log.Warnf("safety finding in user input: %s", blocking.Message)
 			}
@@ -289,6 +295,7 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 			"messages": len(e.messages), "est_tokens": e.totalTokens, "overhead_tokens": e.requestOverhead, "window": api.ContextWindowForModel(t.model)})
 	}
 	e.lastRoutedModel = t.model
+	e.turnModelSnap.Store(t.model)
 
 	// The iteration cap, the time limit and the stagnation prompt are soft:
 	// an interactive front end is asked whether to go on (see
@@ -375,7 +382,7 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 	// renderers would overwrite each other.
 	var walker *termui.WalkingIndicator
 	if e.shouldShowWalkingIndicator(iter) {
-		walker = termui.NewWalkingIndicator("thinking...")
+		walker = termui.NewWalkingIndicator("思考中…")
 		walker.Start()
 	}
 	// A front end with a sink gets the same information as transient
@@ -387,7 +394,7 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 		resp, err = e.nextReplayResponse(useStream, t.onDelta, t.onReasoning)
 	} else if useStream {
 		firstDelta := true
-		modelAct := e.beginActivity("call model " + modelName)
+		modelAct := e.beginActivity(modelCallActivity + " " + modelName)
 		resp, err = e.llm.ChatStream(t.ctx, req, func(ev api.StreamEvent) {
 			e.progressActivity(modelAct)
 			if firstDelta && walker != nil {
@@ -399,7 +406,7 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 		})
 		e.endActivity(modelAct)
 	} else {
-		modelAct := e.beginActivity("call model " + modelName)
+		modelAct := e.beginActivity(modelCallActivity + " " + modelName)
 		// A non-streaming call reports nothing until it returns; the stall
 		// monitor would call every reply longer than its threshold a hang.
 		e.pauseActivity(modelAct, true)
@@ -446,6 +453,25 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 		// prompt, tool definitions) is what does not fit. Say so, or the
 		// failure line alone reads like a transient API error.
 		e.engineOutput("  上下文超出模型上限，且对话历史已无法再压缩")
+	}
+	// The model is overloaded (503) or out of quota (429) even after the
+	// provider's retries: the other configured model usually is not (a
+	// separate capacity pool and quota), so the turn goes on there, once,
+	// instead of failing with its work half done.
+	if err != nil && t.ctx.Err() == nil && !t.fellBack {
+		if kind := api.Classify(err); kind == api.KindServerError || kind == api.KindRateLimit {
+			if alt := e.fallbackModel(modelName); alt != "" {
+				t.fellBack = true
+				why := "暂时不可用"
+				if kind == api.KindRateLimit {
+					why = "被限流或额度用尽"
+				}
+				e.engineOutput(fmt.Sprintf("  \x1b[33m模型 %s %s，本轮改用 %s 继续\x1b[0m", modelName, why, alt))
+				trace.Write("fallback", map[string]any{"from": modelName, "to": alt, "error": textutil.ClipRunes(err.Error(), 160)})
+				t.model = alt
+				return nil, flowNext
+			}
+		}
 	}
 	if err != nil {
 		e.recordEvent(t.ctx, "llm_error", map[string]any{"error": err.Error()})
@@ -542,6 +568,14 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 		e.messages = append(e.messages, newSyntheticUserMsg(nudge))
 		return flowNext
 	}
+	// A turn that ends with the task list still open: once, the model either
+	// finishes the items or marks them done. Models finished the work and
+	// left every item pending, and the next session was offered the "unfinished" plan.
+	if nudge := e.todoFinishNudge(t); nudge != "" {
+		e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
+		e.messages = append(e.messages, newSyntheticUserMsg(nudge))
+		return flowNext
+	}
 	// Completion verification gate (minimal EDCL "done contract"): if
 	// the user configured done_verify_commands, don't accept the
 	// model's self-reported "done" (no more tool calls) until those
@@ -551,6 +585,8 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 	// turns that claim into something checked instead of trusted.
 	gaveUpUnresolved := false
 	if e.verifyGate.Enabled() && (!e.verifyGate.onlyWhenFilesChanged || e.filesChangedThisTurn()) {
+		// Said once, when a check first runs: a chat turn used to print it too.
+		e.announceVerifyGate()
 		results, passed := e.verifyGate.Run(t.ctx, t.limits.verifyPassed)
 		if !passed && TimedOut(results) {
 			// Too slow to tell: not the model's failure. No retry,
@@ -560,14 +596,23 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 			if e.verifyAttempts < e.verifyGate.MaxRetries() {
 				e.verifyAttempts++
 				e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
-				e.engineOutput(fmt.Sprintf("  \x1b[33m! verify_gate rejected completion (attempt %d/%d)\x1b[0m", e.verifyAttempts, e.verifyGate.MaxRetries()))
+				e.engineOutput(fmt.Sprintf("  \x1b[33m! 完成校验未通过，已打回修改（第 %d/%d 次）\x1b[0m", e.verifyAttempts, e.verifyGate.MaxRetries()))
 				e.messages = append(e.messages, newSyntheticUserMsg(Summary(results)))
 				t.model = e.escalate(t.model, "完成校验未通过")
 				e.emitSeparator(t.onDelta, false)
 				return flowNext
 			}
-			e.engineOutput("  \x1b[31m! verify_gate: still failing after max retries, returning control to user\x1b[0m")
+			e.engineOutput("  \x1b[31m! 完成校验多次重试后仍未通过，交还给你处理\x1b[0m")
 			gaveUpUnresolved = true
+		}
+	}
+	// Self-review (self_review.go): once per turn, after the gate passed.
+	if !gaveUpUnresolved {
+		if findings := e.selfReview(t.ctx, t.user.Content); findings != "" {
+			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
+			e.messages = append(e.messages, newSyntheticUserMsg(selfReviewFeedback(findings)))
+			e.emitSeparator(t.onDelta, false)
+			return flowNext
 		}
 	}
 	// Feed the router's failure-rate signal (api.FailureRateSignal):
@@ -788,7 +833,7 @@ func (e *Engine) absorbToolResults(t *turn, iter int, results []toolResult) flow
 		isErr := r.Failed
 		if !e.config.Debug {
 			e.activity("")
-			e.emitToolResult(r.Name, r.Input, r.Content, isErr, r.Elapsed)
+			e.emitToolResult(r.ID, r.Name, r.Input, r.Content, isErr, r.Elapsed)
 		}
 		// Unparsable arguments were already recorded as E4009 when the
 		// call was dispatched; a second, uncoded line would show the
@@ -799,6 +844,8 @@ func (e *Engine) absorbToolResults(t *turn, iter int, results []toolResult) flow
 		}
 		if isErr {
 			e.noteOutsideDirectory(r.Content)
+		} else if isTodoWrite(r.Name) {
+			e.persistPlan()
 		}
 		toolTrace := map[string]any{"name": r.Name, "ms": r.Elapsed.Milliseconds(), "result_bytes": len(r.Content), "error": isErr}
 		if isErr {
@@ -845,6 +892,11 @@ func (e *Engine) absorbToolResults(t *turn, iter int, results []toolResult) flow
 		if last := len(e.messages) - 1; last >= 0 && e.messages[last].Role == "tool" {
 			// Once per window, on the latest tool result: tell the
 			// model how much of the window is left (budgetNotice).
+			e.messages[last].Content += "\n\n" + n
+		}
+	}
+	if n := e.todoRoundReminder(results); n != "" {
+		if last := len(e.messages) - 1; last >= 0 && e.messages[last].Role == "tool" {
 			e.messages[last].Content += "\n\n" + n
 		}
 	}

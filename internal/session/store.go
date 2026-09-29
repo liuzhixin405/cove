@@ -50,6 +50,9 @@ type Record struct {
 //	             updated_at, tokens, cost), so List never decodes a message.
 //	<id>.json    the old whole-file format. Still loaded; the next Save of that
 //	             session migrates it to <id>.jsonl and removes it.
+//	archive/<id>/<unix-nanos>.jsonl
+//	             the transcript as it was before a rewrite dropped messages
+//	             (compaction, /clear); the latest archiveMaxPerSession are kept.
 //
 // The metadata that changes on every save (updated_at, title, tokens, cost)
 // lives in index.json; the first line of a .jsonl carries the values of the
@@ -223,6 +226,7 @@ func (s *Store) save(r *Record, stamp, forceRewrite bool) error {
 	if st := s.appendableState(key, path, r.Messages); st != nil && !forceRewrite && !st.metaStale(r) {
 		err = s.appendMessages(r, key, path, st)
 	} else {
+		s.archiveIfDropping(key, path, r.Messages)
 		err = s.rewrite(r, key, path)
 	}
 	if err != nil {
@@ -307,6 +311,62 @@ func (s *Store) appendMessages(r *Record, key, path string, st *persistedState) 
 	}
 	st.appends++
 	return nil
+}
+
+// archiveMaxPerSession bounds the archived transcripts kept per session.
+const archiveMaxPerSession = 5
+
+// archiveDir holds the transcripts a rewrite replaced:
+// archive/<id>/<unix-nanos>.jsonl. List never sees it (it skips directories).
+func (s *Store) archiveDir(key string) string { return filepath.Join(s.dir, "archive", key) }
+
+// archiveIfDropping copies the session file aside before a rewrite that
+// drops messages written earlier (compaction replaces the history with a
+// summary, /clear empties it): the rewrite used to be the only copy, so the
+// original conversation was gone for good. A rewrite that only extends the
+// history or refreshes its metadata keeps everything and archives nothing.
+// Failures are logged; they never block the save.
+func (s *Store) archiveIfDropping(key, path string, msgs []api.Message) {
+	st := s.persisted[key]
+	if st == nil || len(st.prints) == 0 {
+		return
+	}
+	extends := len(msgs) >= len(st.prints)
+	for i := 0; extends && i < len(st.prints); i++ {
+		extends = printOf(msgs[i]) == st.prints[i]
+	}
+	if extends {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	dir := s.archiveDir(key)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Warnf("archive session %s: %v", key, err)
+		return
+	}
+	name := fmt.Sprintf("%d%s", time.Now().UnixNano(), jsonlExt)
+	if err := fsatomic.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+		log.Warnf("archive session %s: %v", key, err)
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == jsonlExt {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names) // same-width nanosecond names sort by time
+	for len(names) > archiveMaxPerSession {
+		_ = os.Remove(filepath.Join(dir, names[0]))
+		names = names[1:]
+	}
 }
 
 // rewrite replaces the session file with the full record, atomically, and
@@ -570,6 +630,9 @@ func (s *Store) Delete(id string) error {
 
 	found := false
 	var errs []error
+	if err := os.RemoveAll(s.archiveDir(key)); err != nil {
+		errs = append(errs, err)
+	}
 	for _, name := range []string{key + jsonlExt, key + legacyExt} {
 		err := os.Remove(filepath.Join(s.dir, name))
 		switch {

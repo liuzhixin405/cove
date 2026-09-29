@@ -45,11 +45,28 @@ func (e *Engine) setRequestOverhead(systemPrompt string, tools []api.ToolDef) {
 // prompt size plus an estimate of the messages appended since, or — with no
 // usable report — an estimate of everything a request sends.
 func (e *Engine) updateTokenCount() {
+	defer func() { e.contextTokens.Store(int64(e.totalTokens)) }()
 	if e.lastInputTokens > 0 && e.usageMsgCount <= len(e.messages) {
 		e.totalTokens = e.lastInputTokens + countTokens(e.messages[e.usageMsgCount:])
 		return
 	}
 	e.totalTokens = e.requestOverhead + countTokens(e.messages)
+}
+
+// ContextUsage reports how full the model's window is: the tokens the next
+// request carries (as last counted) and the window of the model in use. It
+// is safe to call from any goroutine (the status line polls it).
+func (e *Engine) ContextUsage() (tokens, window int) {
+	return int(e.contextTokens.Load()), api.ContextWindowForModel(e.currentModelSnapshot())
+}
+
+// currentModelSnapshot is the model of the running or last turn, readable
+// from any goroutine.
+func (e *Engine) currentModelSnapshot() string {
+	if m, _ := e.turnModelSnap.Load().(string); m != "" {
+		return m
+	}
+	return e.config.Model
 }
 
 // countTokens estimates the tokens msgs occupy in a request: text, text

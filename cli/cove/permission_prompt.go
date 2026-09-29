@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/liuzhixin405/cove/internal/engine"
 	"github.com/liuzhixin405/cove/internal/permission"
+	"github.com/liuzhixin405/cove/internal/render"
 	"github.com/liuzhixin405/cove/internal/repl"
 	"github.com/liuzhixin405/cove/internal/termui"
 )
@@ -80,18 +83,22 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	// push"、"echo"、"git log" 开头的命令 [p] 永久允许 "cd"、"git push"、… and
 	// had to be read in full before answering.
 	options := "[y] 允许"
+	keys := "yn"
 	if canRemember {
 		options += "   [a] 本会话记住"
+		keys += "a"
 	}
 	if canPersist {
 		options += "   [p] 本项目记住"
+		keys += "p"
 	}
 	options += "   [n] 拒绝"
 	// The answer line starts at the prompt's content column, the scope line
 	// one step further in, so the block reads as one indented unit.
 	text := termui.PermissionPrompt(toolName, permissionPromptDescription(input, reason)) +
+		permissionDiffPreview(toolName, input) +
 		termui.PromptContentIndent + termui.Styled(termui.Bold, options) +
-		"   " + termui.Styled(termui.Dim, "（回车无效，Ctrl+C 拒绝并停止任务）") + "\n"
+		"   " + termui.Styled(termui.Dim, "（按键即答，无需回车；Ctrl+C 拒绝并停止任务）") + "\n"
 	if canRemember {
 		text += termui.PromptContentIndent + "    " + termui.Styled(termui.Dim, "记住范围: "+what) + "\n"
 	}
@@ -103,7 +110,8 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 		}
 	}
 
-	answer, ok := repl.Ask(text, permissionAnswerAccepted, permissionAnswerHint, permissionPromptTimeout)
+	answer, ok := repl.AskWith(repl.AskSpec{Text: text, Accepts: permissionAnswerAccepted, Hint: permissionAnswerHint,
+		Timeout: permissionPromptTimeout, Keys: keys})
 	if !ok {
 		termui.PrintAbove(termui.PromptContentIndent + termui.Styled(termui.Dim, "授权超时，已拒绝 "+toolName) + "\n")
 		return false
@@ -243,6 +251,40 @@ func permissionPromptDescription(input map[string]any, reason string) string {
 		}
 	}
 	return reason
+}
+
+// permissionPreviewLines bounds the diff shown in the permission prompt.
+const permissionPreviewLines = 40
+
+// permissionDiffPreview is the change a write or edit would make, shown in
+// the prompt under the path: the path alone said nothing about what was
+// about to be written. "" for other tools or when it cannot be computed.
+func permissionDiffPreview(toolName string, input map[string]any) string {
+	cwd, _ := os.Getwd()
+	d, ok := engine.PreviewFileChange(toolName, input, cwd)
+	if !ok {
+		return ""
+	}
+	gutter := "  " + termui.Yellow + "┃" + termui.Reset + " "
+	if d.Text == "" {
+		return gutter + termui.Styled(termui.Dim, "内容不变") + "\n" + "  " + termui.Yellow + "┃" + termui.Reset + "\n"
+	}
+	lines := strings.Split(d.Text, "\n")
+	more := 0
+	if len(lines) > permissionPreviewLines {
+		more = len(lines) - permissionPreviewLines
+		lines = lines[:permissionPreviewLines]
+	}
+	var sb strings.Builder
+	sb.WriteString(gutter + termui.Styled(termui.Dim, "改动 "+d.Summary()) + "\n")
+	for _, l := range strings.Split(render.ColorDiff(render.StripControls(strings.Join(lines, "\n")), false), "\n") {
+		sb.WriteString(gutter + strings.ReplaceAll(l, "\t", "    ") + "\n")
+	}
+	if more > 0 {
+		sb.WriteString(gutter + termui.Styled(termui.Dim, fmt.Sprintf("… 还有 %d 行", more)) + "\n")
+	}
+	sb.WriteString("  " + termui.Yellow + "┃" + termui.Reset + "\n")
+	return sb.String()
 }
 
 // policiesFileForDisplay names the policies file a "[p]" rule was written to:

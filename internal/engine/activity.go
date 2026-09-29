@@ -133,11 +133,23 @@ const localModelStallThreshold = 90 * time.Second
 // stallThresholdFor is the idle time after which the stage named label is
 // called stuck: longer for model calls to a local provider.
 func (e *Engine) stallThresholdFor(label string) time.Duration {
-	if strings.HasPrefix(label, "call model") && e.localProvider() {
+	if strings.HasPrefix(label, modelCallActivity) && e.localProvider() {
 		return localModelStallThreshold
+	}
+	// A build or a test suite that prints nothing for a minute is normal; a
+	// go test compiling for 31 s was called "可能卡住".
+	if label == toolActivity+" bash" || label == toolActivity+" powershell" {
+		return shellStallThreshold
 	}
 	return stallThreshold
 }
+
+// toolActivity starts the label of a tool call's activity.
+const toolActivity = "执行工具"
+
+// shellStallThreshold is the stall threshold of a shell command without
+// output.
+const shellStallThreshold = 2 * time.Minute
 
 // localProvider reports whether the configured provider is a local or
 // self-hosted server: a loopback base URL, or a provider that only exists
@@ -150,3 +162,7 @@ func (e *Engine) localProvider() bool {
 	}
 	return api.IsLocalBaseURL(pc.BaseURL)
 }
+
+// modelCallActivity starts the label of a model call's activity; the stall
+// line shows it ("仍在「调用模型 x」阶段").
+const modelCallActivity = "调用模型"

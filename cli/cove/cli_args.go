@@ -239,6 +239,10 @@ const maxPipedStdin = 8 * 1024 * 1024
 // never gets data or EOF; without a limit "cove -p" would hang there forever.
 const stdinFirstDataTimeout = 3 * time.Second
 
+// utf8BOM is the byte-order mark Windows PowerShell 5 writes at the start of
+// text it pipes into a native program.
+var utf8BOM = string([]byte{0xEF, 0xBB, 0xBF})
+
 // readPipedStdin reads r to EOF, keeping at most limit bytes (truncated
 // reports whether more arrived). When nothing at all arrives within
 // firstDataTimeout it gives up and returns "", leaving the blocked read
@@ -275,7 +279,8 @@ func readPipedStdin(r io.Reader, firstDataTimeout time.Duration, limit int) (str
 		}
 		sb.Write(rest)
 	}
-	s := sb.String()
+	// Windows PowerShell adds a byte-order mark to what it pipes in.
+	s := strings.TrimPrefix(sb.String(), utf8BOM)
 	if len(s) > limit {
 		// Cut on a rune boundary: a piped Chinese log split mid-rune would
 		// ship invalid UTF-8 to the provider.

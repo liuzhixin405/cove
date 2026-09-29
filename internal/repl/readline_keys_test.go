@@ -68,7 +68,8 @@ func TestEscapeSequencesNeverTypeGarbage(t *testing.T) {
 	tests := []struct {
 		name, keys, want string
 	}{
-		{"ctrl+left moves left", "ab\x1b[1;5Dx\r", "axb"},
+		{"ctrl+left jumps to the word start", "ab\x1b[1;5Dx\r", "xab"},
+		{"ctrl+left then ctrl+right", "ab cd\x1b[1;5D\x1b[1;5D\x1b[1;5Cx\r", "abx cd"},
 		{"shift+right moves right", "ab\x1b[D\x1b[D\x1b[1;2Cx\r", "axb"},
 		{"home as CSI 1~", "bc\x1b[1~a\r", "abc"},
 		{"home as CSI 7~", "bc\x1b[7~a\r", "abc"},

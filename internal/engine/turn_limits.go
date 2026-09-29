@@ -268,7 +268,7 @@ func (e *Engine) wrapUpSummary(ctx context.Context, routedModel, reason string) 
 		// 1024 output tokens.
 		Thinking: "disabled",
 	}
-	act := e.beginActivity("wrap-up summary " + model)
+	act := e.beginActivity("生成收尾总结 " + model)
 	resp, err := e.llm.Chat(ctx, req)
 	e.endActivity(act)
 	if err != nil {

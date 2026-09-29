@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/liuzhixin405/cove/internal/textmode"
 )
 
 var consoleMu sync.Mutex
@@ -33,9 +35,9 @@ func normalizeOutputNewlines(s string) string {
 }
 
 func printOutputLocked(s string, ensureTrailingNewline bool) {
-	fmt.Print(s)
+	termPrint(s)
 	if ensureTrailingNewline && !strings.HasSuffix(s, "\r\n") {
-		fmt.Print("\r\n")
+		termPrint("\r\n")
 	}
 }
 
@@ -56,7 +58,7 @@ func PrintAbove(s string) {
 	}
 
 	if activeReader == nil || !activeReader.reading {
-		fmt.Print(s)
+		termPrint(s)
 		return
 	}
 
@@ -75,17 +77,17 @@ func StreamPrint(s string) {
 	// without a trailing newline shares the current terminal line and the next
 	// erase (\r\x1b[2K) wiped it.
 	if streamingActive {
-		fmt.Print(s)
+		termPrint(s)
 		streamMidLine = endsMidLine(streamMidLine, s)
 		return
 	}
 	if activeReader != nil && activeReader.reading {
 		activeReader.eraseLineLocked()
-		fmt.Print(s)
+		termPrint(s)
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
 		return
 	}
-	fmt.Print(s)
+	termPrint(s)
 }
 
 func PrintTransientStatus(s string) {
@@ -95,18 +97,18 @@ func PrintTransientStatus(s string) {
 	// The spinner runs during streaming; just overwrite the current line in
 	// place without touching any input-line state.
 	if streamingActive {
-		fmt.Print("\x1b[0m\x1b[?25h\r\x1b[K" + s)
+		termPrint("\x1b[0m\x1b[?25h\r\x1b[K" + s)
 		streamMidLine = s != ""
 		return
 	}
 
 	if activeReader != nil && activeReader.reading {
 		activeReader.eraseLineLocked()
-		fmt.Print("\x1b[0m\x1b[?25h" + s)
+		termPrint("\x1b[0m\x1b[?25h" + s)
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
 		return
 	}
-	fmt.Print("\x1b[0m\x1b[?25h\r\x1b[K" + s)
+	termPrint("\x1b[0m\x1b[?25h\r\x1b[K" + s)
 }
 
 // BeginOutput starts a turn's streaming. With an editor on screen and a
@@ -125,7 +127,7 @@ func BeginOutput() {
 	streamMidLine = false
 	canPin := !pinned && lr != nil && lr.reading && pinEnabled()
 	if !canPin {
-		fmt.Print("\n")
+		termPrint("\n")
 		consoleMu.Unlock()
 		return
 	}
@@ -184,7 +186,7 @@ func EndOutput() {
 // current one. Callers hold consoleMu.
 func breakStreamLineLocked() {
 	if streamingActive && streamMidLine {
-		fmt.Print("\r\n")
+		termPrint("\r\n")
 		streamMidLine = false
 	}
 }
@@ -227,7 +229,7 @@ func ClearScreen() bool {
 	if streamingActive {
 		return false
 	}
-	fmt.Print(clearScreenSeq)
+	termPrint(clearScreenSeq)
 	if activeReader != nil && activeReader.reading {
 		activeReader.redrawLocked(activeReader.renderBuf, activeReader.renderCursor)
 	}
@@ -248,3 +250,16 @@ func (lr *LineReader) BeginOutput() { BeginOutput() }
 
 // EndOutput implements termui.Console.
 func (lr *LineReader) EndOutput() { EndOutput() }
+
+// noColor is the NO_COLOR setting, read once.
+var noColor = textmode.NoColor()
+
+// termPrint is how this package writes to the terminal: fmt.Print, without
+// colour under NO_COLOR (cursor control stays).
+func termPrint(a ...any) {
+	s := fmt.Sprint(a...)
+	if noColor {
+		s = textmode.StripSGR(s)
+	}
+	fmt.Print(s)
+}

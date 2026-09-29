@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -64,6 +66,9 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 	if input == "" {
 		return nil
 	}
+	if suggestions, ok := completeAtPath(input); ok {
+		return suggestions
+	}
 	if suggestions := completeArgs(input, commands); len(suggestions) > 0 {
 		return suggestions
 	}
@@ -101,6 +106,50 @@ func complete(input string, commands []cmdEntry, skills map[string]string) []str
 	}
 	sort.Strings(matches)
 	return matches
+}
+
+// completeAtPathMax bounds the candidates of one @path completion.
+const completeAtPathMax = 60
+
+// completeAtPath completes an "@path" being typed as the last word (the
+// attachment syntax) from the files under the working directory: the whole
+// line with the path completed, directories ending in "/". ok is false when
+// the last word is not an @path.
+func completeAtPath(input string) (lines []string, ok bool) {
+	start := strings.LastIndexAny(input, " \t") + 1
+	word := input[start:]
+	if !strings.HasPrefix(word, "@") {
+		return nil, false
+	}
+	typed := strings.ReplaceAll(word[1:], "\\", "/")
+	dir, base := "", typed
+	if i := strings.LastIndexByte(typed, '/'); i >= 0 {
+		dir, base = typed[:i+1], typed[i+1:]
+	}
+	cwd, _ := os.Getwd()
+	entries, err := os.ReadDir(filepath.Join(cwd, filepath.FromSlash(dir)))
+	if err != nil {
+		return nil, true
+	}
+	lower := strings.ToLower(base)
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(name), lower) {
+			continue
+		}
+		if e.IsDir() {
+			name += "/"
+		}
+		lines = append(lines, input[:start]+"@"+dir+name)
+		if len(lines) == completeAtPathMax {
+			break
+		}
+	}
+	sort.Strings(lines)
+	return lines, true
 }
 
 func completeArgs(input string, commands []cmdEntry) []string {

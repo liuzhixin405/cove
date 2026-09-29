@@ -119,6 +119,14 @@ type Config struct {
 	// default) keeps 120 s, and 300 s for dotnet and npm commands. A command
 	// that runs out of time is reported, not counted as a failure.
 	DoneVerifyTimeoutSeconds int `json:"done_verify_timeout_seconds,omitempty"`
+	// DoneVerifyTests, with automatic verification on, also runs the tests
+	// (and go vet) of the packages/projects the turn changed: compiling says
+	// nothing about the logic. nil means on.
+	DoneVerifyTests *bool `json:"done_verify_tests,omitempty"`
+	// DoneSelfReview has a read-only review sub-agent check the turn's diff
+	// before the turn may end: "off" (the default), "on" (every turn that
+	// changed files) or "auto" (only changes of SelfReviewMinLines or more).
+	DoneSelfReview string `json:"done_self_review,omitempty"`
 	// DoneCheck controls the one-time "is the request fully met?" prompt the
 	// engine shows a model that is about to end a turn which changed files:
 	// "on", "off", or "auto" (the default, also for an empty or unknown
@@ -211,6 +219,24 @@ func (c *Config) DoneCheckMode() string {
 // VerifyAutoEnabled reports whether automatic completion verification is on.
 func (c *Config) VerifyAutoEnabled() bool {
 	return c.DoneVerifyAuto == nil || *c.DoneVerifyAuto
+}
+
+// VerifyTestsEnabled reports whether automatic verification also runs the
+// tests of what the turn changed.
+func (c *Config) VerifyTestsEnabled() bool {
+	return c.VerifyAutoEnabled() && (c.DoneVerifyTests == nil || *c.DoneVerifyTests)
+}
+
+// SelfReviewMode is the effective done_self_review setting: "on", "auto" or
+// "off" (the default, also for an unknown value).
+func (c *Config) SelfReviewMode() string {
+	if c != nil {
+		switch m := strings.ToLower(strings.TrimSpace(c.DoneSelfReview)); m {
+		case "on", "auto":
+			return m
+		}
+	}
+	return "off"
 }
 
 // MemoryEmbeddingConfig configures the optional remote embeddings endpoint
@@ -381,6 +407,12 @@ func loadProjectOverride(cfg *Config) error {
 	}
 	if override.DoneVerifyTimeoutSeconds > 0 {
 		cfg.DoneVerifyTimeoutSeconds = override.DoneVerifyTimeoutSeconds
+	}
+	if override.DoneVerifyTests != nil {
+		cfg.DoneVerifyTests = override.DoneVerifyTests
+	}
+	if override.DoneSelfReview != "" {
+		cfg.DoneSelfReview = override.DoneSelfReview
 	}
 	if override.DoneCheck != "" {
 		cfg.DoneCheck = override.DoneCheck

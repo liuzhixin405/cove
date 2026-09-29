@@ -40,6 +40,14 @@ type conversation struct {
 	// verifyAttempts is how many times the gate has rejected completion this
 	// turn.
 	verifyAttempts int
+	// roundsSinceTodo counts tool rounds since the last todowrite call while
+	// the task list has open items (todoRoundReminder).
+	roundsSinceTodo int
+	// planOffered: the first turn already checked for an unfinished plan of
+	// an earlier session (previousPlanNote).
+	planOffered bool
+	// selfReviewed: this turn's diff was already reviewed (selfReview).
+	selfReviewed bool
 
 	// Notices shown once per conversation.
 

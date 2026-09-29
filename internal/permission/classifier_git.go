@@ -43,6 +43,11 @@ func gitSubcommand(args []string) (sub string, rest []string, ok bool) {
 // classifyGit rates a git invocation by its subcommand; see gitSubcommand
 // for the global options it tolerates.
 func (c *Classifier) classifyGit(args []string) CmdCategory {
+	// "git --version" is the usual way to check git is there; the option
+	// read as an unknown global one and the check asked for approval.
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "--help") {
+		return CatSafe
+	}
 	sub, rest, ok := gitSubcommand(args)
 	if !ok {
 		return CatUnknown

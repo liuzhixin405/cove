@@ -120,9 +120,9 @@ func TestOutlineHintFirst(t *testing.T) {
 
 func TestOutlineWithoutMappedLanguages(t *testing.T) {
 	root := t.TempDir()
-	writeTree(t, root, map[string]string{"src/Main.java": "class Main {}\n", "pom.xml": "<project/>\n"})
+	writeTree(t, root, map[string]string{"src/main.c": "int main(void) { return 0; }\n", "Makefile": "all:\n\tcc src/main.c\n"})
 	out := Outline(root)
 	if strings.Contains(out, "repo_map tool") || !strings.Contains(out, "grep") {
-		t.Fatalf("outline of a Java repo should point at grep/glob, not repo_map:\n%s", out)
+		t.Fatalf("outline of a C repo should point at grep/glob, not repo_map:\n%s", out)
 	}
 }

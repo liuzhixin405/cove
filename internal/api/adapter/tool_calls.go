@@ -6,6 +6,8 @@ type ToolCall struct {
 	Name       string
 	Input      map[string]any
 	ParseError bool
+	// Extra is provider data returned with the call as is (api.ToolCall.Extra).
+	Extra []byte
 }
 
 // CloneToolCalls returns a defensive copy of tool calls.

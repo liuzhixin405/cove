@@ -21,6 +21,33 @@ type SessionNotes struct {
 	path     string
 	entries  []NoteEntry
 	modified bool
+	// plan is the last task list (todowrite) with items still open, as
+	// rendered lines, and when it was saved; empty once every item is done.
+	// It survives the session, so the next one can pick an unfinished plan
+	// up (the list otherwise lives only in memory).
+	plan   string
+	planAt time.Time
+}
+
+// SetPlan records the current task list (todowrite's rendering, one item per
+// line); an empty list clears it. It is written by the next Flush.
+func (s *SessionNotes) SetPlan(list string) {
+	list = strings.TrimSpace(list)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if list == s.plan {
+		return
+	}
+	s.plan = list
+	s.planAt = time.Now()
+	s.modified = true
+}
+
+// Plan returns the saved task list and when it was saved; "" when none.
+func (s *SessionNotes) Plan() (string, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.plan, s.planAt
 }
 
 // NoteEntry is a single note item.
@@ -121,14 +148,15 @@ func (s *SessionNotes) AddDiscovery(text string) { s.Add("discovery", text) }
 // AddError records a notable error and resolution.
 func (s *SessionNotes) AddError(text string) { s.Add("error", text) }
 
-// AddTask records task progress.
+// AddTask records task progress: the engine logs each task list item as it
+// is completed.
 func (s *SessionNotes) AddTask(text string) { s.Add("task", text) }
 
 // Flush writes the notes to disk if modified.
 func (s *SessionNotes) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.modified || len(s.entries) == 0 || s.path == "" {
+	if !s.modified || (len(s.entries) == 0 && s.plan == "") || s.path == "" {
 		return nil
 	}
 	s.modified = false
@@ -167,6 +195,10 @@ func (s *SessionNotes) render() string {
 	var sb strings.Builder
 	sb.WriteString("# Session Notes\n\n")
 	fmt.Fprintf(&sb, "_Last updated: %s_\n\n", time.Now().Format("2006-01-02 15:04"))
+
+	if s.plan != "" {
+		fmt.Fprintf(&sb, "## %s\n\n%s%s_\n\n%s\n\n", planHeader, planSavedPrefix, s.planAt.Format(noteTimeLayout), s.plan)
+	}
 
 	// Group by category
 	categories := []string{"decision", "task", "discovery", "error"}
@@ -211,12 +243,16 @@ func (s *SessionNotes) Load() {
 	}
 	var loaded []NoteEntry
 	var currentCategory string
+	var planLines []string
+	var planAt time.Time
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		// Detect category headers like "## Decisions"
 		if strings.HasPrefix(trimmed, "## ") {
 			header := strings.ToLower(strings.TrimPrefix(trimmed, "## "))
 			switch {
+			case header == strings.ToLower(planHeader):
+				currentCategory = "plan"
 			case strings.Contains(header, "decision"):
 				currentCategory = "decision"
 			case strings.Contains(header, "task"):
@@ -225,6 +261,14 @@ func (s *SessionNotes) Load() {
 				currentCategory = "discovery"
 			case strings.Contains(header, "error"):
 				currentCategory = "error"
+			}
+			continue
+		}
+		if currentCategory == "plan" {
+			if at, ok := strings.CutPrefix(trimmed, planSavedPrefix); ok {
+				planAt = parseNoteTime(strings.TrimSuffix(at, "_"), day)
+			} else if trimmed != "" {
+				planLines = append(planLines, trimmed)
 			}
 			continue
 		}
@@ -248,10 +292,14 @@ func (s *SessionNotes) Load() {
 		})
 	}
 
-	if len(loaded) == 0 {
-		return
-	}
 	s.mu.Lock()
+	if len(planLines) > 0 && s.plan == "" {
+		s.plan = strings.Join(planLines, "\n")
+		s.planAt = planAt
+		if planAt.IsZero() {
+			s.planAt = day
+		}
+	}
 	for _, e := range loaded {
 		if !s.hasLocked(e.Category, e.Text) {
 			s.entries = append(s.entries, e)
@@ -263,6 +311,13 @@ func (s *SessionNotes) Load() {
 // noteTimeLayout is how a note's time is written. It used to be "15:04"
 // alone, and every loaded note was then stamped with the load time.
 const noteTimeLayout = "2006-01-02 15:04"
+
+// The plan section of the notes file: "## Unfinished Plan", a "_Saved: <time>_"
+// line, then the task list lines.
+const (
+	planHeader      = "Unfinished Plan"
+	planSavedPrefix = "_Saved: "
+)
 
 // parseNoteTime reads a note's bracketed time: a full date and time, or the
 // old hour and minute on day. Unparseable text gives day itself.

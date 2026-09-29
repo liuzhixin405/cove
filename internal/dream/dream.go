@@ -36,7 +36,10 @@ type Runner struct {
 	// to (config.ProjectDataDir(root)/memory), consolidated alongside
 	// memoryRoot; "" when there is none (guarded by mu).
 	projectMemory string
-	sessionsDir   string
+	// projectRoot is the project projectMemory belongs to, which its
+	// memories' paths and symbols are checked against (guarded by mu).
+	projectRoot string
+	sessionsDir string
 
 	// The last finished run, for Status (guarded by mu).
 	lastRunFiles int
@@ -98,6 +101,7 @@ func (r *Runner) SetProjectRoot(root string) {
 	}
 	r.mu.Lock()
 	r.projectMemory = dir
+	r.projectRoot = root
 	r.mu.Unlock()
 }
 
@@ -257,6 +261,13 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 	roots := r.memoryRoots()
 	prompt := BuildConsolidationPrompt(roots[0], r.sessionsDir, sessionIDs, roots[1:]...)
+	r.mu.Lock()
+	projRoot, projMem := r.projectRoot, r.projectMemory
+	r.mu.Unlock()
+	if reports := markStaleMemories(projRoot, projMem, time.Now()); len(reports) > 0 {
+		log.Infof("[dream] %d memories reference paths or symbols no longer in %s", len(reports), projRoot)
+		prompt += staleSection(reports)
+	}
 	// Priced like the billing tracker the metered provider reports to; kept
 	// per run so /dream can show what the last consolidation cost.
 	meter := cost.NewTracker(0)

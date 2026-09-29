@@ -13,6 +13,7 @@ import (
 	"github.com/liuzhixin405/cove/internal/api"
 	"github.com/liuzhixin405/cove/internal/log"
 	"github.com/liuzhixin405/cove/internal/textutil"
+	"github.com/liuzhixin405/cove/internal/token"
 	"github.com/liuzhixin405/cove/internal/tool"
 )
 
@@ -27,6 +28,9 @@ type SubAgent struct {
 	authorize      Authorizer
 	executor       Executor
 	budgetExceeded func() bool
+	contextTokens  int
+	progress       func(step string)
+	fallback       string
 }
 
 // Authorizer decides whether a sub-agent may run one tool call. It is the same
@@ -62,12 +66,24 @@ type Config struct {
 	// BudgetExceeded, when set, is checked before every model call; a true
 	// result stops the sub-agent.
 	BudgetExceeded func() bool
+	// ContextTokens is how many tokens the request (system prompt and
+	// history) may take before old tool results are trimmed; 0 = no limit.
+	ContextTokens int
+	// Progress, when set, is told each tool step as it finishes (the
+	// stepSummary line), for the front end's live progress.
+	Progress func(step string)
+	// Fallback is the model to move to, once, when the model is overloaded
+	// or out of quota (503/429 after the provider's retries); "" = none.
+	Fallback string
 }
 
 // Options adjusts a single delegated task.
 type Options struct {
 	// ReadOnly restricts the sub-agent to read-only tools.
 	ReadOnly bool
+	// Exclude names tools the sub-agent does not get (a code review has no
+	// use for web search).
+	Exclude []string
 }
 
 // excludedTools are never offered to a sub-agent. The first group would let
@@ -114,7 +130,58 @@ func NewSubAgent(cfg Config) *SubAgent {
 		authorize:      cfg.Authorize,
 		executor:       cfg.Executor,
 		budgetExceeded: cfg.BudgetExceeded,
+		contextTokens:  cfg.ContextTokens,
+		progress:       cfg.Progress,
+		fallback:       cfg.Fallback,
 	}
+}
+
+// keepRecentToolResults: the latest tool results are never trimmed; they are
+// what the sub-agent is working from.
+const keepRecentToolResults = 6
+
+// trimmedToolHead is how much of a trimmed tool result is kept.
+const trimmedToolHead = 400
+
+const trimmedToolNote = "\n[earlier tool output trimmed to fit the context; run the tool again if you need it]"
+
+// trimHistory cuts the oldest tool results (all but the latest
+// keepRecentToolResults) to their first trimmedToolHead bytes until the
+// history fits budget tokens. A sub-agent has no compaction: 60 rounds of
+// 32KB results overflowed the window and the run died on a context-length
+// error, losing its work.
+func trimHistory(msgs []api.Message, budget int) []api.Message {
+	if budget <= 0 {
+		return msgs
+	}
+	total := 0
+	var toolIdx []int
+	for i, m := range msgs {
+		total += token.Estimate(m.Content)
+		for _, tc := range m.ToolCalls {
+			args, _ := json.Marshal(tc.Input)
+			total += token.Estimate(string(args))
+		}
+		if m.Role == "tool" {
+			toolIdx = append(toolIdx, i)
+		}
+	}
+	if total <= budget || len(toolIdx) <= keepRecentToolResults {
+		return msgs
+	}
+	for _, i := range toolIdx[:len(toolIdx)-keepRecentToolResults] {
+		c := msgs[i].Content
+		if len(c) <= trimmedToolHead+len(trimmedToolNote) || strings.HasSuffix(c, trimmedToolNote) {
+			continue
+		}
+		cut := textutil.ClipBytes(c, trimmedToolHead, "") + trimmedToolNote
+		total -= token.Estimate(c) - token.Estimate(cut)
+		msgs[i].Content = cut
+		if total <= budget {
+			break
+		}
+	}
+	return msgs
 }
 
 // gate reports whether the sub-agent may run this tool call.
@@ -230,6 +297,9 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			return res
 		}
 
+		if sa.contextTokens > 0 {
+			messages = trimHistory(messages, sa.contextTokens-token.Estimate(systemPrompt))
+		}
 		resp, err := sa.provider.Chat(ctx, api.ChatRequest{
 			Model:      sa.model,
 			Messages:   messages,
@@ -237,6 +307,18 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			Tools:      toolDefs,
 			MaxTokens:  16000,
 		})
+		// An overloaded model hands the run to the fallback once, as the
+		// engine does for a turn: a sub-agent used to die on the first 503.
+		if err != nil && ctx.Err() == nil && sa.fallback != "" && sa.fallback != sa.model {
+			if k := api.Classify(err); k == api.KindServerError || k == api.KindRateLimit {
+				if sa.progress != nil {
+					sa.progress("模型 " + sa.model + " 不可用，改用 " + sa.fallback)
+				}
+				sa.model, sa.fallback = sa.fallback, ""
+				iter--
+				continue
+			}
+		}
 		if err != nil {
 			res.Error, res.ExitReason = err.Error(), ExitError
 			if ctx.Err() != nil {
@@ -281,6 +363,9 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 		for _, tc := range resp.ToolCalls {
 			content := sa.runTool(ctx, tc)
 			steps = append(steps, stepSummary(tc, content))
+			if sa.progress != nil {
+				sa.progress(steps[len(steps)-1])
+			}
 			// Truncate large results on a rune boundary (a byte slice lands
 			// inside a multi-byte rune for Chinese output, and invalid UTF-8
 			// goes straight into the next request's JSON body). The engine's
@@ -385,7 +470,39 @@ type Delegator struct {
 	budgetExceeded func() bool
 	// maxIter is each sub-agent's model-call cap; 0 = DefaultMaxIter.
 	maxIter int
+	// contextSource, when set, returns the project context (environment,
+	// instruction files, outline) appended to every sub-agent's system
+	// prompt. Sub-agents used to get only a one-line role, so they worked
+	// without the project's rules or even its working directory.
+	contextSource func() string
+	// contextBudget, when set, is the token budget of a sub-agent request
+	// on model (Config.ContextTokens).
+	contextBudget func(model string) int
+	// progress, when set, receives one line per sub-agent event: start,
+	// each tool step, end. Sub-agents used to run silently until their
+	// result came back as one collapsed block.
+	progress func(line string)
+	// fallbackFor, when set, names the model a sub-agent on model moves to
+	// when that one is overloaded (Config.Fallback).
+	fallbackFor func(model string) string
 }
+
+// SetFallback installs the overload fallback (see fallbackFor). Call it
+// before the first Delegate; not guarded by mu.
+func (d *Delegator) SetFallback(f func(model string) string) { d.fallbackFor = f }
+
+// SetProgress installs the progress sink (see progress). Call it before the
+// first Delegate; not guarded by mu. It is called from the sub-agents'
+// goroutines, in parallel for a parallel plan.
+func (d *Delegator) SetProgress(f func(line string)) { d.progress = f }
+
+// SetContextSource installs the project context source (see contextSource).
+// Call it before the first Delegate; not guarded by mu.
+func (d *Delegator) SetContextSource(src func() string) { d.contextSource = src }
+
+// SetContextBudget installs the per-model request token budget (see
+// contextBudget). Call it before the first Delegate; not guarded by mu.
+func (d *Delegator) SetContextBudget(budget func(model string) int) { d.contextBudget = budget }
 
 // NewDelegator creates a sub-agent delegator.
 func NewDelegator(provider api.Provider, model string, tools []tool.Tool) *Delegator {
@@ -458,15 +575,33 @@ func (d *Delegator) DelegateWith(ctx context.Context, taskID, task, systemPrompt
 	log.Debugf("delegate: starting sub-agent for task %s", taskID)
 
 	tools := d.tools
-	if opts.ReadOnly {
+	if opts.ReadOnly || len(opts.Exclude) > 0 {
+		excluded := map[string]bool{}
+		for _, n := range opts.Exclude {
+			excluded[n] = true
+		}
 		tools = nil
 		for _, t := range d.tools {
-			if t.Def().IsReadOnly {
-				tools = append(tools, t)
+			if opts.ReadOnly && !t.Def().IsReadOnly || excluded[t.Def().Name] {
+				continue
 			}
+			tools = append(tools, t)
 		}
 	}
 	provider, model := d.providerSource()
+	if d.contextSource != nil {
+		if c := strings.TrimSpace(d.contextSource()); c != "" {
+			systemPrompt += "\n\n" + c
+		}
+	}
+	contextTokens := 0
+	if d.contextBudget != nil {
+		contextTokens = d.contextBudget(model)
+	}
+	fallback := ""
+	if d.fallbackFor != nil {
+		fallback = d.fallbackFor(model)
+	}
 	sa := NewSubAgent(Config{
 		Provider:       provider,
 		Model:          model,
@@ -477,7 +612,20 @@ func (d *Delegator) DelegateWith(ctx context.Context, taskID, task, systemPrompt
 		Authorize:      d.authorize,
 		Executor:       d.executor,
 		BudgetExceeded: d.budgetExceeded,
+		ContextTokens:  contextTokens,
+		Fallback:       fallback,
 	})
-
-	return sa.Run(subCtx, task, systemPrompt)
+	if d.progress == nil {
+		return sa.Run(subCtx, task, systemPrompt)
+	}
+	sa.progress = func(step string) { d.progress("├ " + taskID + " · " + step) }
+	d.progress("▸ " + taskID + " 开始：" + textutil.ClipRunes(strings.Join(strings.Fields(task), " "), 80))
+	start := time.Now()
+	res := sa.Run(subCtx, task, systemPrompt)
+	mark, how := "✓", "完成"
+	if !res.Success {
+		mark, how = "✗", "未完成："+textutil.ClipRunes(res.Error, 60)
+	}
+	d.progress(fmt.Sprintf("%s %s %s · %d 步 · %s", mark, taskID, how, res.Steps, time.Since(start).Round(time.Second)))
+	return res
 }
