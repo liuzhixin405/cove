@@ -251,14 +251,32 @@ func (lr *LineReader) BeginOutput() { BeginOutput() }
 // EndOutput implements termui.Console.
 func (lr *LineReader) EndOutput() { EndOutput() }
 
-// noColor is the NO_COLOR setting, read once.
-var noColor = textmode.NoColor()
+// noColor reports whether output must carry no colour (the NO_COLOR setting).
+//
+// The environment is read at first use rather than at init: a test binary
+// pins it in TestMain, and an init-time read would already have happened by
+// then, so the byte-exact render tests would depend on the ambient NO_COLOR.
+func noColor() bool {
+	noColorOnce.Do(func() { noColorValue = textmode.NoColor() })
+	return noColorValue
+}
+
+var (
+	noColorOnce  sync.Once
+	noColorValue bool
+)
+
+// resetNoColor makes the next decision read the environment again. Tests only.
+func resetNoColor() {
+	noColorOnce = sync.Once{}
+	noColorValue = false
+}
 
 // termPrint is how this package writes to the terminal: fmt.Print, without
 // colour under NO_COLOR (cursor control stays).
 func termPrint(a ...any) {
 	s := fmt.Sprint(a...)
-	if noColor {
+	if noColor() {
 		s = textmode.StripSGR(s)
 	}
 	fmt.Print(s)

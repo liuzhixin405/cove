@@ -21,6 +21,12 @@ var (
 
 // TestMain removes the template store after the run.
 func TestMain(m *testing.M) {
+	// Render tests here assert exact bytes, SGR sequences included. NO_COLOR
+	// is set in plenty of environments (Cove's own shells set it for the tools
+	// they spawn) and the terminal packages read it at first use, so clearing
+	// it before any test pins their output regardless of the caller.
+	_ = os.Unsetenv("NO_COLOR")
+
 	// No test may start a real detached `cove --dream-worker` (os.Executable
 	// is the test binary): exit-path tests with two or more turns would.
 	// Tests that exercise the spawn replace it themselves (stubDreamSpawn).

@@ -109,12 +109,30 @@ func write(s string) {
 	_, _ = fmt.Fprint(dest(), uncolor(s))
 }
 
-// noColor is the NO_COLOR setting, read once.
-var noColor = textmode.NoColor()
+// noColor reports whether output must carry no colour (the NO_COLOR setting).
+//
+// The environment is read at first use rather than at init: a test binary
+// pins it in TestMain, and an init-time read would already have happened by
+// then, so the byte-exact render tests would depend on the ambient NO_COLOR.
+func noColor() bool {
+	noColorOnce.Do(func() { noColorValue = textmode.NoColor() })
+	return noColorValue
+}
+
+var (
+	noColorOnce  sync.Once
+	noColorValue bool
+)
+
+// resetNoColor makes the next decision read the environment again. Tests only.
+func resetNoColor() {
+	noColorOnce = sync.Once{}
+	noColorValue = false
+}
 
 // uncolor drops colour sequences from s under NO_COLOR.
 func uncolor(s string) string {
-	if noColor {
+	if noColor() {
 		return textmode.StripSGR(s)
 	}
 	return s
