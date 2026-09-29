@@ -1,29 +1,49 @@
 ﻿{
+    "active_profile": "deepseek",
     "model": "deepseek-v4-pro",
     "model_fast": "deepseek-v4-flash",
     "provider": {
         "name": "deepseek",
         "api_key": "sk-your-deepseek-api-key-here",
-        "base_url": ""
+        "base_url": "https://api.deepseek.com/v1"
     },
     "permission_mode": "default",
     "max_budget_usd": 10,
-    "max_iterations": 200,
-    "max_turn_minutes": 60,
-    "subagent_max_iterations": 60,
-    "max_sessions": 200,
     "thinking_tokens": 16000,
-    "debug": false,
-    "verbose": false,
-    "done_verify_commands": [],
-    "done_verify_auto": true,
-    "done_verify_tests": true,
-    "done_self_review": "off",
-    "thinking": "",
-    "effort": "",
-    "show_reasoning": false,
-    "disabled_skills": [],
-    "memory_embedding": null,
     "system_prompt": "你是 Cove，一个 AI 编程助手。核心职责：使用工具完成任务，而非描述任务。",
+    "profiles": {
+        "deepseek": {
+            "model": "deepseek-v4-pro",
+            "model_fast": "deepseek-v4-flash",
+            "provider": {
+                "name": "deepseek",
+                "api_key": "sk-your-deepseek-api-key-here",
+                "base_url": "https://api.deepseek.com/v1"
+            },
+            "thinking_tokens": 16000,
+            "max_budget_usd": 10
+        },
+        "local": {
+            "model": "qwen3.6-27b",
+            "model_fast": "qwen3.6-27b",
+            "provider": {
+                "name": "openai-compatible",
+                "api_key": "local",
+                "base_url": "http://127.0.0.1:8080/v1"
+            },
+            "max_budget_usd": 999999
+        },
+        "gemini": {
+            "model": "gemini-3.6-flash",
+            "model_fast": "gemini-3.1-flash-lite",
+            "provider": {
+                "name": "gemini",
+                "api_key": "AIzaSy-your-gemini-api-key-here",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
+            },
+            "thinking_tokens": 16000,
+            "max_budget_usd": 10
+        }
+    },
     "mcp_servers": {}
 }
