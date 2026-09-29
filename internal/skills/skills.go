@@ -288,7 +288,7 @@ type RegistryEntry struct {
 	Author      string `json:"author,omitempty"`
 }
 
-var RegistryURL = "https://raw.githubusercontent.com/liuzhixin405/cove/main/skills-registry.json"
+var RegistryURL = "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills-registry.json"
 var fallbackJSON = `[{"name":"security-audit","description":"Security audit: scan deps, check vulnerabilities.","author":"marketplace"},{"name":"api-design","description":"REST API design: endpoints, schemas, OpenAPI.","author":"marketplace"},{"name":"dockerize","description":"Docker: Dockerfile, compose, build, push.","author":"marketplace"},{"name":"i18n","description":"Internationalization: extract strings, translations.","author":"marketplace"},{"name":"ci-cd","description":"CI/CD: Actions, pipelines, testing.","author":"marketplace"}]`
 
 // installHTTPClient and the registry fetch both use the shared SSRF-hardened

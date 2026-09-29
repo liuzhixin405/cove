@@ -66,7 +66,7 @@ cove -d
 
 ### 预编译二进制
 
-前往 [Releases](https://github.com/liuzhixin405/cove/releases) 下载对应平台的压缩包：
+前往 [Releases](https://github.com/liuzhixin405/cove-agent/releases) 下载对应平台的压缩包：
 
 | 平台 | 文件 |
 |------|------|
@@ -90,7 +90,7 @@ Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
 
 需要 Go 1.25+：
 ```bash
-git clone https://github.com/liuzhixin405/cove.git
+git clone https://github.com/liuzhixin405/cove-agent.git
 cd cove
 go build -o cove ./cli/cove
 ./cove --version
@@ -1634,7 +1634,7 @@ CovePhone 是 Cove 的 Android 手机伴侣应用。
 
 ### 安装
 
-1. 从 [Releases](https://github.com/liuzhixin405/cove/releases) 下载 APK
+1. 从 [Releases](https://github.com/liuzhixin405/cove-agent/releases) 下载 APK
 2. 允许安装未知来源应用
 3. 打开 APK 完成安装
 
@@ -1663,7 +1663,7 @@ CovePhone 是 Cove 的 Android 手机伴侣应用。
 
 ### 技术支持
 
-- GitHub Issues: https://github.com/liuzhixin405/cove/issues
+- GitHub Issues: https://github.com/liuzhixin405/cove-agent/issues
 - 邮箱: 164910441@qq.com
 
 ---

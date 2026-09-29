@@ -4,8 +4,8 @@
 
 **像专家一样在终端里写代码。不再是简单的 AI 聊天，而是你的自动化代码执行引擎。**
 
-[![CI](https://github.com/liuzhixin405/cove/actions/workflows/ci.yml/badge.svg)](https://github.com/liuzhixin405/cove/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/liuzhixin405/cove?include_prereleases)](https://github.com/liuzhixin405/cove/releases)
+[![CI](https://github.com/liuzhixin405/cove-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/liuzhixin405/cove-agent/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/liuzhixin405/cove-agent?include_prereleases)](https://github.com/liuzhixin405/cove-agent/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [中文](#中文) | [English](#english)
@@ -56,7 +56,7 @@ cove和其他agent没什么不一样的，此处省略N多token
 
 ```bash
 # 1. 下载对应平台的二进制（Windows / macOS / Linux）
-#    https://github.com/liuzhixin405/cove/releases
+#    https://github.com/liuzhixin405/cove-agent/releases
 
 # 2. 或者从源码构建（需要 Go 1.25+）
 go build -o cove ./cli/cove
