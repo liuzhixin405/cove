@@ -322,9 +322,31 @@ func pinIfStreaming() {
 	want := streamingActive && !pinned && activeReader != nil && activeReader.reading && pinEnabled()
 	consoleMu.Unlock()
 	if want {
-		go pinAtCursor(false)
+		startPin(func() { pinAtCursor(false) })
 	}
 }
+
+// pinWG tracks the detached pinners: pinIfStreaming and pinAtCursor run off
+// the key loop, because the loop is what answers the terminal's cursor query.
+// waitForPin joins them, so a caller about to hand the terminal over — a test
+// swapping os.Stdout, or shutdown — does not read it while one is still
+// writing.
+var pinWG sync.WaitGroup
+
+// startPin runs f on the pinning goroutine's bookkeeping. f may start more
+// pinned work through startPin; the counter is already up when it does, so a
+// concurrent waitForPin cannot see it reach zero in between.
+func startPin(f func()) {
+	pinWG.Add(1)
+	go func() {
+		defer pinWG.Done()
+		f()
+	}()
+}
+
+// waitForPin blocks until no detached pinning work is outstanding. Tests call
+// it before they take os.Stdout back.
+func waitForPin() { pinWG.Wait() }
 
 // unpinLocked leaves pinned mode. Callers hold consoleMu.
 func unpinLocked() {
@@ -383,7 +405,7 @@ func (lr *LineReader) repinIfResizedLocked(w, h int) bool {
 	pinned = false
 	pinRows, pinCols = 0, 0
 	if lr.reading && streamingActive {
-		go pinIfStreaming()
+		startPin(pinIfStreaming)
 	}
 	return true
 }

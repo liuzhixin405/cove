@@ -375,6 +375,10 @@ func TestResizeWhilePinnedReleasesAndRepins(t *testing.T) {
 	repinned := lr.repinIfResizedLocked(80, 40)
 	stillPinned := pinned
 	consoleMu.Unlock()
+	// The repin is detached (it asks the key loop where the cursor is), so it
+	// must be joined before this test takes os.Stdout back: -race caught the
+	// pinning goroutine reading it while captureStdout's restore wrote it.
+	waitForPin()
 	out := restore()
 	if !repinned || stillPinned {
 		t.Fatalf("resize not handled: repinned=%v pinned=%v", repinned, stillPinned)
