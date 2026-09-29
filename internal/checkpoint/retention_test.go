@@ -70,8 +70,15 @@ func TestCreateRunsGCPeriodically(t *testing.T) {
 		if _, err := mgr.Create(""); err != nil {
 			t.Fatal(err)
 		}
+		// Drain before the next creation. The pending work is a pair of
+		// booleans — a trigger arriving while the background goroutine is
+		// still running is *queued*, not counted — so an un-drained loop can
+		// coalesce the trigger for creation 4 into creation 2's gc and the
+		// count below would depend on how quickly that goroutine gets
+		// scheduled (which is how this failed on a loaded macOS runner with
+		// "gc ran 1 times over 5 creations, want 2").
+		mgr.WaitMaintenance()
 	}
-	mgr.WaitMaintenance()
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("gc ran %d times over 5 creations, want 2", got)
 	}
