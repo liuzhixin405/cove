@@ -1,4 +1,4 @@
-module github.com/liuzhixin405/cove-agent-agent
+module github.com/liuzhixin405/cove-agent
 
 go 1.25.0
 
