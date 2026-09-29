@@ -28,9 +28,11 @@ Cove-Agent 重新定义了 **AI 辅助编程**，将开发效率提升至自动�
 
 ### 📽️ 自动化演示
 
-cove和其他agent没什么不一样的，此处省略N多token
+下面两张图是 cove-agent 在真实仓库里的会话——本仓库的代码就是这么写出来的。
 
----
+![cove-agent 在终端里规划并执行任务](images/README/1790699695911.png)
+
+![cove-agent 执行工具调用并汇报结果](images/README/1790699714465.png)
 
 <a name="中文"></a>
 
@@ -71,54 +73,54 @@ cove /new "添加一个新的 API 接口并更新 README"
 
 ### ⌨️ 命令速查
 
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/keys` | 查看输入快捷键（别名 `/shortcuts`） |
-| `/model <名称>` | 切换 AI 模型 |
-| `/provider <名称>` | 切换提供商（anthropic/deepseek/openai/glm/kimi/qwen/doubao 等） |
-| `/api-key <密钥>` | 保存 API 密钥 |
-| `/base-url <地址>` | 设置自定义接口地址 |
-| `/mode <模式>` | 设置权限模式（`default`/`plan`/`auto`/`bypass`） |
-| `/permissions` | 查看当前权限模式 |
-| `/profile [list\|switch\|save\|delete\|show]` | 管理具名配置档案 |
-| `/config` | 查看完整配置 |
-| `/system <提示词>` | 设置自定义系统提示词 |
-| `/budget <金额\|auto\|off\|save>` | 设置本会话预算上限（$）；`save` 写入 `config.json` |
-| `/cost` | 查看用量和费用 |
-| `/ratelimit` | 查看 API 速率限制状态 |
-| `/stats` | 查看消息数与费用统计 |
-| `/status` | 查看代理状态与会话信息 |
-| `/context` | 查看当前上下文 |
-| `/compact` | 立即压缩对话历史（打印压缩前后的 token 数） |
-| `/new` | 保存当前会话并开始新会话（清空对话上下文） |
-| `/clear` | 清屏并清空回滚区（别名 `/cls`，快捷键 Ctrl+L） |
-| `/history` | 查看和恢复历史会话 |
-| `/resume [id]` | 恢复已保存的会话 |
-| `/continue` | 从中断处继续上一轮（已完成的工具步骤不会重做） |
-| `/export` | 导出当前对话 |
-| `/undo` | 回退到上一个检查点 |
-| `/checkpoints` | 列出所有检查点 |
-| `/diff` | 显示 git diff |
-| `/commit [msg]` | Git add + commit |
-| `/review` | 审查工作区变更 |
-| `/init [apply\|discard]` | 让模型阅读仓库并起草 AGENTS.md，以 diff 展示草稿 |
-| `/cd <路径>` | 切换工作目录（按新目录重新加载 `policies.json` 规则） |
-| `/attach <文件...>` | 挂载图片或文件（支持 `list`/`remove`/`clear` 子命令） |
-| `/memory [list\|add\|search\|remove\|stats]` | 管理持久记忆 |
-| `/dream [status\|run]` | 记忆整理（dream）的触发方式、上次结果与费用；`run` 立即整理 |
-| `/hooks` | 列出从 `hooks.json` 加载的钩子 |
-| `/mcp` | MCP 服务器管理 |
-| `/plugin` | 插件管理 |
-| `/skill <名称>` | 查看或调用一个技能（别名 `/skills`） |
-| `/tools` | 列出可用工具 |
-| `/tasks` | 查看运行中/排队任务（TUI）；headless 显示同步执行状态 |
-| `/stop` | 取消当前任务（别名 `/cancel`） |
-| `/record [status\|start\|stop]` | 控制会话事件录制 |
-| `/x [编号] [all]` | 展开工具块折叠的输出（别名 `/expand`） |
-| `/doctor` | 快速检查 git、ripgrep、供应商与 API key |
-| `/diagnose [quick\|errors\|archive\|codes\|trace N]` | 完整系统诊断与错误分析 |
-| `/exit` | 退出 REPL |
+| 命令                  | 说明                                                            |
+| --------------------- | --------------------------------------------------------------- |
+| `/help`             | 显示帮助                                                        |
+| `/keys`             | 查看输入快捷键（别名 `/shortcuts`）                           |
+| `/model <名称>`     | 切换 AI 模型                                                    |
+| `/provider <名称>`  | 切换提供商（anthropic/deepseek/openai/glm/kimi/qwen/doubao 等） |
+| `/api-key <密钥>`   | 保存 API 密钥                                                   |
+| `/base-url <地址>`  | 设置自定义接口地址                                              |
+| `/mode <模式>`      | 设置权限模式（`default`/`plan`/`auto`/`bypass`）        |
+| `/permissions`      | 查看当前权限模式                                                |
+| `/profile [list       | switch                                                          |
+| `/config`           | 查看完整配置                                                    |
+| `/system <提示词>`  | 设置自定义系统提示词                                            |
+| `/budget <金额        | auto                                                            |
+| `/cost`             | 查看用量和费用                                                  |
+| `/ratelimit`        | 查看 API 速率限制状态                                           |
+| `/stats`            | 查看消息数与费用统计                                            |
+| `/status`           | 查看代理状态与会话信息                                          |
+| `/context`          | 查看当前上下文                                                  |
+| `/compact`          | 立即压缩对话历史（打印压缩前后的 token 数）                     |
+| `/new`              | 保存当前会话并开始新会话（清空对话上下文）                      |
+| `/clear`            | 清屏并清空回滚区（别名 `/cls`，快捷键 Ctrl+L）                |
+| `/history`          | 查看和恢复历史会话                                              |
+| `/resume [id]`      | 恢复已保存的会话                                                |
+| `/continue`         | 从中断处继续上一轮（已完成的工具步骤不会重做）                  |
+| `/export`           | 导出当前对话                                                    |
+| `/undo`             | 回退到上一个检查点                                              |
+| `/checkpoints`      | 列出所有检查点                                                  |
+| `/diff`             | 显示 git diff                                                   |
+| `/commit [msg]`     | Git add + commit                                                |
+| `/review`           | 审查工作区变更                                                  |
+| `/init [apply         | discard]`                                                       |
+| `/cd <路径>`        | 切换工作目录（按新目录重新加载 `policies.json` 规则）         |
+| `/attach <文件...>` | 挂载图片或文件（支持 `list`/`remove`/`clear` 子命令）     |
+| `/memory [list        | add                                                             |
+| `/dream [status       | run]`                                                           |
+| `/hooks`            | 列出从 `hooks.json` 加载的钩子                                |
+| `/mcp`              | MCP 服务器管理                                                  |
+| `/plugin`           | 插件管理                                                        |
+| `/skill <名称>`     | 查看或调用一个技能（别名 `/skills`）                          |
+| `/tools`            | 列出可用工具                                                    |
+| `/tasks`            | 查看运行中/排队任务（TUI）；headless 显示同步执行状态           |
+| `/stop`             | 取消当前任务（别名 `/cancel`）                                |
+| `/record [status      | start                                                           |
+| `/x [编号] [all]`   | 展开工具块折叠的输出（别名 `/expand`）                        |
+| `/doctor`           | 快速检查 git、ripgrep、供应商与 API key                         |
+| `/diagnose [quick     | errors                                                          |
+| `/exit`             | 退出 REPL                                                       |
 
 *更多信息请查看 [贡献指南](CONTRIBUTING.md) 和 [开发文档](docs/README.md)。*
 
