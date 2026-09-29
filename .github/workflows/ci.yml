@@ -73,10 +73,15 @@ jobs:
 
       # Pinned: "latest" let a new golangci-lint release (new default rules,
       # config schema changes) turn a green build red without a code change.
+      # It must also be built with a Go at least as new as go.mod's: v2.1.6
+      # was built with Go 1.24 and refused to run against go 1.25.0 outright
+      # ("can't load config: the Go language version (go1.24) used to build
+      # golangci-lint is lower than the targeted Go version"), so the job
+      # exited 3 without ever looking at the code.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.1.6
+          version: v2.4.0
           args: --timeout=5m
 
   build:
