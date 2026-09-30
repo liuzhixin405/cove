@@ -22,7 +22,7 @@ import (
 var (
 	conversationManaged = []string{
 		"messages", "sessionView", "systemPrompt", "totalTokens", "lastInputTokens", "usageMsgCount",
-		"session", "costBase", "fileHistory", "turnFilesChanged", "turnChangedFiles", "turnCheckpointed",
+		"session", "costBase", "fileHistory", "turnFilesChanged", "turnRanGit", "turnChangedFiles", "turnCheckpointed",
 		"pendingSteer", "pendingSteerN", "loopDetector", "guardrails",
 		"lastReviewMsgCount", "turnsSinceReview", "turnUsedWork", "conversationGen",
 		"newMemories", "shownMemories", "repoMapExcerpts", "injectedSkills",

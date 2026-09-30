@@ -60,7 +60,9 @@ type Rule struct {
 	// MCP proxy tool.
 	InputEquals map[string]string
 	// ParamMatch scopes a rule to calls whose input fields match these glob
-	// patterns (policies.json "param_match").
+	// patterns (policies.json "param_match"). For the "command" of a shell
+	// tool the glob applies per simple command: an allow needs every command
+	// of the line to match, a deny or ask any one (commandParamMatches).
 	ParamMatch map[string]string
 	// Priority orders ask against allow rules (policies.json "priority";
 	// rules remembered in the session have 0): an ask wins unless an allow
@@ -190,8 +192,9 @@ func sameRule(a, b Rule) bool {
 func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecision Decision) (Decision, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	kind := shellKindFor(toolName, m.shellKind)
 	for _, r := range m.deny {
-		if matchRule(r, toolName, toolInput) {
+		if matchRuleFor(r, toolName, toolInput, kind) {
 			return DDeny, ReasonDenyRule
 		}
 	}
@@ -210,12 +213,12 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 	// Bypass mode (above) skips them; only deny rules and plan mode stop it.
 	askPri, asked := 0, false
 	for _, r := range m.ask {
-		if matchRule(r, toolName, toolInput) && (!asked || r.Priority > askPri) {
+		if matchRuleFor(r, toolName, toolInput, kind) && (!asked || r.Priority > askPri) {
 			askPri, asked = r.Priority, true
 		}
 	}
 	allowPri, allowed, allowReason := 0, false, ""
-	cov := coverage{kind: shellKindFor(toolName, m.shellKind)}
+	cov := coverage{kind: kind}
 	poolPri, pooling := 0, false
 	for _, r := range m.allow {
 		if r.CommandPrefix != "" || r.CommandGroup != "" {
@@ -234,7 +237,7 @@ func (m *Manager) Check(toolName string, toolInput map[string]any, defaultDecisi
 			}
 			continue
 		}
-		if matchRule(r, toolName, toolInput) && (!allowed || r.Priority > allowPri) {
+		if matchRuleFor(r, toolName, toolInput, kind) && (!allowed || r.Priority > allowPri) {
 			allowPri, allowed, allowReason = r.Priority, true, "allowed by policy rule"
 		}
 	}
@@ -271,6 +274,12 @@ func toolMatches(r Rule, toolName string) bool {
 }
 
 func matchRule(r Rule, toolName string, input map[string]any) bool {
+	return matchRuleFor(r, toolName, input, "")
+}
+
+// matchRuleFor is matchRule for a shell tool whose command runs under kind
+// (the zero kind is the strict one); only param_match on "command" uses it.
+func matchRuleFor(r Rule, toolName string, input map[string]any, kind ShellKind) bool {
 	if !toolMatches(r, toolName) {
 		return false
 	}
@@ -290,7 +299,17 @@ func matchRule(r Rule, toolName string, input map[string]any) bool {
 	}
 	for field, pattern := range r.ParamMatch {
 		got, ok := input[field]
-		if !ok || !matchGlob(pattern, fmt.Sprintf("%v", got)) {
+		if !ok {
+			return false
+		}
+		if field == "command" && IsShellTool(toolName) {
+			s, _ := got.(string)
+			if !commandParamMatches(pattern, s, r.Decision, kind) {
+				return false
+			}
+			continue
+		}
+		if !matchGlob(pattern, fmt.Sprintf("%v", got)) {
 			return false
 		}
 	}

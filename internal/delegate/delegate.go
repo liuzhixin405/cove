@@ -305,7 +305,10 @@ func (sa *SubAgent) Run(ctx context.Context, task string, systemPrompt string) *
 			Messages:   messages,
 			SystemBase: systemPrompt,
 			Tools:      toolDefs,
-			MaxTokens:  16000,
+			// Sized per model, as the engine's turns are: a fixed 16000 was
+			// rejected with a 400 by deepseek-chat (8192) and claude-3-haiku
+			// (4096) on every sub-agent call. sa.model may be the fallback.
+			MaxTokens: api.MaxOutputTokensForModel(sa.model),
 		})
 		// An overloaded model hands the run to the fallback once, as the
 		// engine does for a turn: a sub-agent used to die on the first 503.

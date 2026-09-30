@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,7 +29,9 @@ import (
 // 工具由引擎以 fail-closed 方式拒绝（见 Engine.authorizeTool）。
 var replInteractive bool
 
-func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
+// runREPL runs the interactive shell until the user leaves it, and reports
+// whether they left with /restart (main then starts cove again).
+func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) (restart bool) {
 	eng, toolReg, cfg, mcpPool := app.eng, app.toolReg, app.cfg, app.mcpPool
 	skillMgr, memStore, pluginMgr, projCtx := app.skillMgr, app.memStore, app.pluginMgr, app.projCtx
 
@@ -69,6 +72,7 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 	if dir, err := config.ConfigDir(); err == nil {
 		repl.SetHistoryFile(filepath.Join(dir, "input_history.jsonl"))
 	}
+	repl.SetHistoryFilter(historyLineKeeps)
 	reader := repl.New(func(input string) []string {
 
 		return complete(input, allCommands, skillDescs)
@@ -142,7 +146,7 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 	// On startup, check for interrupted draft and notify user
 
-	if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
+	if draft := usableInterruptedDraft(eng); draft != nil {
 
 		age := time.Since(draft.UpdatedAt).Truncate(time.Second)
 
@@ -198,7 +202,10 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 		if errors.Is(err, repl.ErrExit) {
 
-			autoSaveSession(eng)
+			// Ctrl+D / stdin EOF leaves like /exit. It used to save at once
+			// while the task kept running: half a turn saved, the save racing
+			// the task's appends, and the task then killed with no draft.
+			leaveREPL(tasks, func() { autoSaveSession(eng) })
 
 			repl.PrintAbove("再见！\r\n")
 
@@ -239,152 +246,45 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 			repl.PrintAbove("  \x1b[2m提示仍在等待回答（" + hint + "）；这一行按普通输入处理\x1b[0m\r\n")
 		}
 
+		// The editor hands the line over as typed; every exact-match handler
+		// below ("exit", "/history", "/compact"...) compared the raw text, so
+		// a trailing space (Tab completion leaves one) made "/history " try
+		// to resume a session named "", "/compact " fall through to the
+		// generic command that only says to use the REPL's, and a line of
+		// spaces went to the model as an empty message — a paid call, and a
+		// failed one on providers that reject empty content. Headless trims
+		// its lines; the shell does the same now.
+		input = strings.TrimSpace(input)
 		if input == "" {
-
 			continue
-
 		}
 
-		if fe.historyPickPending && !strings.HasPrefix(input, "/") {
-
-			if isPositiveNumber(input) {
-
-				handleHistoryResume(input, eng)
-
-				fe.historyPickPending = false
-
-				continue
-
-			}
-
-			fe.historyPickPending = false
-
+		if fe.takeHistoryPick(input, func(in string) {
+			before := eng.SessionID()
+			handleHistoryResume(in, eng)
+			fe.noteSessionSwitch(before)
+		}) {
+			continue
 		}
 
 		switch {
 
 		case input == "exit" || input == "/exit":
 
-			// Wait briefly for the task goroutine to finish its cleanup (save draft)
-
-			if tasks.CancelForExit() {
-
-				_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
-
-			}
-
-			autoSaveSession(eng)
+			leaveREPL(tasks, func() { autoSaveSession(eng) })
 
 			repl.PrintAbove("再见！\r\n")
 
 			return
 
-		case isContinueCommand(input):
-
-			if tasks.IsRunning() {
-
-				repl.PrintAbove("[提示] 当前有任务正在运行，请等待其结束后再重试。\r\n")
-
-				fe.historyPickPending = false
-
-				continue
-
-			}
-
-			if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
-
-				repl.PrintAbove(budgetExceededRetryHint(eng.CostTracker()) + "\r\n")
-
-				fe.historyPickPending = false
-
-				continue
-
-			}
-
-			pf := tasks.PendingFailed()
-
-			if pf != nil {
-
-				if isLowSignalResumeInput(pf.Content) {
-
-					tasks.ClearPendingFailed()
-
-					_ = clearInterruptedDraft()
-
-					repl.PrintAbove("[提示] 已为您推荐相关历史任务...\r\n")
-
-					resumeAndContinue(eng, tasks)
-
-					fe.historyPickPending = false
-
-					continue
-
-				}
-
-				tasks.ClearPendingFailed()
-
-				_, merged := tasks.Enqueue(*pf)
-
-				if merged {
-
-					repl.PrintAbove("[恢复] 任务记录已合并。\r\n")
-
-				} else {
-
-					repl.PrintAbove("[恢复] 任务已排队，即将开始处理。\r\n")
-
-				}
-
-				// Don't block: task runs in the background.
-
-				fe.historyPickPending = false
-
-				continue
-
-			}
-
-			if draft, _ := loadInterruptedDraft(); draft != nil && strings.TrimSpace(draft.UserContent) != "" {
-
-				if isLowSignalResumeInput(draft.UserContent) {
-
-					_ = clearInterruptedDraft()
-
-					repl.PrintAbove("[提示] 已为您推荐相关历史任务...\r\n")
-
-					resumeAndContinue(eng, tasks)
-
-					fe.historyPickPending = false
-
-					continue
-
-				}
-
-				msg := api.Message{Role: "user", Content: draft.UserContent}
-
-				_, merged := tasks.Enqueue(msg)
-
-				if merged {
-
-					repl.PrintAbove("[恢复] 任务记录已合并。\r\n")
-
-				} else {
-
-					repl.PrintAbove("[恢复] 任务已排队，即将开始处理。\r\n")
-
-				}
-
-				// Don't block: task runs in the background.
-
-				fe.historyPickPending = false
-
-				continue
-
-			}
-
-			resumeAndContinue(eng, tasks)
-
+		// While a task runs, a bare "继续" is ordinary input (steered into the
+		// task, or queued if it is finishing), like any other line. It used to
+		// be refused with "当前有任务正在运行" — also in the moment after the
+		// answer had been shown and the turn was only saving and cleaning up,
+		// which is exactly when a person types it.
+		case isContinueCommand(input) && !tasks.IsRunning():
 			fe.historyPickPending = false
-
+			fe.continueTyped(input)
 			continue
 
 		case input == "/":
@@ -393,12 +293,13 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 		case fe.dispatch(input):
 			if fe.exitRequested {
-				if tasks.CancelForExit() {
-					_ = tasks.WaitIdleUntil(time.Now().Add(3 * time.Second))
+				leaveREPL(tasks, func() { autoSaveSession(eng) })
+				if fe.restartRequested {
+					repl.PrintAbove("正在重启 cove…\r\n")
+					return true
 				}
-				autoSaveSession(eng)
 				repl.PrintAbove("再见！\r\n")
-				return
+				return false
 			}
 			continue
 
@@ -438,6 +339,19 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 			if shouldAutoSwitchToVision(warnings) {
 
 				if visionModel := preferredVisionModelForProvider(pc.Name, cfg.Model); visionModel != "" && visionModel != cfg.Model {
+
+					if tasks.IsRunning() {
+						// Switching reloads the provider under the running
+						// turn (ReloadProvider mid-request, a data race the
+						// "must not run while a task runs" rule keeps /model
+						// out of). Sending the message anyway would queue an
+						// image the current model cannot see, degraded to a
+						// text note. So neither: the message is not sent,
+						// its attachments stay mounted, and Up recalls the
+						// line once the task has ended.
+						fe.print(visionSwitchDeferredNotice(visionModel))
+						continue
+					}
 
 					if err := applyProviderConfigChange(cfg, eng, func() error {
 
@@ -488,8 +402,14 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 			startedByNew := fe.freshFromNew
 			fe.freshFromNew = false
 			if len(eng.Messages()) == 0 && !tasks.IsRunning() && len(userMsg.Parts) == 0 && !startedByNew {
+				before := eng.SessionID()
 				if rec, idx := resumeDuplicateSession(eng, userMsg.Content); rec != nil {
-					repl.PrintAbove(fmt.Sprintf("[已恢复] 这条请求与会话 #%d（%s，%d 条消息）相同且该会话未完成，已在它上面继续，不再新建会话。\r\n", idx, rec.UpdatedAt.Format("01-02 15:04"), len(rec.Messages)))
+					fe.noteSessionSwitch(before)
+					label := "会话"
+					if idx > 0 {
+						label = fmt.Sprintf("会话 #%d", idx)
+					}
+					repl.PrintAbove(fmt.Sprintf("[已恢复] 这条请求与%s（%s，%d 条消息）相同且该会话未完成，已在它上面继续，不再新建会话。\r\n", label, rec.UpdatedAt.Format("01-02 15:04"), len(rec.Messages)))
 					userMsg = api.Message{Role: "user", Content: "继续"}
 				}
 			}
@@ -510,6 +430,42 @@ func runREPL(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
 
 	}
 
+}
+
+// historyLineKeeps is the input history's filter (repl.SetHistoryFilter): a
+// line that sets a credential is kept neither in memory (Up, Ctrl+R) nor in
+// input_history.jsonl. Every line used to be recorded, "/api-key sk-..."
+// included, in plain text. Refused: /api-key with a value, /config setting
+// a key whose name says it is secret (api_key, token, secret, password),
+// and /base-url with a user:password@ in the URL.
+func historyLineKeeps(line string) bool {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return true
+	}
+	switch strings.ToLower(fields[0]) {
+	case "/api-key":
+		return false
+	case "/config":
+		key := strings.ToLower(fields[1])
+		for _, s := range []string{"api_key", "api-key", "apikey", "token", "secret", "password"} {
+			if strings.Contains(key, s) {
+				return false
+			}
+		}
+	case "/base-url":
+		if u, err := url.Parse(fields[1]); err == nil && u.User != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// visionSwitchDeferredNotice is shown for an image typed while a task runs
+// on a model that cannot see it (see the REPL loop): the switch to
+// visionModel waits until the task has ended, and the message with it.
+func visionSwitchDeferredNotice(visionModel string) string {
+	return fmt.Sprintf("[提示] 当前模型看不到图片，需要切换到视觉模型 %s，但任务运行中不能切换模型。这条消息未发送，附件仍保留；请等任务结束后重新发送（↑ 可找回刚才的输入），或先 /stop。", visionModel)
 }
 
 // steerFeedback is the line shown for text typed while a task runs: it was
@@ -567,6 +523,177 @@ func denyPendingPermissionPrompt() bool {
 	}
 	ch <- promptInterrupt
 	return true
+}
+
+// exitTaskWait bounds how long leaving the REPL waits for the cancelled task
+// to finish its cleanup (saving the interrupted draft).
+const exitTaskWait = 3 * time.Second
+
+// exitTasks is the part of the task runner leaving the REPL needs.
+type exitTasks interface {
+	CancelForExit() bool
+	WaitIdleUntil(deadline time.Time) bool
+}
+
+// leaveREPL is every way out of the REPL — Ctrl+D / stdin EOF, "exit",
+// /exit and /restart: answer a waiting prompt, stop the running task, give
+// it exitTaskWait to clean up, then save.
+//
+// Ctrl+D used to save at once while the task kept running (a half turn
+// saved, racing the task's appends, and no interrupted draft when the
+// process then died). And none of the paths answered a waiting
+// permission/question/limit prompt: the task, blocked on the prompt's
+// answer channel rather than its context, could not return, so the exit
+// waited the full 3 seconds and saved with the task still blocked.
+func leaveREPL(tasks exitTasks, save func()) {
+	denyPendingPermissionPrompt()
+	if tasks.CancelForExit() {
+		_ = tasks.WaitIdleUntil(time.Now().Add(exitTaskWait))
+	}
+	// /exit typed while a turn streamed left the pinned input row's scroll
+	// region set: the shell then scrolled inside the shortened window.
+	repl.ReleaseTerminal()
+	save()
+}
+
+// takeHistoryPick handles a line typed right after /history listed sessions
+// and reports whether it consumed it: a bare number resumes that session
+// (resume); anything else ends the pick and is handled as usual.
+//
+// While a task runs the number is refused, the way the dispatcher refuses
+// "/history 2": resuming swaps the session the task is appending to. The
+// bare number used to go straight to ResumeSession. The pick stays pending,
+// so the number can be typed again once the task has ended.
+func (fe *frontend) takeHistoryPick(input string, resume func(string)) bool {
+	if !fe.historyPickPending || strings.HasPrefix(input, "/") {
+		return false
+	}
+	if !isPositiveNumber(input) {
+		fe.historyPickPending = false
+		return false
+	}
+	if fe.running() {
+		fe.print("[提示] 任务运行中不能恢复历史会话：它会改写正在使用的会话状态。请等任务结束后再输入编号，或先 /stop。")
+		return true
+	}
+	resume(input)
+	fe.historyPickPending = false
+	return true
+}
+
+// continueTyped handles a bare "继续" typed at the prompt: retry the request
+// that just failed, else the interrupted draft of this session, else send
+// "继续" on.
+func (fe *frontend) continueTyped(input string) {
+	eng, tasks := fe.eng, fe.tasks
+	if tasks.IsRunning() {
+		fe.print("[提示] 当前有任务正在运行，请等待其结束后再重试。")
+		return
+	}
+	if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
+		fe.print(budgetExceededRetryHint(eng.CostTracker()))
+		return
+	}
+	requeue := func(msg api.Message) {
+		// Don't block: the task runs in the background.
+		if _, merged := tasks.Enqueue(msg); merged {
+			fe.print("[恢复] 任务记录已合并。")
+		} else {
+			fe.print("[恢复] 任务已排队，即将开始处理。")
+		}
+	}
+	if pf := tasks.PendingFailed(); pf != nil {
+		tasks.ClearPendingFailed()
+		if isLowSignalResumeInput(pf.Content) {
+			// This session's draft only: pf says nothing about a draft
+			// another project or session left in the one-per-user file.
+			_ = clearInterruptedDraftFor(eng.SessionID())
+			fe.continueConversation(input)
+			return
+		}
+		requeue(*pf)
+		return
+	}
+	if draft := usableInterruptedDraft(eng); draft != nil {
+		// Typed after a restart: the draft's session is not the one in use
+		// (that is empty). Go back to it, so the request continues where it
+		// stopped instead of starting over in a new session. This comes
+		// before the low-signal check: a killed "继续" leaves a draft that
+		// says nothing but still names its session, and continuing an empty
+		// conversation used to resume the best-scored session instead.
+		if !eng.HasMessages() && draft.SessionID != "" && draft.SessionID != eng.SessionID() && eng.Store() != nil {
+			if rec, err := eng.Store().Load(draft.SessionID); err == nil {
+				eng.ResumeSession(rec)
+				fe.print(fmt.Sprintf("[恢复] 已切回中断任务所在的会话（%s，%d 条消息）。", shortDesc(effectiveHistoryTitle(*rec)), len(rec.Messages)))
+			}
+		}
+		if isLowSignalResumeInput(draft.UserContent) {
+			_ = clearInterruptedDraft()
+			fe.continueConversation(input)
+			return
+		}
+		// A process killed mid-task saved the request at turn start and
+		// never answered it; with no interrupted turn in memory, sending the
+		// draft again would put the same request in the session twice.
+		// "继续" goes on from it instead.
+		if requestPending(eng, draft.UserContent) {
+			fe.continueConversation(input)
+			return
+		}
+		requeue(api.Message{Role: "user", Content: draft.UserContent})
+		return
+	}
+	fe.continueConversation(input)
+}
+
+// requestPending reports whether eng's conversation ends with content as an
+// unanswered request that no in-memory interrupted turn covers: what a
+// session saved at turn start by a process that was then killed looks like.
+// An interrupted turn of this process is resumed by re-sending its message
+// (the engine matches it), so that case is not pending here.
+func requestPending(eng *engine.Engine, content string) bool {
+	if eng.HasInterruptedTurn() {
+		return false
+	}
+	msgs := eng.Messages()
+	if len(msgs) == 0 {
+		return false
+	}
+	last := msgs[len(msgs)-1]
+	return last.Role == "user" && strings.TrimSpace(last.Content) == strings.TrimSpace(content)
+}
+
+// continueConversation sends "继续" when there is nothing of this session to
+// retry. With a conversation in progress it goes to that conversation, as
+// any message would (the engine resumes an interrupted turn itself). It
+// used to go to resumeAndContinue whatever the state, which resumes the
+// saved session that scores highest — so "继续" after a completed turn
+// could swap in a different session and continue that one. Only an empty
+// conversation, which has nothing to continue, recovers the most relevant
+// saved session.
+func (fe *frontend) continueConversation(input string) {
+	if fe.eng.HasMessages() {
+		if msg := fe.tasks.SubmitWithFeedback(api.Message{Role: "user", Content: input}); msg != "" {
+			fe.print(msg)
+		}
+		return
+	}
+	fe.print("[提示] 已为您推荐相关历史任务...")
+	before := fe.eng.SessionID()
+	resumeAndContinue(fe.eng, fe.tasks)
+	fe.noteSessionSwitch(before)
+}
+
+// noteSessionSwitch drops the REPL's retry bookkeeping of the session that
+// was in use when the engine has since moved to another one (before is the
+// session ID from before the command). The failed request "继续" retries
+// used to survive /history N, /resume <id> and the duplicate-request
+// resume, so "继续" sent session A's failed request into session B.
+func (fe *frontend) noteSessionSwitch(before string) {
+	if fe.tasks == nil || fe.eng == nil || fe.eng.SessionID() == before {
+		return
+	}
+	fe.tasks.ClearPendingFailed()
 }
 
 // promptInterrupt is what Ctrl+C sends to a waiting prompt instead of a

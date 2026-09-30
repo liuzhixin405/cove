@@ -48,19 +48,30 @@ const nonVisionImageWarning = "可能不支持图片视觉功能"
 // named "bar.com" and fail the whole prompt.
 var attachmentTokenRE = regexp.MustCompile(`(^|\s)@("[^"]+"|'[^']+'|\S+)`)
 
+// buildUserMessage turns a typed line into the message to send: @path tokens
+// naming existing files become attachments (see extractInlineAttachments),
+// explicitPaths (--image/--file, /attach) are attached as well. An explicit
+// path that cannot be read is an error; an @token is not (see
+// inlineAttachmentWanted), it stays text and a warning says so.
 func buildUserMessage(input, cwd string, explicitPaths []string, model string) (api.Message, []string, error) {
+	var warnings []string
 	cleaned, inlinePaths := extractInlineAttachments(input, func(raw string) bool {
-		return inlineAttachmentWanted(cwd, raw)
+		if inlineAttachmentWanted(cwd, raw) {
+			return true
+		}
+		if looksLikeAttachmentPath(raw) {
+			warnings = append(warnings, fmt.Sprintf("⚠ @%s 不是已存在的文件，已按普通文本发送（附加文件请检查路径，或用 /attach）", raw))
+		}
+		return false
 	})
 	allPaths := append([]string{}, explicitPaths...)
 	allPaths = append(allPaths, inlinePaths...)
 
 	msg := api.Message{Role: "user", Content: strings.TrimSpace(cleaned)}
 	if len(allPaths) == 0 {
-		return msg, nil, nil
+		return msg, warnings, nil
 	}
 
-	var warnings []string
 	seen := map[string]bool{}
 	for _, p := range allPaths {
 		part, absPath, warn, err := buildAttachmentPart(cwd, p, model)
@@ -226,15 +237,15 @@ func splitQuotedFields(input string) ([]string, error) {
 	return fields, nil
 }
 
-// inlineAttachmentWanted decides whether an @token names an attachment. A
-// token that looks like a path (it has a dot or a separator) always does, so a
-// mistyped @logs/app.lgo still fails loudly. A bare word such as @Override or
-// @dataclass only does when that file exists: coding prompts are full of
-// decorators and annotations, and each one used to fail the whole prompt.
+// inlineAttachmentWanted decides whether an @token names an attachment: only
+// when it is an existing file. A token that looked like a path (a dot or a
+// separator) used to be taken whatever it named, and a missing file failed
+// the whole prompt with 读取附件失败 — for a package name like @babel/core or
+// @types/node in a pasted log as much as for a typo. Such a token now stays
+// text and buildUserMessage warns about it (looksLikeAttachmentPath), so a
+// mistyped @logs/app.lgo is still reported. Bare words such as @Override or
+// @dataclass are everyday text in coding prompts and pass silently.
 func inlineAttachmentWanted(cwd, raw string) bool {
-	if strings.ContainsAny(raw, `./\:`) {
-		return true
-	}
 	p := raw
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(cwd, p)
@@ -243,8 +254,20 @@ func inlineAttachmentWanted(cwd, raw string) bool {
 	return err == nil && !st.IsDir()
 }
 
+// looksLikeAttachmentPath reports whether an @token that is not a file was
+// probably meant as one (it has a dot or a separator), which is worth a
+// warning, unlike a bare @word.
+func looksLikeAttachmentPath(raw string) bool {
+	return strings.ContainsAny(raw, `./\:`)
+}
+
 // extractInlineAttachments removes the @path tokens that want accepts from
 // input and returns them; the others stay in the text unchanged.
+//
+// Only the token goes, with one space next to it. The rest of the text used
+// to be rebuilt with strings.Join(strings.Fields(...), " ") as soon as one
+// token was taken, which flattened the whole message onto one line: the
+// newlines and indentation of a pasted code block or log were lost.
 func extractInlineAttachments(input string, want func(raw string) bool) (string, []string) {
 	matches := attachmentTokenRE.FindAllStringSubmatchIndex(input, -1)
 	if len(matches) == 0 {
@@ -254,15 +277,31 @@ func extractInlineAttachments(input string, want func(raw string) bool) (string,
 	var out strings.Builder
 	last := 0
 	taken := 0
+	isBlank := func(s string) bool { return s == " " || s == "\t" }
 	for _, m := range matches {
-		// m[2]:m[3] is the whitespace before the @, m[4]:m[5] the path.
-		tokenStart, end := m[3], m[1]
+		// m[2]:m[3] is the whitespace before the @ ("" at the start),
+		// m[4]:m[5] the path.
+		before, end := input[m[2]:m[3]], m[1]
 		raw := strings.TrimSpace(input[m[4]:m[5]])
 		raw = strings.Trim(raw, `"'`)
 		if raw == "" || (want != nil && !want(raw)) {
 			continue
 		}
-		out.WriteString(input[last:tokenStart])
+		// "看 @a.txt 的内容" → "看 的内容": the space before goes. At the start
+		// of the text or a line the newline stays, and the space after the
+		// token goes instead.
+		// When the space before already went with the previous token
+		// ("@a @b x"), the one after goes.
+		start := m[3]
+		if isBlank(before) && m[2] >= last {
+			start = m[2]
+		} else if end < len(input) && isBlank(input[end:end+1]) {
+			end++
+		}
+		if start < last {
+			start = last
+		}
+		out.WriteString(input[last:start])
 		paths = append(paths, raw)
 		last = end
 		taken++
@@ -271,8 +310,7 @@ func extractInlineAttachments(input string, want func(raw string) bool) (string,
 		return input, nil
 	}
 	out.WriteString(input[last:])
-	cleaned := strings.Join(strings.Fields(out.String()), " ")
-	return cleaned, paths
+	return out.String(), paths
 }
 
 // buildAttachmentPart reads a file and creates an api.MessagePart.

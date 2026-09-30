@@ -116,13 +116,16 @@ type oaiFuncDef struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 type oaiReq struct {
-	Model         string            `json:"model"`
-	Messages      []oaiMsg          `json:"messages"`
-	Tools         []oaiTool         `json:"tools,omitempty"`
-	ToolChoice    string            `json:"tool_choice,omitempty"`
-	MaxTokens     int               `json:"max_tokens,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	StreamOptions *oaiStreamOptions `json:"stream_options,omitempty"`
+	Model      string    `json:"model"`
+	Messages   []oaiMsg  `json:"messages"`
+	Tools      []oaiTool `json:"tools,omitempty"`
+	ToolChoice string    `json:"tool_choice,omitempty"`
+	MaxTokens  int       `json:"max_tokens,omitempty"`
+	// MaxCompletionTokens replaces MaxTokens for OpenAI's reasoning models
+	// (setOutputLimit); exactly one of the two is sent.
+	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
+	Stream              bool              `json:"stream,omitempty"`
+	StreamOptions       *oaiStreamOptions `json:"stream_options,omitempty"`
 }
 
 type oaiStreamOptions struct {
@@ -179,8 +182,8 @@ func (p *openAICompatProvider) Chat(ctx context.Context, req ChatRequest) (*Chat
 		Messages:   msgs,
 		Tools:      tools,
 		ToolChoice: toolChoice,
-		MaxTokens:  req.MaxTokens,
 	}
+	body.setOutputLimit(req.MaxTokens)
 
 	return retryWithBackoff(ctx, defaultRetry, func() (*ChatResponse, error) {
 		return p.doChat(ctx, body)
@@ -473,10 +476,10 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		Messages:      messages,
 		Tools:         tools,
 		ToolChoice:    toolChoice,
-		MaxTokens:     req.MaxTokens,
 		Stream:        true,
 		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
 	}
+	body.setOutputLimit(req.MaxTokens)
 	hadImage := oaiReqHasImageURL(body)
 
 	data, _ := json.Marshal(body)
@@ -496,6 +499,7 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
+	markProgress() // headers arrived: the idle clock starts now
 
 	if httpResp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
@@ -521,11 +525,28 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 	byIndex := make(map[int]*tcAccum)
 	lastFinish := "" // finish_reason from the most recent chunk that reported one
 	sawDone := false
+	// partial is the return for a failure once the body has started: the
+	// provider bills what it generated, so the error carries that usage for
+	// the meter (withPartialUsage).
+	partial := func(err error) (*ChatResponse, error) {
+		generated := streamAcc.Content() + streamAcc.Reasoning()
+		for _, acc := range calls {
+			generated += acc.ArgsBuf.String()
+		}
+		return nil, withPartialUsage(err, &ChatResponse{
+			Model:                 req.Model,
+			InputTokens:           usage.PromptTokens,
+			OutputTokens:          usage.CompletionTokens,
+			PromptCacheHitTokens:  usage.cacheHitTokens(),
+			PromptCacheMissTokens: usage.cacheMissTokens(),
+			ReasoningTokens:       usage.reasoningTokens(),
+		}, generated)
+	}
 
 	for scanner.Scan() {
 		// Stop promptly if the caller cancelled (e.g. user pressed Ctrl+C).
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return partial(ctx.Err())
 		}
 		markProgress() // reset the idle watchdog on every received line
 		payload, ok := sseDataPayload(scanner.Text())
@@ -542,7 +563,9 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 			continue
 		}
 		if chunk.Error != nil {
-			return nil, fmt.Errorf("provider stream error: %s", streamErrorText(chunk.Error))
+			// Typed with the status the error's code/type stands for, so a
+			// streamed 503 fails over and cools down like an HTTP 503.
+			return partial(streamError(chunk.Error))
 		}
 		if len(chunk.Choices) > 0 {
 			if fr := chunk.Choices[0].FinishReason; fr != "" {
@@ -593,19 +616,22 @@ func (p *openAICompatProvider) ChatStream(ctx context.Context, req ChatRequest, 
 		// If the watchdog cancelled the read (idle stall) while the caller did
 		// not cancel, surface a clear timeout error instead of a generic one.
 		if streamCtx.Err() != nil && ctx.Err() == nil {
-			return nil, fmt.Errorf("stream stalled: no data received for %s", streamIdleTimeout)
+			return partial(streamStalledError())
 		}
-		return nil, fmt.Errorf("stream read error: %w", err)
+		return partial(fmt.Errorf("stream read error: %w", err))
+	}
+	if streamCtx.Err() != nil && ctx.Err() == nil && !sawDone {
+		return partial(streamStalledError())
 	}
 	// Neither a finish_reason nor [DONE]: the connection closed cleanly in
 	// the middle of the answer. This used to be returned as a normal "stop",
 	// so a half-written reply was taken as the final one.
 	if !sawDone && lastFinish == "" {
-		return nil, fmt.Errorf("stream ended before the response completed (unexpected EOF: no finish_reason or [DONE])")
+		return partial(fmt.Errorf("stream ended before the response completed (unexpected EOF: no finish_reason or [DONE])"))
 	}
 
 	if lastFinish == finishInsufficientResource {
-		return nil, errInsufficientResource()
+		return partial(errInsufficientResource())
 	}
 
 	truncated := lastFinish == "length"
@@ -761,4 +787,44 @@ func formatOpenAICompatAPIError(status int, raw []byte, hadImage bool) error {
 func isReasonerModel(model string) bool {
 	m := strings.ToLower(model)
 	return strings.Contains(m, "deepseek-reasoner") || strings.Contains(m, "deepseek-r1") || strings.Contains(m, "deepseek/deepseek-r1")
+}
+
+// setOutputLimit puts the request's output limit in the field the model
+// accepts. OpenAI's reasoning models reject max_tokens ("Unsupported
+// parameter: 'max_tokens' is not supported with this model. Use
+// 'max_completion_tokens' instead"), so every request to o1/o3/o4/gpt-5 came
+// back 400. They get max_completion_tokens and no max_tokens. The choice is
+// by model name, not provider name: a gateway fronting OpenAI forwards the
+// body as-is and the official API rejects max_tokens just the same, while
+// third-party servers (DeepSeek, llama.cpp, vLLM) do not all understand
+// max_completion_tokens, so every other model keeps max_tokens. These models
+// also reject a temperature other than 1; none is sent for any model.
+func (r *oaiReq) setOutputLimit(n int) {
+	if isOpenAIReasoningModel(r.Model) {
+		r.MaxCompletionTokens, r.MaxTokens = n, 0
+		return
+	}
+	r.MaxTokens, r.MaxCompletionTokens = n, 0
+}
+
+// isOpenAIReasoningModel reports OpenAI's reasoning families (o1, o3, o4,
+// gpt-5 and their -mini/-pro/.1 variants), with or without a gateway's
+// "vendor/" prefix. The family name must be followed by the end of the name,
+// "-" or "." so that "o10-mini" or a third party's "moonshot-o3" does not
+// match.
+func isOpenAIReasoningModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	for _, family := range []string{"o1", "o3", "o4", "gpt-5"} {
+		if !strings.HasPrefix(m, family) {
+			continue
+		}
+		rest := m[len(family):]
+		if rest == "" || rest[0] == '-' || rest[0] == '.' {
+			return true
+		}
+	}
+	return false
 }

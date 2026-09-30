@@ -173,27 +173,69 @@ func gitGrepCategory(args []string) CmdCategory {
 	return CatSafe
 }
 
+// gitBranchShortFlags are git branch's single-letter listing options: --list,
+// --all, --remotes, --verbose, --ignore-case, --quiet.
+const gitBranchShortFlags = "larviq"
+
+// gitBranchLongFlags are the long listing options, spelled out. The value
+// says whether the option takes a value: 'n' never, 'r' required (as
+// "=value" or the next word), 'o' optional (a commit: "=value" or a next word
+// that is not an option).
+var gitBranchLongFlags = map[string]byte{
+	"--list": 'n', "--all": 'n', "--remotes": 'n', "--verbose": 'n', "--show-current": 'n',
+	"--ignore-case": 'n', "--quiet": 'n', "--no-color": 'n', "--no-column": 'n', "--no-abbrev": 'n',
+	"--color": 'n', "--column": 'n', "--abbrev": 'n', // only as --opt or --opt=value
+	"--contains": 'o', "--no-contains": 'o', "--merged": 'o', "--no-merged": 'o',
+	"--points-at": 'r', "--sort": 'r', "--format": 'r',
+}
+
 // gitBranchCategory: listing branches is read-only; naming a branch without
-// --list, or any create/delete/move/upstream option, changes the repository.
+// --list, or any other option, may change the repository. It compared whole
+// words against a list of writing options, which missed an attached value
+// ("-uorigin/main") and git's abbreviations of long options ("--set-u=x",
+// "--unset-up"), both of which write .git/config. Now every option must be a
+// listing option spelled out, and every letter of a short group a listing
+// letter; anything else is CatGit.
 func gitBranchCategory(args []string) CmdCategory {
-	listing := hasAny(args, "--list", "-l")
-	for _, a := range args {
-		if !strings.HasPrefix(a, "-") {
-			if !listing {
+	listing := false
+	var names []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			names = append(names, args[i+1:]...)
+			i = len(args)
+		case strings.HasPrefix(a, "--"):
+			name, _, hasValue := strings.Cut(a, "=")
+			kind, ok := gitBranchLongFlags[name]
+			if !ok {
 				return CatGit
 			}
-			continue
+			listing = listing || name == "--list"
+			switch {
+			case hasValue:
+			case kind == 'r':
+				if i+1 >= len(args) {
+					return CatGit
+				}
+				i++
+			case kind == 'o' && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-"):
+				i++ // the commit
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			for _, r := range a[1:] {
+				if !strings.ContainsRune(gitBranchShortFlags, r) {
+					return CatGit
+				}
+			}
+			listing = listing || strings.ContainsRune(a[1:], 'l')
+		default:
+			names = append(names, a)
 		}
-		name := a
-		if i := strings.IndexByte(name, '='); i > 0 {
-			name = name[:i]
-		}
-		switch name {
-		case "-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "-t",
-			"--delete", "--move", "--copy", "--force", "--set-upstream-to", "--set-upstream",
-			"--unset-upstream", "--edit-description", "--track", "--no-track":
-			return CatGit
-		}
+	}
+	if len(names) > 0 && !listing {
+		// A branch name without --list creates that branch.
+		return CatGit
 	}
 	return CatSafe
 }

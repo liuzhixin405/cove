@@ -67,6 +67,9 @@ func TestE2E_QuestionToolRelaysTheAnswer(t *testing.T) {
 // A 429 that outlives the provider's retries ends the turn with a coded
 // hint; /continue picks it up once the server answers.
 func TestE2E_RateLimitIsCodedAndContinues(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	steps := []fakeStep{}
 	for i := 0; i < 8; i++ {
 		steps = append(steps, fakeStep{Status: 429, Body: `{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}`})
@@ -92,6 +95,9 @@ func TestE2E_RateLimitIsCodedAndContinues(t *testing.T) {
 
 // "p" writes policies.json with the group and /permissions lists it.
 func TestE2E_PersistedRuleIsVisibleInPermissionsAndOnDisk(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	model := newFakeModel(t,
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"git init -q"}`}}},
 		fakeStep{Content: "仓库初始化完成，可以开始添加文件并进行第一次提交了。"},
@@ -188,6 +194,9 @@ func TestE2E_RefusedToolIsReportedToBoth(t *testing.T) {
 // /tasks shows the running task and the guidance waiting for it; once the
 // model consumed the guidance the note is gone.
 func TestE2E_TasksShowsRunningTaskAndPendingGuidance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	model := newFakeModel(t,
 		fakeStep{Delay: 1500 * time.Millisecond, ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"echo step1"}`}}},
 		fakeStep{Content: "第一步已经完成，指引也收到了，接下来按你的要求只用小写命名。"},

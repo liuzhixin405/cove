@@ -127,7 +127,12 @@ func (mf *ModelFallback) try(
 	call func(Provider) (*ChatResponse, error),
 ) (*ChatResponse, Provider, error) {
 	mf.mu.Lock()
-	startIdx := mf.currentIdx
+	// Every request starts from the primary; the loop below skips it while
+	// it cools down or is unavailable. Starting from currentIdx kept traffic
+	// on the fallback for the rest of the session after one 503 or 429: the
+	// primary was tried again only when the fallback failed, long after its
+	// cooldown had expired. currentIdx now only records who served last.
+	const startIdx = 0
 	tried := 0
 	called := false
 	// unavailable is the onUnavailable call to make once the lock is
@@ -237,9 +242,16 @@ func (mf *ModelFallback) try(
 			mf.mu.Unlock()
 			return resp, pw.Provider, nil
 		}
-		if ctx.Err() == nil {
-			pw.LastError = err
+		// A cancelled request says nothing about the provider (as above), so
+		// it is not recorded — but it is still this request's answer. Falling
+		// through used to report the provider's stale LastError, the 503 from
+		// a minute ago, as the reason a Ctrl+C'd request failed.
+		if ctx.Err() != nil {
+			mf.mu.Unlock()
+			fire()
+			return nil, nil, err
 		}
+		pw.LastError = err
 	}
 
 	// All providers exhausted. With a single provider its own error is the

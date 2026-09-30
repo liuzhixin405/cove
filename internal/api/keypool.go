@@ -58,6 +58,22 @@ func (p *KeyPool) size() int {
 	return len(p.keys)
 }
 
+// hasLiveKey reports whether any key is not dead (it may be cooling down);
+// false for a nil or empty pool.
+func (p *KeyPool) hasLiveKey() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, k := range p.keys {
+		if k.Status != KeyDead {
+			return true
+		}
+	}
+	return false
+}
+
 // Get returns the next available API key using round-robin.
 // Returns empty string if all keys are exhausted/dead.
 func (p *KeyPool) Get() string {

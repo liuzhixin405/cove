@@ -63,15 +63,20 @@ func (lr *LineReader) complete(buf *[]rune, cursor *int) {
 		return
 	}
 	texts := completionTexts(suggestions)
+	// The cursor indexes the rune buffer, so it is the completion's rune
+	// count. It used to be its byte length: "请看 @internal/" (16 bytes, 12
+	// runes) put the cursor past the end and the redraw panicked.
 	if len(suggestions) == 1 {
-		*buf, *cursor = []rune(texts[0]), len(texts[0])
+		*buf = []rune(texts[0])
+		*cursor = len(*buf)
 		lr.resetCompletionCycle()
 		lr.redraw(*buf, *cursor)
 		return
 	}
 	common := commonPrefix(texts)
 	if len(common) > len(line) {
-		*buf, *cursor = []rune(common), len(common)
+		*buf = []rune(common)
+		*cursor = len(*buf)
 		lr.completionBase, lr.completionList, lr.completionIdx = common, texts, -1
 		lr.redraw(*buf, *cursor)
 		return
@@ -87,7 +92,8 @@ func (lr *LineReader) advanceCompletionCycle(buf *[]rune, cursor *int) bool {
 		return false
 	}
 	lr.completionIdx = idx
-	*buf, *cursor = []rune(next), len(next)
+	*buf = []rune(next)
+	*cursor = len(*buf) // runes, not bytes (see complete)
 	lr.redraw(*buf, *cursor)
 	return true
 }
@@ -125,15 +131,23 @@ func completionTexts(ss []string) []string {
 	return res
 }
 
+// commonPrefix is the longest prefix of whole characters the candidates
+// share. It used to trim a byte at a time, so "@档案" and "@案卷" (档 and 案
+// share their first two bytes) left half a character, shown as U+FFFD.
 func commonPrefix(ss []string) string {
 	if len(ss) == 0 {
 		return ""
 	}
-	p := ss[0]
+	p := []rune(ss[0])
 	for _, s := range ss[1:] {
-		for !strings.HasPrefix(s, p) {
-			p = p[:len(p)-1]
+		n := 0
+		for _, r := range s {
+			if n >= len(p) || p[n] != r {
+				break
+			}
+			n++
 		}
+		p = p[:n]
 	}
-	return p
+	return string(p)
 }

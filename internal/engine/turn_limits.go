@@ -228,7 +228,7 @@ func (e *LimitError) Error() string {
 const wrapUpMaxTokens = 1024
 
 // wrapUpPromptFmt asks for that summary; %s is the stop reason.
-const wrapUpPromptFmt = "[system: The run is stopping (%s). Without calling tools, summarize in the user's language: what was completed, what remains, and the recommended next step.]"
+const wrapUpPromptFmt = "[system: The run is stopping (%s). Without calling tools, summarize in the user's language, for the latest request only: what was completed, what remains, and the recommended next step. In a git repository, say whether the changes are committed and pushed.]"
 
 // errWrapUpSkipped is wrapUpSummary's error when no call was made.
 var errWrapUpSkipped = errors.New("wrap-up skipped")
@@ -285,6 +285,8 @@ func (e *Engine) wrapUpSummary(ctx context.Context, routedModel, reason string) 
 // (LastWrapUp). A failed or skipped summary is silently left out.
 func (e *Engine) stopWithWrapUp(ctx context.Context, user api.Message, routedModel, reason string, onDelta func(string)) {
 	e.interrupt(user, routedModel, reason)
+	// After the summary, like a turn that ended on its own.
+	defer e.reportGitWorkState(ctx)
 	s, err := e.wrapUpSummary(ctx, routedModel, reason)
 	if err != nil || s == "" {
 		return

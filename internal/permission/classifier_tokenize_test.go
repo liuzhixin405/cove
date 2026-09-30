@@ -11,9 +11,9 @@ func countTokenize(tb testing.TB) *int {
 	tb.Helper()
 	n := new(int)
 	orig := simpleCommands
-	simpleCommands = func(command string) []safety.SimpleCommand {
+	simpleCommands = func(command string, posix bool) []safety.SimpleCommand {
 		*n++
-		return orig(command)
+		return orig(command, posix)
 	}
 	tb.Cleanup(func() { simpleCommands = orig })
 	return n

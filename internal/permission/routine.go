@@ -48,11 +48,14 @@ type routineGroup struct {
 	// are checked inside grouped flags too ("-fu").
 	refusedShort map[string]string
 	// split separates the subcommand from the rest; nil means the first
-	// word that is not an option.
+	// word, which must not be an option (firstWordSubcommand).
 	split func(args []string) (sub string, rest []string, ok bool)
 	// check adds per-group rules on the parsed invocation.
 	check func(sub string, positional []string, shortFlags string, hasLong func(string) bool) bool
-	label string
+	// checkArgs adds per-group rules on the words after the subcommand as
+	// written, for options whose value decides (npm --location global).
+	checkArgs func(sub string, rest []string) bool
+	label     string
 }
 
 var routineGroups = map[string]*routineGroup{
@@ -93,8 +96,12 @@ var routineGroups = map[string]*routineGroup{
 			"install": true, "i": true, "ci": true, "run": true, "test": true, "init": true,
 			"uninstall": true, "remove": true, "build": true, "ls": true, "list": true, "outdated": true, "audit": true,
 		},
-		refusedLong:  map[string][]string{"*": {"--force", "--global"}},
+		// --prefix installs into another tree ("npm install --prefix
+		// /usr/local"); --location global|user is npm 9's spelling of -g
+		// (npmCheckArgs).
+		refusedLong:  map[string][]string{"*": {"--force", "--global", "--prefix"}},
 		refusedShort: map[string]string{"*": "g"},
+		checkArgs:    npmCheckArgs,
 		label:        "npm/pnpm/yarn 常规操作（install/run/test/build 等，不含 publish、全局安装、exec）",
 	},
 	GroupGoRoutine: {
@@ -151,14 +158,18 @@ const minLongAbbrev = len("--xx")
 
 // longRefused reports whether the long option name (without "=value") is
 // one of, or an abbreviation of, the group's refused options for sub or for
-// every subcommand.
+// every subcommand, or a longer name that starts with one. Only the
+// abbreviation direction used to be checked, so "git switch --force-create"
+// (and its abbreviation "--force-c") passed as routine although it resets an
+// existing branch: every --force-something, --delete-something ... is now
+// taken out of the group as well.
 func (g *routineGroup) longRefused(sub, name string) bool {
 	if len(name) < minLongAbbrev {
 		return false
 	}
 	for _, list := range [][]string{g.refusedLong["*"], g.refusedLong[sub]} {
 		for _, r := range list {
-			if strings.HasPrefix(r, name) {
+			if strings.HasPrefix(r, name) || strings.HasPrefix(name, r) {
 				return true
 			}
 		}
@@ -166,15 +177,46 @@ func (g *routineGroup) longRefused(sub, name string) bool {
 	return false
 }
 
-// firstWordSubcommand is the default split: the first word that is not an
-// option is the subcommand; a program with options only has none.
-func firstWordSubcommand(args []string) (string, []string, bool) {
-	for i, a := range args {
-		if !strings.HasPrefix(a, "-") {
-			return a, append(append([]string(nil), args[:i]...), args[i+1:]...), true
+// npmCheckArgs refuses npm 9's --location global|user, the successor of
+// -g/--global, in every spelling: "--location=global", "--location global"
+// and nopt's abbreviations ("--loc=global"). Only --global and -g used to be
+// refused, so "npm install --location=global pkg" was a routine install.
+// Only the project location stays in the group.
+func npmCheckArgs(_ string, rest []string) bool {
+	for i, a := range rest {
+		if a == "--" {
+			break
+		}
+		name := optionName(a)
+		if len(name) < minLongAbbrev || !strings.HasPrefix("--location", name) {
+			continue
+		}
+		value := optionValue(a)
+		if !strings.Contains(a, "=") {
+			if i+1 >= len(rest) {
+				return false
+			}
+			value = rest[i+1]
+		}
+		if value != "project" {
+			return false
 		}
 	}
-	return "", nil, false
+	return true
+}
+
+// firstWordSubcommand is the default split: the subcommand must be the first
+// word. It used to be the first word that is not an option, so a global
+// option's value became the subcommand — "npm --prefix test publish" read as
+// npm test, "go -C build env -w X=y" as go build — and the group ran a
+// publish or an env -w unasked. Which global options take a value differs per
+// tool and version, so any option in front of the subcommand takes the
+// invocation out of the group (it asks) instead of being guessed at.
+func firstWordSubcommand(args []string) (string, []string, bool) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", nil, false
+	}
+	return args[0], args[1:], true
 }
 
 // routine reports whether an invocation of one of the group's programs (its
@@ -223,6 +265,9 @@ func (g *routineGroup) routine(args []string) bool {
 		return false
 	}
 	if g.check != nil && !g.check(sub, positional, shortFlags, hasLongWithValues(longNames, hasLong)) {
+		return false
+	}
+	if g.checkArgs != nil && !g.checkArgs(sub, rest) {
 		return false
 	}
 	return true
@@ -333,18 +378,55 @@ func routineGroupOf(words []string) string {
 }
 
 // groupMatchesAny is the deny/ask reading of a group rule: some command of
-// the line, seen through runners, paths and letter case, is in the group.
+// the line, seen through runners, paths, letter case and bash's backslash
+// reading (anyReading), runs one of the group's programs in a way that is not
+// read-only. Global options in front of the subcommand ("npm --prefix sub
+// install", "git -c x push") never make an invocation read-only, so they
+// only widen the rule.
+//
+// Every invocation of the group's programs that is not read-only matches,
+// routine or not. The deny/ask reading used to be the routine test alone, so it only
+// fired on the routine writes: with "ask for git" and an allow prefix "git
+// push", "git push origin main" asked and "git push --force" ran unasked,
+// and "deny git" only asked for "git reset --hard". What the group leaves
+// out as too risky must be caught at least as strongly as what it covers;
+// only the read-only commands (git status, npm view), less risky than the
+// routine writes, stay outside.
+//
+// The commands a line runs indirectly count too (see denyReading): "bash -c
+// 'git push'", "xargs git push" and "find -exec git push" used to pass a
+// deny on the git group. A nested command whose program is a variable
+// matches every group.
 func groupMatchesAny(group, command string) bool {
 	g := routineGroups[group]
 	if g == nil {
 		return false
 	}
-	for _, c := range safety.SimpleCommands(command) {
+	cmds, opaque := denyReading(command)
+	if opaque {
+		return true
+	}
+	for _, c := range cmds {
 		for _, words := range [][]string{c.Words, safety.StripCommandRunners(c.Words)} {
-			if len(words) > 0 && groupForProgram(words[0]) == group && g.routine(words[1:]) {
-				return true
+			if len(words) == 0 || groupForProgram(words[0]) != group {
+				continue
 			}
+			args := words[1:]
+			name := programName(words[0])
+			// Rated as spelled plainly, so "/usr/bin/git status" is the
+			// read-only git status and "git.exe push -f" a forced push. The
+			// read-only test comes first: the listing forms of routine
+			// subcommands (git branch -a, git tag, git stash list) passed the
+			// routine test, so an ask rule on the git group asked for them in
+			// auto mode, against "all non-read-only usages" above.
+			if groupClassifier.classifyWords(append([]string{name}, args...)) == CatSafe {
+				continue
+			}
+			return true
 		}
 	}
 	return false
 }
+
+// groupClassifier rates invocations for groupMatchesAny.
+var groupClassifier = NewClassifier()

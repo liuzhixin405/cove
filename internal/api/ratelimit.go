@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -80,8 +81,13 @@ func headerInt(h http.Header, key string) int {
 	return n
 }
 
+// headerDuration reads a reset header as the time left until the limit
+// resets. OpenAI writes a duration ("1m30s", "6s") or bare seconds;
+// Anthropic's anthropic-ratelimit-*-reset headers are RFC 3339 timestamps,
+// which used to fail both parses and always read as 0, so the status line
+// never knew when an Anthropic limit would clear.
 func headerDuration(h http.Header, key string) time.Duration {
-	v := h.Get(key)
+	v := strings.TrimSpace(h.Get(key))
 	if v == "" {
 		return 0
 	}
@@ -93,6 +99,11 @@ func headerDuration(h http.Header, key string) time.Duration {
 	// Try parsing as seconds
 	if secs, err := strconv.ParseFloat(v, 64); err == nil {
 		return time.Duration(secs * float64(time.Second))
+	}
+	// RFC 3339 (RFC3339Nano accepts both with and without fractions): the
+	// wait until that instant, never negative once it has passed.
+	if at, err := time.Parse(time.RFC3339Nano, v); err == nil {
+		return untilPositive(at)
 	}
 	return 0
 }

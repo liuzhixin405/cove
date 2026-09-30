@@ -114,10 +114,53 @@ func TestBuildUserMessageWarnsNonVisionModel(t *testing.T) {
 	}
 }
 
-func TestBuildUserMessageReturnsErrorForMissingAttachment(t *testing.T) {
-	_, _, err := buildUserMessage("分析 @missing.txt", t.TempDir(), nil, "")
-	if err == nil {
-		t.Fatalf("expected error for missing file")
+// A path-like @token that is not a file used to fail the whole prompt with
+// 读取附件失败 (a log line mentioning @babel/core did too); it now stays text
+// and a warning says it was not attached.
+func TestBuildUserMessageKeepsMissingAttachmentAsText(t *testing.T) {
+	for _, in := range []string{"分析 @missing.txt", "error in @babel/core: x"} {
+		msg, warnings, err := buildUserMessage(in, t.TempDir(), nil, "")
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if msg.Content != in || len(msg.Parts) != 0 {
+			t.Fatalf("%q: content = %q parts = %d, want the text unchanged", in, msg.Content, len(msg.Parts))
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "已按普通文本发送") {
+			t.Fatalf("%q: warnings = %q", in, warnings)
+		}
+	}
+}
+
+// An explicit --file / /attach path is still an error when it cannot be read.
+func TestBuildUserMessageFailsForMissingExplicitPath(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := buildUserMessage("分析", dir, []string{filepath.Join(dir, "missing.txt")}, ""); err == nil {
+		t.Fatal("expected an error for a missing explicit attachment")
+	}
+}
+
+// Taking an @token used to rebuild the message with strings.Fields, so a
+// pasted code block lost its newlines and indentation.
+func TestInlineAttachmentKeepsTheRestOfTheText(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in := "看 @a.txt 里的问题:\n```go\nfunc f() {\n\treturn  1\n}\n```\n@a.txt 再看一次"
+	msg, _, err := buildUserMessage(in, dir, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "看 里的问题:\n```go\nfunc f() {\n\treturn  1\n}\n```\n再看一次"
+	if msg.Content != want {
+		t.Fatalf("content = %q, want %q", msg.Content, want)
+	}
+	if len(msg.Parts) != 1 {
+		t.Fatalf("parts = %d, want 1 (the same file twice)", len(msg.Parts))
+	}
+	if got, _ := extractInlineAttachments("@a.txt @a.txt 看", func(string) bool { return true }); got != "看" {
+		t.Fatalf("adjacent tokens: %q", got)
 	}
 }
 

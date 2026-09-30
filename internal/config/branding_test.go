@@ -134,6 +134,11 @@ func TestConfigDirAndProjectOverrideUseCoveNames(t *testing.T) {
 	if err := os.Chdir(projectDir); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
+	// permission_mode "auto" loosens the default, so .cove.json may only set
+	// it once trusted; trust it here, this test is about the file names.
+	if err := TrustProjectConfig(filepath.Join(projectDir, ".cove.json")); err != nil {
+		t.Fatalf("trust: %v", err)
+	}
 
 	cfg, err := Load()
 	if err != nil {

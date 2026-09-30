@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/htmlindex"
 
 	"github.com/liuzhixin405/cove-agent/internal/safeurl"
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
@@ -47,12 +51,7 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 		return Result{Data: "Error: format must be one of text, markdown, html", IsError: true}, nil
 	}
 
-	if !strings.HasPrefix(url, "http") {
-		url = "https://" + url
-	}
-	if strings.HasPrefix(url, "http://") {
-		url = "https://" + strings.TrimPrefix(url, "http://")
-	}
+	url = normalizeFetchURL(url)
 
 	client := newSafeHTTPClient(30 * time.Second)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -84,23 +83,57 @@ func (t *WebFetchTool) Call(ctx context.Context, input Input, tctx Context) (Res
 	return Result{Data: "URL: " + url + "\nStatus: " + strconv.Itoa(resp.StatusCode) + "\nFormat: " + format + "\n\n" + strings.TrimSpace(content)}, nil
 }
 
+// normalizeFetchURL adds https:// to a URL without a scheme and upgrades
+// http:// to https://. The scheme test used to be HasPrefix(url, "http"), so
+// "httpbin.org/get" or "http-docs.example.org" got no scheme at all and the
+// request failed with unsupported protocol scheme "".
+func normalizeFetchURL(u string) string {
+	u = strings.TrimSpace(u)
+	i := strings.Index(u, "://")
+	if i <= 0 || !isURLScheme(u[:i]) {
+		return "https://" + u
+	}
+	if strings.EqualFold(u[:i], "http") {
+		return "https://" + u[i+3:]
+	}
+	return u
+}
+
+// isURLScheme reports whether s is an RFC 3986 scheme: a letter followed by
+// letters, digits, '+', '-' or '.'. It keeps "example.com/?next=http://" from
+// counting as having one.
+func isURLScheme(s string) bool {
+	for i, c := range s {
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
 // fetchedText turns a response body into text for the model. Binary bodies
 // (PDFs, images, archives) are refused: dumped as text they were up to 100KB
 // of noise in the context.
 func fetchedText(body []byte, contentType, format string) (string, error) {
-	sample := body
-	if len(sample) > 8192 {
-		sample = sample[:8192]
-	}
-	if sniffText(sample) == textBinary {
-		if contentType == "" {
-			contentType = "unknown type"
-		}
-		return "", fmt.Errorf("binary content (%s, %d bytes); webfetch only returns text. Download it with bash (curl -o) if you need the file", contentType, len(body))
-	}
-	content := string(body)
 	ct := strings.ToLower(contentType)
-	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml") {
+	isHTML := strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml")
+	content, decoded := decodeFetchedCharset(body, contentType, isHTML)
+	if !decoded {
+		sample := body
+		if len(sample) > 8192 {
+			sample = sample[:8192]
+		}
+		if sniffText(sample) == textBinary {
+			if contentType == "" {
+				contentType = "unknown type"
+			}
+			return "", fmt.Errorf("binary content (%s, %d bytes); webfetch only returns text. Download it with bash (curl -o) if you need the file", contentType, len(body))
+		}
+	}
+	if isHTML {
 		switch format {
 		case "text":
 			content = htmlToText(content)
@@ -109,6 +142,43 @@ func fetchedText(body []byte, contentType, format string) (string, error) {
 		}
 	}
 	return content, nil
+}
+
+// reFetchMetaCharset finds a charset declared in an HTML <meta> tag, either
+// <meta charset="gbk"> or <meta http-equiv="Content-Type" content="...; charset=gb2312">.
+// Copied from internal/browser (decodeBody there is unexported).
+var reFetchMetaCharset = regexp.MustCompile(`(?i)<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_\-:.]+)`)
+
+// decodeFetchedCharset converts body to UTF-8 from the charset the server
+// declared (Content-Type, else a <meta> tag in the first 2KB of an HTML page),
+// or from GBK when nothing is declared and the bytes are GBK rather than
+// UTF-8. The body used to be taken as UTF-8 whatever was declared, so GBK
+// pages, still common on Chinese sites, came back as mojibake. decoded is
+// false when the body is returned as it was.
+func decodeFetchedCharset(body []byte, contentType string, isHTML bool) (text string, decoded bool) {
+	cs := ""
+	if _, params, err := mime.ParseMediaType(contentType); err == nil {
+		cs = strings.ToLower(strings.TrimSpace(params["charset"]))
+	}
+	if cs == "" && isHTML {
+		head := body[:min(len(body), 2048)]
+		if m := reFetchMetaCharset.FindSubmatch(head); m != nil {
+			cs = strings.ToLower(string(m[1]))
+		}
+	}
+	if cs != "" && cs != "utf-8" && cs != "utf8" {
+		if enc, err := htmlindex.Get(cs); err == nil {
+			if out, err := enc.NewDecoder().Bytes(body); err == nil {
+				return string(out), true
+			}
+		}
+	}
+	if cs == "" && !utf8.Valid(body) {
+		if lt, ok := decodeGBK(body); ok {
+			return lt.text, true
+		}
+	}
+	return string(body), false
 }
 
 var (
@@ -183,7 +253,12 @@ func htmlToMarkdown(s string) string {
 
 func (t *WebFetchTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	u, _ := input["url"].(string)
-	if isPrivateURL(u) {
+	// Judge the URL Call will fetch. The raw input was checked before, and
+	// safeurl prepends https:// only when "://" appears nowhere, so
+	// "example.com/?next=http://127.0.0.1/" parsed with the scheme
+	// "example.com/?next=http" and was denied as private although the fetch
+	// went to https://example.com/.
+	if isPrivateURL(normalizeFetchURL(u)) {
 		return Denied("access to private/internal URLs is blocked")
 	}
 	return Allowed("webfetch is read-only")

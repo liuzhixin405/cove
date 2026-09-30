@@ -25,10 +25,15 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return string(out), nil
 }
 
-func (c *CommitCmd) Name() string        { return "commit" }
-func (c *CommitCmd) Aliases() []string   { return nil }
-func (c *CommitCmd) Description() string { return "暂存并创建 git 提交" }
-func (c *CommitCmd) Help() string        { return "/commit [消息] - 暂存所有更改并提交" }
+func (c *CommitCmd) Name() string { return "commit" }
+
+// MutatesEngine: /commit stages everything with `git add -A`, so mid-task it
+// committed whatever half-written files the agent had at that instant. It used
+// to be accepted while a task ran.
+func (c *CommitCmd) MutatesEngine([]string) bool { return true }
+func (c *CommitCmd) Aliases() []string           { return nil }
+func (c *CommitCmd) Description() string         { return "暂存并创建 git 提交" }
+func (c *CommitCmd) Help() string                { return "/commit [消息] - 暂存所有更改并提交" }
 func (c *CommitCmd) Execute(ctx context.Context, in Input) (Output, error) {
 	so, err := gitOutput(ctx, in.Cwd, "status", "--porcelain")
 	if err != nil {

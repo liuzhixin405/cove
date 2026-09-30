@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/png"
 	"io"
@@ -209,11 +210,43 @@ func TestReadPipedStdinGivesUpWhenNothingArrives(t *testing.T) {
 	defer w.Close()
 	start := time.Now()
 	got, _, err := readPipedStdin(r, 50*time.Millisecond, 1024)
-	if err != nil || got != "" {
+	// errStdinNoData, not nil: the timeout used to pass silently, and the
+	// caller could not warn that the piped input was dropped.
+	if !errors.Is(err, errStdinNoData) || got != "" {
 		t.Fatalf("got %q err=%v", got, err)
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("readPipedStdin waited far past its timeout")
+	}
+}
+
+// `go test ./... 2>&1 | cove -p` wrote its first byte after more than the 3
+// seconds -p waited, and the test output was dropped. Without a limit the
+// read waits for the slow writer.
+func TestReadPipedStdinWaitsForASlowWriterWithoutLimit(t *testing.T) {
+	r, w := io.Pipe()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(w, "--- FAIL: TestX\n")
+		_ = w.Close()
+	}()
+	got, _, err := readPipedStdin(r, 0, 1024)
+	if err != nil || got != "--- FAIL: TestX\n" {
+		t.Fatalf("got %q err=%v", got, err)
+	}
+}
+
+// Who waits how long: a file always ends, a person at a terminal can see the
+// notice and press Ctrl+C; only an unwatched pipe keeps the launcher guard.
+func TestStdinFirstDataWait(t *testing.T) {
+	if d := stdinFirstDataWait(0, false); d != 0 {
+		t.Errorf("regular file: %v, want no limit", d)
+	}
+	if d := stdinFirstDataWait(os.ModeNamedPipe, true); d != 0 {
+		t.Errorf("pipe with a terminal on stderr: %v, want no limit", d)
+	}
+	if d := stdinFirstDataWait(os.ModeNamedPipe, false); d != stdinFirstDataTimeout {
+		t.Errorf("unwatched pipe: %v, want %v", d, stdinFirstDataTimeout)
 	}
 }
 

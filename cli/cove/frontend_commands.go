@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 	"github.com/liuzhixin405/cove-agent/internal/engine"
 	"github.com/liuzhixin405/cove-agent/internal/mcp"
 	"github.com/liuzhixin405/cove-agent/internal/memory"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 	"github.com/liuzhixin405/cove-agent/internal/plugin"
 	"github.com/liuzhixin405/cove-agent/internal/repl"
+	"github.com/liuzhixin405/cove-agent/internal/session"
 	"github.com/liuzhixin405/cove-agent/internal/skills"
 	"github.com/liuzhixin405/cove-agent/internal/tool"
 )
@@ -53,6 +56,13 @@ type frontend struct {
 	freshFromNew bool
 	// exitRequested is set by /exit; the loop leaves after the command.
 	exitRequested bool
+	// restartRequested is set by /restart, with exitRequested: the loop
+	// leaves the same way, and main then starts cove again.
+	restartRequested bool
+	// terminated is set when a SIGTERM stopped a slash command. Headless
+	// ends the run on it, as it does for a SIGTERM during a turn; the REPL
+	// ignores it (there the signal only cancels the command, as before).
+	terminated bool
 
 	// print shows a notice line; enqueue runs a message as a task (queued
 	// in the REPL, synchronously in headless).
@@ -99,6 +109,34 @@ func (c *feCmd) Execute(ctx context.Context, in command.Input) (command.Output, 
 		return command.Output{}, nil
 	}
 	return c.base.Execute(ctx, in)
+}
+
+// historyArgsResume reports whether "/history <args>" resumes a session,
+// following handleSessionCommand's parse: every form except the listings
+// (bare, all), detail, delete, clean and clear does. Only "/history <N>"
+// used to count, so "/history all 2" and "/history <session-id>" swapped
+// the session a running task was appending to.
+func historyArgsResume(a []string) bool {
+	if len(a) == 0 {
+		return false
+	}
+	arg := strings.Join(a, " ")
+	if strings.EqualFold(arg, "clean") {
+		return false
+	}
+	if _, _, ok := parseHistoryClear(arg); ok {
+		return false
+	}
+	if strings.EqualFold(a[0], "all") {
+		if a = a[1:]; len(a) == 0 {
+			return false
+		}
+	}
+	switch strings.ToLower(a[0]) {
+	case "detail", "delete":
+		return false
+	}
+	return true
 }
 
 func always([]string) bool        { return true }
@@ -156,7 +194,9 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 				return true
 			}},
 		{name: "api-key", desc: "设置 API 密钥", category: catModel, mutates: withArgs, run: usage("/api-key <密钥>")},
-		{name: "base-url", desc: "设置 API 地址", category: catModel, run: usage("/base-url <地址>")},
+		// mutates like /model and /api-key: it reloads the provider, and
+		// without it "/base-url <地址>" swapped the client mid-turn.
+		{name: "base-url", desc: "设置 API 地址", category: catModel, mutates: withArgs, run: usage("/base-url <地址>")},
 		{name: "mode", desc: "设置权限模式 (default|plan|auto|bypass)", category: catModel,
 			hints: []string{"default", "plan", "auto", "bypass"},
 			run: func(ctx context.Context, in command.Input) bool {
@@ -183,7 +223,7 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 		{name: "compact", desc: "压缩对话历史", category: catSession, mutates: always, base: base("compact"), run: session},
 		{name: "history", desc: "查看和继续历史会话（clear/delete/detail/all）", category: catSession,
 			hints:   []string{"clear", "delete", "clean", "detail", "all"},
-			mutates: func(a []string) bool { return len(a) > 0 && isPositiveNumber(a[0]) },
+			mutates: historyArgsResume,
 			base:    base("history"), run: session},
 		{name: "resume", desc: "恢复已保存的会话", category: catSession, mutates: withArgs, base: base("resume"), run: session},
 		{name: "export", desc: "导出当前会话为 Markdown", category: catSession, base: base("export"), run: session},
@@ -199,7 +239,9 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 						// again; the retry bookkeeping of "继续" is now stale.
 						fe.tasks.ClearPendingFailed()
 					}
-					_ = clearInterruptedDraft()
+					// This conversation's draft only; another project's or
+					// session's is not what /continue resumes.
+					_ = clearInterruptedDraftFor(fe.eng.SessionID())
 					fe.enqueue(msg)
 				}))
 				return true
@@ -276,6 +318,21 @@ func (fe *frontend) install(reg *command.Registry) *command.Registry {
 		{name: "exit", aliases: []string{"quit"}, desc: "退出", category: catSystem,
 			run: func(ctx context.Context, in command.Input) bool {
 				fe.exitRequested = true
+				return true
+			}},
+		{name: "trust", desc: "信任当前项目：目录（回合结束自动运行构建/测试校验）及其 .cove.json（启用其中的 MCP、provider、校验命令等设置，/restart 后生效）", category: catSystem,
+			run: func(ctx context.Context, in command.Input) bool {
+				fe.print(trustProjectConfig(fe.cfg))
+				return true
+			}},
+		// mutates: a restart in the middle of a task would cut it off.
+		{name: "restart", desc: "保存会话并重启 cove，之后继续当前会话（新装的技能、插件和新版本随之生效）", category: catSystem, mutates: always,
+			run: func(ctx context.Context, in command.Input) bool {
+				if !fe.interactive() {
+					fe.print("headless 模式不支持 /restart：输入来自管道，重启后无法接着读。")
+					return true
+				}
+				fe.exitRequested, fe.restartRequested = true, true
 				return true
 			}},
 	} {
@@ -370,9 +427,17 @@ func (fe *frontend) dispatch(input string) bool {
 	if shadowed != "" {
 		fe.print(fmt.Sprintf("[提示] %s 与内置命令同名，已执行内置命令 /%s", shadowed, name))
 	}
-	withInterrupt(func(ctx context.Context) {
+	before := ""
+	if fe.eng != nil {
+		before = fe.eng.SessionID()
+	}
+	if sig := withInterrupt(func(ctx context.Context) {
 		fe.execute(ctx, input)
-	})
+	}); turnEndsRun(sig) {
+		fe.terminated = true
+	}
+	// /history N, /history all N, /history <id>, /resume <id>.
+	fe.noteSessionSwitch(before)
 	return true
 }
 
@@ -382,4 +447,46 @@ func commandMutatesEngine(input string) bool {
 	fe := &frontend{}
 	fe.install(registerAllCommands())
 	return fe.mutates(input)
+}
+
+// trustProjectConfig is /trust: it trusts the .cove.json content this process
+// loaded (not whatever the file holds now, so a file swapped after the
+// warning stays untrusted) and its directory, and returns the notice to show.
+// With no untrusted .cove.json it trusts the project directory, which lets
+// the automatic build/test verification run: /trust used to answer "nothing
+// to trust" there, and that verification ran in every clone unasked.
+func trustProjectConfig(cfg *config.Config) string {
+	if cfg == nil {
+		return "配置不可用"
+	}
+	path, fields := cfg.UntrustedProjectConfig()
+	if path == "" {
+		return trustProjectDir(currentProjectDir())
+	}
+	// The loaded file is the startup directory's. After /cd it used to be
+	// trusted anyway while the notice pointed at /restart, and the restarted
+	// cove, now in the new directory, found that directory's .cove.json
+	// still untrusted.
+	if !session.SameProjectDir(filepath.Dir(path), currentProjectDir()) {
+		return fmt.Sprintf("工作目录已切换（%s），/trust 只能信任启动时加载的 %s。请先 /restart，再对新目录的 .cove.json 执行 /trust。", currentProjectDir(), path)
+	}
+	if err := cfg.TrustLoadedProjectConfig(); err != nil {
+		return fmt.Sprintf("信任 %s 失败: %v", path, err)
+	}
+	return fmt.Sprintf("已信任 %s（按当前内容，文件改动后需要重新 /trust）。输入 /restart 让 %s 生效。", path, strings.Join(fields, "、"))
+}
+
+// trustProjectDir trusts the project root of dir (its git root, else dir),
+// the directory the engine's verification gate checks along with dir itself.
+func trustProjectDir(dir string) string {
+	root := permission.ProjectRoot(dir)
+	for _, d := range []string{dir, root} {
+		if ok, _ := config.IsProjectDirTrusted(d); ok {
+			return "此项目已受信任。"
+		}
+	}
+	if err := config.TrustProjectDir(root); err != nil {
+		return fmt.Sprintf("信任 %s 失败: %v", root, err)
+	}
+	return fmt.Sprintf("已信任此项目目录 %s：回合结束时会自动运行构建/测试校验。", root)
 }

@@ -234,10 +234,37 @@ func resumeStartupSession(store sessionLoader, id, cwd string, resume func(*sess
 // line reader uses for one line.
 const maxPipedStdin = 8 * 1024 * 1024
 
-// stdinFirstDataTimeout is how long -p waits for a pipe's first byte. Some
-// launchers (IDEs, CI runners, other agents) hand a child an open stdin that
-// never gets data or EOF; without a limit "cove -p" would hang there forever.
+// stdinFirstDataTimeout is how long -p waits for a pipe's first byte when
+// nobody is watching (stdinFirstDataWait). Some launchers (IDEs, CI runners,
+// other agents) hand a child an open stdin that never gets data or EOF;
+// without a limit "cove -p" would hang there forever.
 const stdinFirstDataTimeout = 3 * time.Second
+
+// errStdinNoData is readPipedStdin's report that nothing arrived within the
+// timeout; the caller warns and goes on without stdin.
+var errStdinNoData = errors.New("no data on stdin")
+
+// stdinFirstDataWait is how long -p waits for the first byte of stdin (0 =
+// until data or EOF), given stdin's file mode and whether stderr is a
+// terminal.
+//
+// The 3-second limit used to apply to every pipe, and silently: in
+// `go test ./... 2>&1 | cove -p "..."` the tests take longer than that
+// before printing anything, so the output was dropped and the model
+// answered a prompt without it. A pipe whose writer is slow cannot be told
+// from a launcher's pipe that will never be written (both are open, both
+// are empty), so the choice rests on who is there:
+//   - a regular file (cove -p < file) always reaches EOF: no limit;
+//   - stderr on a terminal means a person ran the pipeline in a shell, can
+//     see the "waiting" notice main prints and can press Ctrl+C: no limit;
+//   - otherwise (IDE, CI, another agent — the hanging-launcher case) the
+//     limit stays, and main now warns on stderr when it hits.
+func stdinFirstDataWait(mode os.FileMode, stderrTerminal bool) time.Duration {
+	if mode.IsRegular() || stderrTerminal {
+		return 0
+	}
+	return stdinFirstDataTimeout
+}
 
 // utf8BOM is the byte-order mark Windows PowerShell 5 writes at the start of
 // text it pipes into a native program.
@@ -245,8 +272,9 @@ var utf8BOM = string([]byte{0xEF, 0xBB, 0xBF})
 
 // readPipedStdin reads r to EOF, keeping at most limit bytes (truncated
 // reports whether more arrived). When nothing at all arrives within
-// firstDataTimeout it gives up and returns "", leaving the blocked read
-// behind; that only happens in a one-shot -p run that is about to exit.
+// firstDataTimeout (0 = no limit) it gives up and returns errStdinNoData,
+// leaving the blocked read behind; that only happens in a one-shot -p run
+// that is about to exit.
 func readPipedStdin(r io.Reader, firstDataTimeout time.Duration, limit int) (string, bool, error) {
 	type chunk struct {
 		data []byte
@@ -259,11 +287,15 @@ func readPipedStdin(r io.Reader, firstDataTimeout time.Duration, limit int) (str
 		first <- chunk{buf[:n], err}
 	}()
 
+	var timeout <-chan time.Time
+	if firstDataTimeout > 0 {
+		timeout = time.After(firstDataTimeout)
+	}
 	var c chunk
 	select {
 	case c = <-first:
-	case <-time.After(firstDataTimeout):
-		return "", false, nil
+	case <-timeout:
+		return "", false, errStdinNoData
 	}
 
 	var sb strings.Builder

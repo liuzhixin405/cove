@@ -156,11 +156,57 @@ func (s *SessionNotes) AddTask(text string) { s.Add("task", text) }
 func (s *SessionNotes) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.modified || (len(s.entries) == 0 && s.plan == "") || s.path == "" {
+	if !s.modified || s.path == "" {
 		return nil
+	}
+	if len(s.entries) == 0 && s.plan == "" {
+		// Nothing to render, but a modification with nothing left is a
+		// plan just cleared (SetPlan("")). Returning early here kept the
+		// old plan on disk, and the next session offered it as unfinished.
+		s.modified = false
+		return s.clearPlanOnDisk()
 	}
 	s.modified = false
 	return s.writeToDisk()
+}
+
+// clearPlanOnDisk removes the plan section from the notes file, keeping
+// whatever else it holds (notes this instance never loaded), and removes the
+// file when nothing is left. A missing file is fine.
+func (s *SessionNotes) clearPlanOnDisk() error {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var kept []string
+	inPlan, hasEntries := false, false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			inPlan = strings.EqualFold(strings.TrimPrefix(trimmed, "## "), planHeader)
+		}
+		if inPlan {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- [") {
+			hasEntries = true
+		}
+		kept = append(kept, line)
+	}
+	if !hasEntries {
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	out := strings.Join(kept, "\n")
+	if out == string(data) {
+		return nil
+	}
+	return fsatomic.WriteFile(s.path, []byte(out), 0644)
 }
 
 // maxNotesBytes caps the notes file.

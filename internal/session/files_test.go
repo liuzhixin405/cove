@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -50,6 +51,15 @@ func TestListSessionFiles(t *testing.T) {
 	}
 	if SessionIDFromFile("a.jsonl") != "a" || SessionIDFromFile("b.json") != "b" {
 		t.Error("SessionIDFromFile did not strip the extension")
+	}
+	// A directory entry is taken verbatim: trimming " padded .jsonl" to
+	// "padded " named another file (see Prune in store.go).
+	if got := SessionIDFromFile(" padded .jsonl"); got != " padded " {
+		t.Errorf("SessionIDFromFile(%q) = %q, want %q", " padded .jsonl", got, " padded ")
+	}
+	// User input is trimmed once, by ParseSessionID.
+	if got, err := ParseSessionID("  s1.jsonl\n"); err != nil || got != "s1" {
+		t.Errorf("ParseSessionID(pasted s1.jsonl) = %q, %v, want s1", got, err)
 	}
 	if _, err := ListSessionFiles(filepath.Join(dir, "missing")); err == nil {
 		t.Error("a missing directory must be reported")
@@ -113,5 +123,19 @@ func TestIndexIsAReservedSessionID(t *testing.T) {
 	}
 	if _, err := store.Load("index"); !errors.Is(err, ErrReservedID) {
 		t.Fatalf("Load(index) err = %v, want ErrReservedID", err)
+	}
+	// Save used to write index.jsonl (lost: Load refuses it, List hides it)
+	// and Delete used to remove index.json and write back an empty index.
+	if err := store.Save(&Record{ID: "index"}); !errors.Is(err, ErrReservedID) {
+		t.Errorf("Save(index) err = %v, want ErrReservedID", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "index.jsonl")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Save(index) left index.jsonl: stat err = %v", err)
+	}
+	if err := store.Delete("index"); !errors.Is(err, ErrReservedID) {
+		t.Errorf("Delete(index) err = %v, want ErrReservedID", err)
+	}
+	if idx, err := store.readIndex(); err != nil || idx.Sessions["s1"] == nil {
+		t.Errorf("after Delete(index): readIndex err = %v, s1 entry = %v, want it kept", err, idx.Sessions["s1"])
 	}
 }

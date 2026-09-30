@@ -62,6 +62,24 @@ func (e *Engine) reviewMessages() []api.Message {
 	return append([]api.Message(nil), e.messages...)
 }
 
+// rebaseReviewThrottle moves the review throttle with a compaction that
+// shrank the history from before to after messages. lastReviewMsgCount is a
+// message count of the old history; only /new and /resume reset it, so once
+// a compaction left fewer messages than it, len(messages)-lastReviewMsgCount
+// stayed below the threshold and skill review was off for the rest of the
+// session. The messages not yet reviewed are kept in the count, and a review
+// still running on the old history does not move the throttle when it ends
+// (conversationGen).
+func (e *Engine) rebaseReviewThrottle(before, after int) {
+	e.bgMu.Lock()
+	defer e.bgMu.Unlock()
+	e.lastReviewMsgCount -= before - after
+	if e.lastReviewMsgCount < 0 {
+		e.lastReviewMsgCount = 0
+	}
+	e.conversationGen++
+}
+
 // reviewTimeout bounds one background review request.
 const reviewTimeout = 30 * time.Second
 
@@ -74,7 +92,9 @@ type reviewResult struct {
 // runReview asks the background model for reusable workflows in msgs and
 // saves them. The throttle (lastReviewMsgCount) only moves when the review
 // really ran: a skipped or failed one is tried again after the next turn.
-func (e *Engine) runReview(msgs []api.Message) reviewResult {
+// sessionID is the session the reviewed turn belonged to, captured with the
+// snapshot (see applyReview).
+func (e *Engine) runReview(msgs []api.Message, sessionID string) reviewResult {
 	defer func() {
 		e.bgMu.Lock()
 		e.reviewRunning = false
@@ -105,7 +125,7 @@ func (e *Engine) runReview(msgs []api.Message) reviewResult {
 		e.turnsSinceReview = 0
 	}
 	e.bgMu.Unlock()
-	return e.applyReview(resp.Content)
+	return e.applyReview(resp.Content, sessionID)
 }
 
 const reviewPrompt = `你是一个对话回顾助手。分析以下对话片段，判断是否有值得记住的内容。
@@ -149,7 +169,14 @@ func (e *Engine) reviewRequest(snapshot string) api.ChatRequest {
 // saved. MEMORY lines are ignored: the per-turn memory extraction saves
 // memories, and the review used to save the same facts a second time under
 // other names.
-func (e *Engine) applyReview(output string) reviewResult {
+//
+// sessionID is what a saved skill names as its source_session. It is passed
+// in rather than read from e.session: the review runs after the part of the
+// background work WaitBackground covers, so /new or /resume could enter
+// another session meanwhile. applyReview read e.SessionID() unsynchronized
+// (a data race with enterSession) and could credit the skill to the new
+// session.
+func (e *Engine) applyReview(output, sessionID string) reviewResult {
 	var res reviewResult
 	output = strings.TrimSpace(output)
 	if output == "NONE" || output == "" || e.skillMgr == nil {
@@ -188,7 +215,7 @@ func (e *Engine) applyReview(output string) reviewResult {
 			continue
 		}
 		sk := skills.Skill{Name: name, Description: desc, Prompt: content}
-		path, updated, err := writeAutoSkill(sk, e.SessionID(), time.Now())
+		path, updated, err := writeAutoSkill(sk, sessionID, time.Now())
 		if err != nil {
 			log.Warnf("background review: saving skill %q: %v", name, err)
 			continue
@@ -318,7 +345,7 @@ func buildReviewSnapshot(msgs []api.Message) string {
 		case "assistant":
 			sb.WriteString("助手: " + content + "\n")
 			for _, tc := range m.ToolCalls {
-				if path, ok := tc.Input["filePath"].(string); ok {
+				if path := toolFilePath(tc); path != "" {
 					sb.WriteString("  → " + tc.Name + "(" + path + ")\n")
 				} else if cmd, ok := tc.Input["command"].(string); ok {
 					sb.WriteString("  → bash(" + keepRunes(cmd, 80) + ")\n")

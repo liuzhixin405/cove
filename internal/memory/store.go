@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 	"github.com/liuzhixin405/cove-agent/internal/safety"
@@ -136,12 +137,67 @@ func contentHash(content string) string {
 // nudges results when it is.
 const vectorScoreWeight = 0.5
 
+// Embedding request limits. Instruction files alone can reach 32KB, and a
+// single input over the provider's per-input token limit (8191 for the
+// OpenAI family) fails the WHOLE request. Every entry used to be sent
+// unclipped in one call, so one large file made every search fail and
+// re-arm the 5-minute backoff forever — semantic search silently never
+// worked again.
+const (
+	// embedTokenBudget is the estimated token cap per input, well under the
+	// common 8k limit so estimation error cannot push it over.
+	embedTokenBudget = 6000
+	// maxEmbedInputBytes is a hard byte cap on each input on top of the
+	// token estimate.
+	maxEmbedInputBytes = 24 * 1024
+	// embedBatchSize is the maximum number of inputs per Embed call.
+	embedBatchSize = 32
+)
+
+// clipForEmbedding shortens text to fit embedTokenBudget and
+// maxEmbedInputBytes. Tokens are estimated conservatively: ~4 ASCII bytes
+// per token, and 1.5 tokens per non-ASCII rune (CJK text commonly costs one
+// to two tokens per character).
+func clipForEmbedding(text string) string {
+	var cost float64
+	for i, r := range text {
+		if r < 0x80 {
+			cost += 0.25
+		} else {
+			cost += 1.5
+		}
+		if cost > embedTokenBudget || i+utf8.RuneLen(r) > maxEmbedInputBytes {
+			return text[:i]
+		}
+	}
+	return text
+}
+
+// isInputSizeError reports whether an embeddings error is about an input
+// being too long (a problem with this call's data, not with the endpoint),
+// so it must not arm the backoff that disables semantic search for everyone.
+func isInputSizeError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	// "tokens per minute" rate limits mention tokens too, but they are an
+	// endpoint condition that the backoff exists for.
+	if strings.Contains(msg, "429") || strings.Contains(msg, "rate limit") {
+		return false
+	}
+	for _, k := range []string{"too long", "too large", "maximum context", "context length", "max_tokens", "token limit", "tokens", "input length", "413"} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
 // vectorScores returns cosine similarity between query and each entry in
-// entries (by slice index), using the configured EmbeddingProvider. It
-// returns nil — not an error — whenever semantic search isn't usable for
-// this call (disabled, backing off after a recent failure, or the API call
-// itself failed just now), so callers can unconditionally add
-// vectorScoreWeight*score without a separate enabled/disabled branch.
+// entries (by slice index), using the configured EmbeddingProvider. Callers
+// pass only the BM25 candidates. It returns nil — not an error — whenever
+// semantic search isn't usable for this call (disabled, backing off after a
+// recent failure, or the API call itself failed just now), so callers can
+// unconditionally add vectorScoreWeight*score without a separate
+// enabled/disabled branch.
 func (s *Store) vectorScores(ctx context.Context, query string, entries []Entry) map[int]float64 {
 	s.mu.Lock()
 	provider := s.embedProvider
@@ -156,43 +212,81 @@ func (s *Store) vectorScores(ctx context.Context, query string, entries []Entry)
 	}
 
 	type pendingEntry struct {
-		idx  int
+		text string
 		hash string
 	}
 	hashes := make([]string, len(entries))
 	var toEmbed []pendingEntry
+	queued := map[string]bool{}
 
 	s.mu.Lock()
 	for i, e := range entries {
-		h := contentHash(e.Content)
+		text := clipForEmbedding(e.Content)
+		h := contentHash(text)
 		hashes[i] = h
-		if _, ok := s.embedCache[h]; !ok {
-			toEmbed = append(toEmbed, pendingEntry{idx: i, hash: h})
+		if _, ok := s.embedCache[h]; !ok && !queued[h] {
+			queued[h] = true
+			toEmbed = append(toEmbed, pendingEntry{text: text, hash: h})
 		}
 	}
 	s.mu.Unlock()
 
-	// Batch the query plus any not-yet-cached entries into one API call.
-	inputs := make([]string, 0, 1+len(toEmbed))
-	inputs = append(inputs, query)
-	for _, p := range toEmbed {
-		inputs = append(inputs, entries[p.idx].Content)
-	}
-
-	vecs, err := provider.Embed(ctx, inputs)
-	if err != nil || len(vecs) == 0 || vecs[0] == nil {
+	fail := func(err error) {
+		if err != nil && isInputSizeError(err) {
+			return
+		}
 		s.mu.Lock()
 		s.embedBackoffUntil = time.Now().Add(embedBackoffDuration)
 		s.mu.Unlock()
-		return nil
 	}
-	queryVec := vecs[0]
+
+	// The query rides in the first batch; the rest go in batches of at most
+	// embedBatchSize inputs.
+	var queryVec []float32
+	fresh := map[string][]float32{}
+	pending := toEmbed
+	first := true
+	for first || len(pending) > 0 {
+		inputs := make([]string, 0, embedBatchSize)
+		if first {
+			inputs = append(inputs, clipForEmbedding(query))
+		}
+		n := embedBatchSize - len(inputs)
+		if n > len(pending) {
+			n = len(pending)
+		}
+		batch := pending[:n]
+		pending = pending[n:]
+		for _, p := range batch {
+			inputs = append(inputs, p.text)
+		}
+
+		vecs, err := provider.Embed(ctx, inputs)
+		off := 0
+		if first {
+			if err != nil || len(vecs) == 0 || vecs[0] == nil {
+				fail(err)
+				return nil
+			}
+			queryVec = vecs[0]
+			off = 1
+		} else if err != nil {
+			// A later batch failing still leaves the query and everything
+			// embedded so far usable; score with that.
+			fail(err)
+			break
+		}
+		first = false
+		for i, p := range batch {
+			if off+i < len(vecs) && vecs[off+i] != nil {
+				fresh[p.hash] = vecs[off+i]
+			}
+		}
+	}
 
 	s.mu.Lock()
-	for i, p := range toEmbed {
-		if 1+i < len(vecs) && vecs[1+i] != nil {
-			s.embedCache[p.hash] = vecs[1+i]
-		}
+	for h, v := range fresh {
+		s.embedCache[h] = v
 	}
 	scores := make(map[int]float64, len(entries))
 	for i, h := range hashes {
@@ -264,11 +358,16 @@ func (s *Store) All() []Entry {
 				continue
 			}
 			seenName[f.Name()] = true
+			var mtime time.Time
+			if info, err := f.Info(); err == nil {
+				mtime = info.ModTime()
+			}
 			entries = append(entries, Entry{
 				Name:    f.Name(),
 				Path:    path,
 				Content: string(data),
 				Source:  source,
+				Updated: mtime,
 			})
 		}
 	}
@@ -509,17 +608,45 @@ func (s *Store) Search(query string, topK int) []EntryMatch {
 	// concurrent Search calls would Clear/Index/Search the same instance.
 	bm25 := NewBM25(1.2, 0.75)
 
+	// Index with each file's mtime. Every document used to be indexed with
+	// updated=now, which made the 0.3 recency term of CombinedScore the same
+	// constant for all of them, so a months-old memory ranked exactly like
+	// one saved a minute ago.
 	now := time.Now()
 	for i, e := range entries {
-		bm25.Index(i, e.Content, now)
+		updated := e.Updated
+		if updated.IsZero() {
+			updated = now
+		}
+		bm25.Index(i, e.Content, updated)
 	}
 
 	scored := bm25.Search(query, topK*2)
 	// Optional semantic re-ranking bonus (nil map when disabled/unavailable
 	// — see vectorScores' doc comment), computed once over the BM25
 	// candidate set rather than the full corpus, since embedding every
-	// memory entry on every search would be wasteful.
-	vecScores := s.vectorScores(context.Background(), query, entries)
+	// memory entry on every search would be wasteful. It used to be passed
+	// the full corpus despite this comment, embedding every memory and
+	// instruction file in one request.
+	cands := make([]Entry, 0, len(scored))
+	for _, r := range scored {
+		if r.ID >= 0 && r.ID < len(entries) {
+			cands = append(cands, entries[r.ID])
+		}
+	}
+	var vecScores map[int]float64
+	if candScores := s.vectorScores(context.Background(), query, cands); candScores != nil {
+		vecScores = make(map[int]float64, len(candScores))
+		ci := 0
+		for _, r := range scored {
+			if r.ID >= 0 && r.ID < len(entries) {
+				if v, ok := candScores[ci]; ok {
+					vecScores[r.ID] = v
+				}
+				ci++
+			}
+		}
+	}
 
 	seen := make(map[string]bool)
 	var results []EntryMatch
@@ -592,6 +719,9 @@ type Entry struct {
 	Project bool
 	// Source is SourceInstructions, SourceProject or SourceGlobal.
 	Source string
+	// Updated is the file's modification time; Search feeds it to the
+	// recency term of the ranking.
+	Updated time.Time
 }
 
 // validName reports whether name is a plain file name inside the memory
@@ -601,6 +731,13 @@ func validName(name string) error {
 	if name == "" || name == "." || name == ".." ||
 		strings.ContainsAny(name, `/\`) || filepath.Base(name) != name || filepath.VolumeName(name) != "" {
 		return fmt.Errorf("invalid memory name %q: use a plain file name such as notes.md", name)
+	}
+	// Dot files in the directory are bookkeeping (the dream consolidation
+	// lock, the memory write lock, the extraction record), which All skips;
+	// they were accepted here, so Save(".consolidate-lock") replaced the lock
+	// of a running consolidation and Delete could remove it.
+	if strings.HasPrefix(name, ".") {
+		return fmt.Errorf("invalid memory name %q: memory names never start with a dot (dot files are the memory directory's bookkeeping)", name)
 	}
 	return nil
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
@@ -257,23 +259,46 @@ const deadWorkerLockSlack = time.Minute
 // would count as consolidated. The lock is rolled back to what it was before
 // that run and the record marked failed. A lock someone stamped since is left
 // alone.
+//
+// Whose lock it is used to be judged by its mtime alone (within
+// deadWorkerLockSlack of the dead run's start), and outside the takeover
+// guard: a worker that had just taken the dead run's stale lock over carried
+// a timestamp that close too, so it was rolled back under the live worker and
+// a second consolidation could start beside it. The lock is now rolled back
+// only while holding the takeover guard (no takeover can be half done) and
+// only when its body is the dead worker's own PID.
 func recoverDeadWorker() {
 	lr, err := ReadLastRun()
 	if err != nil || lr.Result != ResultRunning || lr.PID == os.Getpid() || isProcessRunning(lr.PID) {
 		return
 	}
-	lockAt, err := ReadLastConsolidatedAt()
-	if err == nil && !lockAt.IsZero() {
-		if d := lockAt.Sub(lr.StartedAt); d > -deadWorkerLockSlack && d < deadWorkerLockSlack {
-			if err := RollbackConsolidationLock(lr.PriorConsolidatedAt); err != nil && !os.IsNotExist(err) {
+	path := lockPath()
+	release, ok, err := acquireTakeoverGuard(path + takeoverSuffix)
+	if err != nil || !ok {
+		// A takeover is in progress (or the guard cannot be made): the lock
+		// cannot be judged now. The record stays "running" so the next check
+		// looks again.
+		return
+	}
+	defer release()
+	rolledBack := false
+	if info, data, err := readLock(path); err == nil {
+		pid, perr := strconv.Atoi(strings.TrimSpace(string(data)))
+		d := info.ModTime().Sub(lr.StartedAt)
+		if perr == nil && pid == lr.PID && d > -deadWorkerLockSlack && d < deadWorkerLockSlack {
+			if err := rollbackLockFile(path, lr.PriorConsolidatedAt); err != nil && !os.IsNotExist(err) {
 				log.Warnf("[dream] roll back the dead worker's lock: %v", err)
 				return
 			}
+			rolledBack = true
 			log.Warnf("[dream] worker PID %d died mid-run; consolidation lock rolled back", lr.PID)
 		}
 	}
 	lr.Result, lr.FinishedAt = ResultFailed, time.Now()
-	lr.Error = fmt.Sprintf("整理进程 PID %d 异常退出（被终止或崩溃），整理锁已回滚", lr.PID)
+	lr.Error = fmt.Sprintf("整理进程 PID %d 异常退出（被终止或崩溃）", lr.PID)
+	if rolledBack {
+		lr.Error += "，整理锁已回滚"
+	}
 	if err := writeLastRun(lr); err != nil {
 		log.Warnf("[dream] write %s: %v", lastRunPath(), err)
 	}

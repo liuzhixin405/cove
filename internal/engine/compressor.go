@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"unicode/utf8"
 
@@ -112,8 +113,31 @@ func (cc *ChatCompressor) Compress(
 	}
 
 	// ─ Layer 1: Trim old tool results ─
-	cc.trimOldToolResults(messages, int(float64(len(messages))*cc.keepFraction))
+	// A dedupe stub (masker.go) past the trim boundary names a result
+	// before it; trimming that result would leave the stub pointing at
+	// nothing, so its content moves into the stub first.
+	trimKeep := int(float64(len(messages)) * cc.keepFraction)
+	restoreDedupedAcross(messages, trimCutoff(len(messages), trimKeep))
+	// trimmed: layer 1 changed the history in place. Every early return
+	// below used to report Compressed=false after it, so compact skipped
+	// the cleanup a rewritten history needs and /compact said "可摘要的历史
+	// 太短" about a history it had just trimmed.
+	trimmed := cc.trimOldToolResults(messages, trimKeep)
 	tokenCount = overhead + countTokens(messages)
+	// notSummarized is the result of an early return: Compressed when
+	// layer 1 did trim, with why the summary layer did not run.
+	notSummarized := func(reason string) *CompressResult {
+		if !trimmed {
+			return &CompressResult{Reason: reason}
+		}
+		return &CompressResult{
+			Compressed:   true,
+			OldCount:     originalCount,
+			NewCount:     len(messages),
+			TokenSavings: originalTokens - tokenCount,
+			Reason:       "仅裁剪了旧工具输出；" + reason,
+		}
+	}
 	if !force && !cc.NeedsCompression(tokenCount, tokenLimit) {
 		log.Debugf("compressor: layer1 trimming sufficient (%d tokens)", tokenCount)
 		return &CompressResult{
@@ -146,13 +170,16 @@ func (cc *ChatCompressor) Compress(
 	splitIdx := chooseCompressionSplitAssistant(messages, keepCount)
 	if splitIdx <= 0 {
 		// no clean assistant boundary — nothing safe to summarize
-		return &CompressResult{Reason: "找不到可安全切分的助手回复边界"}, messages
+		return notSummarized("找不到可安全切分的助手回复边界"), messages
 	}
 
 	history := messages[:splitIdx]
 	if len(history) < minHistory {
-		return &CompressResult{Reason: "可摘要的历史太短"}, messages
+		return notSummarized("可摘要的历史太短"), messages
 	}
+	// The summarized part goes; a stub in the kept tail must not point
+	// into it.
+	restoreDedupedAcross(messages, splitIdx)
 
 	summary, err := cc.generateSummary(ctx, history, tryChat)
 	if err == nil {
@@ -176,6 +203,9 @@ func (cc *ChatCompressor) Compress(
 		truncated = append(truncated, api.Message{
 			Role:    "user",
 			Content: "<compress summary=\"context-truncated\">\n" + originalRequestBlock(messages) + "[Context truncated due to length. Continue the task.]\n</compress>",
+			// Engine text, not a request: a later compaction took it for
+			// the user's request and nested its <original_request> block.
+			Synthetic: true,
 		})
 		truncated = append(truncated, messages[splitIdx:]...)
 		return &CompressResult{
@@ -191,8 +221,9 @@ func (cc *ChatCompressor) Compress(
 	// assistant-anchored tail.
 	compressed := make([]api.Message, 0, 1+keepCount)
 	compressed = append(compressed, api.Message{
-		Role:    "user",
-		Content: "<compress summary=\"conversation-history\">\n" + originalRequestBlock(messages) + summary + "\n\n[Continue the task from where you left off.]\n</compress>",
+		Role:      "user",
+		Content:   "<compress summary=\"conversation-history\">\n" + originalRequestBlock(messages) + summary + "\n\n[Continue the task from where you left off.]\n</compress>",
+		Synthetic: true,
 	})
 	compressed = append(compressed, messages[splitIdx:]...)
 
@@ -213,18 +244,27 @@ func (cc *ChatCompressor) Compress(
 }
 
 // trimOldToolResults replaces verbose tool results in old messages with 1-line summaries.
-// Messages within the keep boundary are left intact.
+// Messages within the keep boundary are left intact. It reports whether it
+// changed any message.
 // NOTE: this mutates the slice's content in place (intentional — Layer 1 is cheap, no copy needed).
-func (cc *ChatCompressor) trimOldToolResults(messages []api.Message, keepCount int) {
-	cutoff := len(messages) - keepCount
+func (cc *ChatCompressor) trimOldToolResults(messages []api.Message, keepCount int) bool {
+	changed := false
+	for i := 0; i < trimCutoff(len(messages), keepCount); i++ {
+		if messages[i].Role == "tool" && len(messages[i].Content) > 300 {
+			messages[i].Content = keepRunes(messages[i].Content, 100)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// trimCutoff is the index before which trimOldToolResults trims.
+func trimCutoff(n, keepCount int) int {
+	cutoff := n - keepCount
 	if cutoff < 1 {
 		cutoff = 1
 	}
-	for i := 0; i < cutoff; i++ {
-		if messages[i].Role == "tool" && len(messages[i].Content) > 300 {
-			messages[i].Content = keepRunes(messages[i].Content, 100)
-		}
-	}
+	return cutoff
 }
 
 // generateSummary calls the model to produce a concise summary of old messages.
@@ -262,7 +302,7 @@ func (cc *ChatCompressor) generateSummary(
 		summaryInput.WriteString(content)
 		if len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
-				if path, ok := tc.Input["filePath"].(string); ok {
+				if path := toolFilePath(tc); path != "" {
 					fmt.Fprintf(&summaryInput, " → %s(%s)", tc.Name, path)
 				} else if cmd, ok := tc.Input["command"].(string); ok {
 					fmt.Fprintf(&summaryInput, " → bash(%s)", keepRunes(cmd, 60))
@@ -356,22 +396,112 @@ func toolTargetPath(input map[string]any) string {
 	return ""
 }
 
-// clipRunes truncates s to at most n runes (not bytes), appending "..." if it
-// was shortened. Byte-slicing (s[:n]) would cut multi-byte UTF-8 sequences mid
-// character and corrupt Chinese/emoji text, which this codebase produces heavily.
-// originalRequest is the first genuine (non-synthetic) user message of a
-// history: the task everything since has been about.
-func originalRequest(messages []api.Message) string {
-	for _, m := range messages {
-		if m.Role == "user" && !m.Synthetic && strings.TrimSpace(m.Content) != "" {
-			return strings.TrimSpace(m.Content)
+// toolFilePath is the file a tool call targets, through every key alias the
+// file tools accept, or "" when the call names no file. For the file tools
+// themselves (read, write, edit) it is toolTargetPath, "path" included; for
+// every other tool only the explicit file keys count, because grep's and
+// glob's "path" is the directory they search, not a file they touch.
+func toolFilePath(tc api.ToolCall) string {
+	switch strings.ToLower(tc.Name) {
+	case "read", "write", "edit":
+		return toolTargetPath(tc.Input)
+	}
+	for _, k := range []string{"filePath", "file_path", "filepath", "file"} {
+		if v, ok := tc.Input[k].(string); ok && v != "" {
+			return filepath.Clean(v)
 		}
 	}
 	return ""
 }
 
+// toolKeyArg is the one argument that identifies a tool call: the file it
+// targets (toolFilePath), else the first non-empty of its well-known keys.
+// Loop detection, the compaction summary and the review snapshot all keyed on
+// "filePath" alone, so an edit sent with file_path (which the tool accepts)
+// looked like a bare "edit": ten edits to ten files tripped the loop detector,
+// and summaries listed "edit()" with no file.
+func toolKeyArg(tc api.ToolCall) string {
+	if p := toolFilePath(tc); p != "" {
+		return p
+	}
+	for _, k := range []string{"command", "pattern", "query", "url", "name", "title", "message", "path"} {
+		if v, ok := tc.Input[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// writeClaimKey is the key dispatchTools claims a write/edit path under:
+// absolute against the project directory, cleaned, and case-folded on
+// Windows, whose file system does not tell "X.go" from "x.go". Two
+// spellings of one file must claim the same key, or two edits to it run at
+// once and one change is lost.
+func writeClaimKey(path, cwd string) string {
+	if !filepath.IsAbs(path) && cwd != "" {
+		path = filepath.Join(cwd, path)
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+// lastRequestIndex is the index of the latest genuine user request in msgs
+// (not engine text: turn notes, nudges, compaction summaries), or -1.
+func lastRequestIndex(msgs []api.Message) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role == "user" && !looksSynthetic(m) && strings.TrimSpace(m.Content) != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// originalRequest is the request a compaction keeps verbatim: the latest
+// genuine user message, the one the current turn works on. It used to be
+// the first one, which in a session of several tasks is task #1, not the
+// current request; and compaction summaries were not recognized as engine
+// text, so each compaction nested the previous <original_request> block
+// inside its own. A history whose only request was already summarized away
+// keeps the one the earlier compaction carried.
+func originalRequest(messages []api.Message) string {
+	if i := lastRequestIndex(messages); i >= 0 {
+		return strings.TrimSpace(messages[i].Content)
+	}
+	for _, m := range messages {
+		if m.Role == "user" {
+			if r := carriedRequest(m.Content); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
+// carriedRequest is the request inside a compaction message's
+// <original_request> block, or "". Blocks nested by earlier versions are
+// read from the innermost one, the request itself.
+func carriedRequest(content string) string {
+	if !strings.HasPrefix(strings.TrimSpace(content), "<compress") {
+		return ""
+	}
+	end := strings.Index(content, "</original_request>")
+	if end < 0 {
+		return ""
+	}
+	start := strings.LastIndex(content[:end], "<original_request>")
+	if start < 0 {
+		return ""
+	}
+	return strings.TrimSpace(content[start+len("<original_request>") : end])
+}
+
 // originalRequestBlock is the <original_request> block every compaction
-// message starts with, or "" when the history has no genuine request. A
+// message starts with (the current request, see originalRequest), or ""
+// when the history has no genuine request. A
 // summary can misstate the task and a truncation drops it entirely (a real
 // session continued from "[Context truncated]" alone); the request itself is
 // short and is kept verbatim, so the model can always re-read what it was

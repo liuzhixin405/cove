@@ -28,15 +28,54 @@ type endpoint struct {
 // maxResponseBytes bounds a non-streamed response body.
 const maxResponseBytes = 10 * 1024 * 1024
 
+// errCreateRequest marks a request that could not be built, so post tells
+// it apart from a transport failure (both can be a *url.Error).
+var errCreateRequest = errors.New("create request")
+
 // newRequest builds the POST of data with the provider's headers.
 func (ep endpoint) newRequest(ctx context.Context, data []byte, key string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", ep.url, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("%w: %w", errCreateRequest, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	ep.auth(req.Header, key)
 	return req, nil
+}
+
+// send makes one request with the pool's next key and records the outcome
+// in the pool (rate-limited / dead / ok), so multi-key rotation fails over.
+//
+// A 401/403 is the key's fault while another key in the pool is still
+// alive, so the request goes out again at once with the next key. It used to
+// come back as the reply: the dead key was marked, but the caller saw a
+// non-retryable auth error, so one revoked key in a three-key pool failed the
+// turn and the fallback chain blacklisted the provider for the session. Only
+// when no live key remains is the auth error returned.
+func (ep endpoint) send(ctx context.Context, data []byte) (*http.Response, error) {
+	attempts := max(1, ep.pool.size())
+	for i := 1; ; i++ {
+		key := ep.key()
+		req, err := ep.newRequest(ctx, data, key)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := ep.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		ep.pool.MarkOutcome(key, resp.StatusCode, RetryAfterFor(resp.StatusCode, resp.Header))
+		if isAuthStatus(resp.StatusCode) && i < attempts && ep.pool.hasLiveKey() {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
+			_ = resp.Body.Close()
+			continue
+		}
+		return resp, nil
+	}
+}
+
+func isAuthStatus(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden
 }
 
 // response is a non-streamed reply: its body (bounded), status and headers
@@ -54,22 +93,17 @@ type response struct {
 // the whole timeout, so a retry repeats that wait for most likely the same
 // outcome.
 func (ep endpoint) post(ctx context.Context, data []byte) (response, error) {
-	key := ep.key()
-	req, err := ep.newRequest(ctx, data, key)
+	resp, err := ep.send(ctx, data)
 	if err != nil {
-		return response{}, err
-	}
-	resp, err := ep.client.Do(req)
-	if err != nil {
+		if errors.Is(err, errCreateRequest) {
+			return response{}, err
+		}
 		if isClientTimeout(err) {
 			return response{}, fmt.Errorf("http: %w", err)
 		}
 		return response{}, &RetryableError{Msg: fmt.Sprintf("http: %v", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Key-pool health (rate-limited / dead / ok), so multi-key rotation
-	// fails over.
-	ep.pool.MarkOutcome(key, resp.StatusCode, RetryAfterFor(resp.StatusCode, resp.Header))
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	// 529 is Anthropic's "overloaded"; it falls under >= 500.
 	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
@@ -86,25 +120,16 @@ func (ep endpoint) post(ctx context.Context, data []byte) (response, error) {
 // only: once the body streams, deltas have reached the handler and a retry
 // would duplicate output. The caller checks the status and closes the body.
 func (ep endpoint) openStream(ctx context.Context, data []byte) (*http.Response, error) {
-	var key string
-	resp, err := retryConnectHTTP(
+	return retryConnectHTTP(
 		ctx,
 		defaultRetry,
-		func(callCtx context.Context) (*http.Response, error) {
-			key = ep.key()
-			req, err := ep.newRequest(callCtx, data, key)
-			if err != nil {
-				return nil, err
-			}
-			return ep.client.Do(req)
-		},
+		// send marks every attempt's key, as post does. Only the final
+		// response used to be: each retry takes the next key and the 429s in
+		// between were swallowed, so a rate-limited key was never cooled down
+		// and kept being handed out.
+		func(callCtx context.Context) (*http.Response, error) { return ep.send(callCtx, data) },
 		func(statusCode int) bool { return statusCode >= 500 || statusCode == http.StatusTooManyRequests },
 	)
-	if err != nil {
-		return nil, err
-	}
-	ep.pool.MarkOutcome(key, resp.StatusCode, RetryAfterFor(resp.StatusCode, resp.Header))
-	return resp, nil
 }
 
 // maxSSELineBytes bounds one SSE line: a whole file's content can arrive as

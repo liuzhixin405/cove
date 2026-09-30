@@ -9,11 +9,16 @@
 package fsatomic
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // tempPrefix marks the in-progress files WriteFile creates.
@@ -32,14 +37,62 @@ func IsTempName(name string) bool {
 	return strings.HasPrefix(filepath.Base(name), tempPrefix)
 }
 
+const (
+	// maxNameBytes is the file name length every common file system caps at
+	// (NTFS, ext4, APFS, tmpfs: 255 bytes, or UTF-16 units on NTFS).
+	maxNameBytes = 255
+	// tempRandomLen is the longest suffix os.CreateTemp appends to a pattern
+	// (a uint32 in decimal).
+	tempRandomLen = 10
+	// tempHashLen is the hex digits of the name hash a shortened pattern
+	// carries so that two long names sharing a head get distinct patterns.
+	tempHashLen = 16
+)
+
+// tempPattern returns the os.CreateTemp pattern for the temp file that
+// replaces base.
+//
+// The pattern used to be tempPrefix+base+".", 11 bytes more than the name
+// itself, plus the random suffix CreateTemp adds. A 250-byte name, which
+// os.WriteFile handled, therefore produced a 271-byte temp name and CreateTemp
+// failed ("filename syntax is incorrect" on Windows, ENAMETOOLONG elsewhere),
+// so write and edit refused files they used to write. A name too long for that
+// is cut on a rune boundary and given a hash of the full name instead.
+func tempPattern(base string) string {
+	const overhead = len(tempPrefix) + 1 + tempRandomLen // prefix, the "." and the random digits
+	if len(base)+overhead <= maxNameBytes {
+		return tempPrefix + base + "."
+	}
+	sum := sha256.Sum256([]byte(base))
+	hash := hex.EncodeToString(sum[:])[:tempHashLen]
+	keep := maxNameBytes - overhead - len(hash) - 1 // "-" between head and hash
+	for keep > 0 && !utf8.RuneStart(base[keep]) {
+		keep--
+	}
+	return tempPrefix + base[:keep] + "-" + hash + "."
+}
+
+// ErrStreamName is returned on Windows for a path whose file name contains
+// ':', which names an NTFS alternate data stream rather than a file: an atomic
+// replace by rename cannot write one.
+var ErrStreamName = errors.New("file name contains ':' (an NTFS alternate data stream), which cannot be replaced atomically")
+
 // WriteFile atomically replaces path with data.
 //
 // The temporary file is created alongside the destination (never in the system
 // temp dir) so the final rename stays within one filesystem. On any failure the
 // temporary file is removed and the original destination is left untouched.
 func WriteFile(path string, data []byte, perm os.FileMode) error {
+	// On Windows a ':' in the base name (the drive letter is not part of it)
+	// names an NTFS alternate data stream. The temp pattern carries the name,
+	// so CreateTemp made the file .cove-tmp-<head> plus a stream on it; the
+	// rename then failed and the cleanup removed only the stream, leaving an
+	// empty .cove-tmp-<head> behind for good. Refuse before creating anything.
+	if runtime.GOOS == "windows" && strings.Contains(filepath.Base(path), ":") {
+		return fmt.Errorf("write %s: %w", path, ErrStreamName)
+	}
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, tempPrefix+filepath.Base(path)+".")
+	tmp, err := os.CreateTemp(dir, tempPattern(filepath.Base(path)))
 	if err != nil {
 		return fmt.Errorf("create temp for %s: %w", path, err)
 	}
@@ -82,7 +135,7 @@ var renameBackoff = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond
 
 // Seams for tests.
 var (
-	rename          = os.Rename
+	rename          = platformRename
 	retryableRename = isRetryableRename
 	sleep           = time.Sleep
 )

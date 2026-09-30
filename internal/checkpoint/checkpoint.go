@@ -1,12 +1,15 @@
 package checkpoint
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -50,8 +53,12 @@ func New(workDir string) (*Manager, error) {
 		}
 	}
 
-	// Install the exclude rules into the shadow store. See excludePatterns.
+	// Install the exclude rules and the byte-exact attributes into the shadow
+	// store. See excludePatterns and storeAttributes.
 	if err := writeStoreExcludes(storeDir); err != nil {
+		return nil, err
+	}
+	if err := writeStoreAttributes(storeDir); err != nil {
 		return nil, err
 	}
 
@@ -99,6 +106,41 @@ func writeStoreExcludes(storeDir string) error {
 	return nil
 }
 
+// storeAttributes makes every path in the shadow store opaque bytes.
+//
+// info/attributes outranks the project's own .gitattributes, so a project
+// asking for `text eol=crlf` or an LFS filter cannot reshape what a checkpoint
+// stores or what /undo writes back. Before this, attributes (and the user's
+// config, see storeConfig) applied: /undo rewrote LF files as CRLF under Git for
+// Windows' default core.autocrlf=true.
+const storeAttributes = "# Managed by cove — regenerated on startup.\n* -text -filter -diff -merge -ident -working-tree-encoding\n"
+
+func writeStoreAttributes(storeDir string) error {
+	if err := os.WriteFile(filepath.Join(storeDir, "info", "attributes"), []byte(storeAttributes), 0600); err != nil {
+		return fmt.Errorf("checkpoint store attributes: %w", err)
+	}
+	return nil
+}
+
+// storeConfig is prepended to every git invocation on the shadow store. The
+// store inherited the user's global and system config, so core.autocrlf,
+// core.eol or an LFS filter changed the bytes /undo wrote back, and the default
+// core.quotePath=true turned non-ASCII names in parsed output into
+// "\344\270\255..." strings that matched no file. None of that is a user
+// preference about cove's private store.
+var storeConfig = []string{
+	"-c", "core.autocrlf=false",
+	"-c", "core.eol=lf",
+	"-c", "core.safecrlf=false",
+	"-c", "core.quotePath=false",
+	"-c", "core.precomposeUnicode=true",
+	"-c", "filter.lfs.smudge=",
+	"-c", "filter.lfs.clean=",
+	"-c", "filter.lfs.process=",
+	"-c", "filter.lfs.required=false",
+	"-c", "advice.addEmbeddedRepo=false",
+}
+
 // Create snapshots the working tree and returns the checkpoint's commit hash.
 // When nothing changed since the last checkpoint it returns that one instead
 // of adding an identical entry.
@@ -134,7 +176,7 @@ func (m *Manager) snapshot(ref, label string) (string, bool, error) {
 	env := m.env()
 	// The exclusions live in the store's info/exclude (written by
 	// writeStoreExcludes), and git also honors the project's own .gitignore.
-	if err := m.gitCmd(env, "add", "--all"); err != nil {
+	if err := m.addAll(env); err != nil {
 		return "", false, fmt.Errorf("git add failed: %w", err)
 	}
 	tree, err := m.gitOutput(env, "write-tree")
@@ -222,29 +264,93 @@ func (m *Manager) Restore(commitHash string) (string, error) {
 	// Paths that exist now but not in the target have to be deleted, not left
 	// in place: `checkout <hash> -- .` only writes out what the commit
 	// contains. The backup holds every one of them, so this is reversible.
-	out, err := m.gitOutput(env, "diff", "--name-only", "--no-renames", "--diff-filter=A", target, backup)
+	//
+	// The list is read NUL-separated with modes (--raw -z): the newline form
+	// quoted non-ASCII names, which then matched no file, and gave no way to
+	// tell a nested repository (gitlink) from a file.
+	out, err := m.gitOutput(env, "diff", "--raw", "-z", "--no-renames", "--diff-filter=A", target, backup)
 	if err != nil {
 		return "", err
 	}
-	if err := m.gitCmd(env, "checkout", target, "--", "."); err != nil {
+	added, err := parseRawAdded(out)
+	if err != nil {
 		return "", err
 	}
-	for _, rel := range strings.Split(strings.TrimSpace(out), "\n") {
-		rel = strings.TrimSpace(rel)
-		if rel == "" {
-			continue
-		}
+	// From here on the working tree is being rewritten, so the backup is
+	// returned with every error: it is the only way back.
+	if err := m.gitCmd(env, "checkout", target, "--", "."); err != nil {
+		return backup, err
+	}
+	// Per-path failures are collected rather than returned on the first one:
+	// the checkout above has already rewritten the tree, and stopping midway
+	// left the remaining new files in place on top of the old state.
+	var errs []error
+	var nested []string
+	root := filepath.Clean(m.workDir)
+	for _, a := range added {
 		// Guard against a path escaping the working directory (a maliciously
 		// crafted commit, or a stray absolute path in the diff output).
-		full := filepath.Join(m.workDir, filepath.FromSlash(rel))
-		if !strings.HasPrefix(full, filepath.Clean(m.workDir)+string(os.PathSeparator)) {
+		full := filepath.Join(root, filepath.FromSlash(a.path))
+		if !strings.HasPrefix(full, root+string(os.PathSeparator)) {
+			continue
+		}
+		if a.mode == gitlinkMode {
+			// A nested repository is recorded as a bare commit id, its files
+			// are in no checkpoint: removing it would lose them for good.
+			nested = append(nested, a.path)
 			continue
 		}
 		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-			return backup, fmt.Errorf("restore: removing %s: %w", rel, err)
+			errs = append(errs, fmt.Errorf("删除 %s 失败: %w", a.path, err))
+			continue
 		}
+		pruneEmptyParents(root, filepath.Dir(full))
 	}
-	return backup, nil
+	if len(nested) > 0 {
+		errs = append(errs, fmt.Errorf("嵌套 git 仓库未纳入检查点，已跳过（保留原样）: %s", strings.Join(nested, ", ")))
+	}
+	return backup, errors.Join(errs...)
+}
+
+// gitlinkMode is the tree mode of a nested repository (a submodule entry).
+const gitlinkMode = "160000"
+
+type addedPath struct {
+	mode string // new mode
+	path string
+}
+
+// parseRawAdded reads `git diff --raw -z` output: each entry is
+// ":<old mode> <new mode> <old id> <new id> <status>\0<path>\0".
+func parseRawAdded(out string) ([]addedPath, error) {
+	fields := strings.Split(out, "\x00")
+	var res []addedPath
+	for i := 0; i < len(fields); i++ {
+		meta := fields[i]
+		if meta == "" {
+			continue
+		}
+		parts := strings.Fields(strings.TrimPrefix(meta, ":"))
+		if !strings.HasPrefix(meta, ":") || len(parts) < 5 || i+1 >= len(fields) {
+			return nil, fmt.Errorf("restore: unexpected git diff output %q", meta)
+		}
+		i++
+		res = append(res, addedPath{mode: parts[1], path: fields[i]})
+	}
+	return res, nil
+}
+
+// pruneEmptyParents removes dir and its ancestors below root while they are
+// empty. They were left behind before; only directories that end up empty go
+// (os.Remove refuses anything else), so ignored or uncaptured files inside a
+// new directory — which no checkpoint holds — are never deleted.
+func pruneEmptyParents(root, dir string) {
+	for dir != root && strings.HasPrefix(dir, root+string(os.PathSeparator)) {
+		if os.Remove(dir) != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // List returns available checkpoints (most recent first).
@@ -306,24 +412,56 @@ func (m *Manager) isAncestor(commit, ref string) bool {
 	return m.gitCmd(m.env(), "merge-base", "--is-ancestor", commit, ref) == nil
 }
 
-func (m *Manager) gitCmd(env []string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Dir = m.workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(out))
+// noCommitRepoRe finds the nested repositories git refuses to add because
+// they have no commit yet ("error: 'sub/' does not have a commit checked out").
+var noCommitRepoRe = regexp.MustCompile(`'([^']+)' does not have a commit checked out`)
+
+// maxNestedExcludes bounds the retries of addAll, one per batch of nested
+// repositories reported.
+const maxNestedExcludes = 8
+
+// addAll stages the work tree. A nested repository created with git init and
+// no commit yet (right after "git init" in a subdirectory) made "git add
+// --all" fail outright, so no checkpoint could be taken and /undo refused to
+// run for want of its backup. Such a repository is left out of the snapshot,
+// as nested repositories with commits already are in effect (they are stored
+// as a bare gitlink, their content never captured).
+func (m *Manager) addAll(env []string) error {
+	args := []string{"add", "--all"}
+	var excluded []string
+	for i := 0; ; i++ {
+		err := m.gitCmd(env, args...)
+		if err == nil {
+			return nil
+		}
+		found := noCommitRepoRe.FindAllStringSubmatch(err.Error(), -1)
+		if len(found) == 0 || i >= maxNestedExcludes {
+			return err
+		}
+		for _, f := range found {
+			excluded = append(excluded, ":(exclude)"+f[1])
+		}
+		args = append([]string{"add", "--all", "--", "."}, excluded...)
 	}
-	return nil
 }
 
+func (m *Manager) gitCmd(env []string, args ...string) error {
+	_, err := m.gitOutput(env, args...)
+	return err
+}
+
+// gitOutput runs git on the shadow store with storeConfig and returns stdout
+// only. stderr used to be mixed in, so a warning git printed (a CRLF notice,
+// an embedded-repo hint) became part of the output parsed as paths or hashes.
 func (m *Manager) gitOutput(env []string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", append(append([]string(nil), storeConfig...), args...)...)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Dir = m.workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, string(out))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stdout.String()+stderr.String()))
 	}
-	return string(out), nil
+	return stdout.String(), nil
 }

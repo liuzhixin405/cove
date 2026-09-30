@@ -14,8 +14,10 @@ import (
 // replaceFile writes data to path for write and edit. It used to be a plain
 // os.WriteFile, which truncates the file before writing it, so a crash or a
 // full disk in between left the user's file truncated. Now a complete new file
-// is renamed into place (fsatomic), keeping the old file's permission bits; if
-// writing the new file fails, the old one is untouched.
+// is renamed into place (fsatomic), keeping the old file's permission bits
+// (and on Windows its attributes, ACL and alternate data streams, which a
+// plain rename dropped: a hidden .env came back visible); if writing the new
+// file fails, the old one is untouched.
 func replaceFile(path string, data []byte) error {
 	// Write the file a symlink points to, so the link itself survives; renaming
 	// onto the link would replace it with a regular file.

@@ -64,3 +64,36 @@ func TestDeleteUnknownSessionIsAnError(t *testing.T) {
 		t.Fatalf("Delete(nope) = %v, want fs.ErrNotExist", err)
 	}
 }
+
+// A session ID that is not a plain name is "no such session", never a path:
+// Delete("..") used to RemoveAll the store directory itself (archiveDir
+// joined "archive/.." back onto it), and Delete("/") the whole archive.
+func TestDeleteRefusesPathLikeIDs(t *testing.T) {
+	s := newTestStore(t)
+	r := &Record{ID: "keep", Model: "m", Messages: []api.Message{{Role: "user", Content: "hi"}}}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(s.archiveDir("keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"..", "/", `\`, "../..", "archive/..", "", "  ", "."} {
+		if err := s.Delete(id); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Delete(%q) = %v, want ErrNotExist", id, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "keep.jsonl")); err != nil {
+		t.Fatalf("keep.jsonl gone: %v", err)
+	}
+	if _, err := os.Stat(s.archiveDir("keep")); err != nil {
+		t.Fatalf("archive gone: %v", err)
+	}
+	// A hostile ID that still names a file is kept inside the store (Base),
+	// as documented; only one that names no file is refused.
+	if _, err := s.Load("../keep"); err != nil {
+		t.Fatalf("Load(../keep) = %v, want it mapped to keep inside the store", err)
+	}
+	if _, err := s.Load(".."); err == nil {
+		t.Fatal("Load(..) succeeded")
+	}
+}

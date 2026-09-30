@@ -26,7 +26,9 @@ func TestUpdateAllReportsPluginsItCannotUpdate(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cached, "plugin.json"), []byte(`{"name":"foo","version":"1.0.0"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mgr.Marketplace().index = []MarketplaceEntry{{Name: "foo", Source: "https://example.invalid/foo.git"}}
+	// A refreshed index records the marketplace and directory of each entry;
+	// only that directory of that marketplace's cache is copied.
+	mgr.Marketplace().index = []MarketplaceEntry{{Name: "foo", Source: "https://example.invalid/foo.git", Marketplace: "official", Path: "plugins/foo"}}
 	if err := mgr.MarketplaceInstall("foo"); err != nil {
 		t.Fatalf("MarketplaceInstall: %v", err)
 	}

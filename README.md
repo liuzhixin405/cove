@@ -120,6 +120,8 @@ cove /new "添加一个新的 API 接口并更新 README"
 | `/x [编号] [all]`   | 展开工具块折叠的输出（别名 `/expand`）                        |
 | `/doctor`           | 快速检查 git、ripgrep、供应商与 API key                         |
 | `/diagnose [quick     | errors                                                          |
+| `/trust`            | 信任当前项目的 `.cove.json`（启用其中的 MCP、provider 等设置）      |
+| `/restart`          | 保存会话并重启 cove，重启后接着当前会话                         |
 | `/exit`             | 退出 REPL                                                       |
 
 *更多信息请查看 [贡献指南](CONTRIBUTING.md) 和 [开发文档](docs/README.md)。*

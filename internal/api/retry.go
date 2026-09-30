@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -89,15 +90,36 @@ func retryWithBackoff[T any](ctx context.Context, cfg retryConfig, operation fun
 	return zero, fmt.Errorf("max retries exceeded")
 }
 
+// isResponseHeaderTimeout reports whether err is the transport giving up on
+// the response headers (ResponseHeaderTimeout). net/http reports it only as
+// a timeout *url.Error with this text (HTTP/1 and HTTP/2 alike); a dial or
+// TLS handshake timeout is a different, cheap failure and is not matched.
+func isResponseHeaderTimeout(err error) bool {
+	return isClientTimeout(err) && strings.Contains(err.Error(), "timeout awaiting response headers")
+}
+
 func retryConnectHTTP(
 	ctx context.Context,
 	cfg retryConfig,
 	connect func(context.Context) (*http.Response, error),
 	shouldRetryStatus func(statusCode int) bool,
 ) (*http.Response, error) {
+	headerTimeouts := 0
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 		resp, err := connect(ctx)
 		if err != nil {
+			// A server that accepted the request and never answered costs a
+			// whole ResponseHeaderTimeout (180s cloud, 15 min local) per
+			// attempt. It used to be retried like a refused connection, so
+			// the turn failed only after ~12 minutes, an hour locally. One
+			// retry covers a request lost in a restart; refused and reset
+			// connections keep the full schedule.
+			if isResponseHeaderTimeout(err) {
+				headerTimeouts++
+				if headerTimeouts > 1 {
+					return nil, err
+				}
+			}
 			if attempt == cfg.MaxRetries {
 				return nil, err
 			}

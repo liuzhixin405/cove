@@ -1,0 +1,7 @@
+[
+  {"name": "security-audit", "description": "Security audit: scan deps, check vulnerabilities.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/security-audit/SKILL.md", "author": "marketplace"},
+  {"name": "api-design", "description": "REST API design: endpoints, schemas, OpenAPI.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/api-design/SKILL.md", "author": "marketplace"},
+  {"name": "dockerize", "description": "Docker: Dockerfile, compose, build, push.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/dockerize/SKILL.md", "author": "marketplace"},
+  {"name": "i18n", "description": "Internationalization: extract strings, translations.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/i18n/SKILL.md", "author": "marketplace"},
+  {"name": "ci-cd", "description": "CI/CD: Actions, pipelines, testing.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/ci-cd/SKILL.md", "author": "marketplace"}
+]

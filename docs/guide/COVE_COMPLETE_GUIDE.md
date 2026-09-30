@@ -74,7 +74,7 @@ Cove 是一个**在终端中运行的 AI 编程助手**。你输入自然语言�
 ```bash
 # 1. 克隆
 git clone https://github.com/liuzhixin405/cove-agent
-cd cove/agent
+cd cove-agent
 
 # 2. 配置 API Key（二选一）
 # Anthropic:

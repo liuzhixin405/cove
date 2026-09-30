@@ -106,7 +106,7 @@ func markStaleMemories(projectRoot, memDir string, now time.Time) []staleReport 
 	if len(mems) == 0 {
 		return nil
 	}
-	foundNames, foundSymbols := searchProject(projectRoot, wantNames, wantSymbols)
+	foundNames, foundSymbols := searchProjectFn(projectRoot, wantNames, wantSymbols)
 
 	var reports []staleReport
 	for _, m := range mems {
@@ -127,17 +127,49 @@ func markStaleMemories(projectRoot, memDir string, now time.Time) []staleReport 
 			}
 		}
 		sort.Strings(missing)
-		updated := setStaleMarker(m.body, missing, now)
-		if updated != m.body {
-			if err := fsatomic.WriteFile(m.path, []byte(updated), 0o644); err != nil {
-				log.Warnf("[dream] stale marker for %s: %v", m.path, err)
-			}
-		}
+		writeStaleMarker(m.path, m.body, missing, now)
 		if len(missing) > 0 {
 			reports = append(reports, staleReport{File: m.path, Missing: missing})
 		}
 	}
 	return reports
+}
+
+// searchProjectFn is searchProject; a variable so tests can act while the
+// walk runs.
+var searchProjectFn = searchProject
+
+// writeStaleMarker sets the marker on the memory at path. The body read
+// before the project walk is not what gets written back: the walk can take
+// a while, and a turn-end extraction appending to the memory meanwhile used
+// to be erased by writing the marker onto the old copy. The file is re-read
+// under the memory write locks (this process's and the memory directory's
+// lock file, which an extraction in another process takes) and the marker
+// applied to what it holds now.
+func writeStaleMarker(path, readBody string, missing []string, now time.Time) {
+	unlock, err := lockMemoryDir(filepath.Dir(path))
+	if err != nil {
+		// Skipping the marker costs nothing lasting: the next consolidation
+		// checks again. Writing without the lock could erase an append.
+		log.Warnf("[dream] stale marker for %s skipped: %v", path, err)
+		return
+	}
+	defer unlock()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // removed meanwhile: nothing to mark
+	}
+	current := string(data)
+	if current != readBody {
+		log.Debugf("[dream] %s changed during the stale check; marking its current content", path)
+	}
+	updated := setStaleMarker(current, missing, now)
+	if updated == current {
+		return
+	}
+	if err := fsatomic.WriteFile(path, []byte(updated), 0o644); err != nil {
+		log.Warnf("[dream] stale marker for %s: %v", path, err)
+	}
 }
 
 // memoryRefs extracts from a memory the project paths it names (with a

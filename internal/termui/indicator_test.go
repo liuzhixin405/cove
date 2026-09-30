@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 // frame 0 of each animation is deterministic: the goroutine paints before its
@@ -289,4 +291,51 @@ func tail(s string) string {
 		return s[len(s)-60:]
 	}
 	return s
+}
+
+// A spinner frame ("思考中… 已推理 N 字" plus the elapsed/context/cost
+// suffix, ~60 columns) was printed whole, so in a narrow pane every 80 ms
+// frame wrapped and "\r\x1b[K" erased only the second row, leaving a stale
+// row behind per frame. Each frame now fits in width-1 columns.
+func TestIndicatorFramesAreClippedToTheTerminalWidth(t *testing.T) {
+	old := terminalWidth
+	terminalWidth = func() int { return 30 }
+	t.Cleanup(func() { terminalWidth = old })
+
+	check := func(t *testing.T, out string) {
+		t.Helper()
+		frames := strings.Split(out, "\r\x1b[K")
+		painted := 0
+		for _, f := range frames[1:] {
+			if f == "" {
+				continue
+			}
+			painted++
+			f = strings.TrimSuffix(f, "\x1b[0m\x1b[?25h")
+			if w := textutil.Width(f); w > 29 {
+				t.Errorf("frame is %d columns wide on a 30-column terminal: %q", w, f)
+			}
+			if !strings.HasSuffix(f, Reset) {
+				t.Errorf("clipped frame does not end its styling: %q", f)
+			}
+		}
+		if painted == 0 {
+			t.Fatalf("no frame painted: %q", out)
+		}
+	}
+
+	c := captureStdout(t)
+	s := NewSpinner("思考中… 已推理 12345 字")
+	s.SetSuffix(func() string { return "12.3s · 上下文 45% · $0.1234" })
+	s.Start()
+	c.waitFor("思考中")
+	s.Stop()
+	check(t, c.finish())
+
+	c = captureStdout(t)
+	w := NewWalkingIndicator("正在读取一个名字非常非常长的文件 internal/termui/indicator.go")
+	w.Start()
+	c.waitFor("正在")
+	w.Stop()
+	check(t, c.finish())
 }

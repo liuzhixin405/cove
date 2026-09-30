@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -147,6 +148,10 @@ func printOf(m api.Message) msgPrint {
 type persistedState struct {
 	prints []msgPrint
 	size   int64
+	// modTime is the file's mtime (UnixNano) as this Store last wrote or
+	// read it; 0 when unknown. With size it tells this process's own file
+	// from one another cove process on the same session changed since.
+	modTime int64
 	// meta is the file's first line as last written, and appends counts the
 	// appends since then; together they decide when the line is refreshed.
 	meta    fileMeta
@@ -213,36 +218,76 @@ func (s *Store) Save(r *Record) error {
 }
 
 func (s *Store) save(r *Record, stamp, forceRewrite bool) error {
+	key, err := writableKey(r.ID)
+	if err != nil {
+		return fmt.Errorf("save session %q: %w", r.ID, err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if stamp {
 		r.UpdatedAt = time.Now()
 	}
-	key := fileKey(r.ID)
 	path := s.path(r.ID)
 
-	var err error
-	if st := s.appendableState(key, path, r.Messages); st != nil && !forceRewrite && !st.metaStale(r) {
-		err = s.appendMessages(r, key, path, st)
+	// expected is the file size this save leaves, computed from what it
+	// wrote (see below).
+	var expected int64
+	if s.changedBehind(key, path) {
+		// Another cove process on this session (or an external edit) changed
+		// the file since this Store last wrote it. The rewrite below replaces
+		// it with this process's history, which used to erase the other
+		// process's appended turns for good: the size mismatch forced a
+		// rewrite, and archiveIfDropping compared only against this
+		// process's own record, so it archived nothing. The on-disk version
+		// is archived first, so nothing is lost.
+		log.Warnf("session %s was changed by another process; archiving its version to %s before overwriting", r.ID, s.archiveDir(key))
+		s.archiveFile(key, path)
+		expected, err = s.rewrite(r, key, path)
+	} else if st := s.appendableState(key, path, r.Messages); st != nil && !forceRewrite && !st.metaStale(r) {
+		var n int64
+		n, err = s.appendMessages(r, key, path, st)
+		expected = st.size + n
 	} else {
 		s.archiveIfDropping(key, path, r.Messages)
-		err = s.rewrite(r, key, path)
+		expected, err = s.rewrite(r, key, path)
 	}
 	if err != nil {
 		return err
+	}
+	if afterSessionWrite != nil {
+		afterSessionWrite(path)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat session %s: %w", r.ID, err)
 	}
-	s.state(key).size = info.Size()
+	// The recorded size is what this process wrote, not what the stat says:
+	// the stat is not excluded from other writers, and taking its size used
+	// to adopt bytes another cove process appended right after our write as
+	// our own. The next save then appended after them unaware, and a later
+	// rewrite dropped them without archiving. A file larger (or smaller)
+	// than we left it keeps the mismatch, so changedBehind archives it on the
+	// next save; its mtime is only recorded when the size is ours.
+	st := s.state(key)
+	st.size = expected
+	ours := info.Size() == expected
+	if ours {
+		st.modTime = info.ModTime().UnixNano()
+	} else {
+		log.Warnf("session %s changed during this save (%d bytes on disk, %d written); the next save archives it first", r.ID, info.Size(), expected)
+	}
 	// The messages are on disk; the index is a cache List rebuilds from the
 	// file when it does not match. index.json is shared by every cove process
 	// and replacing it can fail on Windows while another one reads it, so a
 	// failed update is logged, not returned: the caller's save did succeed.
 	if err := s.updateIndex(func(idx *indexFile) {
-		idx.Sessions[key] = entryFor(r, filepath.Base(path), info)
+		e := entryFor(r, filepath.Base(path), info)
+		if !ours {
+			// Describes our history, not the file: make List rescan it.
+			e.Size, e.ModTime = expected, 0
+		}
+		idx.Sessions[key] = e
 	}); err != nil {
 		log.Warnf("session index update for %s failed (List will rebuild it): %v", r.ID, err)
 	}
@@ -262,10 +307,26 @@ func (s *Store) appendableState(key, path string, msgs []api.Message) *persisted
 		}
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Size() != st.size {
+	if err != nil || info.Size() != st.size || (st.modTime != 0 && info.ModTime().UnixNano() != st.modTime) {
 		return nil
 	}
 	return st
+}
+
+// changedBehind reports whether the session file exists but is not the one
+// this Store last wrote or read: its size or mtime differ from the record, or
+// this Store has no record of a non-empty file (it never loaded it, or its
+// last append failed). Such a file may hold turns only another process has.
+func (s *Store) changedBehind(key, path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+	st := s.persisted[key]
+	if st == nil {
+		return true
+	}
+	return info.Size() != st.size || (st.modTime != 0 && info.ModTime().UnixNano() != st.modTime)
 }
 
 func (s *Store) state(key string) *persistedState {
@@ -280,23 +341,29 @@ func (s *Store) state(key string) *persistedState {
 	return st
 }
 
-func (s *Store) appendMessages(r *Record, key, path string, st *persistedState) error {
+// afterSessionWrite runs between a save's write and its stat; a variable so
+// tests can stand in for another process writing in that window.
+var afterSessionWrite func(path string)
+
+// appendMessages appends the messages st does not have yet and returns the
+// bytes it appended.
+func (s *Store) appendMessages(r *Record, key, path string, st *persistedState) (int64, error) {
 	fresh := r.Messages[len(st.prints):]
 	if len(fresh) == 0 {
-		return nil
+		return 0, nil
 	}
 	var buf bytes.Buffer
 	for _, m := range fresh {
 		line, err := json.Marshal(m)
 		if err != nil {
-			return fmt.Errorf("marshal session %s: %w", r.ID, err)
+			return 0, fmt.Errorf("marshal session %s: %w", r.ID, err)
 		}
 		buf.Write(line)
 		buf.WriteByte('\n')
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		return fmt.Errorf("append session %s: %w", r.ID, err)
+		return 0, fmt.Errorf("append session %s: %w", r.ID, err)
 	}
 	_, werr := f.Write(buf.Bytes())
 	serr := f.Sync()
@@ -304,13 +371,13 @@ func (s *Store) appendMessages(r *Record, key, path string, st *persistedState) 
 	if err := errors.Join(werr, serr, cerr); err != nil {
 		// What reached the disk is unknown; the next Save rewrites the file.
 		delete(s.persisted, key)
-		return fmt.Errorf("append session %s: %w", r.ID, err)
+		return 0, fmt.Errorf("append session %s: %w", r.ID, err)
 	}
 	for _, m := range fresh {
 		st.prints = append(st.prints, printOf(m))
 	}
 	st.appends++
-	return nil
+	return int64(buf.Len()), nil
 }
 
 // archiveMaxPerSession bounds the archived transcripts kept per session.
@@ -338,6 +405,12 @@ func (s *Store) archiveIfDropping(key, path string, msgs []api.Message) {
 	if extends {
 		return
 	}
+	s.archiveFile(key, path)
+}
+
+// archiveFile copies the session file as it is on disk into the archive and
+// trims the archive to the latest archiveMaxPerSession. Failures are logged.
+func (s *Store) archiveFile(key, path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -370,12 +443,12 @@ func (s *Store) archiveIfDropping(key, path string, msgs []api.Message) {
 }
 
 // rewrite replaces the session file with the full record, atomically, and
-// removes a legacy <id>.json it supersedes.
-func (s *Store) rewrite(r *Record, key, path string) error {
+// removes a legacy <id>.json it supersedes. It returns the length written.
+func (s *Store) rewrite(r *Record, key, path string) (int64, error) {
 	var buf bytes.Buffer
 	meta, err := json.Marshal(metaOf(r))
 	if err != nil {
-		return fmt.Errorf("marshal session %s: %w", r.ID, err)
+		return 0, fmt.Errorf("marshal session %s: %w", r.ID, err)
 	}
 	buf.Write(meta)
 	buf.WriteByte('\n')
@@ -384,7 +457,7 @@ func (s *Store) rewrite(r *Record, key, path string) error {
 		if err != nil {
 			// Fail without touching the file: a single unserializable value
 			// must not cost the conversation already on disk.
-			return fmt.Errorf("marshal session %s: %w", r.ID, err)
+			return 0, fmt.Errorf("marshal session %s: %w", r.ID, err)
 		}
 		buf.Write(line)
 		buf.WriteByte('\n')
@@ -393,10 +466,10 @@ func (s *Store) rewrite(r *Record, key, path string) error {
 	// Atomic replace: a crash or a full disk mid-write would otherwise truncate
 	// the session file.
 	if err := fsatomic.WriteFile(path, buf.Bytes(), 0600); err != nil {
-		return err
+		return 0, err
 	}
 	if err := os.Remove(s.legacyPath(r.ID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove migrated session %s: %w", r.ID, err)
+		return 0, fmt.Errorf("remove migrated session %s: %w", r.ID, err)
 	}
 	st := s.state(key)
 	st.prints = make([]msgPrint, len(r.Messages))
@@ -404,18 +477,19 @@ func (s *Store) rewrite(r *Record, key, path string) error {
 		st.prints[i] = printOf(m)
 	}
 	st.meta, st.appends = metaOf(r), 0
-	return nil
+	return int64(buf.Len()), nil
 }
 
 func (s *Store) Load(id string) (*Record, error) {
-	if isReservedID(id) {
-		return nil, ErrReservedID
+	key, err := writableKey(id)
+	if err != nil {
+		return nil, fmt.Errorf("load session %q: %w", id, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := fileKey(id)
 	path := s.path(id)
+	preInfo, _ := os.Stat(path)
 	data, err := os.ReadFile(path)
 	if err == nil {
 		r, clean, perr := parseJSONL(data)
@@ -431,6 +505,12 @@ func (s *Store) Load(id string) (*Record, error) {
 		if clean {
 			st := s.state(key)
 			st.size = int64(len(data))
+			st.modTime = 0
+			if preInfo != nil && preInfo.Size() == st.size {
+				// Stat before the read: a mismatch means the file changed in
+				// between, and size alone then tells it apart.
+				st.modTime = preInfo.ModTime().UnixNano()
+			}
 			st.prints = make([]msgPrint, len(r.Messages))
 			for i, m := range r.Messages {
 				st.prints[i] = printOf(m)
@@ -560,7 +640,7 @@ func (s *Store) Prune(keep int, protect ...string) (int, error) {
 	}
 	var candidates []*indexEntry
 	for _, e := range entries {
-		if !protected[SessionIDFromFile(e.File)] {
+		if !protected[keyOfFile(e.File)] {
 			candidates = append(candidates, e)
 		}
 	}
@@ -592,10 +672,21 @@ func (s *Store) Prune(keep int, protect ...string) (int, error) {
 	var errs []error
 	var gone []string
 	for _, e := range excess {
-		key := SessionIDFromFile(e.File)
-		failed := false
+		// The key is the file name minus its extension, exactly as
+		// scanLocked and the index key it. It used to come from
+		// SessionIDFromFile, which trimmed spaces: " padded .jsonl" became
+		// "padded ", so Prune removed a file that did not exist, counted it
+		// as removed, dropped the index entry and left the session on disk
+		// (and Prune(keep, " padded ") compared the protected ID against
+		// that wrong key, so protection did not hold either).
+		key := keyOfFile(e.File)
+		failed, found := false, false
 		for _, name := range []string{key + jsonlExt, key + legacyExt} {
-			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			err := os.Remove(filepath.Join(s.dir, name))
+			switch {
+			case err == nil:
+				found = true
+			case !errors.Is(err, fs.ErrNotExist):
 				errs = append(errs, err)
 				failed = true
 			}
@@ -603,9 +694,20 @@ func (s *Store) Prune(keep int, protect ...string) (int, error) {
 		if failed {
 			continue
 		}
+		// The archived transcripts go with the session, as in Delete: Prune
+		// used to leave archive/<id>/ behind, so up to archiveMaxPerSession
+		// copies of every pruned session accumulated forever.
+		if err := os.RemoveAll(s.archiveDir(key)); err != nil {
+			errs = append(errs, err)
+		}
 		delete(s.persisted, key)
 		gone = append(gone, key)
-		removed++
+		if found {
+			// A file that was already gone (another process removed it
+			// since the scan) loses its index entry but is not counted:
+			// the caller reports how many sessions this Prune deleted.
+			removed++
+		}
 	}
 	if err := s.updateIndex(func(idx *indexFile) {
 		for _, key := range gone {
@@ -621,9 +723,13 @@ func (s *Store) Prune(keep int, protect ...string) (int, error) {
 // and from index.json. It reports fs.ErrNotExist when no such session is
 // stored, so a caller counting deletions does not count a miss.
 func (s *Store) Delete(id string) error {
-	key := fileKey(id)
-	if strings.TrimSpace(key) == "" || key == "." {
-		return fmt.Errorf("delete session: %w", fs.ErrNotExist)
+	// "index" is refused before anything is touched, with ErrReservedID as
+	// Load and Save refuse it: Delete("index") used to remove index.json
+	// (index + ".json" is the legacy path) and write back an empty index,
+	// wiping every other session's list metadata, and then report success.
+	key, err := writableKey(id)
+	if err != nil {
+		return fmt.Errorf("delete session %q: %w", id, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -690,7 +796,53 @@ func (s *Store) AutoPrune(keep int, protect ...string) (int, error) {
 	if n > 0 {
 		log.Debugf("session auto-prune removed %d sessions (keeping %d)", n, keep)
 	}
+	if oerr := s.pruneOrphanArchives(protect...); oerr != nil {
+		err = errors.Join(err, oerr)
+	}
 	return n, err
+}
+
+// pruneOrphanArchives removes archive/<id>/ directories whose session file
+// no longer exists: sessions pruned before Prune removed their archive, or
+// deleted by hand. The protected sessions' archives are kept (the session in
+// use may not have been written yet). s.mu is taken so a Save through this
+// Store, which archives only a session file that exists, cannot interleave.
+func (s *Store) pruneOrphanArchives(protect ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(filepath.Join(s.dir, "archive"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	protected := map[string]bool{}
+	for _, id := range protect {
+		protected[fileKey(id)] = true
+	}
+	var errs []error
+	for _, e := range entries {
+		key := e.Name()
+		if !e.IsDir() || protected[key] {
+			continue
+		}
+		orphan := true
+		for _, name := range []string{key + jsonlExt, key + legacyExt} {
+			if _, err := os.Lstat(filepath.Join(s.dir, name)); !errors.Is(err, fs.ErrNotExist) {
+				orphan = false // present, or unknown: keep it
+			}
+		}
+		if !orphan {
+			continue
+		}
+		if err := os.RemoveAll(s.archiveDir(key)); err != nil {
+			errs = append(errs, err)
+		} else {
+			log.Debugf("session auto-prune removed the archive of missing session %s", key)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // scanLocked returns the list metadata of every readable session in the
@@ -707,7 +859,7 @@ func (s *Store) scanLocked() ([]*indexEntry, error) {
 	hasJSONL := map[string]bool{}
 	for _, de := range dirEntries {
 		if !de.IsDir() && filepath.Ext(de.Name()) == jsonlExt {
-			hasJSONL[strings.TrimSuffix(de.Name(), jsonlExt)] = true
+			hasJSONL[keyOfFile(de.Name())] = true
 		}
 	}
 
@@ -719,7 +871,7 @@ func (s *Store) scanLocked() ([]*indexEntry, error) {
 			continue
 		}
 		ext := filepath.Ext(name)
-		key := strings.TrimSuffix(name, ext)
+		key := keyOfFile(name)
 		if ext == legacyExt && hasJSONL[key] {
 			continue // superseded by a migrated .jsonl
 		}
@@ -908,9 +1060,74 @@ func overlayEntry(r *Record, e *indexEntry) {
 	}
 }
 
-// fileKey is the file base name for a session ID; filepath.Base keeps a
-// hostile ID ("../../x") inside the store directory.
-func fileKey(id string) string { return filepath.Base(id) }
+// fileKey is the file base name for a session ID. filepath.Base keeps a
+// hostile ID ("../../x") inside the store directory for path(); it did not
+// for archiveDir(): Base("..") is "..", and Join(dir, "archive", "..") is the
+// store directory itself, so Delete("..") — typed as "/history delete .." —
+// RemoveAll'd every session. Base("/") is "/" and pointed at the whole
+// archive. An ID that is not a plain name is mapped to "", which every
+// caller treats as "no such session".
+//
+// On Windows a ':' left after Base (the drive letter is already stripped)
+// names an NTFS alternate data stream: "ab:c.jsonl" is stream "c.jsonl" of
+// file "ab". Such a key is not a plain name either. Elsewhere ':' is an
+// ordinary character.
+//
+// The ID is used verbatim otherwise: surrounding spaces are part of it, as
+// they are part of the file name (" padded " is " padded .jsonl", which no
+// file system trims). Trimming belongs to parsing user input
+// (ParseSessionID), never to the Store, so that Save, Load, Delete, Prune
+// and its protect list all name the same file for one ID.
+func fileKey(id string) string {
+	key := filepath.Base(id)
+	if key == "." || key == ".." || strings.ContainsAny(key, `/\`) || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	if runtime.GOOS == "windows" && strings.Contains(key, ":") {
+		return ""
+	}
+	return key
+}
+
+// ErrInvalidID is returned by Save, Load and Delete for an ID that is not a
+// plain file name (see fileKey): "", "..", "/", "archive/..", "C:" or "ab:c"
+// on Windows. It matches fs.ErrNotExist too, so Load and Delete keep
+// reporting such an ID as "no such session", which callers counting misses
+// rely on; Save returns the same value. Save used to accept these IDs and
+// write <dir>/.jsonl, one file shared by all of them that List never showed
+// but Load("..") read back; with a ':' on Windows it failed only at the
+// rename, after the temp file had been created as a file plus a stream, and
+// the cleanup removed just the stream.
+var ErrInvalidID error = invalidIDError{}
+
+type invalidIDError struct{}
+
+func (invalidIDError) Error() string {
+	return "session id is not a plain file name (empty, a path, or an NTFS stream)"
+}
+
+func (invalidIDError) Is(target error) bool { return target == fs.ErrNotExist }
+
+// writableKey is the file key for id, or ErrInvalidID / ErrReservedID when
+// no session may be stored under it. Everything that reads or writes a
+// session by ID goes through it before touching the disk.
+func writableKey(id string) (string, error) {
+	key := fileKey(id)
+	if key == "" {
+		return "", ErrInvalidID
+	}
+	if isReservedID(id) {
+		return "", ErrReservedID
+	}
+	return key, nil
+}
+
+// keyOfFile is the file key of a session file name from the store directory:
+// the name without its extension, untrimmed (the inverse of path and
+// legacyPath).
+func keyOfFile(name string) string {
+	return strings.TrimSuffix(name, filepath.Ext(name))
+}
 
 func (s *Store) path(id string) string {
 	return filepath.Join(s.dir, fileKey(id)+jsonlExt)
@@ -937,6 +1154,10 @@ func looksSyntheticContent(c string) bool {
 		"[system:", "[Conversation Summary]",
 		"[系统检测到重复操作循环]", "[Context truncated",
 		"[用户指引]", "[Continue the task", "[会话摘要]",
+		// Compaction summaries; sessions saved before they were flagged
+		// Synthetic carry them as ordinary user messages, so a /history
+		// title or turn count took the summary for something the user typed.
+		"<compress",
 	}
 	for _, p := range knownPrefixes {
 		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {

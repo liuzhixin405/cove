@@ -56,3 +56,25 @@ func TestFetchedBodyRefusesBinary(t *testing.T) {
 		t.Fatalf("html body = %q, %v", got, err)
 	}
 }
+
+// CheckPermissions judged the raw input, and safeurl prepends https:// only
+// when "://" appears nowhere, so "example.com/?next=http://127.0.0.1/" was
+// parsed with scheme "example.com/?next=http" and denied as private although
+// the fetch itself normalizes it to https://example.com/... . The check must
+// see the URL that will be fetched. The mirror case, a private host with a
+// public URL in its query, must still be denied.
+func TestWebFetchPermissionChecksTheFetchedURL(t *testing.T) {
+	wf := NewWebFetchTool()
+	cases := map[string]PermissionResult{
+		"8.8.8.8/?next=http://127.0.0.1/":       Allow,
+		"https://8.8.8.8/?next=http://10.0.0.5": Allow,
+		"127.0.0.1/?next=https://8.8.8.8/":      Deny,
+		"http://127.0.0.1/":                     Deny,
+		"":                                      Deny,
+	}
+	for u, want := range cases {
+		if d := wf.CheckPermissions(Input{"url": u}, Context{}); d.Decision != want {
+			t.Errorf("url %q: decision = %v (%s), want %v", u, d.Decision, d.Reason, want)
+		}
+	}
+}

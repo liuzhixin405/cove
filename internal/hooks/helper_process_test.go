@@ -56,6 +56,14 @@ const (
 	// the test closes the connection. It is the grandchild of
 	// modeSpawnBackground, so the test can clean it up deterministically.
 	modeDialWaitClose = "dial-wait-close"
+	// modeBlockExitNonZero prints a {"continue": false} veto and exits 1, the
+	// way a hook script that ends on a failing command does.
+	modeBlockExitNonZero = "block-exit-nonzero"
+	// modeExit2 writes a reason to stderr and exits 2, the Claude Code
+	// PreToolUse convention for "block".
+	modeExit2 = "exit-2"
+	// modePrintThenHang prints a veto and then hangs until its timeout.
+	modePrintThenHang = "print-then-hang"
 )
 
 const helperMarker = "hook-ran"
@@ -130,12 +138,25 @@ func runHelperProcess(mode string) {
 			os.Exit(8)
 		}
 		emit(HookOutput{Continue: true, Message: "spawned"})
+	case modeBlockExitNonZero:
+		_, _ = io.ReadAll(os.Stdin)
+		emit(HookOutput{Continue: false, Message: "vetoed then failed"})
+		os.Exit(1)
+	case modeExit2:
+		_, _ = io.ReadAll(os.Stdin)
+		fmt.Fprint(os.Stderr, "blocked: touches production")
+		os.Exit(2)
+	case modePrintThenHang:
+		_, _ = io.ReadAll(os.Stdin)
+		emit(HookOutput{Continue: false, Message: "late veto"})
+		announce()
+		time.Sleep(10 * time.Minute)
 	case modeDialWaitClose:
 		conn := announceConn()
 		_, _ = io.Copy(io.Discard, conn) // returns when the test closes it
 	default:
 		fmt.Fprintf(os.Stderr, "helper: unknown mode %q\n", mode)
-		os.Exit(2)
+		os.Exit(9) // not 2, which a hook uses to block
 	}
 	os.Exit(0)
 }

@@ -71,9 +71,10 @@ func runChatInteractionMessage(ctx context.Context, runner chatRunner, userMsg a
 				// Live output from long-running tools (bash/powershell), so the
 				// user can tell what a slow command is doing instead of only
 				// seeing the stall warning.
-				ToolProgress:    p.toolProgress,
-				ToolOutputStart: p.toolOutputStart,
-				TurnModel:       func(model string) { p.engineLine(turnModelLine(model)) },
+				ToolProgress:       p.toolProgress,
+				ToolStderrProgress: p.toolStderrProgress,
+				ToolOutputStart:    p.toolOutputStart,
+				TurnModel:          func(model string) { p.engineLine(turnModelLine(model)) },
 			})
 			// Engine diagnostic lines (tool blocks, stall warnings, memory
 			// notices) go through the printer into the conversation area.
@@ -196,8 +197,11 @@ type turnPrinter struct {
 	atLineStart    bool
 
 	// One sanitiser per stream, so a sequence split across two chunks of
-	// the same stream is reassembled rather than half-printed.
-	text, thought, progress render.StreamSanitizer
+	// the same stream is reassembled rather than half-printed. A command's
+	// stdout and stderr are separate streams (progress, progressErr): they
+	// used to share one sanitiser, and bytes held from one were completed by
+	// the other's next chunk.
+	text, thought, progress, progressErr render.StreamSanitizer
 
 	// md renders the answer's Markdown as it streams (headings, bold, code
 	// blocks, bullets). It runs after the sanitiser, so the only escapes it
@@ -238,6 +242,10 @@ func (p *turnPrinter) beginAttempt() {
 	// must not leave the next answer drawn as code: print what the renderer
 	// still holds, end its row, and start the attempt with a fresh renderer.
 	p.flushHeldTextLocked()
+	// Likewise the reasoning sanitiser: it was flushed only in stop(), so
+	// the bytes a failed attempt held back were completed by the retry's
+	// first reasoning chunk.
+	p.flushThoughtLocked()
 	p.ensureLineStartLocked()
 	p.md = render.NewMarkdownStream()
 	p.spinner = termui.NewSpinner("思考中...")
@@ -277,8 +285,29 @@ func (p *turnPrinter) stop() {
 	// Unconditionally: a reply that was only a held-back marker printed
 	// nothing, so the printer never switched to text.
 	p.flushHeldTextLocked()
+	p.flushProgressLocked()
+	p.flushThoughtLocked()
 	if p.last == outReasoning {
 		termui.StreamPrint(termui.Reset)
+	}
+}
+
+// flushProgressLocked prints what the live-output sanitizer still holds (the
+// start of a character the command's last chunk ended in).
+func (p *turnPrinter) flushProgressLocked() {
+	for _, z := range []*render.StreamSanitizer{&p.progress, &p.progressErr} {
+		if rest := z.Flush(); rest != "" {
+			p.switchToLocked(outProgress)
+			p.printLocked(termui.Dim + indentLines(rest, toolProgressIndent, p.atLineStart) + termui.Reset)
+		}
+	}
+}
+
+// flushThoughtLocked prints what the reasoning sanitizer still holds.
+func (p *turnPrinter) flushThoughtLocked() {
+	if rest := p.thought.Flush(); rest != "" {
+		p.switchToLocked(outReasoning)
+		p.printLocked(termui.ReasoningStyle + rest + termui.Reset)
 	}
 }
 
@@ -295,7 +324,9 @@ func (p *turnPrinter) flushTextLocked() {
 // switches to it first. Printed straight after a reasoning trace, it used to
 // share the trace's row and, until the closing reset, its style.
 func (p *turnPrinter) flushHeldTextLocked() {
-	held := p.md.Flush()
+	// The sanitizer holds back a character split across chunks until its
+	// next bytes arrive; at the end of the stream they never will.
+	held := p.md.Write(p.text.Flush()) + p.md.Flush()
 	if held == "" {
 		return
 	}
@@ -397,6 +428,8 @@ func (p *turnPrinter) toolOutputStart(toolName, header string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stopSpinnerLocked()
+	// The previous command's held-back bytes belong under its own header.
+	p.flushProgressLocked()
 	line := "  ▸ " + toolName
 	if h := strings.TrimSpace(render.StripControls(strings.ReplaceAll(header, "\n", " "))); h != "" {
 		line += " " + h
@@ -413,10 +446,20 @@ const toolProgressIndent = "    "
 // powershell) so the user can tell what a slow command is doing. The
 // command's own colour survives; its control sequences do not.
 func (p *turnPrinter) toolProgress(toolName, chunk string) {
+	p.toolStreamProgress(&p.progress, chunk)
+}
+
+// toolStderrProgress is toolProgress for the command's stderr, through its
+// own sanitiser.
+func (p *turnPrinter) toolStderrProgress(toolName, chunk string) {
+	p.toolStreamProgress(&p.progressErr, chunk)
+}
+
+func (p *turnPrinter) toolStreamProgress(z *render.StreamSanitizer, chunk string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stopSpinnerLocked()
-	out := p.progress.Write(chunk)
+	out := z.Write(chunk)
 	if out == "" {
 		return
 	}

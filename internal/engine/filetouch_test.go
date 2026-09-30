@@ -33,6 +33,11 @@ func TestTouchPathsFor(t *testing.T) {
 			want: []string{"a.go", "pkg"},
 		},
 		{
+			name: "a file_path alias counts like filePath",
+			tc:   api.ToolCall{Name: "read", Input: map[string]any{"file_path": "pkg/b.go"}},
+			want: []string{"pkg/b.go"},
+		},
+		{
 			name: "bash carries no path of its own",
 			tc:   api.ToolCall{Name: "bash", Input: map[string]any{"command": "go test ./..."}},
 			want: nil,

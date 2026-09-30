@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove-agent/internal/permission"
 	"github.com/liuzhixin405/cove-agent/internal/shell"
@@ -88,6 +89,9 @@ type VerifyGate struct {
 	// onlyWhenFilesChanged limits the gate to turns that wrote or edited a
 	// file. Set for automatically detected commands (newAutoVerifyGate).
 	onlyWhenFilesChanged bool
+	// needsTrust marks a gate of detected commands and automatic tests: it
+	// runs only in a trusted project or in auto/bypass mode (verifyTrusted).
+	needsTrust bool
 	// dynamic, when set, returns further commands for the current turn, run
 	// after the fixed ones (the tests of what the turn changed,
 	// testCommandsFor).
@@ -183,6 +187,12 @@ func (g *VerifyGate) Run(ctx context.Context, alreadyPassed func(cmd string) boo
 		out, exitCode, runErr := runner(runCtx, cmdStr, g.workDir)
 		deadlineHit := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
+		if ctx.Err() != nil {
+			// Cancelled (Ctrl+C): the command was killed, which says
+			// nothing about the change. It used to go into the ledger as a
+			// failure. The caller sees ctx.Err() and ends the turn.
+			return results, false
+		}
 		if runErr != nil {
 			out = out + "\n[verify_gate] failed to run command: " + runErr.Error()
 			exitCode = -1
@@ -284,7 +294,7 @@ func runVerifyCommand(ctx context.Context, cmdStr string, workDir string) (outpu
 	runErr := cmd.Run()
 	out := buf.String()
 	if len(out) > 20000 {
-		out = out[len(out)-20000:] // keep the tail: errors are usually at the end
+		out = tailBytes(out, 20000) // keep the tail: errors are usually at the end
 	}
 	if runErr == nil {
 		return out, 0, nil
@@ -300,7 +310,21 @@ func truncateTail(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
-	return "... (truncated)\n" + s[len(s)-maxBytes:]
+	return "... (truncated)\n" + tailBytes(s, maxBytes)
+}
+
+// tailBytes is the last maxBytes bytes of s at most, starting on a rune
+// boundary. Slicing bytes (as truncateTail and the 20000-byte cap did) cut
+// Chinese compiler output mid-rune, and the model got invalid UTF-8.
+func tailBytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	start := len(s) - maxBytes
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 // normalizeCommand collapses runs of whitespace, so "go  build ./... " and

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -132,8 +133,13 @@ func TestSetCurrentSessionMovesExclusion(t *testing.T) {
 // RunNow still takes the lock: a live holder makes it fail with ErrLockHeld.
 func TestRunNowRespectsLock(t *testing.T) {
 	r, _ := statusTestRunner(t, "")
-	// The current process holds the lock (a live PID, fresh mtime).
-	if err := RecordConsolidation(); err != nil {
+	// Another live process holds the lock (its PID, fresh mtime). This used
+	// to be RecordConsolidation, i.e. this process's PID with no run: that
+	// counting as held was the bug that refused "/dream run" after a run.
+	if err := os.MkdirAll(memoryDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath(), []byte(strconv.Itoa(os.Getppid())), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.RunNow(context.Background()); !errors.Is(err, ErrLockHeld) {

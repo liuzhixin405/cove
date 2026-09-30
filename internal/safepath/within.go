@@ -58,7 +58,8 @@ func Within(root, target string) bool {
 // clean absolute path p, component by component, up to the first component
 // that does not exist; the rest is appended unchanged, so a file that does
 // not exist yet is judged by where its directory really is. ok is false when
-// a link chain is longer than maxLinkHops (or loops).
+// a link chain is longer than maxLinkHops (or loops), or a link's target
+// cannot be placed (see linkTarget).
 // filepath.EvalSymlinks is not enough: since Go 1.23 it leaves Windows mount
 // points (junctions, which mklink /J makes without privileges) unresolved.
 func resolveExisting(p string) (string, bool) {
@@ -102,15 +103,43 @@ func resolveLinks(p string, hops int) (string, bool) {
 				if hops >= maxLinkHops {
 					return "", false
 				}
-				if !filepath.IsAbs(dest) {
-					dest = filepath.Join(cur, dest)
+				abs, ok := linkTarget(cur, dest)
+				if !ok {
+					return "", false
 				}
-				return resolveLinks(filepath.Clean(filepath.Join(append([]string{dest}, parts[i+1:]...)...)), hops+1)
+				return resolveLinks(filepath.Clean(filepath.Join(append([]string{abs}, parts[i+1:]...)...)), hops+1)
 			}
 		}
 		cur = next
 	}
 	return cur, true
+}
+
+// linkTarget turns dest, a link's stored target as os.Readlink returns it,
+// into an absolute path; dir is the directory holding the link. ok is false
+// when where the target lies cannot be known, and the caller must treat the
+// path as outside.
+//
+// On Windows a relative target is not always relative to dir. One starting
+// with a single "\" or "/" is relative to the root of the link's drive:
+// D:\proj\l -> \Users\me\.ssh is D:\Users\me\.ssh. It used to be joined
+// under dir like any relative target, so D:\proj\l\id_rsa counted as inside
+// D:\proj. One with a drive but no root ("C:foo") is relative to that
+// drive's current directory, which depends on the process following the
+// link, so it fails closed.
+func linkTarget(dir, dest string) (string, bool) {
+	if filepath.IsAbs(dest) {
+		return dest, true
+	}
+	if runtime.GOOS == "windows" {
+		if filepath.VolumeName(dest) != "" {
+			return "", false
+		}
+		if dest != "" && (dest[0] == '\\' || dest[0] == '/') {
+			return filepath.Join(filepath.VolumeName(dir)+string(filepath.Separator), dest), true
+		}
+	}
+	return filepath.Join(dir, dest), true
 }
 
 // isLinkMode reports whether an Lstat mode may be a link os.Readlink can

@@ -47,6 +47,9 @@ func TestPermissionAnswerAccepted(t *testing.T) {
 
 // Denying prints a line: the result used to reach only the model.
 func TestDeniedAnswerPrintsFeedback(t *testing.T) {
+	// The key hint is shown on the process's first prompt only; make this
+	// the first.
+	keyHintShown.Store(false)
 	m := permission.NewManager(permission.Default)
 	allow, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "rm -rf build"}, "n")
 	if allow {

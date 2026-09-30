@@ -2,6 +2,7 @@ package repl
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,6 +99,35 @@ func TestHistoryFileRoundTrip(t *testing.T) {
 	got := loadHistory()
 	if strings.Join(got, "|") != "first line|multi\nline" {
 		t.Fatalf("history = %q", got)
+	}
+}
+
+// Every submitted line was recorded, so "/api-key sk-..." sat in the history
+// file and came back with Up. Lines the filter refuses are kept nowhere, and
+// ones already in the file are dropped when it is loaded.
+func TestHistoryFilterKeepsSecretsOut(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.jsonl")
+	SetHistoryFile(path)
+	defer SetHistoryFile("")
+	restore := captureStdout(t)
+	lr := typed("")
+	lr.submit([]rune("/api-key sk-old")) // before the filter: in the file
+	SetHistoryFilter(func(line string) bool { return !strings.HasPrefix(line, "/api-key") })
+	defer SetHistoryFilter(nil)
+	lr.submit([]rune("/api-key sk-secret"))
+	lr.submit([]rune("hello there"))
+	restore()
+	for _, h := range lr.history {
+		if strings.Contains(h, "sk-secret") {
+			t.Fatalf("in-memory history kept %q", h)
+		}
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), "sk-secret") {
+		t.Fatalf("history file kept the key: %s", raw)
+	}
+	if got := loadHistory(); strings.Join(got, "|") != "hello there" {
+		t.Fatalf("loaded history = %q, want the old key filtered out too", got)
 	}
 }
 

@@ -107,12 +107,20 @@ func (p *Pool) Connect(ctx context.Context, name string, cfg ServerConfig) error
 		Connected: true,
 	}
 
+	// A list that failed for any reason other than "not supported" used to
+	// be dropped: the server was published connected with zero tools and no
+	// error, and nothing asked again (a list_changed notification is the
+	// only refresh). The error is kept on the entry, so /mcp list says why.
 	if tools, err := client.ListTools(ctx); err == nil {
 		ms.Tools = tools
+	} else if !isUnsupported(err) {
+		ms.Err = "tools/list: " + err.Error()
 	}
 
 	if resources, err := client.ListResources(ctx); err == nil {
 		ms.Resources = resources
+	} else if !isUnsupported(err) && ms.Err == "" {
+		ms.Err = "resources/list: " + err.Error()
 	}
 
 	p.mu.Lock()
@@ -155,6 +163,20 @@ func (p *Pool) watch(name string, cfg ServerConfig, ms *ManagedServer) {
 			}
 			p.mu.Unlock()
 			if !retry {
+				// Past the one reconnect (or already replaced): reap the dead
+				// client, or its process was never Wait()ed and its pipes
+				// stayed open until exit, and say why /mcp list shows it down.
+				if current {
+					p.mu.Lock()
+					if p.servers[name] == ms {
+						ms.Close()
+						if ms.Err == "" {
+							ms.Err = "connection lost again after a reconnect; use /mcp connect to retry"
+						}
+						p.version.Add(1)
+					}
+					p.mu.Unlock()
+				}
 				return
 			}
 			logF("MCP: %s: connection lost, reconnecting in %s", name, reconnectDelay)
@@ -464,4 +486,10 @@ func (p *Pool) LoadFromConfig(ctx context.Context, servers map[string]ServerConf
 // so MCP connection problems stay hidden in normal (release) runs.
 func logF(format string, args ...any) {
 	log.Debugf(format, args...)
+}
+
+// isUnsupported reports the "server does not support X" errors ListTools and
+// ListResources return for a capability the server did not declare.
+func isUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "does not support")
 }

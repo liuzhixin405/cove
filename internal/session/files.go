@@ -30,10 +30,14 @@ func IsSessionFile(name string) bool {
 
 // SessionIDFromFile returns the session ID a session file name stands for:
 // name without a trailing .jsonl or .json. Any other suffix is part of the ID
-// (IDs may contain dots), so it is also safe on user input such as a file name
-// copied out of ~/.cove/sessions.
+// (IDs may contain dots).
+//
+// The name is taken verbatim, as read from the sessions directory: it used to
+// be trimmed, so " padded .jsonl" gave "padded ", which names another file,
+// and a caller loading or pruning by the result missed the session. User
+// input (a file name typed or pasted) goes through ParseSessionID, which
+// trims it first.
 func SessionIDFromFile(name string) string {
-	name = strings.TrimSpace(name)
 	for _, ext := range []string{jsonlExt, legacyExt} {
 		if strings.HasSuffix(name, ext) {
 			return strings.TrimSuffix(name, ext)
@@ -46,22 +50,28 @@ func SessionIDFromFile(name string) string {
 // may use it: Load would read the index as a legacy session.
 const reservedID = "index"
 
-// ErrReservedID is returned for the reserved session ID "index".
+// ErrReservedID is returned for the reserved session ID "index" (in any case:
+// on Windows INDEX.json is index.json) by ParseSessionID, Load, Save and
+// Delete. Save("index") used to write index.jsonl, which Load refused and List
+// hid, so the save was silently lost.
 var ErrReservedID = errors.New(`session id "index" is reserved for the sessions index (index.json), not a session`)
 
 // ParseSessionID is SessionIDFromFile for user input (-r / --resume, /resume
-// by file name): it also rejects the reserved ID "index", so "cove -r
-// index.json" fails clearly instead of loading the index as a session.
+// by file name): it trims the surrounding white space a paste carries, and it
+// rejects the reserved ID "index", so "cove -r index.json" fails clearly
+// instead of loading the index as a session.
 func ParseSessionID(name string) (string, error) {
-	id := SessionIDFromFile(name)
+	id := SessionIDFromFile(strings.TrimSpace(name))
 	if isReservedID(id) {
 		return "", ErrReservedID
 	}
 	return id, nil
 }
 
+// isReservedID compares the untrimmed key, as the Store names files: " index"
+// is the file " index.jsonl", not the index.
 func isReservedID(id string) bool {
-	return strings.EqualFold(fileKey(strings.TrimSpace(id)), reservedID)
+	return strings.EqualFold(fileKey(id), reservedID)
 }
 
 // ListSessionFiles returns the base names of the session files in dir, sorted.

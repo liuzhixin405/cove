@@ -45,9 +45,9 @@ const (
 // Texts of the nudges (English, like every engine-injected instruction).
 const (
 	nudgeAnnouncedText  = "[system: You announced a next step but did not perform it. Continue now by calling the required tools, or state clearly that the task is complete.]"
-	nudgeDegenerateText = "[system: Your last message is too brief to be a final answer after doing work. Summarize what you changed and what remains, or continue.]"
+	nudgeDegenerateText = "[system: Your last message is too brief to be a final answer after doing work. Summarize what you changed for the latest request and what remains, or continue.]"
 	nudgeEmptyText      = "[system: Your response was empty. Provide the answer or call a tool.]"
-	nudgeDoneCheckText  = "[system: Before finishing, check whether the user's request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer.]"
+	nudgeDoneCheckText  = "[system: Before finishing, check whether the user's latest request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer about that request.]"
 )
 
 // completionMarkers are words that make an ending read as "finished".

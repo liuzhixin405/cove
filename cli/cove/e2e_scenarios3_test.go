@@ -14,6 +14,9 @@ import (
 // The write tool asks once; "a" covers every later write in the session,
 // and the files land in the project directory.
 func TestE2E_WriteToolRememberedForTheSession(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	model := newFakeModel(t,
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "write", Args: `{"filePath":"notes/a.txt","content":"first\n"}`}}},
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "write", Args: `{"filePath":"notes/b.txt","content":"second\n"}`}}},

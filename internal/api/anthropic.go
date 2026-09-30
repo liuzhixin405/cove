@@ -493,6 +493,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
+	markProgress() // headers arrived: the idle clock starts now
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		return nil, &StatusError{Status: httpResp.StatusCode, Msg: truncate(string(body), 500)}
@@ -517,34 +518,61 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 	var usage anthropicUsage
 	var stopReason string
 	sawStop := false
+	textBlocks := 0
+	// outputFinal: output_tokens came from message_delta. message_start's
+	// count is a placeholder (typically 1), not what was generated.
+	outputFinal := false
+	// partial is the return for a failure once the body has started: the
+	// provider bills what it generated, so the error carries that usage for
+	// the meter (withPartialUsage).
+	partial := func(err error) (*ChatResponse, error) {
+		generated := streamAcc.Content()
+		for _, acc := range tcAccum {
+			generated += acc.JSONBuf.String()
+		}
+		for _, acc := range thinkAccum {
+			generated += acc.text.String()
+		}
+		out := 0
+		if outputFinal {
+			out = usage.OutputTokens
+		}
+		return nil, withPartialUsage(err, &ChatResponse{
+			Model:                  req.Model,
+			InputTokens:            usage.totalInputTokens(),
+			OutputTokens:           out,
+			PromptCacheHitTokens:   usage.cacheHitTokens(),
+			PromptCacheMissTokens:  usage.cacheMissTokens(),
+			PromptCacheWriteTokens: usage.CacheCreationInputTokens,
+		}, generated)
+	}
 
 	for {
 		line, err := readSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			// Distinguish an idle-watchdog abort from a genuine read error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {
-				return nil, fmt.Errorf("stream stalled: no data received for %s", streamIdleTimeout)
+				return partial(streamStalledError())
 			}
-			return nil, fmt.Errorf("read anthropic SSE: %w", err)
+			return partial(fmt.Errorf("read anthropic SSE: %w", err))
 		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return partial(ctx.Err())
 		}
 		markProgress() // reset the idle watchdog on every received line
 		if payload, ok := sseDataPayload(line); ok {
 			if payload != "" && payload != "[DONE]" {
 				var ev anthropicStreamBlock
 				if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-					return nil, fmt.Errorf("decode anthropic SSE: %w", err)
+					return partial(fmt.Errorf("decode anthropic SSE: %w", err))
 				}
 
 				switch ev.Type {
 				case "error":
-					e := ev.Error
-					if e == nil {
-						e = &oaiStreamError{}
-					}
-					return nil, fmt.Errorf("provider stream error: %s", streamErrorText(e))
+					// Typed with the status the error type stands for, so
+					// a streamed overloaded_error fails over and cools down
+					// exactly like an HTTP 529 (see streamError).
+					return partial(streamError(ev.Error))
 				case "message_stop":
 					sawStop = true
 				case "message_start":
@@ -556,6 +584,19 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 						usage.merge(*ev.Usage)
 					}
 				case "content_block_start":
+					// Text blocks are joined with a newline, as Chat's
+					// extractContent does: streamed "before"[tool]"after"
+					// used to read "beforeafter" while the same reply
+					// fetched without streaming read "before\nafter".
+					if ev.ContentBlock != nil && ev.ContentBlock.Type == "text" {
+						if textBlocks > 0 {
+							streamAcc.AddDelta("\n")
+							if handler != nil {
+								handler(StreamEvent{Type: "delta", Delta: "\n"})
+							}
+						}
+						textBlocks++
+					}
 					if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
 						acc := &accumTC{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
 						tcAccum[ev.Index] = acc
@@ -595,6 +636,7 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				case "message_delta":
 					if ev.Usage != nil {
 						usage.merge(*ev.Usage)
+						outputFinal = true
 					}
 					if ev.Delta != nil && ev.Delta.StopReason != "" {
 						stopReason = ev.Delta.StopReason
@@ -602,14 +644,22 @@ func (p *anthropicProvider) ChatStream(ctx context.Context, req ChatRequest, han
 				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
+		// message_stop is Anthropic's terminal event, like OpenAI's [DONE]:
+		// the reply is complete whatever the connection does afterwards. The
+		// loop used to keep reading, so a server that held the connection
+		// open after message_stop tripped the idle watchdog and a finished
+		// answer came back as "stream stalled" (retried, then failed over).
+		if sawStop || errors.Is(err, io.EOF) {
 			break
 		}
+	}
+	if streamCtx.Err() != nil && ctx.Err() == nil && !sawStop {
+		return partial(streamStalledError())
 	}
 	// No message_stop and no stop_reason: the connection closed in the middle
 	// of the answer, which used to be reported as a complete end_turn.
 	if !sawStop && stopReason == "" {
-		return nil, fmt.Errorf("stream ended before the response completed (unexpected EOF: no message_stop)")
+		return partial(fmt.Errorf("stream ended before the response completed (unexpected EOF: no message_stop)"))
 	}
 
 	indices := make([]int, 0, len(tcAccum))

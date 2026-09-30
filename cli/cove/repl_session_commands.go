@@ -50,13 +50,16 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 			all = true
 			histID = strings.TrimSpace(histID[len("all "):])
 		}
-		if strings.HasPrefix(strings.ToLower(histID), "detail ") {
-			handleHistoryDetail(strings.TrimSpace(histID[len("detail "):]), eng, all)
+		// With or without an argument: bare "/history detail" used to fall
+		// through to resuming a session named "detail" instead of printing
+		// the handler's usage line.
+		if _, arg, ok := historySubcommand(histID, "detail"); ok {
+			handleHistoryDetail(arg, eng, all)
 			*historyPickPending = false
 			return true
 		}
-		if strings.HasPrefix(strings.ToLower(histID), "delete ") {
-			handleHistoryDelete(strings.TrimSpace(histID[len("delete "):]), eng, all)
+		if _, arg, ok := historySubcommand(histID, "delete"); ok {
+			handleHistoryDelete(arg, eng, all)
 			*historyPickPending = false
 			return true
 		}
@@ -81,11 +84,15 @@ func handleSessionCommand(input string, eng *engine.Engine, historyPickPending *
 func startNewSession(eng *engine.Engine, tasks *replTaskRunner, attachedFiles *[]string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), exitBackgroundWait)
 	defer cancel()
+	// The ID of the session being left, taken before NewSession replaces it:
+	// only that session's draft goes with it. /new used to delete whatever
+	// draft there was, another project's included.
+	left := eng.SessionID()
 	saved := eng.NewSession(ctx)
 	if tasks != nil {
 		tasks.ClearPendingFailed()
 	}
-	_ = clearInterruptedDraft()
+	_ = clearInterruptedDraftFor(left)
 	*attachedFiles = nil
 	return saved
 }
@@ -111,4 +118,18 @@ func compactReportLine(r engine.CompactReport) string {
 	default:
 		return fmt.Sprintf("未压缩（当前 %d tokens）。", r.BeforeTokens)
 	}
+}
+
+// historySubcommand reports whether rest is the history sub-command name
+// (case-insensitive), alone or followed by an argument, and returns that
+// argument trimmed.
+func historySubcommand(rest, name string) (sub, arg string, ok bool) {
+	lower := strings.ToLower(rest)
+	switch {
+	case lower == name:
+		return name, "", true
+	case strings.HasPrefix(lower, name+" "):
+		return name, strings.TrimSpace(rest[len(name)+1:]), true
+	}
+	return "", "", false
 }

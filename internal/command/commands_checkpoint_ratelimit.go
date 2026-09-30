@@ -18,9 +18,14 @@ type rateLimitEngine interface {
 	RateLimitInfo() api.RateLimitInfo
 }
 
-func (c *UndoCmd) Name() string        { return "undo" }
-func (c *UndoCmd) Aliases() []string   { return nil }
-func (c *UndoCmd) Description() string { return "回退到检查点" }
+func (c *UndoCmd) Name() string { return "undo" }
+
+// MutatesEngine: /undo rewrites the working tree, so running it while a task
+// is still editing files interleaved the rollback with the agent's writes and
+// left a mix of both. It used to be accepted mid-task.
+func (c *UndoCmd) MutatesEngine([]string) bool { return true }
+func (c *UndoCmd) Aliases() []string           { return nil }
+func (c *UndoCmd) Description() string         { return "回退到检查点" }
 func (c *UndoCmd) Help() string {
 	return "/undo [commit] - 回退到上一个与当前不同的检查点（可连续回退），或指定检查点；回退前自动备份"
 }
@@ -34,13 +39,17 @@ func (c *UndoCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		hash = strings.TrimSpace(in.Args[0])
 	}
 	backup, err := eng.RestoreCheckpoint(hash)
-	if err != nil {
-		return Output{Message: fmt.Sprintf("回退失败: %v", err)}, nil
-	}
-	msg := "已回退到最近检查点"
-	if hash != "" {
+	var msg string
+	switch {
+	case err != nil:
+		msg = fmt.Sprintf("回退失败: %v", err)
+	case hash != "":
 		msg = fmt.Sprintf("已回退到检查点 %s", hash)
+	default:
+		msg = "已回退到最近检查点"
 	}
+	// A failed restore may already have rewritten part of the tree; the backup
+	// is then the only way back, and it used to be dropped with the error.
 	if len(backup) >= 8 {
 		msg += fmt.Sprintf("\n回退前的状态已备份，撤销这次回退: /undo %s", backup[:8])
 	}

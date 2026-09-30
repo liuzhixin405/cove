@@ -98,8 +98,12 @@ func (t *TeamDeleteTool) Call(ctx context.Context, input Input, tctx Context) (R
 	removed := 0
 	if tctx.Runtime != nil {
 		tctx.Runtime.Lock()
-		for id := range tctx.Runtime.Tasks {
-			if strings.HasPrefix(id, "team-"+name+"-") {
+		for id, tr := range tctx.Runtime.Tasks {
+			// A member of this team, not one of team "<name>-x": the prefix
+			// "team-<name>-" alone also matched team-a-b-1 when deleting "a".
+			// ParentID names the team (team_create sets it); a record without
+			// one is judged by its ID alone.
+			if isTeamMemberID(id, name) && (tr == nil || tr.ParentID == "" || tr.ParentID == name) {
 				delete(tctx.Runtime.Tasks, id)
 				removed++
 			}
@@ -114,6 +118,22 @@ func (t *TeamDeleteTool) Call(ctx context.Context, input Input, tctx Context) (R
 	}
 	return Result{Data: fmt.Sprintf("Team '%s' removed from runtime (%d members cleaned up).", name, removed)}, nil
 }
+
+// isTeamMemberID reports whether id is exactly "team-<team>-<n>", the ID
+// team_create gives the n-th member of team.
+func isTeamMemberID(id, team string) bool {
+	rest, ok := strings.CutPrefix(id, "team-"+team+"-")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (t *TeamDeleteTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("team deletion is safe in current runtime")
 }

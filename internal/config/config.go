@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
 	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 type ProviderConfig struct {
@@ -58,6 +61,11 @@ type Profile struct {
 	MaxTurnMinutes        *int `json:"max_turn_minutes,omitempty"`
 	SubagentMaxIterations int  `json:"subagent_max_iterations,omitempty"`
 	MaxSessions           int  `json:"max_sessions,omitempty"`
+
+	// extra holds the keys of this profile that the struct does not know (an
+	// option from a newer cove, a note the user added), so Save writes them
+	// back instead of dropping them.
+	extra map[string]json.RawMessage
 }
 
 // UnmarshalJSON keeps backward compatibility with older configs that used
@@ -75,7 +83,64 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 	if p.PermissionMode == "" && aux.Mode != "" {
 		p.PermissionMode = aux.Mode
 	}
+	var all map[string]json.RawMessage
+	if json.Unmarshal(data, &all) == nil {
+		for k, v := range all {
+			// "mode" was folded into permission_mode above; writing it back
+			// would resurrect the legacy field.
+			if k == "mode" || profileKnownKeys[k] {
+				continue
+			}
+			if p.extra == nil {
+				p.extra = map[string]json.RawMessage{}
+			}
+			p.extra[k] = v
+		}
+	}
 	return nil
+}
+
+// profileKnownKeys are the JSON names of Profile's fields.
+var profileKnownKeys = func() map[string]bool {
+	m := map[string]bool{}
+	t := reflect.TypeOf(Profile{})
+	for i := 0; i < t.NumField(); i++ {
+		if name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ","); name != "" && name != "-" {
+			m[name] = true
+		}
+	}
+	return m
+}()
+
+// rawJSON is the profile as written to disk: every field, the provider's API
+// key unmasked, and the keys the struct does not know.
+func (p *Profile) rawJSON() (json.RawMessage, error) {
+	type alias Profile
+	cp := alias(*p)
+	cp.Provider = nil // marshalled below without ProviderConfig's masking
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	if p.Provider != nil {
+		if m["provider"], err = json.Marshal(rawProvider{
+			Name:    p.Provider.Name,
+			APIKey:  p.Provider.APIKey,
+			BaseURL: p.Provider.BaseURL,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for k, v := range p.extra {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
+	return json.Marshal(m)
 }
 
 type Config struct {
@@ -182,6 +247,26 @@ type Config struct {
 	// turnMinutesExplicit records that config.json, .cove.json or the active
 	// profile set max_turn_minutes (UnattendedTurnMinutes).
 	turnMinutesExplicit bool
+	// appliedProfile is the profile Load applied (active_profile or
+	// --profile). Save writes a change to a field that profile sets into the
+	// profile: the top level would be overridden by it again on every start.
+	appliedProfile string
+	// appliedProf is that profile as Load applied it, kept so Save still
+	// knows which keys it set once /profile delete removed it from Profiles.
+	appliedProf *Profile
+
+	// The project's .cove.json as Load saw it: its path, the sha256 of the
+	// content that was read, and the sensitive fields that were ignored
+	// because that content is not trusted (see project_trust.go).
+	projectConfigPath string
+	projectConfigHash string
+	untrustedFields   []string
+
+	// userValues and loadedValues are the profile settings Load produced
+	// without and with the project .cove.json (profile_snapshot.go), so
+	// SnapshotProfile can leave the project's values out of a saved
+	// profile. Both nil when the project changed none of them.
+	userValues, loadedValues *profileValues
 }
 
 // UnattendedTurnMinutes is the turn time limit for -p and headless runs,
@@ -217,6 +302,9 @@ func (c *Config) DoneCheckMode() string {
 }
 
 // VerifyAutoEnabled reports whether automatic completion verification is on.
+// On (the default) still runs the detected commands only in a trusted
+// project directory or in auto/bypass mode (engine verifyTrusted): they
+// execute the repository's build scripts.
 func (c *Config) VerifyAutoEnabled() bool {
 	return c.DoneVerifyAuto == nil || *c.DoneVerifyAuto
 }
@@ -309,9 +397,16 @@ func LoadWithProfile(profileName string) (*Config, error) {
 	// says "provider": {"name": "deepseek"} sent claude-sonnet-4 to DeepSeek and
 	// every request failed; empty lets applyDefaults pick the provider's default.
 	cfg.Model = ""
+	var base Config // cfg before the project override
+	baseSet := false
+	var applied *Profile
 	finish := func(err error) (*Config, error) {
+		if !baseSet {
+			base = *cfg // failed before the project override: nothing from it
+		}
 		applyDefaults(cfg)
 		cfg.loadedView, _ = rawView(cfg)
+		recordUserLevelValues(cfg, base, applied)
 		return cfg, err
 	}
 	dir, err := ConfigDir()
@@ -325,6 +420,7 @@ func LoadWithProfile(profileName string) (*Config, error) {
 			cfg.turnMinutesExplicit = hasKey(stripBOM(data), "max_turn_minutes")
 		}
 	}
+	base, baseSet = *cfg, true
 	if err := loadProjectOverride(cfg); err != nil {
 		return finish(err)
 	}
@@ -339,6 +435,9 @@ func LoadWithProfile(profileName string) (*Config, error) {
 			return finish(fmt.Errorf("profile %q not found in config", profileName))
 		}
 		applyProfile(cfg, prof)
+		applied = prof
+		cfg.appliedProfile = profileName
+		cfg.appliedProf = prof
 	}
 	return finish(nil)
 }
@@ -367,48 +466,142 @@ func CheckFile(path string) error {
 	return nil
 }
 
+// maxProjectConfigBytes caps a project .cove.json; a real one is a few KiB.
+const maxProjectConfigBytes = 1 << 20
+
+// errProjectConfigRefused marks a .cove.json that is not read at all: not a
+// regular file, or over maxProjectConfigBytes.
+var errProjectConfigRefused = errors.New("project config ignored")
+
+// readProjectConfigFile reads the project .cove.json at p in one read, the
+// bytes both parsed and hashed for the trust gate.
+//
+// The file comes with the repository. It used to be read with os.ReadFile,
+// which follows a symlink and reads without a limit, so a committed
+// `.cove.json -> /dev/zero` (or /dev/tty, a fifo) hung cove at startup or ran
+// it out of memory, and the dream worker with it. Only a regular file, not a
+// link, of at most maxProjectConfigBytes is read now.
+func readProjectConfigFile(p string) ([]byte, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file (%s)", errProjectConfigRefused, p, fi.Mode().Type())
+	}
+	if fi.Size() > maxProjectConfigBytes {
+		return nil, fmt.Errorf("%w: %s is larger than %d bytes", errProjectConfigRefused, p, maxProjectConfigBytes)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	// The path may have been swapped for a link or a device between the
+	// Lstat and the Open; what was opened must be the file that was checked.
+	if opened, err := f.Stat(); err != nil || !os.SameFile(fi, opened) {
+		return nil, fmt.Errorf("%w: %s changed while being read", errProjectConfigRefused, p)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxProjectConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxProjectConfigBytes {
+		return nil, fmt.Errorf("%w: %s is larger than %d bytes", errProjectConfigRefused, p, maxProjectConfigBytes)
+	}
+	return data, nil
+}
+
+// loadProjectOverride merges the working directory's .cove.json into cfg.
+//
+// The file comes with the repository, so a clone must not be able to run code
+// or redirect credentials just by being opened. It used to be applied in full:
+// its mcp_servers were started at launch (`python -c ...` ran before the first
+// prompt), its provider.base_url received the user's global API key on the
+// first request, and its done_verify_commands ran after every turn. Fields
+// like these (see the sensitive checks below) now apply only when the user
+// trusted this exact content (project_trust.go); otherwise they are left out
+// and recorded for UntrustedProjectConfig. Everything else applies as before.
 func loadProjectOverride(cfg *Config) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
 	p := filepath.Join(cwd, ".cove.json")
-	data, err := os.ReadFile(p)
+	data, err := readProjectConfigFile(p)
 	if err != nil {
+		if errors.Is(err, errProjectConfigRefused) {
+			log.Warnf("%v", err)
+		}
 		return nil
 	}
 	var override Config
 	if err := json.Unmarshal(stripBOM(data), &override); err != nil {
 		return fmt.Errorf("parse project config %s: %w", p, err)
 	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	p = filepath.Clean(p)
+	hash := contentHash(data)
+	cfg.projectConfigPath, cfg.projectConfigHash = p, hash
+
+	// trusted is looked up only when a sensitive field is present, so the
+	// common .cove.json (model, effort ...) never reads the trust store. An
+	// unreadable store counts as "not trusted".
+	var trustChecked, trusted bool
+	var ignored []string
+	sensitive := func(field string) bool {
+		if !trustChecked {
+			trustChecked = true
+			trusted, _ = isTrustedHash(p, hash)
+		}
+		if !trusted {
+			ignored = append(ignored, field)
+		}
+		return trusted
+	}
+
 	if override.Model != "" {
 		cfg.Model = override.Model
 	}
 	if override.ModelFast != "" {
 		cfg.ModelFast = override.ModelFast
 	}
-	if override.PermissionMode != "" {
+	// "auto" and "bypass" run tools without asking; only a mode at least as
+	// careful as the default needs no trust.
+	if override.PermissionMode != "" && (restrictivePermissionMode(override.PermissionMode) || sensitive("permission_mode")) {
 		cfg.PermissionMode = override.PermissionMode
 	}
+	// Raising the spend cap spends the user's money; lowering it is safe.
 	if override.MaxBudgetUsd > 0 {
-		cfg.MaxBudgetUsd = override.MaxBudgetUsd
+		raises := cfg.MaxBudgetUsd > 0 && override.MaxBudgetUsd > cfg.MaxBudgetUsd
+		if !raises || sensitive("max_budget_usd") {
+			cfg.MaxBudgetUsd = override.MaxBudgetUsd
+		}
 	}
-	if override.SystemPrompt != "" {
+	// The system prompt steers every tool call the model makes.
+	if override.SystemPrompt != "" && sensitive("system_prompt") {
 		cfg.SystemPrompt = override.SystemPrompt
 	}
-	if len(override.MCPServers) > 0 {
+	// MCP servers are processes started at launch.
+	if len(override.MCPServers) > 0 && sensitive("mcp_servers") {
 		cfg.MCPServers = override.MCPServers
 	}
-	if len(override.DoneVerifyCommands) > 0 {
+	// Shell commands run automatically after a turn.
+	if len(override.DoneVerifyCommands) > 0 && sensitive("done_verify_commands") {
 		cfg.DoneVerifyCommands = override.DoneVerifyCommands
 	}
-	if override.DoneVerifyAuto != nil {
+	// Automatic verification runs the project's own build and tests (cargo
+	// build scripts, a node_modules tsc, go test); turning it on needs trust,
+	// turning it off does not.
+	if override.DoneVerifyAuto != nil && (!*override.DoneVerifyAuto || sensitive("done_verify_auto")) {
 		cfg.DoneVerifyAuto = override.DoneVerifyAuto
 	}
 	if override.DoneVerifyTimeoutSeconds > 0 {
 		cfg.DoneVerifyTimeoutSeconds = override.DoneVerifyTimeoutSeconds
 	}
-	if override.DoneVerifyTests != nil {
+	if override.DoneVerifyTests != nil && (!*override.DoneVerifyTests || sensitive("done_verify_tests")) {
 		cfg.DoneVerifyTests = override.DoneVerifyTests
 	}
 	if override.DoneSelfReview != "" {
@@ -429,25 +622,30 @@ func loadProjectOverride(cfg *Config) error {
 	if len(override.DisabledSkills) > 0 {
 		cfg.DisabledSkills = override.DisabledSkills
 	}
-	if override.MemoryEmbedding != nil {
+	// Its base_url defaults to the provider's and its api_key to the user's:
+	// an endpoint from the project would receive the key and the memories.
+	if override.MemoryEmbedding != nil && sensitive("memory_embedding") {
 		cfg.MemoryEmbedding = override.MemoryEmbedding
 	}
 	if override.ExperimentalTools {
 		cfg.ExperimentalTools = true
 	}
-	if override.WebSearch != nil {
+	// Carries an API key and decides where search queries are sent.
+	if override.WebSearch != nil && sensitive("web_search") {
 		cfg.WebSearch = override.WebSearch
 	}
 	// Provider and ThinkingTokens were silently dropped here, so a project that
 	// pinned its own endpoint or thinking budget in .cove.json was ignored with
-	// no message — the user's setting simply had no effect.
-	if override.Provider.Name != "" {
+	// no message — the user's setting simply had no effect. The provider is
+	// sensitive: a base_url from the project received the user's global API
+	// key, and a name or key from it redirects the session's traffic.
+	if override.Provider.Name != "" && sensitive("provider.name") {
 		cfg.Provider.Name = override.Provider.Name
 	}
-	if override.Provider.APIKey != "" {
+	if override.Provider.APIKey != "" && sensitive("provider.api_key") {
 		cfg.Provider.APIKey = override.Provider.APIKey
 	}
-	if override.Provider.BaseURL != "" {
+	if override.Provider.BaseURL != "" && sensitive("provider.base_url") {
 		cfg.Provider.BaseURL = override.Provider.BaseURL
 	}
 	if override.ThinkingTokens > 0 {
@@ -460,8 +658,17 @@ func loadProjectOverride(cfg *Config) error {
 	if override.SubagentMaxIterations > 0 {
 		cfg.SubagentMaxIterations = override.SubagentMaxIterations
 	}
+	// Saved sessions beyond max_sessions are deleted: a project value below
+	// the user's own would delete the user's sessions.
 	if override.MaxSessions != 0 {
-		cfg.MaxSessions = override.MaxSessions
+		cur := cfg.MaxSessions
+		if cur == 0 {
+			cur = DefaultMaxSessions
+		}
+		prunesMore := override.MaxSessions > 0 && (cur < 0 || override.MaxSessions < cur)
+		if !prunesMore || sensitive("max_sessions") {
+			cfg.MaxSessions = override.MaxSessions
+		}
 	}
 	// max_turn_minutes has no omitempty and 0 means "off": only the key's
 	// presence tells an explicit value from an absent one.
@@ -469,7 +676,18 @@ func loadProjectOverride(cfg *Config) error {
 		cfg.MaxTurnMinutes = override.MaxTurnMinutes
 		cfg.turnMinutesExplicit = true
 	}
+	cfg.untrustedFields = ignored
 	return nil
+}
+
+// restrictivePermissionMode reports whether mode asks at least as often as
+// the default mode.
+func restrictivePermissionMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "default", "plan":
+		return true
+	}
+	return false
 }
 
 func applyProfile(cfg *Config, prof *Profile) {
@@ -610,6 +828,43 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	// The applied profile was deleted this session (/profile delete of the
+	// active one). Its values are still in effect but have no profile to
+	// live in any more, and against loadedView they look unchanged, so
+	// neither the delete nor a later `/model <same value>` wrote them: the
+	// next start silently fell back to the top-level values. They go to
+	// the top level now, so the file says what is running.
+	if cfg.appliedProfile != "" && cfg.Profiles[cfg.appliedProfile] == nil {
+		for _, k := range profileOwnedKeys(cfg.appliedProf) {
+			delete(cfg.loadedView, k)
+		}
+		cfg.appliedProfile, cfg.appliedProf = "", nil
+	}
+	// A change to a field the applied profile sets goes into that profile;
+	// written at the top level, applyProfile overrode it again on the next
+	// start and /model or /api-key was silently lost.
+	write := view
+	// Recomputed whenever the profile was touched, not only when a key is
+	// still owned: clearing a profile-owned field to a value the profile
+	// cannot hold (budget 0) changed prof but left owned empty, so the
+	// profiles blob written was the one rendered before the change, and the
+	// next start applied the old value again.
+	if owned, touched := syncAppliedProfile(cfg, view); touched {
+		if view, err = rawView(cfg); err != nil {
+			return err
+		}
+		write = make(map[string]json.RawMessage, len(view))
+		for k, v := range view {
+			write[k] = v
+		}
+		for _, k := range owned {
+			if old, ok := cfg.loadedView[k]; ok {
+				write[k] = old
+			} else {
+				delete(write, k)
+			}
+		}
+	}
 	onDisk := map[string]json.RawMessage{}
 	data, err := os.ReadFile(path)
 	switch {
@@ -626,7 +881,7 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	mergeChanges(onDisk, cfg.loadedView, view)
+	mergeChanges(onDisk, cfg.loadedView, write)
 	out, err := json.MarshalIndent(onDisk, "", "  ")
 	if err != nil {
 		return err
@@ -639,6 +894,56 @@ func Save(cfg *Config) error {
 	}
 	cfg.loadedView = view
 	return nil
+}
+
+// syncAppliedProfile copies into the applied profile each top-level field that
+// changed since Load and that the profile sets, and returns those fields' keys:
+// the top level must keep its own value for them.
+//
+// touched reports whether the profile was changed at all; owned lists the
+// keys the profile still sets afterwards (kept at their loaded top-level
+// value in the file).
+func syncAppliedProfile(cfg *Config, view map[string]json.RawMessage) (owned []string, touched bool) {
+	if cfg.loadedView == nil || cfg.appliedProfile == "" {
+		return nil, false
+	}
+	prof := cfg.Profiles[cfg.appliedProfile]
+	if prof == nil {
+		return nil, false
+	}
+	changed := func(k string) bool { return !bytes.Equal(cfg.loadedView[k], view[k]) }
+	// A value the profile cannot hold (0 for max_budget_usd, "" for model)
+	// clears the field there and goes to the top level as well, so that is
+	// what the next start sees; hence sets is asked again after apply.
+	own := func(k string, sets func() bool, apply func()) {
+		if sets() && changed(k) {
+			apply()
+			touched = true
+			if sets() {
+				owned = append(owned, k)
+			}
+		}
+	}
+	own("model", func() bool { return prof.Model != "" }, func() { prof.Model = cfg.Model })
+	own("model_fast", func() bool { return prof.ModelFast != "" }, func() { prof.ModelFast = cfg.ModelFast })
+	own("provider", func() bool { return prof.Provider != nil }, func() {
+		// The profile's provider replaces cfg.Provider as a whole, so every
+		// provider field belongs to it, even ones the profile left empty.
+		p := cfg.Provider
+		p.APIKeys = nil
+		prof.Provider = &p
+	})
+	own("permission_mode", func() bool { return prof.PermissionMode != "" }, func() { prof.PermissionMode = cfg.PermissionMode })
+	own("max_budget_usd", func() bool { return prof.MaxBudgetUsd > 0 }, func() { prof.MaxBudgetUsd = cfg.MaxBudgetUsd })
+	own("thinking_tokens", func() bool { return prof.ThinkingTokens > 0 }, func() { prof.ThinkingTokens = cfg.ThinkingTokens })
+	own("debug", func() bool { return prof.Debug != nil }, func() { v := cfg.Debug; prof.Debug = &v })
+	own("verbose", func() bool { return prof.Verbose != nil }, func() { v := cfg.Verbose; prof.Verbose = &v })
+	own("system_prompt", func() bool { return prof.SystemPrompt != "" }, func() { prof.SystemPrompt = cfg.SystemPrompt })
+	own("max_iterations", func() bool { return prof.MaxIterations > 0 }, func() { prof.MaxIterations = cfg.MaxIterations })
+	own("max_turn_minutes", func() bool { return prof.MaxTurnMinutes != nil }, func() { v := cfg.MaxTurnMinutes; prof.MaxTurnMinutes = &v })
+	own("subagent_max_iterations", func() bool { return prof.SubagentMaxIterations > 0 }, func() { prof.SubagentMaxIterations = cfg.SubagentMaxIterations })
+	own("max_sessions", func() bool { return prof.MaxSessions != 0 }, func() { prof.MaxSessions = cfg.MaxSessions })
+	return owned, touched
 }
 
 // mergeChanges copies into dst every top-level field of cur that differs from
@@ -712,52 +1017,20 @@ func rawView(cfg *Config) (map[string]json.RawMessage, error) {
 	}
 	m["provider"] = providerRaw
 
+	// Each profile is written in full. It used to be rebuilt by hand from a
+	// field list that stopped at system_prompt, and Save replaces the whole
+	// "profiles" key, so any profile change wiped max_iterations,
+	// max_turn_minutes: 0 ... and unknown keys from every profile on disk.
 	if len(cfg.Profiles) > 0 {
-		profilesRaw := make(map[string]interface{}, len(cfg.Profiles))
+		profilesRaw := make(map[string]json.RawMessage, len(cfg.Profiles))
 		for name, prof := range cfg.Profiles {
-			profileVal := map[string]interface{}{}
-			if prof != nil {
-				if prof.Model != "" {
-					profileVal["model"] = prof.Model
-				}
-				if prof.ModelFast != "" {
-					profileVal["model_fast"] = prof.ModelFast
-				}
-				if prof.Provider != nil {
-					providerRaw, err := json.Marshal(rawProvider{
-						Name:    prof.Provider.Name,
-						APIKey:  prof.Provider.APIKey,
-						BaseURL: prof.Provider.BaseURL,
-					})
-					if err != nil {
-						return nil, err
-					}
-					var profProviderVal interface{}
-					_ = json.Unmarshal(providerRaw, &profProviderVal)
-					profileVal["provider"] = profProviderVal
-				}
-				if prof.PermissionMode != "" {
-					profileVal["permission_mode"] = prof.PermissionMode
-				}
-				if prof.MaxBudgetUsd > 0 {
-					profileVal["max_budget_usd"] = prof.MaxBudgetUsd
-				}
-				if prof.ThinkingTokens > 0 {
-					profileVal["thinking_tokens"] = prof.ThinkingTokens
-				}
-				// Round-trip an explicit false as well, so saving does not
-				// quietly discard a profile that deliberately turns these off.
-				if prof.Debug != nil {
-					profileVal["debug"] = *prof.Debug
-				}
-				if prof.Verbose != nil {
-					profileVal["verbose"] = *prof.Verbose
-				}
-				if prof.SystemPrompt != "" {
-					profileVal["system_prompt"] = prof.SystemPrompt
-				}
+			if prof == nil {
+				profilesRaw[name] = json.RawMessage("{}")
+				continue
 			}
-			profilesRaw[name] = profileVal
+			if profilesRaw[name], err = prof.rawJSON(); err != nil {
+				return nil, err
+			}
 		}
 		if m["profiles"], err = json.Marshal(profilesRaw); err != nil {
 			return nil, err
@@ -799,4 +1072,32 @@ func firstEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// profileOwnedKeys lists the config.json keys prof sets (the fields
+// applyProfile copies), as the keys syncAppliedProfile owns.
+func profileOwnedKeys(prof *Profile) []string {
+	if prof == nil {
+		return nil
+	}
+	var keys []string
+	add := func(k string, set bool) {
+		if set {
+			keys = append(keys, k)
+		}
+	}
+	add("model", prof.Model != "")
+	add("model_fast", prof.ModelFast != "")
+	add("provider", prof.Provider != nil)
+	add("permission_mode", prof.PermissionMode != "")
+	add("max_budget_usd", prof.MaxBudgetUsd > 0)
+	add("thinking_tokens", prof.ThinkingTokens > 0)
+	add("debug", prof.Debug != nil)
+	add("verbose", prof.Verbose != nil)
+	add("system_prompt", prof.SystemPrompt != "")
+	add("max_iterations", prof.MaxIterations > 0)
+	add("max_turn_minutes", prof.MaxTurnMinutes != nil)
+	add("subagent_max_iterations", prof.SubagentMaxIterations > 0)
+	add("max_sessions", prof.MaxSessions != 0)
+	return keys
 }

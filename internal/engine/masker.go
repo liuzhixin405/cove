@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
@@ -151,6 +152,58 @@ func (m *ToolOutputMasker) dedupeRepeatedResults(history []api.Message) ([]api.M
 		return history, 0, 0
 	}
 	return out, count, saved
+}
+
+// dedupeStubRe matches a stub dedupeRepeatedResults wrote and captures the
+// call it names.
+var dedupeStubRe = regexp.MustCompile(`^\[identical to earlier tool result for call (\S+) \(\d+ bytes\); content omitted\]$`)
+
+// restoreDedupedAcross is called before compaction drops, summarizes or
+// trims msgs[:boundary]. A dedupe stub at or after boundary whose original
+// lies before it would survive while its content does not: the model was
+// left with "identical to earlier tool result for call X" and no call X.
+// The first such stub gets the original's content back, and later stubs of
+// the same original are pointed at it. It works in place and returns how
+// many stubs it filled.
+func restoreDedupedAcross(msgs []api.Message, boundary int) int {
+	if boundary <= 0 || boundary >= len(msgs) {
+		return 0
+	}
+	before := map[string]int{} // tool_call_id -> index, for results before boundary
+	for i := 0; i < boundary; i++ {
+		if msgs[i].Role == "tool" && msgs[i].ToolCallID != "" {
+			before[msgs[i].ToolCallID] = i
+		}
+	}
+	if len(before) == 0 {
+		return 0
+	}
+	moved := map[string]string{} // lost call id -> call id of the stub now holding the content
+	filled := 0
+	for i := boundary; i < len(msgs); i++ {
+		if msgs[i].Role != "tool" {
+			continue
+		}
+		sm := dedupeStubRe.FindStringSubmatch(msgs[i].Content)
+		if sm == nil {
+			continue
+		}
+		id := sm[1]
+		if holder, ok := moved[id]; ok {
+			msgs[i].Content = strings.Replace(msgs[i].Content, "call "+id+" ", "call "+holder+" ", 1)
+			continue
+		}
+		j, ok := before[id]
+		if !ok {
+			continue
+		}
+		msgs[i].Content = msgs[j].Content
+		filled++
+		if msgs[i].ToolCallID != "" {
+			moved[id] = msgs[i].ToolCallID
+		}
+	}
+	return filled
 }
 
 // maskOldOutputs is the disk-masking pass of Mask.

@@ -541,12 +541,18 @@ func normalizeDirSig(dir string) string {
 	return strings.ToLower(d)
 }
 
-// ResetFingerprintHistory clears only the tool-call fingerprint history
-// (both exact and tool-only) without resetting the entire detector.
-// Used after injecting loop guidance so the model starts fresh.
+// ResetFingerprintHistory clears the tool-call fingerprint history (both
+// exact and tool-only) and the output-hash window without resetting the
+// entire detector (breakCount keeps counting guidance towards the hard
+// stop). Used after injecting loop guidance so the model starts fresh. The
+// output counts used to survive it: after the first Layer-2 warning every
+// further identical output was over the threshold again, and breakCount
+// reached the hard stop within a few outputs.
 func (ld *LoopDetector) ResetFingerprintHistory() {
 	ld.fpHistory = ld.fpHistory[:0]
 	ld.toolOnlyHistory = ld.toolOnlyHistory[:0]
+	ld.outHashes = ld.outHashes[:0]
+	ld.outCounts = make(map[string]int, ld.outWindow)
 	ld.toolOutputs = make(map[string][]string)
 	ld.toolDirs = make(map[string][]string)
 	ld.lastToolOnlyPattern = ""

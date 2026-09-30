@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/liuzhixin405/cove-agent/internal/engine"
@@ -60,6 +61,9 @@ type permissionRulePersister interface {
 	PermissionScope() string
 }
 
+// keyHintShown: the "how to answer" note was shown on a prompt already.
+var keyHintShown atomic.Bool
+
 // askToolPermission renders the approval box, waits for the answer line that
 // the REPL loop relays through repl.TakePermInputCh, and reports the decision.
 //
@@ -97,16 +101,26 @@ func askToolPermission(eng permissionRuleAdder, toolName string, input map[strin
 	// one step further in, so the block reads as one indented unit.
 	text := termui.PermissionPrompt(toolName, permissionPromptDescription(input, reason)) +
 		permissionDiffPreview(toolName, input) +
-		termui.PromptContentIndent + termui.Styled(termui.Bold, options) +
-		"   " + termui.Styled(termui.Dim, "（按键即答，无需回车；Ctrl+C 拒绝并停止任务）") + "\n"
+		termui.PromptContentIndent + termui.Styled(termui.Bold, options)
+	// How to answer is said on the first prompt of the process only; it
+	// used to follow every answer line.
+	if keyHintShown.CompareAndSwap(false, true) {
+		text += "   " + termui.Styled(termui.Dim, "（按键即答，无需回车；Ctrl+C 拒绝并停止任务）")
+	}
+	text += "\n"
 	if canRemember {
-		text += termui.PromptContentIndent + "    " + termui.Styled(termui.Dim, "记住范围: "+what) + "\n"
+		// what names the executable of the command, or the model-supplied
+		// MCP server and tool; it was printed raw, so a name carrying escape
+		// sequences could redraw the prompt it was being approved in.
+		text += termui.PromptContentIndent + "    " + termui.Styled(termui.Dim, "记住范围: "+render.VisibleControls(what)) + "\n"
 	}
 	// Rules were remembered but do not cover this line: say why, or the
-	// prompt reads as if remembering had not worked.
+	// prompt reads as if remembering had not worked. Dim: information, not
+	// a warning (it was yellow).
 	if ex, ok := eng.(permissionExplainer); ok {
 		if why := ex.ExplainPermissionGap(toolName, input); why != "" {
-			text += termui.PromptContentIndent + "    " + termui.Styled(termui.Yellow, why) + "\n"
+			// The reason can quote words of the command: shown the same way.
+			text += termui.PromptContentIndent + "    " + termui.Styled(termui.Dim, render.VisibleControls(why)) + "\n"
 		}
 	}
 
@@ -277,7 +291,10 @@ func permissionDiffPreview(toolName string, input map[string]any) string {
 	}
 	var sb strings.Builder
 	sb.WriteString(gutter + termui.Styled(termui.Dim, "改动 "+d.Summary()) + "\n")
-	for _, l := range strings.Split(render.ColorDiff(render.StripControls(strings.Join(lines, "\n")), false), "\n") {
+	// VisibleControls, not StripControls: stripping dropped an escape
+	// sequence with the text it swallowed (an OSC left open across lines hid
+	// them all), so the user approved content they had not been shown.
+	for _, l := range strings.Split(render.ColorDiff(render.VisibleControls(strings.Join(lines, "\n")), false), "\n") {
 		sb.WriteString(gutter + strings.ReplaceAll(l, "\t", "    ") + "\n")
 	}
 	if more > 0 {

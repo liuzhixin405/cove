@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,11 +150,19 @@ func autoSaveSession(eng *engine.Engine) {
 	}
 }
 
+// interruptedDraft is the unfinished request ~/.cove/interrupted.json keeps
+// for "继续": one that failed, or one whose task is still running (written at
+// task start, so a killed process leaves it behind). Cwd and SessionID say where it came from: the file is one per user,
+// and without them "继续" in another project, or in another session of the
+// same one, re-sent a request that belonged elsewhere
+// (usableInterruptedDraft).
 type interruptedDraft struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	Title       string    `json:"title"`
 	UserContent string    `json:"user_content"`
 	Error       string    `json:"error"`
+	Cwd         string    `json:"cwd,omitempty"`
+	SessionID   string    `json:"session_id,omitempty"`
 }
 
 func interruptedDraftPath() (string, error) {
@@ -189,6 +198,12 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func saveInterruptedDraft(msg api.Message, reqErr error) error {
+	return saveInterruptedDraftFor(msg, reqErr, "")
+}
+
+// saveInterruptedDraftFor saves msg as the interrupted draft of session
+// sessionID in the current project directory.
+func saveInterruptedDraftFor(msg api.Message, reqErr error, sessionID string) error {
 	p, err := interruptedDraftPath()
 	if err != nil {
 		return err
@@ -197,6 +212,8 @@ func saveInterruptedDraft(msg api.Message, reqErr error) error {
 		UpdatedAt:   time.Now(),
 		Title:       shortDesc(msg.Content),
 		UserContent: strings.TrimSpace(msg.Content),
+		Cwd:         session.NormalizeProjectDir(currentProjectDir()),
+		SessionID:   sessionID,
 	}
 	if d.Title == "" {
 		d.Title = "(未命名中断任务)"
@@ -228,6 +245,81 @@ func loadInterruptedDraft() (*interruptedDraft, error) {
 		return nil, fmt.Errorf("empty draft")
 	}
 	return &d, nil
+}
+
+// projectInterruptedDraft returns the interrupted draft when it was saved in
+// the current project, else nil. A draft saved before cove recorded its
+// directory belongs to no known project and is not offered either (like
+// legacy sessions in the per-project history); /history detail interrupted
+// still shows it, with the directory it came from.
+func projectInterruptedDraft() *interruptedDraft {
+	d, err := loadInterruptedDraft()
+	if err != nil || d == nil || !session.SameProjectDir(d.Cwd, currentProjectDir()) {
+		return nil
+	}
+	return d
+}
+
+// usableInterruptedDraft returns the draft "继续" may send in eng's current
+// state: one of this project, and — once a conversation is in progress —
+// of that conversation's session. An empty conversation may take the
+// project's draft (typed after a restart); continueTyped goes back to the
+// draft's session first.
+func usableInterruptedDraft(eng interface {
+	HasMessages() bool
+	SessionID() string
+}) *interruptedDraft {
+	d := projectInterruptedDraft()
+	if d == nil {
+		return nil
+	}
+	if eng != nil && eng.HasMessages() && d.SessionID != eng.SessionID() {
+		return nil
+	}
+	return d
+}
+
+// taskUnfinishedReason is the reason a draft carries while its task is still
+// running (saveTaskStartDraft). It is what the next start finds when the
+// process died mid-task, since no error ever came back to replace it.
+const taskUnfinishedReason = "任务未完成（cove 在任务运行中退出）"
+
+// saveTaskStartDraft records msg as the draft of session sessionID when its
+// task starts, before the model is called. The draft used to be written only
+// when the turn returned an error, so a crash, a power cut or kill -9 left
+// nothing: the next start offered no draft and "继续" resumed whichever saved
+// session scored best instead of the killed one. The draft is cleared again
+// when the task completes (clearInterruptedDraftFor).
+//
+// A draft of another project is left alone: the file is one per user, and a
+// task merely starting here says nothing about that project's interrupted
+// request (it is replaced only by a request that actually fails, as before).
+// One of this project is replaced — the user moved on to a new request, and
+// that request is the one to recover if this task dies.
+func saveTaskStartDraft(msg api.Message, sessionID string) {
+	if strings.TrimSpace(msg.Content) == "" {
+		return // an attachments-only message: loadInterruptedDraft would reject it
+	}
+	if d, err := loadInterruptedDraft(); err == nil && !session.SameProjectDir(d.Cwd, currentProjectDir()) {
+		return
+	}
+	_ = saveInterruptedDraftFor(msg, errors.New(taskUnfinishedReason), sessionID)
+}
+
+// clearInterruptedDraftFor removes the draft when it is session sessionID's
+// in the current project, the only draft a completed turn there settles.
+// Every completed turn used to remove the draft whatever it was, so answering
+// one question in another project (or in another session) deleted this
+// project's interrupted request before the user got back to it.
+func clearInterruptedDraftFor(sessionID string) error {
+	d, err := loadInterruptedDraft()
+	if err != nil || d == nil {
+		return nil
+	}
+	if !session.SameProjectDir(d.Cwd, currentProjectDir()) || d.SessionID != sessionID {
+		return nil
+	}
+	return clearInterruptedDraft()
 }
 
 func clearInterruptedDraft() error {
@@ -286,7 +378,8 @@ func handleHistory(eng *engine.Engine, all bool) {
 	}
 	historyPickAll = all
 	records, hidden := listHistoryRecords(store, currentProjectDir(), all)
-	draft, _ := loadInterruptedDraft()
+	// Only this project's draft: "继续" would not use another one's.
+	draft := projectInterruptedDraft()
 	if len(records) == 0 && draft == nil {
 		termui.PrintSafe("当前项目暂无历史。退出时会自动保存会话。\n")
 		printHiddenSessionsHint(hidden, "/history all")
@@ -650,6 +743,11 @@ func handleHistoryDetail(input string, eng *engine.Engine, all bool) {
 		termui.PrintSafe("\n  中断草稿详情\n")
 		termui.PrintSafe("  更新时间: %s\n", draft.UpdatedAt.Format("2006-01-02 15:04:05"))
 		termui.PrintSafe("  标题: %s\n", draft.Title)
+		if draft.Cwd != "" {
+			termui.PrintSafe("  目录: %s\n", draft.Cwd)
+		} else {
+			termui.PrintSafe("  目录: (旧版草稿，未记录目录；「继续」不会使用它)\n")
+		}
 		termui.PrintSafe("  错误: %s\n\n", shortDesc(draft.Error))
 		termui.PrintSafe("  用户输入:\n")
 		termui.PrintSafe("  %s\n\n", draft.UserContent)
@@ -767,8 +865,27 @@ func handleHistoryResumeMostRelevant(eng *engine.Engine) bool {
 	eng.ResumeSession(best.rec)
 	title := effectiveHistoryTitle(*best.rec)
 	userTurns := countUserTurns(best.rec.Messages)
-	termui.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", best.idx, title, userTurns, len(best.rec.Messages))
+	// The number is the one /history shows. best.idx counts the unfiltered
+	// project list, which also holds the empty and low-signal sessions
+	// /history hides, so "#3" here was not /history's #3.
+	if n := historyNumber(store, best.rec.ID); n > 0 {
+		termui.PrintSafe("已自动恢复最近有效任务 #%d: %s (%d 轮对话 / %d 条消息)\n", n, title, userTurns, len(best.rec.Messages))
+	} else {
+		termui.PrintSafe("已自动恢复最近有效任务: %s (%d 轮对话 / %d 条消息)\n", title, userTurns, len(best.rec.Messages))
+	}
 	return true
+}
+
+// historyNumber is id's number in the current project's /history list (1 is
+// the first), or 0 when that list does not show it.
+func historyNumber(store *session.Store, id string) int {
+	records, _ := listHistoryRecords(store, currentProjectDir(), false)
+	for i, r := range records {
+		if r.ID == id {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // listHistoryRecords returns the sessions /history (and the Ctrl+R picker)
@@ -1004,7 +1121,9 @@ func isSyntheticMessage(m api.Message) bool {
 
 // resumeDuplicateSession looks for an unfinished session of this project that
 // started with the same request and, when there is one, resumes it. It
-// returns the record and its /history number, or nil.
+// returns the record and its /history number (0 when /history does not list
+// it), or nil. The number used to be findDuplicateSession's position in the
+// unfiltered project list, which is not what /history numbers.
 func resumeDuplicateSession(eng *engine.Engine, input string) (*session.Record, int) {
 	if eng == nil || eng.Store() == nil {
 		return nil, 0
@@ -1025,10 +1144,10 @@ func resumeDuplicateSession(eng *engine.Engine, input string) (*session.Record, 
 		}
 		loaded = append(loaded, *rec)
 	}
-	rec, idx := findDuplicateSession(loaded, input)
+	rec, _ := findDuplicateSession(loaded, input)
 	if rec == nil {
 		return nil, 0
 	}
 	eng.ResumeSession(rec)
-	return rec, idx
+	return rec, historyNumber(eng.Store(), rec.ID)
 }

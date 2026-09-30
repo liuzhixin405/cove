@@ -28,23 +28,24 @@ func TestTodoRoundReminder(t *testing.T) {
 	eng.runtime.SetTodos(sampleTodos())
 
 	read := []toolResult{{Name: "read"}}
+	tr := &turn{}
 	for i := 1; i < todoReminderRounds; i++ {
-		if n := eng.todoRoundReminder(read); n != "" {
+		if n := eng.todoRoundReminder(tr, read); n != "" {
 			t.Fatalf("reminder after %d rounds: %q", i, n)
 		}
 	}
-	n := eng.todoRoundReminder(read)
+	n := eng.todoRoundReminder(tr, read)
 	if !strings.Contains(n, "<todo_list>") || !strings.Contains(n, "[>] todo-2. fix the tokenizer [high]") || !strings.Contains(n, "[ ] todo-3. add tests") {
 		t.Fatalf("reminder = %q", n)
 	}
-	if eng.todoRoundReminder(read) != "" {
+	if eng.todoRoundReminder(tr, read) != "" {
 		t.Fatal("the count did not restart after a reminder")
 	}
 
 	for i := 0; i < todoReminderRounds-2; i++ {
-		eng.todoRoundReminder(read)
+		eng.todoRoundReminder(tr, read)
 	}
-	eng.todoRoundReminder([]toolResult{{Name: "TodoWrite"}})
+	eng.todoRoundReminder(tr, []toolResult{{Name: "TodoWrite"}})
 	if eng.roundsSinceTodo != 0 {
 		t.Fatalf("todowrite did not restart the count: %d", eng.roundsSinceTodo)
 	}
@@ -55,17 +56,17 @@ func TestTodoRoundReminderQuietWhenAllDone(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	eng.runtime.SetTodos([]any{map[string]any{"content": "x", "status": "completed", "priority": "low"}})
 	for i := 0; i < 3*todoReminderRounds; i++ {
-		if n := eng.todoRoundReminder([]toolResult{{Name: "read"}}); n != "" {
+		if n := eng.todoRoundReminder(&turn{}, []toolResult{{Name: "read"}}); n != "" {
 			t.Fatalf("finished list reminded: %q", n)
 		}
 	}
 }
 
-// A turn ending with open items is asked about them once.
+// A turn ending with open items of a list it wrote is asked about them once.
 func TestTodoFinishNudge(t *testing.T) {
 	isolatedHome(t)
 	eng := newTestEngine(&mockProvider{})
-	tr := &turn{}
+	tr := &turn{todoTouched: true}
 	if eng.todoFinishNudge(tr) != "" {
 		t.Fatal("no list, yet a nudge")
 	}
@@ -116,7 +117,7 @@ func TestTodoListSurvivesCompaction(t *testing.T) {
 	eng := newTestEngine(&mockProvider{})
 	eng.runtime.SetTodos(sampleTodos())
 	eng.messages = []api.Message{{Role: "user", Content: "<original_request>x</original_request> summary"}, {Role: "assistant", Content: "ok"}}
-	eng.todoAfterCompaction()
+	eng.todoAfterCompaction(true)
 	if !strings.Contains(eng.messages[0].Content, "fix the tokenizer") {
 		t.Fatalf("summary lacks the task list: %q", eng.messages[0].Content)
 	}

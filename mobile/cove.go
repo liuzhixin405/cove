@@ -55,6 +55,50 @@ type MobileEngine struct {
 	messages    []api.Message
 	toolDefs    []ToolDef
 	initialized bool
+	// gen counts the conversations: Reset and Init start a new one. A
+	// ChatStream remembers the generation it started in and drops its
+	// results once that has changed, and genCancel stops the requests of
+	// the current generation. Reset used to clear messages while a run went
+	// on: its tool loop appended the tool results onto the fresh history,
+	// which then began with orphan "tool" messages that every later request
+	// was rejected for.
+	gen       uint64
+	genCtx    context.Context
+	genCancel context.CancelFunc
+}
+
+// errReset is what a run cut short by Reset reports.
+const errReset = "cancelled: conversation reset"
+
+// newGenerationLocked ends the current conversation: its runs are cancelled
+// and whatever they still produce is dropped. Callers hold e.mu.
+func (e *MobileEngine) newGenerationLocked() {
+	if e.genCancel != nil {
+		e.genCancel()
+	}
+	e.gen++
+	e.genCtx, e.genCancel = context.WithCancel(context.Background())
+}
+
+// generationLocked returns the current generation and its context, creating
+// them for an engine that was never reset. Callers hold e.mu.
+func (e *MobileEngine) generationLocked() (uint64, context.Context) {
+	if e.genCtx == nil {
+		e.genCtx, e.genCancel = context.WithCancel(context.Background())
+	}
+	return e.gen, e.genCtx
+}
+
+// appendIfCurrent appends msgs to the history when gen is still the current
+// generation and reports whether it did.
+func (e *MobileEngine) appendIfCurrent(gen uint64, msgs ...api.Message) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.gen != gen {
+		return false
+	}
+	e.messages = append(e.messages, msgs...)
+	return true
 }
 
 // Init initializes the engine with provider config. Must be called after New().
@@ -68,6 +112,7 @@ func (e *MobileEngine) Init(apiKey string, model string, provider string, baseUR
 		BaseURL: mobileBaseURL(provider, baseURL),
 	})
 
+	e.newGenerationLocked()
 	e.provider = prov
 	e.model = model
 	e.messages = make([]api.Message, 0)
@@ -86,10 +131,12 @@ func (e *MobileEngine) AddTool(name string, description string, inputSchema stri
 	})
 }
 
-// Reset clears conversation history.
+// Reset clears conversation history and stops a ChatStream still running
+// (it reports OnError with errReset).
 func (e *MobileEngine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.newGenerationLocked()
 	e.messages = make([]api.Message, 0)
 }
 
@@ -120,6 +167,10 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 		callback.OnError("engine not initialized, call Init() first")
 		return
 	}
+	gen, genCtx := e.generationLocked()
+	// Reset cancels genCtx, and with it this run's requests.
+	stop := context.AfterFunc(genCtx, cancel)
+	defer stop()
 	e.messages = append(e.messages, api.Message{Role: "user", Content: message})
 
 	toolDefs := e.buildAPIToolDefs()
@@ -140,7 +191,17 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 
 	fullResponse := &strings.Builder{}
 
+	// reset reports whether the conversation was reset under this run.
+	reset := func() bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.gen != gen
+	}
 	for iter := 0; iter < 30; iter++ {
+		if reset() {
+			callback.OnError(errReset)
+			return
+		}
 		if ctx.Err() != nil {
 			callback.OnError("timeout")
 			return
@@ -155,6 +216,10 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 			}
 		})
 		if err != nil {
+			if reset() {
+				callback.OnError(errReset)
+				return
+			}
 			callback.OnError(fmt.Sprintf("API error: %v", err))
 			return
 		}
@@ -183,19 +248,20 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 				ToolCalls:        make([]api.ToolCall, len(resp.ToolCalls)),
 			}
 			copy(assistantMsg.ToolCalls, resp.ToolCalls)
-			e.mu.Lock()
-			e.messages = append(e.messages, assistantMsg)
-			e.mu.Unlock()
+			if !e.appendIfCurrent(gen, assistantMsg) {
+				callback.OnError(errReset)
+				return
+			}
 
 			// Execute each tool via Kotlin callback, collect results
 			for _, tc := range resp.ToolCalls {
 				result := runTool(tc, callback)
-
-				e.mu.Lock()
-				e.messages = append(e.messages, api.Message{
+				if !e.appendIfCurrent(gen, api.Message{
 					Role: "tool", ToolCallID: tc.ID, Name: tc.Name, Content: result,
-				})
-				e.mu.Unlock()
+				}) {
+					callback.OnError(errReset)
+					return
+				}
 			}
 
 			// Update request with full history for next LLM iteration
@@ -207,9 +273,10 @@ func (e *MobileEngine) ChatStream(message string, timeoutSecs int, callback Stre
 		}
 
 		// Final text response - no tool calls
-		e.mu.Lock()
-		e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content})
-		e.mu.Unlock()
+		if !e.appendIfCurrent(gen, api.Message{Role: "assistant", Content: resp.Content}) {
+			callback.OnError(errReset)
+			return
+		}
 
 		callback.OnDone(fullResponse.String())
 		return

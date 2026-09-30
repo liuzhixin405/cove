@@ -170,7 +170,8 @@ func TestDefaultModeReadOnlyStillHonoursDenyAndAskRules(t *testing.T) {
 }
 
 // Mode tiers: auto additionally runs build/test commands unasked, but git
-// writes, installs and unknown commands still ask. Plan mode never runs bash.
+// writes, installs and unknown commands still ask. Plan mode runs read-only
+// lines only (it used to refuse every shell line, against the manual).
 func TestAutoModeTiers(t *testing.T) {
 	isolateHome(t)
 	bash := &permShellTool{name: "bash"}
@@ -192,8 +193,14 @@ func TestAutoModeTiers(t *testing.T) {
 	eng.SetPermissionMode(permission.Plan)
 	before := bash.callCount()
 	runShell(t, eng, "bash", "git status")
-	if bash.callCount() != before {
-		t.Fatal("plan mode ran bash")
+	if bash.callCount() != before+1 {
+		t.Fatal("plan mode refused a read-only shell line")
+	}
+	for _, cmd := range []string{"go build ./...", "git commit -m x", "rm -rf build"} {
+		runShell(t, eng, "bash", cmd)
+	}
+	if bash.callCount() != before+1 || p.count() != 4 {
+		t.Fatalf("plan mode ran a build/write line (%d calls) or prompted (%d)", bash.callCount()-before, p.count())
 	}
 }
 

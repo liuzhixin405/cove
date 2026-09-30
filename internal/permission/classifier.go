@@ -1,14 +1,166 @@
 package permission
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
-// simpleCommands is the tokenizer the classifier uses; a variable so a test
-// can count how often a line is split.
-var simpleCommands = safety.SimpleCommands
+// simpleCommands is the tokenizer the classifier uses (posix selects bash's
+// backslash rules, safety.SimpleCommandsPOSIX); a variable so a test can
+// count how often a line is split.
+var simpleCommands = func(command string, posix bool) []safety.SimpleCommand {
+	if posix {
+		return safety.SimpleCommandsPOSIX(command)
+	}
+	return safety.SimpleCommands(command)
+}
+
+// shellCommands splits command the way a shell of kind reads it. Under bash
+// (ShellPOSIX) backslash-newline continues the line and backslash quoting is
+// removed; the literal reading turned "find . -f\<NL>ls out.txt" (bash runs
+// find -fls out.txt) into two read-only commands. PowerShell and cmd keep the
+// backslash, a path character there. For the unknown kind "" either reading
+// may be the real one, so ok is false when the two differ: a line whose
+// meaning depends on backslash handling is not vouched for.
+func shellCommands(command string, kind ShellKind) (cmds []safety.SimpleCommand, ok bool) {
+	switch kind {
+	case ShellPOSIX:
+		return simpleCommands(command, true), true
+	case "":
+		literal := simpleCommands(command, false)
+		if strings.ContainsRune(command, '\\') && !sameCommands(literal, simpleCommands(command, true)) {
+			return literal, false
+		}
+		return literal, true
+	}
+	return simpleCommands(command, false), true
+}
+
+// anyReading lists the simple commands of command under both the literal and
+// the bash reading, for deny and ask rules: widening them to either reading
+// only ever refuses or asks more often. The readings differ where a
+// backslash or a brace is (bash keeps "stash@{0}" one word).
+func anyReading(command string) []safety.SimpleCommand {
+	out := safety.SimpleCommands(command)
+	if strings.ContainsAny(command, `\{}`) {
+		out = append(out, safety.SimpleCommandsPOSIX(command)...)
+	}
+	return out
+}
+
+// denyReading lists the commands deny and ask rules look at: every reading
+// of the line (anyReading), the same for the line without its invisible
+// format characters ("git<ZWSP> push"), and every command the line runs
+// indirectly (safety.NestedCommands: sh -c, eval, xargs, find -exec, a
+// heredoc piped into a shell ...). Only the top-level commands used to be
+// seen, so "bash -c 'git push'" passed a deny on git push.
+//
+// opaque reports a command whose program cannot be read from the text
+// ($GIT push, bash -c "$CMD", eval "$x", xargs "$tool", %TOOL% under cmd,
+// $env:TOOL or ${x} under PowerShell): it may be anything, so every deny and
+// ask rule applies to the line. Only nested commands used to count, so with
+// the whole tool allowed and a deny on git push, "$GIT push" and "G=git; $G
+// push" ran. Such a command is never read-only either (classifyWords refuses
+// a program word holding a $).
+func denyReading(command string) (cmds []safety.SimpleCommand, opaque bool) {
+	variants := []string{command}
+	if s := safety.StripFormatCharacters(command); s != command {
+		variants = append(variants, s)
+	}
+	for _, v := range variants {
+		top := anyReading(v)
+		cmds = append(cmds, top...)
+		nested := safety.NestedCommands(v)
+		cmds = append(cmds, nested...)
+		for _, c := range append(top, nested...) {
+			if variableProgram(c.Words) {
+				opaque = true
+			}
+		}
+	}
+	return cmds, opaque
+}
+
+// variableProgram reports a simple command whose program word, after the
+// runners in front (sudo, env, VAR=value), is built from a variable or a
+// substitution: $X, ${X}, $env:X, rm${IFS}-rf, %X%, a backtick. A lone "%"
+// is PowerShell's ForEach-Object alias, not a cmd variable, and a statement
+// that is only a member access ($_.Name in a ForEach-Object block) is a
+// PowerShell expression: both used to count only when nested, and must not
+// make every deny rule refuse "ls | % { $_.Name }".
+func variableProgram(words []string) bool {
+	w := safety.StripCommandRunners(words)
+	if len(w) == 0 {
+		return false
+	}
+	p := w[0]
+	switch {
+	case strings.ContainsRune(p, '`') || strings.Count(p, "%") >= 2:
+		return true
+	case !strings.Contains(p, "$"):
+		return false
+	case len(w) == 1 && psMemberAccess.MatchString(p):
+		return false
+	}
+	return true
+}
+
+// psMemberAccess is a PowerShell property read such as $_.Name or
+// $item.FullName.Length.
+var psMemberAccess = regexp.MustCompile(`^\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$`)
+
+// definesGitAlias reports a git invocation among words that defines an alias
+// (git -c alias.p=push p, git config alias.p push): the alias runs a
+// subcommand, or a shell command, that no rule on git's subcommands sees, so
+// every deny and ask rule on git applies.
+func definesGitAlias(words []string) bool {
+	w := safety.StripCommandRunners(words)
+	return len(w) > 0 && programName(w[0]) == "git" && safety.GitDefinesAlias(w[1:])
+}
+
+// literalUNC reports a UNC path (\\host\share) in the literal reading of
+// command. Bash's reading turns \\evil\x into \evilx, but the line may not
+// reach bash as typed (Git Bash users write UNC paths this way), so a word
+// that names another host in either reading is refused.
+func literalUNC(command string) bool {
+	if !strings.Contains(command, `\\`) {
+		return false
+	}
+	for _, sc := range safety.SimpleCommands(command) {
+		for _, w := range sc.Words {
+			if isUNCPath(w) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameCommands(a, b []safety.SimpleCommand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !sameStrings(a[i].Words, b[i].Words) || !sameStrings(a[i].Redirects, b[i].Redirects) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 type CmdCategory int
 
@@ -65,6 +217,7 @@ func NewClassifier() *Classifier { return &Classifier{} }
 // command, a redirect or a substitution is CatUnknown here; ClassifyLine is
 // the entry point that looks at every command of a compound line.
 func (c *Classifier) Classify(cmd string) CmdCategory {
+	hostile := safety.HasHostileCharacters(cmd)
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return CatSafe
@@ -72,11 +225,11 @@ func (c *Classifier) Classify(cmd string) CmdCategory {
 	if c.isDangerous(cmd) {
 		return CatDangerous
 	}
-	if c.hasShellControlOperator(cmd) {
+	if hostile || c.hasShellControlOperator(cmd) {
 		return CatUnknown
 	}
-	simple := simpleCommands(cmd)
-	if len(simple) == 0 {
+	simple, ok := shellCommands(cmd, "")
+	if !ok || len(simple) == 0 {
 		return CatUnknown
 	}
 	return c.classifyWords(simple[0].Words)
@@ -104,6 +257,7 @@ func (c *Classifier) ClassifyLineFor(command string, kind ShellKind) CmdCategory
 // tokenized (nil when it decided before tokenizing), so IsReadOnlyLineFor
 // can look at them without splitting the line a second time.
 func (c *Classifier) classifyLine(command string, kind ShellKind) (CmdCategory, []safety.SimpleCommand) {
+	hostile := safety.HasHostileCharacters(command) // before trimming: a trailing lone CR counts
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return CatUnknown, nil
@@ -111,11 +265,19 @@ func (c *Classifier) classifyLine(command string, kind ShellKind) (CmdCategory, 
 	if c.isDangerous(command) {
 		return CatDangerous, nil
 	}
+	// A lone CR, FF, VT, a Unicode space or separator, a control or an
+	// invisible format character: PowerShell splits commands or words where
+	// the tokenizer may not, and the person may not see it. Such a line is
+	// never read-only or auto-approved ("ls<CR>Remove-Item ..." was a
+	// read-only ls).
+	if hostile {
+		return CatUnknown, nil
+	}
 	if hasSubstitution(command) || maybePowerShell(kind) && (hasUnquotedBrace(command) || hasTypographicQuote(command)) {
 		return CatUnknown, nil
 	}
-	simple := simpleCommands(command)
-	if len(simple) == 0 {
+	simple, ok := shellCommands(command, kind)
+	if !ok || len(simple) == 0 || kind == ShellPOSIX && literalUNC(command) {
 		return CatUnknown, nil
 	}
 	trustQuotes := quotingTrusted(command, kind)
@@ -125,6 +287,16 @@ func (c *Classifier) classifyLine(command string, kind ShellKind) (CmdCategory, 
 		if len(sc.Words) > 0 && !writesFile(sc.Redirects) && literalWords(sc, kind, trustQuotes) &&
 			(!maybePowerShell(kind) || !powerShellIterator(sc.Words[0])) {
 			cat = c.classifyWords(sc.Words)
+			if maybePowerShell(kind) && powerShellFetch(sc.Words[0]) {
+				// Under PowerShell curl/wget are Invoke-WebRequest and only its
+				// allowlist applies; under the unknown kind both must pass.
+				switch {
+				case !powerShellFetchReadOnly(sc.Words[1:]):
+					cat = CatUnknown
+				case kind == ShellPowerShell && cat == CatUnknown && isCurlOrWget(sc.Words[0]):
+					cat = CatSafe
+				}
+			}
 		}
 		if riskRank(cat) > riskRank(worst) {
 			worst = cat
@@ -298,6 +470,15 @@ func (c *Classifier) hasShellControlOperator(cmd string) bool {
 // contacts another host, and on Windows sends the user's credentials to it,
 // so a "read" of it is not a local read. A leading separator pair followed by
 // a space or another separator (a "// TODO" grep pattern) is not a host name.
+//
+// Only the word start and the text after the first '=' used to be checked,
+// so PowerShell's other ways of starting a path inside a word ran unasked:
+// "-Path:\\host\share" (parameter:value), "FileSystem::\\host\share" and
+// "Microsoft.PowerShell.Core\FileSystem::\\host\share" (provider-qualified),
+// ".,\\host\share" (an array argument). A path may now begin at the word
+// start or after any '=', ',' or '(', after "::", after a ':' that does not
+// end a drive letter ("C:\\Users" in bash's doubled spelling is local), and
+// "//host" after a -Parameter: (a URL's "https://" is not one).
 func isUNCPath(word string) bool {
 	check := func(w string) bool {
 		w = strings.Trim(w, `"'`)
@@ -313,7 +494,47 @@ func isUNCPath(word string) bool {
 	if check(word) {
 		return true
 	}
-	if i := strings.IndexByte(word, '='); i >= 0 && check(word[i+1:]) {
+	for i := 0; i < len(word); i++ {
+		rest := word[i+1:]
+		switch word[i] {
+		case '=', ',', '(':
+			if check(rest) {
+				return true
+			}
+		case ':':
+			switch {
+			case i > 0 && word[i-1] == ':':
+				if check(rest) {
+					return true
+				}
+			case strings.HasPrefix(strings.TrimLeft(rest, `"'`), `\\`):
+				if !driveLetterBefore(word, i) && check(rest) {
+					return true
+				}
+			case strings.HasPrefix(word, "-") && check(rest):
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// driveLetterBefore reports whether the ':' at word[i] ends a drive letter:
+// a single ASCII letter at the word start or after a separator ("C:",
+// "-Path:C:", "a,D:").
+func driveLetterBefore(word string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	c := word[i-1] | 0x20
+	if c < 'a' || c > 'z' {
+		return false
+	}
+	if i == 1 {
+		return true
+	}
+	switch word[i-2] {
+	case ':', '=', ',', '(', '"', '\'':
 		return true
 	}
 	return false
@@ -358,27 +579,36 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 		}
 		return CatUnknown
 	case "date":
-		for _, a := range args {
-			if a == "-s" || strings.HasPrefix(a, "--set") {
-				return CatUnknown
-			}
-		}
-		return CatSafe
+		return classifyDate(args)
 	case "hostname":
 		if len(args) == 0 {
 			return CatSafe
 		}
 		return CatUnknown
 	case "ag":
+		// --pager runs a program. ag parses with getopt_long, which takes any
+		// unambiguous prefix, so "--pag=x" is --pager too; only the exact
+		// spelling used to be refused. Every prefix down to "--p" asks (the
+		// shorter ones are ambiguous and ag rejects them anyway).
 		for _, a := range args {
-			if a == "--pager" || strings.HasPrefix(a, "--pager=") {
+			if a == "--" {
+				break
+			}
+			if name := optionName(a); len(name) >= len("--p") && strings.HasPrefix("--pager", name) {
 				return CatUnknown
 			}
 		}
 		return CatSafe
 	case "rg":
+		// --pre and --hostname-bin run a program (the latter was missed).
+		// ripgrep's parser (lexopt; clap before 14) takes no abbreviations,
+		// so the exact names are enough.
 		for _, a := range args {
-			if a == "--pre" || strings.HasPrefix(a, "--pre=") || strings.HasPrefix(a, "--pre-glob") {
+			if a == "--" {
+				break
+			}
+			switch optionName(a) {
+			case "--pre", "--pre-glob", "--hostname-bin":
 				return CatUnknown
 			}
 		}
@@ -396,8 +626,17 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 		}
 		return CatSafe
 	case "file":
+		// -C/--compile writes a .mgc file. Only the exact spellings used to
+		// be refused; GNU file takes getopt_long abbreviations ("--comp")
+		// and grouped short options ("-zC").
 		for _, a := range args {
-			if a == "-C" || a == "--compile" {
+			if a == "--" {
+				break
+			}
+			if name := optionName(a); strings.HasPrefix(a, "--") && len(name) >= len("--c") && strings.HasPrefix("--compile", name) {
+				return CatUnknown
+			}
+			if len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a[1:], 'C') {
 				return CatUnknown
 			}
 		}
@@ -406,6 +645,10 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 		return classifyFind(args)
 	case "go", "cargo", "rustc", "javac", "tsc", "make", "cmake", "ninja", "bazel", "meson":
 		return c.classifyBuild(name, args)
+	case "dotnet":
+		return classifyDotnet(args)
+	case "pytest", "gofmt":
+		return classifyTestTool(name, args)
 	case "npm", "yarn", "pnpm", "pip", "pip3", "gem", "composer", "nuget", "apt", "apt-get",
 		"yum", "dnf", "brew", "choco", "winget", "pacman", "zypper", "snap", "flatpak":
 		return c.classifyPackageManager(name, args)
@@ -416,6 +659,51 @@ func (c *Classifier) classifyWords(words []string) CmdCategory {
 	default:
 		return CatUnknown
 	}
+}
+
+// classifyDate allows date only when it cannot set the clock. The old check
+// matched "-s" and "--set..." as whole words, missing the abbreviation
+// "--s"/"--se" (GNU getopt accepts unambiguous prefixes) and -s grouped with
+// other letters ("-us"). Now any short group holding s, any prefix of --set,
+// and any operand other than a +FORMAT (GNU date MMDDhhmm[[CC]YY] sets the
+// clock) is CatUnknown.
+func classifyDate(args []string) CmdCategory {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--"):
+			name, _, hasValue := strings.Cut(a, "=")
+			if len(name) >= len("--s") && strings.HasPrefix("--set", name) {
+				return CatUnknown
+			}
+			if !hasValue && (name == "--date" || name == "--file" || name == "--reference") {
+				i++ // the value
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			// Letters are read as getopt does: u R j n are flags, d f r v
+			// take the rest of the group or the next word as their value,
+			// I takes an optional glued value. Anything else (s included)
+			// is CatUnknown.
+		letters:
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 'u', 'R', 'j', 'n':
+				case 'I':
+					break letters
+				case 'd', 'f', 'r', 'v':
+					if j == len(a)-1 {
+						i++ // the value is the next word
+					}
+					break letters
+				default:
+					return CatUnknown
+				}
+			}
+		case !strings.HasPrefix(a, "+"):
+			return CatUnknown
+		}
+	}
+	return CatSafe
 }
 
 // classifyFind allows find only without its actions that delete, run
@@ -464,100 +752,195 @@ func (c *Classifier) classifyNetworking(cmd string) CmdCategory {
 }
 
 func (c *Classifier) classifyNetworkingWords(fields []string) CmdCategory {
-	// Short flags are matched CASE-SENSITIVELY, on tokenized arguments.
+	// An allowlist, not a list of known-bad options: the old denylist rated
+	// every option it had not heard of as a read, so "curl --json @~/.ssh/id_rsa
+	// URL" uploaded a key, "curl -XDELETE URL" (method glued to -X) deleted, and
+	// -D, --trace, -c and --stderr wrote files — all CatSafe, all run unasked
+	// in auto mode. Now every option must be a known read-only one, spelled
+	// exactly (curl's unambiguous abbreviations fail closed), and the method
+	// must be GET or HEAD.
 	//
-	// Case matters: for curl, -F is a multipart form upload while -f is
-	// --fail, and -T is an upload while -t is unrelated. Lowercasing the
-	// command first (as an earlier version of this function did) conflated
-	// them, so an ordinary read-only `curl -f <url>` was escalated to a
-	// confirmation prompt. Tokenizing matters too: a substring scan for " -d "
-	// also fires on a URL or a quoted body that happens to contain it.
+	// Short flags are matched CASE-SENSITIVELY on tokenized arguments: for
+	// curl -F is a form upload while -f is --fail, -T an upload while -t is
+	// unrelated.
 	if len(fields) == 0 {
 		return CatUnknown
 	}
+	spec := curlReadOnly
+	wget := programName(fields[0]) == "wget"
+	if wget {
+		spec = wgetReadOnly
+	}
 	args := fields[1:]
-
-	hasArg := func(want ...string) bool {
-		for _, a := range args {
-			// Split "--data=x" / "--output=x" at the "=" so both spellings match.
-			name := a
-			if i := strings.IndexByte(name, '='); i > 0 {
-				name = name[:i]
+	// wget writes a file by default, so it is only a read with an explicit
+	// stdout target (-O -).
+	toStdout := false
+	value := func(opt, v string) bool {
+		switch opt {
+		case "X", "--request":
+			m := strings.ToUpper(v)
+			return m == "GET" || m == "HEAD"
+		case "o", "O", "--output", "--output-document":
+			// Only stdout: any other target writes a file.
+			if v != "-" {
+				return false
 			}
-			for _, w := range want {
-				if name == w {
-					return true
+			toStdout = true
+			return true
+		case "H", "--header":
+			// "-H @file" reads headers from a file and sends them.
+			return !strings.HasPrefix(v, "@")
+		}
+		return true
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--" || a == "-":
+			return CatUnknown
+		case strings.HasPrefix(a, "--"):
+			name, v, hasValue := strings.Cut(a, "=")
+			switch {
+			case spec.longFlags[name] && !hasValue:
+			case spec.longValues[name]:
+				if !hasValue {
+					if i+1 >= len(args) {
+						return CatUnknown
+					}
+					i++
+					v = args[i]
 				}
+				if !value(name, v) {
+					return CatUnknown
+				}
+			default:
+				return CatUnknown
+			}
+		case strings.HasPrefix(a, "-"):
+			group := a[1:]
+			for j := 0; j < len(group); j++ {
+				letter := group[j : j+1]
+				if strings.Contains(spec.shortFlags, letter) {
+					continue
+				}
+				if !strings.Contains(spec.shortValues, letter) {
+					return CatUnknown
+				}
+				// A value-taking letter ends the group: the rest of it, or the
+				// next word, is its value (-XGET, -m5, -qO-, -X GET).
+				v := group[j+1:]
+				if v == "" {
+					if i+1 >= len(args) {
+						return CatUnknown
+					}
+					i++
+					v = args[i]
+				}
+				if !value(letter, v) {
+					return CatUnknown
+				}
+				break
 			}
 		}
-		return false
 	}
-	hasArgPrefix := func(prefix string) bool {
-		for _, a := range args {
-			if strings.HasPrefix(a, prefix) {
-				return true
-			}
-		}
-		return false
-	}
-	// method returns the value of -X/--request, uppercased ("" when absent).
-	method := ""
-	for i, a := range args {
-		if (a == "-X" || a == "--request") && i+1 < len(args) {
-			method = strings.ToUpper(args[i+1])
-			break
-		}
-		if strings.HasPrefix(a, "--request=") {
-			method = strings.ToUpper(strings.TrimPrefix(a, "--request="))
-			break
-		}
-	}
-
-	// Any explicit non-read method needs confirmation.
-	switch method {
-	case "POST", "PUT", "PATCH", "DELETE":
+	if wget && !toStdout {
 		return CatUnknown
 	}
-
-	// Request-body and upload flags mean data is being sent outward, whatever
-	// the method ends up being (curl infers POST from -d/-F/--data-*).
-	if hasArg("-d", "--data", "-F", "--form", "-T", "--upload-file",
-		"--post-data", "--post-file", "--data-binary", "--data-raw",
-		"--data-urlencode", "--form-string") || hasArgPrefix("--data") {
-		return CatUnknown
-	}
-	// Disabling certificate verification turns a fetch into an untrusted one.
-	if hasArg("-k", "--insecure", "--no-check-certificate") {
-		return CatUnknown
-	}
-
-	// Writing the response to disk needs confirmation. "-o -" / "-O -" targets
-	// stdout, which is still a read.
-	outputToStdout := false
-	for i, a := range args {
-		if (a == "-o" || a == "-O" || a == "--output") && i+1 < len(args) && args[i+1] == "-" {
-			outputToStdout = true
-			break
-		}
-	}
-	if !outputToStdout {
-		if hasArg("-o", "-O", "--output", "--remote-name", "--output-dir") {
-			return CatUnknown
-		}
-		// wget writes a file by default, so without an explicit stdout target
-		// it is never a pure read.
-		if base := strings.ToLower(fields[0]); strings.HasSuffix(base, "wget") ||
-			strings.HasSuffix(base, "wget.exe") {
-			return CatUnknown
-		}
-	}
-
-	switch method {
-	case "GET", "HEAD", "OPTIONS":
-		return CatSafe
-	}
-	// A plain `curl <url>` prints to stdout and is a read.
 	return CatSafe
+}
+
+// netReadOnly lists the options of a fetch tool that keep it a read: flags
+// without a value and options taking one, short letters and long names. A
+// value is checked further in classifyNetworkingWords (method, output target,
+// header file).
+type netReadOnly struct {
+	shortFlags, shortValues string
+	longFlags, longValues   map[string]bool
+}
+
+// curlReadOnly: output shaping, redirects, timeouts, retries, protocol
+// versions, headers. Not in it, among others: -d/--data*/--json/-F/-T/
+// --upload-file/--url-query (send data), -o/-O/-D/-c/--trace*/--stderr/
+// --remote-name* (write files; -o - is stdout), -K/--config (options from a
+// file), -b/-u/-x (cookies, credentials, proxy), -w (%output{} writes a file),
+// -k/--insecure.
+var curlReadOnly = netReadOnly{
+	shortFlags:  "sSfLIiv46gGNq0123#jl",
+	shortValues: "XoHAemr",
+	longFlags: map[string]bool{
+		"--silent": true, "--show-error": true, "--fail": true, "--fail-with-body": true,
+		"--location": true, "--head": true, "--include": true, "--verbose": true,
+		"--compressed": true, "--globoff": true, "--get": true, "--no-buffer": true,
+		"--no-progress-meter": true, "--progress-bar": true, "--ipv4": true, "--ipv6": true,
+		"--http1.0": true, "--http1.1": true, "--http2": true, "--http2-prior-knowledge": true,
+		"--http3": true, "--tlsv1": true, "--tlsv1.0": true, "--tlsv1.1": true, "--tlsv1.2": true,
+		"--tlsv1.3": true, "--list-only": true,
+	},
+	longValues: map[string]bool{
+		"--request": true, "--output": true, "--header": true, "--user-agent": true,
+		"--referer": true, "--max-time": true, "--connect-timeout": true, "--retry": true,
+		"--retry-delay": true, "--retry-max-time": true, "--range": true, "--max-redirs": true,
+		"--url": true,
+	},
+}
+
+// wgetReadOnly: only a fetch printed to stdout (-O -), quiet or verbose.
+var wgetReadOnly = netReadOnly{
+	shortFlags:  "qvS",
+	shortValues: "OUT",
+	longFlags: map[string]bool{
+		"--quiet": true, "--verbose": true, "--server-response": true, "--no-verbose": true,
+	},
+	longValues: map[string]bool{
+		"--output-document": true, "--user-agent": true, "--timeout": true, "--tries": true,
+		"--header": true,
+	},
+}
+
+// powerShellFetch names the programs a PowerShell line may run as
+// Invoke-WebRequest or Invoke-RestMethod; see powerShellFetchReadOnly.
+func powerShellFetch(word string) bool {
+	switch programName(word) {
+	case "curl", "wget", "iwr", "irm", "invoke-webrequest", "invoke-restmethod":
+		return true
+	}
+	return false
+}
+
+// isCurlOrWget reports the two fetch aliases that may be rated CatSafe; iwr,
+// irm and the cmdlets always ask.
+func isCurlOrWget(word string) bool {
+	switch programName(word) {
+	case "curl", "wget":
+		return true
+	}
+	return false
+}
+
+// powerShellFetchReadOnly is the test for curl and wget under PowerShell,
+// where Windows PowerShell 5.1 aliases both to Invoke-WebRequest: -Method,
+// -InFile, -Body and -OutFile mean nothing to curl's rules. Only one URL,
+// given bare or with -Uri, and -UseBasicParsing make it a GET that prints the
+// response; everything else (curl options included, which Invoke-WebRequest
+// would read as its own parameters) asks.
+func powerShellFetchReadOnly(args []string) bool {
+	urls := 0
+	for i := 0; i < len(args); i++ {
+		switch a := strings.ToLower(args[i]); {
+		case a == "-usebasicparsing":
+		case a == "-uri":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return false
+			}
+			i++
+			urls++
+		case strings.HasPrefix(a, "-"):
+			return false
+		default:
+			urls++
+		}
+	}
+	return urls == 1
 }
 
 func (c *Classifier) ShouldAutoApprove(cmd string) bool {

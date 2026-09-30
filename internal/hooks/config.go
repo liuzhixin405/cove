@@ -29,7 +29,7 @@ const defaultConfigHookTimeout = 60 * time.Second
 // from a BeforeTool hook blocks the tool call.
 type HookDef struct {
 	Event   HookEvent `json:"-"`
-	Matcher string    `json:"matcher,omitempty"` // regexp on the whole tool name; empty or "*" = all
+	Matcher string    `json:"matcher,omitempty"` // regexp on the whole tool name, case-insensitive, Claude Code names accepted (see claudeCodeToolNames); empty or "*" = all
 	Command string    `json:"command"`
 	Timeout int       `json:"timeout,omitempty"` // seconds; 0 = defaultConfigHookTimeout
 	Async   bool      `json:"async,omitempty"`   // fire-and-forget; cannot block

@@ -68,9 +68,20 @@ func (s Shell) Describe() string {
 // runs, and git status runs unasked as a read-only command. A
 // GIT_CONFIG_COUNT already in base is extended, so config the user passes
 // that way still applies.
+//
+// safe.bareRepository=explicit is set the same way. A repository cannot
+// commit a .git directory, but it can ship a bare repository (HEAD, config,
+// objects/ in a plain directory); "cd that/dir && git status" then ran
+// under that directory's config, core.fsmonitor aside (core.pager,
+// diff.external, a hooks path...). With explicit, git only uses a bare
+// repository named with --git-dir or GIT_DIR. Hooks are left alone on
+// purpose: a clone's .git/config and .git/hooks are created locally, not
+// taken from the remote, and disabling core.hooksPath would skip the
+// project's own pre-commit checks on the agent's commits.
 func Env(base []string) []string {
 	n := gitConfigCount(base)
 	idx := strconv.Itoa(n)
+	idx2 := strconv.Itoa(n + 1)
 	return append(append([]string(nil), base...),
 		"GIT_EDITOR=true",
 		"GIT_SEQUENCE_EDITOR=true",
@@ -81,9 +92,11 @@ func Env(base []string) []string {
 		"TERM=dumb",
 		"CLICOLOR=0",
 		"FORCE_COLOR=0",
-		"GIT_CONFIG_COUNT="+strconv.Itoa(n+1),
+		"GIT_CONFIG_COUNT="+strconv.Itoa(n+2),
 		"GIT_CONFIG_KEY_"+idx+"=core.fsmonitor",
 		"GIT_CONFIG_VALUE_"+idx+"=false",
+		"GIT_CONFIG_KEY_"+idx2+"=safe.bareRepository",
+		"GIT_CONFIG_VALUE_"+idx2+"=explicit",
 	)
 }
 

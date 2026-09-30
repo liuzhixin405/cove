@@ -127,8 +127,11 @@ func (e *Engine) resetConversationState() {
 	e.steerMu.Unlock()
 
 	e.fileMu.Lock()
-	e.fileHistory = nil
-	e.turnFilesChanged, e.turnCheckpointed = false, false
+	// Emptied, not nil: trackFileChanges assigns into it, and the nil map
+	// this used to leave made every write or edit after /new or /resume
+	// panic, reporting a file that had been written as a failed call.
+	e.fileHistory = map[string]bool{}
+	e.turnFilesChanged, e.turnCheckpointed, e.turnRanGit = false, false, false
 	e.turnChangedFiles = nil
 	e.fileMu.Unlock()
 

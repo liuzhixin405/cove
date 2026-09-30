@@ -9,7 +9,10 @@ import (
 // a write did (the tool block's expanded form, the permission preview).
 type LineDiff struct {
 	// Text is the diff: "@@ -a,b +c,d @@" hunks with 3 lines of context,
-	// "-" and "+" lines. Empty when the texts are equal.
+	// "-" and "+" lines. Empty only when the texts are equal. A line that
+	// ends its text without a newline is followed by "\ No newline at end of
+	// file", as in diff -u, and a change of line endings (CRLF/LF) the lines
+	// cannot show is stated in a leading "\ Line endings changed..." line.
 	Text string
 	// Added and Removed count the "+" and "-" lines.
 	Added, Removed int
@@ -33,7 +36,8 @@ func Diff(old, newText string) LineDiff {
 	if old == newText {
 		return LineDiff{}
 	}
-	a, b := splitDiffLines(old), splitDiffLines(newText)
+	a, crA := splitDiffLines(old)
+	b, crB := splitDiffLines(newText)
 
 	// Common prefix and suffix need no table.
 	pre := 0
@@ -53,7 +57,16 @@ func Diff(old, newText string) LineDiff {
 		ai, bi := len(a)-suf+i, len(b)-suf+i
 		ops = append(ops, diffOp{kind: ' ', text: a[ai], ai: ai, bi: bi})
 	}
-	return formatHunks(ops)
+	d := formatHunks(ops)
+	// The note goes first so a preview cut to its first lines still shows it.
+	if note := lineEndingNote(ops, a, b, crA, crB); note != "" {
+		if d.Text == "" {
+			d.Text = note
+		} else {
+			d.Text = note + "\n" + d.Text
+		}
+	}
+	return d
 }
 
 type diffOp struct {
@@ -138,8 +151,16 @@ func formatHunks(ops []diffOp) LineDiff {
 		for _, op := range ops[start:stop] {
 			switch op.kind {
 			case ' ':
+				// Each side takes its start from its own first line. Both
+				// used to be set together whenever the old side had none
+				// yet, so a hunk opening with an addition had the new side's
+				// start overwritten by the context line after it: prepending
+				// a line gave "+2,3" instead of "+1,3".
 				if aStart < 0 {
-					aStart, bStart = op.ai, op.bi
+					aStart = op.ai
+				}
+				if bStart < 0 {
+					bStart = op.bi
 				}
 				aLen++
 				bLen++
@@ -157,8 +178,11 @@ func formatHunks(ops []diffOp) LineDiff {
 				d.Added++
 			}
 			body.WriteByte(op.kind)
-			body.WriteString(op.text)
+			body.WriteString(strings.TrimSuffix(op.text, "\n"))
 			body.WriteByte('\n')
+			if !strings.HasSuffix(op.text, "\n") {
+				body.WriteString(noNewlineMarker + "\n")
+			}
 		}
 		if aStart < 0 {
 			aStart = hunkAnchor(ops, start, true)
@@ -196,12 +220,81 @@ func hunkAnchor(ops []diffOp, from int, old bool) int {
 	return 0
 }
 
-func splitDiffLines(s string) []string {
-	if s == "" {
-		return nil
+// splitDiffLines splits s into lines that keep their "\n", so a last line
+// without one compares unequal to the same text with one, as in diff -u. A
+// CRLF ending is compared as "\n" (a converted file would otherwise differ on
+// every line) and recorded in crlf instead, for lineEndingNote.
+//
+// It used to normalise CRLF and trim the final newline before splitting, so
+// "a\n" → "a", or a file converted between LF and CRLF, gave an empty diff and
+// the permission prompt reported the write as "内容不变".
+func splitDiffLines(s string) (lines []string, crlf []bool) {
+	for len(s) > 0 {
+		n := strings.IndexByte(s, '\n')
+		if n < 0 {
+			lines = append(lines, s)
+			crlf = append(crlf, false)
+			break
+		}
+		line := s[:n+1]
+		s = s[n+1:]
+		cr := strings.HasSuffix(line, "\r\n")
+		if cr {
+			line = line[:len(line)-2] + "\n"
+		}
+		lines = append(lines, line)
+		crlf = append(crlf, cr)
 	}
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+	return lines, crlf
+}
+
+// noNewlineMarker follows a line that ends the text without a newline.
+const noNewlineMarker = `\ No newline at end of file`
+
+// lineEndingNote describes a change of line endings that the diff's lines do
+// not show ("" when there is none): the lines are compared with CRLF read as
+// LF, so a line whose only change is its ending is context. The note is
+// written when such a context line exists or when the files' overall styles
+// differ.
+func lineEndingNote(ops []diffOp, a, b []string, crA, crB []bool) string {
+	changed := 0
+	for _, op := range ops {
+		if op.kind == ' ' && crA[op.ai] != crB[op.bi] {
+			changed++
+		}
+	}
+	oldStyle, newStyle := lineEndingStyle(a, crA), lineEndingStyle(b, crB)
+	if oldStyle == "" || newStyle == "" || (changed == 0 && oldStyle == newStyle) {
+		return ""
+	}
+	if changed == 0 {
+		return fmt.Sprintf(`\ Line endings changed: %s → %s`, oldStyle, newStyle)
+	}
+	return fmt.Sprintf(`\ Line endings changed on %d unchanged line(s): %s → %s`, changed, oldStyle, newStyle)
+}
+
+// lineEndingStyle is "CRLF", "LF" or "mixed CRLF/LF" for the terminated lines,
+// "" when no line ends in a newline.
+func lineEndingStyle(lines []string, crlf []bool) string {
+	var cr, lf int
+	for i, l := range lines {
+		switch {
+		case !strings.HasSuffix(l, "\n"):
+		case crlf[i]:
+			cr++
+		default:
+			lf++
+		}
+	}
+	switch {
+	case cr == 0 && lf == 0:
+		return ""
+	case lf == 0:
+		return "CRLF"
+	case cr == 0:
+		return "LF"
+	}
+	return "mixed CRLF/LF"
 }
 
 // ColorDiff colours a diff for the terminal: additions green, removals red,

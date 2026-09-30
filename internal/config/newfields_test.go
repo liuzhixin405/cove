@@ -8,6 +8,18 @@ import (
 
 func loadIn(t *testing.T, projectJSON string) *Config {
 	t.Helper()
+	return loadInWith(t, projectJSON, false)
+}
+
+// loadInTrusted is loadIn with the .cove.json trusted first, for tests of
+// the sensitive fields, which an untrusted project file cannot set.
+func loadInTrusted(t *testing.T, projectJSON string) *Config {
+	t.Helper()
+	return loadInWith(t, projectJSON, true)
+}
+
+func loadInWith(t *testing.T, projectJSON string, trust bool) *Config {
+	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	t.Setenv("USERPROFILE", tmp)
@@ -24,6 +36,12 @@ func loadIn(t *testing.T, projectJSON string) *Config {
 	t.Cleanup(func() { _ = os.Chdir(oldWD) })
 	if err := os.Chdir(project); err != nil {
 		t.Fatal(err)
+	}
+	t.Setenv("COVE_CONFIG_DIR", filepath.Join(tmp, ".cove"))
+	if trust && projectJSON != "" {
+		if err := TrustProjectConfig(filepath.Join(project, ".cove.json")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := Load()
 	if err != nil {

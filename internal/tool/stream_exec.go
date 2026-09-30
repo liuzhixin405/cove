@@ -33,11 +33,19 @@ const (
 	// shellStdoutMax and shellStderrMax are what the result keeps of each.
 	shellStdoutMax = 30000
 	shellStderrMax = 10000
+	// shellWaitDelay is how long output is still read after the command
+	// exits, for background children that inherited the pipes.
+	shellWaitDelay = 5 * time.Second
 )
 
 var (
 	errCommandTimedOut  = errors.New("command timed out")
 	errCommandCancelled = errors.New("command cancelled")
+	// errOutputHeldOpen means the command exited with status 0 but a process
+	// it left running (a dev server, "nohup x &") still held stdout/stderr,
+	// so os/exec closed the pipes after WaitDelay. That is a success, not a
+	// failure to start.
+	errOutputHeldOpen = errors.New("output held open by a background process")
 )
 
 // commandTimeout reads the "timeout" input (milliseconds), defaulting to
@@ -84,8 +92,20 @@ func runShell(ctx context.Context, sh shell.Shell, cmdStr string, input Input, t
 	cmd.Env = shell.Env(os.Environ())
 
 	var stdout, stderr boundedBuffer
-	exitCode, runErr := streamCommand(execCtx, cmd, &stdout, &stderr, tctx.OnProgress, progressDecoder(sh.Kind, runtime.GOOS))
+	onOut, onErr := progressHooks(tctx)
+	exitCode, runErr := streamCommand(execCtx, cmd, &stdout, &stderr, onOut, onErr, progressDecoder(sh.Kind, runtime.GOOS))
 	return formatShellResult(input, sh.Kind, &stdout, &stderr, exitCode, runErr, timeout)
+}
+
+// progressHooks returns the live-output callbacks for stdout and stderr:
+// stderr goes to OnStderrProgress when it is set, else to OnProgress with
+// stdout as before.
+func progressHooks(tctx Context) (onStdout, onStderr func(string)) {
+	onStdout, onStderr = tctx.OnProgress, tctx.OnProgress
+	if tctx.OnStderrProgress != nil {
+		onStderr = tctx.OnStderrProgress
+	}
+	return onStdout, onStderr
 }
 
 // formatShellResult turns a finished (or killed) command into the tool
@@ -94,7 +114,7 @@ func runShell(ctx context.Context, sh shell.Shell, cmdStr string, input Input, t
 func formatShellResult(input Input, kind shell.Kind, stdout, stderr *boundedBuffer, exitCode int, runErr error, timeout time.Duration) Result {
 	decode := func(p []byte) string { return decodeShellOutput(p, kind, runtime.GOOS) }
 
-	if runErr != nil && !errors.Is(runErr, errCommandTimedOut) && !errors.Is(runErr, errCommandCancelled) {
+	if runErr != nil && !errors.Is(runErr, errCommandTimedOut) && !errors.Is(runErr, errCommandCancelled) && !errors.Is(runErr, errOutputHeldOpen) {
 		// The command could not be started at all.
 		return Result{Data: fmt.Sprintf("Error: %v\nStderr: %s", runErr, stderr.clip(shellStderrMax, decode)), IsError: true}
 	}
@@ -122,6 +142,9 @@ func formatShellResult(input Input, kind shell.Kind, stdout, stderr *boundedBuff
 		res.IsError = true
 	case exitCode != 0:
 		parts = append(parts, fmt.Sprintf("[exit code: %d]", exitCode))
+	}
+	if errors.Is(runErr, errOutputHeldOpen) {
+		parts = append(parts, fmt.Sprintf("[command exited, but a background process it started kept the output open; output after %s was not captured]", shellWaitDelay))
 	}
 	res.Data = strings.Join(parts, "\n")
 	return res
@@ -392,9 +415,9 @@ func (w *progressWriter) flush() {
 //     group on Unix) so inherited pipes close promptly.
 //   - WaitDelay is a backstop: if I/O is still pending shortly after the process
 //     exits, os/exec force-closes the pipes so Run() returns instead of hanging.
-func streamCommand(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Writer, onProgress func(chunk string), decode func([]byte) string) (exitCode int, runErr error) {
-	outW := &progressWriter{buf: stdout, onProgress: onProgress, decode: decode}
-	errW := &progressWriter{buf: stderr, onProgress: onProgress, decode: decode}
+func streamCommand(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Writer, onStdout, onStderr func(chunk string), decode func([]byte) string) (exitCode int, runErr error) {
+	outW := &progressWriter{buf: stdout, onProgress: onStdout, decode: decode}
+	errW := &progressWriter{buf: stderr, onProgress: onStderr, decode: decode}
 	cmd.Stdout, cmd.Stderr = outW, errW
 
 	// Put the child in its own process group (Unix) so the whole tree can be
@@ -408,7 +431,7 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Writer,
 	}
 	// Backstop: even if the tree kill misses something, force-close the pipes a
 	// few seconds after the process exits so Run() can't block indefinitely.
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = shellWaitDelay
 
 	err := cmd.Run()
 	// Run has returned, so the copy goroutines are done writing.
@@ -428,6 +451,17 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Writer,
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode(), nil
+		}
+		// os/exec returns ErrWaitDelay only when the process itself exited
+		// successfully and a child it left behind ("npm run dev &") kept the
+		// pipes open. This used to fall through as a start failure, marking a
+		// clean run as an error and dropping everything it printed.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			code := 0
+			if cmd.ProcessState != nil {
+				code = cmd.ProcessState.ExitCode()
+			}
+			return code, errOutputHeldOpen
 		}
 		return 0, err
 	}

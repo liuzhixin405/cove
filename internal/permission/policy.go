@@ -2,6 +2,8 @@ package permission
 
 import (
 	"strings"
+
+	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
 
 // PolicyAction is the action to take when a policy matches.
@@ -20,13 +22,16 @@ const (
 // whole tool), and Scope: the absolute project root they were granted in.
 // The engine ignores a rule whose non-empty Scope is a different project.
 type PolicyRule struct {
-	ID          string            `json:"id"`
-	Description string            `json:"description"`
-	ToolPattern string            `json:"tool_pattern"` // glob pattern: "bash", "write:*", "*"
-	Action      PolicyAction      `json:"action"`
-	Priority    int               `json:"priority"` // higher = evaluated first
-	Enabled     bool              `json:"enabled"`
-	ParamMatch  map[string]string `json:"param_match,omitempty"` // param key -> glob value
+	ID          string       `json:"id"`
+	Description string       `json:"description"`
+	ToolPattern string       `json:"tool_pattern"` // glob pattern: "bash", "write:*", "*"
+	Action      PolicyAction `json:"action"`
+	Priority    int          `json:"priority"` // higher = evaluated first
+	Enabled     bool         `json:"enabled"`
+	// ParamMatch maps an input field to a glob. On the "command" field of a
+	// shell tool the glob applies to each simple command of the line, not
+	// the raw line (see commandParamMatches).
+	ParamMatch map[string]string `json:"param_match,omitempty"`
 	// CommandPrefix scopes a shell-tool rule to commands starting with these
 	// words, with the same semantics as Rule.CommandPrefix.
 	CommandPrefix string `json:"command_prefix,omitempty"`
@@ -73,6 +78,76 @@ func (r PolicyRule) ToRule() (Rule, bool) {
 		}
 	}
 	return out, true
+}
+
+// commandParamMatches is param_match on the "command" field of a shell tool.
+// It used to be matchGlob over the whole line, so an allow of "git status*"
+// allowed "git status; rm -rf ./src". The glob now applies per simple
+// command, like a command prefix:
+//
+//   - allow: the line must be one commandCovered would vouch for (no
+//     substitution, no file redirect, no hostile characters; see
+//     coverableCommands) and every simple command must match;
+//   - deny and ask: the whole line matching (as before), or any one simple
+//     command, nested ones included (see denyReading), is enough.
+//
+// A pattern of words ending in "*" and holding no other "*" ("git status*",
+// "npm run *") is a word prefix: "git status" and "git status -s" match,
+// "git statusx" does not. Any other pattern is matchGlob on the command's
+// words joined by single spaces.
+func commandParamMatches(pattern, command string, decision Decision, kind ShellKind) bool {
+	prefix, isPrefix := globWordPrefix(pattern)
+	if decision == DAllow {
+		cmds, ok := coverableCommands(command, kind)
+		if !ok {
+			return false
+		}
+		for _, words := range cmds {
+			if isPrefix && !hasWordPrefixFold(words, prefix) || !isPrefix && !matchGlob(pattern, strings.Join(words, " ")) {
+				return false
+			}
+		}
+		return true
+	}
+	if matchGlob(pattern, command) {
+		return true
+	}
+	if isPrefix {
+		return anyCommandHasPrefixNormalized(command, prefix)
+	}
+	cmds, opaque := denyReading(command)
+	if opaque {
+		return true
+	}
+	for _, c := range cmds {
+		if matchGlob(pattern, strings.Join(c.Words, " ")) ||
+			matchGlob(pattern, strings.Join(normalizeProgram(safety.StripCommandRunners(c.Words)), " ")) {
+			return true
+		}
+	}
+	return false
+}
+
+// globWordPrefix returns the words of a "words*" pattern.
+func globWordPrefix(pattern string) ([]string, bool) {
+	if !strings.HasSuffix(pattern, "*") || strings.Count(pattern, "*") != 1 {
+		return nil, false
+	}
+	words := strings.Fields(strings.TrimSuffix(pattern, "*"))
+	return words, len(words) > 0
+}
+
+// hasWordPrefixFold is hasWordPrefix ignoring letter case, as matchGlob does.
+func hasWordPrefixFold(words, prefix []string) bool {
+	if len(words) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if !strings.EqualFold(words[i], p) {
+			return false
+		}
+	}
+	return true
 }
 
 // PolicyStorage persists policy rules. *FilePolicyStorage implements it.

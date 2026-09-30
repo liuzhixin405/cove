@@ -2,9 +2,42 @@ package termui
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/term"
+
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
+
+// terminalWidth reports the width of the terminal on stdout, or 0 when it
+// cannot be determined (a pipe, a test). Replaced in tests.
+var terminalWidth = func() int {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 0
+	}
+	return w
+}
+
+// fitStatusLine clips a transient status frame to one row of the terminal.
+//
+// Frames used to be printed whole. The spinner's "思考中… 已推理 N 字" plus
+// its elapsed/context/cost suffix is ~60 columns, so in a narrower pane every
+// 80 ms frame wrapped onto a second row; the next frame's "\r\x1b[K" returns
+// to the start of that second row only, so each frame left the previous first
+// row behind. The budget is width-1 because writing the last column makes
+// some terminals (the Windows console) wrap early. Width is measured the way
+// textutil.Width measures it, CJK and East Asian Ambiguous glyphs as two
+// columns. Reset is re-appended since the cut may drop the frame's own.
+func fitStatusLine(line string) string {
+	w := terminalWidth()
+	if w <= 1 || textutil.Width(line) <= w-1 {
+		return line
+	}
+	return textutil.TruncateWidth(line, w-1, "…") + Reset
+}
 
 type Spinner struct {
 	mu      sync.Mutex
@@ -73,7 +106,7 @@ func (s *Spinner) Start() {
 						line += "  " + Dim + lastSuffix + Reset
 					}
 				}
-				PrintTransientStatus(line)
+				PrintTransientStatus(fitStatusLine(line))
 				i++
 				time.Sleep(80 * time.Millisecond)
 			}
@@ -154,7 +187,7 @@ func (w *WalkingIndicator) Start() {
 				w.mu.Lock()
 				msg := w.message
 				w.mu.Unlock()
-				PrintTransientStatus(fmt.Sprintf("  %s%s%s %s%s%s", Cyan, frame, Reset, Dim, msg, Reset))
+				PrintTransientStatus(fitStatusLine(fmt.Sprintf("  %s%s%s %s%s%s", Cyan, frame, Reset, Dim, msg, Reset)))
 				i++
 				time.Sleep(120 * time.Millisecond)
 			}

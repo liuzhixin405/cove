@@ -276,9 +276,9 @@ type Engine struct {
 	// ran a tool that is not read-only. Both gate reviewMessages.
 	turnsSinceReview int
 	turnUsedWork     bool
-	// conversationGen counts conversation switches (/new, /resume), so
-	// background work that outlives one does not write into the next
-	// (guarded by bgMu).
+	// conversationGen counts conversation switches (/new, /resume) and
+	// compactions that rewrote the history, so background work that
+	// outlives one does not write into the next (guarded by bgMu).
 	conversationGen int
 	// nonInteractive marks a process that exits right after its answer
 	// (cove -p, SetNonInteractive): the skill review would be abandoned
@@ -288,6 +288,11 @@ type Engine struct {
 	// turnFilesChanged records whether this turn wrote or edited a file, for
 	// the automatic verification gate. Guarded by fileMu.
 	turnFilesChanged bool
+	// turnRanGit records that this turn ran a git command that can change
+	// the repository (commit, push, checkout…; gitChangesRepo), whether or
+	// not it succeeded, for the turn-end git status line
+	// (reportGitWorkState). Guarded by fileMu.
+	turnRanGit bool
 	// turnChangedFiles are the absolute paths this turn wrote or edited, for
 	// the tests the verification gate runs and the self-review diff.
 	// Guarded by fileMu.
@@ -554,6 +559,7 @@ func (e *Engine) SetWorkingDir(dir string) {
 		log.Debugf("[checkpoint] init failed for %s: %v", dir, err)
 	}
 	e.verifyAnnounced = false
+	e.verifyTrustNoticed = false
 	e.verifyGate = e.newVerifyGate(dir)
 	if e.sessionNotes != nil {
 		if err := e.sessionNotes.Flush(); err != nil {
@@ -1021,10 +1027,11 @@ You are Cove, an AI coding assistant working in the user's terminal and reposito
 
 # Reporting back
 
-When you finish, write a short report for the user:
+When you finish, write a short report for the user about the latest request only. Earlier requests in this conversation were already reported; mention their work only where this request continued or changed it.
 - Lead with the outcome: what is done, or what is not and why.
 - Name the files you changed and anything the user needs to do next.
 - Say how you verified it (the command and its result), or that you could not.
+- In a git repository, if you changed files, say whether the changes are committed and pushed. Only call a commit or push done if you ran it and it succeeded; otherwise say plainly that the changes are not committed or not pushed. Commands you list for the user to run are instructions, not work you did — say so.
 - Mention remaining risks or open questions only if there are any.
 
 Keep it brief: do not restate the request, replay every step, or add filler. Reply in the user's language.
@@ -1298,8 +1305,20 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		// "Error:" prefix. Guardrail warns only after repeated failures, so a
 		// prepended note turned exactly those failures into "successes" —
 		// shown as OK and resetting the consecutive-error breaker.
+		//
+		// This deferred call runs after the read-marker one registered
+		// further down, so the warning used to land after "[next: offset=N]"
+		// and the marker was no longer the last line. It goes in front of
+		// the marker instead.
 		defer func() {
-			toolOutput = fmt.Sprintf("%s\n[guardrail: %s]", toolOutput, guardrailWarning)
+			body, marker := toolOutput, ""
+			if tc.Name == "read" && !failed {
+				body, marker = splitReadMarker(toolOutput)
+			}
+			toolOutput = fmt.Sprintf("%s\n[guardrail: %s]", body, guardrailWarning)
+			if marker != "" {
+				toolOutput += "\n" + marker
+			}
 		}()
 	}
 
@@ -1310,6 +1329,29 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		e.checkpointBefore([]api.ToolCall{tc})
 	}
 	outputStarted := false
+	// stdout and stderr arrive from separate goroutines; the header is
+	// printed once, for whichever comes first.
+	var outputMu sync.Mutex
+	onProgress := func(chunk string, stderr bool) {
+		e.progressActivity(toolAct)
+		h := e.turnHooks()
+		// Under the lock, so the other stream's first chunk waits for the
+		// header instead of printing before it.
+		outputMu.Lock()
+		if !outputStarted {
+			outputStarted = true
+			if h.ToolOutputStart != nil {
+				h.ToolOutputStart(tc.Name, toolHeaderFor(tc.Name, tc.Input))
+			}
+		}
+		outputMu.Unlock()
+		switch {
+		case stderr && h.ToolStderrProgress != nil:
+			h.ToolStderrProgress(tc.Name, chunk)
+		case h.ToolProgress != nil:
+			h.ToolProgress(tc.Name, chunk)
+		}
+	}
 	tctx := tool.Context{
 		Cwd:              cwd,
 		ToolUseID:        tc.ID,
@@ -1321,19 +1363,9 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		// producing command isn't mislabeled as "stuck", and surface the
 		// chunk to the UI so the user can see what the command is doing,
 		// under a header naming the command the first time.
-		SetWaiting: func(waiting bool) { e.pauseActivity(toolAct, waiting) },
-		OnProgress: func(chunk string) {
-			e.progressActivity(toolAct)
-			if !outputStarted {
-				outputStarted = true
-				if h := e.turnHooks(); h.ToolOutputStart != nil {
-					h.ToolOutputStart(tc.Name, toolHeaderFor(tc.Name, tc.Input))
-				}
-			}
-			if h := e.turnHooks(); h.ToolProgress != nil {
-				h.ToolProgress(tc.Name, chunk)
-			}
-		},
+		SetWaiting:       func(waiting bool) { e.pauseActivity(toolAct, waiting) },
+		OnProgress:       func(chunk string) { onProgress(chunk, false) },
+		OnStderrProgress: func(chunk string) { onProgress(chunk, true) },
 	}
 
 	if e.classifier != nil && permission.IsShellTool(tc.Name) {
@@ -1346,8 +1378,12 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 		// engine's pre-approval; deny and ask rules are still applied by
 		// authorizeToolCall.
 		kind := e.perm.ShellKindFor(tc.Name)
-		switch e.effectiveMode() { // plan pre-approves nothing: a build line writes
-		case permission.Default:
+		switch e.effectiveMode() { // plan pre-approves read-only lines only: a build line writes
+		case permission.Default, permission.Plan:
+			// Plan mode too: the manual lets a read-only shell line run in
+			// plan mode and planModeGate has a branch for it, but the shell
+			// tool itself refuses every line while tctx says "plan", so
+			// that branch was never reached and `git status` was refused.
 			if e.classifier.IsReadOnlyLineFor(cmd, kind) {
 				tctx.PermissionMode = "auto"
 				log.Debugf("[permission] %s auto-allowed: read-only command", tc.Name)
@@ -1384,6 +1420,7 @@ func (e *Engine) executeTool(ctx context.Context, tc api.ToolCall) (toolOutput s
 			diffBefore, diffOK = readForDiff(diffPath)
 		}
 	}
+	e.noteGitInvocation(tc)
 	result, err := t.Call(ctx, tc.Input, tctx)
 	if err == nil && !result.IsError && diffOK {
 		e.recordFileDiff(tc.ID, diffPath, diffBefore)
@@ -1702,10 +1739,20 @@ func (e *Engine) trackFileChanges(tc api.ToolCall) {
 		}
 	}
 
+	// Whoever resets the history must leave an empty map, but a nil one here
+	// panics inside a call whose tool has already written the file.
+	if e.fileHistory == nil {
+		e.fileHistory = map[string]bool{}
+	}
+
 	switch tc.Name {
 	case "write", "edit":
 		e.turnFilesChanged = true
-		if path, ok := tc.Input["filePath"].(string); ok {
+		// toolTargetPath honors every key alias the tools accept (file_path,
+		// path, filepath, file). Reading only "filePath" left a call using
+		// an alias out of turnChangedFiles and Layer 3's file activity,
+		// although the file had changed.
+		if path := toolTargetPath(tc.Input); path != "" {
 			e.fileHistory[path] = true
 			if e.turnChangedFiles == nil {
 				e.turnChangedFiles = map[string]bool{}
@@ -1909,7 +1956,14 @@ func (e *Engine) compact(ctx context.Context, threshold int) *CompressResult {
 	}()
 	if result.Compressed {
 		e.messages = newMsgs
-		e.todoAfterCompaction()
+		// Only a summary or the truncation fallback (fewer messages) replaced
+		// the head of the history; layer-1 trimming alone left the user's
+		// first request there.
+		rewritten := result.Summarized || len(newMsgs) < beforeMsgs
+		e.todoAfterCompaction(rewritten)
+		if rewritten {
+			e.rebaseReviewThrottle(beforeMsgs, len(newMsgs))
+		}
 		stripThinkingBlocks(e.messages)
 		// The history was rewritten, so the cached prefix is gone anyway:
 		// the one moment the snapshotted parts of the system prompt (repo map,
@@ -2118,6 +2172,12 @@ func (e *Engine) checkpointBefore(calls []api.ToolCall) {
 	if e.cpMgr == nil {
 		return
 	}
+	// Plan mode refuses every write before it runs, so there is nothing for
+	// /undo to restore; the snapshot (a git commit of the tree, ~1.5 s) was
+	// still taken for each batch that named a write tool.
+	if e.effectiveMode() == permission.Plan {
+		return
+	}
 	for _, tc := range calls {
 		if tc.Name == "write" || tc.Name == "edit" || e.shellMayWrite(tc) || delegates(tc) {
 			if hash, err := e.cpMgr.Create("auto-" + tc.Name); err != nil {
@@ -2159,6 +2219,9 @@ func looksSynthetic(m api.Message) bool {
 		"[Context truncated",
 		"[用户指引]",
 		"[Continue the task",
+		// Compaction summaries and truncation notes (compressor.go);
+		// saved before they were marked Synthetic.
+		"<compress",
 	}
 	for _, p := range knownPrefixes {
 		if strings.HasPrefix(c, p) || strings.EqualFold(c, p) {
@@ -2531,13 +2594,14 @@ func (e *Engine) fingerprintToolCalls(toolCalls []api.ToolCall) string {
 	}
 	parts := make([]string, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		// Include the tool name and the first non-empty value from well-known keys
-		key := tc.Name
-		for _, k := range []string{"filePath", "command", "pattern", "query", "url", "name", "title", "message"} {
-			if v, ok := tc.Input[k].(string); ok && v != "" {
-				key += ":" + v
-				break
-			}
+		// The tool name and its key argument (toolKeyArg): the target file
+		// through every path alias, else the first well-known key. The name
+		// is the registry's canonical one: checkToolLoop fingerprints the
+		// model's raw calls, so a model alternating `Edit` and `edit` on one
+		// file split the loop detector's history in two.
+		key := e.canonicalToolName(tc.Name)
+		if v := toolKeyArg(tc); v != "" {
+			key += ":" + v
 		}
 		parts = append(parts, key)
 	}
@@ -2548,11 +2612,14 @@ func (e *Engine) fingerprintToolCalls(toolCalls []api.ToolCall) string {
 
 // isFastModelName checks if a model name indicates a fast/flash/cheap model
 // that is more prone to repetitive loops and needs tighter detection thresholds.
+//
+// The tier words are matched as whole tokens of the name, split at every
+// character that is not a letter (- _ . : / and digits): a substring match
+// found "mini" in "gemini", so gemini-2.5-pro counted as a fast model.
 func isFastModelName(model string) bool {
-	model = strings.ToLower(model)
-	fastIndicators := []string{"flash", "mini", "lite", "tiny", "fast", "haiku", "nano"}
-	for _, ind := range fastIndicators {
-		if strings.Contains(model, ind) {
+	fastIndicators := map[string]bool{"flash": true, "mini": true, "lite": true, "tiny": true, "fast": true, "haiku": true, "nano": true}
+	for _, tok := range strings.FieldsFunc(strings.ToLower(model), func(r rune) bool { return r < 'a' || r > 'z' }) {
+		if fastIndicators[tok] {
 			return true
 		}
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzhixin405/cove-agent/internal/engine"
 	"github.com/liuzhixin405/cove-agent/internal/mcp"
+	"github.com/liuzhixin405/cove-agent/internal/render"
 	"github.com/liuzhixin405/cove-agent/internal/repl"
 	"github.com/liuzhixin405/cove-agent/internal/termui"
 )
@@ -36,6 +37,14 @@ func askUserQuestion(prompt string) string {
 	if !replInteractive {
 		return ""
 	}
+	// The prompt is the model's text (header, question, option labels and
+	// descriptions) and was printed raw: a question carrying cursor-up and
+	// erase-line sequences repainted the option list above before the user
+	// pressed a digit. Show controls as inert text, as the permission box
+	// does. The option lines are taken from the shown text too, since they
+	// are displayed again on the input line when picked with ↑↓; escaping
+	// keeps every '\n', so the options and their numbers do not change.
+	prompt = render.VisibleControls(prompt)
 	options, keys := questionOptions(prompt)
 	hint := "输入选项编号或直接输入回答"
 	if len(options) > 0 {

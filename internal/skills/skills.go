@@ -10,12 +10,14 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/liuzhixin405/cove-agent/internal/log"
 	"github.com/liuzhixin405/cove-agent/internal/safepath"
 	"github.com/liuzhixin405/cove-agent/internal/safeurl"
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
@@ -70,15 +72,28 @@ func (m *Manager) addDirectory(dir, source string) {
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			m.loadSkillFile(filepath.Join(dir, e.Name(), "SKILL.md"), source)
+			m.loadSkillFile(filepath.Join(dir, e.Name(), "SKILL.md"), source, dir)
 		}
 		if strings.HasSuffix(e.Name(), ".md") && !e.IsDir() {
-			m.loadSkillFile(filepath.Join(dir, e.Name()), source)
+			m.loadSkillFile(filepath.Join(dir, e.Name()), source, dir)
 		}
 	}
 }
 
-func (m *Manager) loadSkillFile(path, source string) {
+// loadSkillFile loads one skill file found in skillsDir.
+func (m *Manager) loadSkillFile(path, source, skillsDir string) {
+	if source == SourceProject {
+		// A project's skills come with the repository, like its .cove.json.
+		// A SKILL.md that is a link out of the project was read through
+		// os.ReadFile, which follows it: a link to ~/.ssh/id_rsa or
+		// /proc/self/environ became a skill's body in the system prompt.
+		// skillsDir is <project>/.cove/skills or <project>/.claude/skills.
+		root := filepath.Dir(filepath.Dir(skillsDir))
+		if !safepath.Within(root, path) {
+			log.Warnf("skills: %s points outside the project, not loaded", path)
+			return
+		}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -89,6 +104,14 @@ func (m *Manager) loadSkillFile(path, source string) {
 	}
 	sk := parseSkill(name, string(data), path)
 	sk.Source = source
+	// The closer definition wins, so a project skill does replace a
+	// built-in, plugin or user skill of the same name (a team shares its
+	// workflow that way). It used to happen without a word, so a cloned
+	// repository's .cove/skills/commit silently took over the user's own
+	// commit skill; now the replacement is said once, at load.
+	if old, ok := m.skills[sk.Name]; ok && source == SourceProject && old.Source != SourceProject {
+		log.Warnf("skills: 项目技能 %s（%s）替换了同名的%s技能", sk.Name, path, sourceLabel(old.Source))
+	}
 	m.skills[sk.Name] = sk
 }
 
@@ -123,46 +146,91 @@ func parseSkill(name, content, path string) Skill {
 	return skill
 }
 
+// utf8BOM is the byte order mark some Windows editors prepend to files.
+const utf8BOM = string(rune(0xFEFF))
+
+// parseFrontmatter extracts the leading "---" block. It used to require an
+// exact LF-only layout (opening line, block, closing line followed by a
+// newline), so a SKILL.md saved with CRLF line endings or a UTF-8 BOM (common
+// on Windows), or one whose closing "---" was the last line without a
+// trailing newline, had its frontmatter ignored: the description became "---"
+// and the raw frontmatter was sent as the prompt. Line endings are
+// normalized and a BOM stripped first; the body is returned with LF line
+// endings.
 func parseFrontmatter(content string) *frontmatter {
+	content = strings.TrimPrefix(content, utf8BOM)
+	content = strings.ReplaceAll(content, "\r\n", "\n")
 	if !strings.HasPrefix(content, "---\n") {
 		return nil
 	}
-	end := strings.Index(content[4:], "\n---\n")
-	if end == -1 {
+	rest := content[4:]
+	var fmRaw, body string
+	if strings.HasPrefix(rest, "---\n") || rest == "---" {
+		// Empty frontmatter block.
+		fmRaw, body = "", strings.TrimPrefix(strings.TrimPrefix(rest, "---"), "\n")
+	} else if end := strings.Index(rest, "\n---\n"); end != -1 {
+		fmRaw, body = rest[:end], rest[end+5:]
+	} else if strings.HasSuffix(rest, "\n---") {
+		fmRaw, body = strings.TrimSuffix(rest, "\n---"), ""
+	} else {
 		return nil
 	}
-	fmRaw := content[4 : 4+end]
-	body := content[4+end+5:]
 	fm := &frontmatter{Body: body}
+	// listKey is the key whose value is being continued by "- item" lines
+	// (a YAML block list: "paths:" followed by indented "- *.go").
+	var listKey string
+	add := func(key, v string) {
+		v = strings.TrimSpace(unquote(strings.TrimSpace(v)))
+		if v == "" {
+			// Empty entries used to be kept, so "paths:" followed by a
+			// block list produced Paths=[""] and made the skill Conditional
+			// with no real pattern.
+			return
+		}
+		switch key {
+		case "paths":
+			fm.Paths = append(fm.Paths, v)
+		case "allowed_tools":
+			fm.AllowedTools = append(fm.AllowedTools, v)
+		case "steps":
+			fm.Steps = append(fm.Steps, v)
+		}
+	}
 	sc := bufio.NewScanner(strings.NewReader(fmRaw))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if line == "-" || strings.HasPrefix(line, "- ") {
+			if listKey != "" {
+				add(listKey, strings.TrimPrefix(line, "-"))
+			}
+			continue
+		}
+		listKey = ""
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		k, v := strings.TrimSpace(parts[0]), unquote(strings.TrimSpace(parts[1]))
+		k, raw := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		v := unquote(raw)
 		switch k {
 		case "name":
 			fm.Name = v
 		case "description":
 			fm.Description = v
-		case "paths":
-			for _, p := range strings.Split(v, ",") {
-				fm.Paths = append(fm.Paths, strings.TrimSpace(p))
+		case "paths", "allowed_tools", "steps":
+			if raw == "" {
+				listKey = k
+				continue
 			}
-		case "allowed_tools":
-			for _, t := range strings.Split(v, ",") {
-				fm.AllowedTools = append(fm.AllowedTools, strings.TrimSpace(t))
+			// Inline YAML list: [a, "b"].
+			if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+				v = raw[1 : len(raw)-1]
 			}
-		case "steps":
-			for _, step := range strings.Split(v, ",") {
-				if s := strings.TrimSpace(step); s != "" {
-					fm.Steps = append(fm.Steps, s)
-				}
+			for _, item := range strings.Split(v, ",") {
+				add(k, item)
 			}
 		}
 	}
@@ -235,23 +303,145 @@ func (m *Manager) sortedLocked() []Skill {
 
 // Matching returns skills whose Paths glob-patterns match the given file path.
 // Only conditional skills (those with Paths defined) are considered.
+//
+// A pattern without '/' matches the file's base name (`*.go`). A pattern
+// with '/' is matched against the path relative to the project root, with
+// forward slashes, and `**` matches any number of directories
+// (`internal/**/*.ts`). Only the base name used to be compared, so every
+// directory pattern silently never matched. filePath may be relative (to the
+// working directory) or absolute; see matchCandidates.
 func (m *Manager) Matching(ctx context.Context, filePath string) []Skill {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	var rels []string
+	base := ""
 	var r []Skill
 	for _, sk := range m.skills {
 		if !sk.Conditional || len(sk.Paths) == 0 {
 			continue
 		}
-		base := filepath.Base(filePath)
 		for _, pattern := range sk.Paths {
-			if matched, _ := filepath.Match(strings.TrimSpace(pattern), base); matched {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			pattern = strings.TrimPrefix(strings.ReplaceAll(pattern, "\\", "/"), "./")
+			pattern = strings.TrimPrefix(pattern, "/")
+			matched := false
+			if !strings.Contains(pattern, "/") {
+				if base == "" {
+					base = path.Base(slashPath(filePath))
+				}
+				matched, _ = filepath.Match(pattern, base)
+			} else {
+				if rels == nil {
+					rels = matchCandidates(filePath)
+				}
+				for _, rel := range rels {
+					if matchGlob(strings.Split(pattern, "/"), strings.Split(rel, "/")) {
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
 				r = append(r, sk)
 				break
 			}
 		}
 	}
+	sort.Slice(r, func(i, j int) bool { return r[i].Name < r[j].Name })
 	return r
+}
+
+// slashPath cleans p and converts it to forward slashes (backslashes too, so
+// a Windows-style relative path behaves the same on every OS).
+func slashPath(p string) string {
+	return path.Clean(strings.ReplaceAll(filepath.ToSlash(p), "\\", "/"))
+}
+
+// matchCandidates returns the project-relative forms of filePath that a
+// directory pattern is tried against. Callers (the engine) pass the tool's
+// filePath as given, which is either relative to the working directory or
+// absolute. The project root is taken to be the nearest ancestor of the
+// working directory holding .git, and the working directory itself; a path
+// outside both yields no candidates for absolute input.
+func matchCandidates(filePath string) []string {
+	var out []string
+	seen := map[string]bool{}
+	addRel := func(rel string) {
+		rel = strings.TrimPrefix(slashPath(rel), "./")
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || seen[rel] {
+			return
+		}
+		seen[rel] = true
+		out = append(out, rel)
+	}
+	cwd, _ := os.Getwd()
+	abs := filePath
+	if !filepath.IsAbs(filePath) {
+		addRel(filePath)
+		if cwd == "" {
+			return out
+		}
+		abs = filepath.Join(cwd, filepath.FromSlash(strings.ReplaceAll(filePath, "\\", "/")))
+	}
+	if cwd == "" {
+		return out
+	}
+	for _, root := range []string{gitRoot(cwd), cwd} {
+		if root == "" {
+			continue
+		}
+		if rel, err := filepath.Rel(root, abs); err == nil {
+			addRel(rel)
+		}
+	}
+	return out
+}
+
+// gitRoot returns the nearest ancestor of dir (inclusive) containing .git,
+// or "" when there is none.
+func gitRoot(dir string) string {
+	for d := filepath.Clean(dir); ; {
+		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+		d = parent
+	}
+}
+
+// matchGlob matches slash-separated path segments against pattern segments;
+// "**" matches zero or more whole segments, other segments use path.Match.
+func matchGlob(pat, segs []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			for len(pat) > 0 && pat[0] == "**" {
+				pat = pat[1:]
+			}
+			if len(pat) == 0 {
+				return true
+			}
+			for i := 0; i <= len(segs); i++ {
+				if matchGlob(pat, segs[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(segs) == 0 {
+			return false
+		}
+		if ok, _ := path.Match(pat[0], segs[0]); !ok {
+			return false
+		}
+		pat, segs = pat[1:], segs[1:]
+	}
+	return len(segs) == 0
 }
 
 func (m *Manager) BuildPrompt() string {
@@ -288,8 +478,20 @@ type RegistryEntry struct {
 	Author      string `json:"author,omitempty"`
 }
 
+// RegistryURL is skills-registry.json at the repository root; each entry's url
+// points at skills/<name>/SKILL.md in the same repository.
 var RegistryURL = "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills-registry.json"
-var fallbackJSON = `[{"name":"security-audit","description":"Security audit: scan deps, check vulnerabilities.","author":"marketplace"},{"name":"api-design","description":"REST API design: endpoints, schemas, OpenAPI.","author":"marketplace"},{"name":"dockerize","description":"Docker: Dockerfile, compose, build, push.","author":"marketplace"},{"name":"i18n","description":"Internationalization: extract strings, translations.","author":"marketplace"},{"name":"ci-cd","description":"CI/CD: Actions, pipelines, testing.","author":"marketplace"}]`
+
+// fallbackJSON is used when the registry cannot be fetched. It must stay equal
+// to skills-registry.json (TestFallbackMatchesRegistryFile): the entries used to
+// carry no url, so installing one "succeeded" with a placeholder file.
+var fallbackJSON = `[
+  {"name": "security-audit", "description": "Security audit: scan deps, check vulnerabilities.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/security-audit/SKILL.md", "author": "marketplace"},
+  {"name": "api-design", "description": "REST API design: endpoints, schemas, OpenAPI.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/api-design/SKILL.md", "author": "marketplace"},
+  {"name": "dockerize", "description": "Docker: Dockerfile, compose, build, push.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/dockerize/SKILL.md", "author": "marketplace"},
+  {"name": "i18n", "description": "Internationalization: extract strings, translations.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/i18n/SKILL.md", "author": "marketplace"},
+  {"name": "ci-cd", "description": "CI/CD: Actions, pipelines, testing.", "url": "https://raw.githubusercontent.com/liuzhixin405/cove-agent/main/skills/ci-cd/SKILL.md", "author": "marketplace"}
+]`
 
 // installHTTPClient and the registry fetch both use the shared SSRF-hardened
 // client: these are the only outbound requests the skills package makes, and
@@ -302,10 +504,12 @@ func FetchRegistry() ([]RegistryEntry, error) {
 	resp, err := c.Get(RegistryURL)
 	if err == nil {
 		defer func() { _ = resp.Body.Close() }()
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		var entries []RegistryEntry
-		if json.Unmarshal(data, &entries) == nil {
-			return entries, nil
+		if resp.StatusCode == http.StatusOK {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			var entries []RegistryEntry
+			if json.Unmarshal(data, &entries) == nil {
+				return entries, nil
+			}
 		}
 	}
 	var fallback []RegistryEntry
@@ -371,7 +575,9 @@ var embeddedSkills embed.FS
 
 // LoadAll loads skills from every source, lowest precedence first; a later
 // definition with the same name replaces an earlier one, so the closer
-// definition wins:
+// definition wins (a project skill replacing another source's is logged, and
+// a project skill file resolving outside the project is not read; see
+// loadSkillFile):
 //
 //  1. built-in skills compiled into the binary
 //  2. skills bundled with enabled plugins (~/.cove/plugins/<name>/skills)
@@ -503,4 +709,17 @@ func ExportBuiltin(name string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// sourceLabel names a skill source for a user-facing notice.
+func sourceLabel(source string) string {
+	switch source {
+	case SourceBuiltin:
+		return "内置"
+	case SourcePlugin:
+		return "插件"
+	case SourceUser:
+		return "用户"
+	}
+	return source
 }

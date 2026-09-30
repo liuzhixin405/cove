@@ -46,11 +46,34 @@ const (
 
 type mdGlyphs struct {
 	bullet, bar, fenceOpen, fenceClose string
+	// table holds the table rules (renderTable). They used to be hard-coded
+	// box-drawing glyphs, so tables were mojibake on a console that needs
+	// the ASCII set.
+	table tableGlyphs
+}
+
+// tableGlyphs are a table's rule pieces: horizontal and vertical lines, the
+// corners and tees of the top, separator and bottom rules.
+type tableGlyphs struct {
+	h, v                      string
+	topL, topM, topR          string
+	midL, midM, midR          string
+	bottomL, bottomM, bottomR string
 }
 
 var (
-	mdUnicode = mdGlyphs{bullet: "•", bar: "│", fenceOpen: "┌─", fenceClose: "└─"}
-	mdASCII   = mdGlyphs{bullet: "-", bar: "|", fenceOpen: "+-", fenceClose: "+-"}
+	mdUnicode = mdGlyphs{bullet: "•", bar: "│", fenceOpen: "┌─", fenceClose: "└─", table: tableGlyphs{
+		h: "─", v: "│",
+		topL: "┌", topM: "┬", topR: "┐",
+		midL: "├", midM: "┼", midR: "┤",
+		bottomL: "└", bottomM: "┴", bottomR: "┘",
+	}}
+	mdASCII = mdGlyphs{bullet: "-", bar: "|", fenceOpen: "+-", fenceClose: "+-", table: tableGlyphs{
+		h: "-", v: "|",
+		topL: "+", topM: "+", topR: "+",
+		midL: "+", midM: "+", midR: "+",
+		bottomL: "+", bottomM: "+", bottomR: "+",
+	}}
 )
 
 type mdLine int
@@ -115,7 +138,7 @@ func (m *MarkdownStream) Flush() string {
 		m.codeLine.Reset()
 	}
 	if len(m.table) > 0 {
-		out += renderTable(m.table)
+		out += renderTable(m.table, m.g.table)
 		m.table = nil
 	}
 	if m.bold || m.code || (m.started && m.kind == mdHeading) {
@@ -196,15 +219,19 @@ func (m *MarkdownStream) startLine(out *strings.Builder, line string, hasNL, com
 		m.table = append(m.table, u)
 		return wholeLine, true
 	}
+	// Only indentation so far and the line not complete: the next byte may
+	// be the '|' of another table row. Ending the table here (as the check
+	// below used to do first) split an indented table in two whenever a
+	// chunk boundary fell inside a row's leading spaces.
+	if u == "" && !complete {
+		return 0, false
+	}
 	if len(m.table) > 0 {
-		out.WriteString(renderTable(m.table))
+		out.WriteString(renderTable(m.table, m.g.table))
 		m.table = nil
 	}
 
 	if u == "" {
-		if !complete {
-			return 0, false
-		}
 		m.begin(mdText)
 		return 0, true
 	}

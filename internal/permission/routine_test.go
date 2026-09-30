@@ -199,17 +199,23 @@ func TestGitRoutineGroupPoolsWithPrefixRules(t *testing.T) {
 }
 
 // As a deny or ask rule the group applies as soon as one command of the
-// line is a routine git write, seen through runners and global options.
+// line is a routine git write, seen through runners and global options, or
+// any other git invocation that is not read-only ("git push --force" used to
+// be left out, so the riskier variant was caught less strongly than the
+// routine one). The listing forms of routine subcommands (git branch -a, git
+// tag, git stash list) are read-only and stay outside, for deny as for ask;
+// they used to match because they passed the routine test.
 func TestGitRoutineGroupDenyMatchesAnyCommand(t *testing.T) {
 	for _, decision := range []Decision{DDeny, DAsk} {
 		m := NewManager(Default)
 		m.AddRule(decision, Rule{ToolPattern: "bash", CommandGroup: GroupGitRoutine})
-		for _, cmd := range []string{"git push", "echo a && git commit -m x", "sudo git push", "git -C . push", "git.exe push"} {
+		for _, cmd := range []string{"git push", "echo a && git commit -m x", "sudo git push", "git -C . push", "git.exe push", "git push --force",
+			"git branch newname", "git branch -D main", "git tag v1", "git stash", "git -c x=y branch -a", "$GIT branch -a"} {
 			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAllow); d != decision {
 				t.Errorf("%s: %q = %v, want %v", decision, cmd, d, decision)
 			}
 		}
-		for _, cmd := range []string{"git status", "git push --force", "ls"} {
+		for _, cmd := range []string{"git status", "ls", "git branch -a", "git branch", "git tag", "git tag -l", "git stash list", "git remote -v", "git --no-pager branch -r"} {
 			if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAllow); d != DAllow {
 				t.Errorf("%s: %q = %v, want allow", decision, cmd, d)
 			}
@@ -316,6 +322,57 @@ func TestGitRoutineGroupPersists(t *testing.T) {
 		t.Errorf("unknown group converted: %+v", got)
 	}
 	_ = os.Remove(path)
+}
+
+// The default split took the first word that is not an option as the
+// subcommand, so a global option's value became the subcommand: with the npm
+// group remembered, "npm --prefix test publish" read as "npm test" and ran a
+// publish unasked. An option in front of the subcommand now takes the
+// invocation out of the group (its value cannot be told from a subcommand).
+func TestRoutineGroupRefusesOptionsBeforeSubcommand(t *testing.T) {
+	m := NewManager(Default)
+	m.SetShellKind(ShellPOSIX)
+	for _, g := range []string{GroupNpmRoutine, GroupGoRoutine, GroupCargoRoutine, GroupDotnetRoutine} {
+		m.AddRule(DAllow, Rule{ToolPattern: "bash", CommandGroup: g})
+	}
+	for _, cmd := range []string{
+		"npm --prefix test publish",
+		"pnpm -C test publish",
+		"yarn --cwd install publish",
+		"npm -w run exec -- evil",
+		"npm --workspace=a install",
+		"go -C test install ./...",
+		"go -C build env -w GOFLAGS=-x",
+		"cargo -C build install x",
+		"cargo --config build.rustc=evil build",
+		"cargo +nightly build",
+		"dotnet --roll-forward build publish",
+	} {
+		if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAsk {
+			t.Errorf("%q = %v, want ask", cmd, d)
+		}
+		// Nor does the prompt offer a group rule for it.
+		rules, _ := ShellRememberRules("bash", cmd, ShellPOSIX)
+		for _, r := range rules {
+			if r.CommandGroup != "" {
+				t.Errorf("ShellRememberRules(%q) offered group %q", cmd, r.CommandGroup)
+			}
+		}
+	}
+	for _, cmd := range []string{"npm install", "npm run build -- --prod", "pnpm test", "go test ./...", "go build -o x .", "cargo build --release", "dotnet build -c Release"} {
+		if d, _ := m.Check("bash", map[string]any{"command": cmd}, DAsk); d != DAllow {
+			t.Errorf("%q = %v, want allow", cmd, d)
+		}
+	}
+	// As deny rules the groups still see through the global options.
+	md := NewManager(Default)
+	md.AddRule(DDeny, Rule{ToolPattern: "bash", CommandGroup: GroupNpmRoutine})
+	md.AddRule(DDeny, Rule{ToolPattern: "bash", CommandGroup: GroupGoRoutine})
+	for _, cmd := range []string{"npm --prefix sub install", "pnpm -C sub test", "go -C sub build ./...", "npm --silent install"} {
+		if d, _ := md.Check("bash", map[string]any{"command": cmd}, DAllow); d != DDeny {
+			t.Errorf("deny group: %q = %v, want deny", cmd, d)
+		}
+	}
 }
 
 // The audit reproduced these as covered by the routine group although each

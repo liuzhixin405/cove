@@ -57,6 +57,9 @@ type grepOptions struct {
 	context    int
 	// base is the directory paths are shown relative to (the cwd).
 	base string
+	// root is the working directory files must really be in (tctx.Cwd;
+	// empty confines nothing, as in resolvePathInCwd).
+	root string
 }
 
 // display shows path relative to the working directory when it is inside it.
@@ -90,7 +93,7 @@ func (t *GrepTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
 
-	opts := grepOptions{pattern: pattern, include: include, base: tctx.Cwd}
+	opts := grepOptions{pattern: pattern, include: include, base: tctx.Cwd, root: tctx.Cwd}
 	if opts.base == "" {
 		opts.base, _ = os.Getwd()
 	}
@@ -275,30 +278,35 @@ func builtinGrep(ctx context.Context, opts grepOptions, searchPath string) ([]st
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	if info.IsDir() {
-		rels, err := projectFiles(ctx, searchPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, rel := range rels {
-			if opts.include == "" || matchGlob(opts.include, rel) {
-				files = append(files, filepath.Join(searchPath, filepath.FromSlash(rel)))
-			}
-		}
-	} else {
-		files = []string{searchPath}
-	}
-
 	g := grepCollector{opts: opts, re: re, limit: grepMaxLines + 1}
-	for _, path := range files {
+	if !info.IsDir() {
+		g.file(searchPath)
+		return g.lines, nil
+	}
+	rels, err := projectFiles(ctx, searchPath)
+	if err != nil {
+		return nil, err
+	}
+	// Only searchPath was checked against the working directory; the listing
+	// includes links, which os.Open in g.file follows. Each file is confined
+	// just before it is searched, so a search that fills up early does not
+	// stat the rest of the tree. rg needs no such step: without -L it does not
+	// follow links while walking.
+	confine := newFileConfiner(opts.root, searchPath)
+	for _, rel := range rels {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		if g.full() {
 			break
 		}
-		g.file(path)
+		if opts.include != "" && !matchGlob(opts.include, rel) {
+			continue
+		}
+		if !confine.allow(rel) {
+			continue
+		}
+		g.file(filepath.Join(searchPath, filepath.FromSlash(rel)))
 	}
 	return g.lines, nil
 }

@@ -177,37 +177,66 @@ func (s ScoredDoc) CombinedScore(now time.Time, decayHours float64) float64 {
 	return 0.7*s.Score + 0.3*recencyScore
 }
 
+// isCJK reports whether r belongs to a script written without spaces between
+// words (Han, Hiragana, Katakana, Hangul).
+func isCJK(r rune) bool {
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul)
+}
+
 // tokenize splits text into lowercase tokens, removing punctuation.
+//
+// CJK runs become overlapping bigrams (a lone CJK character stays a unigram).
+// They used to count as ordinary letters, so an entire Chinese clause up to
+// the next punctuation mark was ONE token: the query "中文回复" could never
+// match a memory reading "用户偏好使用中文回复，提交前运行测试", and once the
+// memories exceeded InlineBudgetBytes ranked retrieval returned nothing for
+// Chinese queries. Bigrams are the usual dictionary-free CJK segmentation.
+// Latin words keep the old behavior (including the length/stopword filter).
 func tokenize(text string) []string {
 	lower := strings.ToLower(text)
 
 	var tokens []string
 	start := -1
+	var cjk []rune
+
+	flushWord := func(end int) {
+		if start >= 0 {
+			if t := lower[start:end]; len(t) > 2 && !isStopword(t) {
+				tokens = append(tokens, t)
+			}
+			start = -1
+		}
+	}
+	flushCJK := func() {
+		switch {
+		case len(cjk) == 1:
+			tokens = append(tokens, string(cjk))
+		case len(cjk) > 1:
+			for i := 0; i+1 < len(cjk); i++ {
+				tokens = append(tokens, string(cjk[i:i+2]))
+			}
+		}
+		cjk = cjk[:0]
+	}
 
 	for i, r := range lower {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' {
+		switch {
+		case isCJK(r):
+			flushWord(i)
+			cjk = append(cjk, r)
+		case unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-':
+			flushCJK()
 			if start < 0 {
 				start = i
 			}
-		} else {
-			if start >= 0 {
-				tokens = append(tokens, lower[start:i])
-				start = -1
-			}
+		default:
+			flushWord(i)
+			flushCJK()
 		}
 	}
-	if start >= 0 {
-		tokens = append(tokens, lower[start:])
-	}
-
-	// Remove pure stopwords and short tokens
-	var filtered []string
-	for _, t := range tokens {
-		if len(t) > 2 && !isStopword(t) {
-			filtered = append(filtered, t)
-		}
-	}
-	return filtered
+	flushWord(len(lower))
+	flushCJK()
+	return tokens
 }
 
 func isStopword(s string) bool {

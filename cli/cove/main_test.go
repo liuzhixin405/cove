@@ -150,6 +150,9 @@ func TestApplyProviderConfigChangeReturnsReloadError(t *testing.T) {
 }
 
 func TestRunChatInteractionReturnsVisibleError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	runner := stubStreamingRunner{err: errors.New("api: connection refused")}
 	out, err := runChatInteraction(context.Background(), runner, "hello")
 	if err == nil {

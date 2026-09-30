@@ -32,8 +32,17 @@ type turn struct {
 	sp       string
 	toolDefs []api.ToolDef
 	// model is the model the turn runs on; escalation can change it.
-	model  string
-	limits *turnLimits
+	model string
+	// startModel is the model the turn was routed to, before escalation or
+	// an overload fallback moved it. The router's fast-model failure signal
+	// is recorded against it: escalation switched model to the premium one
+	// at the first verify failure, so "verify retries exhausted" never
+	// counted as a fast-model failure.
+	startModel string
+	// outcomeRecorded: this turn already fed the fast-model outcome window
+	// (one outcome per turn).
+	outcomeRecorded bool
+	limits          *turnLimits
 
 	// compactedForLength limits the context-length recovery to one retry.
 	compactedForLength bool
@@ -45,6 +54,11 @@ type turn struct {
 	// todoChecked: the model was already asked about the task list's open
 	// items at a finish (todoFinishNudge).
 	todoChecked bool
+	// todoTouched: the model called todowrite with success in this turn, so
+	// the task list is part of this turn's work. A list only an earlier
+	// request wrote neither forces the finish nudge nor is reminded as the
+	// model's own (todoFinishNudge, todoRoundReminder).
+	todoTouched bool
 	// fellBack: the turn already moved to the other model after an
 	// overload (callModel).
 	fellBack bool
@@ -69,8 +83,12 @@ type TurnHooks struct {
 	// path) before the first ToolProgress chunk; the tool's own block only
 	// arrives when the call has finished.
 	ToolOutputStart func(tool, header string)
-	// ToolProgress receives live output chunks of a long-running tool.
+	// ToolProgress receives live output chunks of a long-running tool: its
+	// stdout, and its stderr too when ToolStderrProgress is nil.
 	ToolProgress func(tool, chunk string)
+	// ToolStderrProgress, when set, receives the stderr chunks, so a front
+	// end can keep per-stream state (tool.Context.OnStderrProgress).
+	ToolStderrProgress func(tool, chunk string)
 	// TurnModel receives the model a turn was routed to, when routing
 	// chooses between a fast and a main model.
 	TurnModel func(model string)
@@ -143,6 +161,19 @@ func (e *Engine) RunMessageWithStream(ctx context.Context, userMessage api.Messa
 	if userMessage.Role == "" {
 		userMessage.Role = "user"
 	}
+	// A panic on the turn goroutine (a tool, a hook, a bug) used to unwind
+	// straight through here: no interruption marker, the last tool calls
+	// left without results, the session unsaved. The front end's recover
+	// then offered "继续", beginTurn took the re-sent message for a new
+	// request and appended it a second time, and the model redid the
+	// completed steps. Mark the turn interrupted the way a cancel does and
+	// let the panic go on to the caller's recover.
+	defer func() {
+		if r := recover(); r != nil {
+			e.interrupt(userMessage, e.currentModel(), "内部异常")
+			panic(r)
+		}
+	}()
 	t := e.beginTurn(ctx, userMessage, onDelta, onReasoning)
 
 	for iter := 0; ; iter++ {
@@ -227,13 +258,26 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 		e.messages = append(e.messages, userMessage)
 		e.fileMu.Lock()
 		e.turnFilesChanged = false
+		e.turnRanGit = false
 		e.turnChangedFiles = nil
 		e.turnCheckpointed = false
 		e.fileMu.Unlock()
+		// The tool-failure breaker counts within one request. It was never
+		// reset, so after a bad previous turn the first failed batch of a
+		// new request tripped "3+ tool calls failed" and escalated at once.
+		// A resumed turn keeps its count: it is the same request.
+		e.consecutiveErrors = 0
 	}
 	e.saveSession()
 
 	t := &turn{ctx: ctx, user: userMessage, onDelta: onDelta, onReasoning: onReasoning}
+	// A resumed turn already ran part of its work: a todowrite call in it
+	// makes the list this turn's own, as it was before the interruption.
+	if resuming {
+		if i := lastRequestIndex(e.messages); i >= 0 {
+			t.todoTouched = todoWrittenSince(e.messages[i+1:])
+		}
+	}
 	// Cache system prompt and tool defs across iterations (stable within a run)
 	t.sp = e.SystemPrompt()
 	t.toolDefs = e.buildAPIToolDefs()
@@ -294,8 +338,8 @@ func (e *Engine) beginTurn(ctx context.Context, userMessage api.Message, onDelta
 		trace.Write("turn", map[string]any{"model": t.model, "user_bytes": len(userMessage.Content), "note_bytes": len(note),
 			"messages": len(e.messages), "est_tokens": e.totalTokens, "overhead_tokens": e.requestOverhead, "window": api.ContextWindowForModel(t.model)})
 	}
-	e.lastRoutedModel = t.model
-	e.turnModelSnap.Store(t.model)
+	e.setTurnModel(t.model)
+	t.startModel = t.model
 
 	// The iteration cap, the time limit and the stagnation prompt are soft:
 	// an interactive front end is asked whether to go on (see
@@ -433,7 +477,11 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 		if fit := compactionThreshold(modelName); fit < target {
 			target = fit
 		}
-		e.compact(t.ctx, target)
+		res := e.compact(t.ctx, target)
+		// shrunk: the request really changed. Retrying on "the estimate
+		// went down" alone could resend an identical request, spending
+		// the one retry.
+		shrunk := res != nil && res.Compressed
 		how := "已压缩对话历史"
 		if e.totalTokens >= before || e.totalTokens > target {
 			// Compaction found nothing to summarise (a fresh turn, too
@@ -442,10 +490,11 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 			// drop and cut those (window_shrink.go).
 			if e.shrinkForWindow(target) {
 				how = "已移除本轮附加上下文并裁剪大工具结果"
+				shrunk = true
 			}
 		}
-		trace.Write("overflow", map[string]any{"model": modelName, "tokens_before": before, "tokens_after": e.totalTokens, "retry": e.totalTokens < before})
-		if e.totalTokens < before {
+		trace.Write("overflow", map[string]any{"model": modelName, "tokens_before": before, "tokens_after": e.totalTokens, "retry": shrunk})
+		if shrunk {
 			e.engineOutput("  上下文超出模型上限，" + how + "后重试")
 			return nil, flowNext
 		}
@@ -468,7 +517,12 @@ func (e *Engine) callModel(t *turn, iter int) (*api.ChatResponse, flow) {
 				}
 				e.engineOutput(fmt.Sprintf("  \x1b[33m模型 %s %s，本轮改用 %s 继续\x1b[0m", modelName, why, alt))
 				trace.Write("fallback", map[string]any{"from": modelName, "to": alt, "error": textutil.ClipRunes(err.Error(), 160)})
+				// The whole turn moves, as escalate moves it: setting t.model
+				// alone left currentModel() (tool output limits, the window
+				// the context is shrunk for, ContextUsage) on the failed
+				// model for the rest of the turn.
 				t.model = alt
+				e.setTurnModel(alt)
 				return nil, flowNext
 			}
 		}
@@ -571,10 +625,16 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 	// A turn that ends with the task list still open: once, the model either
 	// finishes the items or marks them done. Models finished the work and
 	// left every item pending, and the next session was offered the "unfinished" plan.
-	if nudge := e.todoFinishNudge(t); nudge != "" {
-		e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
-		e.messages = append(e.messages, newSyntheticUserMsg(nudge))
-		return flowNext
+	// Gated by canNudge like stopNudge: it used to run unconditionally, so
+	// an answer given at the last allowed call (-p --max-turns N) with open
+	// items was sent back, and the next call hit the cap: the report was
+	// replaced by a limit error.
+	if e.canNudge(t.ctx, t.limits, iter) {
+		if nudge := e.todoFinishNudge(t); nudge != "" {
+			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
+			e.messages = append(e.messages, newSyntheticUserMsg(nudge))
+			return flowNext
+		}
 	}
 	// Completion verification gate (minimal EDCL "done contract"): if
 	// the user configured done_verify_commands, don't accept the
@@ -584,10 +644,30 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 	// exactly the kind of claim they get wrong more often  - this
 	// turns that claim into something checked instead of trusted.
 	gaveUpUnresolved := false
-	if e.verifyGate.Enabled() && (!e.verifyGate.onlyWhenFilesChanged || e.filesChangedThisTurn()) {
+	due := e.verifyGate.Enabled() && (!e.verifyGate.onlyWhenFilesChanged || e.filesChangedThisTurn())
+	if due && !e.verifyTrusted(e.verifyGate) {
+		// Skipped, neither passed nor failed: the turn ends as if no gate
+		// were configured.
+		due = false
+		if !e.verifyTrustNoticed {
+			e.verifyTrustNoticed = true
+			e.engineOutput(untrustedVerifyNotice)
+		}
+	}
+	if due {
 		// Said once, when a check first runs: a chat turn used to print it too.
 		e.announceVerifyGate()
 		results, passed := e.verifyGate.Run(t.ctx, t.limits.verifyPassed)
+		if t.ctx.Err() != nil {
+			// Ctrl+C during the check is the user's doing, not a failed
+			// verification: it used to count a retry, hand "[verify_gate]
+			// ... FAIL" back to the model, escalate and go on working. The
+			// reply stays in the history and the turn ends cancelled,
+			// resumable like any other.
+			e.messages = append(e.messages, api.Message{Role: "assistant", Content: resp.Content, ReasoningContent: resp.ReasoningContent, ThinkingBlocks: resp.ThinkingBlocks})
+			e.interrupt(t.user, t.model, "已被用户取消")
+			return t.end("", t.ctx.Err())
+		}
 		if !passed && TimedOut(results) {
 			// Too slow to tell: not the model's failure. No retry,
 			// no escalation; the turn ends normally.
@@ -617,8 +697,9 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 	}
 	// Feed the router's failure-rate signal (api.FailureRateSignal):
 	// a clean pass/no-gate counts as success, exhausting verify
-	// retries counts as failure, for whichever model this turn used.
-	if isFastModelName(t.model) {
+	// retries counts as failure, for the model the turn started on.
+	if isFastModelName(t.startModel) && !t.outcomeRecorded {
+		t.outcomeRecorded = true
 		e.fastOutcomes.Record(gaveUpUnresolved)
 	}
 
@@ -630,6 +711,9 @@ func (e *Engine) finishOrNudge(t *turn, iter int, resp *api.ChatResponse) flow {
 	e.bgMu.Lock()
 	e.turnUsedWork = t.limits.usedTools
 	e.bgMu.Unlock()
+	// Right under the final report, so a report that only describes the
+	// commit and push steps cannot pass for having run them.
+	e.reportGitWorkState(t.ctx)
 	// Turn-end pipeline (all run in background)
 	e.runTurnEndPipeline()
 	// Auto-track decisions and discoveries
@@ -701,9 +785,40 @@ func (e *Engine) checkToolLoop(t *turn, iter int, resp *api.ChatResponse) flow {
 
 // dispatchTools runs one batch of tool calls and returns their results in
 // call order. The batch is checkpointed first, so /undo can take it back.
+// canonicalToolCalls returns calls with every tool name the registry knows
+// replaced by its canonical name. It copies the slice rather than rewriting
+// the model's response in place. Unknown names are kept: executeTool reports
+// them.
+func (e *Engine) canonicalToolCalls(calls []api.ToolCall) []api.ToolCall {
+	out := make([]api.ToolCall, len(calls))
+	for i, tc := range calls {
+		tc.Name = e.canonicalToolName(tc.Name)
+		out[i] = tc
+	}
+	return out
+}
+
+// canonicalToolName is the registry's canonical name for name (an alias or
+// the name itself), or name unchanged when no registered tool answers to it.
+func (e *Engine) canonicalToolName(name string) string {
+	if e.registry != nil {
+		if t, ok := e.registry.Find(name); ok {
+			return t.Def().Name
+		}
+	}
+	return name
+}
+
 func (e *Engine) dispatchTools(ctx context.Context, calls []api.ToolCall) []toolResult {
 	results := make([]toolResult, len(calls))
 
+	// Canonical names first: the model may call a tool by an alias ("Edit",
+	// "Write", "PowerShell", "Agent"), and everything below classifies by
+	// the canonical name. checkpointBefore used to see the raw "Edit", took
+	// no snapshot, and still marked the batch checkpointed, so executeTool
+	// (which normalized later) skipped its own: the file changed with
+	// nothing for /undo to restore.
+	calls = e.canonicalToolCalls(calls)
 	e.checkpointBefore(calls)
 	ctx = withCheckpointed(ctx)
 
@@ -734,8 +849,8 @@ func (e *Engine) dispatchTools(ctx context.Context, calls []api.ToolCall) []tool
 	// wait for the batch to drain.
 	claimedWritePaths := make(map[string]bool)
 	// deferred holds same-file duplicates. They run once nothing else
-	// is in flight: at the next serial call (before it, since it may
-	// depend on them) or after the batch.
+	// is in flight: at the next serial call or observer (before it, since
+	// it may depend on them) or after the batch.
 	var deferred []int
 	runDeferred := func() {
 		for _, i := range deferred {
@@ -750,30 +865,78 @@ func (e *Engine) dispatchTools(ctx context.Context, calls []api.ToolCall) []tool
 	// spawn an unbounded number of goroutines.
 	sem := make(chan struct{}, maxParallelTools)
 
+	// A parallel group holds one kind of call: readers (read-only and
+	// concurrency-safe: read, grep, glob), writes (write/edit to distinct
+	// files) or other concurrency-safe calls that are not read-only (agent,
+	// MCP tools, team_create, task_create, send_message), never a mix. Only
+	// later write/edit calls to a claimed path used to be held back, so
+	// [edit P, read P] read P before or halfway through the edit, [write
+	// a.go, grep "newFunc"] grepped the old file, [edit P, agent "refactor
+	// P"] had two writers, and [read P, edit P] could read the edited file.
+	// Readers and agents also shared one group, so [agent "refactor P",
+	// read P] read P while the agent was rewriting it. Switching kind drains
+	// the group first (and runs the held-back duplicates, which a later
+	// reader must see), so the batch keeps its sequential meaning; writes to
+	// distinct files, readers among themselves and agents among themselves
+	// still overlap.
+	const (
+		groupNone = iota
+		groupReaders
+		groupWrites
+		groupOthers
+	)
+	group := groupNone
+	drainGroup := func() {
+		wg.Wait()
+		runDeferred()
+		claimedWritePaths = make(map[string]bool)
+		group = groupNone
+	}
+	// enterGroup waits for the running group when kind differs from it.
+	enterGroup := func(kind int) {
+		if group != groupNone && group != kind {
+			drainGroup()
+		}
+		group = kind
+	}
+	cwd := e.projectCwd()
+
 	for i, tc := range calls {
 		t, _ := e.registry.Find(tc.Name)
 		safe := t != nil && t.Def().IsConcurrencySafe
+		kind := groupOthers
+		if safe && t.Def().IsReadOnly {
+			kind = groupReaders
+		}
 
 		// write/edit to distinct files can also be parallelized.
 		// The path must be read through toolTargetPath, which honors
 		// every key alias the tools themselves accept (file_path, path,
-		// filepath, file) and normalizes the spelling. Looking only at
-		// "filePath" meant a call using an alias reported no path at
-		// all, fell through as non-parallelizable, and — worse — never
-		// claimed its path, so a sibling call to the same file was not
-		// serialized against it.
+		// filepath, file). Looking only at "filePath" meant a call using
+		// an alias reported no path at all, fell through as
+		// non-parallelizable, and — worse — never claimed its path, so a
+		// sibling call to the same file was not serialized against it.
+		// The claim key is the absolute, cleaned path, case-folded on
+		// Windows (writeClaimKey): "internal/x.go" and
+		// "D:\proj\internal\x.go", or "X.go" and "x.go" on Windows, were
+		// two keys for one file, so both edits ran at once and one change
+		// was lost.
 		if !safe && (tc.Name == "write" || tc.Name == "edit") {
 			if fp := toolTargetPath(tc.Input); fp != "" {
-				if claimedWritePaths[fp] {
+				enterGroup(groupWrites)
+				key := writeClaimKey(fp, cwd)
+				if claimedWritePaths[key] {
 					deferred = append(deferred, i)
 					continue
 				}
-				claimedWritePaths[fp] = true
+				claimedWritePaths[key] = true
 				safe = true // first call to this path, safe to parallelize
+				kind = groupWrites
 			}
 		}
 
 		if safe {
+			enterGroup(kind)
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(idx int, tcall api.ToolCall) {
@@ -798,9 +961,7 @@ func (e *Engine) dispatchTools(ctx context.Context, calls []api.ToolCall) []tool
 			// "mkdir d", write d/f] wrote before the mkdir). Same-file
 			// duplicates held back so far run before it too, and paths
 			// claimed before the barrier are free again after it.
-			wg.Wait()
-			runDeferred()
-			claimedWritePaths = make(map[string]bool)
+			drainGroup()
 			started := time.Now()
 			res, failed := e.runToolRecovered(ctx, tc)
 			results[i] = toolResult{ID: tc.ID, Name: tc.Name, Input: tc.Input, Content: res, Failed: failed, Elapsed: time.Since(started)}
@@ -895,7 +1056,7 @@ func (e *Engine) absorbToolResults(t *turn, iter int, results []toolResult) flow
 			e.messages[last].Content += "\n\n" + n
 		}
 	}
-	if n := e.todoRoundReminder(results); n != "" {
+	if n := e.todoRoundReminder(t, results); n != "" {
 		if last := len(e.messages) - 1; last >= 0 && e.messages[last].Role == "tool" {
 			e.messages[last].Content += "\n\n" + n
 		}
@@ -927,7 +1088,8 @@ func (e *Engine) afterIteration(t *turn, iter int, results []toolResult) flow {
 			e.consecutiveErrors = 0
 			// Feed the router's failure-rate signal: this turn visibly
 			// struggled on the currently-routed model.
-			if isFastModelName(t.model) {
+			if isFastModelName(t.model) && !t.outcomeRecorded {
+				t.outcomeRecorded = true
 				e.fastOutcomes.Record(true)
 			}
 			// And act on it now rather than only on later turns.

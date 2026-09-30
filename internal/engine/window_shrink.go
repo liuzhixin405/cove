@@ -13,7 +13,8 @@ import (
 // window and compaction found nothing to summarise (a fresh turn: too few
 // messages, no assistant boundary). It removes what the engine itself added
 // and what is cheapest to lose, until the estimate is at or under target,
-// and reports whether anything changed:
+// and reports whether the request actually got smaller (a message removed
+// or a tool result cut):
 //
 //  1. the synthetic turn notes (repo map excerpt, memories, environment),
 //     which the model can ask for with tools;
@@ -23,27 +24,36 @@ import (
 //
 // The user's messages and the assistant's own turns are never touched.
 func (e *Engine) shrinkForWindow(target int) bool {
-	before := e.totalTokens
 	model := e.currentModel()
 
-	kept := e.messages[:0:0]
+	// The last marker stays where it is and earlier ones go. The newest
+	// marker's text used to be written into the oldest one's position.
 	lastMarker := -1
-	for _, m := range e.messages {
+	for i, m := range e.messages {
+		if m.Synthetic && isResumeMarker(m.Content) {
+			lastMarker = i
+		}
+	}
+	kept := e.messages[:0:0]
+	for i, m := range e.messages {
 		if m.Synthetic && isTurnNote(m.Content) {
 			continue
 		}
-		if m.Synthetic && isResumeMarker(m.Content) {
-			if lastMarker >= 0 {
-				kept[lastMarker] = m
-				continue
-			}
-			lastMarker = len(kept)
+		if m.Synthetic && isResumeMarker(m.Content) && i != lastMarker {
+			continue
 		}
 		kept = append(kept, m)
 	}
-	e.messages = kept
-	e.invalidateUsage()
-	e.updateTokenCount()
+	// changed says the request really got smaller. It used to be "the
+	// estimate went down", and re-estimating alone can do that: the single
+	// context-length retry was spent on an identical request, after a line
+	// saying context had been removed.
+	changed := len(kept) < len(e.messages)
+	if changed {
+		e.messages = kept
+		e.invalidateUsage()
+		e.updateTokenCount()
+	}
 
 	if e.totalTokens > target {
 		capTokens := toolResultBudgetTokens(model) / 4
@@ -64,13 +74,17 @@ func (e *Engine) shrinkForWindow(target int) bool {
 			est := token.Estimate(m.Content)
 			m.Content = token.TruncateMiddle(m.Content, capTokens) +
 				"\n[tool result cut from about " + itoa(est) + " to " + itoa(capTokens) + " tokens to fit the context window; re-run the tool with a narrower range if the cut part matters.]"
+			if !changed {
+				changed = true
+				e.invalidateUsage()
+			}
 			e.updateTokenCount()
 			if e.totalTokens <= target {
 				break
 			}
 		}
 	}
-	return e.totalTokens < before
+	return changed
 }
 
 // isTurnNote reports whether content is a per-turn note the engine attached

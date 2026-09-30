@@ -40,6 +40,12 @@ type Context struct {
 	// long-running tool (e.g. bash/powershell) executes. It lets the UI show
 	// live output and lets the stall monitor know the tool is still alive.
 	OnProgress func(chunk string)
+	// OnStderrProgress, when set, receives the chunks of the tool's stderr,
+	// which otherwise go to OnProgress too. stdout and stderr are copied by
+	// separate goroutines; a consumer that keeps per-stream state (a
+	// sanitiser holding back a partial escape or UTF-8 sequence) needs them
+	// apart, or the held bytes of one are completed by the other's chunk.
+	OnStderrProgress func(chunk string)
 	// SetWaiting, when set, tells the engine the tool is waiting on the
 	// person (the question tool at AskUser), so the stall monitor does not
 	// call the wait a hang. Call it with true before waiting, false after.

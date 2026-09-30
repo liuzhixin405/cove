@@ -16,7 +16,7 @@ import (
 func TestReviewIgnoresMemoryLines(t *testing.T) {
 	eng := reviewEngine(t, &mockProvider{})
 	before := len(eng.memStore.All())
-	eng.applyReview("MEMORY: 用户偏好用 tab 缩进")
+	eng.applyReview("MEMORY: 用户偏好用 tab 缩进", eng.SessionID())
 	if got := len(eng.memStore.All()); got != before {
 		t.Fatalf("review saved a memory: %d -> %d entries", before, got)
 	}
@@ -27,7 +27,7 @@ func TestReviewIgnoresMemoryLines(t *testing.T) {
 // survives the process (it lived only in memory).
 func TestReviewWritesSkillToDisk(t *testing.T) {
 	eng := reviewEngine(t, &mockProvider{})
-	res := eng.applyReview("SKILL: Release Flow | 发布新版本 | run the tests, tag, push the tag")
+	res := eng.applyReview("SKILL: Release Flow | 发布新版本 | run the tests, tag, push the tag", eng.SessionID())
 	if len(res.added) != 1 || res.added[0] != "Release Flow" {
 		t.Fatalf("new skills = %+v", res)
 	}
@@ -50,7 +50,7 @@ func TestReviewWritesSkillToDisk(t *testing.T) {
 		t.Fatalf("registered skill = %+v, %v", sk, ok)
 	}
 	// Two-part lines still work; the description is the steps' start.
-	if got := eng.applyReview("SKILL: 部署 | 构建镜像，推送，滚动更新"); len(got.added) != 1 {
+	if got := eng.applyReview("SKILL: 部署 | 构建镜像，推送，滚动更新", eng.SessionID()); len(got.added) != 1 {
 		t.Fatalf("two-part skill not saved: %v", got)
 	}
 }
@@ -88,8 +88,8 @@ func TestAutoSkillSlugCarriesNameHash(t *testing.T) {
 		t.Fatalf("both slug to %q", a)
 	}
 	eng := reviewEngine(t, &mockProvider{})
-	eng.applyReview("SKILL: K8s Deploy | a | steps one")
-	eng.applyReview("SKILL: k8s-deploy | b | steps two")
+	eng.applyReview("SKILL: K8s Deploy | a | steps one", eng.SessionID())
+	eng.applyReview("SKILL: k8s-deploy | b | steps two", eng.SessionID())
 	for name, want := range map[string]string{"K8s Deploy": "steps one", "k8s-deploy": "steps two"} {
 		data, err := os.ReadFile(autoSkillFile(t, name))
 		if err != nil || !strings.Contains(string(data), want) {
@@ -113,7 +113,7 @@ func TestAutoSkillDoesNotOverwriteForeignFile(t *testing.T) {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		res := eng.applyReview("SKILL: Release | new | new steps")
+		res := eng.applyReview("SKILL: Release | new | new steps", eng.SessionID())
 		if len(res.added)+len(res.updated) != 0 {
 			t.Fatalf("foreign file replaced: %+v", res)
 		}
@@ -126,10 +126,10 @@ func TestAutoSkillDoesNotOverwriteForeignFile(t *testing.T) {
 // Learning an auto skill again rewrites its file and counts as an update.
 func TestAutoSkillRelearnedCountsAsUpdate(t *testing.T) {
 	eng := reviewEngine(t, &mockProvider{})
-	if res := eng.applyReview("SKILL: Release | v1 | old steps"); len(res.added) != 1 {
+	if res := eng.applyReview("SKILL: Release | v1 | old steps", eng.SessionID()); len(res.added) != 1 {
 		t.Fatalf("first: %+v", res)
 	}
-	res := eng.applyReview("SKILL: Release | v2 | new steps")
+	res := eng.applyReview("SKILL: Release | v2 | new steps", eng.SessionID())
 	if len(res.updated) != 1 || len(res.added) != 0 {
 		t.Fatalf("second: %+v", res)
 	}
@@ -142,7 +142,7 @@ func TestAutoSkillRelearnedCountsAsUpdate(t *testing.T) {
 func TestAutoSkillDoesNotShadowExistingSkill(t *testing.T) {
 	eng := reviewEngine(t, &mockProvider{})
 	eng.skillMgr.Register(skills.Skill{Name: "commit", Prompt: "user's commit skill", FilePath: filepath.Join(t.TempDir(), "commit", "SKILL.md")})
-	res := eng.applyReview("SKILL: commit | c | learned steps")
+	res := eng.applyReview("SKILL: commit | c | learned steps", eng.SessionID())
 	if len(res.added)+len(res.updated) != 0 {
 		t.Fatalf("shadowed: %+v", res)
 	}

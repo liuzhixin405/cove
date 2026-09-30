@@ -115,9 +115,13 @@ func (e *Engine) runStallMonitor(stop <-chan struct{}) {
 // same stall, and /diagnose errors counts stalls, not reminders. It does not
 // log it either: a log line would land in errors.log a second time, uncoded,
 // through the log sink.
+//
+// It is a plain line. It used to start with "\r\x1b[K" to wipe whatever the
+// terminal showed on the current row: cursor steering that a front end with
+// a live region must never receive, and garbage in a piped log.
 func (e *Engine) reportStall(label string, idle time.Duration, record bool) {
 	e.engineOutput(fmt.Sprintf(
-		"\r\x1b[K\x1b[33m! 仍在「%s」阶段，已 %s 无进展（可能卡住，按 Ctrl+C 可中断）\x1b[0m\n",
+		"\x1b[33m! 仍在「%s」阶段，已 %s 无进展（可能卡住，按 Ctrl+C 可中断）\x1b[0m",
 		label, idle.Round(time.Second)))
 	if record {
 		diagnostic.ReportError(&diagnostic.Stall{Stage: label, Idle: idle}, e.diagContext("", ""))

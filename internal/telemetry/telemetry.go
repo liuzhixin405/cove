@@ -2,10 +2,15 @@ package telemetry
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
+	"github.com/liuzhixin405/cove-agent/internal/log"
 )
 
 // Event represents a single telemetry event.
@@ -91,6 +96,12 @@ func (r *Recorder) RecordToolCall(toolName string, success bool, duration time.D
 }
 
 // Flush writes accumulated events to disk.
+//
+// The file is replaced atomically. It used to be rewritten in place with
+// os.WriteFile, so a crash or a concurrent reader mid-write could leave a torn
+// file; the next Flush then failed to parse it and silently threw away the
+// whole history. A file that still fails to parse is now moved aside to
+// telemetry.json.bak with a warning, and history starts fresh.
 func (r *Recorder) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -100,7 +111,16 @@ func (r *Recorder) Flush() error {
 	}
 
 	// Append-only: read existing, merge, write back
-	existing, _ := readEvents(r.filePath)
+	existing, err := readEvents(r.filePath)
+	if errors.Is(err, errCorrupt) {
+		bak := r.filePath + ".bak"
+		if rerr := os.Rename(r.filePath, bak); rerr != nil {
+			log.Warnf("telemetry: %s is corrupt (%v) and could not be backed up (%v); starting a new history", r.filePath, err, rerr)
+		} else {
+			log.Warnf("telemetry: %s is corrupt (%v); kept it as %s and started a new history", r.filePath, err, bak)
+		}
+		existing = nil
+	}
 	all := append(existing, r.events...)
 	// Cap at 5000
 	if len(all) > 5000 {
@@ -115,8 +135,13 @@ func (r *Recorder) Flush() error {
 		return err
 	}
 
+	// Clear the buffer only once the events are on disk; clearing it first
+	// lost them whenever the write failed.
+	if err := fsatomic.WriteFile(r.filePath, data, 0644); err != nil {
+		return err
+	}
 	r.events = nil
-	return os.WriteFile(r.filePath, data, 0644)
+	return nil
 }
 
 // Stats returns current in-memory event counts by type.
@@ -130,6 +155,10 @@ func (r *Recorder) Stats() map[string]int {
 	return counts
 }
 
+// errCorrupt marks a telemetry file that was read but does not parse, as
+// opposed to one that is missing or unreadable.
+var errCorrupt = errors.New("corrupt telemetry file")
+
 func readEvents(path string) ([]Event, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -137,7 +166,7 @@ func readEvents(path string) ([]Event, error) {
 	}
 	var events []Event
 	if err := json.Unmarshal(data, &events); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 	}
 	return events, nil
 }

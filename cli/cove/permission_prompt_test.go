@@ -313,6 +313,37 @@ func TestPromptExplainsWhyRememberedRulesDidNotApply(t *testing.T) {
 	}
 }
 
+// The explanation is information, not a warning: it used to be a yellow line
+// of its own under nearly every compound command, repeating "按 y 允许本次，
+// n 拒绝" under the answer line that said just that.
+func TestPromptExplanationIsQuiet(t *testing.T) {
+	m := permission.NewManager(permission.Default)
+	m.SetShellKind(permission.ShellPOSIX)
+	// A line that cannot be remembered: no [a], and nothing more to say.
+	_, out := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": `sed "s/a/b/" s.json > s2.json`}, "n")
+	if strings.Contains(out, "[a]") || strings.Contains(out, "无法") || strings.Contains(out, "按 y 允许本次") {
+		t.Fatalf("a line that cannot be remembered is still explained:\n%s", out)
+	}
+	// A remembered rule that does not cover the line is explained, dim.
+	m.AddRule(permission.DAllow, permission.Rule{ToolPattern: "bash", CommandPrefix: "mkdir"})
+	_, out = answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "mkdir a && dotnet new sln"}, "n")
+	if !strings.Contains(out, "未覆盖这一行") || strings.Contains(out, termui.Yellow+"已记住") {
+		t.Fatalf("gap explanation missing or yellow:\n%s", out)
+	}
+}
+
+// How to answer is said once per process, not under every prompt.
+func TestPromptKeyHintShownOnce(t *testing.T) {
+	keyHintShown.Store(false)
+	t.Cleanup(func() { keyHintShown.Store(false) })
+	m := permission.NewManager(permission.Default)
+	_, first := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "rm -rf build"}, "n")
+	_, second := answerPrompt(t, managerRules{m}, "bash", map[string]any{"command": "rm -rf dist"}, "n")
+	if !strings.Contains(first, "按键即答") || strings.Contains(second, "按键即答") {
+		t.Fatalf("first has hint=%v, second has hint=%v", strings.Contains(first, "按键即答"), strings.Contains(second, "按键即答"))
+	}
+}
+
 // answerPrompt runs one prompt for toolName/input, answers it and returns the
 // decision together with everything the prompt printed.
 func answerPrompt(t *testing.T, rules permissionRuleAdder, toolName string, input map[string]any, answer string) (bool, string) {

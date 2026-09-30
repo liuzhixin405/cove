@@ -2,10 +2,12 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/liuzhixin405/cove-agent/internal/filelock"
 	"github.com/liuzhixin405/cove-agent/internal/memory"
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
@@ -41,21 +43,37 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 		}
 		name := in.Args[1]
 		content := strings.Join(in.Args[2:], " ")
-		// A name only the global directory has: build on its content, or the
-		// new project copy would hide what the global one said.
-		if ap, ok := in.MemoryStore.(memoryAppender); ok {
-			if _, fromLower, exists := ap.BaseContent(name); exists && fromLower {
-				written, err := ap.Append(name, content)
-				if err != nil {
-					return Output{}, err
+		// The write (and the probe it builds on) holds both memory write
+		// locks like every other writer: without them a turn-end extraction
+		// mid read -> append -> rename in this or another cove process
+		// replaced what was just saved, or lost the fact it had appended.
+		var msg string
+		err := withMemoryWriteLock(in.MemoryStore, func() error {
+			// A name only the global directory has: build on its content, or
+			// the new project copy would hide what the global one said.
+			if ap, ok := in.MemoryStore.(memoryAppender); ok {
+				if _, fromLower, exists := ap.BaseContent(name); exists && fromLower {
+					written, err := ap.Append(name, content)
+					if err != nil {
+						return err
+					}
+					msg = fmt.Sprintf("记忆 '%s' 已保存（在全局同名记忆基础上追加到项目目录）", written)
+					return nil
 				}
-				return Output{Message: fmt.Sprintf("记忆 '%s' 已保存（在全局同名记忆基础上追加到项目目录）", written)}, nil
 			}
+			if err := in.MemoryStore.Save(name, content); err != nil {
+				return err
+			}
+			msg = fmt.Sprintf("记忆 '%s' 已保存", name)
+			return nil
+		})
+		if errors.Is(err, filelock.ErrTimeout) {
+			return Output{Message: "记忆目录正被另一个 cove 进程写入，请稍后重试"}, nil
 		}
-		if err := in.MemoryStore.Save(name, content); err != nil {
+		if err != nil {
 			return Output{}, err
 		}
-		return Output{Message: fmt.Sprintf("记忆 '%s' 已保存", name)}, nil
+		return Output{Message: msg}, nil
 	case "remove", "delete", "rm":
 		if len(in.Args) < 2 {
 			return Output{Message: "用法: /memory remove <名称>"}, nil
@@ -111,6 +129,25 @@ func (c *MemoryCmd) Execute(ctx context.Context, in Input) (Output, error) {
 type memoryAppender interface {
 	BaseContent(name string) (content string, fromLower, ok bool)
 	Append(name, content string) (string, error)
+}
+
+// memoryDirer is the part of *memory.Store that names the directory its
+// writes go to, whose lock file guards them.
+type memoryDirer interface {
+	PrimaryDir() string
+}
+
+// withMemoryWriteLock runs fn under the memory write locks of store's write
+// directory (memory.WithWriteLock). A store without a directory (a test
+// double) has no lock file to take; fn then runs under the in-process lock
+// alone.
+func withMemoryWriteLock(store MemoryStore, fn func() error) error {
+	if d, ok := store.(memoryDirer); ok && d.PrimaryDir() != "" {
+		return memory.WithWriteLock(d.PrimaryDir(), fn)
+	}
+	unlock := memory.LockWrites()
+	defer unlock()
+	return fn()
 }
 
 // sourceMarker labels where a memory entry was loaded from.

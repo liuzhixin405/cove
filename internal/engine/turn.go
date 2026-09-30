@@ -14,8 +14,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/config"
 	"github.com/liuzhixin405/cove-agent/internal/cost"
 	"github.com/liuzhixin405/cove-agent/internal/delegate"
+	"github.com/liuzhixin405/cove-agent/internal/permission"
 	"github.com/liuzhixin405/cove-agent/internal/repomap"
 	"github.com/liuzhixin405/cove-agent/internal/safety"
 )
@@ -264,9 +266,17 @@ func (e *Engine) escalate(model, why string) string {
 		return model
 	}
 	e.engineOutput(fmt.Sprintf("  \x1b[2m(%s，本轮后续改用 %s)\x1b[0m", why, premium))
-	e.lastRoutedModel = premium
-	e.turnModelSnap.Store(premium)
+	e.setTurnModel(premium)
 	return premium
+}
+
+// setTurnModel records model as the one the rest of the turn runs on:
+// currentModel() for the turn goroutine and turnModelSnap for readers on
+// other goroutines. Routing, escalation and the overload fallback all go
+// through here, so none of them updates one and forgets the other.
+func (e *Engine) setTurnModel(model string) {
+	e.lastRoutedModel = model
+	e.turnModelSnap.Store(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,14 +318,18 @@ func (e *Engine) newSkillPrompts(path string) string {
 // compaction (resetShownContext).
 func (e *Engine) toolContextHints(tc api.ToolCall) string {
 	var out string
-	if filePath, ok := tc.Input["filePath"].(string); ok {
+	// toolFilePath honors every path alias the tools accept; reading only
+	// "filePath" showed no file-type skill and no directory hint for an edit
+	// sent with file_path.
+	filePath := toolFilePath(tc)
+	if filePath != "" {
 		out += e.newSkillPrompts(filePath)
 	}
 	if e.subdirHints == nil {
 		return out
 	}
-	if path, ok := tc.Input["filePath"].(string); ok && path != "" {
-		out += e.subdirHints.CheckPath(path)
+	if filePath != "" {
+		out += e.subdirHints.CheckPath(filePath)
 	} else if path, ok := tc.Input["path"].(string); ok && path != "" {
 		out += e.subdirHints.CheckPath(path)
 	} else if cmd, ok := tc.Input["command"].(string); ok {
@@ -403,7 +417,12 @@ func (e *Engine) filesChangedThisTurn() bool {
 }
 
 // detectVerifyCommands derives a completion check from the project's build
-// files. Only compile/type checks: fast, and they do not run the project.
+// files. Only compile/type checks, which are fast — but they do execute code
+// from the repository: cargo check runs build.rs, npm run build runs a
+// package.json script, npx tsc runs the repo's node_modules/.bin/tsc, dotnet
+// build runs MSBuild targets. (This comment used to say "they do not run the
+// project", and the commands ran in any clone unasked.) The gate built from
+// them therefore runs only in a trusted project (verifyTrusted).
 func detectVerifyCommands(dir string) []string {
 	exists := func(parts ...string) bool {
 		_, err := os.Stat(filepath.Join(append([]string{dir}, parts...)...))
@@ -517,7 +536,47 @@ func (e *Engine) newVerifyGate(dir string) *VerifyGate {
 func newAutoVerifyGate(cmds []string, dir string) *VerifyGate {
 	g := NewVerifyGate(cmds, dir)
 	g.onlyWhenFilesChanged = true
+	g.needsTrust = true
 	return g
+}
+
+// untrustedVerifyNotice is shown once when the gate is skipped because the
+// project is not trusted.
+const untrustedVerifyNotice = "  \x1b[2m未信任的项目不自动运行构建/测试校验（npm run build 等会执行仓库里的脚本）；确认可信后输入 /trust\x1b[0m"
+
+// dirTrusted reports whether dir was trusted; an unreadable trust store
+// counts as "not trusted".
+func dirTrusted(dir string) bool {
+	ok, _ := config.IsProjectDirTrusted(dir)
+	return ok
+}
+
+// verifyTrusted reports whether the gate may run its commands now. Detected
+// commands and automatic tests execute the repository's own code (build
+// scripts, conftest.py, MSBuild targets); they used to run at the end of any
+// turn that edited a file, so a cloned hostile repository without any
+// .cove.json had its `npm run build` executed as soon as the user approved
+// one edit. They now need the project trusted (/trust), or a mode in which
+// the user already lets build and test commands run unasked (auto, bypass).
+// Commands the user configured (done_verify_commands) always run: the user
+// wrote them, and a project's are already gated by .cove.json trust.
+func (e *Engine) verifyTrusted(g *VerifyGate) bool {
+	if g == nil || !g.needsTrust {
+		return true
+	}
+	if e.perm != nil {
+		if m := e.perm.Mode(); m == permission.Auto || m == permission.Bypass {
+			return true
+		}
+	}
+	if g.workDir == "" {
+		return false
+	}
+	if dirTrusted(g.workDir) {
+		return true
+	}
+	root := permission.ProjectRoot(g.workDir)
+	return root != g.workDir && dirTrusted(root)
 }
 
 // ---------------------------------------------------------------------------

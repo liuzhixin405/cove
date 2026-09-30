@@ -134,8 +134,9 @@ func isIdentPart(c byte) bool { return isIdentStart(c) || c >= '0' && c <= '9' }
 
 // renderTable lays out the rows of a Markdown table with aligned columns and
 // box-drawing rules; the row after a "---" separator row is the body, the
-// rows before it the (bold) header.
-func renderTable(rows []string) string {
+// rows before it the (bold) header. g supplies the rule glyphs, ASCII on a
+// console that cannot show box drawing.
+func renderTable(rows []string, g tableGlyphs) string {
 	var cells [][]string
 	header := -1
 	for _, r := range rows {
@@ -176,15 +177,15 @@ func renderTable(rows []string) string {
 			if i > 0 {
 				sb.WriteString(m)
 			}
-			sb.WriteString(strings.Repeat("─", w+2))
+			sb.WriteString(strings.Repeat(g.h, w+2))
 		}
 		sb.WriteString(r + sgrDimOff + "\n")
 		return sb.String()
 	}
 	var sb strings.Builder
-	sb.WriteString(rule("┌", "┬", "┐"))
+	sb.WriteString(rule(g.topL, g.topM, g.topR))
 	for ri, r := range cells {
-		sb.WriteString(codeGutter + sgrDim + "│" + sgrDimOff)
+		sb.WriteString(codeGutter + sgrDim + g.v + sgrDimOff)
 		for i := 0; i < cols; i++ {
 			c := ""
 			if i < len(r) {
@@ -194,13 +195,13 @@ func renderTable(rows []string) string {
 			if ri < header {
 				c = sgrBold + c + sgrBoldOff
 			}
-			sb.WriteString(" " + c + pad + " " + sgrDim + "│" + sgrDimOff)
+			sb.WriteString(" " + c + pad + " " + sgrDim + g.v + sgrDimOff)
 		}
 		sb.WriteString("\n")
 		if ri == header-1 {
-			sb.WriteString(rule("├", "┼", "┤"))
+			sb.WriteString(rule(g.midL, g.midM, g.midR))
 		}
 	}
-	sb.WriteString(rule("└", "┴", "┘"))
+	sb.WriteString(rule(g.bottomL, g.bottomM, g.bottomR))
 	return sb.String()
 }

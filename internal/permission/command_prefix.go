@@ -141,7 +141,9 @@ var (
 
 func commandPrefix(words []string) (string, bool) {
 	exe := words[0]
-	if strings.ContainsAny(exe, " \t$*?[=") || strings.HasPrefix(exe, "-") {
+	// "%" is refused like "$": cmd expands %GIT% before it runs anything, so
+	// a remembered "%GIT%" prefix would allow whatever the variable names.
+	if strings.ContainsAny(exe, " \t$%*?[=") || strings.HasPrefix(exe, "-") {
 		return "", false
 	}
 	name := programName(exe)
@@ -180,6 +182,9 @@ func programName(exe string) string { return safety.ProgramName(exe) }
 //     the line is preceded by a backslash (\" in bash). Under cmd, where a
 //     single quote is an ordinary character, such a word never matches.
 //   - Here-document and here-string bodies are stdin data, not commands.
+//   - Under bash the words are read after its line continuation and
+//     backslash quoting (see shellCommands); under the unknown kind a line
+//     whose backslashes change its meaning never matches.
 //   - A read-only command (cd, echo, git status; see readOnlyCommandWords)
 //     counts as covered without a rule, except under cmd.exe: it would run
 //     unasked on its own, so chaining it to an allowed command changes
@@ -223,12 +228,27 @@ func lineCovered(command string, cov coverage) bool {
 // coverableCommands splits command into the words of each simple command, or
 // reports false when the line contains something commandCovered refuses.
 func coverableCommands(command string, kind ShellKind) ([][]string, bool) {
+	// A line with a lone CR, FF, VT, a Unicode space or separator, a control
+	// or a format character is never covered: PowerShell runs "go test
+	// ./...<CR>Remove-Item ..." as two commands, and the tokenizer used to see
+	// one go test. See safety.HasHostileCharacters.
+	if safety.HasHostileCharacters(command) {
+		return nil, false
+	}
+	// A catastrophic line is hard-blocked in every mode, so nothing about it
+	// may be remembered or covered. ShellRememberRules used to offer "rm" for
+	// "rm -rf /" and "mkfs.ext4" for "mkfs.ext4 /dev/sda1": unreachable while
+	// the engine blocks first, but a rule the person saved from such a prompt
+	// would name exactly the command the block exists for.
+	if _, bad := safety.CatastrophicCommand(command); bad {
+		return nil, false
+	}
 	if hasSubstitution(command) || maybePowerShell(kind) && (hasUnquotedBrace(command) || hasTypographicQuote(command)) {
 		return nil, false
 	}
 	trustQuotes := quotingTrusted(command, kind)
-	simple := safety.SimpleCommands(command)
-	if len(simple) == 0 {
+	simple, ok := shellCommands(command, kind)
+	if !ok || len(simple) == 0 || kind == ShellPOSIX && literalUNC(command) {
 		return nil, false
 	}
 	out := make([][]string, 0, len(simple))
@@ -264,14 +284,18 @@ func quotingTrusted(command string, kind ShellKind) bool {
 // literalWords reports whether every word of c is certainly a plain argument
 // rather than shell syntax the tokenizer may have misread: a word holding an
 // operator character must be fully quoted under a shell whose quotes are
-// trusted, and under PowerShell an unquoted $ is refused because
-// $var.Method(...) in argument position runs code.
+// trusted, under PowerShell an unquoted $ is refused because $var.Method(...)
+// in argument position runs code, and a bash brace expansion ({a,b}, {1..3})
+// is refused because it turns one word into several ("git log
+// {--output=x,HEAD}" writes a file). The check for a CR in a word was dead
+// and is gone: a line holding one outside a CRLF is refused before
+// (safety.HasHostileCharacters), and the CR of a CRLF is a blank.
 func literalWords(c safety.SimpleCommand, kind ShellKind, trustQuotes bool) bool {
 	for i, w := range c.Words {
 		if trustQuotes && i < len(c.Quoted) && c.Quoted[i] {
 			continue
 		}
-		if strings.ContainsAny(w, ";&|<>()\n\r") {
+		if strings.ContainsAny(w, ";&|<>()\n") || braceExpansion(w) {
 			return false
 		}
 		if kind == ShellPowerShell && strings.Contains(w, "$") {
@@ -279,6 +303,26 @@ func literalWords(c safety.SimpleCommand, kind ShellKind, trustQuotes bool) bool
 		}
 	}
 	return true
+}
+
+// braceExpansion reports a {...} in w that bash would expand: one holding a
+// comma or "..". The reflog spellings stash@{0}, HEAD@{1}, @{u} and
+// main@{yesterday} are literal.
+func braceExpansion(w string) bool {
+	for {
+		open := strings.IndexByte(w, '{')
+		if open < 0 {
+			return false
+		}
+		end := strings.IndexByte(w[open:], '}')
+		if end < 0 {
+			return false
+		}
+		if inner := w[open+1 : open+end]; strings.ContainsRune(inner, ',') || strings.Contains(inner, "..") {
+			return true
+		}
+		w = w[open+end+1:]
+	}
 }
 
 func discardTarget(path string) bool {
@@ -308,18 +352,28 @@ func hasWordPrefix(words, prefix []string) bool {
 // same program: a directory or .exe on the program name and any letter case
 // ("/usr/bin/git", "git.exe", "GIT"), runners and assignments in front
 // ("sudo", "env X=1", "command", "nohup", "X=1"; see
-// safety.StripCommandRunners), and the global options a subcommand tool
-// takes before its subcommand ("git -C . push", "kubectl -n prod delete").
+// safety.StripCommandRunners), the global options a subcommand tool takes
+// before its subcommand ("git -C . push", "kubectl -n prod delete"), and
+// bash's backslash reading of the line as well as the literal one ("r\m" is
+// rm under bash; see anyReading), and the commands the line runs indirectly
+// (bash -c, eval, xargs, find -exec ...; see denyReading). A git alias
+// defined on the line matches every rule on git, and a nested command whose
+// program is a variable matches every rule.
 // Widening a deny or ask rule only ever asks or refuses more often.
 func anyCommandHasPrefixNormalized(command string, prefix []string) bool {
 	if len(prefix) == 0 {
 		return false
 	}
 	want := normalizeProgram(prefix)
-	for _, c := range safety.SimpleCommands(command) {
+	cmds, opaque := denyReading(command)
+	if opaque {
+		return true
+	}
+	for _, c := range cmds {
 		if hasWordPrefix(c.Words, prefix) ||
 			hasWordPrefix(normalizeProgram(c.Words), want) ||
-			hasWordPrefix(normalizeProgram(safety.StripCommandRunners(c.Words)), want) {
+			hasWordPrefix(normalizeProgram(safety.StripCommandRunners(c.Words)), want) ||
+			want[0] == "git" && definesGitAlias(c.Words) {
 			return true
 		}
 	}

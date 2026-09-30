@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
 )
 
 // Index is the incremental repo map of one workspace: per-file definitions
@@ -189,6 +191,13 @@ func (ix *Index) scan() map[string]fileStat {
 		}
 		ext := strings.ToLower(filepath.Ext(name))
 		if !isScannedExt(ext) || strings.HasSuffix(name, ".min.js") || strings.HasSuffix(name, ".d.ts") {
+			return nil
+		}
+		// A link to a file outside the project was parsed through os.Open,
+		// which follows it, and its outline (names, signatures) went to the
+		// model although read refuses that path. WalkDir itself does not
+		// descend into linked directories.
+		if d.Type()&fs.ModeSymlink != 0 && !safepath.Within(ix.root, p) {
 			return nil
 		}
 		info, err := d.Info()

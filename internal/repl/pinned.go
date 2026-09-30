@@ -45,10 +45,57 @@ var (
 	// missing one.
 	cprCh = make(chan cursorPos, 1)
 	cprMu sync.Mutex
-	// cprUnsupported remembers a terminal that never answered, so later
-	// turns do not each wait for it.
-	cprUnsupported atomic.Bool
+	// cprMisses counts the cursor queries in a row that went unanswered, and
+	// cprRetryAt (unix nanoseconds) is when the next one may be tried, so
+	// later turns do not each wait for a terminal that does not answer. One
+	// miss used to disable pinning for the whole session, yet the usual
+	// cause is a report that arrived where nobody relayed it (the history
+	// search, a paste, between two ReadLine calls) rather than a terminal
+	// without the feature. A miss now suspends pinning for cprRetryDelay;
+	// only cprMaxMisses in a row give up for good, and any report, however
+	// late, clears the count.
+	cprMisses  atomic.Int32
+	cprRetryAt atomic.Int64
 )
+
+const (
+	cprMaxMisses  = 3
+	cprRetryDelay = 30 * time.Second
+)
+
+// cprUsable reports whether a cursor query is worth sending now.
+func cprUsable() bool {
+	return cprMisses.Load() < cprMaxMisses && time.Now().UnixNano() >= cprRetryAt.Load()
+}
+
+// noteCPRMiss records an unanswered query.
+func noteCPRMiss() {
+	cprMisses.Add(1)
+	cprRetryAt.Store(time.Now().Add(cprRetryDelay).UnixNano())
+}
+
+// resetCPRState forgets earlier misses: the terminal has shown it answers.
+func resetCPRState() {
+	cprMisses.Store(0)
+	cprRetryAt.Store(0)
+}
+
+// deliverCursorReport hands the parameters of a CSI ... R sequence to the
+// pending cursor query and reports whether they were a cursor report. Every
+// reader of the raw input that consumes CSI sequences must pass R through
+// here: the key loop, the history search and the bracketed paste.
+func deliverCursorReport(params string) bool {
+	pos, ok := parseCursorReport(params)
+	if !ok {
+		return false
+	}
+	resetCPRState()
+	select {
+	case cprCh <- pos:
+	default:
+	}
+	return true
+}
 
 // cursorPos is a 1-based terminal cursor position.
 type cursorPos struct{ row, col int }
@@ -133,9 +180,9 @@ func pinnedNote(steered, queued int32) string {
 
 // pinEnabled reports whether the pinned row may be used at all: stdout is a
 // terminal, COVE_PIN_INPUT does not turn it off, and the terminal has not
-// already failed to answer a cursor query.
+// recently (or repeatedly) failed to answer a cursor query (cprUsable).
 func pinEnabled() bool {
-	if cprUnsupported.Load() {
+	if !cprUsable() {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("COVE_PIN_INPUT"))) {
@@ -241,7 +288,15 @@ func pinnedInputLine(prompt string, promptWidth int, buf []rune, cursor, w int, 
 	}
 	sb.WriteString(string(disp[:rel]))
 	if rel < len(disp) {
-		sb.WriteString("\x1b[7m" + string(disp[rel]) + "\x1b[27m" + string(disp[rel+1:]))
+		// The caret covers the whole cluster under the cursor: ending the
+		// reverse video between "⚠" and its U+FE0F split the sequence, and
+		// the terminal drew the halves as separate cells.
+		_, cont := cellWidths(disp)
+		next := rel + 1
+		for next < len(disp) && cont[next] {
+			next++
+		}
+		sb.WriteString("\x1b[7m" + string(disp[rel:next]) + "\x1b[27m" + string(disp[next:]))
 	} else {
 		sb.WriteString("\x1b[7m \x1b[27m")
 	}
@@ -252,11 +307,11 @@ func pinnedInputLine(prompt string, promptWidth int, buf []rune, cursor, w int, 
 // queryCursorRow asks the terminal where the cursor is and waits for the
 // key loop to relay the answer. Callers must not hold consoleMu: the loop
 // takes it while it edits. A terminal that does not answer in time is
-// remembered as unsupported.
+// remembered (noteCPRMiss), and pinning waits a while before asking again.
 func queryCursorPos() (cursorPos, bool) {
 	cprMu.Lock()
 	defer cprMu.Unlock()
-	if cprUnsupported.Load() {
+	if !cprUsable() {
 		return cursorPos{}, false
 	}
 	select {
@@ -268,7 +323,7 @@ func queryCursorPos() (cursorPos, bool) {
 	case pos := <-cprCh:
 		return pos, true
 	case <-time.After(cprTimeout):
-		cprUnsupported.Store(true)
+		noteCPRMiss()
 		return cursorPos{}, false
 	}
 }

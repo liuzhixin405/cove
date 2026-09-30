@@ -73,6 +73,9 @@ func TestHighlightCode(t *testing.T) {
 }
 
 func TestMarkdownTableAndCode(t *testing.T) {
+	// The Unicode glyph set is pinned: tables now follow textmode.PreferASCII,
+	// which on a legacy console would otherwise pick ASCII rules.
+	t.Setenv("COVE_TUI_ASCII", "0")
 	m := NewMarkdownStream()
 	out := m.Write("| 名称 | 值 |\n|---|---|\n| a | 1 |\n| 长一些 | 22 |\n\n```go\nreturn nil\n```\n")
 	out += m.Flush()

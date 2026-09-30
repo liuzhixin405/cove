@@ -311,20 +311,49 @@ func TestExtractAppendModeKeepsExistingContent(t *testing.T) {
 	}
 }
 
-func TestExtractWriteModeReplacesDissimilarContent(t *testing.T) {
-	p := &fakeProvider{response: memoryBlock("notes.md", "write", "Brand new unrelated memory body.")}
-	r, dir := newTestRunner(t, p)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatalf("mkdir: %v", err)
+// MODE: write (or no MODE) for an existing memory used to replace the whole
+// file: the model had seen only its name, so 3KB of architecture facts were
+// replaced by the one new line. An existing memory is now appended to.
+func TestExtractWriteModeNeverReplacesExistingMemory(t *testing.T) {
+	for _, mode := range []string{"write", ""} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			p := &fakeProvider{response: memoryBlock("project-architecture.md", mode, "The TUI uses bubbletea.")}
+			r, dir := newTestRunner(t, p)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			existing := strings.Repeat("Fact: zzzz qqqq 1234567890 nothing alike.\n", 70) // ~3KB
+			if err := os.WriteFile(filepath.Join(dir, "project-architecture.md"), []byte(existing), 0644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			r.Extract(context.Background(), conversation(6))
+
+			got := readMemory(t, dir, "project-architecture.md")
+			if !strings.HasPrefix(got, existing) || !strings.HasSuffix(got, "The TUI uses bubbletea.") {
+				t.Fatalf("existing memory was not kept and appended to (len %d -> %d); tail = %q",
+					len(existing), len(got), lastRunes(got, 40))
+			}
+		})
 	}
-	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("zzzz qqqq 1234567890 nothing alike"), 0644); err != nil {
-		t.Fatalf("seed: %v", err)
+}
+
+// A write for a name only the global directory has must not shadow the
+// global memory with a project copy holding just the new line.
+func TestExtractWriteModeKeepsShadowedGlobalMemory(t *testing.T) {
+	p := &fakeProvider{response: memoryBlock("user-preferences.md", "write", "Replies in Chinese.")}
+	r, _ := newTestRunner(t, p)
+	proj, glob := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(glob, "user-preferences.md"), []byte("Prefers tabs."), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	r.SetRecorder(memory.NewStoreForProject(proj, glob))
 
 	r.Extract(context.Background(), conversation(6))
 
-	if got := readMemory(t, dir, "notes.md"); got != "Brand new unrelated memory body." {
-		t.Errorf("notes.md = %q, want the replacement content only", got)
+	got := readMemory(t, proj, "user-preferences.md")
+	if !strings.Contains(got, "Prefers tabs.") || !strings.Contains(got, "Replies in Chinese.") {
+		t.Fatalf("project copy = %q, want the global content plus the new line", got)
 	}
 }
 

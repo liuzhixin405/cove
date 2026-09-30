@@ -25,6 +25,12 @@ type MarketplaceEntry struct {
 	Stars       int      `json:"stars,omitempty"`
 	Downloads   int      `json:"downloads,omitempty"`
 	UpdatedAt   string   `json:"updated_at,omitempty"`
+	// Marketplace is the name of the source the entry was listed by and Path
+	// its directory inside that source's cached repository (slash-separated,
+	// e.g. "plugins/foo"). An install copies exactly that directory; the cache
+	// used to be searched across every marketplace by the entry's name.
+	Marketplace string `json:"marketplace,omitempty"`
+	Path        string `json:"path,omitempty"`
 }
 
 // MarketplaceSource is a registry that provides plugin listings.
@@ -271,16 +277,21 @@ func (m *Marketplace) fetchGitSource(src MarketplaceSource) ([]MarketplaceEntry,
 	// Try registry.json first (flat index format)
 	registryPath := filepath.Join(repoDir, "registry.json")
 	if _, err := os.Stat(registryPath); err == nil {
-		return m.fetchFileSource(registryPath)
+		entries, err := m.fetchFileSource(registryPath)
+		for i := range entries {
+			entries[i].Marketplace = src.Name
+		}
+		return entries, err
 	}
 
 	// Fall back to Claude plugins official format:
 	// scan plugins/*/.claude-plugin/plugin.json and external_plugins/*/.claude-plugin/plugin.json
-	return m.fetchClaudePluginsRepo(repoDir, src.URL)
+	return m.fetchClaudePluginsRepo(repoDir, src)
 }
 
 // fetchClaudePluginsRepo scans a repo with anthropics/claude-plugins-official layout.
-func (m *Marketplace) fetchClaudePluginsRepo(repoDir, sourceURL string) ([]MarketplaceEntry, error) {
+func (m *Marketplace) fetchClaudePluginsRepo(repoDir string, src MarketplaceSource) ([]MarketplaceEntry, error) {
+	sourceURL := src.URL
 	var entries []MarketplaceEntry
 
 	dirs := []string{
@@ -332,6 +343,8 @@ func (m *Marketplace) fetchClaudePluginsRepo(repoDir, sourceURL string) ([]Marke
 				Version:     version,
 				Source:      plugSrc,
 				Category:    filepath.Base(dir), // "plugins" or "external_plugins"
+				Marketplace: src.Name,
+				Path:        filepath.Base(dir) + "/" + sub.Name(),
 			})
 		}
 	}
@@ -453,6 +466,13 @@ func (m *Marketplace) List() []MarketplaceEntry {
 
 // InstallFromMarketplace installs a plugin by name from the registry.
 func (m *Marketplace) InstallFromMarketplace(name string) error {
+	_, err := m.installFromMarketplace(name)
+	return err
+}
+
+// installFromMarketplace installs the index entry matching name (ignoring
+// case) and returns the entry's name, which is the directory it went into.
+func (m *Marketplace) installFromMarketplace(name string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -465,10 +485,11 @@ func (m *Marketplace) InstallFromMarketplace(name string) error {
 		}
 	}
 	if entry == nil {
-		return fmt.Errorf("plugin %q not found in marketplace (try: /plugin refresh)", name)
+		return "", fmt.Errorf("plugin %q not found in marketplace (try: /plugin refresh)", name)
 	}
 
-	return m.installFromSource(entry.Name, entry.Source, entry.Version)
+	e := *entry
+	return e.Name, m.installFromSource(e.Name, e.Source, e.Version, &e)
 }
 
 // InstallFromGit installs a plugin directly from a git URL.
@@ -482,10 +503,14 @@ func (m *Marketplace) InstallFromGit(url string) error {
 		return fmt.Errorf("cannot derive plugin name from URL: %s", url)
 	}
 
-	return m.installFromSource(name, url, "")
+	// No index entry: the URL the user gave is cloned, never a cached plugin
+	// that merely has the same name.
+	return m.installFromSource(name, url, "", nil)
 }
 
-func (m *Marketplace) installFromSource(name, source, version string) error {
+// installFromSource installs name from source. entry is the index entry being
+// installed, if any; only its own marketplace's cache is used for a copy.
+func (m *Marketplace) installFromSource(name, source, version string, entry *MarketplaceEntry) error {
 	// name reaches here from the marketplace index, which is built by reading
 	// manifest "name" fields out of a CLONED REMOTE REPOSITORY. It is joined
 	// into a path that is then git-cloned into and RemoveAll'd on failure, so
@@ -504,7 +529,7 @@ func (m *Marketplace) installFromSource(name, source, version string) error {
 	}
 
 	// Try to find plugin in local marketplace cache (from claude-plugins-official layout)
-	if cachedDir := m.findCachedPlugin(name); cachedDir != "" {
+	if cachedDir := m.findCachedPlugin(entry); cachedDir != "" {
 		if err := copyDir(cachedDir, pluginDir); err != nil {
 			_ = os.RemoveAll(pluginDir)
 			return fmt.Errorf("copy from cache: %w", err)
@@ -839,33 +864,90 @@ func copyDir(src, dst string) error {
 	})
 }
 
-// findCachedPlugin looks for a plugin by name in the local marketplace cache
-// (supports claude-plugins-official layout: plugins/<name>/ and external_plugins/<name>/).
-func (m *Marketplace) findCachedPlugin(name string) string {
-	// Scan all cached source repos
-	cacheEntries, _ := os.ReadDir(m.cacheDir)
-	for _, ce := range cacheEntries {
-		if !ce.IsDir() {
-			continue
+// findCachedPlugin returns the directory of entry's plugin in its own
+// marketplace's cached repository, or "" to install from entry's source.
+//
+// It used to scan every cached marketplace and take the first directory named
+// like the entry, so an install could copy another marketplace's plugin (one
+// that merely shared the name) while the lockfile recorded this entry's
+// source. Now only the marketplace that listed the entry is looked at, and
+// the directory the index recorded for it (entry.Path) is used.
+func (m *Marketplace) findCachedPlugin(entry *MarketplaceEntry) string {
+	if entry == nil {
+		return ""
+	}
+	repoDir := m.entryRepoDir(entry)
+	if repoDir == "" {
+		return ""
+	}
+	if entry.Path != "" {
+		candidate := filepath.Join(repoDir, filepath.FromSlash(entry.Path))
+		// Path comes from the index file; keep it inside this repository.
+		rel, err := filepath.Rel(repoDir, candidate)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ""
 		}
-		repoDir := filepath.Join(m.cacheDir, ce.Name())
-		// Check plugins/<name> and external_plugins/<name>
-		for _, subdir := range []string{"plugins", "external_plugins"} {
-			candidate := filepath.Join(repoDir, subdir, name)
-			if _, err := os.Stat(candidate); err == nil {
-				return candidate
-			}
-		}
-		// Also check root-level <name> (standard directory source)
-		candidate := filepath.Join(repoDir, name)
-		if _, err := os.Stat(filepath.Join(candidate, "manifest.json")); err == nil {
+		if isPluginDir(candidate) {
 			return candidate
 		}
-		if _, err := os.Stat(filepath.Join(candidate, ".claude-plugin", "plugin.json")); err == nil {
+		return ""
+	}
+	// An index written by an older cove has no path: look where the layouts
+	// put a plugin of that name, and only take it if it declares that name.
+	for _, candidate := range []string{
+		filepath.Join(repoDir, "plugins", entry.Name),
+		filepath.Join(repoDir, "external_plugins", entry.Name),
+		filepath.Join(repoDir, entry.Name),
+	} {
+		if isPluginDir(candidate) && declaredPluginName(candidate) == entry.Name {
 			return candidate
 		}
 	}
 	return ""
+}
+
+// entryRepoDir is the cache directory of the git marketplace that listed
+// entry, or "" when that is unknown or the source is no longer configured.
+func (m *Marketplace) entryRepoDir(entry *MarketplaceEntry) string {
+	for _, s := range m.sources {
+		if s.Type != "git" {
+			continue
+		}
+		// An index from an older cove does not name the marketplace; its
+		// entries carry the marketplace repository's URL as their source.
+		if (entry.Marketplace != "" && s.Name == entry.Marketplace) ||
+			(entry.Marketplace == "" && s.URL != "" && s.URL == entry.Source) {
+			return filepath.Join(m.cacheDir, sanitizeName(s.Name))
+		}
+	}
+	return ""
+}
+
+func isPluginDir(dir string) bool {
+	for _, f := range []string{"manifest.json", filepath.Join(".claude-plugin", "plugin.json")} {
+		if info, err := os.Stat(filepath.Join(dir, f)); err == nil && info.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
+}
+
+// declaredPluginName is the name dir's manifest.json or .claude-plugin/plugin.json
+// gives, or the directory name when neither names it.
+func declaredPluginName(dir string) string {
+	for _, f := range []string{"manifest.json", filepath.Join(".claude-plugin", "plugin.json")} {
+		data, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			continue
+		}
+		var v struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(data, &v) == nil && v.Name != "" {
+			return v.Name
+		}
+	}
+	return filepath.Base(dir)
 }
 
 // ensureManifest generates a manifest.json from .claude-plugin/plugin.json if the

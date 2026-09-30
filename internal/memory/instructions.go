@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
@@ -98,12 +99,17 @@ func loadInstructionFiles(cwd string, entries *[]Entry, seen map[string]bool) (t
 			if rel, err := filepath.Rel(base, path); err == nil {
 				display = filepath.ToSlash(rel)
 			}
+			var mtime time.Time
+			if info, err := os.Stat(path); err == nil {
+				mtime = info.ModTime()
+			}
 			*entries = append(*entries, Entry{
 				Name:    display,
 				Path:    path,
 				Content: content,
 				Project: true,
 				Source:  SourceInstructions,
+				Updated: mtime,
 			})
 		}
 	}

@@ -42,9 +42,10 @@ func TestExplainUncovered(t *testing.T) {
 	if got := m.ExplainUncovered("bash", map[string]any{"command": "dotnet build"}); got != "" {
 		t.Errorf("dotnet build = %q, want nothing: no remembered rule concerns it", got)
 	}
-	got := m.ExplainUncovered("bash", map[string]any{"command": `sed "s/a/b/" s.json > s2.json`})
-	if strings.Contains(got, "docref") || strings.Contains(got, "mkdir") || !strings.Contains(got, "重定向") || !strings.Contains(got, "s2.json") {
-		t.Errorf("sed > s2.json = %q, want the redirect named and no unrelated rule", got)
+	// A line that cannot be remembered is not explained either: the prompt
+	// offers no [a], which says it.
+	if got := m.ExplainUncovered("bash", map[string]any{"command": `sed "s/a/b/" s.json > s2.json`}); got != "" {
+		t.Errorf("sed > s2.json = %q, want nothing: no remembered rule concerns it", got)
 	}
 	// A covered line has nothing to explain.
 	if got := m.ExplainUncovered("bash", map[string]any{"command": "mkdir a && git commit -m x"}); got != "" {

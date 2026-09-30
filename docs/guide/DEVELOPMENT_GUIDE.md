@@ -1435,7 +1435,7 @@ export COVE_MODEL="claude-sonnet-4-20250514"
 
 ```bash
 # 基础构建
-cd G:\github\cove\agent
+cd cove-agent
 go build -o cove.exe ./cli/cove/
 
 # 包含 Headless Chrome 支持（可选）
@@ -1577,6 +1577,10 @@ type mockTool struct {
 ```bash
 # 全部测试
 go test ./...
+
+# 日常开发：跳过超过 3 秒的慢用例（主要是 cli/cove 的 e2e 流程里真实等待重试/超时的分支），
+# cli/cove 约 2.5 分钟；提交前仍跑一次完整的 go test ./... 与 go test -race ./...
+go test -short ./...
 
 # 指定测试
 go test ./internal/engine/ -v -run "TestEngine"

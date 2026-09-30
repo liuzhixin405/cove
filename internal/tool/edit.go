@@ -352,7 +352,14 @@ func fuzzyApplyEdit(content, oldS, newS string) fuzzyOutcome {
 		if includeTrailingNL {
 			regionWidth += widths[s+n-1]
 		} else {
-			regionWidth += len(lines[s+n-1])
+			// Stop before the last line's "\r" when it ends a CRLF line:
+			// lines keep it, and replacing it with a newString that lacks it
+			// left one LF line among CRLF ones.
+			last := lines[s+n-1]
+			if widths[s+n-1] > len(last) {
+				last = strings.TrimSuffix(last, "\r")
+			}
+			regionWidth += len(last)
 		}
 		byteEnd := byteStart + regionWidth
 		if byteStart < 0 || byteEnd > len(content) || byteStart > byteEnd {
@@ -654,8 +661,8 @@ func normalizeLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// splitLinesWithWidths splits content into lines *without* their line
-// terminator, plus the exact original byte width of each line *including*
+// splitLinesWithWidths splits content into lines without their "\n" (a CRLF
+// line keeps its "\r"), plus the exact original byte width of each line *including*
 // its terminator (or, for a final unterminated line, just its own length).
 // Keeping widths lets callers reconstruct precise byte offsets for a
 // replacement without re-scanning the original content.

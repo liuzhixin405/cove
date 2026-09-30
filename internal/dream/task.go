@@ -37,6 +37,9 @@ type Task struct {
 	CancelFunc       func() // cancels the dream context
 	// Usage is the run's token usage and cost so far (guarded by mu).
 	Usage Usage
+	// completing: the run's goroutine has claimed the completion
+	// (claimCompletion) and is finishing the lock before the status flips.
+	completing bool
 }
 
 const maxTurns = 30
@@ -140,6 +143,23 @@ func (t *Task) AddTurn(turn Turn, touchedPaths []string) {
 
 // Complete marks the task as completed; see finish for the return value.
 func (t *Task) Complete() bool { return t.finish(StatusCompleted) }
+
+// claimCompletion reports whether the task is still running and no one has
+// claimed its completion yet, and claims it. The task stays StatusRunning
+// (ActiveTask still reports it) until Complete, so the work done between the
+// two — marking the lock done — is over before anyone sees the run as ended.
+// It used to be done after Complete: a caller that waited for ActiveTask to
+// return nil (a test removing its temp home, the next /dream run) raced the
+// lock file being rewritten.
+func (t *Task) claimCompletion() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Status != StatusRunning || t.completing {
+		return false
+	}
+	t.completing = true
+	return true
+}
 
 // Fail marks the task as failed; see finish for the return value.
 func (t *Task) Fail() bool { return t.finish(StatusFailed) }

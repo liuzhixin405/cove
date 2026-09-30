@@ -1,16 +1,20 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -26,7 +30,7 @@ func NewDrawImageTool() Tool {
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
-				"outputPath": {"type":"string","description":"Absolute path to save the PNG file"},
+				"outputPath": {"type":"string","description":"Absolute path to save the PNG file (must end in .png; an existing file is only replaced if it is a PNG)"},
 				"width": {"type":"integer","description":"Image width in pixels","minimum":1},
 				"height": {"type":"integer","description":"Image height in pixels","minimum":1},
 				"shapes": {
@@ -43,7 +47,7 @@ func NewDrawImageTool() Tool {
 							"x2": {"type":"number","description":"End X (line only)"},
 							"y2": {"type":"number","description":"End Y (line only)"},
 							"color": {"type":"string","description":"Stroke/fill color as hex or rgba"},
-							"strokeWidth": {"type":"number","description":"Stroke width in pixels (default 1)"}
+							"strokeWidth": {"type":"number","description":"Stroke width in pixels (default 1, at most 64)"}
 						},
 						"required":["type"]
 					}
@@ -61,7 +65,17 @@ func NewDrawImageTool() Tool {
 const (
 	maxDrawDimension = 16384
 	maxDrawPixels    = 64 << 20 // 67,108,864 pixels
+	// maxDrawStroke caps strokeWidth: every line point stamps a sw x sw
+	// square, so an uncapped 1e6 meant 1e12 pixel writes per point.
+	maxDrawStroke = 64
+	// maxDrawCoord bounds coordinates and sizes before they are rounded to
+	// int. Far beyond any canvas, yet small enough that x+w and r*r cannot
+	// overflow.
+	maxDrawCoord = 1 << 24
 )
+
+// pngSignature starts every PNG file.
+var pngSignature = []byte("\x89PNG\r\n\x1a\n")
 
 func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Result, error) {
 	outPath, _ := input["outputPath"].(string)
@@ -98,6 +112,19 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	if err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
+	// The output used to go straight to os.Create, so a mistaken outputPath
+	// (main.go, a config) was silently truncated and replaced by PNG bytes,
+	// with none of write's read-before-write protection. Only .png paths are
+	// accepted, and an existing file is replaced only if it already is a PNG.
+	if hasStreamSeparator(fullPath, runtime.GOOS) {
+		return Result{Data: "Error: outputPath must not contain ':' (on Windows it names an alternate data stream of another file): " + fullPath, IsError: true}, nil
+	}
+	if !strings.EqualFold(filepath.Ext(fullPath), ".png") {
+		return Result{Data: "Error: outputPath must end in .png: " + fullPath, IsError: true}, nil
+	}
+	if err := checkReplaceableImage(fullPath); err != nil {
+		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
+	}
 
 	// Create the image with white background
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
@@ -107,12 +134,18 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	// Process shapes
 	painted := 0
 	for i, raw := range shapesRaw {
+		if ctx.Err() != nil {
+			return Result{Data: "Error: draw_image cancelled", IsError: true}, nil
+		}
 		shape, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
 		shapeType, _ := shape["type"].(string)
-		if err := t.drawShape(img, shape, width, height); err != nil {
+		if err := t.drawShape(ctx, img, shape); err != nil {
+			if ctx.Err() != nil {
+				return Result{Data: "Error: draw_image cancelled", IsError: true}, nil
+			}
 			return Result{
 				Data:    fmt.Sprintf("Error drawing shape %d (%s): %s", i+1, shapeType, err.Error()),
 				IsError: true,
@@ -126,15 +159,14 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 		return Result{Data: "Error: mkdir: " + err.Error(), IsError: true}, nil
 	}
 
-	// Save as PNG
-	f, err := os.Create(fullPath)
-	if err != nil {
-		return Result{Data: "Error: create: " + err.Error(), IsError: true}, nil
-	}
-	defer func() { _ = f.Close() }()
-
-	if err := png.Encode(f, img); err != nil {
+	// Encode first, then replace atomically like write does: a failed
+	// encode or a full disk leaves any previous image intact.
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
 		return Result{Data: "Error: encode PNG: " + err.Error(), IsError: true}, nil
+	}
+	if err := replaceFile(fullPath, buf.Bytes()); err != nil {
+		return Result{Data: "Error: write: " + err.Error(), IsError: true}, nil
 	}
 
 	return Result{
@@ -142,7 +174,42 @@ func (t *DrawImageTool) Call(ctx context.Context, input Input, tctx Context) (Re
 	}, nil
 }
 
-func (t *DrawImageTool) drawShape(img *image.RGBA, shape map[string]any, imgW, imgH int) error {
+// checkReplaceableImage refuses an existing path that is not a PNG file.
+func checkReplaceableImage(path string) error {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s exists and is not a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	head := make([]byte, len(pngSignature))
+	n, _ := f.Read(head)
+	if !bytes.Equal(head[:n], pngSignature) {
+		return fmt.Errorf("%s exists and is not a PNG image; refusing to overwrite it", path)
+	}
+	return nil
+}
+
+// drawCoord reads a coordinate or size, clamped to +-maxDrawCoord (NaN is 0)
+// so that rounding to int and the arithmetic after it cannot overflow.
+func drawCoord(shape map[string]any, key string) float64 {
+	v, _ := toFloat(shape[key])
+	if math.IsNaN(v) {
+		return 0
+	}
+	return math.Max(-maxDrawCoord, math.Min(maxDrawCoord, v))
+}
+
+func (t *DrawImageTool) drawShape(ctx context.Context, img *image.RGBA, shape map[string]any) error {
 	shapeType, _ := shape["type"].(string)
 
 	switch shapeType {
@@ -151,9 +218,9 @@ func (t *DrawImageTool) drawShape(img *image.RGBA, shape map[string]any, imgW, i
 	case "rect":
 		return t.drawRect(img, shape)
 	case "circle":
-		return t.drawCircle(img, shape)
+		return t.drawCircle(ctx, img, shape)
 	case "line":
-		return t.drawLine(img, shape)
+		return t.drawLine(ctx, img, shape)
 	default:
 		return fmt.Errorf("unknown shape type: %s", shapeType)
 	}
@@ -171,10 +238,8 @@ func (t *DrawImageTool) drawFill(img *image.RGBA, shape map[string]any) error {
 
 // drawRect draws a filled rectangle.
 func (t *DrawImageTool) drawRect(img *image.RGBA, shape map[string]any) error {
-	x, _ := toFloat(shape["x"])
-	y, _ := toFloat(shape["y"])
-	w, _ := toFloat(shape["w"])
-	h, _ := toFloat(shape["h"])
+	x, y := drawCoord(shape, "x"), drawCoord(shape, "y")
+	w, h := drawCoord(shape, "w"), drawCoord(shape, "h")
 
 	c, err := parseColor(shape, "color")
 	if err != nil {
@@ -191,44 +256,53 @@ func (t *DrawImageTool) drawRect(img *image.RGBA, shape map[string]any) error {
 	return nil
 }
 
-// drawCircle draws a filled circle using the midpoint circle algorithm.
-func (t *DrawImageTool) drawCircle(img *image.RGBA, shape map[string]any) error {
-	cx, _ := toFloat(shape["x"])
-	cy, _ := toFloat(shape["y"])
-	rad, _ := toFloat(shape["r"])
+// drawCircle draws a filled circle.
+//
+// It used to scan the whole (2r+1)^2 bounding box and clip each pixel, so
+// r=100000 on a 100x100 canvas meant 4e10 iterations. Now only the rows
+// inside the canvas are visited, each filling one clipped span.
+func (t *DrawImageTool) drawCircle(ctx context.Context, img *image.RGBA, shape map[string]any) error {
+	cx, cy, rad := drawCoord(shape, "x"), drawCoord(shape, "y"), drawCoord(shape, "r")
 
 	col, err := parseColor(shape, "color")
 	if err != nil {
 		return fmt.Errorf("circle color: %w", err)
 	}
 
-	r := int(math.Round(rad))
-	ix := int(math.Round(cx))
-	iy := int(math.Round(cy))
-	bounds := img.Bounds()
+	r := int64(math.Round(rad))
+	ix := int64(math.Round(cx))
+	iy := int64(math.Round(cy))
+	b := img.Bounds()
 
-	// Fill circle using bounding box scan
-	for dy := -r; dy <= r; dy++ {
-		for dx := -r; dx <= r; dx++ {
-			if dx*dx+dy*dy <= r*r {
-				px := ix + dx
-				py := iy + dy
-				if px >= bounds.Min.X && px < bounds.Max.X && py >= bounds.Min.Y && py < bounds.Max.Y {
-					img.Set(px, py, col)
-				}
+	y0 := max(iy-r, int64(b.Min.Y))
+	y1 := min(iy+r, int64(b.Max.Y-1))
+	for py := y0; py <= y1; py++ {
+		if (py-y0)%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+		}
+		dy := py - iy
+		// The widest dx with dx*dx+dy*dy <= r*r, the test the per-pixel scan
+		// made; the float estimate is corrected in integers.
+		half := int64(math.Sqrt(float64(r*r - dy*dy)))
+		for half > 0 && half*half+dy*dy > r*r {
+			half--
+		}
+		for (half+1)*(half+1)+dy*dy <= r*r {
+			half++
+		}
+		x0 := max(ix-half, int64(b.Min.X))
+		x1 := min(ix+half, int64(b.Max.X-1))
+		for px := x0; px <= x1; px++ {
+			img.Set(int(px), int(py), col)
 		}
 	}
 	return nil
 }
 
 // drawLine draws a line using Bresenham's algorithm.
-func (t *DrawImageTool) drawLine(img *image.RGBA, shape map[string]any) error {
-	x0, _ := toFloat(shape["x"])
-	y0, _ := toFloat(shape["y"])
-	x1, _ := toFloat(shape["x2"])
-	y1, _ := toFloat(shape["y2"])
-
+func (t *DrawImageTool) drawLine(ctx context.Context, img *image.RGBA, shape map[string]any) error {
 	col, err := parseColor(shape, "color")
 	if err != nil {
 		return fmt.Errorf("line color: %w", err)
@@ -237,19 +311,58 @@ func (t *DrawImageTool) drawLine(img *image.RGBA, shape map[string]any) error {
 	strokeWidth := 1.0
 	if sw, ok := shape["strokeWidth"]; ok {
 		if v, err := toFloat(sw); err == nil && v > 0 {
-			strokeWidth = v
+			strokeWidth = min(v, maxDrawStroke)
 		}
 	}
 
-	ix0, iy0 := int(math.Round(x0)), int(math.Round(y0))
-	ix1, iy1 := int(math.Round(x1)), int(math.Round(y1))
+	x0, y0 := math.Round(drawCoord(shape, "x")), math.Round(drawCoord(shape, "y"))
+	x1, y1 := math.Round(drawCoord(shape, "x2")), math.Round(drawCoord(shape, "y2"))
 
-	bresenhamLine(img, ix0, iy0, ix1, iy1, col, strokeWidth)
-	return nil
+	// Bresenham used to step every point of the segment, off-canvas ones
+	// included, so a line from -1e9 to 1e9 never finished. Clip it to the
+	// canvas widened by half the stroke first; a segment already inside is
+	// drawn exactly as before.
+	sw := int(math.Max(1, math.Round(strokeWidth)))
+	pad := float64(sw/2) + 1
+	b := img.Bounds()
+	cx0, cy0, cx1, cy1, ok := clipSegment(x0, y0, x1, y1,
+		float64(b.Min.X)-pad, float64(b.Min.Y)-pad, float64(b.Max.X-1)+pad, float64(b.Max.Y-1)+pad)
+	if !ok {
+		return nil
+	}
+	return bresenhamLine(ctx, img,
+		int(math.Round(cx0)), int(math.Round(cy0)), int(math.Round(cx1)), int(math.Round(cy1)), col, sw)
 }
 
-// bresenhamLine draws a line with optional stroke width.
-func bresenhamLine(img *image.RGBA, x0, y0, x1, y1 int, col color.Color, strokeW float64) {
+// clipSegment clips the segment (x0,y0)-(x1,y1) to the rectangle
+// [minX,maxX]x[minY,maxY] (Liang-Barsky). ok is false when no part of it is
+// inside.
+func clipSegment(x0, y0, x1, y1, minX, minY, maxX, maxY float64) (cx0, cy0, cx1, cy1 float64, ok bool) {
+	dx, dy := x1-x0, y1-y0
+	t0, t1 := 0.0, 1.0
+	for _, e := range [4][2]float64{{-dx, x0 - minX}, {dx, maxX - x0}, {-dy, y0 - minY}, {dy, maxY - y0}} {
+		p, q := e[0], e[1]
+		if p == 0 {
+			if q < 0 {
+				return 0, 0, 0, 0, false
+			}
+			continue
+		}
+		r := q / p
+		if p < 0 {
+			t0 = math.Max(t0, r)
+		} else {
+			t1 = math.Min(t1, r)
+		}
+		if t0 > t1 {
+			return 0, 0, 0, 0, false
+		}
+	}
+	return x0 + t0*dx, y0 + t0*dy, x0 + t1*dx, y0 + t1*dy, true
+}
+
+// bresenhamLine draws a line sw pixels wide, checking ctx as it goes.
+func bresenhamLine(ctx context.Context, img *image.RGBA, x0, y0, x1, y1 int, col color.Color, sw int) error {
 	dx := abs(x1 - x0)
 	dy := abs(y1 - y0)
 	sx := 1
@@ -261,23 +374,27 @@ func bresenhamLine(img *image.RGBA, x0, y0, x1, y1 int, col color.Color, strokeW
 		sy = -1
 	}
 	err := dx - dy
-	sw := int(math.Max(1, math.Round(strokeW)))
+	b := img.Bounds()
 
-	for {
+	for step := 0; ; step++ {
+		if step%1024 == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+		}
 		// Draw a small square around each point for stroke width
 		for wy := -sw / 2; wy <= sw/2; wy++ {
 			for wx := -sw / 2; wx <= sw/2; wx++ {
 				px := x0 + wx
 				py := y0 + wy
-				if px >= img.Bounds().Min.X && px < img.Bounds().Max.X &&
-					py >= img.Bounds().Min.Y && py < img.Bounds().Max.Y {
+				if px >= b.Min.X && px < b.Max.X && py >= b.Min.Y && py < b.Max.Y {
 					img.Set(px, py, col)
 				}
 			}
 		}
 
 		if x0 == x1 && y0 == y1 {
-			break
+			return nil
 		}
 		e2 := 2 * err
 		if e2 > -dy {

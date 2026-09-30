@@ -229,6 +229,14 @@ func (r *replTaskRunner) CancelForExit() bool {
 	return r.CancelRunning()
 }
 
+// sessionID is the engine's session, which the interrupted draft records.
+func (r *replTaskRunner) sessionID() string {
+	if r.eng == nil {
+		return ""
+	}
+	return r.eng.SessionID()
+}
+
 func (r *replTaskRunner) PendingFailed() *api.Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -373,10 +381,14 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 			r.mu.Lock()
 			msgCopy := userMsg
 			r.pendingFailedMsg = &msgCopy
-			_ = saveInterruptedDraft(userMsg, fmt.Errorf("internal panic: %v", recovered))
+			_ = saveInterruptedDraftFor(userMsg, fmt.Errorf("internal panic: %v", recovered), r.sessionID())
+			// Reclaim before finishLocked, as afterRun does: the reclaimed
+			// guidance names the task it was typed during (taskPreview of
+			// r.current), which finishLocked clears.
+			reclaimed := r.reclaimSteerLocked()
 			r.finishLocked()
 			repl.PrintAbove(fmt.Sprintf("\r\n%s任务执行出现内部异常，已恢复输入。可输入“继续”重试。%s\r\n", repl.Red, repl.Reset))
-			if r.reclaimSteerLocked() {
+			if reclaimed {
 				repl.PrintAbove(steerReclaimedFeedback + "\r\n")
 			}
 			r.startNextLocked()
@@ -384,6 +396,11 @@ func (r *replTaskRunner) run(ctx context.Context, userMsg api.Message) {
 		}
 	}()
 
+	// Before the model call: a process killed mid-task (crash, power cut,
+	// kill -9) runs neither the error branch of afterRun nor the recover
+	// above, and used to leave no draft at all. The session ID is known here:
+	// the engine assigns it when the session starts, not at its first save.
+	saveTaskStartDraft(userMsg, r.sessionID())
 	_, reqErr := runChatInteractionMessage(ctx, r.eng, userMsg)
 	r.afterRun(userMsg, reqErr)
 }
@@ -405,9 +422,12 @@ func (r *replTaskRunner) afterRun(userMsg api.Message, reqErr error) {
 		msgCopy := userMsg
 		r.pendingFailedMsg = &msgCopy
 		if isBudgetExceededError(reqErr) {
+			// No draft for a budget stop, as before the task-start draft
+			// existed: "继续" retries it once /budget allows, in this process.
+			_ = clearInterruptedDraftFor(r.sessionID())
 			repl.PrintAbove(budgetExceededRetryHint(r.eng.CostTracker()) + "\n")
 		} else {
-			_ = saveInterruptedDraft(userMsg, reqErr)
+			_ = saveInterruptedDraftFor(userMsg, reqErr, r.sessionID())
 			if hint := taskErrorHint(reqErr); hint != "" {
 				repl.PrintAbove(hint + "\n")
 			}
@@ -419,7 +439,9 @@ func (r *replTaskRunner) afterRun(userMsg api.Message, reqErr error) {
 		}
 	} else {
 		r.pendingFailedMsg = nil
-		_ = clearInterruptedDraft()
+		// Only this session's draft in this project: the draft of another
+		// project, or of another session, is still unfinished.
+		_ = clearInterruptedDraftFor(r.sessionID())
 		// Guidance typed too late for this task (it completed before its
 		// next model call) runs as the next task instead of vanishing.
 		if r.reclaimSteerLocked() {

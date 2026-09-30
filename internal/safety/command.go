@@ -27,21 +27,47 @@ func catastrophicCommand(command string, depth int) (string, bool) {
 		return "shell nesting too deep", true
 	}
 	command = ifsPattern.ReplaceAllString(command, " ")
+	// $1..$9, $@ and $* are empty in the fresh shell a command line runs in,
+	// so "rm$IFS$9-rf$IFS$9/" is rm -rf /; only $IFS used to be normalized.
+	command = positionalPattern.ReplaceAllString(command, "")
 	// PowerShell accepts en dash, em dash and minus sign as the parameter
 	// dash (Remove-Item –Recurse). Normalizing them for every shell only
 	// makes the scan stricter.
 	command = dashNormalizer.Replace(command)
-	if name, ok := forkBomb(command); ok {
+	if stripped := StripFormatCharacters(command); stripped != command {
+		// Zero-width and bidi characters are invisible: "r<ZWSP>m -rf /" is
+		// judged as the rm -rf / the person sees, as well as as written.
+		if why, ok := catastrophicCommand(stripped, depth+1); ok {
+			return why, true
+		}
+	}
+	// The fork-bomb patterns see the line with quoted operator text removed:
+	// echo ":(){ :|:& };:" and git commit -m ":(){ :|:& };:" only print or
+	// store the text, and were hard-blocked when the raw line was matched. A
+	// shell that runs a quoted bomb (bash -c ':(){ :|:& };:', eval '...') is
+	// unwrapped below and judges the text again, unquoted.
+	if name, ok := forkBomb(dropQuotedOperators(command)); ok {
 		return "fork bomb " + name + "()", true
 	}
-	for _, pipeline := range parseShell(command) {
+	if why, ok := fetchedCodeRun(command); ok {
+		return why, true
+	}
+	// The line is scanned as written and again as bash would read it (line
+	// continuations joined, backslash quoting removed; see parseShellMode).
+	// The caller does not say which shell runs it, and the literal reading
+	// alone missed "rm \<NL>-rf ~", "r\m -rf /" and "rm -rf /\u\s\r" under
+	// bash. The second pass can only add blocks, so a PowerShell or cmd path
+	// such as C:\proj\build is still judged by its literal spelling as well.
+	// Braces are read the bash way in the second pass as well ("{/etc,/usr}"
+	// is one word there, brace-expanded below; the literal reading splits it).
+	for _, pipeline := range readings(command) {
 		if why, ok := catastrophicPipeline(pipeline); ok {
 			return why, true
 		}
 		if why, ok := catastrophicXargs(pipeline); ok {
 			return why, true
 		}
-		for _, c := range pipeline {
+		for i, c := range pipeline {
 			if inner, encoded, ok := unwrapShell(c.words); ok {
 				if encoded {
 					return "encoded command", true
@@ -50,21 +76,89 @@ func catastrophicCommand(command string, depth int) (string, bool) {
 					return why, true
 				}
 			}
-			if len(c.heredocs) > 0 {
-				if name, _ := commandWords(c.words); stdinShells[name] {
-					for _, h := range c.heredocs {
-						if why, ok := catastrophicCommand(h.body, depth+1); ok {
-							return why, true
-						}
+			// eval and iex/Invoke-Expression run their arguments as a command
+			// line. Deny rules already looked into them (NestedCommands), the
+			// hard block did not: eval 'rm -rf /' and iex 'rm -rf /' ran in
+			// bypass mode.
+			if inner, ok := evalText(c.words); ok {
+				if why, ok := catastrophicCommand(inner, depth+1); ok {
+					return why, true
+				}
+			}
+			// The command xargs or find -exec starts, with its arguments
+			// written inline: "xargs rm -rf /" and "find . -exec rm -rf / \;"
+			// delete the root whatever the input is. Only an xargs target
+			// taken from the pipeline (echo / | xargs rm -rf) and find's own
+			// start path used to be judged.
+			if why, ok := catastrophicStarted(c.words, depth); ok {
+				return why, true
+			}
+			// A here-document is a script when the command reading it is a
+			// shell (bash <<EOF) or when it is piped into one (cat <<EOF |
+			// sh); only the first used to be scanned.
+			if len(c.heredocs) > 0 && (stdinShell(c) || pipesIntoShell(pipeline[i+1:])) {
+				for _, h := range c.heredocs {
+					if why, ok := catastrophicCommand(h.body, depth+1); ok {
+						return why, true
 					}
 				}
 			}
 			if why, ok := catastrophicSimple(c); ok {
 				return why, true
 			}
+			if expanded := braceExpandWords(c.words); expanded != nil {
+				if why, ok := catastrophicSimple(simpleCmd{words: expanded, redirects: c.redirects}); ok {
+					return why, true
+				}
+			}
 		}
 	}
 	return "", false
+}
+
+// readings parses command literally and, when a backslash or a brace makes
+// bash read it differently, the bash way as well.
+func readings(command string) [][]simpleCmd {
+	pipelines := parseShell(command)
+	if strings.ContainsAny(command, `\{}`) {
+		pipelines = append(pipelines, parseShellMode(command, true)...)
+	}
+	return pipelines
+}
+
+// braceExpandWords returns words with bash's brace expansion applied, or nil
+// when no word has a {a,b} group.
+func braceExpandWords(words []string) []string {
+	var out []string
+	changed := false
+	for _, w := range words {
+		alts := braceExpand(w)
+		if len(alts) != 1 || alts[0] != w {
+			changed = true
+		}
+		out = append(out, alts...)
+	}
+	if !changed {
+		return nil
+	}
+	return out
+}
+
+// stdinShell reports whether c is a shell that runs its stdin as a script.
+func stdinShell(c simpleCmd) bool {
+	name, _ := commandWords(c.words)
+	return stdinShells[name]
+}
+
+// pipesIntoShell reports whether one of the later commands of a pipeline is
+// a shell reading its stdin as a script.
+func pipesIntoShell(rest []simpleCmd) bool {
+	for _, c := range rest {
+		if name, args := commandWords(c.words); stdinShells[name] && readsCodeFromStdin(name, args) {
+			return true
+		}
+	}
+	return false
 }
 
 // stdinShells run a here-document or here-string fed to them as a script.
@@ -110,22 +204,55 @@ func unwrapShell(words []string) (inner string, encoded, ok bool) {
 			}
 		}
 	case "pwsh", "powershell":
-		for i, a := range args {
-			la := strings.ToLower(a)
+		for i := 0; i < len(args); i++ {
+			la := strings.ToLower(args[i])
 			if !strings.HasPrefix(la, "-") && !strings.HasPrefix(la, "/") {
-				continue
+				// The first positional argument is the -Command (Windows
+				// PowerShell) or, for pwsh, a script file; read as a command
+				// either way, the stricter choice. Positionals used to be
+				// skipped, so powershell "Remove-Item -Recurse -Force
+				// C:\Windows" was not scanned.
+				return strings.Join(args[i:], " "), false, true
 			}
 			flag := "-" + strings.TrimLeft(la, "-/")
+			if j := strings.IndexByte(flag, ':'); j > 0 {
+				flag = flag[:j] // -ExecutionPolicy:Bypass
+			}
 			switch {
 			case flag == "-ec" || len(flag) >= 2 && strings.HasPrefix("-encodedcommand", flag):
 				// -e, -ec, -enc ... -EncodedCommand: a base64 payload.
 				return "", true, true
 			case len(flag) >= 2 && strings.HasPrefix("-command", flag):
 				return strings.Join(args[i+1:], " "), false, true
+			case len(flag) >= 2 && strings.HasPrefix("-file", flag):
+				// A script file; the words after it are its arguments.
+				return "", false, false
+			case powerShellValueParam(flag) && !strings.Contains(la, ":"):
+				i++ // the parameter's value, not the command
 			}
 		}
 	}
 	return "", false, false
+}
+
+// powerShellValueParam reports a powershell.exe / pwsh parameter that takes
+// a value (-ExecutionPolicy Bypass, -WindowStyle Hidden), given lowercased
+// with one leading "-", by its full name, an abbreviation or an alias.
+func powerShellValueParam(flag string) bool {
+	switch flag {
+	case "-ep", "-ex", "-wd", "-if", "-of", "-v", "-w", "-o", "-cnf":
+		return true
+	}
+	for _, name := range []string{
+		"-executionpolicy", "-windowstyle", "-version", "-inputformat", "-outputformat",
+		"-configurationname", "-psconsolefile", "-workingdirectory", "-settingsfile",
+		"-custompipename", "-configurationfile",
+	} {
+		if len(flag) >= 4 && strings.HasPrefix(name, flag) {
+			return true
+		}
+	}
+	return false
 }
 
 // xargsValueFlags are xargs options that take a separate value.
@@ -169,10 +296,51 @@ func catastrophicXargs(p []simpleCmd) (string, bool) {
 	return "", false
 }
 
+// catastrophicStarted judges the commands xargs and find -exec/-execdir/
+// -ok/-okdir start (their words after xargs's options, or up to find's ";"
+// or "+") as a command line of their own.
+func catastrophicStarted(words []string, depth int) (string, bool) {
+	if depth > maxShellNesting {
+		return "shell nesting too deep", true
+	}
+	var started [][]string
+	switch name, args := commandWords(words); name {
+	case "xargs":
+		started = append(started, xargsCommand(args))
+	case "find":
+		started = findExecCommands(args)
+	}
+	for _, w := range started {
+		if len(w) == 0 {
+			continue
+		}
+		if why, ok := catastrophicSimple(simpleCmd{words: w}); ok {
+			return why, true
+		}
+		if inner, encoded, ok := unwrapShell(w); ok {
+			if encoded {
+				return "encoded command", true
+			}
+			if why, ok := catastrophicCommand(inner, depth+1); ok {
+				return why, true
+			}
+		}
+		if inner, ok := evalText(w); ok {
+			if why, ok := catastrophicCommand(inner, depth+1); ok {
+				return why, true
+			}
+		}
+		if why, ok := catastrophicStarted(w, depth+1); ok {
+			return why, true
+		}
+	}
+	return "", false
+}
+
 // catastrophicFind catches find <critical path> -delete / -exec rm.
 func catastrophicFind(args []string) (string, bool) {
 	var paths []string
-	i := 0
+	i := findGlobalOptions(args)
 	for ; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") || a == "(" || a == "!" {
@@ -206,20 +374,86 @@ func catastrophicFind(args []string) (string, bool) {
 	return "", false
 }
 
-var ifsPattern = regexp.MustCompile(`\$\{?IFS\}?`)
+// findGlobalOptions returns the index of the first word after GNU find's
+// options that come before the paths: -H, -L, -P, -D debugopts and
+// -Olevel (also "-O level"). The paths were taken to start at the first
+// word, so "find -P / -delete" had no path and was let through.
+func findGlobalOptions(args []string) int {
+	i := 0
+	for i < len(args) {
+		switch a := args[i]; {
+		case a == "-H" || a == "-L" || a == "-P":
+			i++
+		case a == "-D":
+			i += 2
+		case a == "-O":
+			i++
+			if i < len(args) && isDigits(args[i]) {
+				i++
+			}
+		case strings.HasPrefix(a, "-O") && isDigits(a[2:]):
+			i++
+		default:
+			return i
+		}
+	}
+	return len(args)
+}
+
+var (
+	ifsPattern        = regexp.MustCompile(`\$\{?IFS\}?`)
+	positionalPattern = regexp.MustCompile(`\$\{?[1-9@*]\}?`)
+)
 
 // dashNormalizer maps PowerShell's other dashes (SpecialCharacters.IsDash:
 // en dash, em dash, horizontal bar) and the minus sign to "-".
 var dashNormalizer = strings.NewReplacer("\u2013", "-", "\u2014", "-", "\u2015", "-", "\u2212", "-")
 
-var funcDef = regexp.MustCompile(`([\w:.]+)\s*\(\)\s*\{([^}]*)\}`)
+var (
+	funcDef = regexp.MustCompile(`([\w:.]+)\s*\(\)\s*\{([^}]*)\}`)
+	// funcKeyword is bash's other spelling, "function f { ... }" (the
+	// parentheses optional), which funcDef did not see.
+	funcKeyword = regexp.MustCompile(`\bfunction\s+([\w:.-]+)\s*(?:\(\s*\))?\s*\{([^}]*)\}`)
+)
+
+// dropQuotedOperators returns command with every quoted part that holds a
+// shell operator character removed, quotes included, so text such as the
+// message in git commit -m ":(){ :|:& };:" is not read as code. A quoted part
+// without operators keeps its text and loses its quotes, so a quoted name
+// ("f"|"f") still reads as the name. An unterminated quote runs to the end.
+func dropQuotedOperators(command string) string {
+	if !strings.ContainsAny(command, `'"`) {
+		return command
+	}
+	var b strings.Builder
+	for i := 0; i < len(command); {
+		q := command[i]
+		if q != '\'' && q != '"' {
+			b.WriteByte(q)
+			i++
+			continue
+		}
+		var inner string
+		if end := strings.IndexByte(command[i+1:], q); end < 0 {
+			inner, i = command[i+1:], len(command)
+		} else {
+			inner, i = command[i+1:i+1+end], i+end+2
+		}
+		if !strings.ContainsAny(inner, "(){}|&;<>") {
+			b.WriteString(inner)
+		}
+	}
+	return b.String()
+}
 
 // forkBomb finds a function that pipes into itself, e.g. :(){ :|:& };:
 func forkBomb(command string) (string, bool) {
-	for _, m := range funcDef.FindAllStringSubmatch(command, -1) {
-		body := strings.Join(strings.Fields(m[2]), "")
-		if strings.Contains(body, m[1]+"|"+m[1]) {
-			return m[1], true
+	for _, re := range []*regexp.Regexp{funcDef, funcKeyword} {
+		for _, m := range re.FindAllStringSubmatch(command, -1) {
+			body := strings.Join(strings.Fields(m[2]), "")
+			if strings.Contains(body, m[1]+"|"+m[1]) {
+				return m[1], true
+			}
 		}
 	}
 	return "", false
@@ -240,7 +474,17 @@ type simpleCmd struct {
 // command substitution — enough to find each command's name and arguments.
 // Backslash is kept literally: the same string may be a PowerShell or cmd
 // command, where it is a path separator.
-func parseShell(s string) [][]simpleCmd {
+func parseShell(s string) [][]simpleCmd { return parseShellMode(s, false) }
+
+// parseShellMode is parseShell with posix selecting bash's backslash rules:
+// outside quotes a backslash-newline is a line continuation (removed, the
+// command goes on) and a backslash quotes the next character; inside double
+// quotes it only escapes $ ` " \ and newline; inside single quotes it is
+// literal. The literal reading ended the command at "\<NL>" and kept "r\m" as
+// written, so a command meant a different thing to bash than to the checks.
+// A character quoted by a backslash counts as unquoted for Quoted, so a caller
+// that trusts quoted words still refuses an operator character in it.
+func parseShellMode(s string, posix bool) [][]simpleCmd {
 	var (
 		pipelines [][]simpleCmd
 		pipeline  []simpleCmd
@@ -311,6 +555,28 @@ func parseShell(s string) [][]simpleCmd {
 		if i+1 < len(rs) {
 			next = rs[i+1]
 		}
+		if posix && ch == '\\' && quote != '\'' {
+			switch {
+			case quote == '"':
+				switch next {
+				case '$', '`', '"', '\\':
+					word.WriteRune(next)
+					i++
+				case '\n':
+					i++
+				default:
+					word.WriteRune(ch)
+				}
+			case next == '\n':
+				i++ // line continuation: neither character is part of the line
+			case i+1 >= len(rs):
+				writeUnquoted(ch) // a trailing backslash is literal
+			default:
+				writeUnquoted(next)
+				i++
+			}
+			continue
+		}
 		if quote != 0 {
 			if ch == quote {
 				quote = 0
@@ -324,7 +590,17 @@ func parseShell(s string) [][]simpleCmd {
 			quote = ch
 			inWord = true
 			hadQuote = true
-		case ch == ' ' || ch == '\t' || ch == '\r':
+		case isStatementBreak(ch, next):
+			// PowerShell ends a statement at a lone CR, NEL, U+2028 and
+			// U+2029. The lone CR used to be read as a blank, so "ls<CR>rm
+			// -rf x" was one ls with arguments here and two commands there.
+			// Splitting is the stricter reading for bash too, which keeps
+			// these characters inside a word.
+			endPipeline()
+			lineComment = false
+		case ch != '\n' && isBlank(ch):
+			// FF, VT, NBSP and the other Unicode spaces separate arguments
+			// for PowerShell; only space, tab and CR (before LF) used to.
 			endWord()
 		case ch == '\n':
 			endPipeline()
@@ -350,6 +626,16 @@ func parseShell(s string) [][]simpleCmd {
 					word.WriteRune(rs[i])
 				}
 				writeUnquoted('}')
+				continue
+			}
+			if posix && !braceIsGroup(ch, inWord, next) {
+				// Under bash a brace is a command group only as a word of its
+				// own ("{ cmd; }"); inside a word it is literal or brace
+				// expansion (stash@{0}, HEAD@{1}, @{u}, {a,b}). Splitting there
+				// made "git diff HEAD@{1}" three unknown commands. The literal
+				// reading keeps splitting: a PowerShell scriptblock glued to a
+				// word (ForEach-Object{ ... }) must stay visible.
+				writeUnquoted(ch)
 				continue
 			}
 			endPipeline()
@@ -399,8 +685,10 @@ func parseShell(s string) [][]simpleCmd {
 			}
 			redirect = true
 		case ch == '<':
-			// \< is a literal < for bash, so \<<EOF is no heredoc.
-			escaped := i > 0 && rs[i-1] == '\\'
+			// \< is a literal < for bash, so \<<EOF is no heredoc. In posix
+			// mode the escape was already consumed above (and \\<<EOF is a
+			// real heredoc after a literal backslash).
+			escaped := !posix && i > 0 && rs[i-1] == '\\'
 			if inWord && isDigits(word.String()) {
 				word.Reset()
 				inWord = false
@@ -463,8 +751,20 @@ type SimpleCommand struct {
 // commands of their own, so a caller that vets each entry also vets what a
 // substitution would run.
 func SimpleCommands(command string) []SimpleCommand {
+	return simpleCommandsMode(command, false)
+}
+
+// SimpleCommandsPOSIX is SimpleCommands for a line bash runs: backslash-newline
+// continues the line and backslash quoting is removed from the words, as bash
+// does before it starts the command (see parseShellMode). "find . -f\<NL>ls x"
+// is one command, find -fls x, not a find and an ls.
+func SimpleCommandsPOSIX(command string) []SimpleCommand {
+	return simpleCommandsMode(command, true)
+}
+
+func simpleCommandsMode(command string, posix bool) []SimpleCommand {
 	var out []SimpleCommand
-	for _, pipeline := range parseShell(command) {
+	for _, pipeline := range parseShellMode(command, posix) {
 		for _, c := range pipeline {
 			if len(c.words) == 0 && len(c.redirects) == 0 {
 				continue // only here-document data
@@ -568,14 +868,19 @@ func StripCommandRunners(words []string) []string {
 }
 
 var (
-	driveRoot  = regexp.MustCompile(`^[a-z]:[\\/]*\*?$`)
+	driveRoot = regexp.MustCompile(`^[a-z]:$`)
+	// gitBashDrive is a drive as Git Bash, MSYS, WSL and Cygwin spell it:
+	// /c, /mnt/c, /cygdrive/c, optionally followed by a path.
+	gitBashDrive = regexp.MustCompile(`^/(?:mnt/|cygdrive/)?([a-z])(/.*)?$`)
+	multiSlash   = regexp.MustCompile(`/{2,}`)
+	// systemDirs are compared lowercased, with forward slashes.
 	systemDirs = map[string]bool{
 		"/bin": true, "/boot": true, "/dev": true, "/etc": true, "/home": true,
 		"/lib": true, "/lib64": true, "/opt": true, "/proc": true, "/root": true,
 		"/sbin": true, "/sys": true, "/usr": true, "/var": true,
 		"/system": true, "/users": true, "/library": true, "/applications": true,
-		`c:\windows`: true, `c:\program files`: true, `c:\program files (x86)`: true,
-		`c:\users`: true, `c:\programdata`: true,
+		"c:/windows": true, "c:/program files": true, "c:/program files (x86)": true,
+		"c:/users": true, "c:/programdata": true,
 	}
 	homeRefs = map[string]bool{
 		"~": true, "$home": true, "${home}": true, "%userprofile%": true,
@@ -590,22 +895,34 @@ func criticalPath(target string) bool {
 	// PowerShell treats typographic quotes (U+2018–U+201F) as quotes; the
 	// tokenizer keeps them, so strip them before judging the target.
 	t := strings.ToLower(strings.TrimSpace(strings.Trim(target, "‘’‚‛“”„‟")))
-	if t == "" || t == "*" || t == "." || t == "./" {
-		// The working directory: destructive, but project-scoped (a warning).
+	if strings.Contains(t, ",") {
+		// A PowerShell array argument (".,C:\Windows") names each element.
+		for _, part := range strings.Split(t, ",") {
+			if criticalPath(part) {
+				return true
+			}
+		}
 		return false
 	}
-	t = strings.TrimSuffix(t, "*")
-	if t == "/" || t == "" {
-		return true
+	// Globs and separators at the end name the same directory's contents:
+	// "/**", "/*/", "/etc/**", "~/**". Only one "*" and then the slashes used
+	// to be stripped, so those were judged as some other path.
+	base := strings.TrimRight(t, `*/\`)
+	if base == "" {
+		// "/", "/**", `\` are the root; "", "*", "**", "*/" the working
+		// directory (destructive, but project-scoped: a warning).
+		return strings.HasPrefix(t, "/") || strings.HasPrefix(t, `\`)
 	}
-	if driveRoot.MatchString(t) {
-		return true
+	if base == "." {
+		return false // ".", "./", "./*", "./**/": the working directory
 	}
-	trimmed := strings.TrimRight(t, `/\`)
-	if trimmed == "" {
-		return true
+	p := multiSlash.ReplaceAllString(strings.ReplaceAll(base, `\`, "/"), "/")
+	if m := gitBashDrive.FindStringSubmatch(p); m != nil {
+		// /c/Windows is C:\Windows for Git Bash; forward-slash Windows
+		// paths (C:/Users) were not known either.
+		p = m[1] + ":" + m[2]
 	}
-	return homeRefs[trimmed] || systemDirs[trimmed]
+	return driveRoot.MatchString(p) || homeRefs[p] || systemDirs[p]
 }
 
 func catastrophicSimple(c simpleCmd) (string, bool) {
@@ -636,12 +953,23 @@ func catastrophicSimple(c simpleCmd) (string, bool) {
 		if !recursive {
 			return "", false
 		}
-		for _, a := range args {
-			if strings.HasPrefix(a, "-") || cmdSwitch.MatchString(a) {
+		// Only cmd's del/erase/rd/rmdir take /s /q /p /f /a switches. Any
+		// "/x" used to be skipped as one, so "rm -rf /c" (Git Bash's C:\)
+		// was not judged at all.
+		cmdBuiltin := name == "del" || name == "erase" || name == "rd" || name == "rmdir"
+		for i, a := range args {
+			if strings.HasPrefix(a, "-") || cmdBuiltin && cmdSwitch.MatchString(strings.ToLower(a)) {
 				continue
 			}
 			if criticalPath(a) {
 				return "recursive delete of " + a, true
+			}
+			// An unquoted path with a space ("c:/program files/") arrives as
+			// two words; the pair is judged as one path as well.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				if joined := a + " " + args[i+1]; criticalPath(joined) {
+					return "recursive delete of " + joined, true
+				}
 			}
 		}
 	case "chmod", "chown", "chgrp":
@@ -660,9 +988,40 @@ func catastrophicSimple(c simpleCmd) (string, bool) {
 		}
 	case "dd":
 		for _, a := range args {
-			if strings.HasPrefix(a, "of=") && rawDisk(strings.TrimPrefix(a, "of=")) {
+			if strings.HasPrefix(strings.ToLower(a), "of=") && rawDisk(a[len("of="):]) {
 				return "dd to raw disk " + a, true
 			}
+		}
+	case "shred", "tee":
+		// shred overwrites every file it is given, tee writes to them: of a
+		// block device, that destroys the disk. Only dd and redirects were
+		// known.
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-") && rawDisk(a) {
+				return name + " to raw disk " + a, true
+			}
+		}
+	case "cp", "mv", "install", "copy-item", "move-item", "copy", "move":
+		// The destination is the last operand (or -t DIR / --target-directory).
+		var operands []string
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			switch {
+			case a == "-t" && i+1 < len(args):
+				if rawDisk(args[i+1]) {
+					return name + " onto raw disk " + args[i+1], true
+				}
+				i++
+			case strings.HasPrefix(a, "--target-directory="):
+				if rawDisk(strings.TrimPrefix(a, "--target-directory=")) {
+					return name + " onto raw disk " + a, true
+				}
+			case !strings.HasPrefix(a, "-"):
+				operands = append(operands, a)
+			}
+		}
+		if n := len(operands); n >= 2 && rawDisk(operands[n-1]) {
+			return name + " onto raw disk " + operands[n-1], true
 		}
 	case "shutdown", "reboot", "halt", "poweroff", "stop-computer", "restart-computer":
 		return name + " takes the machine down", true
@@ -692,8 +1051,10 @@ func recursiveFlag(la string) bool {
 }
 
 var (
-	shortFlags = regexp.MustCompile(`^-[rfivd]{1,4}$`)
-	cmdSwitch  = regexp.MustCompile(`^/[a-z]$`)
+	// Any number of letters: the group used to be capped at four, so "rm
+	// -rfvvv /" was not recursive to the scan.
+	shortFlags = regexp.MustCompile(`^-[rfivd]+$`)
+	cmdSwitch  = regexp.MustCompile(`^/[sqpfa](:.*)?$`)
 	driveArg   = regexp.MustCompile(`^[a-z]:$`)
 )
 
@@ -709,7 +1070,7 @@ func rawDisk(path string) bool {
 
 var (
 	remoteSources = map[string]bool{
-		"curl": true, "wget": true, "iwr": true, "irm": true,
+		"curl": true, "wget": true, "fetch": true, "iwr": true, "irm": true,
 		"invoke-webrequest": true, "invoke-restmethod": true,
 		"base64": true, "xxd": true,
 	}
@@ -728,7 +1089,7 @@ func catastrophicPipeline(p []simpleCmd) (string, bool) {
 	source := ""
 	for _, c := range p {
 		name, args := commandWords(c.words)
-		if source != "" && interpreters[name] && readsCodeFromStdin(args) {
+		if source != "" && interpreters[name] && readsCodeFromStdin(name, args) {
 			return source + " piped into " + name, true
 		}
 		if remoteSources[name] {
@@ -738,12 +1099,105 @@ func catastrophicPipeline(p []simpleCmd) (string, bool) {
 	return "", false
 }
 
-func readsCodeFromStdin(args []string) bool {
-	for _, a := range args {
-		la := strings.ToLower(a)
-		if !strings.HasPrefix(la, "-") || la == "-c" || la == "-m" || la == "-e" ||
-			la == "-command" || la == "-file" {
-			return false
+// posixShells are the sh-family interpreters readsCodeFromStdin reads the
+// options of.
+var posixShells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "ash": true, "fish": true}
+
+// codeOptions lists, per interpreter, the options whose value is the program
+// text (so stdin is data). Letters are case-sensitive: python -E only ignores
+// the environment, perl -E runs code.
+var codeOptions = map[string]string{
+	"python": "cm", "python3": "cm", "perl": "eE", "ruby": "e", "node": "ep", "php": "r",
+}
+
+// stdinScript reports a script operand that is stdin itself.
+func stdinScript(a string) bool {
+	switch a {
+	case "-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0":
+		return true
+	}
+	return false
+}
+
+// readsCodeFromStdin reports whether interpreter name, given args, runs the
+// program text it reads on stdin. Any -c/-m/-e style option, or a script
+// file operand, used to mean "reads data" and every other word a flag; so
+// "bash -s -- install" (-s: commands from stdin, the rest positional
+// parameters), "bash /dev/stdin", "bash -" and "bash -e" (errexit, not code)
+// were let through while they run the piped download.
+func readsCodeFromStdin(name string, args []string) bool {
+	switch {
+	case posixShells[name]:
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			switch {
+			case stdinScript(a):
+				return true
+			case a == "--":
+				return i+1 >= len(args) || stdinScript(args[i+1])
+			case a == "-o" || a == "+o" || a == "-O" || a == "+O":
+				i++ // the option name
+			case a == "--rcfile" || a == "--init-file":
+				i++
+			case strings.HasPrefix(a, "--"):
+			case strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+"):
+				switch {
+				case strings.ContainsRune(a[1:], 'c'):
+					return false // -c: the command is an argument
+				case strings.ContainsRune(a[1:], 's'):
+					return true // -s: commands from stdin, the rest are parameters
+				}
+			default:
+				return false // a script file
+			}
+		}
+		return true
+	case name == "pwsh" || name == "powershell":
+		for i := 0; i < len(args); i++ {
+			la := strings.ToLower(args[i])
+			if !strings.HasPrefix(la, "-") && !strings.HasPrefix(la, "/") {
+				return false // the command (or a script) is an argument
+			}
+			flag := "-" + strings.TrimLeft(la, "-/")
+			switch {
+			case len(flag) >= 2 && (strings.HasPrefix("-command", flag) || strings.HasPrefix("-file", flag)):
+				// -Command - and -File - read stdin.
+				return i+1 < len(args) && args[i+1] == "-"
+			case powerShellValueParam(flag):
+				i++
+			}
+		}
+		return true
+	case name == "iex" || name == "invoke-expression":
+		// iex runs its pipeline input unless it is given the string itself.
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-") {
+				return false
+			}
+		}
+		return true
+	}
+	code := codeOptions[name]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case stdinScript(a):
+			return true
+		case a == "--":
+			return i+1 >= len(args) || stdinScript(args[i+1])
+		case strings.HasPrefix(a, "--"):
+			if a == "--eval" || a == "--print" || strings.HasPrefix(a, "--eval=") {
+				return false
+			}
+		case strings.HasPrefix(a, "-"):
+			if strings.ContainsAny(a[1:], code) {
+				return false
+			}
+			if (name == "python" || name == "python3") && (a == "-W" || a == "-X") {
+				i++ // the option's value
+			}
+		default:
+			return false // a script file
 		}
 	}
 	return true

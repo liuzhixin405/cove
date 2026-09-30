@@ -72,10 +72,38 @@ func TestDreamStatusShowsGates(t *testing.T) {
 	}
 }
 
+// blockingProvider's Chat waits until release is closed, so a run started
+// with it is still in progress when the test looks.
+type blockingProvider struct {
+	doneProvider
+	release chan struct{}
+}
+
+func (p blockingProvider) Chat(ctx context.Context, _ api.ChatRequest) (*api.ChatResponse, error) {
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+	}
+	return &api.ChatResponse{Content: "done"}, nil
+}
+
+// A second /dream run while the first is still running reports the lock. It
+// used to rely on a completed run keeping its lock for an hour; a completed
+// run now leaves a done lock that does not block (see the next test), and
+// with an instant provider the first run was often over already.
 func TestDreamRunStartsImmediatelyThenReportsLock(t *testing.T) {
 	home := backgroundHome(t)
 	writeSessions(t, home, "a")
-	dream.NewRunner(doneProvider{}, "m", "")
+	release := make(chan struct{})
+	dream.NewRunner(blockingProvider{release: release}, "m", "")
+	defer func() {
+		close(release)
+		// Let the background run finish before the temp home is removed.
+		deadline := time.Now().Add(10 * time.Second)
+		for dream.ActiveTask() != nil && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 
 	out, err := NewDreamCmd().Execute(context.Background(), Input{Args: []string{"run"}})
 	if err != nil {
@@ -84,7 +112,6 @@ func TestDreamRunStartsImmediatelyThenReportsLock(t *testing.T) {
 	if !strings.Contains(out.Message, "已开始") {
 		t.Fatalf("/dream run output = %q", out.Message)
 	}
-	// The run (or its fresh lock stamp) now holds the lock.
 	out, err = NewDreamCmd().Execute(context.Background(), Input{Args: []string{"run"}})
 	if err != nil {
 		t.Fatal(err)
@@ -92,10 +119,29 @@ func TestDreamRunStartsImmediatelyThenReportsLock(t *testing.T) {
 	if !strings.Contains(out.Message, "锁") {
 		t.Fatalf("second /dream run output = %q, want a lock notice", out.Message)
 	}
-	// Let the background run finish before the temp home is removed.
-	deadline := time.Now().Add(10 * time.Second)
-	for dream.ActiveTask() != nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+}
+
+// Once a run has finished, /dream run starts again at once: the lock of a
+// completed run used to block it for an hour.
+func TestDreamRunAgainAfterTheFirstFinished(t *testing.T) {
+	home := backgroundHome(t)
+	writeSessions(t, home, "a")
+	dream.NewRunner(doneProvider{}, "m", "")
+	wait := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for dream.ActiveTask() != nil && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		out, err := NewDreamCmd().Execute(context.Background(), Input{Args: []string{"run"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.Message, "已开始") {
+			t.Fatalf("run %d output = %q", i+1, out.Message)
+		}
+		wait()
 	}
 }
 

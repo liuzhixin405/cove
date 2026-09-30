@@ -78,7 +78,9 @@ func Classify(err error) ErrorKind {
 	if errors.Is(err, context.Canceled) {
 		return KindCanceled
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	// The idle watchdog's stall is a timeout like a deadline; it used to fall
+	// through to KindUnknown and was reported and retried as neither.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrStreamStalled) {
 		return KindTimeout
 	}
 	if IsContextLengthError(err) {
@@ -124,6 +126,12 @@ func isRateLimit(err error) bool {
 }
 
 func isTemporary(err error) bool {
+	// A stalled stream is a timeout of the body: transient, so the fallback
+	// cools the provider down. Its text carries neither a status nor
+	// "timeout", so three stalls used to mark the provider unavailable.
+	if errors.Is(err, ErrStreamStalled) {
+		return true
+	}
 	if st := statusOf(err); st != 0 {
 		return st >= 500
 	}

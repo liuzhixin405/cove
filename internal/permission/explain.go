@@ -53,11 +53,9 @@ func (m *Manager) ExplainUncovered(toolName string, input map[string]any) string
 			return "已记住的规则属于 " + siblingHas + " 工具，这次模型用的是 " + toolName + " 工具，两者的规则不通用"
 		}
 		// No remembered rule concerns this line, so there is no gap to
-		// explain. What still helps is why the line cannot be remembered
-		// at all (the prompt then offers no [a]).
-		if p := coverabilityProblem(command, cov.kind); p != "" {
-			return "这一行无法按规则记住：" + p + "。按 y 允许本次，n 拒绝"
-		}
+		// explain. Why the line cannot be remembered at all used to be said
+		// here, on nearly every compound command; the prompt offering no
+		// [a] already says it.
 		return ""
 	}
 	if lineCovered(command, cov) {
@@ -70,7 +68,7 @@ func (m *Manager) ExplainUncovered(toolName string, input map[string]any) string
 	if reason == "" {
 		reason = "这一行不在已记住的范围内"
 	}
-	return "上次记住的规则（" + strings.Join(remembered, "、") + "）未覆盖这一行：" + reason + "。按 y 允许本次，n 拒绝"
+	return "已记住的规则（" + strings.Join(remembered, "、") + "）未覆盖这一行：" + reason
 }
 
 // linePrograms is the set of programs (programName) the simple commands of
@@ -120,7 +118,11 @@ func coverabilityProblem(command string, kind ShellKind) string {
 		return "本行含 PowerShell 脚本块或弯引号，无法安全判定"
 	}
 	trustQuotes := quotingTrusted(command, kind)
-	for _, c := range safety.SimpleCommands(command) {
+	simple, ok := shellCommands(command, kind)
+	if !ok {
+		return "本行的反斜杠在 bash 和按字面读取时含义不同，无法确定实际会运行什么"
+	}
+	for _, c := range simple {
 		if len(c.Words) == 0 {
 			continue
 		}

@@ -117,3 +117,29 @@ func TestTruncateWidthHandlesDegenerateWidths(t *testing.T) {
 		}
 	}
 }
+
+// Emoji presentation and ZWJ sequences are one cluster, two columns wide:
+// per-rune widths put 1 on "⚠️" and 6 on a family, and a line editor summing
+// them overflowed its row.
+func TestGraphemeCellsMeasuresClusters(t *testing.T) {
+	for _, s := range []string{"⚠️", "❤️", "✔️", "1️⃣", "👨‍👩‍👧", "a", "汉", "e" + string(rune(0x301))} {
+		rs := []rune(s)
+		cells := GraphemeCells(rs)
+		if len(cells) != len(rs) {
+			t.Fatalf("%q: %d cells for %d runes", s, len(cells), len(rs))
+		}
+		if cells[0] != Width(s) {
+			t.Errorf("%q: first rune carries %d columns, Width says %d", s, cells[0], Width(s))
+		}
+		for i := 1; i < len(cells); i++ {
+			if cells[i] != -1 {
+				t.Errorf("%q: rune %d is %d, want -1 (continues the cluster)", s, i, cells[i])
+			}
+		}
+	}
+	// An unpaired surrogate is not valid UTF-8; the index must stay in step.
+	rs := []rune{'a', 0xD800, 'b'}
+	if cells := GraphemeCells(rs); len(cells) != 3 || cells[0] != 1 || cells[2] != 1 {
+		t.Errorf("invalid rune threw the index off: %v", cells)
+	}
+}

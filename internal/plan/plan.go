@@ -18,7 +18,11 @@ import (
 // Example: "depends:task-1,task-2 Create auth tests"
 const DepPrefix = "depends:"
 
-var depRe = regexp.MustCompile(`^depends:([\w\-]+(?:,[\w\-]+)*)?\s*`)
+// Spaces are allowed around ':' and ','. The pattern used to allow none, so
+// "depends:task-1, task-2 X" lost task-2 into the title and "depends: task-1 X"
+// had no dependencies at all. Group 1 is the space after the colon, group 2
+// the ID list.
+var depRe = regexp.MustCompile(`^depends\s*:(\s*)([\w\-]+(?:\s*,\s*[\w\-]+)*)?\s*`)
 
 // Task represents one executable node in a plan.
 type Task struct {
@@ -71,13 +75,21 @@ func FromRuntime(planID string, rt *tool.Runtime) (*Plan, error) {
 		var deps []string
 
 		if m := depRe.FindStringSubmatch(content); m != nil {
-			if m[1] != "" {
-				deps = strings.Split(m[1], ",")
+			rest := content[len(m[0]):]
+			// "depends: Just do it" is a bare prefix followed by the title,
+			// "depends: task-1 do x" a dependency: with a space after the colon
+			// a single word counts as an ID only when such a task exists.
+			// Without the space, or in a comma list, it is always an ID, so
+			// a typo is still reported as an unknown task.
+			if _, known := rt.Tasks[m[2]]; m[1] != "" && m[2] != "" && !strings.Contains(m[2], ",") && !known {
+				rest = content[strings.Index(content, ":")+1:]
+			} else if m[2] != "" {
+				deps = strings.Split(m[2], ",")
 				for i := range deps {
 					deps[i] = strings.TrimSpace(deps[i])
 				}
 			}
-			title = strings.TrimSpace(content[len(m[0]):])
+			title = strings.TrimSpace(rest)
 		}
 		if title == "" {
 			title = content

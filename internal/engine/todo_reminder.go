@@ -26,10 +26,17 @@ func todoBlock(intro, list string) string {
 
 // todoRoundReminder returns, every todoReminderRounds tool rounds without a
 // todowrite call, the open task list to append to the round's last tool
-// result; "" otherwise. A round that calls todowrite restarts the count.
-func (e *Engine) todoRoundReminder(results []toolResult) string {
+// result; "" otherwise. A round that calls todowrite restarts the count and
+// marks the list as part of this turn's work (t.todoTouched).
+//
+// The list lives for the whole conversation, so a list an earlier task left
+// open was shown as "your task list" while the model worked on an unrelated
+// request. A list this turn has not touched is introduced as the earlier
+// work it is, to be continued only if the latest request is part of it.
+func (e *Engine) todoRoundReminder(t *turn, results []toolResult) string {
 	for _, r := range results {
 		if isTodoWrite(r.Name) && !r.Failed {
+			t.todoTouched = true
 			e.roundsSinceTodo = 0
 			return ""
 		}
@@ -47,14 +54,21 @@ func (e *Engine) todoRoundReminder(results []toolResult) string {
 		return ""
 	}
 	e.roundsSinceTodo = 0
+	if !t.todoTouched {
+		return todoBlock("Reminder, the task list from earlier in this conversation (not updated during the current request). Continue it only if the latest request is part of that work; otherwise leave it as it is:", list)
+	}
 	return todoBlock("Reminder, your task list (update it with todowrite as items finish; do not stop while items are open unless you are blocked):", list)
 }
 
 // todoFinishNudge is, once per turn, the message sent back to a model that
 // is ending the turn while its task list still has open items; "" when the
-// list is done (or there is none).
+// list is done (or there is none), or when this turn never called todowrite.
+// A list only counts as this turn's work once the turn wrote it: an
+// unrelated request that followed a task with open items used to be told to
+// carry on with them and report again in full, and its report came out
+// covering the old task.
 func (e *Engine) todoFinishNudge(t *turn) string {
-	if t.todoChecked || e.runtime == nil {
+	if t.todoChecked || !t.todoTouched || e.runtime == nil {
 		return ""
 	}
 	list, open := e.runtime.TodoList()
@@ -62,7 +76,21 @@ func (e *Engine) todoFinishNudge(t *turn) string {
 		return ""
 	}
 	t.todoChecked = true
-	return todoBlock(fmt.Sprintf("[system: You are ending the turn with %d item(s) of your task list still open. If they are done, mark them completed with todowrite; if not, carry on with them. Then write your final report to the user again, in full: only your last message is shown to them.]", open), list)
+	return todoBlock(fmt.Sprintf("[system: You are ending the turn with %d item(s) of your task list still open. If they are done, mark them completed with todowrite; if not, carry on with them. Then write your final report on the latest request to the user again, in full: only your last message is shown to them.]", open), list)
+}
+
+// todoWrittenSince reports whether msgs (the part of the history a resumed
+// turn already ran) hold a todowrite call: a turn resumed after an
+// interruption keeps the list as its own work.
+func todoWrittenSince(msgs []api.Message) bool {
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			if isTodoWrite(c.Name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // fallbackModel is the configured model to move to when model is
@@ -80,16 +108,38 @@ func (e *Engine) fallbackModel(model string) string {
 // todoAfterCompaction appends the open task list to the first message of a
 // compacted history (the summary): the summary may not carry it, and the
 // todowrite result that did is gone.
-func (e *Engine) todoAfterCompaction() {
-	if e.runtime == nil || len(e.messages) == 0 || e.messages[0].Role != "user" {
+//
+// rewritten says the older history was really replaced (summarized, or cut
+// by the truncation fallback). A compaction that only trimmed old tool
+// results also reports Compressed, but keeps the history as it was: its
+// first message is then the user's own request, and every such compaction
+// used to append another copy of the list to it. A block this function
+// appended before (known by its intro line) is replaced by the current list
+// rather than joined by a second. Any other <todo_list> text is left alone:
+// replacing from the first "<todo_list>" to the next "</todo_list>" could
+// start in a block cut short by truncation and delete everything up to a
+// later block's end.
+func (e *Engine) todoAfterCompaction(rewritten bool) {
+	if !rewritten || e.runtime == nil || len(e.messages) == 0 || e.messages[0].Role != "user" {
 		return
 	}
 	list, open := e.runtime.TodoList()
 	if open == 0 {
 		return
 	}
-	e.messages[0].Content += "\n\n" + todoBlock("The task list at the time of compaction (keep it current with todowrite):", list)
+	content := e.messages[0].Content
+	head := "<todo_list>\n" + compactionTodoIntro + "\n"
+	if i := strings.LastIndex(content, head); i >= 0 {
+		if j := strings.Index(content[i:], "</todo_list>"); j >= 0 {
+			content = strings.TrimRight(content[:i], "\n") + content[i+j+len("</todo_list>"):]
+		}
+	}
+	e.messages[0].Content = content + "\n\n" + todoBlock(compactionTodoIntro, list)
 }
+
+// compactionTodoIntro is the intro line of the block todoAfterCompaction
+// appends; it identifies the block on a later compaction.
+const compactionTodoIntro = "The task list at the time of compaction (keep it current with todowrite):"
 
 // previousPlanMaxAge: a plan left unfinished longer ago than this is not
 // offered to a new conversation any more.
@@ -142,7 +192,7 @@ func (e *Engine) previousPlanNote(query string) string {
 		return ""
 	}
 	e.planOffered = true
-	return "<previous_plan>\nThe user asked to continue; an earlier session in this project left this task list unfinished (saved " + at.Format("2006-01-02 15:04") +
+	return "<previous_plan>\nThe user asked to continue; earlier work in this project (an earlier task or session) left this task list unfinished (saved " + at.Format("2006-01-02 15:04") +
 		"). Check the current state of the code, restore the list with todowrite and carry on from the open items.\n" +
 		plan + "\n</previous_plan>"
 }

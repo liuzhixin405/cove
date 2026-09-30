@@ -2,15 +2,20 @@ package api
 
 import (
 	"context"
+	"errors"
 	"sync"
+
+	"github.com/liuzhixin405/cove-agent/internal/token"
 )
 
-// UsageFunc receives the usage of one successful model call. model is the
-// model that actually served the request when the provider reports it, and
-// the requested model otherwise.
+// UsageFunc receives the usage of one model call: a successful one, or a
+// stream that failed after the model had generated (partialUsageError).
+// model is the model that actually served the request when the provider
+// reports it, and the requested model otherwise.
 type UsageFunc func(model string, resp *ChatResponse)
 
-// meteredProvider reports the usage of every successful call it forwards.
+// meteredProvider reports the usage of every call it forwards that the
+// provider bills: successful ones and streams that failed mid-generation.
 //
 // Billing lives here, at the provider, rather than at each call site: the
 // engine's main loop used to be the only caller that recorded usage, so
@@ -21,7 +26,7 @@ type meteredProvider struct {
 	onUsage UsageFunc
 }
 
-// NewMeteredProvider wraps inner so every successful call is reported to onUsage.
+// NewMeteredProvider wraps inner so every billed call is reported to onUsage.
 func NewMeteredProvider(inner Provider, onUsage UsageFunc) Provider {
 	return &meteredProvider{inner: inner, onUsage: onUsage}
 }
@@ -44,7 +49,21 @@ func (m *meteredProvider) ChatStream(ctx context.Context, req ChatRequest, h Str
 }
 
 func (m *meteredProvider) report(req ChatRequest, resp *ChatResponse, err error) {
-	if err != nil || resp == nil || m.onUsage == nil {
+	if m.onUsage == nil {
+		return
+	}
+	if err != nil {
+		// A stream that failed after the model generated is billed by the
+		// provider all the same; only successful calls used to be reported,
+		// so every stall, cut-off stream and in-stream error went past
+		// max_budget_usd.
+		var pe *partialUsageError
+		if !errors.As(err, &pe) {
+			return
+		}
+		resp = pe.usage
+	}
+	if resp == nil {
 		return
 	}
 	model := resp.Model
@@ -52,6 +71,34 @@ func (m *meteredProvider) report(req ChatRequest, resp *ChatResponse, err error)
 		model = req.Model
 	}
 	m.onUsage(model, resp)
+}
+
+// partialUsageError is a streamed call that failed after the provider began
+// generating, carrying what it will bill for. The usage travels in the
+// error, not in a response next to it, so callers that ignore the response
+// on error, and wrappers such as the fallback chain that drop it, keep
+// working; errors.Is / errors.As see the cause through Unwrap.
+type partialUsageError struct {
+	err   error
+	usage *ChatResponse
+}
+
+func (e *partialUsageError) Error() string { return e.err.Error() }
+func (e *partialUsageError) Unwrap() error { return e.err }
+
+// withPartialUsage attaches usage to err, a streaming failure after the body
+// started. usage holds the counters the stream reported, where an output
+// count of 0 means none was final; it is then estimated from generated, the
+// text, reasoning and tool arguments streamed so far. With nothing reported
+// and nothing generated, err is returned unchanged.
+func withPartialUsage(err error, usage *ChatResponse, generated string) error {
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = token.Estimate(generated)
+	}
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		return err
+	}
+	return &partialUsageError{err: err, usage: usage}
 }
 
 // SwitchableProvider is a Provider whose target can be replaced at runtime.

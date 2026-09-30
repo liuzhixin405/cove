@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -215,15 +217,38 @@ func defaultHTTPTransport() *http.Transport {
 // clients intentionally have no overall Timeout (so long answers aren't cut
 // off), so this watchdog is what prevents the UI from hanging forever on
 // "思考中..." when a connection silently drops or the server stops sending.
-const streamIdleTimeout = 180 * time.Second
+// A var so tests can shorten it.
+var streamIdleTimeout = 180 * time.Second
+
+// ErrStreamStalled is what a streamed request returns when the idle watchdog
+// ended it: the body stopped producing data for streamIdleTimeout. It is not a
+// context.Canceled, which the engine reports as the user's own cancel.
+var ErrStreamStalled = errors.New("stream stalled")
+
+// streamStalledError is the error for a stream the watchdog aborted.
+func streamStalledError() error {
+	return fmt.Errorf("%w: no data received for %s", ErrStreamStalled, streamIdleTimeout)
+}
 
 // newStreamWatchdog derives a context that is cancelled if markProgress is not
 // called within streamIdleTimeout. Build the streaming HTTP request with the
 // returned context so that a stall aborts the blocking body read. Call
-// markProgress on every received chunk, and defer stop to release resources.
+// markProgress once the response headers have arrived and on every received
+// chunk, and defer stop to release resources.
+//
+// The clock starts at the first markProgress, not here. It used to start
+// before the request was sent, so waiting for the headers (a local server's
+// prefill, which may take minutes) and the connect retries' backoff (a 429's
+// Retry-After) counted as idle, and the stream ended in a bare
+// context.Canceled. The connection phase has its own limits: the
+// transport's ResponseHeaderTimeout and the retry schedule.
 func newStreamWatchdog(parent context.Context) (ctx context.Context, markProgress func(), stop func()) {
 	ctx, cancel := context.WithCancel(parent)
-	timer := time.NewTimer(streamIdleTimeout)
+	// Read once, on the caller's goroutine: the loop below may outlive the
+	// request, and a test that shortened the variable restores it meanwhile.
+	idle := streamIdleTimeout
+	timer := time.NewTimer(idle)
+	timer.Stop() // armed by the first markProgress
 	progress := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
@@ -244,7 +269,7 @@ func newStreamWatchdog(parent context.Context) (ctx context.Context, markProgres
 					default:
 					}
 				}
-				timer.Reset(streamIdleTimeout)
+				timer.Reset(idle)
 			}
 		}
 	}()

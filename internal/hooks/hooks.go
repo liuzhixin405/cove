@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,6 +88,9 @@ func NewManager() *Manager {
 
 // Fire synchronously runs all sequential hooks matching the given event + target.
 // Returns aggregated HookOutput (all must Continue=true for the action to proceed).
+// A command hook blocks by printing {"continue": false} (honoured whatever
+// its exit code) or by exiting with code 2; a hook that errors or times out
+// otherwise does not block (see failedHookOutput).
 func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, input HookInput) HookOutput {
 	m.mu.RLock()
 	hooks := m.copyHooks(event)
@@ -145,6 +149,8 @@ func (m *Manager) Fire(ctx context.Context, event HookEvent, target string, inpu
 			cancel()
 		}
 		if err != nil {
+			// An erroring hook fails open. A command hook's veto printed
+			// before a non-zero exit is not an error (see failedHookOutput).
 			log.Warnf("hook %s error: %v", event, err)
 			continue
 		}
@@ -267,7 +273,7 @@ func (m *Manager) runProgram(ctx context.Context, input HookInput, cmdPath strin
 	// ErrWaitDelay alone means the hook exited cleanly and only a process it
 	// left behind still held stdout; what the hook printed is its result.
 	if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
-		return HookOutput{Continue: true}, fmt.Errorf("hook command: %w", err)
+		return failedHookOutput(ctx, out, err)
 	}
 
 	// Continue defaults to true: "continue" is the veto, so a hook that
@@ -281,6 +287,48 @@ func (m *Manager) runProgram(ctx context.Context, input HookInput, cmdPath strin
 	return output, nil
 }
 
+// failedHookOutput is the result of a hook command that did not exit 0.
+//
+// Its output used to be discarded, so a hook that printed {"continue":
+// false} and then exited non-zero (a script whose last command failed) had
+// its veto ignored and the tool ran. Now:
+//
+//   - Killed at its Timeout or by cancellation: non-blocking, whatever it
+//     printed — a half-finished run decides nothing — and the error says it
+//     timed out so Fire's warning shows the hook never finished.
+//   - Exit code 2: a block, the Claude Code PreToolUse convention (the
+//     PreToolUse alias of BeforeTool is accepted, so the convention is too);
+//     stderr, else the printed message, is the reason. Not an error.
+//   - Any other exit code: a JSON veto on stdout is still honoured; the exit
+//     is only logged, since Fire treats an error as "fail open". Without a
+//     veto the hook fails open as before.
+func failedHookOutput(ctx context.Context, out []byte, err error) (HookOutput, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			return HookOutput{Continue: true}, fmt.Errorf("hook command timed out, not blocking: %w", err)
+		}
+		return HookOutput{Continue: true}, fmt.Errorf("hook command: %w", err)
+	}
+	printed := HookOutput{Continue: true}
+	decoded := json.Unmarshal(out, &printed) == nil
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+		msg := strings.TrimSpace(string(exitErr.Stderr))
+		if msg == "" && decoded {
+			msg = printed.Message
+		}
+		if msg == "" {
+			msg = "hook 以退出码 2 拒绝了此操作"
+		}
+		return HookOutput{Continue: false, Message: msg}, nil
+	}
+	if decoded && !printed.Continue {
+		log.Warnf("hook command exited with %v after printing a veto; the veto is honoured", err)
+		return printed, nil
+	}
+	return HookOutput{Continue: true}, fmt.Errorf("hook command: %w", err)
+}
+
 // copyHooks returns a safe copy of registered hooks for the given event.
 func (m *Manager) copyHooks(event HookEvent) []HookConfig {
 	list := m.hooks[event]
@@ -292,18 +340,40 @@ func (m *Manager) copyHooks(event HookEvent) []HookConfig {
 	return cp
 }
 
-// matches checks whether the hook's Matcher regex matches the target.
-// An empty Matcher matches everything.
+// claudeCodeToolNames lists, for a cove tool, the Claude Code tool names a
+// hooks.json matcher may use for it. Matchers used to be compared
+// case-sensitively against cove's lowercase names, so hooks copied from a
+// Claude Code config ("matcher": "Bash", "Edit|Write") loaded without error
+// and then never fired. Matching is now case-insensitive (which covers
+// Bash/Edit/Write/Read/Grep/Glob/WebFetch/WebSearch directly); this table adds
+// the names that differ: Claude Code's MultiEdit is cove's edit, and its Bash
+// also covers cove's powershell tool, the shell tool used on Windows.
+var claudeCodeToolNames = map[string][]string{
+	"edit":       {"MultiEdit"},
+	"powershell": {"Bash"},
+}
+
+// matches checks whether the hook's Matcher regex matches the target,
+// ignoring case, or matches one of the target's Claude Code tool names (see
+// claudeCodeToolNames). An empty Matcher matches everything.
 func (m *Manager) matches(h HookConfig, target string) bool {
 	if h.Matcher == "" {
 		return true
 	}
-	matched, err := regexp.MatchString(h.Matcher, target)
+	re, err := regexp.Compile("(?i)" + h.Matcher)
 	if err != nil {
 		log.Warnf("hook regex error: %v", err)
 		return false
 	}
-	return matched
+	if re.MatchString(target) {
+		return true
+	}
+	for _, alias := range claudeCodeToolNames[strings.ToLower(target)] {
+		if re.MatchString(alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // Legacy event aliases, kept because hook config files and docs spell the

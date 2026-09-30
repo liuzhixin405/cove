@@ -65,3 +65,33 @@ func TruncateWidth(s string, width int, tail string) string {
 	}
 	return termWidth.TruncateString(s, width, tail)
 }
+
+// GraphemeCells measures rs one grapheme cluster at a time, the way Width
+// does, and reports the result per rune for callers that index by rune (the
+// line editor): the cluster's width on its first rune and -1 on every rune
+// that continues a cluster. Summing RuneWidth instead counts an emoji
+// presentation sequence such as "⚠️" (base + U+FE0F) as 1 column and a ZWJ
+// family as 6, while the terminal draws both 2 wide.
+func GraphemeCells(rs []rune) []int {
+	cells := make([]int, len(rs))
+	// string(rs) turns every rune into exactly one rune (an invalid one into
+	// U+FFFD), so counting the runes of each cluster keeps the index in step.
+	g := termWidth.StringGraphemes(string(rs))
+	i := 0
+	for g.Next() && i < len(rs) {
+		first := true
+		for range g.Value() {
+			if i >= len(rs) {
+				break
+			}
+			if first {
+				cells[i] = g.Width()
+				first = false
+			} else {
+				cells[i] = -1
+			}
+			i++
+		}
+	}
+	return cells
+}

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/liuzhixin405/cove-agent/internal/browser"
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
 )
 
 // BrowserTool drives a (optionally headless-Chrome) browser to fetch
@@ -35,7 +37,14 @@ func NewBrowserTool() Tool {
 				},
 				"required":["action","url"]
 			}`),
-			IsReadOnly: true, IsConcurrencySafe: false, UserFacingName: "Browser",
+			// Not read-only: action=screenshot writes a PNG into the
+			// workspace. Declared read-only, the tool went to read-only
+			// sub-agents (which run read-only tools with no permission gate)
+			// and through plan mode, either of which could then overwrite a
+			// project file. Def has no per-action read-only report, so the
+			// whole tool is gated like write; navigate stays Allowed in
+			// CheckPermissions.
+			IsReadOnly: false, IsConcurrencySafe: false, UserFacingName: "Browser",
 		}},
 		br: browser.New(browser.DefaultConfig()),
 	}
@@ -101,7 +110,7 @@ func (t *BrowserTool) Call(ctx context.Context, input Input, tctx Context) (Resu
 		if err != nil {
 			return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 		}
-		if err := os.WriteFile(out, png, 0644); err != nil {
+		if err := saveScreenshot(out, png); err != nil {
 			return Result{Data: "Error writing screenshot: " + err.Error(), IsError: true}, nil
 		}
 		return Result{Data: fmt.Sprintf("Saved screenshot (%d bytes) to %s", len(png), out)}, nil
@@ -146,11 +155,23 @@ func isScreenshotAction(input Input) bool {
 	return false
 }
 
+// saveScreenshot writes the PNG the way write does: a complete new file
+// renamed into place (replaceFile). It used os.WriteFile, which truncates
+// first, so a crash or a full disk left an empty file where an image was.
+func saveScreenshot(out string, png []byte) error {
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return err
+	}
+	return replaceFile(out, png)
+}
+
 // screenshotPath resolves the screenshot's output path and refuses anything
-// but a .png file inside the workspace. The tool is marked read-only, so a
-// read-only sub-agent runs it with no permission gate at all, and the path is
-// picked by the model: without this check an absolute path or "../" let such a
-// call overwrite any file the user can write.
+// but a .png file inside the workspace, and an existing file that is not a
+// PNG. The tool was marked read-only, so a read-only sub-agent ran it with no
+// permission gate at all, and the path is picked by the model: without this
+// check an absolute path or "../" let such a call overwrite any file the user
+// can write. It is no longer read-only, but the checks stay as the second
+// line of defense.
 func screenshotPath(input Input, cwd string) (string, error) {
 	out, _ := input["output"].(string)
 	out = strings.TrimSpace(out)
@@ -172,9 +193,30 @@ func screenshotPath(input Input, cwd string) (string, error) {
 		abs = filepath.Join(cwd, abs)
 	}
 	abs = filepath.Clean(abs)
+	// "main.go:x.png" ends in .png but is a stream of main.go on NTFS.
+	if hasStreamSeparator(abs, runtime.GOOS) {
+		return "", fmt.Errorf("screenshot output must not contain ':' (on Windows it names an alternate data stream of another file), got %q", out)
+	}
 	rel, err := filepath.Rel(filepath.Clean(cwd), abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("screenshot output must be inside the workspace %s, got %q", cwd, out)
+	}
+	// The text of the path is not enough: os.WriteFile follows links, and a
+	// junction in the workspace (mklink /J needs no privilege) pointing
+	// elsewhere took "out/x.png" outside it. Resolve links as write does.
+	if !safepath.Within(cwd, abs) {
+		return "", fmt.Errorf("screenshot output must be inside the workspace %s, got %q (it leads outside through a link)", cwd, out)
+	}
+	// A link as the file itself would have its target overwritten, or, when
+	// dangling, created wherever it points.
+	if fi, err := os.Lstat(abs); err == nil && !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("screenshot output %q exists and is not a regular file (a link?); choose another name", out)
+	}
+	// An existing regular file used to be replaced whatever it held: a
+	// project asset named .png was gone. As draw_image does, replace only a
+	// file that already is a PNG.
+	if err := checkReplaceableImage(abs); err != nil {
+		return "", fmt.Errorf("screenshot output: %w", err)
 	}
 	return abs, nil
 }

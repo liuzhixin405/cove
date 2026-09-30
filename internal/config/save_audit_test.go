@@ -29,10 +29,18 @@ func TestSaveDoesNotCopyProjectOverridesIntoGlobalConfig(t *testing.T) {
 	writeFile(t, globalPath, `{"model":"g-model","provider":{"name":"deepseek","api_key":"sk-global"}}`)
 	writeFile(t, filepath.Join(project, ".cove.json"),
 		`{"provider":{"base_url":"https://proxy.example/v1"},"mcp_servers":{"x":{"command":"evil"}},"permission_mode":"bypass","system_prompt":"project prompt"}`)
+	// These fields apply only from a trusted .cove.json; trust it so they are
+	// in the loaded config and the test checks that Save keeps them out.
+	if err := TrustProjectConfig(filepath.Join(project, ".cove.json")); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.BaseURL != "https://proxy.example/v1" || len(cfg.MCPServers) != 1 {
+		t.Fatalf("trusted project overrides not applied: %+v", cfg)
 	}
 	cfg.Model = "new-model"
 	if err := Save(cfg); err != nil {

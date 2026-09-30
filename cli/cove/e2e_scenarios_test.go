@@ -245,6 +245,9 @@ func TestE2E_ProjectRuleSurvivesRestart(t *testing.T) {
 // The git routine group remembered once covers the rest of the cycle, quoted
 // commit messages with operators included.
 func TestE2E_GitRoutineGroupCoversTheWholeCycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	model := newFakeModel(t,
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"git init -q && git add . && git commit -q -m \"feat: scaffold; first cut\" --allow-empty"}`}}},
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"git commit -q --allow-empty -m \"fix: a && b\" && git log --oneline -1"}`}}},
@@ -268,6 +271,9 @@ func TestE2E_GitRoutineGroupCoversTheWholeCycle(t *testing.T) {
 // program used to be, which read as if the command had something to do with
 // it (a "sed … > s2.json" line was said to fall outside a docref.exe rule).
 func TestE2E_SecondPromptDoesNotNameUnrelatedRules(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow (>3s): skipped under -short")
+	}
 	model := newFakeModel(t,
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"mkdir agent"}`}}},
 		fakeStep{ToolCalls: []fakeToolCall{{Name: "bash", Args: `{"command":"cd agent && dotnet --version"}`}}},
@@ -282,7 +288,7 @@ func TestE2E_SecondPromptDoesNotNameUnrelatedRules(t *testing.T) {
 	s.WaitFor("已记住 bash 中", e2eTimeout)
 	s.WaitForCount("需要授权", 2, e2eTimeout)
 	s.WaitFor("cd agent && dotnet --version", e2eTimeout)
-	s.WaitForCount("按键即答", 2, e2eTimeout)
+	s.WaitForCount("[n] 拒绝", 2, e2eTimeout)
 	out := s.Output()
 	second := out[strings.LastIndex(out, "需要授权"):]
 	if !strings.Contains(second, "dotnet --version") {

@@ -44,7 +44,7 @@ func (c *DreamCmd) Execute(ctx context.Context, in Input) (Output, error) {
 			if task := dream.ActiveTask(); task != nil {
 				return Output{Message: fmt.Sprintf("整理锁被占用：已有整理在运行 (开始于 %s)。", task.StartTime.Format("15:04:05"))}, nil
 			}
-			return Output{Message: "整理锁被占用：另一个 cove 进程正在整理，或本进程 1 小时内刚整理过（整理完成后锁会保留 1 小时）。稍后再试。"}, nil
+			return Output{Message: "整理锁被占用：另一个 cove 进程正在整理。稍后再试。"}, nil
 		case err != nil:
 			return Output{}, fmt.Errorf("dream: %w", err)
 		}

@@ -3,6 +3,7 @@ package tool
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/liuzhixin405/cove-agent/internal/safepath"
@@ -22,6 +23,14 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 		path = filepath.Join(tctx.Cwd, path)
 	}
 	path = filepath.Clean(path)
+	// "README.md:notes" is, on NTFS, a hidden alternate data stream of
+	// README.md. Only the screenshot and draw_image paths refused it; write
+	// and edit created such a stream inside the workspace, invisible to git,
+	// Explorer and read. Every file tool resolves through here, so refuse it
+	// here.
+	if hasStreamSeparator(path, runtime.GOOS) {
+		return "", fmt.Errorf("path must not contain ':' after the drive letter (on Windows it names an alternate data stream of another file): %s", path)
+	}
 	if tctx.Cwd == "" {
 		return path, nil
 	}
@@ -50,4 +59,27 @@ func resolvePathInCwd(path string, tctx Context, forWrite bool) (string, error) 
 		return "", outsideWorkingDirectoryError(path, root)
 	}
 	return path, nil
+}
+
+// hasStreamSeparator reports whether p, on Windows (goos), has a ':' after
+// its volume name. NTFS reads "main.go:x.png" as the stream x.png of main.go,
+// so a path that passes a ".png" check could write into a source file's
+// hidden alternate data stream. ':' is an ordinary name character elsewhere.
+func hasStreamSeparator(p, goos string) bool {
+	if goos != "windows" {
+		return false
+	}
+	// The extended-length forms are four characters (`\\?\C:\...`); they were
+	// listed as three, so a `\\?\` path was never stripped and its drive
+	// colon counted as a stream separator.
+	for _, prefix := range []string{`\\?\`, `\\.\`, `//?/`, `//./`} {
+		if strings.HasPrefix(p, prefix) {
+			p = p[len(prefix):]
+			break
+		}
+	}
+	if len(p) >= 2 && p[1] == ':' && ('a' <= p[0] && p[0] <= 'z' || 'A' <= p[0] && p[0] <= 'Z') {
+		p = p[2:]
+	}
+	return strings.Contains(p, ":")
 }

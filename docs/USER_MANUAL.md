@@ -91,7 +91,7 @@ Expand-Archive cove-v*-windows-amd64.zip -DestinationPath .
 需要 Go 1.25+：
 ```bash
 git clone https://github.com/liuzhixin405/cove-agent.git
-cd cove
+cd cove-agent
 go build -o cove ./cli/cove
 ./cove --version
 ```
@@ -112,7 +112,7 @@ go build -o cove ./cli/cove
 | `--list-sessions [all]` | 列出当前项目的会话；加 `all` 列出所有项目的会话 |
 | `--dump-system-prompt` | 打印系统提示词 |
 | `--no-auto` | 禁用后台自学习功能 |
-| `--no-tui` | 使用 headless 模式（按行读 stdin，答案写 stdout，提示写 stderr） |
+| `--no-tui` | 使用 headless 模式（按行读 stdin，答案写 stdout，提示写 stderr）；任一轮失败（请求出错、取消、缺 API key、超预算、附件读不到）时以退出码 1 结束；收到 SIGTERM 时（含执行斜杠命令期间）保存会话后结束，不再读后续输入 |
 | `--tui` | 即使 stdin/stdout 不是终端也强制使用交互界面 |
 | `--profile <name>` | 使用指定 profile 启动 |
 | `--record <dir>` | 录制本次会话的请求与响应到目录 |
@@ -246,7 +246,8 @@ go build -o cove ./cli/cove
 
 1. **环境变量** — `LLM_API_KEY`, `LLM_BASE_URL`, 各提供商专用变量
 2. **用户配置** — `~/.cove/config.json`
-3. **项目配置** — 当前目录下的 `.cove.json`
+3. **项目配置** — 当前目录下的 `.cove.json`（能执行命令或改变密钥去向的字段需先 `/trust`，见[项目配置的信任](#项目配置的信任)）
+4. **profile** — `active_profile` 或 `--profile` 选中的配置档案。档案里设置了的字段，用 `/model`、`/provider`、`/api-key`、`/base-url`、`/mode`、`/budget save` 修改时写回该档案（以前写到顶层，重启后又被档案覆盖回去）
 
 ---
 
@@ -341,6 +342,8 @@ go build -o cove ./cli/cove
 | `/dream [status\|run]` | 无参数或 `status`：查看记忆整理（dream）的触发方式、上次结果与用量费用；`run`：忽略门槛立即在后台整理 |
 | `/hooks` | 列出从用户级 `hooks.json` 加载的钩子（事件、匹配工具、同步/异步、超时、命令），以及未加载条目的原因 |
 | `/help` | 显示帮助 |
+| `/trust` | 信任当前项目：项目目录（回合结束自动运行构建/测试校验）以及它的 `.cove.json`（按本进程读到的内容记录哈希，`/restart` 后其中需要信任的设置生效，文件一改就失去信任）。`/cd` 之后先 `/restart` 再信任新目录。见[项目配置的信任](#项目配置的信任) |
+| `/restart` | 保存会话并重启 cove，新进程用 `-r <会话 ID>` 接着当前会话（空会话则新开）。用于让新装的技能（`/skill install`）、插件、配置文件改动或升级后的二进制生效。退出部分与 `/exit` 相同（SessionEnd hook、MCP 断开）；启动参数沿用，但去掉 `-r`/`--resume` 和 `--image`/`--file`。任务运行中不能执行；headless 模式不支持。Windows 没有进程替换，首次重启后原进程留作监督进程等待新进程，之后的重启都由它发起，不会一层层叠加 |
 | `/exit` | 退出 REPL |
 
 ---
@@ -464,7 +467,7 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 | 模式 | 自动放行（不弹窗） | 仍需确认 |
 |------|------------------|---------|
 | `default` | 只读工具（`read`/`grep`/`glob` 等）；**整行都是只读简单命令**的 `bash`/`powershell` 命令，如 `git status`、`git diff --stat`、`git log --oneline -5`、`ls -la`、`cat go.mod`、`grep -rn foo .`、`git status && git diff` | 其余一切：写文件、编辑、git 写操作、构建、安装、网络请求（`curl`/`wget` 即使只是 GET 也询问） |
-| `auto` | `default` 的全部 + 构建/测试命令（`go build`/`go test`/`go vet`、`cargo test`、`make test` 等）+ 目标路径位于项目工作目录内的 `write`/`edit` | git 写操作（`commit`/`push` 等）、包安装、网络请求、未知命令、项目外写入、MCP 工具、`draw_image`、浏览器截图、`worktree` 等 |
+| `auto` | `default` 的全部 + 构建/测试命令（`go build`/`go test`/`go vet`/`go list`、`gofmt`、`cargo test`、`make`/`make test`、`dotnet test/build/run`、`pytest`、`npm run test:unit` 这类 test/lint/build 脚本等）+ 目标路径位于项目工作目录内的 `write`/`edit` | git 写操作（`commit`/`push` 等）、包安装、网络请求、未知命令、项目外写入、MCP 工具、`draw_image`、浏览器截图、`worktree` 等 |
 | `bypass` | 全部（`deny` 规则仍生效） | 无（灾难命令仍被硬拦截，见下文） |
 | `plan` | 只读工具；整行只读的 `bash`/`powershell` 命令；只影响会话本身的工具（`todowrite`、`question`、`skill`，以及 `agent`/`execute_plan`，子代理的每个调用照样受 plan 限制） | 不询问：其余工具一律拒绝，不管工具自己怎么回答（之前选过的“总是允许”在此模式下不生效）。模型用 `plan_mode` 自行进入的计划模式同样按此执行；它可以用 `exit_plan_mode` 退出（需你确认），但你用 `/mode plan` 设置的计划模式只能由你切换 |
 
@@ -500,6 +503,8 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 - `p` / `permanent` / `永久` — 本次会话生效，并写入 `~/.cove/policies.json`（设置了 `COVE_CONFIG_DIR` 时位于该目录下），**只对当前项目生效**（项目根 = 从启动目录向上找到的含 `.git` 的目录，找不到时为启动目录）。之后在同一项目启动 cove 不再询问。成功时提示会显示实际写入的文件路径，写入的规则作为本项目的磁盘规则装入本会话：用 `/cd` 切换到其他项目时与其他 `policies.json` 规则一起卸下，同一命令会重新询问，按新项目的规则判断。写入失败时提示“未能写入，仅本次会话有效”，规则退化为会话规则
 - `n` 或其他输入 — 拒绝
 - 15 分钟内没有回答视为拒绝（提示“授权超时”）
+
+提示尽量不带多余文字：“按键即答，无需回车；Ctrl+C 拒绝并停止任务”只在本进程第一次询问时显示；无法按规则记住的命令（带重定向、组合了无法归类的程序等）只是不提供 `[a]`/`[p]`，不再额外说明原因；只有已经记住过相关规则、这一行却没被覆盖时，才用一行暗色字说明哪条规则、为什么没覆盖，避免看起来像“记住了却没生效”。
 
 “记住范围”只列**真正需要授权**的那部分。`cd`、`echo`、`git status`、`git log` 这类只读命令在任何模式下都自动放行，所以既不出现在范围里，也不需要单独记住：`cd proj && git remote -v` 这样整行只读的命令直接执行，不再因为 `cd` 而询问。
 
@@ -542,19 +547,40 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 **`allow` 规则不做归一化**，仍按原样逐词比较（见上一节），所以允许 `go test` 不会放行 `sudo go test` 或 `/usr/local/go/bin/go test`。
 
-已知限制：`bash -c "git push"`、`xargs` 这类内联脚本里的命令不展开，`deny`/`ask` 前缀规则不会命中其中的命令（灾难命令检查另有展开，不受影响）。
+**`deny` / `ask` 规则也看嵌套命令**：`bash -c "git push"`、`sh -c`、`cmd /c`、`powershell "…"`、`eval`/`iex`、`xargs git push`、`find -exec/-execdir/-ok`、管道进 shell 的 heredoc 里的命令都会被展开匹配。命令行上定义了 git 别名（`git -c alias.p=push`、`--config-env`、`git config alias.*`）时，所有针对 git 的 deny/ask 规则都命中；命令的程序名是变量（`$GIT push`、`G=git; $G push`、`${GIT} push`、`$env:GIT push`、`%GIT% push`，以及嵌套的 `bash -c "$CMD"`、`eval "$x"`）时看不出要运行什么，所有 deny/ask 规则都命中；这类命令也不算只读、不自动批准、不能记住前缀。git 组的 ask/deny 规则只覆盖非只读用法，`git branch -a`、`git tag`、`git stash list`、`git remote -v` 这类只读列表命令不受影响。
+
+**`param_match` 里的 `command`**（bash/powershell 工具）按简单命令逐条匹配，而不是整行前缀：`allow` 要求行内每条命令都匹配该 glob，且不含命令替换或写文件的重定向；`deny`/`ask` 只要任一条命令（含嵌套命令）匹配即生效。末尾单个 `*` 按整词扩展，`git status*` 匹配 `git status --short`，不匹配 `git statusx`，也不再放行 `git status; rm -rf ./src`。
 
 ### 灾难命令硬拦截
 
 无论哪种模式（包括 `bypass`），以下命令都会被直接拦截：
 
-- 递归删除根目录/家目录/系统目录或盘符根（如 `rm -rf /`、`rm -rf ~`、`Remove-Item -Recurse C:\`、`find / -delete`、`find ~ -exec rm …`、`echo ~ | xargs rm -rf`）
-- 格式化磁盘或写裸设备（`mkfs`、`dd of=/dev/sda`、`format c:`）、关机重启、fork bomb
-- 把下载或解码的内容直接交给解释器执行（`curl … | sh`、`irm … | iex`、`base64 -d | bash`）
-- 通过嵌套 shell 包装的上述命令：`bash -c "rm -rf ~"`、`sh -c 'rm -rf /'`、`cmd /c rd /s /q C:\`、`powershell -Command "Remove-Item -Recurse -Force C:\"`、`pwsh -c "rm -r -fo ~"`、多层 `bash -c "bash -c '…'"`，以及喂给 shell 的 heredoc（`bash <<EOF` 里写 `rm -rf /`）
+- 递归删除根目录/家目录/系统目录或盘符根（如 `rm -rf /`、`rm -rf /**`、`rm -rf ~`、`rm -rfvvv /`、`Remove-Item -Recurse C:\`、`rm -rf C:/Windows`、`rm -rf /c/`（Git Bash 盘符）、`rm -rf /{etc,usr}`、`find / -delete`、`find -L / -exec rm …`、`echo ~ | xargs rm -rf`、`rm$IFS-rf$IFS/`）
+- 格式化磁盘或写裸设备（`mkfs`、`dd of=/dev/sda`、`shred /dev/sda`、`tee`/`cp`/`mv` 写入 `/dev/sd*`、`/dev/nvme*`、`\\.\PhysicalDrive*`、`format c:`）、关机重启、fork bomb（含 `function f { f|f& }; f` 写法）
+- 把下载或解码的内容直接交给解释器执行：管道形式（`curl … | sh`、`curl … | bash -s -- x`、`| bash /dev/stdin`、`| bash -`、`| python3 -`、`irm … | iex`、`base64 -d | bash`），以及进程替换 / 命令替换形式（`bash <(curl …)`、`source <(curl …)`、`. <(curl …)`、`python3 <(curl …)`、`sh -c "$(curl …)"`、`eval "$(curl …)"`、直接执行 `$(curl …)`、`echo "$(curl …)" | sh`、`iex (iwr …)`、`iex (irm …)`）；下载源包括 `curl`、`wget`、`fetch`、`iwr`/`irm`。只把下载结果当数据参数的不拦（`python3 parse.py <(curl …)`、`diff <(curl a) <(curl b)`、`git commit -m "$(curl …)"`）。已知未覆盖：`iex (New-Object Net.WebClient).DownloadString('…')`
+- 通过嵌套 shell 包装的上述命令：`bash -c "rm -rf ~"`、`sh -c 'rm -rf /'`、`cmd /c rd /s /q C:\`、`powershell -Command "Remove-Item -Recurse -Force C:\"`、`powershell "Remove-Item -Recurse -Force C:\Windows"`（第一个位置参数按 -Command 处理）、`pwsh -c "rm -r -fo ~"`、多层 `bash -c "bash -c '…'"`、`eval '…'`/`iex '…'`/`Invoke-Expression "…"`，`xargs`/`find -exec` 行内写死的目标（`xargs rm -rf /`、`find . -exec rm -rf / \;`），以及喂给或管道进 shell 的 heredoc（`bash <<EOF`、`cat <<'EOF' | sh` 里写 `rm -rf /`）
+- 含单独 CR、不可见空白或零宽字符的写法按去掉这些字符后的形式检查（`echo hi<CR>Remove-Item … C:\Windows`、`r<零宽空格>m -rf /` 同样拦截）
 - `powershell -EncodedCommand …`：内容无法审查，一律拦截（理由 “encoded command”）
 
-不会误拦截：删除项目内的文件或目录（如 `rm -rf build`）、`bash -c "go test ./..."`、`git commit -m "rm -rf /"`（引号内只是参数）、`cat <<EOF > notes.md` 里写的 `rm -rf /`（heredoc 喂给 `cat` 只是数据），这些按当前模式正常确认。
+不会误拦截：删除项目内的文件或目录（如 `rm -rf build`）、`bash -c "go test ./..."`、`git commit -m "rm -rf /"`、`echo ":(){ :|:& };:"`（引号内只是参数）、`cat <<EOF > notes.md` 里写的 `rm -rf /`（heredoc 喂给 `cat` 只是数据），这些按当前模式正常确认。
+
+### 无法确定含义时一律询问
+
+命令的含义没法可靠判断时，按“需要授权”处理，不会自动放行，也不会被已记住的规则覆盖：
+
+- **不寻常的空白与不可见字符**：PowerShell 把单独的 CR、NEL、U+2028/U+2029 当作换行，把 FF、VT、不间断空格等当作参数分隔，`ls<CR>Remove-Item -Recurse -Force src` 实际是两条命令。含这类字符、其他控制字符、零宽/双向控制等不可见格式字符或非法 UTF-8 的命令，一律不算只读、不自动批准、不被记住的前缀/分组/`param_match` 规则覆盖，改为询问。
+- **bash 的 `@{…}`**：`git stash show -p stash@{0}`、`git diff HEAD@{1}`、`git log @{u}..HEAD` 里词内的花括号按字面处理，算只读、可记住；`{a,b}`、`{1..3}` 花括号展开仍询问，PowerShell 下未加引号的花括号仍询问。
+- **子命令前有选项**：记住的 npm/pnpm/yarn、go、cargo、dotnet 常规组，不覆盖子命令前带选项的写法（`npm --prefix x publish`、`pnpm -C x test`、`go -C x install`、`cargo +nightly build`），这类命令也不提供记住整组的选项。以前选项的值会被当成子命令，`npm --prefix test publish` 会被当作 `npm test` 放行。
+- **bash 的反斜杠**：bash 下按 bash 的规则理解反斜杠续行和转义；`r\m -rf /`、`rm \<换行>-rf ~` 这类写法同样被硬拦截。含义取决于反斜杠处理方式的行（如 `find . -f\<换行>ls x`）需要授权。
+- **curl / wget**：只有全部选项都在只读白名单内、方法为 GET/HEAD、输出只到 stdout 时才算只读；`--json`、`-d`、`-F`、`-T`、`-o 文件`、`-D`、`-c`、`--trace`、`-XDELETE` 等都需要授权。PowerShell 下 `curl`/`wget` 是 `Invoke-WebRequest` 的别名，只允许单个 URL（可加 `-Uri`、`-UseBasicParsing`）；`iwr`、`irm` 与 `Invoke-*` 总是询问。
+- **可能执行项目脚本的子命令**：yarn、pnpm、composer 遇到不是自身内置命令的子命令，会执行项目里同名的脚本，所以只有确定是内置命令的才算只读（如 `yarn info`/`why`、`pnpm list`/`outdated`/`why`/`audit`、`composer show`/`outdated`/`why`）；`yarn doctor`、`composer freeze` 等需要授权。`audit --fix`（含缩写）需要授权。
+- **`git branch`** 只在全部选项都是已知的列表选项时算只读；`-uorigin/main`、`--set-u=…` 这类附带值或缩写的写法会改 `.git/config`，需要授权。
+- **`date`**：`--s…`（`--set` 的缩写）、含 `s` 的组合短选项、以及除 `+格式` 以外的参数都需要授权。
+- **ask/deny 规则覆盖整组**：对 git、npm 等常规组设置的 ask/deny 规则，同样拦下该程序的高风险写法（`git push --force`、`git reset`、`git -c …`、`npm publish`、`-g`），以前只拦常规用法，高风险的反而放行。`--force-create` 这类以被拒选项开头的长选项、`npm --location=global|user`、`--prefix` 也不算常规。
+- **yarn 不再有只读命令**：仓库的 `yarnPath` 会让任何 yarn 命令（包括 `yarn --version`）执行指定脚本。
+- 其他不再免询问的：PowerShell 的 `-Path:\\host\share`、`FileSystem::\\host\share`（访问网络共享，会带上凭据）；`ag --pag…`、`rg --hostname-bin`；`docker compose config -o`；`file --comp`/`-C`。
+- **auto 模式下与 `go test` 一致**：`npm test`、`npm run test|build|lint|check|typecheck|…`（含 `test:unit`、`lint:fix`、`build:prod` 这类带冒号后缀的脚本名）、`pnpm`/`yarn` 的 `test`/`build` 等，以及 `dotnet test/build/run`（带 `--force` 除外）、`pytest`（带 `--basetemp` 除外）、`go list`、`gofmt`、不带参数的 `make`，都按构建/测试类处理，auto 模式下免询问（`--` 之前带任何选项仍会询问）。
+- **子进程 git 不使用夹带的裸仓库**：shell 工具启动的 git 设置 `safe.bareRepository=explicit`，仓库里夹带的裸仓库目录（HEAD、config、objects/）不会在 `cd 该目录 && git status` 时被使用。
 
 ### 命令运行在哪个 shell
 
@@ -618,6 +644,30 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 - 用户配置：`~/.cove/config.json`
 - 项目配置：项目根目录的 `.cove.json`
+
+### 项目配置的信任
+
+`.cove.json` 跟着仓库走，克隆别人的仓库就会带上别人写的配置。其中能执行命令或改变密钥去向的设置，在确认信任前**不生效**：
+
+| 字段 | 何时需要信任 |
+|------|-------------|
+| `provider.name` / `provider.api_key` / `provider.base_url` | 总是（`base_url` 指向别处，首个请求就会把你的 API key 发过去） |
+| `mcp_servers` | 总是（启动时就会拉起这些进程） |
+| `done_verify_commands`、`system_prompt`、`memory_embedding`、`web_search` | 总是 |
+| `permission_mode` | 取值不是 `default` 或 `plan` 时 |
+| `done_verify_auto`、`done_verify_tests` | 取值为 `true` 时 |
+| `max_budget_usd` | 调高了全局上限时（调低直接生效） |
+| `max_sessions` | 比当前生效值更小时（会删除更多旧会话） |
+
+- 启动时如有被忽略的设置，stderr 用黄色提示文件路径和字段名。确认可信后在交互模式输入 `/trust`，再 `/restart`。
+- 信任记录在 `~/.cove/trusted_projects.json`（设置了 `COVE_CONFIG_DIR` 时位于该目录），按 `.cove.json` 的绝对路径保存其内容的 SHA-256；**文件内容一改就失去信任**，需要重新 `/trust`。`/trust` 信任的是本进程启动时读到的内容，提示之后被替换的文件仍不受信任。
+- 其余字段（模型、思考、上限、展示类开关等）照常直接生效；更严格的取值（`plan`/`default` 模式、更低的预算、关闭校验）也直接生效。
+- `.cove.json` 是符号链接、设备、管道或超过 1 MiB 时直接忽略（stderr 警告）。
+- `/profile save` 只保存你自己的设置：`.cove.json` 提供的 provider、`system_prompt`、`permission_mode`、模型、预算等不会被复制进全局 profile（会话中你手动改过的值照常保存）。
+
+**自动校验也需要信任**：回合结束时自动推断并运行的构建/测试校验（`go build`、`cargo check`、`npx --no-install tsc`、`dotnet build`、`npm run build --if-present`、`python -m compileall`，以及自动运行的 `go test`/`pytest`/`dotnet test`）会执行仓库里的代码（`package.json` 脚本、`build.rs`、MSBuild 目标、`conftest.py`）。它们只在**受信任的项目目录**里、或 `auto`/`bypass` 模式下（这两种模式下构建/测试命令本来就免询问）自动运行；否则跳过并暗色提示一次“未信任的项目不自动运行构建/测试校验（npm run build 等会执行仓库里的脚本）；确认可信后输入 /trust”。跳过不算通过也不算失败。你在用户级 `config.json` 里明确写的 `done_verify_commands` 不受影响。
+
+对没有 `.cove.json` 的项目，`/trust` 信任的是项目目录（git 根目录，没有则为当前目录），只对这个目录生效，不包括其他目录；信任 `.cove.json` 时也同时信任它所在的目录。
 
 ### config.json 示例
 
@@ -706,9 +756,9 @@ Agent（AI）在对话中可以调用以下工具。每个工具有其权限要�
 
 | 字段 | 说明 |
 |------|------|
-| 事件名 | `BeforeTool`、`AfterTool`、`SessionStart`、`SessionEnd`；也接受别名 `PreToolUse`/`PostToolUse`。`SessionEnd` 在退出时触发一次（`/exit`、Ctrl+D、headless 读完输入、`-p` 结束），cove 等它完成（含 `async` hook）再退出，总上限 30 秒；配置了 SessionEnd hook 时退出前在 stderr 提示“正在运行 SessionEnd hook…” |
-| `matcher` | 对工具名的正则（Go RE2），匹配**完整**工具名：`bash` 不匹配 `bash_output`，`write\|edit` 只匹配这两个工具；写了 `^` 或 `$` 的按原样使用；空或 `*` 表示所有工具 |
-| `command` | 一条命令行，用与 `bash` 工具相同的 shell 执行（Windows 上依次选 Git Bash → PowerShell → cmd；其他系统 bash/sh）。stdin 收到 JSON（`event`、`tool_name`、`tool_input`、`model`、`session_id`、`cwd`）；`BeforeTool` 钩子在 stdout 输出 `{"continue": false, "message": "..."}` 可阻止这次工具调用，非 JSON 输出视为不阻止 |
+| 事件名 | `BeforeTool`、`AfterTool`、`SessionStart`、`SessionEnd`；也接受别名 `PreToolUse`/`PostToolUse`。`SessionEnd` 在退出时触发一次（`/exit`、`/restart`、Ctrl+D、headless 读完输入、`-p` 结束），cove 等它完成（含 `async` hook）再退出，总上限 30 秒；配置了 SessionEnd hook 时退出前在 stderr 提示“正在运行 SessionEnd hook…” |
+| `matcher` | 对工具名的正则（Go RE2），匹配**完整**工具名：`bash` 不匹配 `bash_output`，`write\|edit` 只匹配这两个工具；写了 `^` 或 `$` 的按原样使用；空或 `*` 表示所有工具。**不区分大小写**，并接受 Claude Code 的工具名：`Bash`（也匹配 `powershell`）、`Edit`/`MultiEdit`、`Write`、`Read`、`Grep`、`Glob`、`WebFetch`、`WebSearch`，从 Claude Code 复制来的 hook 可直接用 |
+| `command` | 一条命令行，用与 `bash` 工具相同的 shell 执行（Windows 上依次选 Git Bash → PowerShell → cmd；其他系统 bash/sh）。stdin 收到 JSON（`event`、`tool_name`、`tool_input`、`model`、`session_id`、`cwd`）；`BeforeTool` 钩子在 stdout 输出 `{"continue": false, "message": "..."}` 可阻止这次工具调用（非零退出码时同样有效），**退出码 2** 也表示阻止（原因取自 stderr，与 Claude Code 的 PreToolUse 约定相同）；其他非零退出码、非 JSON 输出视为不阻止；超时不阻止，记一条日志 |
 | `timeout` | 秒，默认 60 |
 | `async` | `true` 表示不等待结果（因此不能阻止工具调用） |
 
@@ -729,7 +779,7 @@ Cove 内置 **12 个技能**，编译在二进制里，随 cove 版本一起更�
 ### 技能加载机制
 
 - **按需加载**：所有技能只把名称和一句话描述列在系统提示词里，模型判断任务需要时再用 `skill` 工具加载全文。内置技能都是工作流（写计划、TDD、调试等），不会因为读写了某类文件就被自动塞进对话
-- **按文件类型注入（仅自定义技能）**：自己写的技能如果在 `paths` 里声明了 glob 模式，操作匹配文件时会自动注入，每个会话只注入一次
+- **按文件类型注入（仅自定义技能）**：自己写的技能如果在 `paths` 里声明了 glob 模式，操作匹配文件时会自动注入，每个会话只注入一次。不含 `/` 的模式（`*.go`）只比较文件名；含 `/` 的模式（`src/api/*.go`、`internal/**/*.ts`）按相对项目根目录的路径匹配，`**` 匹配任意层目录。`paths`、`allowed_tools`、`steps` 支持逗号分隔、YAML 列表（`- item`）和 `[a, b]` 三种写法；文件为 CRLF 换行或带 BOM 也能正确解析。**项目技能**（仓库里的 `.cove/skills`、`.claude/skills`）与内置、插件或用户技能同名时仍按“越近越优先”覆盖，但加载时会提示一次；解析后指向项目目录之外的项目技能文件（符号链接、目录联接）不会加载
 - **禁用**：在配置里写 `"disabled_skills": ["spike", "plan"]`，就不会加载这些技能（内置或自定义都可以）
 
 ### 技能来源与优先级
@@ -852,7 +902,7 @@ Cove 的 REPL 支持异步任务执行：
 
 - **主 REPL** 循环中，用户输入被转换为任务放入队列
 - 后台 goroutine 取出任务异步执行
-- 用户可以在当前任务执行时继续输入：输入的文本**作为指引送进当前任务**，下一次模型调用时生效，回车后提示 `[已插入] 已作为指引送入当前任务，下一步模型调用时生效`；连续输入多条会一起送入。若任务在用到指引之前就结束了（完成、`/stop`、Ctrl+C、撞上迭代/时间上限或出错），未生效的指引会自动作为新任务排到队首执行，并提示 `[已排队] 当前任务已结束，刚插入的指引将作为新任务执行`。带附件（`/attach`）的消息不能作为指引，仍排队等待。空闲时输入的指令直接开始执行，不打提示
+- 用户可以在当前任务执行时继续输入：输入的文本**作为指引送进当前任务**，下一次模型调用时生效，回车后提示 `[已插入] 已作为指引送入当前任务，下一步模型调用时生效`；连续输入多条会一起送入。若任务在用到指引之前就**正常完成**了，未生效的指引会自动作为新任务排到队首执行，并提示 `[已排队] 当前任务已结束，刚插入的指引将作为新任务执行`；若任务是因 `/stop`、Ctrl+C、撞上迭代/时间上限、出错或内部异常而结束，指引保留在原任务上，提示 `[已保留] 刚插入的指引未生效，将在 /continue 继续或下一次模型调用时送入`，`/continue`（或“继续”）恢复该任务时随第一次模型调用送入。带附件（`/attach`）的消息不能作为指引，仍排队等待。空闲时输入的指令直接开始执行，不打提示
 - `/tasks` 查看运行中和排队任务（仅交互式 REPL 维护队列）
 - `/stop` 取消当前任务（仅交互式 REPL；headless 为同步执行）
 
@@ -860,7 +910,7 @@ Cove 的 REPL 支持异步任务执行：
 
 任务运行时直接输入并回车，就像在旁边给正在干活的助手递纸条：文本会在下一次模型调用前以 `[用户指引]` 消息追加进对话，模型据此调整后续步骤，不会打断正在执行的工具调用。典型用法：“别改测试文件”“先看 internal/api 目录”“用表驱动测试”。多条指引在同一次模型调用前会合并成一条消息，按输入顺序排列。
 
-指引不会静默丢失：如果任务在下一次模型调用前就结束了（无论是正常完成还是取消、撞上限、出错），这些指引会作为一条新任务立刻开始执行。这时它是独立请求，模型看不到“上一任务的中途”这一语境，如有需要可再补一句说明。`exit` 退出时未生效的指引会直接丢弃。
+指引不会静默丢失：如果任务在下一次模型调用前就正常完成了，这些指引会作为一条新任务立刻开始执行——这时它是独立请求，模型看不到“上一任务的中途”这一语境，如有需要可再补一句说明；如果任务是被取消、撞上限、出错或内部异常结束的，指引留在该任务上，`/continue` 恢复时一起送入，模型能看到中断前的上下文。`exit` 退出时未生效的指引会直接丢弃。
 
 `/tasks` 会在当前任务下方显示 `待生效指引: <预览>`；固定输入行的行末显示 `已插入 N 条指引`，模型消费后清零。以 `/` 开头的命令、授权提示与提问工具的回答不走这条路径，行为不变。
 
@@ -868,7 +918,7 @@ Cove 的 REPL 支持异步任务执行：
 
 任务运行时，输入行固定在终端**最后一行**，上方一条暗色横线把它和输出流分开。输入行显示 `⚡ ❯` 与正在输入的内容（光标位置以反色标出），空白时提示“任务运行中，可直接输入指引，回车后送入当前任务”；有未生效指引时行末显示 `已插入 N 条指引`，有排队任务时显示 `已排队 N 条`，两者同时存在时用 ` · ` 连接；模型输出和工具结果只在横线上方滚动，不会把输入行刷走。回车后输入的内容会回显到上方的输出流里，便于在记录中看到插入了什么。
 
-实现上用的是终端自己的滚动区域（DECSTBM）加一次光标位置查询（`ESC[6n`），不靠程序数行，所以折行、宽字符、spinner 都不影响定位。以下情况自动退回旧行为（运行期间不显示输入行，回车后只排队不回显）：终端不回应光标位置查询（首次超时 300 ms 后本进程内不再尝试）、stdout 不是终端、窗口不足 8 行、设置了 `COVE_PIN_INPUT=0`。授权提示出现时输入行临时回到输出流中答题，答完再钉回底部。
+实现上用的是终端自己的滚动区域（DECSTBM）加一次光标位置查询（`ESC[6n`），不靠程序数行，所以折行、宽字符、spinner 都不影响定位。以下情况自动退回旧行为（运行期间不显示输入行，回车后只排队不回显）：终端不回应光标位置查询（超时 300 ms；一次未应答后暂停 30 秒再试，连续 3 次未应答才在本进程内停用，之后收到任何应答即恢复）、stdout 不是终端、窗口不足 8 行、设置了 `COVE_PIN_INPUT=0`。授权提示出现时输入行临时回到输出流中答题，答完再钉回底部。
 
 长时间运行的 `bash`/`powershell` 命令的实时输出，会先打一行 `▸ bash <命令>  实时输出:`，输出内容缩进在它下面；命令结束后照常出现工具摘要行（`✓ Command: … · 共 N 行`）。
 
@@ -882,7 +932,7 @@ Cove 的 REPL 支持异步任务执行：
 
 ### 中断草稿保存
 
-任务因异常中断时，输入会自动保存为中断草稿，重启后可以恢复。
+任务开始时即把输入保存为中断草稿，任务正常完成后自动清除。因此请求失败、被 Ctrl+C 中断或进程异常退出（崩溃、断电、被杀）后，下次在同一项目目录启动时会提示草稿，输入“继续”回到该草稿所在的会话接着做（请求不会重复写入会话）。草稿只在保存它的项目目录中提示和使用；在其他项目或其他会话中完成对话不会清除它；在同一项目开始新任务会替换它。任务运行期间 `/history detail interrupted` 显示的错误一栏为“任务未完成（cove 在任务运行中退出）”。`-p`/headless 模式不保存草稿。
 
 ---
 
@@ -987,8 +1037,8 @@ cove 与 gemini-cli、Codex CLI、OpenCode、goose 等开源 Agent 的基准判�
 |------|------|---------|-----------------|---------|
 | 1 | 空回复 | 没有可见文本、也没有工具调用（只有思考/推理内容也算） | `[system: Your response was empty. Provide the answer or call a tool.]` | 2 次（空回复本身不写入历史） |
 | 2 | 宣告未做 | 最后一段里有一句以“宣告下一步”开头（见下） | `[system: You announced a next step but did not perform it. Continue now by calling the required tools, or state clearly that the task is complete.]` | 与退化结尾合计 2 次 |
-| 3 | 退化结尾 | 本轮运行过非只读工具（写文件、执行命令等），最终文本少于 40 个字符（含中文时 20 个字），且不含完成词 | `[system: Your last message is too brief to be a final answer after doing work. Summarize what you changed and what remains, or continue.]` | 与宣告未做合计 2 次 |
-| 4 | 完成前自检 | 本轮写/改过文件，且 `done_check` 生效（见下节） | `[system: Before finishing, check whether the user's request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer.]` | 1 次 |
+| 3 | 退化结尾 | 本轮运行过非只读工具（写文件、执行命令等），最终文本少于 40 个字符（含中文时 20 个字），且不含完成词 | `[system: Your last message is too brief to be a final answer after doing work. Summarize what you changed for the latest request and what remains, or continue.]` | 与宣告未做合计 2 次 |
+| 4 | 完成前自检 | 本轮写/改过文件，且 `done_check` 生效（见下节） | `[system: Before finishing, check whether the user's latest request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer about that request.]` | 1 次 |
 | 5 | 验证门禁 | `done_verify_commands` 或自动推断的校验命令（见[配置字段说明](#配置字段说明)） | 校验失败时打回继续修改 | — |
 
 - 超过上限后，模型的回复原样作为最终答复。
@@ -1022,16 +1072,35 @@ cove 与 gemini-cli、Codex CLI、OpenCode、goose 等开源 Agent 的基准判�
 
 ### 收尾总结
 
-回合不是因为模型自己说完而停下时，引擎再调用一次模型，要求它不调用工具、用用户的语言总结：已完成什么、还剩什么、建议的下一步。提示为：
+回合不是因为模型自己说完而停下时，引擎再调用一次模型，要求它不调用工具、用用户的语言、只针对最近这条请求总结：已完成什么、还剩什么、建议的下一步，在 git 仓库里还要说明改动是否已提交、已推送。提示为：
 
 ```
-[system: The run is stopping (<reason>). Without calling tools, summarize in the user's language: what was completed, what remains, and the recommended next step.]
+[system: The run is stopping (<reason>). Without calling tools, summarize in the user's language, for the latest request only: what was completed, what remains, and the recommended next step. In a git repository, say whether the changes are committed and pushed.]
 ```
 
 - 触发：迭代/时间上限（交互模式选 `[s]`，以及 `-p`/headless 撞硬上限）、停滞询问选停止、循环检测询问选停止、循环检测累计 5 次硬停。
 - 这次调用不带工具定义（anthropic provider 例外：历史里有 tool_use 时 API 要求带 tools，提示照样要求不调工具，回复中的工具调用会被丢弃），`max_tokens` 1024，关闭思考，使用本轮实际使用的模型；计费。
 - 总结作为一条助手消息写进历史（提示本身不保留）。交互模式流式显示；`-p` 与 headless 在打印错误前先把总结写到 stdout，退出码与错误不变（仍是上限错误，退出码 1）。
 - 已取消、预算已用尽、回放模式（`--replay`）或调用失败时静默跳过。
+
+### 只汇报当前请求
+
+同一会话里连做几个互不相关的任务时，最终报告只讲最近这条请求：
+
+- 系统提示词要求报告只针对最近的请求；之前的请求已经汇报过，只有本次接着做或改动了那部分工作时才提。上面各条补充提示（退化结尾、完成前自检、收尾总结）也都限定在“最近的请求”。
+- **只有本回合写过的任务列表才会“追着”模型**：`todowrite` 的列表在整个会话里保留（你回答模型的提问、`/resume` 之后的第一句话都不会丢掉计划）。回合结束前“还有 N 项未完成，做完再完整写一遍报告”的提示，只在**本回合调用过 `todowrite`** 时出现；本回合没碰过的旧列表不会强迫模型接着做、也不会被写进新任务的报告。每 8 轮的提醒对这种旧列表会注明“这是对话前面留下的列表，只有最近的请求属于那项工作时才继续”。
+
+### 提交与推送状态
+
+- 系统提示词要求：在 git 仓库里改了文件时，报告必须说明改动是否已提交、已推送；只有真的执行且成功了才能说已提交/已推送，否则明确写“未提交”“未推送”；列给用户执行的命令要说明是给用户的步骤，不是已经做了的事。
+- **引擎给出的状态行**：不依赖模型怎么说。本轮用 `write`/`edit` 改过文件，或运行过会改变仓库状态的 git 命令（`add`、`commit`、`push`、`pull`、`merge`、`rebase`、`reset`、`checkout`、`switch`、`restore`、`rm`、`mv`、`cherry-pick`、`revert`、`clone`、`init`、`am`、`apply`、`clean`，以及 `stash`/`tag`/`branch` 的修改用法；失败或超时的 `git push` 同样算），且工作目录在 git 仓库里时，最终报告（或收尾总结）下方显示一行暗色的 `git status` 结果，例如：
+  - `git：3 个文件有未提交的改动`
+  - `git：改动已提交，2 个提交未推送到 origin/main`
+  - `git：改动已提交，分支 feature 没有上游，未推送`
+  - `git：工作区干净，与 origin/main 同步（按本地记录）`
+  - `git：工作区干净，没有未推送的提交，落后 origin/main N 个提交（按本地记录）`
+- 只读的 `git log`、`git diff`、`git status`、`git show`、`git fetch` 不会触发这一行。`/usr/bin/git`、`"C:\Program Files\Git\bin\git.exe"` 这类带路径的写法也能识别。
+- “未推送/落后的提交数”按本地记录的上游分支计算（上次 fetch/push 时的状态），不访问网络；`git status` 超过 3 秒或失败时不显示。
 
 ### 中断标记
 
@@ -1179,7 +1248,7 @@ Cove 在对话过程中自动提取记忆、学习技能，并在对话结束后
 
 **`session_end` 模式（默认）**：
 
-- 回合结束时不再检查 dream。退出时（`/exit`、Ctrl+D、`-p` 结束、headless 结束，在 SessionEnd hook 跑完之后）检查：dream 已启用、本次进程完成的回合数 ≥ `min_turns`、上次整理后有会话被修改（含本会话）。`--no-auto` 与 `--replay` 时跳过。
+- 回合结束时不再检查 dream。退出时（`/exit`、`/restart`、Ctrl+D、`-p` 结束、headless 结束，在 SessionEnd hook 跑完之后）检查：dream 已启用、本次进程完成的回合数 ≥ `min_turns`、上次整理后有会话被修改（含本会话）。`--no-auto` 与 `--replay` 时跳过。
 - 满足条件时以**分离的后台进程**整理，stderr 显示“已在后台启动记忆整理（约 1–3 分钟，至多约 30 次后台模型调用，结果见 /dream）”，cove 立即退出。后台进程继承工作目录（项目 `.cove.json` 的模型配置同样生效），使用 `model_fast`（未设则 `model`），最长 5 分钟，调用计费并写入费用历史。
 - 后台进程启动失败时在当前进程内整理，最多 60 秒，每秒打印一个进度点；超时则取消并回滚整理锁。
 - 后台进程的输出追加到配置目录下的 `dream.log`（超过 1MB 时滚动为 `dream.log.1`）；结果写入 `dream-last.json`（`mode`、`pid`、`started_at`、`finished_at`、`result`=running/completed/failed/skipped、`error`、`sessions_reviewed`、`files_touched`、`input_tokens`、`output_tokens`、`cost_usd`）。进程崩溃或被强杀时，下一次检查会把记录改为失败并回滚锁。
@@ -1305,7 +1374,7 @@ Cove 在对话过程中自动提取记忆、学习技能，并在对话结束后
 - Layer 1/2 前 5 次检测到循环 → 注入引导消息，要求 AI 换思路，自动清空检测窗口
 - 交互模式下，一轮内第 2 次命中时暂停询问 `[c] 本轮禁用循环检测并继续 / [s] 停止`（见[循环检测第二次询问](#循环检测第二次询问)）
 - 超出 5 次 → 先生成收尾总结，再硬终止当前回合，返回错误
-- 只读工具（`read`/`grep`/`glob`/`webfetch`/`browser`/`task_list`/`skills_list`/`skill_view`）豁免检测
+- 只读工具（`read`/`grep`/`glob`/`webfetch`/`task_list`/`skills_list`/`skill_view`）豁免检测（`browser` 的 `screenshot` 会写文件，不算只读工具）
 - Flash 模型使用更敏感的阈值（8/12, 8/10, 8/30, 50）
 
 ### 幂等结果检测
@@ -1391,7 +1460,7 @@ API 请求失败重试时，退避时间为 `基准 × 2^n × [0.5, 1.5)` 的随
 
 ### 按项目区分的历史
 
-`/history`、`/resume`、`cove --list-sessions` 以及输入“继续”时自动恢复最近任务，默认**只列出当前目录（项目）的会话**，避免把其他代码库的对话恢复到当前项目、让模型混淆文件路径。目录比较前会规范化为绝对路径；在 Windows 上不区分大小写（`D:\Proj` 与 `d:\proj` 视为同一项目）。
+`/history`、`/resume`、`cove --list-sessions` 以及单独输入“继续”（或 `continue`，可带句末标点）时自动恢复最近任务——“继续把 README 翻译成英文”这类更长的句子按普通消息发送，任务运行中则作为指引送入当前任务，默认**只列出当前目录（项目）的会话**，避免把其他代码库的对话恢复到当前项目、让模型混淆文件路径。目录比较前会规范化为绝对路径；在 Windows 上不区分大小写（`D:\Proj` 与 `d:\proj` 视为同一项目）。
 
 需要查看所有项目的会话时加上 `all`：
 
@@ -1482,7 +1551,7 @@ Cove 的会话管理具备低信噪比排除算法。当会自动为您保存的
 ### 实时追踪
 
 - 每次 API 调用的 token 使用和费用实时计算
-- 不同模型的计费标准不同
+- 不同模型的计费标准不同；价目表未收录的 `claude-*` 型号按 Opus 单价（$15 / $75 每百万 token）估算，宁可高估也不少算，其他未知型号按默认单价（$0.435 / $0.87）估算
 - Anthropic 的 prompt cache 写入（`cache_creation_input_tokens`）按输入价的 1.25 倍计费
 - 达到预算上限时自动暂停并提示
 

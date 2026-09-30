@@ -126,12 +126,7 @@ func (lr *LineReader) applyKey(buf *[]rune, cursor *int, params string, final ru
 	case 'R':
 		// CSI row ; col R is the terminal's cursor position report, the
 		// answer to queryCursorPos; SS3 R (F3) has no parameters.
-		if pos, ok := parseCursorReport(params); ok {
-			select {
-			case cprCh <- pos:
-			default:
-			}
-		}
+		deliverCursorReport(params)
 	case 'A':
 		if !lr.cycleOption(buf, cursor, -1) {
 			lr.historyUp(buf, cursor)
@@ -210,6 +205,12 @@ func (lr *LineReader) readBracketedPaste(buf *[]rune, cursor *int) error {
 			}
 			if final == '~' && csiKey(params) == 201 {
 				return nil
+			}
+			// A cursor report can land in the middle of a paste; it was
+			// dropped with every other sequence, the query timed out, and
+			// pinning was switched off.
+			if final == 'R' {
+				deliverCursorReport(params)
 			}
 		case r == '\r':
 			lr.skipRune('\n')

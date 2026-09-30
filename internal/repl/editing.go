@@ -61,26 +61,40 @@ func escInterruptEnabled() bool { return os.Getenv("COVE_ESC_INTERRUPT") != "0" 
 // reverseSearch runs the incremental history search: typing narrows it,
 // Ctrl+R steps to an older match, Enter puts the match on the input line,
 // Esc or Ctrl+G gives the line back as it was (ok false).
+//
+// A query that matches nothing is a failing search, like bash's "failing
+// reverse-i-search": the prompt says "无匹配", no entry is shown, and Enter
+// (or an arrow key) gives the original line back, the same as Esc. The search
+// used to keep the last entry that had matched a shorter query, so with
+// "git status" in the history, typing "gitx" still showed it and Enter put
+// it on the line. Backspace to a query that matches again finds it again;
+// Ctrl+R with no older match keeps the current one, which still matches.
 func (lr *LineReader) reverseSearch(orig []rune) (line string, ok bool, err error) {
 	var query []rune
 	idx := len(lr.history) // index of the current match; len = none
-	find := func(from int) {
+	// find moves idx to the newest match at or before from and reports
+	// whether there was one; idx is left alone when there was not.
+	find := func(from int) bool {
 		q := strings.ToLower(string(query))
 		for i := from; i >= 0; i-- {
 			if i < len(lr.history) && strings.Contains(strings.ToLower(lr.history[i]), q) {
 				idx = i
-				return
+				return true
 			}
 		}
+		return false
 	}
 	draw := func() {
 		match := ""
+		label := "(搜索历史)"
 		if idx < len(lr.history) {
 			match = lr.history[idx]
+		} else if len(query) > 0 {
+			label = "(搜索历史 · 无匹配)"
 		}
 		consoleMu.Lock()
 		savedPrompt, savedWidth := lr.prompt, lr.promptWidth
-		lr.prompt = "\x1b[36m(搜索历史)\x1b[0m " + string(query) + " ❯ "
+		lr.prompt = "\x1b[36m" + label + "\x1b[0m " + string(query) + " ❯ "
 		lr.promptWidth = promptVisibleWidth(lr.prompt)
 		m := []rune(match)
 		lr.redrawLocked(m, len(m))
@@ -96,7 +110,7 @@ func (lr *LineReader) reverseSearch(orig []rune) (line string, ok bool, err erro
 		switch {
 		case r == 18: // Ctrl+R: older match
 			if idx > 0 {
-				find(idx - 1)
+				_ = find(idx - 1)
 			}
 		case r == 7: // Ctrl+G
 			return string(orig), false, nil
@@ -104,7 +118,14 @@ func (lr *LineReader) reverseSearch(orig []rune) (line string, ok bool, err erro
 			if lr.rawReader.Buffered() > 0 {
 				// A key's sequence (an arrow): leave the search with the match.
 				if next, _ := readInputRune(lr.rawReader); next == '[' {
-					_, _, _ = readCSI(lr.rawReader)
+					params, final, _ := readCSI(lr.rawReader)
+					// The terminal's cursor report is not a key: it was
+					// taken for an arrow, ended the search and never
+					// reached the waiting query, which then switched
+					// pinning off. Relay it and keep searching.
+					if final == 'R' && deliverCursorReport(params) {
+						continue
+					}
 				}
 				return lr.searchResult(idx, orig)
 			}
@@ -115,7 +136,7 @@ func (lr *LineReader) reverseSearch(orig []rune) (line string, ok bool, err erro
 			if len(query) > 0 {
 				query = query[:len(query)-1]
 				idx = len(lr.history)
-				find(len(lr.history) - 1)
+				_ = find(len(lr.history) - 1)
 			}
 		case r >= 32:
 			query = append(query, r)
@@ -123,7 +144,9 @@ func (lr *LineReader) reverseSearch(orig []rune) (line string, ok bool, err erro
 			if from >= len(lr.history) {
 				from = len(lr.history) - 1
 			}
-			find(from)
+			if !find(from) {
+				idx = len(lr.history) // failing: no stale match to accept
+			}
 		}
 		draw()
 	}
@@ -147,7 +170,29 @@ const historyFileMax = 1000
 var (
 	historyMu   sync.Mutex
 	historyPath string // "" = history is not persisted (tests, -p)
+	// historyFilter, when set, decides which lines the history keeps
+	// (SetHistoryFilter).
+	historyFilter func(line string) bool
 )
+
+// SetHistoryFilter makes the editor keep in its history (memory and file)
+// only the lines keep accepts; nil keeps every line. The application knows
+// which lines carry secrets: every submitted line used to be recorded, so
+// "/api-key sk-..." sat in the history file in plain text and came back
+// with Up. Lines already in the file are filtered when it is loaded too.
+func SetHistoryFilter(keep func(line string) bool) {
+	historyMu.Lock()
+	historyFilter = keep
+	historyMu.Unlock()
+}
+
+// historyKeeps reports whether the history may record line.
+func historyKeeps(line string) bool {
+	historyMu.Lock()
+	keep := historyFilter
+	historyMu.Unlock()
+	return keep == nil || keep(line)
+}
 
 // SetHistoryFile makes the editor keep its history in path across restarts
 // (one JSON string per line, so multi-line entries survive). Call it before
@@ -162,7 +207,14 @@ func loadHistory() []string {
 	historyMu.Lock()
 	path := historyPath
 	historyMu.Unlock()
-	return readHistoryFile(path)
+	entries := readHistoryFile(path)
+	kept := entries[:0]
+	for _, e := range entries {
+		if historyKeeps(e) {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 func readHistoryFile(path string) []string {
@@ -213,6 +265,9 @@ func appendHistory(line string) {
 		entries := readHistoryFile(historyPath)
 		var sb strings.Builder
 		for _, e := range entries {
+			if historyFilter != nil && !historyFilter(e) {
+				continue // recorded before the filter was set
+			}
 			if d, err := json.Marshal(e); err == nil {
 				sb.Write(d)
 				sb.WriteByte('\n')
@@ -248,6 +303,16 @@ func layoutInput(prompt string, promptWidth int, buf []rune, cursor, w int) (row
 	indent := strings.Repeat(" ", promptWidth)
 	row := inputRow{prefix: prompt}
 	cells := 0
+	// Measured by grapheme cluster (cellWidths), on the runes as drawn: a
+	// tab is shown as a space.
+	shown := make([]rune, len(buf))
+	for i, r := range buf {
+		if r == '\t' {
+			r = ' '
+		}
+		shown[i] = r
+	}
+	widths, _ := cellWidths(shown)
 	for i, r := range buf {
 		if i == cursor {
 			curRow, curOff = len(rows), len(row.text)
@@ -262,7 +327,7 @@ func layoutInput(prompt string, promptWidth int, buf []rune, cursor, w int) (row
 		if r == '\t' {
 			disp = ' '
 		}
-		cw := runeCellWidth(disp)
+		cw := widths[i]
 		if cells+cw > avail {
 			rows = append(rows, row)
 			row = inputRow{prefix: indent, start: i}
@@ -286,12 +351,13 @@ func layoutInput(prompt string, promptWidth int, buf []rune, cursor, w int) (row
 func (lr *LineReader) needsMultiRow(buf []rune, w int) bool {
 	multi := false
 	width := 0
-	for _, r := range buf {
+	widths, _ := cellWidths(buf)
+	for i, r := range buf {
 		if r == '\n' {
 			multi = true
 			break
 		}
-		width += runeCellWidth(r)
+		width += widths[i]
 	}
 	if !multi && width <= w-1-lr.promptWidth {
 		return false

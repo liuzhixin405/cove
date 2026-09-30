@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,7 +25,21 @@ import (
 // it reads commands/prompts line-by-line from stdin and runs them synchronously,
 // writing engine output to stdout and diagnostics to stderr. There is no
 // alternate screen, raw-mode reader, or task queue — output is script-friendly.
-func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string) {
+//
+// failed reports that some input was not answered: a turn ended in an error
+// (or was cancelled), a prompt line could not be sent (no API key, over
+// budget, an attachment that could not be read), or a SIGTERM ended the run
+// before the input did. main exits 1 then, after
+// finishSession. The run used to exit 0 whatever happened, so a script
+// piping prompts into cove could not tell a run whose every turn failed
+// from one that worked. Slash commands do not count: they report their own
+// errors as text and have no status to go by.
+func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string) (failed bool) {
+	return runHeadlessFrom(os.Stdin, app, cmdReg, bannerText)
+}
+
+// runHeadlessFrom is runHeadless reading its input from in.
+func runHeadlessFrom(in io.Reader, app *appBootstrap, cmdReg *command.Registry, bannerText string) (failed bool) {
 	eng, toolReg, cfg, mcpPool := app.eng, app.toolReg, app.cfg, app.mcpPool
 	skillMgr, memStore, pluginMgr, projCtx := app.skillMgr, app.memStore, app.pluginMgr, app.projCtx
 	// Headless runs exit when stdin ends, so a skill review started on the last
@@ -38,16 +53,25 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		fmt.Fprint(os.Stderr, bannerText)
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(in)
 	// Allow long single-line inputs (e.g. pasted prompts) up to 8 MiB.
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	// The same command registry and dispatch as the REPL (frontend.go); what
 	// differs is that each line runs synchronously and notices go to stdout.
+	// terminated: a turn was stopped by SIGTERM, so the run ends after it
+	// (see turnEndsRun), whether the turn came from a prompt line or a
+	// command such as /continue or a skill — or a slash command itself was
+	// running when the SIGTERM came (fe.terminated).
+	terminated := false
 	fe := &frontend{eng: eng, cfg: cfg, toolReg: toolReg, mcpPool: mcpPool, skillMgr: skillMgr,
 		memStore: memStore, pluginMgr: pluginMgr, projCtx: projCtx,
-		print:   func(s string) { outln(s) },
-		enqueue: func(msg api.Message) { runHeadlessTurn(eng, msg) },
+		print: func(s string) { outln(s) },
+		enqueue: func(msg api.Message) {
+			term, turnFailed := runHeadlessTurn(eng, msg)
+			terminated = terminated || term
+			failed = failed || turnFailed
+		},
 	}
 	// 前端已持有该注册表并由它分发；返回值是同一个注册表，此路径其后不再使用。
 	fe.install(cmdReg)
@@ -65,16 +89,25 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		if input == "" {
 			continue
 		}
-		if fe.historyPickPending && isPositiveNumber(input) {
-			handleHistoryResume(input, eng)
+		if fe.historyPickPending {
+			// Like the shell's takeHistoryPick: only the line right after
+			// /history may pick a session by number; any other line ends
+			// the pick. It used to stay pending, so a bare number typed
+			// turns later resumed a session instead of going to the model.
 			fe.historyPickPending = false
-			continue
+			if isPositiveNumber(input) {
+				handleHistoryResume(input, eng)
+				continue
+			}
 		}
 		if input == "exit" || input == "quit" {
 			break
 		}
 		if fe.dispatch(input) {
-			if fe.exitRequested {
+			if fe.terminated {
+				terminated = true
+			}
+			if fe.exitRequested || terminated {
 				break
 			}
 			continue
@@ -84,10 +117,12 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		pc := cfg.EffectiveProvider()
 		if eng.CostTracker() != nil && eng.CostTracker().OverBudget() {
 			fmt.Fprintln(os.Stderr, budgetExceededRetryHint(eng.CostTracker()))
+			failed = true
 			continue
 		}
 		if runNeedsAPIKey(pc.APIKey, replayDir != "") {
 			fmt.Fprintln(os.Stderr, missingAPIKeyMessage(pc.Name))
+			failed = true
 			continue
 		}
 
@@ -95,6 +130,7 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		userMsg, warnings, err := buildUserMessage(input, cwd, fe.attachedFiles, cfg.Model)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			failed = true
 			continue
 		}
 
@@ -110,6 +146,7 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 					userMsg, warnings, err = buildUserMessage(input, cwd, fe.attachedFiles, cfg.Model)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+						failed = true
 						continue
 					}
 				}
@@ -121,12 +158,24 @@ func runHeadless(app *appBootstrap, cmdReg *command.Registry, bannerText string)
 		// Clear one-shot attachments after sending (avoids resending each turn).
 		fe.attachedFiles = nil
 
-		runHeadlessTurn(eng, userMsg)
+		term, turnFailed := runHeadlessTurn(eng, userMsg)
+		failed = failed || turnFailed
+		if term {
+			terminated = true
+			break
+		}
 	}
 
+	if terminated {
+		// The rest of the input was not run, which is a failure too.
+		fmt.Fprintln(os.Stderr, "[已终止] 收到 SIGTERM，不再读取后续输入")
+		return true
+	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "stdin 读取错误: %v\n", err)
+		failed = true
 	}
+	return failed
 }
 
 // printModeBackgroundWait bounds how long cove -p waits, after the answer,
@@ -188,20 +237,52 @@ func runPrintModeSession(eng *engine.Engine, argPrompt, prompt string, debug boo
 	return code
 }
 
+// watchTurnSignal cancels the turn when a signal arrives on sigCh. The
+// returned channel yields that signal, or is closed without one once ctx
+// ends — the watcher never outlives its turn. It used to be
+// `go func() { <-sigCh; cancel() }()`, and since signal.Stop does not close
+// the channel, every turn without a signal leaked that goroutine.
+func watchTurnSignal(ctx context.Context, sigCh <-chan os.Signal, cancel context.CancelFunc) <-chan os.Signal {
+	out := make(chan os.Signal, 1)
+	go func() {
+		defer close(out)
+		select {
+		case sig := <-sigCh:
+			cancel()
+			out <- sig
+		case <-ctx.Done():
+		}
+	}()
+	return out
+}
+
+// turnEndsRun reports whether the signal that stopped a headless turn ends
+// the whole run: SIGTERM does (the sender wants the process gone), SIGINT
+// only cancels the turn. SIGTERM used to be treated like SIGINT, and the loop
+// went on to run the next input lines.
+func turnEndsRun(sig os.Signal) bool { return sig == syscall.SIGTERM }
+
 // runHeadlessTurn drives a single engine turn synchronously, printing the reply
 // to stdout. SIGINT/SIGTERM cancel the in-flight turn instead of killing the
-// process outright.
-func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) {
+// process outright; terminated reports a SIGTERM, after which the caller
+// ends the run the normal way (finishSession) instead of reading on. failed
+// reports that the turn ended in an error or was cancelled (runHeadless's
+// exit status).
+func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) (terminated, failed bool) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() { <-sigCh; cancel() }()
+	watched := watchTurnSignal(ctx, sigCh, cancel)
+	defer func() {
+		signal.Stop(sigCh)
+		cancel()
+		terminated = turnEndsRun(<-watched)
+	}()
 
 	resp, err := eng.RunMessageWithStream(ctx, userMsg, nil, nil)
 	if err != nil {
+		failed = true
 		if s := eng.LastWrapUp(); s != "" {
 			outln(s) // the stopped turn's no-tool summary
 		}
@@ -217,4 +298,5 @@ func runHeadlessTurn(eng *engine.Engine, userMsg api.Message) {
 	if eng.HasMessages() {
 		eng.SaveSession()
 	}
+	return
 }

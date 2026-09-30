@@ -54,6 +54,9 @@ type conversation struct {
 	// verifyAnnounced: the gate's commands were shown to the user (first
 	// turn, and again after a working-directory change).
 	verifyAnnounced bool
+	// verifyTrustNoticed: the user was told the gate is skipped because the
+	// project is not trusted (again after a working-directory change).
+	verifyTrustNoticed bool
 	// instrTruncNoticed: the "instruction files truncated" notice was shown.
 	instrTruncNoticed bool
 	// smallToolsNoted: the reduced tool set for a small window was announced.

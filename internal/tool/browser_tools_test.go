@@ -27,8 +27,8 @@ func TestBrowserCaptureAliasAsksLikeScreenshot(t *testing.T) {
 	}
 }
 
-// TestBrowserScreenshotOutputMustStayInWorkspace: the tool is marked
-// read-only, so a read-only sub-agent runs it without any permission gate, and
+// TestBrowserScreenshotOutputMustStayInWorkspace: the tool was marked
+// read-only, so a read-only sub-agent ran it without any permission gate, and
 // "output" is chosen by the model. An absolute path or ../ therefore let a
 // "read-only" call overwrite any file the user can write, e.g. a shell rc file.
 func TestBrowserScreenshotOutputMustStayInWorkspace(t *testing.T) {

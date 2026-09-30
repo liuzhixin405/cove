@@ -50,6 +50,28 @@ type fakeStep struct {
 	ToolCalls []fakeToolCall
 	// StopReason overrides the finish reason ("length" for a truncation).
 	StopReason string
+	// StreamCutAfter > 0 drops a streamed answer after that many SSE events
+	// (content, each tool call, the finish chunk), with no finish reason and
+	// no [DONE]: the connection just ends, as when a proxy cuts it.
+	StreamCutAfter int
+	// StreamError, when set, answers a streamed request with the content
+	// (if any) and then an in-stream {"error":{...}} event instead of a
+	// finish; the stream then ends.
+	StreamError *fakeStreamError
+	// Headers are set on the answer, whatever its kind (Retry-After on a
+	// 429, rate-limit headers on a normal reply).
+	Headers map[string]string
+	// CompletionTokens overrides the usage's completion_tokens (default 10),
+	// to make a reply cost something against a budget without growing the
+	// prompt size the engine tracks.
+	CompletionTokens int
+}
+
+// fakeStreamError is an error object a provider reports inside a 200 stream.
+type fakeStreamError struct {
+	Type    string
+	Code    string
+	Message string
 }
 
 // capturedMessage is one message of a request the fake model received.
@@ -148,6 +170,13 @@ func (f *fakeModel) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	for k, v := range step.Headers {
+		w.Header().Set(k, v)
+	}
+	completion := 10
+	if step.CompletionTokens > 0 {
+		completion = step.CompletionTokens
+	}
 	if step.Status != 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(step.Status)
@@ -163,9 +192,34 @@ func (f *fakeModel) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
+		events := 0
+		cut := false
 		write := func(v any) {
+			if cut {
+				return
+			}
 			b, _ := json.Marshal(v)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			events++
+			if step.StreamCutAfter > 0 && events >= step.StreamCutAfter {
+				cut = true
+			}
+		}
+		if step.StreamError != nil {
+			if step.Content != "" {
+				write(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": step.Content}}}})
+			}
+			msg := step.StreamError.Message
+			if msg == "" {
+				msg = "stream error from the fake model"
+			}
+			errObj := map[string]any{"type": step.StreamError.Type, "message": msg}
+			if step.StreamError.Code != "" {
+				errObj["code"] = step.StreamError.Code
+			}
+			cut = false
+			write(map[string]any{"error": errObj})
+			return
 		}
 		if step.Content != "" {
 			write(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": step.Content}}}})
@@ -178,8 +232,11 @@ func (f *fakeModel) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		write(map[string]any{
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
-			"usage":   map[string]any{"prompt_tokens": 100, "completion_tokens": 10},
+			"usage":   map[string]any{"prompt_tokens": 100, "completion_tokens": completion},
 		})
+		if cut {
+			return // the connection ends mid-stream, no [DONE]
+		}
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		return
 	}
@@ -196,7 +253,7 @@ func (f *fakeModel) handle(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"model":   req.Model,
 		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
-		"usage":   map[string]any{"prompt_tokens": 100, "completion_tokens": 10},
+		"usage":   map[string]any{"prompt_tokens": 100, "completion_tokens": completion},
 	})
 }
 
@@ -247,15 +304,28 @@ type e2eSession struct {
 	out     strings.Builder
 	done    chan struct{}
 	restore func()
+	// restarted is runREPL's result (the person left with /restart); read
+	// it only after done is closed.
+	restarted bool
 }
 
 // startREPL boots the app like main does and runs the REPL on a goroutine.
 func startREPL(t *testing.T) *e2eSession {
 	t.Helper()
+	return startREPLWith(t, nil)
+}
+
+// startREPLWith is startREPL with a step run on the booted app before the
+// REPL starts (what main does between bootstrap and runREPL, such as -r).
+func startREPLWith(t *testing.T, beforeREPL func(app *appBootstrap)) *e2eSession {
+	t.Helper()
 	resetE2EGlobals()
 	app, err := bootstrapApp(false, "", "", "", true)
 	if err != nil {
 		t.Fatalf("bootstrapApp: %v", err)
+	}
+	if beforeREPL != nil {
+		beforeREPL(app)
 	}
 	// Background extraction and review call the model too and would consume
 	// the script out of order; scenarios count the calls they cause.
@@ -294,7 +364,7 @@ func startREPL(t *testing.T) *e2eSession {
 	}
 	go func() {
 		defer close(s.done)
-		runREPL(app, registerAllCommands(), "")
+		s.restarted = runREPL(app, registerAllCommands(), "")
 	}()
 	t.Cleanup(func() { s.Exit() })
 	return s

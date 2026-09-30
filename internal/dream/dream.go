@@ -46,6 +46,11 @@ type Runner struct {
 	lastRunErr   error
 	lastRunAt    time.Time
 	lastRunUsage Usage
+
+	// observed maps each memory file to a hash of the content the dream
+	// model last saw of it, during a run (nil outside one); see memguard.go.
+	obsMu    sync.Mutex
+	observed map[string][32]byte
 }
 
 // Usage is the token usage and cost of one consolidation run.
@@ -268,6 +273,15 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		log.Infof("[dream] %d memories reference paths or symbols no longer in %s", len(reports), projRoot)
 		prompt += staleSection(reports)
 	}
+	// The model's starting view of the memory files; a write over one that
+	// changes after this (a turn-end extraction appending) is refused until
+	// the model reads it again.
+	r.snapshotMemory()
+	defer func() {
+		r.obsMu.Lock()
+		r.observed = nil
+		r.obsMu.Unlock()
+	}()
 	// Priced like the billing tracker the metered provider reports to; kept
 	// per run so /dream can show what the last consolidation cost.
 	meter := cost.NewTracker(0)
@@ -292,7 +306,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 			Messages:   messages,
 			SystemBase: systemPrompt,
 			Tools:      toolDefs,
-			MaxTokens:  16000,
+			MaxTokens:  dreamMaxTokens(r.currentModel()),
 		}
 
 		resp, err := r.provider.Chat(ctx, req)
@@ -326,7 +340,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 		// No tool calls — dream is done
 		if len(resp.ToolCalls) == 0 {
-			task.Complete()
+			completeRun(task)
 			log.Debugf("[autoDream] completed — %d files touched", len(task.FilesTouched))
 			return nil
 		}
@@ -340,7 +354,7 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 
 		// Execute tools (restricted to read-only bash + memory file writes)
 		for _, tc := range resp.ToolCalls {
-			result := r.executeDreamTool(tc)
+			result := r.executeDreamTool(ctx, tc)
 			messages = append(messages, api.Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -350,13 +364,41 @@ func (r *Runner) runDream(ctx context.Context, task *Task, sessionIDs []string) 
 		}
 	}
 
-	task.Complete()
+	completeRun(task)
 	log.Debugf("[autoDream] completed (max iterations) — %d files touched", len(task.FilesTouched))
 	return nil
 }
 
+// completeRun marks task completed and, when this call finished it (not an
+// earlier CancelActive), releases the consolidation lock as done: it used to
+// keep this process's live PID, which counted as held for an hour, so the
+// next "/dream run" in the same session was refused.
+//
+// The lock is marked done before the task is reported completed (see
+// claimCompletion). A run cancelled in between (CancelActive) keeps its
+// cancellation: Complete then reports false, and the lock is already done,
+// which is right for a run whose work had finished.
+func completeRun(task *Task) {
+	if !task.claimCompletion() {
+		return
+	}
+	markConsolidationDone()
+	task.Complete()
+}
+
+// dreamMaxOutputTokens bounds one dream reply: what every model was asked
+// for before the model's own cap was taken into account.
+const dreamMaxOutputTokens = 16000
+
+// dreamMaxTokens is the max_tokens of a dream request for model. A fixed
+// 16000 was rejected with a 400 by models with a smaller output cap
+// (deepseek-chat allows 8192), so their consolidations never ran.
+func dreamMaxTokens(model string) int {
+	return min(dreamMaxOutputTokens, api.MaxOutputTokensForModel(model))
+}
+
 // executeDreamTool runs a tool call with dream-mode restrictions.
-func (r *Runner) executeDreamTool(tc api.ToolCall) string {
+func (r *Runner) executeDreamTool(ctx context.Context, tc api.ToolCall) string {
 	switch tc.Name {
 	case "bash":
 		return r.executeDreamBash(tc)
@@ -369,7 +411,7 @@ func (r *Runner) executeDreamTool(tc api.ToolCall) string {
 	case "glob":
 		return r.executeDreamGlob(tc)
 	case "grep":
-		return r.executeDreamGrep(tc)
+		return r.executeDreamGrep(ctx, tc)
 	default:
 		return fmt.Sprintf("Error: tool %q is not available in dream mode", tc.Name)
 	}
@@ -454,16 +496,37 @@ func (r *Runner) executeDreamWrite(tc api.ToolCall) string {
 	if !r.insideMemoryRoots(absPath) {
 		return fmt.Sprintf("Error: dream mode can only write to the memory directories (%s)", strings.Join(r.memoryRoots(), ", "))
 	}
+	if isDotFile(absPath) {
+		return dotFileMsg(filePath)
+	}
 
 	if err := memory.ScreenContent(content); err != nil {
 		return fmt.Sprintf("Error: refused to write memory: %v", err)
 	}
 	_ = os.MkdirAll(filepath.Dir(absPath), 0700)
+	// The check and the write happen under the memory write lock, which
+	// turn-end extraction holds while it appends, so neither can land in
+	// between. The write replaces the whole file with what the model built
+	// from its last read of it; if the file changed since (or appeared
+	// during the run), that would drop the new content, so it is refused.
+	// The memory directory's lock file is taken too: the in-process lock
+	// alone let an extraction in another cove process append between the
+	// check and the rename (see lockMemoryDir).
+	unlock, lerr := lockMemoryDir(r.memoryRootOf(absPath))
+	if lerr != nil {
+		return lockTimeoutMsg(filePath, lerr)
+	}
+	defer unlock()
+	current, rerr := os.ReadFile(absPath)
+	if r.staleSinceObserved(absPath, current, rerr == nil) {
+		return fmt.Sprintf("Error: %s changed since you last read it (a memory extraction wrote to it during this run); read it again and redo the write so the new content is kept", filePath)
+	}
 	// Atomic replace: a crash mid-write would otherwise leave a half-written
 	// memory file, which is then loaded as a memory entry on every later run.
 	if err := fsatomic.WriteFile(absPath, []byte(content), 0644); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	r.observe(absPath, []byte(content))
 	return fmt.Sprintf("Written %d bytes to %s", len(content), filePath)
 }
 
@@ -484,11 +547,27 @@ func (r *Runner) executeDreamEdit(tc api.ToolCall) string {
 	if !r.insideMemoryRoots(absPath) {
 		return fmt.Sprintf("Error: dream mode can only edit files in the memory directories (%s)", strings.Join(r.memoryRoots(), ", "))
 	}
+	if isDotFile(absPath) {
+		return dotFileMsg(filePath)
+	}
 
+	// An edit applies to the file's current content, so it is safe against
+	// a concurrent extraction as long as the read and the write are not
+	// interleaved with its append: both hold the memory write lock and the
+	// memory directory's lock file (the latter covers an extraction running
+	// in another cove process).
+	unlock, lerr := lockMemoryDir(r.memoryRootOf(absPath))
+	if lerr != nil {
+		return lockTimeoutMsg(filePath, lerr)
+	}
+	defer unlock()
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	// Whether the model had seen the content being edited: only then does
+	// the edited result become its view (else a later write stays refused).
+	seen := !r.staleSinceObserved(absPath, data, true)
 
 	content := string(data)
 	if !strings.Contains(content, oldStr) {
@@ -502,6 +581,9 @@ func (r *Runner) executeDreamEdit(tc api.ToolCall) string {
 	if err := fsatomic.WriteFile(absPath, []byte(newContent), 0644); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	if seen {
+		r.observe(absPath, []byte(newContent))
+	}
 	return fmt.Sprintf("Edited %s", filePath)
 }
 
@@ -514,6 +596,9 @@ func (r *Runner) executeDreamRead(tc api.ToolCall) string {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if abs, aerr := filepath.Abs(filePath); aerr == nil && r.insideMemoryRoots(abs) {
+		r.observe(abs, data) // the model now knows this content
 	}
 	// Truncate large files on a rune boundary: memory files are largely
 	// Chinese, so a byte slice at 30000 would cut a rune in half and hand the
@@ -539,7 +624,7 @@ func (r *Runner) executeDreamGlob(tc api.ToolCall) string {
 }
 
 // executeDreamGrep searches files for a pattern.
-func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
+func (r *Runner) executeDreamGrep(ctx context.Context, tc api.ToolCall) string {
 	pattern, _ := tc.Input["pattern"].(string)
 	path, _ := tc.Input["path"].(string)
 	if pattern == "" {
@@ -553,7 +638,8 @@ func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
 	// shell, which eliminates the command-injection vector present in the former
 	// `sh -c "grep ..."` implementation: %q is Go's quoting, not shell escaping,
 	// so a pattern like `$(rm -rf ~)` executed inside the double quotes.
-	return grepFiles(pattern, path)
+	// ctx is the run's: a search over a huge tree stops at dreamRunTimeout.
+	return grepFiles(ctx, pattern, path)
 }
 
 // isInsideMemoryDir checks if the given absolute path is inside the memory
@@ -562,6 +648,22 @@ func (r *Runner) executeDreamGrep(tc api.ToolCall) string {
 // directory pointing elsewhere is outside). See safepath.Within.
 func isInsideMemoryDir(absPath, memRoot string) bool {
 	return safepath.Within(memRoot, absPath)
+}
+
+// isDotFile reports whether absPath names a dot file. The memory directory's
+// bookkeeping lives in dot files (the consolidation lock and its takeover
+// guard, the memory write lock, the extraction record) and memories never do
+// (the store skips them). The write and edit tools only checked that the
+// path lay inside a memory root, so a model-chosen filePath such as
+// .consolidate-lock replaced the very lock this run holds, and another
+// process could start a second consolidation on the same files.
+func isDotFile(absPath string) bool {
+	return strings.HasPrefix(filepath.Base(absPath), ".")
+}
+
+// dotFileMsg is the tool result for a write or edit aimed at a dot file.
+func dotFileMsg(filePath string) string {
+	return fmt.Sprintf("Error: %s is a bookkeeping file of the memory directory, not a memory; memory file names never start with a dot", filePath)
 }
 
 // buildDreamSystemPrompt returns a minimal system prompt for the dream agent.

@@ -224,7 +224,23 @@ const compactionFraction = 0.75
 
 // modelOutputCaps lists models whose API rejects or truncates larger
 // max_tokens values. Substring match, most specific first.
+//
+// Opus 4 and 4.1 take at most 32000 output tokens. They were missing, so
+// their 200K window gave an outputReserve of 50000 and every request came
+// back 400. Bare "claude-opus-4" would also match Opus 4.6+ (no such cap),
+// so Opus 4 itself is matched by its dated, "-0" alias and Vertex "@" forms.
+// Sonnet 4/4.5 and Opus 4.5 take 64000: the request ceiling anyway, listed
+// so the table says so rather than relying on the clamp.
 var modelOutputCaps = []contextWindowPattern{
+	{"claude-opus-4-1", 32000},
+	{"claude-opus-4-0", 32000},
+	{"claude-opus-4-2025", 32000},
+	{"claude-opus-4@", 32000},
+	{"claude-opus-4-5", 64000},
+	{"claude-sonnet-4-5", 64000},
+	{"claude-sonnet-4-0", 64000},
+	{"claude-sonnet-4-2025", 64000},
+	{"claude-sonnet-4@", 64000},
 	{"claude-3-5-sonnet", 8192},
 	{"claude-3-5-haiku", 8192},
 	{"claude-3-opus", 4096},

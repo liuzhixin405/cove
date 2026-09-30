@@ -36,46 +36,13 @@ const gbkMinCommonRatio = 0.8
 // sequences, if it plausibly is that. The decoded text must encode back to
 // exactly data, so an edit that leaves a region alone leaves its bytes alone.
 func decodeGBK(data []byte) (legacyText, bool) {
-	common, other, fourByte := 0, 0, false
-	for i := 0; i < len(data); {
-		c0 := data[i]
-		switch {
-		case c0 < 0x80:
-			i++
-			continue
-		case c0 == 0x80: // the euro sign in code page 936
-			other++
-			i++
-			continue
-		case c0 == 0xFF || i+1 >= len(data):
-			return legacyText{}, false
-		}
-		c1 := data[i+1]
-		switch {
-		case 0x30 <= c1 && c1 <= 0x39:
-			if i+3 >= len(data) || data[i+2] < 0x81 || data[i+2] == 0xFF || data[i+3] < 0x30 || data[i+3] > 0x39 {
-				return legacyText{}, false
-			}
-			fourByte = true
-			i += 4
-		case 0x40 <= c1 && c1 <= 0xFE && c1 != 0x7F:
-			if isGB2312Pair(c0, c1) {
-				common++
-			} else {
-				other++
-			}
-			i += 2
-		default:
-			return legacyText{}, false
-		}
-	}
-	if common == 0 || float64(common) < gbkMinCommonRatio*float64(common+other) {
+	var st gbkStats
+	if !st.scan(data) {
 		return legacyText{}, false
 	}
-
-	lt := legacyText{enc: simplifiedchinese.GBK, name: "GBK"}
-	if fourByte {
-		lt.enc, lt.name = simplifiedchinese.GB18030, "GB18030"
+	lt, ok := st.encoding()
+	if !ok {
+		return legacyText{}, false
 	}
 	decoded, err := lt.enc.NewDecoder().Bytes(data)
 	if err != nil {
@@ -89,6 +56,122 @@ func decodeGBK(data []byte) (legacyText, bool) {
 	}
 	lt.text = string(decoded)
 	return lt, true
+}
+
+// gbkStats is the structural half of decodeGBK's test, accumulated over one
+// or more pieces of a file.
+type gbkStats struct {
+	common, other int
+	fourByte      bool
+}
+
+// scan adds data's double-byte codes to the counts, reporting false if data
+// is not structurally GBK/GB18030. A piece must not end inside a sequence;
+// a newline byte never occurs inside one, so pieces split at newlines are
+// judged exactly as the whole file would be.
+func (st *gbkStats) scan(data []byte) bool {
+	for i := 0; i < len(data); {
+		c0 := data[i]
+		switch {
+		case c0 < 0x80:
+			i++
+			continue
+		case c0 == 0x80: // the euro sign in code page 936
+			st.other++
+			i++
+			continue
+		case c0 == 0xFF || i+1 >= len(data):
+			return false
+		}
+		c1 := data[i+1]
+		switch {
+		case 0x30 <= c1 && c1 <= 0x39:
+			if i+3 >= len(data) || data[i+2] < 0x81 || data[i+2] == 0xFF || data[i+3] < 0x30 || data[i+3] > 0x39 {
+				return false
+			}
+			st.fourByte = true
+			i += 4
+		case 0x40 <= c1 && c1 <= 0xFE && c1 != 0x7F:
+			if isGB2312Pair(c0, c1) {
+				st.common++
+			} else {
+				st.other++
+			}
+			i += 2
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// encoding picks GBK or GB18030 when the counts look like Chinese text.
+func (st *gbkStats) encoding() (legacyText, bool) {
+	if st.common == 0 || float64(st.common) < gbkMinCommonRatio*float64(st.common+st.other) {
+		return legacyText{}, false
+	}
+	lt := legacyText{enc: simplifiedchinese.GBK, name: "GBK"}
+	if st.fourByte {
+		lt.enc, lt.name = simplifiedchinese.GB18030, "GB18030"
+	}
+	return lt, true
+}
+
+// gbkStream makes decodeGBK's decision over a file fed one line at a time, so
+// read can classify a file of any size without holding it in memory. Neither
+// the structure test nor the round trip crosses a newline, so the verdict is
+// the one decodeGBK would give for the whole content. Which encoding applies
+// is known only at the end (one four-byte sequence anywhere means GB18030),
+// so each line's round trip is checked for both.
+type gbkStream struct {
+	stats           gbkStats
+	invalid         bool
+	gbkBad, gb18Bad bool
+}
+
+func (s *gbkStream) feed(line []byte) {
+	if s.invalid {
+		return
+	}
+	if !s.stats.scan(line) {
+		s.invalid = true
+		return
+	}
+	if isASCII(line) {
+		return
+	}
+	s.gbkBad = s.gbkBad || !roundTrips(simplifiedchinese.GBK, line)
+	s.gb18Bad = s.gb18Bad || !roundTrips(simplifiedchinese.GB18030, line)
+}
+
+// result is the encoding to decode the file with (without text), if any.
+func (s *gbkStream) result() (legacyText, bool) {
+	if s.invalid {
+		return legacyText{}, false
+	}
+	lt, ok := s.stats.encoding()
+	if !ok || (lt.name == "GBK" && s.gbkBad) || (lt.name == "GB18030" && s.gb18Bad) {
+		return legacyText{}, false
+	}
+	return lt, true
+}
+
+func roundTrips(enc encoding.Encoding, p []byte) bool {
+	decoded, err := enc.NewDecoder().Bytes(p)
+	if err != nil {
+		return false
+	}
+	back, err := enc.NewEncoder().Bytes(decoded)
+	return err == nil && bytes.Equal(back, p)
+}
+
+func isASCII(p []byte) bool {
+	for _, c := range p {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // isGB2312Pair reports whether a double-byte GBK code is in GB2312: the symbol

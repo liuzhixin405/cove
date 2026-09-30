@@ -119,3 +119,23 @@ func TestPlanModePreApprovesNoBuildLines(t *testing.T) {
 		t.Fatalf("a build line ran in plan mode: %s", out)
 	}
 }
+
+// Plan mode runs a read-only shell line, as the manual says and as
+// planModeGate's shell branch intends. The engine pre-approved read-only
+// lines in default mode only, so the shell tool saw "plan" in tctx and
+// refused every line before the gate was reached: `git status` in plan mode
+// was refused. Writes and builds stay refused.
+func TestPlanModeRunsReadOnlyShellLines(t *testing.T) {
+	eng := planEngine(t, tool.NewBashTool())
+	eng.classifier = permission.NewClassifier()
+	eng.SetPermissionMode(permission.Plan)
+	out, failed := run1(t, eng, "bash", map[string]any{"command": "echo plan-ok"})
+	if failed || !strings.Contains(out, "plan-ok") {
+		t.Fatalf("read-only line refused in plan mode: failed=%v %s", failed, out)
+	}
+	for _, cmd := range []string{"go build ./...", "rm -rf build", "echo x > f.txt"} {
+		if out, failed := run1(t, eng, "bash", map[string]any{"command": cmd}); !failed {
+			t.Fatalf("%q ran in plan mode: %s", cmd, out)
+		}
+	}
+}

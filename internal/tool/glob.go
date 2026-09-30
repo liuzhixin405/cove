@@ -104,9 +104,28 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	if err != nil {
 		return Result{Data: "Error: " + err.Error(), IsError: true}, nil
 	}
-	var matches []string
+	var picked []string
 	for _, rel := range files {
 		if matchGlob(pattern, rel) {
+			picked = append(picked, rel)
+		}
+	}
+	// Links out of the working directory are left out, as grep leaves them
+	// out: the file tools refuse them, so listing them only invites a read
+	// that fails (or a workaround through the shell).
+	// Only the entries shown are checked (one Lstat each): checking every
+	// match first cost seconds in a large repository on Windows. Entries past
+	// the cap are counted unchecked, so the overflow count is an upper bound.
+	const limit = 200
+	confine := newFileConfiner(tctx.Cwd, basePath)
+	var matches []string
+	rest := 0
+	for i, rel := range picked {
+		if len(matches) == limit {
+			rest = len(picked) - i
+			break
+		}
+		if confine.allow(rel) {
 			matches = append(matches, filepath.FromSlash(rel))
 		}
 	}
@@ -114,10 +133,8 @@ func (t *GlobTool) Call(ctx context.Context, input Input, tctx Context) (Result,
 	if len(matches) == 0 {
 		return Result{Data: "No files found for: " + pattern}, nil
 	}
-
-	limit := 200
-	if len(matches) > limit {
-		return Result{Data: strings.Join(matches[:limit], "\n") + "\n... and " + strconv.Itoa(len(matches)-limit) + " more files"}, nil
+	if rest > 0 {
+		return Result{Data: strings.Join(matches, "\n") + "\n... and up to " + strconv.Itoa(rest) + " more files"}, nil
 	}
 	return Result{Data: strings.Join(matches, "\n")}, nil
 }

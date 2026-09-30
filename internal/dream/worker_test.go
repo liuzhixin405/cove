@@ -314,11 +314,15 @@ func TestDeadWorkerLockRolledBackBeforeNextCheck(t *testing.T) {
 	touchSession(t, sessions, "s")
 	past := time.Now().Add(-time.Minute)
 	_ = os.Chtimes(filepath.Join(sessions, "s.jsonl"), past, past)
-	prior, ok, err := TryAcquireConsolidationLock() // the killed worker's lock
-	if err != nil || !ok {
-		t.Fatalf("lock: %v %v", ok, err)
+	// The killed worker's lock: its PID, stamped at its start (no earlier
+	// consolidation, so rolling back removes it).
+	if err := os.MkdirAll(memoryDir(), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if err := writeLastRun(LastRun{Mode: "worker", PID: 1 << 30, StartedAt: time.Now(), Result: ResultRunning, PriorConsolidatedAt: prior}); err != nil {
+	if err := os.WriteFile(lockPath(), []byte(strconv.Itoa(1<<30)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLastRun(LastRun{Mode: "worker", PID: 1 << 30, StartedAt: time.Now(), Result: ResultRunning}); err != nil {
 		t.Fatal(err)
 	}
 	if due, why := SessionEndDue(2, sessions); !due {

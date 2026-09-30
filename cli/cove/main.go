@@ -13,9 +13,15 @@ import (
 
 	"os/signal"
 
+	"path/filepath"
+
 	"strings"
 
 	"syscall"
+
+	"time"
+
+	"github.com/charmbracelet/x/term"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
 
@@ -26,6 +32,8 @@ import (
 	"github.com/liuzhixin405/cove-agent/internal/engine"
 
 	"github.com/liuzhixin405/cove-agent/internal/permission"
+
+	"github.com/liuzhixin405/cove-agent/internal/safepath"
 
 	"github.com/liuzhixin405/cove-agent/internal/termui"
 	"github.com/liuzhixin405/cove-agent/internal/textutil"
@@ -46,7 +54,7 @@ type chatRunner interface {
 }
 
 var (
-	Version = "11.7.0"
+	Version = "12.0.0"
 
 	BuildTime = "pro"
 
@@ -107,7 +115,13 @@ func main() {
 		// `cat app.log | cove -p "解释"` used to drop the log: -p never read
 		// stdin, and without a prompt it fell through to the interactive shell.
 		if stdinIsPiped() {
-			piped, truncated, err := readPipedStdin(os.Stdin, stdinFirstDataTimeout, maxPipedStdin)
+			piped, truncated, err := readPrintModeStdin()
+			if errors.Is(err, errStdinNoData) {
+				// It used to give up silently, and the answer came without
+				// the input the user piped in.
+				fmt.Fprintf(os.Stderr, "⚠ %d 秒内未从 stdin 读到数据，已忽略管道输入\n", int(stdinFirstDataTimeout/time.Second))
+				err = nil
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: 读取 stdin 失败: %v\n", err)
 				os.Exit(1)
@@ -196,7 +210,7 @@ func main() {
 
 		// The interactive shell builds its own command catalogue from the
 		// registry (buildCommandList), so nothing has to be assembled here.
-		runREPL(app, cmdReg, bannerText)
+		restart := runREPL(app, cmdReg, bannerText)
 
 		// The shell's /exit and Ctrl+D paths already saved the session and
 		// recorded its cost (autoSaveSession, which also fires SessionEnd);
@@ -204,6 +218,16 @@ func main() {
 		// are left.
 		fireSessionEnd(eng)
 		mcpPool.DisconnectAll()
+
+		if restart {
+			// A restart ends this process like /exit does, then the new one
+			// continues the saved conversation (an empty one was not saved).
+			sessionID := ""
+			if eng.HasMessages() {
+				sessionID = eng.SessionID()
+			}
+			restartCove(sessionID)
+		}
 
 		return
 
@@ -213,42 +237,77 @@ func main() {
 	// frontend. The classic line REPL has been removed; its behavior lives in
 	// the Bubble Tea TUI (interactive) and here (non-interactive).
 	applyUnattendedLimits(eng, opts, cfg)
-	runHeadless(app, cmdReg, bannerText)
+	failed := runHeadless(app, cmdReg, bannerText)
 
 	finishSession(eng, mcpPool)
 
+	// Headless used to exit 0 even when every turn failed; a script now gets
+	// 1 when any input went unanswered (see runHeadless), like -p does.
+	if failed {
+		os.Exit(1)
+	}
+
 }
 
-func withInterrupt(f func(ctx context.Context)) {
+// readPrintModeStdin reads -p's piped stdin, waiting as long as
+// stdinFirstDataWait allows. When it may wait without limit, a notice after
+// stdinFirstDataTimeout says what cove is waiting for, so a pipeline whose
+// writer is slow does not look hung.
+func readPrintModeStdin() (string, bool, error) {
+	var mode os.FileMode
+	if fi, err := os.Stdin.Stat(); err == nil {
+		mode = fi.Mode()
+	}
+	wait := stdinFirstDataWait(mode, term.IsTerminal(os.Stderr.Fd()))
+	if wait == 0 && !mode.IsRegular() {
+		notice := time.AfterFunc(stdinFirstDataTimeout, func() {
+			fmt.Fprintln(os.Stderr, "正在等待管道输入（上游命令结束后开始回答，Ctrl+C 取消）…")
+		})
+		defer notice.Stop()
+	}
+	return readPipedStdin(os.Stdin, wait, maxPipedStdin)
+}
 
+// notifyInterrupt registers c for the signals withInterrupt handles; a
+// variable so tests can deliver one.
+var notifyInterrupt = func(c chan<- os.Signal) { signal.Notify(c, syscall.SIGINT, syscall.SIGTERM) }
+
+// withInterrupt runs f with a context that SIGINT or SIGTERM cancels, and
+// returns the signal that did (nil when none arrived). It used to return
+// nothing, so a SIGTERM during a headless slash command only cancelled that
+// command and the run went on reading input; the caller now decides what
+// the signal means (headless ends the run on SIGTERM, the REPL does not).
+func withInterrupt(f func(ctx context.Context)) os.Signal {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	defer cancel()
-
 	sigCh := make(chan os.Signal, 1)
-
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	defer signal.Stop(sigCh)
-
+	notifyInterrupt(sigCh)
+	got := make(chan os.Signal, 1)
 	go func() {
-
+		defer close(got)
 		select {
-
 		case sig := <-sigCh:
-
 			outf("\r\n[中断 - 收到信号 %v]\r\n", sig)
-
 			cancel()
-
+			got <- sig
 		case <-ctx.Done():
-
 		}
-
 	}()
 
 	f(ctx)
 
+	signal.Stop(sigCh)
+	cancel()
+	sig := <-got
+	if sig == nil {
+		// A nested withInterrupt (/resume, /compact) cancelled f on the same
+		// signal, so this context may have ended before the watcher took it
+		// from the buffer; the watcher is gone, so read it here.
+		select {
+		case sig = <-sigCh:
+		default:
+		}
+	}
+	return sig
 }
 
 func shouldAutoSwitchToVision(warnings []string) bool {
@@ -390,7 +449,7 @@ func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, atta
 
 	cwd, _ := os.Getwd()
 
-	userMsg, warnings, err := buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
+	userMsg, warnings, err := buildPrintModeMessage(argPrompt, prompt, cwd, attachmentPaths, cfg.Model)
 
 	if err != nil {
 
@@ -418,7 +477,7 @@ func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, atta
 				// must not capture this notice.
 				fmt.Fprintf(os.Stderr, "[视觉] 检测到图片附件，已自动切换到视觉模型 %s。\n", visionModel)
 
-				userMsg, warnings, err = buildUserMessage(prompt, cwd, attachmentPaths, cfg.Model)
+				userMsg, warnings, err = buildPrintModeMessage(argPrompt, prompt, cwd, attachmentPaths, cfg.Model)
 
 				if err != nil {
 
@@ -456,6 +515,38 @@ func runPrintMode(eng *engine.Engine, argPrompt, prompt string, debug bool, atta
 
 	return 0
 
+}
+
+// splitPrintPrompt separates the -p message main built with
+// combinePromptAndStdin back into the prompt argument and the piped stdin.
+// A prompt that was not built that way is all argument.
+func splitPrintPrompt(argPrompt, prompt string) (arg, piped string) {
+	a := strings.TrimSpace(argPrompt)
+	switch {
+	case a == "":
+		return "", prompt
+	case prompt == a:
+		return a, ""
+	case strings.HasPrefix(prompt, a+"\n\n"):
+		return a, prompt[len(a)+2:]
+	default:
+		return prompt, ""
+	}
+}
+
+// buildPrintModeMessage is buildUserMessage for -p: only the prompt argument
+// is searched for @attachments, and piped stdin is appended as it came. The
+// whole message used to be searched, so a piped log naming @babel/core or a
+// decorator path failed the run with 读取附件失败 — and a matching file would
+// have been attached without the user asking.
+func buildPrintModeMessage(argPrompt, prompt, cwd string, attachmentPaths []string, model string) (api.Message, []string, error) {
+	arg, piped := splitPrintPrompt(argPrompt, prompt)
+	msg, warnings, err := buildUserMessage(arg, cwd, attachmentPaths, model)
+	if err != nil {
+		return msg, warnings, err
+	}
+	msg.Content = combinePromptAndStdin(msg.Content, piped)
+	return msg, warnings, nil
 }
 
 // printModeFailure reports a failed -p turn on w and returns the exit code.
@@ -718,21 +809,39 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		for _, e := range entries {
 
-			if e.Name == name {
+			if e.Name != name {
 
-				_ = skills.InstallSkill(name, "url", e.URL)
+				continue
 
-				termui.PrintSafe("成功安装技能 %s！现在可以使用 /skill %s 调用它。\n", name, name)
+			}
+
+			// An entry without a download URL has nothing to install; saying
+			// "installed" here used to leave the user with a placeholder file.
+			if e.URL == "" {
+
+				termui.PrintSafe("技能市场里的 %s 没有下载地址，无法安装。可用 /skill create %s 自建。\n", name, name)
 
 				return
 
 			}
 
+			if err := skills.InstallSkill(name, "url", e.URL); err != nil {
+
+				termui.PrintSafe("安装技能 %s 失败: %v\n", name, err)
+
+				return
+
+			}
+
+			// Skills are loaded when the engine starts, so the new one is not in
+			// the running session yet.
+			termui.PrintSafe("成功安装技能 %s（~/.cove/skills/%s/SKILL.md），输入 /restart 重启后可用 /skill %s 调用。\n", name, name, name)
+
+			return
+
 		}
 
-		_ = skills.InstallSkill(name, "local", "")
-
-		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
+		termui.PrintSafe("技能市场里没有 %s。可用 /skill marketplace 查看可用技能，或用 /skill create %s 自建。\n", name, name)
 
 	case "create":
 
@@ -746,7 +855,21 @@ func handleSkill(input string, eng *engine.Engine) {
 
 		name := parts[2]
 
-		_ = skills.InstallSkill(name, "local", "")
+		if msg := skillCreateConflict(name, prompts); msg != "" {
+
+			termui.PrintSafe("%s\n", msg)
+
+			return
+
+		}
+
+		if err := skills.InstallSkill(name, "local", ""); err != nil {
+
+			termui.PrintSafe("创建技能 %s 失败: %v\n", name, err)
+
+			return
+
+		}
 
 		termui.PrintSafe("成功创建本地技能目录 %s，请编辑 ~/.cove/skills/%s/SKILL.md\n", name, name)
 
@@ -768,6 +891,30 @@ func handleSkill(input string, eng *engine.Engine) {
 
 	}
 
+}
+
+// skillCreateConflict returns why "/skill create name" must not run, or "".
+// InstallSkill writes its placeholder SKILL.md unconditionally, so creating a
+// skill that already existed replaced the user's instructions with the
+// template.
+func skillCreateConflict(name string, prompts map[string]string) string {
+	if _, ok := prompts[name]; ok {
+		return fmt.Sprintf("技能 %s 已存在，未覆盖。查看内容: /skill %s；如需重建，请先手动删除它的 SKILL.md。", name, name)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "" // InstallSkill reports it
+	}
+	dir, err := safepath.Join("skill", filepath.Join(home, ".cove", "skills"), name)
+	if err != nil {
+		return "" // an invalid name: InstallSkill refuses it with the reason
+	}
+	file := filepath.Join(dir, "SKILL.md")
+	if _, err := os.Stat(file); err == nil {
+		// Installed after this session started, so not in prompts yet.
+		return fmt.Sprintf("技能 %s 已存在（%s），未覆盖。如需重建，请先手动删除该文件。", name, file)
+	}
+	return ""
 }
 
 func applyProviderConfigChange(cfg *config.Config, reloader providerReloader, mutate func() error) error {

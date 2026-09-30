@@ -33,7 +33,9 @@ func (t *TaskStopTool) Call(ctx context.Context, input Input, tctx Context) (Res
 			return Result{Data: fmt.Sprintf("Task %s stopped: %s", id, title)}, nil
 		}
 	}
-	return Result{Data: fmt.Sprintf("Task %s stopped.", id)}, nil
+	// This used to answer "Task X stopped." with IsError=false for an id that
+	// does not exist, so a mistyped id looked like a stopped task.
+	return Result{Data: fmt.Sprintf("Task %s not found", id), IsError: true}, nil
 }
 func (t *TaskStopTool) CheckPermissions(input Input, tctx Context) PermissionDecision {
 	return Allowed("task stop is safe")

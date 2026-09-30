@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
+	"github.com/liuzhixin405/cove-agent/internal/filelock"
 	"github.com/liuzhixin405/cove-agent/internal/fsatomic"
 	"github.com/liuzhixin405/cove-agent/internal/log"
 	"github.com/liuzhixin405/cove-agent/internal/memory"
@@ -168,9 +169,29 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 	}
 
 	saved := 0
-	// The read-modify-write below (dedup probe, append, rewrite) must not
-	// interleave with another extraction run touching the same files.
+	// The read-modify-write below (existence probe, append, rewrite) must not
+	// interleave with another extraction run touching the same files, nor
+	// with a background dream run rewriting them: memory.LockWrites is the
+	// process-wide memory write lock dream's write, edit and stale-marker
+	// writes hold too. That lock is a mutex, so it does not reach a dream
+	// worker process: its "file unchanged since the model read it" check and
+	// its rename were not atomic against this append, and the fact appended
+	// in between was replaced. The memory directory's lock file (filelock)
+	// is therefore taken as well, after the in-process lock, in the same
+	// order dream takes them.
 	r.mu.Lock()
+	unlockWrites := memory.LockWrites()
+	releaseFile, lerr := filelock.MemoryDir(st.PrimaryDir())
+	if lerr != nil {
+		// Another process kept the lock for the whole wait. Writing anyway
+		// could lose its content or ours; skipping loses nothing for good:
+		// the next turn's extraction sees these messages again (the window
+		// is the last 20 messages).
+		unlockWrites()
+		r.mu.Unlock()
+		log.Warnf("[extractMemories] memory directory busy, extraction skipped this turn: %v", lerr)
+		return
+	}
 	for _, m := range memories {
 		if m.Name == "" || m.Content == "" {
 			continue
@@ -182,13 +203,17 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 		// Validate: memory must not be too large
 		m.Content = textutil.ClipBytes(m.Content, 5000, "\n... [truncated]")
 		name := sanitizeFilename(m.Name)
-		// Deduplication: skip if >80% similar to existing memory (the
-		// project's copy, else the global one it would shadow).
+		// Extraction never replaces an existing memory (the project's copy,
+		// or the global one it would shadow): the model only ever sees the
+		// names of existing memories, not their contents, so a MODE: write
+		// for one of them used to replace e.g. 3KB of project-architecture
+		// facts with the single new line. The old guard only turned a write
+		// into an append when the first 100 runes were >80% similar, which
+		// almost never held. An existing name is now always appended to
+		// (Append also skips content that is already the file's tail);
+		// Save stays for names nothing has yet.
 		if existing, _, ok := st.BaseContent(name); ok && existing != "" {
-			if similarity(textutil.HeadRunes(existing, 100), textutil.HeadRunes(m.Content, 100)) > 0.8 {
-				// Merge instead of duplicate
-				m.Append = true
-			}
+			m.Append = true
 		}
 		// Every write goes through memory.Store (Save / Append): the same
 		// screening, entry and total-size limits as a memory saved by hand.
@@ -206,6 +231,8 @@ func (r *Runner) Extract(ctx context.Context, messages []api.Message) {
 		}
 		saved++
 	}
+	releaseFile()
+	unlockWrites()
 	r.mu.Unlock()
 	r.record(saved)
 	if saved > 0 {
@@ -235,7 +262,7 @@ Rules:
 - Only extract DURABLE facts (things that will still be true next week)
 - Skip transient info (current errors being debugged, temporary states)
 - Skip things already obvious from the codebase
-- Prefer updating existing memory files over creating new ones
+- Prefer updating existing memory files over creating new ones; content for an existing file is always appended to it (it is never replaced), so write only the new facts
 - Each memory should be a standalone fact, not a conversation fragment
 - Use descriptive filenames like "project-architecture.md" or "api-conventions.md"
 
@@ -350,7 +377,12 @@ func sanitizeFilename(name string) string {
 		"?", "-", "\"", "-", "<", "-", ">", "-", "|", "-",
 	)
 	name = replacer.Replace(name)
-	if name == "" || name == "." || name == ".." {
+	// A leading dot used to be kept, so "FILE: .consolidate-lock" from the
+	// model was written into the memory directory's bookkeeping (the dream
+	// lock, the memory write lock, the extraction record). Memories are never
+	// dot files (the store skips them), so the dots go.
+	name = strings.TrimLeft(name, ".")
+	if name == "" {
 		name = "memory.md"
 	}
 	// Ensure it has an extension

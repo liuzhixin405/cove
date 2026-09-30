@@ -169,22 +169,26 @@ func (e *Engine) emitToolResult(callID, name string, input map[string]any, outpu
 	// call, but its block is marked failed: "✓ --- FAIL: TestX" read as a
 	// pass.
 	summary := ""
+	// kind is the canonical, lower-case tool name the checks below compare
+	// against. Comparing the raw name missed an alias: a "PowerShell" call
+	// that exited 1 was shown as a success.
+	kind := strings.ToLower(e.canonicalToolName(name))
 	// A read's first line is "File: <absolute path>", which the header
 	// already names; the line count is what is worth saying.
-	if !isError && name == "read" {
+	if !isError && kind == "read" {
 		if n := strings.Count(strings.TrimRight(output, "\n"), "\n"); n > 0 {
 			summary = fmt.Sprintf("%d 行", n)
 		}
 	}
 	// A sub-agent that did not complete is a failed step, whatever the tool
 	// call's own status: "✓ [exit: error, steps: 0]" read as a success.
-	if !isError && name == "agent" {
+	if !isError && kind == "agent" {
 		if agentFailed(output) {
 			isError = true
 		}
 		summary = firstOutputLine(output)
 	}
-	if !isError && (name == "bash" || name == "powershell") {
+	if !isError && (kind == "bash" || kind == "powershell") {
 		if code := shellExitCode(output); code != 0 {
 			isError = true
 			summary = fmt.Sprintf("退出码 %d · %s", code, firstOutputLine(output))

@@ -202,3 +202,21 @@ func TestMarkdownStreamFlushClosesStyles(t *testing.T) {
 		t.Errorf("Flush with nothing pending printed %q", got)
 	}
 }
+
+// Tables were drawn with box-drawing glyphs whatever the console, so on one
+// that cannot show them (textmode.PreferASCII) every table was mojibake.
+func TestMarkdownTableASCIIMode(t *testing.T) {
+	t.Setenv("COVE_TUI_ASCII", "1")
+	out := feed(NewMarkdownStream(), "| 名称 | 值 |\n|---|---|\n| a | 1 |\n\n")
+	plain := ansi.Strip(out)
+	for _, r := range plain {
+		if r > unicode.MaxASCII && !strings.ContainsRune("名称值", r) {
+			t.Fatalf("ASCII-mode table printed %q:\n%s", r, plain)
+		}
+	}
+	for _, want := range []string{"+------+----+", "| 名称 | 值 |", "| a    | 1  |"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("ASCII table lacks %q:\n%s", want, plain)
+		}
+	}
+}

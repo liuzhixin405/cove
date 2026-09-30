@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
@@ -187,9 +188,28 @@ func newProjectMemoryStore(cwd string) *memory.Store {
 }
 
 func runStartupDiagnostics(cfg *config.Config, debugMode bool) {
+	if s := untrustedProjectNotice(cfg); s != "" {
+		fmt.Fprint(os.Stderr, s)
+	}
 	if s := startupDiagnosticsText(cfg, debugMode); s != "" {
 		fmt.Fprint(os.Stderr, s)
 	}
+}
+
+// untrustedProjectNotice says which settings of the project's .cove.json were
+// ignored because the file is not trusted. Such a file used to apply in
+// full: a cloned repository could start an MCP server (any command) at
+// launch, or point base_url elsewhere and receive the user's API key.
+func untrustedProjectNotice(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	path, fields := cfg.UntrustedProjectConfig()
+	if path == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n  \x1b[33m⚠ 项目配置 %s 中的 %s 需要信任后才生效，本次已忽略。确认这个项目可信后，在交互模式输入 /trust，再 /restart。\x1b[0m\n",
+		path, strings.Join(fields, "、"))
 }
 
 // startupDiagnosticsText renders the startup diagnostic notices (config/network

@@ -18,10 +18,18 @@ func touchPathsFor(tc api.ToolCall) []string {
 		return nil
 	}
 	var paths []string
-	for _, key := range []string{"filePath", "path"} {
+	// The file key through every alias the file tools accept (the first one
+	// set), then "path" (grep's and glob's root, or a file tool's path).
+	// Reading only "filePath" and "path" left a read sent with file_path out
+	// of Layer 3's file activity, so exploring new files counted as a stall.
+	for _, key := range []string{"filePath", "file_path", "filepath", "file"} {
 		if v, ok := tc.Input[key].(string); ok && v != "" {
 			paths = append(paths, v)
+			break
 		}
+	}
+	if v, ok := tc.Input["path"].(string); ok && v != "" {
+		paths = append(paths, v)
 	}
 	return paths
 }

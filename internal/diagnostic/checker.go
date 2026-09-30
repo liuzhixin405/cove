@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/liuzhixin405/cove-agent/internal/api"
@@ -149,6 +150,8 @@ type Checker struct {
 	// the running session (SetSession), then to what is on disk.
 	background func() BackgroundStatus
 	policyErr  func() error
+	// writeFile is the disk-space probe's write; nil means os.WriteFile.
+	writeFile func(name string, data []byte, perm os.FileMode) error
 }
 
 // NewChecker creates a new diagnostic checker.
@@ -497,15 +500,43 @@ func (c *Checker) checkDiskSpace(_ context.Context) CheckResult {
 
 	// Try writing a small test file
 	testData := make([]byte, 4096)
-	if err := os.WriteFile(testFile, testData, 0640); err != nil {
+	write := c.writeFile
+	if write == nil {
+		write = os.WriteFile
+	}
+	if err := write(testFile, testData, 0640); err != nil {
+		// Only a full disk is a disk-space problem. Every failed write used
+		// to be reported as a fatal "磁盘空间不足", so a ~/.cove the user
+		// cannot write to — which checkDataDir already reports, with the
+		// right remedy — came out a second time as a wrong fatal telling
+		// them to free disk space.
+		if !isDiskFull(err) {
+			res.Skipped = true
+			res.Detail = "无法写入测试文件，未检测磁盘空间（见“数据目录”检查）: " + err.Error()
+			return res
+		}
 		res.Status = SevFatal
-		res.Error = New(ErrFSDiskFull, "无法写入测试文件")
+		res.Error = New(ErrFSDiskFull, "已耗尽（"+err.Error()+"）")
 		return res
 	}
 	_ = os.Remove(testFile)
 
 	res.Status = SevInfo
 	return res
+}
+
+// isDiskFull reports whether err says the disk (or the user's quota) is
+// full: ENOSPC/EDQUOT, and on Windows ERROR_DISK_FULL and
+// ERROR_HANDLE_DISK_FULL, which the syscall package does not map to ENOSPC.
+func isDiskFull(err error) bool {
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return true
+	}
+	var errno syscall.Errno
+	if runtime.GOOS == "windows" && errors.As(err, &errno) {
+		return errno == 112 || errno == 39 // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+	}
+	return false
 }
 
 func (c *Checker) checkSessionIntegrity(_ context.Context) CheckResult {

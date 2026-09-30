@@ -8,10 +8,11 @@ import (
 	"github.com/liuzhixin405/cove-agent/internal/dream"
 )
 
-// Final fix (Minor 6): the lock a completed run leaves behind is this
-// process's own and stays for an hour, so "/dream run" right after a
-// consolidation hits it; the message must cover that case too.
-func TestDreamRunLockHeldMentionsRecentRunInThisProcess(t *testing.T) {
+// A lock held by another process is reported as such. The message used to
+// also blame "this process consolidated within the hour" (a completed run
+// kept its lock for an hour); a completed run now leaves a done lock that
+// does not block, so that clause was wrong.
+func TestDreamRunLockHeldNamesAnotherProcess(t *testing.T) {
 	backgroundHome(t)
 	dream.NewRunner(doneProvider{}, "m", "")
 	if _, ok, err := dream.TryAcquireConsolidationLock(); err != nil || !ok {
@@ -21,9 +22,7 @@ func TestDreamRunLockHeldMentionsRecentRunInThisProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"整理锁被占用", "本进程", "1 小时内"} {
-		if !strings.Contains(out.Message, want) {
-			t.Fatalf("/dream run output = %q, want %q", out.Message, want)
-		}
+	if !strings.Contains(out.Message, "整理锁被占用") || strings.Contains(out.Message, "1 小时") {
+		t.Fatalf("/dream run output = %q", out.Message)
 	}
 }

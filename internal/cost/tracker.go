@@ -42,6 +42,17 @@ var Prices = map[string]Price{
 	"claude-sonnet-4-6": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
 	"claude-haiku-4-5":  {Input: 1.0, InputCacheHit: 0.10, Output: 5.0},
 
+	// The Claude 4 / 4.1 / 4.5 generation. These were missing and fell to
+	// defaultPrice, under-billing them 7-35x. "claude-opus-4" and
+	// "claude-sonnet-4" are prefixes of the newer entries above; the
+	// longest-substring match keeps those on their own rates, and catches the
+	// dated IDs (claude-opus-4-20250514, claude-sonnet-4-5-20250929).
+	"claude-opus-4-5":   {Input: 5.0, InputCacheHit: 0.50, Output: 25.0},
+	"claude-opus-4-1":   {Input: 15.0, InputCacheHit: 1.5, Output: 75.0},
+	"claude-opus-4":     {Input: 15.0, InputCacheHit: 1.5, Output: 75.0},
+	"claude-sonnet-4-5": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
+	"claude-sonnet-4":   {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
+
 	"claude-3-7-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
 	"claude-3-5-sonnet": {Input: 3.0, InputCacheHit: 0.30, Output: 15.0},
 	"claude-3-5-haiku":  {Input: 0.8, InputCacheHit: 0.08, Output: 4.0},
@@ -63,6 +74,39 @@ var Prices = map[string]Price{
 // Provides a conservative non-zero fallback so unknown models still produce a
 // cost estimate (per-million-token USD rates).
 var defaultPrice = Price{Input: 0.435, InputCacheHit: 0.003625, Output: 0.87}
+
+// unknownClaudePrice is the rate for a claude-* model that matches no entry
+// in Prices: the most expensive known Claude tier (Opus list price). A new
+// Claude ID used to fall to defaultPrice and be billed at a few percent of
+// its real cost, so max_budget_usd was no ceiling at all on it. Over-counting
+// an unknown model is the safe direction; a wrong-but-low estimate is not.
+var unknownClaudePrice = Price{Input: 15.0, InputCacheHit: 1.5, Output: 75.0}
+
+// priceFor is the rate for model: its exact Prices entry, else the longest
+// Prices key it contains, else unknownClaudePrice for a Claude model and
+// defaultPrice for anything else.
+func priceFor(model string) Price {
+	if p, ok := Prices[model]; ok {
+		return p
+	}
+	// Dated model names ("gpt-4o-mini-2024-07-18") contain several price
+	// keys, so the match has to be the most specific one. Taking the first
+	// hit instead would depend on Go's randomized map iteration order and
+	// bill the same request at different rates on different runs.
+	longest := ""
+	for k := range Prices {
+		if len(k) > len(longest) && strings.Contains(model, k) {
+			longest = k
+		}
+	}
+	if longest != "" {
+		return Prices[longest]
+	}
+	if strings.Contains(strings.ToLower(model), "claude") {
+		return unknownClaudePrice
+	}
+	return defaultPrice
+}
 
 // Tracker accumulates token usage and spend for the session.
 //
@@ -150,23 +194,7 @@ func (t *Tracker) AddWithCacheWrite(model string, input, output, cacheHit, cache
 	}
 	t.totalPromptCacheHit += cacheHit
 	t.totalPromptCacheMiss += cacheMiss
-	p, ok := Prices[model]
-	if !ok {
-		p = defaultPrice
-		// Dated model names ("gpt-4o-mini-2024-07-18") contain several price
-		// keys, so the match has to be the most specific one. Taking the first
-		// hit instead would depend on Go's randomized map iteration order and
-		// bill the same request at different rates on different runs.
-		longest := ""
-		for k := range Prices {
-			if len(k) > len(longest) && strings.Contains(model, k) {
-				longest = k
-			}
-		}
-		if longest != "" {
-			p = Prices[longest]
-		}
-	}
+	p := priceFor(model)
 	if p.InputCacheHit == 0 {
 		p.InputCacheHit = p.Input
 	}

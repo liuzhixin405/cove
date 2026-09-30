@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -444,5 +445,23 @@ func runGit(t *testing.T, dir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+// /undo and /commit rewrite the working tree or the repository a running task
+// is editing, so a front end must refuse them until the task ends.
+func TestUndoAndCommitMutateEngine(t *testing.T) {
+	for _, c := range []Command{NewUndoCmd(), NewCommitCmd()} {
+		if !Mutates(c, nil) || !Mutates(c, []string{"x"}) {
+			t.Errorf("/%s does not declare MutatesEngine; it would run mid-task", c.Name())
+		}
+	}
+}
+
+func TestUndoCmdNamesTheBackupOnError(t *testing.T) {
+	eng := &fakeEngine{backup: "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432", restErr: errors.New("删除 x 失败")}
+	out, _ := NewUndoCmd().Execute(context.Background(), Input{Engine: eng})
+	if !strings.Contains(out.Message, "删除 x 失败") || !strings.Contains(out.Message, "/undo 9f8e7d6c") {
+		t.Fatalf("undo output %q must report the error and still say how to reverse it", out.Message)
 	}
 }

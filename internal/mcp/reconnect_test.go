@@ -19,6 +19,9 @@ type autoServer struct {
 	deadOnce sync.Once
 	mu       sync.Mutex
 	tools    []string
+	// toolsErr, when set, is the JSON-RPC error tools/list answers with
+	// (code and message), for the Connect error-handling tests.
+	toolsErr string
 }
 
 func newAutoServer(tools ...string) *autoServer {
@@ -28,6 +31,13 @@ func newAutoServer(tools ...string) *autoServer {
 func (s *autoServer) setTools(tools ...string) {
 	s.mu.Lock()
 	s.tools = tools
+	s.mu.Unlock()
+}
+
+// failToolsList makes tools/list answer with a JSON-RPC error.
+func (s *autoServer) failToolsList(code, message string) {
+	s.mu.Lock()
+	s.toolsErr = fmt.Sprintf(`{"code":%s,"message":%q}`, code, message)
 	s.mu.Unlock()
 }
 
@@ -42,6 +52,16 @@ func (s *autoServer) Send(_ context.Context, msg any) error {
 		return nil
 	}
 	var result string
+	s.mu.Lock()
+	toolsErr := s.toolsErr
+	s.mu.Unlock()
+	if m.Method == "tools/list" && toolsErr != "" {
+		select {
+		case s.in <- json.RawMessage(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":%s}`, *m.ID, toolsErr)):
+		case <-s.dead:
+		}
+		return nil
+	}
 	switch m.Method {
 	case "initialize":
 		result = `{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"auto","version":"1"}}`

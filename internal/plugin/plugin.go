@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -254,6 +255,12 @@ func (m *Manager) Disable(name string) error {
 	if p.State == Disabled {
 		return nil
 	}
+	// An Error entry of a disabled plugin already points at "x.disabled";
+	// appending again would rename it to "x.disabled.disabled".
+	if strings.HasSuffix(p.Dir, ".disabled") {
+		p.State = Disabled
+		return nil
+	}
 	disabledDir := p.Dir + ".disabled"
 	_ = os.RemoveAll(disabledDir)
 	if err := os.Rename(p.Dir, disabledDir); err != nil {
@@ -274,8 +281,20 @@ func (m *Manager) Enable(name string) error {
 	if p.State == Enabled {
 		return nil
 	}
+	// A plugin that failed to load (recordPluginError) keeps its own
+	// directory, without a ".disabled" suffix. Trimming the suffix was then a
+	// no-op and the RemoveAll below deleted the plugin itself.
+	if p.State == Error {
+		return fmt.Errorf("插件 %s 加载失败：%s；请修复后重试", name, p.Error)
+	}
+	if !strings.HasSuffix(p.Dir, ".disabled") {
+		return fmt.Errorf("插件 %s 的目录 %s 不是已禁用的目录，未做改动", name, p.Dir)
+	}
 	enabledDir := strings.TrimSuffix(p.Dir, ".disabled")
-	_ = os.RemoveAll(enabledDir)
+	// Never remove the plugin's own directory, whatever the entry says.
+	if filepath.Clean(enabledDir) != filepath.Clean(p.Dir) {
+		_ = os.RemoveAll(enabledDir)
+	}
 	if err := os.Rename(p.Dir, enabledDir); err != nil {
 		return err
 	}
@@ -331,18 +350,22 @@ type CommandPrompt struct {
 // CommandPrompts scans every enabled plugin's commands/ directory for markdown
 // command files and returns them keyed by command name (filename without the
 // .md extension). When a plugin command is invoked, its prompt body is injected
-// into the engine as a user message. Names from later plugins do not override
-// earlier ones (first writer wins) so behaviour is deterministic.
+// into the engine as a user message. When two plugins define the same command,
+// the plugin whose name sorts first wins. The plugins used to be visited in
+// map order, which is random, so which plugin's command ran changed from one
+// start to the next despite the "first writer wins" promise.
 func (m *Manager) CommandPrompts() map[string]CommandPrompt {
 	m.mu.RLock()
-	dirs := make([]string, 0, len(m.plugins))
 	names := make([]string, 0, len(m.plugins))
 	for name, p := range m.plugins {
-		if p.State != Enabled {
-			continue
+		if p.State == Enabled {
+			names = append(names, name)
 		}
-		dirs = append(dirs, p.Dir)
-		names = append(names, name)
+	}
+	sort.Strings(names)
+	dirs := make([]string, len(names))
+	for i, name := range names {
+		dirs[i] = m.plugins[name].Dir
 	}
 	m.mu.RUnlock()
 
@@ -522,11 +545,15 @@ func (m *Manager) MarketplaceInstall(name string) error {
 	if m.marketplace == nil {
 		return fmt.Errorf("marketplace 未初始化")
 	}
-	if err := m.marketplace.InstallFromMarketplace(name); err != nil {
+	// The index lookup ignores case and installs into the entry's own
+	// directory name; reloading the name as typed ("Foo" for entry "foo")
+	// failed after a successful install on a case-sensitive file system.
+	installed, err := m.marketplace.installFromMarketplace(name)
+	if err != nil {
 		return err
 	}
 	// Reload into plugin map
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.loadPluginLocked(name)
+	return m.loadPluginLocked(installed)
 }

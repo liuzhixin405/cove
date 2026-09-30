@@ -46,7 +46,7 @@
 ```bash
 # 克隆仓库
 git clone https://github.com/liuzhixin405/cove-agent.git
-cd cove
+cd cove-agent
 
 # 运行测试
 go test ./...

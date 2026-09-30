@@ -274,23 +274,9 @@ func handleProfileCommand(input string, cfg *config.Config, eng *engine.Engine) 
 		if cfg.Profiles == nil {
 			cfg.Profiles = map[string]*config.Profile{}
 		}
-		// Snapshot the booleans into locals: pointing the profile at
-		// &cfg.Debug would alias the live config, so a later /debug toggle
-		// would silently rewrite the saved profile.
-		savedDebug, savedVerbose := cfg.Debug, cfg.Verbose
-		p := &config.Profile{
-			Model:          cfg.Model,
-			ModelFast:      cfg.ModelFast,
-			Provider:       &config.ProviderConfig{Name: cfg.Provider.Name, APIKey: cfg.Provider.APIKey, BaseURL: cfg.Provider.BaseURL},
-			PermissionMode: cfg.PermissionMode,
-			MaxBudgetUsd:   cfg.MaxBudgetUsd,
-			ThinkingTokens: cfg.ThinkingTokens,
-			// Explicit pointers so "/profile save" records the current state
-			// faithfully, including off.
-			Debug:        &savedDebug,
-			Verbose:      &savedVerbose,
-			SystemPrompt: cfg.SystemPrompt,
-		}
+		// Only the user's own settings: values a project .cove.json set
+		// used to be copied into the global profile (SnapshotProfile).
+		p := cfg.SnapshotProfile()
 		cfg.Profiles[name] = p
 		if err := config.Save(cfg); err != nil {
 			outf("保存 profile 失败: %v\n", err)

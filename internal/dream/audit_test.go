@@ -1,6 +1,7 @@
 package dream
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,7 +75,7 @@ func TestGrepFilesClipsLongLinesOnRuneBoundary(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte(line+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := grepFiles("记忆", dir)
+	got := grepFiles(context.Background(), "记忆", dir)
 	if !strings.Contains(got, "记忆") {
 		t.Fatalf("grepFiles missed the match: %q", got)
 	}

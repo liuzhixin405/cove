@@ -145,6 +145,7 @@ func (lr *LineReader) editLine() (string, error) {
 			if len(buf) == 0 {
 				consoleMu.Lock()
 				lr.eraseLineLocked()
+				releaseForExitLocked()
 				consoleMu.Unlock()
 				termPrint("\r\n")
 				return "", ErrExit
@@ -272,8 +273,9 @@ func (lr *LineReader) submit(buf []rune) string {
 	}
 	consoleMu.Unlock()
 
-	// One-key prompt answers are not worth recalling.
-	if len([]rune(line)) > 1 && (len(lr.history) == 0 || lr.history[len(lr.history)-1] != line) {
+	// One-key prompt answers are not worth recalling; lines the history
+	// filter refuses (secrets) are not kept at all.
+	if len([]rune(line)) > 1 && (len(lr.history) == 0 || lr.history[len(lr.history)-1] != line) && historyKeeps(line) {
 		lr.history = append(lr.history, line)
 		appendHistory(line)
 	}
@@ -296,12 +298,40 @@ func (lr *LineReader) endOfInput(buf []rune, err error) (string, error) {
 	}
 	consoleMu.Lock()
 	lr.eraseLineLocked()
+	if len(buf) == 0 {
+		releaseForExitLocked()
+	}
 	consoleMu.Unlock()
 	termPrint("\r\n")
 	if len(buf) > 0 {
 		return string(buf), nil
 	}
 	return "", ErrExit
+}
+
+// releaseForExitLocked hands the terminal back before ErrExit ends the
+// session. The pinned row's scroll region used to be reset only by EndOutput
+// and BeginPromptInput, so Ctrl+D (or a closed stdin) during a streaming turn
+// exited with DECSTBM still set and the user's shell went on scrolling inside
+// a region two rows short of the window. Streaming is ended too, so the
+// goodbye line and anything else printed on the way out lands in the normal
+// flow instead of being treated as part of the stream. Callers hold
+// consoleMu.
+func releaseForExitLocked() {
+	breakStreamLineLocked()
+	unpinLocked()
+	streamingActive = false
+	streamMidLine = false
+}
+
+// ReleaseTerminal is releaseForExitLocked for a front end that ends the
+// session some other way (a /exit command, a signal) while a turn may still
+// be streaming: it resets the pinned row's scroll region so the shell gets
+// its whole window back. Safe to call when nothing is pinned.
+func ReleaseTerminal() {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	releaseForExitLocked()
 }
 
 // refresh redraws the input line and its command hints, unless more input is
@@ -354,6 +384,7 @@ func (lr *LineReader) eraseLineLocked() {
 }
 
 func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
+	cursor = clampCursor(cursor, len(buf))
 	lr.renderBuf = append(lr.renderBuf[:0], buf...)
 	lr.renderCursor = cursor
 	if streamingActive {
@@ -382,7 +413,7 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 		maxVis = 1
 	}
 	shown := displayRunes(buf)
-	disp, cells, _, start := inputDisplayWindow(shown, cursor, maxVis)
+	disp, _, used, start := inputDisplayWindow(shown, cursor, maxVis)
 	termPrint(lr.prompt)
 	if len(buf) == 0 && lr.placeholder != "" {
 		ph, _ := truncateRunesByCells([]rune(lr.placeholder), maxVis)
@@ -390,7 +421,12 @@ func (lr *LineReader) redrawLocked(buf []rune, cursor int) {
 	} else {
 		termPrint("\x1b[0m" + string(disp) + "\x1b[0m")
 		if lr.activeHint != "" {
-			rem := w - lr.promptWidth - cells - 1
+			// The hint follows the whole visible text, not the cursor, so
+			// its room is what that text leaves. It used to be measured
+			// from the cursor: with the cursor moved left, the row
+			// overflowed by the text right of it and soft-wrapped, and the
+			// next redraw left the wrapped half behind.
+			rem := w - lr.promptWidth - used - 1
 			termPrint(truncateAnsi(lr.activeHint, rem))
 		}
 	}

@@ -120,7 +120,7 @@ type backgroundJob struct {
 	msgs      []api.Message // snapshot for memory extraction
 	learn     bool          // background learning is on (not --no-auto)
 	saved     bool          // the turn-end session save succeeded
-	sessionID string        // the session pruning must keep
+	sessionID string        // the session pruning must keep, and a learned skill names
 	keep      int           // max_sessions
 	review    []api.Message // snapshot for the skill review; nil = skip it
 	// checkpointed: the turn wrote or edited files after a checkpoint was
@@ -215,7 +215,7 @@ func (e *Engine) runBackgroundWork(job backgroundJob) {
 		releaseWaited()
 		func() {
 			defer e.reviewBg.Done()
-			res := e.runReview(job.review)
+			res := e.runReview(job.review, job.sessionID)
 			sum.NewSkills, sum.UpdatedSkills = res.added, res.updated
 		}()
 	}

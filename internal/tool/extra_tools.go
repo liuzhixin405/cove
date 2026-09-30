@@ -14,6 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/liuzhixin405/cove-agent/internal/textutil"
 )
 
 type WebSearchTool struct {
@@ -477,8 +480,8 @@ func extractWebSearchResults(body string, limit int) []webSearchResult {
 		if len(match) < 3 {
 			continue
 		}
-		link := strings.TrimSpace(html.UnescapeString(match[1]))
-		if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") {
+		link, ok := webSearchTarget(strings.TrimSpace(html.UnescapeString(match[1])))
+		if !ok {
 			continue
 		}
 		if _, ok := seen[link]; ok {
@@ -501,18 +504,69 @@ func extractWebSearchResults(body string, limit int) []webSearchResult {
 	return results
 }
 
+// webSearchTarget returns the page a result link points to. DuckDuckGo's
+// HTML endpoint wraps every result as //duckduckgo.com/l/?uddg=<escaped
+// target>; those used to be dropped for not starting with http(s), which left
+// the default search backend returning no results. The target is unwrapped;
+// direct http(s) links are kept as they are, and anything else (ads at
+// /y.js, pagination, javascript:) is skipped.
+func webSearchTarget(link string) (string, bool) {
+	if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+		if u, err := url.Parse(link); err == nil && isDuckDuckGoRedirect(u) {
+			return duckDuckGoTarget(u)
+		}
+		return link, true
+	}
+	switch {
+	case strings.HasPrefix(link, "//"):
+		link = "https:" + link
+	case strings.HasPrefix(link, "/l/"):
+		link = "https://duckduckgo.com" + link
+	default:
+		return "", false
+	}
+	u, err := url.Parse(link)
+	if err != nil || !isDuckDuckGoRedirect(u) {
+		return "", false
+	}
+	return duckDuckGoTarget(u)
+}
+
+func isDuckDuckGoRedirect(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	return (host == "duckduckgo.com" || strings.HasSuffix(host, ".duckduckgo.com")) && u.Path == "/l/"
+}
+
+func duckDuckGoTarget(u *url.URL) (string, bool) {
+	target := strings.TrimSpace(u.Query().Get("uddg"))
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		return "", false
+	}
+	return target, true
+}
+
 func extractSnippetNearLink(body, linkHTML string) string {
 	idx := strings.Index(body, linkHTML)
 	if idx < 0 {
 		return ""
 	}
-	windowEnd := idx + len(linkHTML) + 400
-	if windowEnd > len(body) {
-		windowEnd = len(body)
+	rest := body[idx+len(linkHTML):]
+	// Cut on rune boundaries: the window used to be body[start:start+400] by
+	// byte offset, so a cut inside a multi-byte character left the snippet
+	// ending in a partial rune (a lone "\xe4"), invalid UTF-8 that providers'
+	// JSON encoders reject. linkHTML ends in ">", but its match need not be
+	// aligned if the page is not valid UTF-8, so the start is checked too.
+	for rest != "" && !utf8.RuneStart(rest[0]) {
+		rest = rest[1:]
 	}
-	window := body[idx+len(linkHTML) : windowEnd]
-	for _, tag := range []string{"</a>", "<a "} {
-		window = strings.ReplaceAll(window, tag, " ")
+	window := textutil.ClipBytes(rest, 400, "")
+	// cleanWebSearchText strips whole tags. "<a " used to be replaced by a
+	// space first, which broke the tag it began: `<a class="x" href="…">`
+	// became ` class="x" href="…">`, no longer a tag, and the snippet
+	// carried the raw attributes. The cut above can also end inside a tag,
+	// whose unclosed start is not text either.
+	if lt := strings.LastIndexByte(window, '<'); lt >= 0 && !strings.Contains(window[lt:], ">") {
+		window = window[:lt]
 	}
 	return cleanWebSearchText(window)
 }
