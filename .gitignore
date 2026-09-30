@@ -45,9 +45,14 @@ coverage.txt
 # Temporary / generated
 /session_notes.md
 /testout.txt
+# Scratch screenshots (the README uses /images/README/)
+/imgs/
 
 # Archive docs (excluded from main tree)
 /docs/archive/
+
+# Local planning / research notes (not shipped docs)
+/docs/superpowers/
 
 # Claude Code local settings (per-user, not shared)
 /.claude/settings.local.json
