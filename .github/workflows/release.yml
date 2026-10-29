@@ -10,7 +10,15 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: taiki-e/create-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   upload:
+    needs: create-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
