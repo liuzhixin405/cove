@@ -1,0 +1,7 @@
+[
+  {"name": "security-audit", "description": "Security audit: scan deps, check vulnerabilities.", "url": "skills/security-audit/SKILL.md", "author": "cove"},
+  {"name": "api-design", "description": "REST API design: endpoints, schemas, OpenAPI.", "url": "skills/api-design/SKILL.md", "author": "cove"},
+  {"name": "dockerize", "description": "Docker: Dockerfile, compose, build, push.", "url": "skills/dockerize/SKILL.md", "author": "cove"},
+  {"name": "i18n", "description": "Internationalization: extract strings, translations.", "url": "skills/i18n/SKILL.md", "author": "cove"},
+  {"name": "ci-cd", "description": "CI/CD: Actions, pipelines, testing.", "url": "skills/ci-cd/SKILL.md", "author": "cove"}
+]

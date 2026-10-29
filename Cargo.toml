@@ -1,0 +1,51 @@
+[package]
+name = "cove"
+version = "0.3.0"
+edition = "2024"
+publish = false
+description = "A small, permission-aware coding agent"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+encoding_rs = "0.8"
+futures-util = "0.3"
+fs2 = "0.4"
+globset = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+png = "0.18"
+regex = "1"
+rmcp = { version = "3.7", default-features = false, features = ["client", "transport-async-rw"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+similar = "2"
+unicode-segmentation = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "signal", "sync", "time", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+which = "7"
+
+[target.'cfg(windows)'.dependencies]
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_RestartManager", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

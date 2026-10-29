@@ -1,0 +1,46 @@
+{
+  "active_profile": "deepseek",
+  "permission_mode": "default",
+  "system_prompt": "先理解任务，再用工具完成；只报告真实执行过的检查结果。",
+  "max_iterations": 40,
+  "max_turn_minutes": 10,
+  "subagent_max_iterations": 15,
+  "done_verify_commands": ["cargo check --all-targets", "cargo test"],
+  "done_verify_timeout_seconds": 300,
+  "web_search": { "provider": "tavily" },
+  "profiles": {
+    "deepseek": {
+      "model": "deepseek-v4-pro",
+      "model_fast": "deepseek-v4-flash",
+      "provider": {
+        "name": "deepseek",
+        "base_url": "https://api.deepseek.com/v1"
+      },
+      "max_output_tokens": 8192,
+      "context_bytes": 262144,
+      "input_price": 0.27,
+      "output_price": 1.1,
+      "max_budget_usd": 10
+    },
+    "claude": {
+      "model": "claude-opus-5-5",
+      "thinking": "adaptive",
+      "provider": { "name": "anthropic" },
+      "max_output_tokens": 16384
+    },
+    "local": {
+      "model": "qwen3.6-27b",
+      "provider": {
+        "name": "openai-compatible",
+        "api_key": "local",
+        "base_url": "http://127.0.0.1:8080/v1"
+      }
+    }
+  },
+  "extensions": {
+    "skills": [],
+    "mcp": {},
+    "hooks": [],
+    "plugins": []
+  }
+}
