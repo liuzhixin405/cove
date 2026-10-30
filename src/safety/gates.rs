@@ -342,11 +342,11 @@ impl Assembly {
             Arc::new(verifier)
         });
         let gated: Arc<dyn crate::tools::ToolExecutor> = match &verifier {
-            Some(verifier) => Arc::new(commit::WithCommitGate {
-                inner: parts.tools.clone(),
-                verifier: verifier.clone(),
-                root: root.clone(),
-            }),
+            Some(verifier) => Arc::new(commit::WithCommitGate::new(
+                parts.tools.clone(),
+                verifier.clone(),
+                root.clone(),
+            )),
             None => parts.tools.clone(),
         };
         let workflow_mode = settings

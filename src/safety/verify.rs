@@ -419,7 +419,8 @@ impl CommandVerifier {
                     .await
                 {
                     Ok(()) => {}
-                    Err(Error::Approval(reason)) => {
+                    // Declined by the user or not askable: the check did not run.
+                    Err(Error::Approval(reason) | Error::Denied(reason)) => {
                         summary.push_str(&format!("not run  {command} ({reason})\n"));
                         self.record(CheckRecord {
                             command: command.clone(),

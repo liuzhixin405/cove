@@ -1399,6 +1399,7 @@ impl Agent {
              Read and search code with read, grep, glob and repo_map, not with shell commands such as cat, sed, head, grep or find: \
              they need no approval, skip ignored files (build output, dependencies) and run in parallel. \
              Put independent reads and searches in the same response, and keep them focused (line ranges, path and include filters). \
+             Git: stage with git add, then run git commit -m \"...\" as a shell call of its own (no chaining, cd or $(...) in it); push and tag in separate calls. \
              When finished, summarize actual changes and evidence briefly.",
             crate::process::Shell::current().dialect(),
             self.limits.max_turns

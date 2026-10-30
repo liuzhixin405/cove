@@ -23,6 +23,25 @@ pub struct WithCommitGate {
     pub inner: Arc<dyn ToolExecutor>,
     pub verifier: Arc<CommandVerifier>,
     pub root: PathBuf,
+    /// Staged trees already judged (`git write-tree` → passed, or the failure): a retried
+    /// commit of the same content does not run, or ask for, the checks again.
+    pub judged:
+        std::sync::Mutex<std::collections::HashMap<String, std::result::Result<(), String>>>,
+}
+
+impl WithCommitGate {
+    pub fn new(
+        inner: Arc<dyn ToolExecutor>,
+        verifier: Arc<CommandVerifier>,
+        root: PathBuf,
+    ) -> Self {
+        Self {
+            inner,
+            verifier,
+            root,
+            judged: Default::default(),
+        }
+    }
 }
 
 /// Whether any command of the line is `git ... commit`.
@@ -163,12 +182,34 @@ impl WithCommitGate {
         if let Err(err) = self.staged_matches(&paths).await {
             return Ok(Err(err));
         }
+        let known = self
+            .judged
+            .lock()
+            .ok()
+            .and_then(|judged| judged.get(&tree).cloned());
+        match known {
+            Some(Ok(())) => return Ok(Ok(())),
+            Some(Err(failure)) => {
+                return Ok(Err(format!(
+                    "this exact staged content already failed, or the user declined, the pre-commit checks (not run or asked again); nothing was committed. Change the staged content, or tell the user the checks fail and ask how to proceed instead of retrying.\n{failure}"
+                )));
+            }
+            None => {}
+        }
         let changed: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
         let verification = self.verifier.verify_commit(&changed, cancel).await?;
-        if verification.outcome != Outcome::Passed {
+        let verdict = if verification.outcome == Outcome::Passed {
+            Ok(())
+        } else {
+            Err(format!("{}{}", verification.summary, verification.detail))
+        };
+        // Declined checks count too: asking again on a retry is what made commits drag.
+        if let Ok(mut judged) = self.judged.lock() {
+            judged.insert(tree.clone(), verdict.clone());
+        }
+        if let Err(failure) = verdict {
             return Ok(Err(format!(
-                "pre-commit verification did not pass; nothing was committed.\n{}{}",
-                verification.summary, verification.detail
+                "pre-commit verification did not pass; nothing was committed.\n{failure}"
             )));
         }
         if let Err(err) = self.staged_matches(&paths).await {
@@ -223,6 +264,58 @@ impl ToolExecutor for WithCommitGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_same_staged_content_is_checked_once() {
+        use crate::safety::permission::{Authorizer, LocalAuthorizer, Mode};
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "x\n").unwrap();
+        git(&["add", "a.txt"]);
+        let store = crate::session::Store::open(data.path()).unwrap();
+        let workspace =
+            Arc::new(crate::session::workspace::Workspace::new(root.clone(), store).unwrap());
+        let authorizer: Arc<dyn Authorizer> = Arc::new(LocalAuthorizer {
+            mode: Mode::Bypass,
+            input: None,
+        });
+        // A failing check that leaves a line per run.
+        let verifier = Arc::new(CommandVerifier::new(
+            root.clone(),
+            vec!["echo run >> runs.log; exit 1".into()],
+            None,
+            workspace,
+            authorizer.clone(),
+        ));
+        let tools = crate::tools::LocalTools::new(root.clone(), authorizer).unwrap();
+        let gate = WithCommitGate::new(Arc::new(tools), verifier, root.clone());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let output = gate
+                .execute(
+                    "shell".into(),
+                    serde_json::json!({"command": "git commit -m x"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(output.failed, "{}", output.content);
+            outputs.push(output.content);
+        }
+        let runs = std::fs::read(root.join("runs.log")).unwrap();
+        let runs = String::from_utf8_lossy(&runs).replace('\0', "");
+        assert_eq!(runs.matches("run").count(), 1, "{runs}");
+        assert!(outputs[1].contains("already failed"), "{}", outputs[1]);
+    }
 
     #[test]
     fn commit_shapes() {

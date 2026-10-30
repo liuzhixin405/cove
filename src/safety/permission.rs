@@ -117,6 +117,11 @@ pub fn mode_default(
         (Mode::Default, Effect::Shell(command)) if classify::read_only(command, dialect) => {
             Decision::Allow
         }
+        (Mode::Default | Mode::Auto, Effect::Shell(command))
+            if classify::local_git(command, dialect) =>
+        {
+            Decision::Allow
+        }
         (Mode::Auto, Effect::Shell(command)) if classify::auto_approvable(command, dialect) => {
             Decision::Allow
         }
@@ -147,6 +152,8 @@ struct ModeState {
 pub struct Permissions {
     state: RwLock<ModeState>,
     rules: RwLock<Vec<PolicyRule>>,
+    /// "Don't ask again this session" rules: like remembered ones, never written.
+    session: RwLock<Vec<PolicyRule>>,
     store: Option<PathBuf>,
     project: PathBuf,
     roots: Vec<PathBuf>,
@@ -168,6 +175,7 @@ impl Permissions {
                 plan: (mode == Mode::Plan).then_some((PlanOrigin::User, Mode::Default)),
             }),
             rules: RwLock::new(Vec::new()),
+            session: RwLock::new(Vec::new()),
             store: None,
             project,
             roots,
@@ -277,11 +285,14 @@ impl Permissions {
 
     pub fn decide(&self, effect: &Effect) -> Decision {
         let mode = self.mode();
-        let rules = self
+        let mut rules = self
             .rules
             .read()
             .map(|rules| rules.clone())
             .unwrap_or_default();
+        if let Ok(session) = self.session.read() {
+            rules.extend(session.iter().cloned());
+        }
         decide(
             mode,
             effect,
@@ -310,25 +321,55 @@ impl Permissions {
                 "{description}；非交互模式无法询问（non-interactive）。请明确指定 --permission auto（允许项目内的构建/测试命令和编辑）或 --permission bypass，或在 policies.json 中添加 allow 规则"
             )));
         };
-        let remember = self
-            .store
-            .as_ref()
-            .and_then(|_| policy::remember_rule(&effect, &self.project, self.dialect));
-        let choices = if remember.is_some() {
-            "[y/N/a=always in this project]"
-        } else {
-            "[y/N]"
-        };
+        // Choices in the manner of Claude Code and Codex: once, this session, always in
+        // this project (naming what the rule will cover), or no with a reason.
+        let rule = policy::remember_rule(&effect, &self.project, self.dialect);
+        let lasting = self.store.is_some();
+        let mut options = vec!["1. 允许这一次 (y)".to_owned()];
+        let mut keys = vec!["y"];
+        if let Some(rule) = &rule {
+            let covers = scope_label(rule);
+            options.push(format!("2. 本次会话不再询问 (s) - {covers}"));
+            keys.push("s");
+            if lasting {
+                options.push(format!("3. 本项目以后都不再询问 (a) - {covers}"));
+                keys.push("a");
+            }
+        }
+        options.push(format!(
+            "{}. 拒绝 (n) - 或直接输入理由，告诉模型该怎么做",
+            options.len() + 1
+        ));
+        keys.push("N");
         let answer = input
             .answer(
-                format!("{head}\n{description}{warnings}\n是否允许？{choices} "),
+                format!(
+                    "{head}\n{description}{warnings}\n{}\n是否允许？[{}] ",
+                    options.join("\n"),
+                    keys.join("/")
+                ),
                 cancel,
             )
             .await?;
+        let deny = options.len().to_string();
+        let answer = match answer.trim() {
+            "1" => "y",
+            "2" if rule.is_some() => "s",
+            "3" if rule.is_some() && lasting => "a",
+            number if number == deny => "n",
+            other => other,
+        }
+        .to_owned();
         match reply(&answer) {
             Reply::Yes => Ok(()),
-            Reply::Always if remember.is_some() => {
-                if let (Some(rule), Some(path)) = (remember, &self.store) {
+            Reply::Session if rule.is_some() => {
+                if let (Some(rule), Ok(mut session)) = (rule, self.session.write()) {
+                    session.push(rule);
+                }
+                Ok(())
+            }
+            Reply::Always if rule.is_some() && lasting => {
+                if let (Some(rule), Some(path)) = (rule, &self.store) {
                     let rules = policy::append(path, &rule)?;
                     if let Ok(mut current) = self.rules.write() {
                         *current = rules;
@@ -344,20 +385,40 @@ impl Permissions {
     }
 }
 
+/// What "don't ask again" will let through, in the user's words.
+fn scope_label(rule: &PolicyRule) -> String {
+    if rule.command_group == "git" {
+        "git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）".into()
+    } else if !rule.command_group.is_empty() {
+        format!("{} 的常规命令（build、test 等）", rule.command_group)
+    } else if !rule.command_prefix.is_empty() {
+        format!("以 `{}` 开头的命令", rule.command_prefix)
+    } else if rule.tool_pattern == "write" {
+        "本项目内的文件修改".into()
+    } else if rule.tool_pattern.starts_with("web") {
+        "网页工具的网络访问".into()
+    } else {
+        rule.description.clone()
+    }
+}
+
 enum Reply {
     Yes,
+    Session,
     Always,
-    /// Denied, with the reason typed after `n`.
+    /// Denied, with the reason the model is told.
     No(Option<String>),
 }
 
-/// An approval answer: y/yes/是/允许, a/always/总是, anything else denies; text
-/// after `n`/`no`/否/拒绝 is the reason the model is given.
+/// An approval answer: y/yes/是/允许, s/session（本次会话）, a/always/总是; n/no/否/拒绝
+/// (with the reason after it) or any other text denies, the text being the reason.
 fn reply(answer: &str) -> Reply {
     let answer = answer.trim();
     match answer.to_lowercase().as_str() {
         "y" | "yes" | "是" | "允许" => return Reply::Yes,
+        "s" | "session" | "本次会话" => return Reply::Session,
         "a" | "always" | "总是" => return Reply::Always,
+        "" => return Reply::No(None),
         _ => {}
     }
     for word in ["no", "n", "否", "拒绝"] {
@@ -368,7 +429,8 @@ fn reply(answer: &str) -> Reply {
             return Reply::No((!reason.is_empty()).then(|| reason.to_owned()));
         }
     }
-    Reply::No(None)
+    // Anything else typed is what the user wants instead.
+    Reply::No(Some(answer.to_owned()))
 }
 
 fn poisoned() -> Error {
@@ -484,11 +546,66 @@ mod tests {
         assert!(matches!(reply("允许"), Reply::Yes));
         assert!(matches!(reply("总是"), Reply::Always));
         assert!(matches!(reply(""), Reply::No(None)));
-        assert!(matches!(reply("nope"), Reply::No(None)));
+        assert!(matches!(reply("s"), Reply::Session));
+        // Text that is no choice is what the user wants instead.
+        assert!(matches!(reply("先别推送"), Reply::No(Some(reason)) if reason == "先别推送"));
         assert!(
             matches!(reply("n use the test script instead"), Reply::No(Some(reason)) if reason == "use the test script instead")
         );
         assert!(matches!(reply("拒绝：先备份"), Reply::No(Some(reason)) if reason == "先备份"));
+    }
+
+    struct Answers(std::sync::Mutex<Vec<String>>, std::sync::Mutex<Vec<String>>);
+
+    impl UserInput for Answers {
+        fn answer(
+            &self,
+            prompt: String,
+            _: CancellationToken,
+        ) -> futures_util::future::BoxFuture<'_, Result<String>> {
+            self.1.lock().unwrap().push(prompt);
+            let answer = self.0.lock().unwrap().remove(0);
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    #[tokio::test]
+    async fn this_session_choice_stops_asking_and_names_what_it_covers() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["s".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        let push = || Effect::Shell("git push origin main".into());
+        permissions
+            .authorize(push(), CancellationToken::new())
+            .await
+            .unwrap();
+        // Asked once; the second push goes through on the session rule.
+        permissions
+            .authorize(push(), CancellationToken::new())
+            .await
+            .unwrap();
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("1. 允许这一次 (y)"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains("2. 本次会话不再询问 (s) - git 常规操作"),
+            "{}",
+            prompts[0]
+        );
+        // No policies file: nothing can be remembered beyond the session.
+        assert!(
+            !prompts[0].contains("本项目以后都不再询问"),
+            "{}",
+            prompts[0]
+        );
+        assert!(prompts[0].trim_end().ends_with("[y/s/N]"), "{}", prompts[0]);
     }
 
     fn decide_posix(mode: Mode, effect: Effect) -> Decision {

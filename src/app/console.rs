@@ -56,6 +56,47 @@ pub enum Input {
 
 static CONSOLE: OnceLock<Arc<Console>> = OnceLock::new();
 
+/// How full the context is and what the session has used, for the usage row.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Meter {
+    /// Tokens of the conversation as the model sees it.
+    pub context: u64,
+    pub window: u64,
+    /// Where the automatic compaction starts.
+    pub compact_at: u64,
+    /// Tokens the session has used, input and output.
+    pub session: u64,
+    pub cost: Option<f64>,
+}
+
+impl Meter {
+    /// The row and whether the context nears the compaction point (from 80% of it).
+    pub fn row(&self) -> Option<(String, bool)> {
+        use crate::app::render::short_count;
+        if self.window == 0 {
+            return None;
+        }
+        let percent = self.context * 100 / self.window;
+        let mut row = format!(
+            "  上下文 {}/{}（{percent}%）· 本会话 {} tokens",
+            short_count(self.context),
+            short_count(self.window),
+            short_count(self.session)
+        );
+        if let Some(cost) = self.cost {
+            row.push_str(&format!(" · ${cost:.2}"));
+        }
+        let near = self.compact_at > 0 && self.context * 5 >= self.compact_at * 4;
+        if near {
+            row.push_str(&format!(
+                " · 快到 {} 自动压缩了，可先输入 /compact",
+                short_count(self.compact_at)
+            ));
+        }
+        Some((row, near))
+    }
+}
+
 /// Status-row spinner frames; Braille dots where the terminal is known to draw them.
 static SPINNER: LazyLock<&'static [&'static str]> = LazyLock::new(|| {
     let modern = ["WT_SESSION", "TERM_PROGRAM", "VSCODE_PID", "WEZTERM_PANE"]
@@ -228,11 +269,35 @@ impl Console {
         }
     }
 
-    /// Tokens a model call of the running task used.
+    /// Tokens a model call of the running task used; `input` (with cache) is also
+    /// how full the context was for that call.
     pub fn add_tokens(&self, input: u64, output: u64) {
         let mut state = self.lock();
         state.tokens.0 += input;
         state.tokens.1 += output;
+        state.meter.context = input;
+        state.meter.session += input + output;
+        state.redraw();
+    }
+
+    /// The usage row: `context` only when the history was rebuilt (start, compaction,
+    /// another session); otherwise the size the last model call reported stays.
+    pub fn set_meter(
+        &self,
+        context: Option<u64>,
+        window: u64,
+        compact_at: u64,
+        session: u64,
+        cost: Option<f64>,
+    ) {
+        let mut state = self.lock();
+        if let Some(context) = context {
+            state.meter.context = context;
+        }
+        state.meter.window = window;
+        state.meter.compact_at = compact_at;
+        state.meter.session = session;
+        state.meter.cost = cost;
         state.redraw();
     }
 
@@ -546,6 +611,8 @@ struct State {
     tokens: (u64, u64),
     /// The spinner frame last drawn.
     frame: u64,
+    /// Context and session usage, shown on a row of its own.
+    meter: Meter,
     hint: Option<String>,
     /// What Esc cleared; Ctrl+Z puts it back.
     cleared: Option<Vec<char>>,
@@ -586,6 +653,7 @@ impl State {
             activity: String::new(),
             tokens: (0, 0),
             frame: 0,
+            meter: Meter::default(),
             hint: None,
             cleared: None,
             drawn: None,
@@ -1318,6 +1386,10 @@ impl State {
         let mut screen = Screen::new(columns);
         if let Some(status) = self.status() {
             screen.text(&self.style("2", &clip(&status, columns - 1)));
+            screen.newline();
+        }
+        if let Some((meter, near)) = self.meter.row() {
+            screen.text(&self.style(if near { "33" } else { "2" }, &clip(&meter, columns - 1)));
             screen.newline();
         }
         let cursor = if let Some(search) = &self.search {
@@ -2106,6 +2178,31 @@ fn enable_virtual_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_usage_row_names_context_session_and_when_to_compact() {
+        let mut meter = Meter {
+            context: 52_100,
+            window: 200_000,
+            compact_at: 127_500,
+            session: 1_250_000,
+            cost: Some(3.2),
+        };
+        assert_eq!(
+            meter.row(),
+            Some((
+                "  上下文 52.1k/200k（26%）· 本会话 1.2M tokens · $3.20".into(),
+                false
+            ))
+        );
+        meter.context = 110_000;
+        let (row, near) = meter.row().unwrap();
+        assert!(
+            near && row.ends_with("快到 127.5k 自动压缩了，可先输入 /compact"),
+            "{row}"
+        );
+        assert_eq!(Meter::default().row(), None);
+    }
 
     fn state() -> (State, mpsc::UnboundedReceiver<Input>) {
         let (sender, receiver) = mpsc::unbounded_channel();

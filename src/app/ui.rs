@@ -63,17 +63,23 @@ fn approval_box(prompt: &str) -> String {
             out.push_str(&format!("\x1b[33m┌\x1b[0m \x1b[1;33m{line}\x1b[0m\n"));
         } else if line.starts_with("警告") {
             out.push_str(&format!("\x1b[33m│\x1b[0m \x1b[31m{line}\x1b[0m\n"));
+        } else if line.split_once(". ").is_some_and(|(number, _)| {
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        }) {
+            // Choice rows stay plain at the line start: the console reads them as the
+            // options Up/Down walk. Only the part after " - " is dimmed.
+            let (choice, covers) = line.split_once(" - ").unwrap_or((line, ""));
+            if covers.is_empty() {
+                out.push_str(&format!("  {choice}\n"));
+            } else {
+                out.push_str(&format!("  {choice} - \x1b[2m{covers}\x1b[0m\n"));
+            }
         } else {
             out.push_str(&format!("\x1b[33m│\x1b[0m {line}\n"));
         }
     }
-    let always = if tail.contains("a=") {
-        "a 本项目内总是允许 · "
-    } else {
-        ""
-    };
     out.push_str(&format!(
-        "\x1b[33m└\x1b[0m \x1b[2my 允许 · {always}回车 拒绝 · n 加理由：拒绝并告诉模型原因\x1b[0m\n{tail}"
+        "\x1b[33m└\x1b[0m \x1b[2m按 y/s/a 直接选，或上下键选择后回车；直接回车 = 拒绝\x1b[0m\n{tail}"
     ));
     out
 }

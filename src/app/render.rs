@@ -294,12 +294,15 @@ pub fn report(
     )
 }
 
+/// `52.1k`, `200k`, `1.2M`.
 pub fn short_count(count: u64) -> String {
-    match count {
-        0..1000 => count.to_string(),
-        1000..1_000_000 => format!("{:.1}k", count as f64 / 1000.0),
-        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
-    }
+    let (value, unit) = match count {
+        0..1000 => return count.to_string(),
+        1000..1_000_000 => (count as f64 / 1000.0, "k"),
+        _ => (count as f64 / 1_000_000.0, "M"),
+    };
+    let text = format!("{value:.1}");
+    format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
 }
 
 pub fn duration(seconds: f64) -> String {

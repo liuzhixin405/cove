@@ -70,6 +70,39 @@ pub fn auto_approvable(command: &str, dialect: Dialect) -> bool {
     matches!(category, Category::Safe | Category::Build) && !line.commands().any(fetches)
 }
 
+/// Git steps that stay in the local repository and can be undone (`add`, `commit`,
+/// `tag`), alone or with read-only commands: no approval in default or auto mode.
+/// Push and anything forced, deleting or rewriting still asks.
+pub fn local_git(command: &str, dialect: Dialect) -> bool {
+    const LOCAL: &[&str] = &["add", "commit", "tag"];
+    let (category, line) = classify_parsed(command, dialect);
+    if category > Category::Git || !line.opaque.is_empty() {
+        return false;
+    }
+    let git = group("git");
+    let mut any = false;
+    for simple in line.commands() {
+        if classify_simple(simple, dialect) == Category::Safe && !fetches(simple) {
+            continue;
+        }
+        let words = simple.argv();
+        let local = words
+            .first()
+            .is_some_and(|program| shell::program_name(program) == "git")
+            && git_subcommand(&words[1..]).is_some_and(|(sub, _)| LOCAL.contains(&sub))
+            && git.is_some_and(|group| group.covers(&words))
+            && simple
+                .redirects
+                .iter()
+                .all(|r| r.op.starts_with('<') || discards(&r.target));
+        if !local {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 fn fetches(simple: &Simple) -> bool {
     simple.words.first().is_some_and(|word| {
         matches!(
@@ -928,6 +961,37 @@ mod tests {
             "env",
         ] {
             assert_ne!(posix(command), Category::Safe, "{command}");
+        }
+    }
+
+    #[test]
+    fn local_git_steps_need_no_approval_but_push_and_forcing_do() {
+        let local = |command| local_git(command, Dialect::Posix);
+        for command in [
+            "git add -A",
+            "git add src/a.rs && git commit -m 'fix: x'",
+            "git commit -am wip",
+            "git tag v1.2.0",
+            "git tag -a v1.2.0 -m release",
+            "git status && git add . && git commit -m x && git log --oneline -3",
+        ] {
+            assert!(local(command), "{command}");
+        }
+        for command in [
+            "git push",
+            "git commit -m x && git push origin main",
+            "git push --tags",
+            "git tag -d v1",
+            "git tag -f v1",
+            "git add -f build/out.txt",
+            "git add -p",
+            "git reset --hard",
+            "git commit -m \"$(cat msg.txt)\"",
+            "git commit -m x > log.txt",
+            "git status",
+            "rm -rf x && git add .",
+        ] {
+            assert!(!local(command), "{command}");
         }
     }
 

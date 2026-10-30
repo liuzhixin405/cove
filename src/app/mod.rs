@@ -426,6 +426,7 @@ impl Application {
     async fn repl_loop(&mut self, reader: &mut ReplInput) -> Result<()> {
         // The banner carries its own styles; print_text would show them as text.
         crate::app::console::write(true, &self.banner())?;
+        self.refresh_meter(true);
         if self.session.has_conversation() {
             crate::commands::sessions::show_conversation(&self.session)?;
         } else if let Some(notice) = crate::commands::sessions::startup_notice(self) {
@@ -507,6 +508,11 @@ impl Application {
             if let Some(console) = console {
                 console.set_busy(true);
             }
+            let before = (
+                self.session.id.clone(),
+                self.session.compactions,
+                self.session.messages.len(),
+            );
             let result = if line == "/" {
                 // A bare `/` asks for the command list.
                 self.command("/help").await
@@ -520,6 +526,12 @@ impl Application {
             if let Some(console) = console {
                 console.set_busy(false);
             }
+            // Another session, a compaction or a shorter history: estimate again.
+            self.refresh_meter(
+                before.0 != self.session.id
+                    || before.1 != self.session.compactions
+                    || self.session.messages.len() < before.2,
+            );
             match result {
                 Ok(true) => break,
                 Ok(false) => {}
@@ -596,6 +608,34 @@ pub(crate) struct Application {
 }
 
 impl Application {
+    /// Updates the console's usage row. `rebuilt`: the history changed in a way the
+    /// last model call does not reflect (start, compaction, another session), so the
+    /// context is estimated: messages, system prompt and tool definitions.
+    pub(crate) fn refresh_meter(&self, rebuilt: bool) {
+        let Some(console) = crate::app::console::active() else {
+            return;
+        };
+        let context = rebuilt.then(|| {
+            use crate::engine::context::{text_tokens, tokens};
+            let tools: usize = self
+                .tools
+                .definitions()
+                .iter()
+                .map(|tool| text_tokens(&tool.description) + text_tokens(&tool.schema.to_string()))
+                .sum();
+            (tokens(&self.session.messages) + text_tokens(&self.agent.system_prompt()) + tools)
+                as u64
+        });
+        let usage = &self.session.accounting.usage;
+        console.set_meter(
+            context,
+            self.settings.context_window as u64,
+            (self.settings.context_tokens * 3 / 4) as u64,
+            usage.input + usage.output + usage.cache_read + usage.cache_write,
+            self.session.accounting.cost,
+        );
+    }
+
     /// Provider for cheap background calls (summaries, memory extraction, reviews):
     /// the `model_fast` model when configured, else the main model.
     #[allow(dead_code)] // Shared contract for background callers.
@@ -1002,7 +1042,7 @@ impl Application {
         }
         if report.tools_failed > 0 {
             return Err(Error::Tool(format!(
-                "任务已结束，但有 {} 个工具调用失败；请查看上面的 [failed] 行（/expand <n> 看完整输出），需要时让模型重试",
+                "任务已结束，但有 {} 个工具调用失败；请查看上面标红的工具结果（/expand <n> 看完整输出），需要时让模型重试",
                 report.tools_failed
             )));
         }
