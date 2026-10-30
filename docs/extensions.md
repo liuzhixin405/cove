@@ -1,6 +1,6 @@
 # 扩展使用说明
 
-当前版本：0.3.1。扩展复用同一条工具调用、权限、取消、限额和持久化路径，不另建 Agent 平台。本文说明配置文件中的 `extensions` 对象和对应的模型工具；`hooks.json`、`<data_dir>/plugins/` 下的插件、技能市场和项目信任的使用方式见 [技术参考](reference.md#扩展skills插件hooksmcp-与项目信任)。下文的 `<data_dir>` 默认是 `~/.cove`。
+当前版本：0.3.2。扩展复用同一条工具调用、权限、取消、限额和持久化路径，不另建 Agent 平台。本文说明配置文件中的 `extensions` 对象和对应的模型工具；`hooks.json`、`<data_dir>/plugins/` 下的插件、技能市场和项目信任的使用方式见 [技术参考](reference.md#扩展skills插件hooksmcp-与项目信任)。下文的 `<data_dir>` 默认是 `~/.cove`。
 
 ## 1. 配置与信任
 
