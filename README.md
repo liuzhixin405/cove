@@ -184,3 +184,4 @@ Get-Content error.log | cove -p "这个报错是什么原因"   # 把管道内�
 - [技术参考](docs/reference.md)：所有功能、命令、配置项和行为细节
 - [扩展使用说明](docs/extensions.md)：MCP、技能、Hooks、插件的完整配置
 - [架构设计](docs/design.md)：模块划分与实现原理
+- [性能说明](docs/performance.md)：已有提速机制、优化候选和测量口径
