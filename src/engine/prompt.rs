@@ -329,7 +329,13 @@ pub trait TurnNote: Send + Sync {
 /// Git branch, short status and recent commits, repeated only when they change.
 pub struct GitNote {
     cwd: PathBuf,
-    last: Mutex<Option<String>>,
+    last: Mutex<Option<GitNoteState>>,
+}
+
+struct GitNoteState {
+    signature: String,
+    head: String,
+    recent: String,
 }
 
 impl GitNote {
@@ -341,9 +347,37 @@ impl GitNote {
     }
 
     fn state(&self) -> Option<String> {
-        let branch = git_branch(&self.cwd)?;
-        let status = git(&self.cwd, &["status", "--porcelain"]).unwrap_or_default();
-        let lines: Vec<&str> = status.lines().collect();
+        // Porcelain v2 includes branch and HEAD in the same query as the worktree status.
+        // Avoid three git process launches for every new task, and only read the recent log
+        // when HEAD changes.
+        let status = git(&self.cwd, &["status", "--porcelain=v2", "--branch"])?;
+        let mut branch = "HEAD (detached)";
+        let mut head = String::new();
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("# branch.head ") {
+                if value != "(detached)" {
+                    branch = value;
+                }
+            } else if let Some(value) = line.strip_prefix("# branch.oid ") {
+                head = value.to_owned();
+            }
+        }
+        let signature = status.clone();
+        let mut last = self.last.lock().ok()?;
+        if last
+            .as_ref()
+            .is_some_and(|previous| previous.signature == signature)
+        {
+            return None;
+        }
+        let recent = match last.as_ref().filter(|previous| previous.head == head) {
+            Some(previous) => previous.recent.clone(),
+            None => git(&self.cwd, &["log", "--oneline", "-5"]).unwrap_or_default(),
+        };
+        let lines: Vec<&str> = status
+            .lines()
+            .filter(|line| !line.starts_with("# "))
+            .collect();
         let mut out = format!("Git branch: {branch}\n");
         if lines.is_empty() {
             out.push_str("Working tree: clean\n");
@@ -356,13 +390,17 @@ impl GitNote {
                 out.push_str(&format!("  ... {} more\n", lines.len() - 15));
             }
         }
-        if let Some(log) = git(&self.cwd, &["log", "--oneline", "-5"]).filter(|log| !log.is_empty())
-        {
+        if !recent.is_empty() {
             out.push_str("Recent commits:\n");
-            for line in log.lines() {
+            for line in recent.lines() {
                 out.push_str(&format!("  {line}\n"));
             }
         }
+        *last = Some(GitNoteState {
+            signature,
+            head,
+            recent,
+        });
         Some(out)
     }
 }
@@ -370,11 +408,6 @@ impl GitNote {
 impl TurnNote for GitNote {
     fn note(&self) -> Option<String> {
         let state = self.state()?;
-        let mut last = self.last.lock().ok()?;
-        if last.as_deref() == Some(state.as_str()) {
-            return None;
-        }
-        *last = Some(state.clone());
         Some(format!("<environment>\n{state}</environment>"))
     }
 }
@@ -430,6 +463,6 @@ mod tests {
         assert!(first.contains("Working tree: clean"), "{first}");
         assert!(note.note().is_none());
         std::fs::write(root.path().join("new.txt"), "x").unwrap();
-        assert!(note.note().unwrap().contains("?? new.txt"));
+        assert!(note.note().unwrap().contains("? new.txt"));
     }
 }
