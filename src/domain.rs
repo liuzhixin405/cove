@@ -110,6 +110,8 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_output_tokens: u32,
+    /// Reuses an estimate already computed by the agent loop for limit checks.
+    pub estimated_tokens: Option<usize>,
     /// Model for this request; `None` lets the provider (or router) choose.
     pub model: Option<String>,
 }

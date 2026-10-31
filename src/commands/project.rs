@@ -328,6 +328,7 @@ async fn draft_with_model(
         messages: vec![Message::user(onboarding::prompt(target, digest))],
         tools: Vec::new(),
         max_output_tokens: app.settings.max_output_tokens.min(4096),
+        estimated_tokens: None,
         model: None,
     };
     let (events, mut receiver) = mpsc::channel(64);

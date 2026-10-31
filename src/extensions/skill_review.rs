@@ -198,6 +198,7 @@ impl TurnHook for SkillReview {
                     messages: vec![Message::user(text)],
                     tools: Vec::new(),
                     max_output_tokens: self.max_output_tokens,
+                    estimated_tokens: None,
                     model: None,
                 }
             };

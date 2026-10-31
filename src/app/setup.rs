@@ -177,6 +177,7 @@ pub async fn verify(
         messages: vec![Message::user("reply ok")],
         tools: Vec::new(),
         max_output_tokens: 256,
+        estimated_tokens: None,
         model: None,
     };
     let result = tokio::time::timeout(

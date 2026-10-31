@@ -1456,6 +1456,7 @@ mod tests {
                 schema: json!({"type":"object"}),
             }],
             max_output_tokens: 100,
+            estimated_tokens: None,
             model: None,
         }
     }

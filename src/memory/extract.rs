@@ -327,6 +327,7 @@ async fn run(
                 messages: vec![Message::user(prompt)],
                 tools: Vec::new(),
                 max_output_tokens,
+                estimated_tokens: None,
                 model: None,
             },
             events,

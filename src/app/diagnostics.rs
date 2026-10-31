@@ -502,7 +502,9 @@ impl Provider for Traced {
                     .system
                     .starts_with(crate::engine::agent::COMPACT_SYSTEM_PREFIX);
             let messages = request.messages.len();
-            let est_tokens = crate::engine::context::tokens(&request.messages);
+            let est_tokens = request
+                .estimated_tokens
+                .unwrap_or_else(|| crate::engine::context::tokens(&request.messages));
             let tools = request.tools.len();
             let started = Instant::now();
             let result = self.inner.stream(request, events, cancel.clone()).await;
