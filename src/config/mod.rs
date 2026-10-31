@@ -1209,6 +1209,7 @@ mod tests {
         .unwrap();
         assert_eq!(bedrock.max_budget_usd, Some(500.0));
         assert_eq!(bedrock.max_output_tokens, Some(16000));
+        assert_eq!(bedrock.thinking.as_deref(), Some("adaptive"));
         assert_eq!(file.resolve(None).unwrap().0.as_deref(), Some("deepseek"));
     }
 

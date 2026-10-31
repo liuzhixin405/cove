@@ -40,6 +40,7 @@
     "bedrock": {
       "model": "anthropic.claude-sonnet-5",
       "model_fast": "anthropic.claude-sonnet-5",
+      "thinking": "adaptive",
       "thinking_tokens": 16000,
       "provider": {
         "name": "bedrock",
