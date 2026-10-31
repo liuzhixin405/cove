@@ -387,7 +387,21 @@ impl Permissions {
 
 /// What "don't ask again" will let through, in the user's words.
 fn scope_label(rule: &PolicyRule) -> String {
-    if rule.command_group == "git" {
+    if !rule.command_endpoint.is_empty() {
+        format!(
+            "本地模型接口 {}（结果只写入 {}）",
+            rule.command_endpoint, rule.command_output
+        )
+    } else if !rule.command_directory.is_empty() {
+        format!(
+            "目录 {} 下程序的只读 --help/--version 查询",
+            rule.command_directory
+        )
+    } else if !rule.command_executable.is_empty() {
+        format!("程序 {} 的后续调用（参数可变）", rule.command_executable)
+    } else if !rule.command_exact.is_empty() {
+        "完全相同的这条 Shell 命令".into()
+    } else if rule.command_group == "git" {
         "git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）".into()
     } else if !rule.command_group.is_empty() {
         format!("{} 的常规命令（build、test 等）", rule.command_group)
@@ -606,6 +620,178 @@ mod tests {
             prompts[0]
         );
         assert!(prompts[0].trim_end().ends_with("[y/s/N]"), "{}", prompts[0]);
+    }
+
+    #[tokio::test]
+    async fn exact_session_approval_reuses_only_the_identical_compound_command() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        let command = r#""/d/tools/llama-server.exe" --list --devices"#;
+        permissions
+            .authorize(Effect::Shell(command.into()), CancellationToken::new())
+            .await
+            .unwrap();
+        // The same command does not ask again.
+        permissions
+            .authorize(Effect::Shell(command.into()), CancellationToken::new())
+            .await
+            .unwrap();
+        // A changed pipeline is a new command and still asks.
+        assert!(
+            permissions
+                .authorize(
+                    Effect::Shell(r#""/d/tools/llama-server.exe" --list --devices; rm x"#.into()),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].contains("程序 /d/tools/llama-server.exe 的后续调用（参数可变）"),
+            "{}",
+            prompts[0]
+        );
+        assert!(prompts[0].trim_end().ends_with("[y/s/N]"), "{}", prompts[0]);
+    }
+
+    #[tokio::test]
+    async fn local_completion_session_approval_allows_new_prompts_to_the_same_target() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        let command = |prompt: &str, output: &str| {
+            format!(
+                "curl -s http://127.0.0.1:9931/completion -H \"Content-Type: application/json\" -d '{{\"prompt\":\"{prompt}\",\"n_predict\":64}}' > {output}; cat {output}"
+            )
+        };
+        permissions
+            .authorize(
+                Effect::Shell(command("Hello", "/tmp/llama_timing.json")),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        permissions
+            .authorize(
+                Effect::Shell(command("Summarize", "/tmp/llama_timing.json")),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            permissions
+                .authorize(
+                    Effect::Shell(command("Summarize", "/tmp/other.json")),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("本地模型接口 http://127.0.0.1:9931/completion"));
+        assert!(prompts[0].contains("结果只写入 /tmp/llama_timing.json"));
+    }
+
+    #[tokio::test]
+    async fn help_query_session_approval_covers_binaries_in_that_directory() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        permissions
+            .authorize(
+                Effect::Shell(
+                    r#"cd "/d/llama" && ./llama-bench.exe --help 2>&1 | head -200"#.into(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        permissions
+            .authorize(
+                Effect::Shell(
+                    r#"cd "/d/llama" && ./llama-server.exe --help 2>&1 | head -100"#.into(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            permissions
+                .authorize(
+                    Effect::Shell(r#"cd "/d/other" && ./llama-server.exe --help"#.into()),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("目录 /d/llama 下程序的只读 --help/--version 查询"));
+    }
+
+    #[tokio::test]
+    async fn executable_session_approval_reuses_only_the_same_program_path() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        permissions
+            .authorize(
+                Effect::Shell(r#"cd "/d/llama" && ./llama-fit-params.exe -ub 128"#.into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        permissions
+            .authorize(
+                Effect::Shell(r#"cd "/d/llama" && ./llama-fit-params.exe -ub 256"#.into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            permissions
+                .authorize(
+                    Effect::Shell(r#"cd "/d/llama" && ./llama-bench.exe --help"#.into()),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("程序 /d/llama/llama-fit-params.exe 的后续调用（参数可变）"));
     }
 
     fn decide_posix(mode: Mode, effect: Effect) -> Decision {

@@ -991,7 +991,7 @@ impl State {
         } else if self.ask.is_some() {
             self.end_ask(Err(Error::Cancelled));
         } else if self.busy {
-            self.notice("[interrupted] 正在停止任务；之后用 /continue 接着做\n");
+            self.notice("[interrupted] 正在停止任务；之后输入 /continue\n");
             return Action::Interrupt;
         } else {
             self.hint = Some("输入 /exit 或按 Ctrl+D 退出".into());
@@ -1016,7 +1016,7 @@ impl State {
                 .take()
                 .is_some_and(|at| at.elapsed() <= ESC_WINDOW)
             {
-                self.notice("[interrupted] 正在停止任务；之后用 /continue 接着做\n");
+                self.notice("[interrupted] 正在停止任务；之后输入 /continue\n");
                 return Action::Interrupt;
             }
             self.esc_armed = Some(Instant::now());

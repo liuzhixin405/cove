@@ -700,7 +700,7 @@ impl Agent {
                 || matches!(session.state, State::Running | State::Interrupted(_))
             {
                 return Err(Error::Session(
-                    "上一个任务还没完成：输入 /continue 接着做，或输入 /new 开启新会话".into(),
+                    "上一个任务还没完成：输入 /continue，或输入 /new 开启新会话".into(),
                 ));
             }
             if prompt.trim().is_empty() {
@@ -1411,6 +1411,7 @@ impl Agent {
              Match verification cost to the change: documentation or prompt-text-only edits need focused diff/format checks, not a full build or test suite; use targeted tests for narrow code changes and the full suite only when the change or user request justifies it. \
              For routine Git tasks, batch independent read-only checks in one response and do not repeat successful checks without a changed result. Keep add, commit and push as separate shell calls; only push after commit succeeds, and do not wait for CI unless asked. Do not add Co-authored-by trailers or unrelated refs/tags unless requested. \
              For long-running build/test commands, do not pipe output through tail/head; show live output so progress remains visible. \
+             For large model downloads, identify the exact repository, file, revision and advertised size once; check disk space and any partial file before starting. Use one resumable transfer to a temporary file, avoid parallel or repeated retries while it is running, and verify size/hash before renaming it into place. After repeated TLS/network failures, stop and report the evidence instead of cycling download commands. \
              Git: stage with git add, then run git commit -m \"...\" as a shell call of its own (no chaining, cd or $(...) in it); push and tag in separate calls. \
              When finished, summarize actual changes and evidence briefly.",
             crate::process::Shell::current().dialect(),

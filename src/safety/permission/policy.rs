@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, path::Path};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Effect, classify,
+    Effect, classify, safety,
     shell::{self, Dialect},
 };
 use crate::domain::{Error, Result};
@@ -43,6 +43,20 @@ pub struct PolicyRule {
     /// Shell: the command starts with these words (each simple command, for allow).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command_prefix: String,
+    /// Shell: the complete command line must match exactly (for explicit approvals).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_exact: String,
+    /// Shell: local model completion endpoint plus its fixed output file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_output: String,
+    /// Shell: read-only help/version probes of executables in one directory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_directory: String,
+    /// Shell: invocations of one executable at a fixed path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_executable: String,
     /// Shell: a routine group (`git`, `cargo`, `npm`, `go`, `dotnet`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command_group: String,
@@ -194,6 +208,31 @@ impl PolicyRule {
         }
         let action = self.action();
         if let Effect::Shell(command) = effect {
+            if !self.command_executable.is_empty()
+                && external_executable(command, dialect, Path::new(&self.scope)).as_deref()
+                    != Some(self.command_executable.as_str())
+            {
+                return false;
+            }
+            if !self.command_directory.is_empty()
+                && external_help_directory(command, dialect).as_deref()
+                    != Some(self.command_directory.as_str())
+            {
+                return false;
+            }
+            if !self.command_endpoint.is_empty()
+                && !local_completion_request(
+                    command,
+                    dialect,
+                    &self.command_endpoint,
+                    &self.command_output,
+                )
+            {
+                return false;
+            }
+            if !self.command_exact.is_empty() && command != &self.command_exact {
+                return false;
+            }
             if !self.command_prefix.is_empty() {
                 let prefix: Vec<&str> = self.command_prefix.split_whitespace().collect();
                 return simple_commands(command)
@@ -337,18 +376,67 @@ pub fn remember_rule(effect: &Effect, project: &Path, dialect: Dialect) -> Optio
                 rule.description = group.label.into();
                 return Some(rule);
             }
+            if let Some((endpoint, output)) = local_completion(command, dialect) {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(format!("{endpoint}\n{output}").as_bytes());
+                let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                rule.command_endpoint = endpoint;
+                rule.command_output = output;
+                rule.id = format!("allow-shell-local-completion-{suffix}");
+                rule.description = "local model completion request".into();
+                return Some(rule);
+            }
+            if let Some(directory) = external_help_directory(command, dialect) {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(directory.as_bytes());
+                let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                rule.command_directory = directory;
+                rule.id = format!("allow-shell-help-directory-{suffix}");
+                rule.description = "read-only help and version queries in one directory".into();
+                return Some(rule);
+            }
+            if let Some(executable) = external_executable(command, dialect, project) {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(executable.as_bytes());
+                let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                rule.command_executable = executable;
+                rule.id = format!("allow-shell-executable-{suffix}");
+                rule.description = "one external executable".into();
+                return Some(rule);
+            }
             let line = shell::parse(command, dialect);
             let commands: Vec<_> = line.commands().collect();
             let category = classify::classify(command, dialect);
-            if !line.opaque.is_empty()
-                || commands.len() != 1
-                || matches!(category, classify::Category::Dangerous)
-            {
+            if matches!(category, classify::Category::Dangerous) {
                 return None;
+            }
+            if !line.opaque.is_empty()
+                || commands.is_empty()
+                || commands
+                    .iter()
+                    .any(|simple| simple.words.iter().any(|word| word.dynamic))
+            {
+                // Parsing uncertainty must never create a reusable family rule, but an
+                // explicit user choice may remember this exact line if it has no secrets.
+                return exact_shell_rule(&mut rule, command);
+            }
+            if commands.len() != 1
+                || commands[0]
+                    .words
+                    .first()
+                    .is_some_and(|word| word.text.contains(['/', '\\']))
+            {
+                return exact_shell_rule(&mut rule, command);
             }
             let words = commands[0].argv();
             if words.iter().any(|w| w.contains(['/', '\\'])) && words.len() == 1 {
                 return None;
+            }
+            if !matches!(
+                category,
+                classify::Category::Safe | classify::Category::Build
+            ) {
+                return exact_shell_rule(&mut rule, command);
             }
             // Program and its subcommand: `make test`, `cargo nextest`, `pytest`.
             let mut prefix = vec![words[0]];
@@ -376,6 +464,332 @@ pub fn remember_rule(effect: &Effect, project: &Path, dialect: Dialect) -> Optio
         }
         Effect::Process(_) | Effect::Read => None,
     }
+}
+
+/// Exact-line memory is safe for opaque commands because it never generalizes their
+/// parsed structure. Avoid storing likely credentials or excessively large scripts.
+fn exact_shell_rule(rule: &mut PolicyRule, command: &str) -> Option<PolicyRule> {
+    if command.is_empty() || command.len() > 8192 || !safety::secrets(command).is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(command.as_bytes());
+    let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    rule.command_exact = command.to_owned();
+    rule.id = format!("allow-shell-exact-{suffix}");
+    rule.description = "exact shell command".into();
+    Some(rule.clone())
+}
+
+/// Recognizes a narrowly scoped local inference request. The prompt body may change,
+/// while the loopback endpoint and output path remain fixed. No other shell steps,
+/// headers, methods, or output destinations are covered.
+fn local_completion(command: &str, dialect: Dialect) -> Option<(String, String)> {
+    let line = shell::parse(command, dialect);
+    if !line.opaque.is_empty()
+        || !(line.pipelines.len() == 1 || line.pipelines.len() == 2)
+        || line.pipelines.iter().any(|pipeline| pipeline.len() != 1)
+    {
+        return None;
+    }
+    let request = &line.pipelines[0][0];
+    if request.words.iter().any(|word| word.dynamic) {
+        return None;
+    }
+    let words = request.argv();
+    if words
+        .first()
+        .is_none_or(|word| shell::program_name(word) != "curl")
+    {
+        return None;
+    }
+    let mut endpoint = None;
+    let mut json_body = None;
+    let mut index = 1;
+    while index < words.len() {
+        match words[index] {
+            "-s" | "--silent" => index += 1,
+            "-H" | "--header" => {
+                let value = *words.get(index + 1)?;
+                if !value.eq_ignore_ascii_case("content-type: application/json") {
+                    return None;
+                }
+                index += 2;
+            }
+            "-d" | "--data" | "--data-raw" => {
+                if json_body.replace(*words.get(index + 1)?).is_some() {
+                    return None;
+                }
+                index += 2;
+            }
+            value if value.starts_with("http://") => {
+                if endpoint.replace(value).is_some() {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    let body = json_body?;
+    if !serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .is_object()
+    {
+        return None;
+    }
+    let url = url::Url::parse(endpoint?).ok()?;
+    let loopback = match url.host()? {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+    };
+    if !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.path(),
+            "/completion" | "/v1/completions" | "/v1/chat/completions"
+        )
+    {
+        return None;
+    }
+    let output = match request.redirects.as_slice() {
+        [redirect] if redirect.op == ">" && !redirect.target.is_empty() => redirect.target.clone(),
+        _ => return None,
+    };
+    if line.pipelines.len() == 2 {
+        let readback = &line.pipelines[1][0];
+        if readback.words.iter().any(|word| word.dynamic)
+            || readback.argv().as_slice() != ["cat", output.as_str()]
+            || !readback.redirects.is_empty()
+        {
+            return None;
+        }
+    }
+    Some((
+        format!("{}{}", url.origin().ascii_serialization(), url.path()),
+        output,
+    ))
+}
+
+fn local_completion_request(command: &str, dialect: Dialect, endpoint: &str, output: &str) -> bool {
+    local_completion(command, dialect).is_some_and(|(actual_endpoint, actual_output)| {
+        actual_endpoint == endpoint && actual_output == output
+    })
+}
+
+/// Finds an external executable's directory when a line only asks for its help or
+/// version and optionally filters that output. No executable arguments are remembered.
+fn external_help_directory(command: &str, dialect: Dialect) -> Option<String> {
+    let line = shell::parse(command, dialect);
+    if !line.opaque.is_empty() || line.pipelines.is_empty() {
+        return None;
+    }
+    let mut working_dir = None;
+    let mut executable_dir = None;
+    let mut executable_count = 0;
+    for simple in line.commands() {
+        if simple.words.iter().any(|word| word.dynamic) {
+            return None;
+        }
+        let words = simple.argv();
+        let Some(program) = words.first() else {
+            return None;
+        };
+        let name = shell::program_name(program);
+        if matches!(name.as_str(), "cd" | "set-location" | "sl") {
+            if working_dir.is_some() || words.len() != 2 || !simple.redirects.is_empty() {
+                return None;
+            }
+            working_dir = Some(normalize_dir(words[1], None)?);
+            continue;
+        }
+        if program.contains(['/', '\\']) {
+            executable_count += 1;
+            if executable_count > 1
+                || words.len() != 2
+                || !matches!(words[1], "--help" | "-h" | "-?" | "--version" | "-V")
+                || simple.redirects.iter().any(|redirect| {
+                    !(redirect.op == ">&"
+                        && (redirect.target.starts_with('&') || redirect.target == "-"))
+                })
+            {
+                return None;
+            }
+            let parent = Path::new(program).parent()?.to_string_lossy().to_string();
+            executable_dir = Some(if program.starts_with("./") || program.starts_with(".\\") {
+                normalize_dir(&parent, working_dir.as_deref())?
+            } else {
+                normalize_dir(&parent, None)?
+            });
+            continue;
+        }
+        if !matches!(
+            name.as_str(),
+            "head"
+                | "tail"
+                | "grep"
+                | "egrep"
+                | "fgrep"
+                | "sed"
+                | "tr"
+                | "cut"
+                | "sort"
+                | "uniq"
+                | "wc"
+        ) || classify::classify_words(&words) != classify::Category::Safe
+            || !simple.redirects.is_empty()
+        {
+            return None;
+        }
+    }
+    if executable_count != 1 {
+        return None;
+    }
+    let executable_dir = executable_dir?;
+    if working_dir
+        .as_deref()
+        .is_some_and(|cwd| !same_dir(cwd, &executable_dir))
+    {
+        return None;
+    }
+    Some(executable_dir)
+}
+
+fn normalize_dir(path: &str, base: Option<&str>) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let absolute = path.starts_with('/')
+        || path
+            .as_bytes()
+            .get(1..3)
+            .is_some_and(|drive| drive[0] == b':' && drive[1] == b'/');
+    if !absolute && base.is_none() {
+        return None;
+    }
+    let combined = if absolute {
+        path
+    } else {
+        format!("{}/{}", base.unwrap().trim_end_matches('/'), path)
+    };
+    let mut parts = Vec::new();
+    for part in combined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    let mut normalized = format!("/{}", parts.join("/"));
+    if cfg!(windows) {
+        normalized = normalized.to_ascii_lowercase();
+    }
+    Some(normalized)
+}
+
+fn same_dir(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+/// Identifies a single external executable invocation, optionally after one literal
+/// `cd`. No compound shell work, pipelines, redirects, or dynamic arguments are saved.
+fn external_executable(command: &str, dialect: Dialect, project: &Path) -> Option<String> {
+    let line = shell::parse(command, dialect);
+    if !line.opaque.is_empty()
+        || !(line.pipelines.len() == 1 || line.pipelines.len() == 2)
+        || line.pipelines.iter().any(|pipeline| pipeline.len() != 1)
+    {
+        return None;
+    }
+    let commands: Vec<_> = line.commands().collect();
+    let (program_command, cwd) = match commands.as_slice() {
+        [command] => (*command, project.to_string_lossy().to_string()),
+        [change_dir, command]
+            if change_dir.argv().first().is_some_and(|program| {
+                matches!(
+                    shell::program_name(program).as_str(),
+                    "cd" | "set-location" | "sl"
+                )
+            }) && change_dir.words.iter().all(|word| !word.dynamic)
+                && change_dir.words.len() == 2
+                && change_dir.redirects.is_empty() =>
+        {
+            (*command, change_dir.argv()[1].to_owned())
+        }
+        _ => return None,
+    };
+    if !program_command.redirects.is_empty()
+        || program_command.words.iter().any(|word| word.dynamic)
+    {
+        return None;
+    }
+    let words = program_command.argv();
+    let program = *words.first()?;
+    if !program.contains(['/', '\\']) {
+        return None;
+    }
+    let basename = program.rsplit(['/', '\\']).next()?;
+    let lower_basename = basename.to_ascii_lowercase();
+    let executable_name = shell::program_name(basename);
+    if matches!(
+        executable_name.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "python"
+            | "python3"
+            | "py"
+            | "node"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+            | "wscript"
+            | "cscript"
+            | "rundll32"
+            | "regsvr32"
+            | "mshta"
+            | "env"
+            | "busybox"
+            | "sudo"
+            | "doas"
+    ) || (cfg!(windows)
+        && !lower_basename.ends_with(".exe")
+        && !lower_basename.ends_with(".com"))
+        || [".bat", ".cmd", ".ps1", ".sh"]
+            .iter()
+            .any(|suffix| lower_basename.ends_with(suffix))
+    {
+        return None;
+    }
+    let parent = Path::new(program).parent()?.to_string_lossy().to_string();
+    let directory = if program.starts_with("./") || program.starts_with(".\\") {
+        normalize_dir(&parent, Some(&normalize_dir(&cwd, None)?))?
+    } else if program.starts_with('/')
+        || program
+            .as_bytes()
+            .get(1..3)
+            .is_some_and(|drive| drive[0] == b':' && drive[1] == b'/' || drive[1] == b'\\')
+    {
+        normalize_dir(&parent, None)?
+    } else {
+        normalize_dir(&parent, Some(&normalize_dir(&cwd, None)?))?
+    };
+    Some(format!("{directory}/{basename}"))
 }
 
 pub fn load(path: &Path) -> Result<Vec<PolicyRule>> {
@@ -505,11 +919,194 @@ mod tests {
         let make = remember_rule(&shell("make test -j4"), project, Dialect::Posix).unwrap();
         assert_eq!(make.command_prefix, "make test");
         assert!(remember_rule(&shell("rm -rf / "), project, Dialect::Posix).is_none());
-        assert!(remember_rule(&shell("a && b"), project, Dialect::Posix).is_none());
+        assert_eq!(
+            remember_rule(&shell("a && b"), project, Dialect::Posix)
+                .unwrap()
+                .command_exact,
+            "a && b"
+        );
         let path = dir.path().join("policies.json");
         append(&path, &make).unwrap();
         let rules = append(&path, &make).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(load(&path).unwrap(), rules);
+    }
+
+    #[test]
+    fn executable_help_approval_covers_only_read_only_queries_in_the_same_directory() {
+        let project = Path::new("/p");
+        let command = r#"cd "/d/tools" && ./llama-server.exe --help 2>&1 | grep -i temp"#;
+        let same_dir = r#"cd "/d/tools" && ./llama-bench.exe --help 2>&1 | head -200"#;
+        let rule = remember_rule(&shell(command), project, Dialect::Posix).unwrap();
+        assert_eq!(rule.command_directory, "/d/tools");
+        let rules = vec![rule];
+        assert_eq!(
+            allow_or_ask(&rules, &shell(same_dir), project, Dialect::Posix),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(r#"cd "/d/other" && ./llama-bench.exe --help 2>&1 | head -200"#),
+                project,
+                Dialect::Posix
+            ),
+            RuleDecision::None
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(same_dir),
+                Path::new("/other"),
+                Dialect::Posix
+            ),
+            RuleDecision::None
+        );
+        for denied in [
+            r#"cd "/d/tools" && ./llama-bench.exe --models"#,
+            r#"cd "/d/tools" && ./llama-bench.exe --help; rm x"#,
+            r#"cd "/d/tools" && ./llama-bench.exe --help > result.txt"#,
+            r#"cd "/d/tools" && ./llama-bench.exe --help $FLAGS"#,
+        ] {
+            assert_eq!(
+                allow_or_ask(&rules, &shell(denied), project, Dialect::Posix),
+                RuleDecision::None,
+                "{denied}"
+            );
+        }
+
+        // Opaque control flow and dynamic variables never get a reusable approval.
+        let loop_rule = remember_rule(
+            &shell("for ub in 128 256; do ./llama-fit-params -ub $ub; done"),
+            project,
+            Dialect::Posix,
+        )
+        .unwrap();
+        assert!(loop_rule.command_prefix.is_empty());
+        assert_eq!(
+            loop_rule.command_exact,
+            "for ub in 128 256; do ./llama-fit-params -ub $ub; done"
+        );
+        assert!(
+            remember_rule(
+                &shell(r#""/d/tool.exe" --token=sk-abcdefghijklmnopqrstuvwxyz0123456789 | grep x"#),
+                project,
+                Dialect::Posix
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn remembered_native_executable_scope_is_path_bound_and_excludes_shell_scripts() {
+        let project = Path::new("/p");
+        let first =
+            r#"cd "/d/llama" && ./llama-fit-params.exe -m models/Qwen.gguf -c 12288 -ub 128"#;
+        let varied =
+            r#"cd "/d/llama" && ./llama-fit-params.exe -m models/Qwen.gguf -c 12288 -ub 256"#;
+        let rule = remember_rule(&shell(first), project, Dialect::Posix).unwrap();
+        assert_eq!(rule.command_executable, "/d/llama/llama-fit-params.exe");
+        let rules = vec![rule];
+        assert_eq!(
+            allow_or_ask(&rules, &shell(varied), project, Dialect::Posix),
+            RuleDecision::Allow
+        );
+        for denied in [
+            r#"cd "/d/llama" && ./llama-other.exe -m models/Qwen.gguf -ub 256"#,
+            r#"cd "/d/other" && ./llama-fit-params.exe -m models/Qwen.gguf -ub 256"#,
+            r#"cd "/d/llama" && ./llama-fit-params.exe -ub $UB"#,
+            r#"cd "/d/llama" && ./llama-fit-params.exe -ub 256 > result.txt"#,
+            r#"cd "/d/llama" && ./llama-fit-params.exe -ub 256 | head"#,
+        ] {
+            assert_eq!(
+                allow_or_ask(&rules, &shell(denied), project, Dialect::Posix),
+                RuleDecision::None,
+                "{denied}"
+            );
+        }
+        for interpreter in [
+            r#"cd "/d/llama" && ./run-params.sh -ub 128"#,
+            r#"cd "/d/llama" && ./python.exe -c "print('hi')""#,
+        ] {
+            let rule = remember_rule(&shell(interpreter), project, Dialect::Posix).unwrap();
+            assert!(rule.command_executable.is_empty());
+            assert_eq!(rule.command_exact, interpreter);
+        }
+    }
+
+    #[test]
+    fn opaque_shell_commands_can_only_be_remembered_as_the_exact_secret_free_line() {
+        let project = Path::new("/p");
+        let command = r#"Get-WinEvent -LogName Application | Where-Object { $_.Message -match 'cove' } | Select-Object -First 10"#;
+        let rule = remember_rule(&shell(command), project, Dialect::PowerShell).unwrap();
+        assert_eq!(rule.command_exact, command);
+        assert_eq!(rule.command_prefix, "");
+        assert_eq!(rule.command_executable, "");
+        let rules = vec![rule];
+        assert_eq!(
+            allow_or_ask(&rules, &shell(command), project, Dialect::PowerShell),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(&command.replace("Application", "System")),
+                project,
+                Dialect::PowerShell
+            ),
+            RuleDecision::None
+        );
+        assert!(
+            remember_rule(
+                &shell(
+                    r#"powershell -Command 'Write-Output sk-abcdefghijklmnopqrstuvwxyz0123456789'"#
+                ),
+                project,
+                Dialect::PowerShell
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn local_completion_approval_covers_only_the_same_endpoint_and_output_file() {
+        let project = Path::new("/p");
+        let first = "curl -s http://127.0.0.1:9931/completion -H \"Content-Type: application/json\" -d '{\"prompt\":\"Hello\",\"n_predict\":64}' > /tmp/llama_timing.json; cat /tmp/llama_timing.json";
+        let varied_body = "curl -s http://127.0.0.1:9931/completion -H \"Content-Type: application/json\" -d '{\"prompt\":\"Summarize\",\"n_predict\":128}' > /tmp/llama_timing.json; cat /tmp/llama_timing.json";
+        let rule = remember_rule(&shell(first), project, Dialect::Posix).unwrap();
+        assert_eq!(rule.command_endpoint, "http://127.0.0.1:9931/completion");
+        assert_eq!(rule.command_output, "/tmp/llama_timing.json");
+        let rules = vec![rule];
+        assert_eq!(
+            allow_or_ask(&rules, &shell(varied_body), project, Dialect::Posix),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(&varied_body.replace("llama_timing.json", "other.json")),
+                project,
+                Dialect::Posix
+            ),
+            RuleDecision::None
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(&varied_body.replace("/completion", "/admin")),
+                project,
+                Dialect::Posix
+            ),
+            RuleDecision::None
+        );
+        assert_eq!(
+            allow_or_ask(
+                &rules,
+                &shell(&format!("{varied_body}; rm x")),
+                project,
+                Dialect::Posix
+            ),
+            RuleDecision::None
+        );
     }
 }

@@ -556,10 +556,14 @@ async fn slash_continue_in_a_new_session_resumes_the_unfinished_task() {
     repl(command, "read the notes\n/exit\n").await;
     let (url, second) =
         mock_server(vec![openai(json!({"content":"notes task done"}), "stop")]).await;
-    let (stdout, stderr) = repl(cli(root.path(), data.path(), &url), "/continue\n/exit\n").await;
+    let (stdout, stderr) = repl(
+        cli(root.path(), data.path(), &url),
+        "/continue\n/continue 1\n/exit\n",
+    )
+    .await;
     assert!(!stderr.contains("no interrupted task"), "{stderr}");
     assert!(
-        stdout.contains("[resume] 回到任务 #1") && stdout.contains("notes task done"),
+        stdout.contains("最近会话") && stdout.contains("notes task done"),
         "{stdout}"
     );
     assert!(

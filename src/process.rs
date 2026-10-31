@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::Path,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -33,12 +39,16 @@ pub struct CommandOutput {
 /// Live display stops after this much per stream; the captured result has its own cap.
 const LIVE_LIMIT: usize = 256 * 1024;
 const LIVE_LINE: usize = 4096;
+const LIVE_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Splits a stream into display lines for `Progress`.
 struct Live {
     progress: Arc<Progress>,
     stderr: bool,
     pending: Vec<u8>,
+    skip_lf: bool,
+    latest_progress: Option<Vec<u8>>,
+    last_progress: Option<Instant>,
     shown: usize,
 }
 
@@ -48,16 +58,40 @@ impl Live {
             return;
         }
         self.pending.extend_from_slice(bytes);
-        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n').or((self
-            .pending
-            .len()
-            >= LIVE_LINE)
-            .then_some(LIVE_LINE - 1))
-        {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            self.emit(&line).await;
+        loop {
+            if self.skip_lf {
+                if self.pending.is_empty() {
+                    break;
+                }
+                if self.pending[0] == b'\n' {
+                    self.pending.remove(0);
+                }
+                self.skip_lf = false;
+            }
+            let Some((end, progress)) = self
+                .pending
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map(|end| (end, self.pending[end] == b'\r'))
+                .or((self.pending.len() >= LIVE_LINE).then_some((LIVE_LINE - 1, false)))
+            else {
+                break;
+            };
+            let mut line: Vec<u8> = self.pending.drain(..=end).collect();
+            line.pop();
+            if progress {
+                // Carriage returns redraw one progress row (curl, compilers, etc.). Keep
+                // only the newest update and show it at a human-readable rate.
+                self.latest_progress = Some(line);
+                self.skip_lf = true;
+                self.flush_progress(false).await;
+            } else {
+                self.flush_progress(true).await;
+                self.emit(&line).await;
+            }
             if self.shown > LIVE_LIMIT {
                 self.pending.clear();
+                self.latest_progress = None;
                 let note = "[live output limit reached; the result keeps its own capture]";
                 self.progress.line(note.into(), self.stderr).await;
                 return;
@@ -66,13 +100,30 @@ impl Live {
     }
 
     async fn emit(&mut self, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
         self.shown += line.len();
         let (text, _) = crate::tools::text_encoding::decode_output_line(line);
         let text = text.trim_end_matches(['\n', '\r']);
         self.progress.line(text.to_owned(), self.stderr).await;
     }
 
+    async fn flush_progress(&mut self, force: bool) {
+        if force
+            || self
+                .last_progress
+                .is_none_or(|last| last.elapsed() >= LIVE_PROGRESS_INTERVAL)
+        {
+            if let Some(line) = self.latest_progress.take() {
+                self.emit(&line).await;
+                self.last_progress = Some(Instant::now());
+            }
+        }
+    }
+
     async fn finish(&mut self) {
+        self.flush_progress(true).await;
         if !self.pending.is_empty() && self.shown <= LIVE_LIMIT {
             let line = std::mem::take(&mut self.pending);
             self.emit(&line).await;
@@ -154,6 +205,7 @@ async fn capture(
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = HeadTail::new(limit);
     let mut buffer = [0_u8; 4096];
+    let mut previous_cr = false;
     loop {
         let count = pipe.read(&mut buffer).await?;
         if count == 0 {
@@ -162,7 +214,27 @@ async fn capture(
         if let Some(live) = &mut live {
             live.feed(&buffer[..count]).await;
         }
-        kept.push(&buffer[..count]);
+        // Normalize terminal redraws and CRLF before retaining tool output. This keeps
+        // control bytes out of model context and lets truncation preserve useful lines.
+        let mut normalized = 0;
+        for index in 0..count {
+            let byte = buffer[index];
+            if previous_cr {
+                previous_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if byte == b'\r' {
+                buffer[normalized] = b'\n';
+                normalized += 1;
+                previous_cr = true;
+            } else {
+                buffer[normalized] = byte;
+                normalized += 1;
+            }
+        }
+        kept.push(&buffer[..normalized]);
     }
     if let Some(live) = &mut live {
         live.finish().await;
@@ -327,6 +399,9 @@ async fn run(
             progress,
             stderr,
             pending: Vec::new(),
+            skip_lf: false,
+            latest_progress: None,
+            last_progress: None,
             shown: 0,
         })
     };

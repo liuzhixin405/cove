@@ -138,6 +138,139 @@ fn persistent_cli(root: &std::path::Path, data: &std::path::Path, url: &str) -> 
     command
 }
 
+fn save_uncertain_write(
+    root: &std::path::Path,
+    data: &std::path::Path,
+) -> (cove::session::Store, cove::session::Session) {
+    use cove::{
+        domain::{Block, Message, Role},
+        session::workspace::Workspace,
+        session::{CallState, PendingCall, Session, SessionPersistence, State, Store},
+    };
+    let store = Store::open(data).unwrap();
+    let workspace = Workspace::new(root.into(), store.clone()).unwrap();
+    let checkpoint = workspace.begin().unwrap();
+    let mut session = Session::new(
+        root.canonicalize().unwrap(),
+        "Openai".into(),
+        "mock-model".into(),
+        None,
+    );
+    session.current_checkpoint = Some(checkpoint.clone());
+    session.checkpoints.push(checkpoint);
+    session.current_request = "create once".into();
+    session.state = State::Running;
+    let input = json!({"path":"once","content":"value"});
+    session.messages = vec![
+        Message::user("create once"),
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "uncertain".into(),
+                name: "write".into(),
+                input: input.clone(),
+                extra: None,
+            }],
+        },
+    ]
+    .into();
+    session.pending.push(PendingCall {
+        id: "uncertain".into(),
+        name: "write".into(),
+        input,
+        state: CallState::Executing,
+        result: None,
+    });
+    store.save(&session).unwrap();
+    (store, session)
+}
+
+#[tokio::test]
+async fn continue_lists_recent_sessions_and_selection_does_not_replay_uncertain_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (store, session) = save_uncertain_write(root.path(), data.path());
+    let (url, server) = mock_server(vec![openai(
+        json!({"content":"I inspected the unknown write outcome and continued."}),
+        "stop",
+    )])
+    .await;
+    let mut command = persistent_cli(root.path(), data.path(), &url);
+    command.args(["--resume", &session.id]);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("/continue\n/continue 1\n/exit\n").as_bytes())
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("最近会话"), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("/continue 接着做"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("I inspected the unknown write outcome"),
+        "{stdout}"
+    );
+    assert!(!root.path().join("once").exists());
+    let request = &server.await.unwrap()[0];
+    assert!(
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["tool_call_id"] == "uncertain"
+                    && message["content"].as_str().is_some_and(|text| {
+                        text.contains("Outcome unknown") && text.contains("not replayed")
+                    })
+            })
+    );
+    assert!(store.load(&session.id).unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn continue_flag_resumes_after_recording_uncertain_result_without_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (store, session) = save_uncertain_write(root.path(), data.path());
+    let (url, server) = mock_server(vec![openai(
+        json!({"content":"Continued without replaying the uncertain write."}),
+        "stop",
+    )])
+    .await;
+    let output = persistent_cli(root.path(), data.path(), &url)
+        .args(["--resume", &session.id, "--continue"])
+        .launch()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("不会自动重放"), "{stdout}\n{stderr}");
+    assert!(!root.path().join("once").exists());
+    assert!(
+        server.await.unwrap()[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["tool_call_id"] == "uncertain"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Outcome unknown")))
+    );
+    assert!(store.load(&session.id).unwrap().pending.is_empty());
+}
+
 fn saved_id(data: &std::path::Path) -> String {
     let entry = std::fs::read_dir(data.join("sessions"))
         .unwrap()
@@ -377,13 +510,6 @@ async fn explicit_uncertain_resolution_never_fabricates_success_or_replays_the_c
     )])
     .await;
     let output = persistent_cli(root.path(), data.path(), &url)
-        .args(["--resume", &session.id, "--continue"])
-        .launch()
-        .await
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("其效果未知"));
-    let output = persistent_cli(root.path(), data.path(), &url)
         .args(["--resume", &session.id, "-p", "/resolve uncertain executed"])
         .launch()
         .await
@@ -421,8 +547,7 @@ async fn openai_cli_reads_edits_runs_real_check_and_returns_evidence() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("code.txt"), "old\r\n").unwrap();
     // The CLI detects the same shell as this test process.
-    let powershell =
-        cove::process::Shell::current().kind == cove::process::ShellKind::PowerShell;
+    let powershell = cove::process::Shell::current().kind == cove::process::ShellKind::PowerShell;
     let check = if powershell {
         "if ((Get-Content -Raw code.txt).Trim() -ne 'new') { exit 1 }; Write-Output 'check passed'"
     } else {

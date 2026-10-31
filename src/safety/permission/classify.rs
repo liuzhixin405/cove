@@ -123,6 +123,7 @@ fn discards(target: &str) -> bool {
 
 fn classify_simple(simple: &Simple, dialect: Dialect) -> Category {
     if simple.words.is_empty()
+        || simple.words[0].dynamic
         || simple
             .redirects
             .iter()
@@ -131,7 +132,6 @@ fn classify_simple(simple: &Simple, dialect: Dialect) -> Category {
             .redirects
             .iter()
             .any(|r| r.op.starts_with('<') && r.op != "<")
-        || simple.words.iter().any(|word| word.dynamic)
     {
         return Category::Unknown;
     }
@@ -297,6 +297,9 @@ pub fn classify_words(words: &[&str]) -> Category {
         | "apt-get" | "yum" | "dnf" | "brew" | "choco" | "winget" | "pacman" | "zypper"
         | "snap" | "flatpak" => classify_package(&name, args),
         "docker" | "podman" | "nerdctl" => classify_docker(args),
+        "certutil" if matches!(args, [flag, _, ..] if flag.eq_ignore_ascii_case("-hashfile")) => {
+            Category::Safe
+        }
         "curl" | "wget" => classify_fetch(&name, args),
         _ => Category::Unknown,
     }
@@ -945,6 +948,9 @@ mod tests {
             "sed -n '/fn main/,/^fn /p' src/main.rs",
             "sed -E 's#a#b#g' a.txt",
             "cygpath -w /c/Users",
+            "ls -la \"$USERPROFILE/.cove\" 2>/dev/null | head -40; echo ---; ls \"$USERPROFILE/.cove/logs\" 2>/dev/null | tail -20",
+            "cd \"$USERPROFILE/.cove\" && tail -c 4000 errors.log",
+            "grep -n -i \"panic\" \"$USERPROFILE/.cove/errors.log\" | tail -20",
         ] {
             assert_eq!(posix(command), Category::Safe, "{command}");
         }
@@ -1011,6 +1017,10 @@ mod tests {
         assert_eq!(posix("rm -rf /"), Category::Dangerous);
         assert_eq!(posix("curl -s https://example.com"), Category::Safe);
         assert_eq!(posix("curl -o x https://example.com"), Category::Unknown);
+        assert_eq!(
+            posix(r#"certutil -hashfile "model.gguf" SHA256"#),
+            Category::Safe
+        );
         assert_eq!(posix("python -m pytest -q"), Category::Build);
         assert_eq!(posix("/bin/ls"), Category::Unknown);
     }

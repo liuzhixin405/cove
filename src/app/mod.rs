@@ -923,6 +923,31 @@ impl Application {
         Ok(())
     }
 
+    /// Continuing lets the Agent inspect unresolved effects, but never replays them.
+    fn continue_uncertain(&mut self) -> Result<()> {
+        let mut changed = false;
+        for call in &mut self.session.pending {
+            if !matches!(call.state, CallState::Executing | CallState::Uncertain) {
+                continue;
+            }
+            call.state = CallState::Finished;
+            call.result = Some(ToolOutput {
+                content: format!(
+                    "Outcome unknown: the previous process stopped while {} was running. This call was not replayed. Inspect its effects before deciding whether to retry.",
+                    call.name
+                ),
+                failed: true,
+                images: Vec::new(),
+                refused: false,
+            });
+            changed = true;
+        }
+        if changed {
+            self.store.save(&self.session)?;
+        }
+        Ok(())
+    }
+
     /// The user moved on from an unfinished task: its open calls are closed with what
     /// is known about them, so the conversation goes on instead of refusing the
     /// message. Nothing is replayed.
@@ -972,6 +997,9 @@ impl Application {
         // Interrupted calls whose outcome can be told from the workspace (or that have
         // no effects) are settled; a new message closes what is left of the old batch.
         self.settle_interrupted()?;
+        if prompt.is_none() {
+            self.continue_uncertain()?;
+        }
         if prompt.is_some() && self.session.unfinished() {
             self.close_unfinished()?;
         }
@@ -990,7 +1018,7 @@ impl Application {
                 || matches!(self.session.state, State::Running | State::Interrupted(_))
             {
                 return Err(Error::Session(
-                    "上一个任务还没结束：输入 /continue 继续它，或用 /new 开新会话".into(),
+                    "上一个任务还没结束：用 /continue 选择要继续的会话，或用 /new 开新会话".into(),
                 ));
             }
             if self.session.title.is_none() {
@@ -1166,16 +1194,6 @@ impl Application {
                 self.lease = lease;
                 print_text(&format!("[session] {}\n", self.session.id), false)?;
             }
-            ["/continue"] => {
-                // In a fresh session, /continue goes back to the last task like 继续.
-                if !self.session.unfinished()
-                    && let Some(result) =
-                        crate::commands::sessions::intercept(self, "continue").await
-                {
-                    return result;
-                }
-                self.execute(None).await?
-            }
             ["/config", rest @ ..] => self.configure(rest).await?,
             ["/compact"] => {
                 let cancel = CancellationToken::new();
@@ -1300,7 +1318,7 @@ async fn drive<T>(
         result = &mut future => return result,
         signal = crate::app::console::interrupted() => { signal?; Error::Cancelled },
         _ = tokio::time::sleep(timeout) => Error::Limit(format!(
-            "任务超过时限（{}）；/continue 接着做，或调高 --timeout / max_turn_minutes",
+            "任务超过时限（{}）；输入 /continue，或调高 --timeout / max_turn_minutes",
             crate::app::diagnostics::duration(timeout.as_millis() as u64)
         )),
     };

@@ -26,6 +26,7 @@ use crate::{
 
 pub(crate) const HELP: &str = "\
 /resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）   /history  同上
+/continue [<n|id>]  列出最近 5 个当前工作区会话供选择，或直接恢复指定会话；未完成任务会继续运行
 /status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token   /usage  同上
 /status cost [month|YYYY-MM|30d|24h|today|all] [export [file]]  按服务商/模型统计用量；export 导出 CSV
 /undo [list|<#n|hash>|files <#n|hash> <file…>|confirm [token]]  文件工具回滚用 /undo confirm；快照可恢复整个工作区（含 Shell 的影响）
@@ -321,7 +322,7 @@ pub(crate) async fn intercept(app: &mut Application, line: &str) -> Option<Resul
             ))));
         };
         let id = id.clone();
-        return Some(resume(app, &id).await);
+        return Some(resume(app, &id, true).await);
     }
     let continuing = CONTINUE_WORDS.contains(&trimmed.to_lowercase().as_str());
     if continuing && app.session.unfinished() {
@@ -356,7 +357,7 @@ pub(crate) async fn intercept(app: &mut Application, line: &str) -> Option<Resul
     Some(
         async {
             say(&note)?;
-            if resume(app, &session.id).await? {
+            if resume(app, &session.id, true).await? {
                 return Ok(true);
             }
             if app.session.unfinished() {
@@ -377,10 +378,12 @@ pub(crate) async fn handle(
 ) -> Result<Option<bool>> {
     app.sessions.ledger.set_session(&app.session.id);
     let first = args.first().copied().unwrap_or_default();
-    if first != "/resume" {
+    if first != "/resume" && first != "/continue" {
         app.sessions.remember_list(None);
     }
     match args {
+        ["/continue"] => continue_sessions(app, None).await?,
+        ["/continue", reference] => continue_sessions(app, Some(*reference)).await?,
         ["/resume" | "/history", rest @ ..] => {
             if history(app, line, rest).await? {
                 return Ok(Some(true));
@@ -488,11 +491,58 @@ pub(crate) fn startup_notice(app: &Application) -> Option<String> {
         "已完成"
     };
     Some(format!(
-        "上次在这里的任务：#{number} {}（{}，{state}，{}）。输入 继续 或 /continue 接着做，/resume 查看全部。\n",
+        "上次在这里的任务：#{number} {}（{}，{state}，{}）。输入 /continue 选择会话，/resume 查看全部。\n",
         session.display_title(),
         turns(session.user_turns()),
         ago(session.updated)
     ))
+}
+
+/// Lists a short, workspace-local history for `/continue`, then resumes the
+/// selected session. Completed sessions restore context without an automatic turn.
+async fn continue_sessions(app: &mut Application, reference: Option<&str>) -> Result<()> {
+    if let Some(reference) = reference {
+        let id = pick(app, reference)?;
+        if id != app.session.id {
+            resume(app, &id, false).await?;
+        }
+        if app.session.unfinished() {
+            app.execute(None).await?;
+        } else {
+            say("已恢复会话上下文；可以直接继续对话。\n")?;
+        }
+        return Ok(());
+    }
+
+    let sessions: Vec<_> = project_sessions(app, false).into_iter().take(5).collect();
+    if sessions.is_empty() {
+        say("没有可继续的历史会话。\n")?;
+        return Ok(());
+    }
+    let lines = history_lines(&sessions, Some(&app.session.id), false);
+    say(&format!(
+        "最近会话（输入 /continue <编号> 选择）：\n{lines}\n"
+    ))?;
+    app.sessions.remember_list(Some(
+        sessions.iter().map(|session| session.id.clone()).collect(),
+    ));
+    if let Some(console) = crate::app::console::active() {
+        let choices = sessions
+            .iter()
+            .zip(lines.lines())
+            .map(|(session, line)| crate::app::console::Choice {
+                value: format!("/continue {}", session.id),
+                label: line.trim().to_owned(),
+                description: if session.unfinished() {
+                    "恢复并继续未完成任务".to_owned()
+                } else {
+                    "恢复会话上下文".to_owned()
+                },
+            })
+            .collect();
+        console.choose("继续哪个会话？", choices);
+    }
+    Ok(())
 }
 
 const CONTINUE_WORDS: [&str; 6] = ["继续", "继续吧", "接着做", "continue", "go on", "resume"];
@@ -570,7 +620,7 @@ fn pick(app: &Application, reference: &str) -> Result<String> {
 }
 
 /// Switches to session `id`; `Ok(true)` when the program restarts to do so.
-async fn resume(app: &mut Application, id: &str) -> Result<bool> {
+async fn resume(app: &mut Application, id: &str, show_continue_hint: bool) -> Result<bool> {
     if id == app.session.id {
         say("已经在使用这个会话。\n")?;
         return Ok(false);
@@ -595,8 +645,8 @@ async fn resume(app: &mut Application, id: &str) -> Result<bool> {
         app.session.display_title()
     ))?;
     show_conversation(&app.session)?;
-    if matches!(app.session.state, State::Interrupted(_)) {
-        say("这个会话有被中断的任务：输入 继续 或 /continue 接着做，或直接发送新消息。\n")?;
+    if show_continue_hint && matches!(app.session.state, State::Interrupted(_)) {
+        say("这个会话有被中断的任务：输入 /continue 恢复，或直接发送新消息。\n")?;
     }
     Ok(false)
 }
@@ -853,7 +903,7 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
         }
         [reference] => {
             let id = pick(app, reference)?;
-            return resume(app, &id).await;
+            return resume(app, &id, true).await;
         }
         _ => {
             return Err(Error::Session(

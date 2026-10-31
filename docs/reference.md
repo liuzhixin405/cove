@@ -327,7 +327,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/resume search <关键词>` | 按标题和用户请求检索所有工作区的会话（BM25，支持中文） |
 | `/resume detail\|delete <n\|id>` | 查看详情 / 删除会话（含归档和文件检查点）；不能删除当前会话 |
 | `/resume clear [all] [confirm]`、`/resume clean`、`/resume export [file]` | 批量清理（先预览，加 `confirm` 才执行）/ 修复历史（先备份）/ 导出 Markdown 记录 |
-| `/continue`，或直接输入 `继续` / `continue` | 继续中断任务，授予新的模型调用窗口，不清空累计费用；当前会话没有未完成任务时（例如刚启动），回到本工作区上次的任务 |
+| `/continue`、`/continue <n|id>` | 裸命令列出最近 5 个当前工作区会话并在交互终端打开选择器；指定编号或 ID 直接恢复。未完成任务会继续运行，已完成任务恢复上下文后等待新消息。结果不确定的工具调用会作为失败结果交回 Agent 检查，不会自动重放。 |
 | `/status usage`（或 `/usage`） | 当前会话的账户与用量：认证方式（供应商及 key 来源）、估算总费用、等待模型响应的累计时间（API 耗时）、会话创建至今的时间、文件工具新增/删除的行数、模型调用次数，以及每个模型的输入/输出/缓存读写 token、调用次数和费用（含子 Agent 的花费） |
 | `/status cost [period] [export [file]]` | 按供应商/模型统计用量与估算费用，可导出 CSV |
 | `/compact` | 付费摘要压缩，原始上下文先归档 |
@@ -441,7 +441,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 历史
 
 - 标题取第一条真实用户请求（跳过系统通知和“继续”这类短输入），最多 60 个字符，保存在会话文件里，压缩后也不丢失。
-- **接着上次做**：启动时如果当前工作区有值得继续的任务（优先未完成的，其次最近有实际内容的），会提示“上次在这里的任务：#n 标题（轮数，状态，多久之前）。输入 继续 或 /continue 接着做”。在新会话里输入 `继续`（或 `continue`、`接着做`、`/continue`）即恢复该任务：未完成的直接续跑，已完成的带着完整上下文继续对话。新会话的第一条消息与某个**未完成**任务的原始请求相同时，也会续跑那个任务，而不是重新开始。
+- **接着上次做**：启动时如果当前工作区有值得继续的任务（优先未完成的，其次最近有实际内容的），会提示“上次在这里的任务：#n 标题（轮数，状态，多久之前）。输入 `/continue` 选择会话”。`/continue` 显示最近 5 条历史并允许选定要恢复的轮次；`/continue <编号或 ID>` 直接选择。未完成任务会续跑，已完成任务恢复完整上下文后等待新消息。结果不确定的工具调用会作为失败结果交回 Agent 检查，不会自动重放。新会话的第一条消息与某个**未完成**任务的原始请求相同时，也会续跑那个任务，而不是重新开始。
 - **恢复后能看到之前的对话**：`/resume`、`--resume`、列表选择、`继续` 恢复会话后，屏幕上会重新显示最近 3 轮对话（你的请求、模型回复、调用了哪些工具及结果首行）；模型拿到的是完整上下文。更早的内容用 `/resume detail` 查看。
 - 启动信息显示版本、模型与供应商、权限模式、工作目录、git 分支和会话 ID 前 8 位；退出时提示下次如何继续（输入 `继续`，或 `cove --resume <id>`）。
 - `/resume` 默认只列当前工作区，显示更新时间（UTC）、状态、对话轮数、标题和 ID 前 8 位；`/resume all` 列出的其他工作区会话，选中后自动在那个目录重启并恢复。
@@ -509,7 +509,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 判定顺序：灾难命令拦截 → 拒绝规则 → plan 模式（只放行只读操作）→ bypass → 允许/询问规则（按优先级，同级时询问优先）→ 模式默认。
 
-- **命令分类**：Shell 命令先按实际 Shell 语法切分（Windows 上按 PowerShell，其他平台按 sh），处理引号、转义、管道、`&&`/`||`/`;`、重定向和 here-doc，再逐条判断类别：只读、构建/测试、Git、安装、未知、危险，整行取最高风险。命令替换 `$(...)`、反引号、PowerShell 脚本块 `{...}`、调用运算符 `&`、写文件的重定向、隐藏字符等无法静态判断的写法一律算“未知”，需要审批。
+- **命令分类**：Shell 命令先按实际 Shell 语法切分（Windows 上按 PowerShell，其他平台按 sh），处理引号、转义、管道、`&&`/`||`/`;`、重定向和 here-doc，再逐条判断类别：只读、构建/测试、Git、安装、未知、危险，整行取最高风险。Windows `certutil -hashfile` 和常见摘要工具按只读命令处理。命令替换 `$(...)`、反引号、PowerShell 脚本块 `{...}`、调用运算符 `&`、写文件的重定向、隐藏字符等无法静态判断的写法一律算“未知”，需要审批。
 - **交互中切换**：`/mode` 显示当前模式、审阅流程和规则；`/mode default|plan|auto|bypass` 立即生效，不需要重启；加 `save` 写入配置文件（`permission_mode`）。
 - **policies.json**：放在数据目录（`<data_dir>/policies.json`），是一个规则数组：
 
@@ -522,8 +522,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ]
 ```
 
-  `tool_pattern` 是工具名 glob：`shell`（也认 `bash`、`powershell`）、`write`/`edit`、`web_fetch`/`web_search`、`mcp`/`hook`。`command_prefix` 按词匹配；`command_group` 是常规操作组（`git` 含 add/commit/push/pull/switch 等但不含 `--force`、reset、clean、checkout；另有 `cargo`、`npm`、`go`、`dotnet`）；`param_match` 按字段 glob（`command`、`path`、`url`）；`input_equals` 要求字段完全相等；`scope` 限定项目根目录；`enabled: false` 停用。允许规则必须覆盖整行的每一条命令才生效，拒绝规则只要命中其中一条（含 `bash -c` 内层文本）就生效。
-- **记住本项目 / 本次会话**：选 `a` 会向 policies.json 追加一条限定本项目的允许规则，选 `s` 生成同样的规则但只保存在本进程内存里（Git 等常规操作记成命令组，其他记成“程序 + 子命令”前缀）。
+- `tool_pattern` 是工具名 glob：`shell`（也认 `bash`、`powershell`）、`write`/`edit`、`web_fetch`/`web_search`、`mcp`/`hook`。`command_prefix` 按词匹配；`command_group` 是常规操作组（`git` 含 add/commit/push/pull/switch 等但不含 `--force`、reset、clean、checkout；另有 `cargo`、`npm`、`go`、`dotnet`）；`command_exact` 要求 Shell 命令整行完全相同；`command_directory` 将确认范围限制为指定目录下程序的 `--help` / `--version` 只读查询；`command_executable` 将确认范围限制为指定原生程序路径；`command_endpoint` / `command_output` 将确认范围限制为本地模型推理端点和同一个输出文件；`param_match` 按字段 glob（`command`、`path`、`url`）；`input_equals` 要求字段完全相等；`scope` 限定项目根目录；`enabled: false` 停用。允许规则必须覆盖整行的每一条命令才生效，拒绝规则只要命中其中一条（含 `bash -c` 内层文本）就生效。
+- **记住本项目 / 本次会话**：选 `a` 会向 policies.json 追加一条限定本项目的允许规则，选 `s` 生成同样的规则但只保存在本进程内存里（常规命令记成组或“程序 + 子命令”前缀；只读帮助/版本查询可记住同一目录；其他复合命令只记住整行；本地模型完成请求可变更 JSON 提示内容，但限制在同一 loopback 端点与同一结果文件；明确路径的原生程序可记住同一个程序路径，后续参数可变，但不覆盖管道或重定向）。含动态变量或解析不确定的命令不会生成命令族规则；无疑似密钥且长度不超过 8 KiB 时，可以选择只记住完全相同的命令行。
 - 拒绝规则和灾难命令被拦截时，模型收到拒绝说明并继续；你在审批里拒绝时同样如此（见“交互控制台”）。需要询问但没有终端时（如 `-p`），任务停止并保留状态，换模式后可 `/continue`。
 
 ### 安全拦截
