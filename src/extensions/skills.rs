@@ -651,17 +651,29 @@ impl Skills {
             Some(stem) => stem.to_owned(),
             None => String::new(),
         };
-        let name = parsed.name.clone().unwrap_or(fallback);
-        if !identifier(&name) {
-            return Err(Error::Tool(format!("invalid skill name {name:?}")));
-        }
-        if origin == Origin::User
+        let auto = origin == Origin::User
             && file
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-                .is_some_and(|dir| dir.starts_with(AUTO_PREFIX))
-        {
+                .is_some_and(|dir| dir.starts_with(AUTO_PREFIX));
+        let mut name = parsed.name.clone().unwrap_or_else(|| fallback.clone());
+        if !identifier(&name) {
+            // Older releases could write a non-ASCII learned-skill name into the
+            // frontmatter. Those files are generated under an `auto-*` directory:
+            // load them under the generated directory name instead of warning on
+            // every startup and dropping the skill.
+            if auto {
+                name = if identifier(&fallback) {
+                    fallback
+                } else {
+                    slug(&name)
+                };
+            } else {
+                return Err(Error::Tool(format!("invalid skill name {name:?}")));
+            }
+        }
+        if auto {
             origin = Origin::Auto;
         }
         entries.insert(
@@ -1373,6 +1385,32 @@ mod tests {
             index
                 .iter()
                 .any(|(name, text)| name == "deploy" && text == "Ship it carefully")
+        );
+    }
+
+    #[test]
+    fn legacy_auto_skills_with_unicode_names_load_under_their_directory() {
+        let data = tempfile::tempdir().unwrap();
+        write(
+            &data.path().join("skills/auto-compile/SKILL.md"),
+            "---\nname: 编译冲突排查\ndescription: Resolve build conflicts\n---\n1. Reproduce\n",
+        );
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        assert!(skills.contains("auto-compile"));
+        assert!(skills.warnings.is_empty(), "{:?}", skills.warnings);
+        assert!(
+            skills
+                .render("auto-compile", None)
+                .unwrap()
+                .contains("1. Reproduce")
         );
     }
 
