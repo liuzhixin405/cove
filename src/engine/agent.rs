@@ -1408,6 +1408,8 @@ impl Agent {
              For a task with at least three substantial, independent work items, use todo and execute_plan with parallel=true; declare dependencies so dependent work starts only after its prerequisites. \
              Keep small tasks and serial workflows (such as commit then push) in the main task; do not delegate them or add planning calls when the work is straightforward. \
              After parallel work, inspect the combined changes and run the narrowest relevant checks once. \
+             For routine Git tasks, batch independent read-only checks in one response and do not repeat successful checks without a changed result. Keep add, commit and push as separate shell calls; only push after commit succeeds, and do not wait for CI unless asked. Do not add Co-authored-by trailers or unrelated refs/tags unless requested. \
+             For long-running build/test commands, do not pipe output through tail/head; show live output so progress remains visible. \
              Git: stage with git add, then run git commit -m \"...\" as a shell call of its own (no chaining, cd or $(...) in it); push and tag in separate calls. \
              When finished, summarize actual changes and evidence briefly.",
             crate::process::Shell::current().dialect(),
