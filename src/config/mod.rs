@@ -1192,7 +1192,7 @@ mod tests {
         let (mut file, _) = FileConfig::read(&path, &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(file.done_verify_commands.as_ref().map(Vec::len), Some(2));
-        for name in ["deepseek", "claude", "local"] {
+        for name in ["deepseek", "claude", "bedrock", "local"] {
             let (_, profile) = FileConfig {
                 profiles: file.profiles.clone(),
                 ..FileConfig::default()
@@ -1201,6 +1201,14 @@ mod tests {
             .unwrap();
             assert!(profile.model.is_some(), "{name}");
         }
+        let (_, bedrock) = FileConfig {
+            profiles: file.profiles.clone(),
+            ..FileConfig::default()
+        }
+        .resolve(Some("bedrock".into()))
+        .unwrap();
+        assert_eq!(bedrock.max_budget_usd, Some(500.0));
+        assert_eq!(bedrock.max_output_tokens, Some(16000));
         assert_eq!(file.resolve(None).unwrap().0.as_deref(), Some("deepseek"));
     }
 
