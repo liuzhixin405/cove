@@ -886,14 +886,13 @@ async fn anthropic_cli_roundtrips_thinking_and_tool_results() {
 }
 
 #[tokio::test]
-async fn headless_default_permission_denies_a_real_model_write() {
+async fn headless_default_permission_allows_a_workspace_write() {
     let dir = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let (url, server) = mock_server(vec![tool(
-        "write-1",
-        "write",
-        json!({"path":"bad","content":"bad"}),
-    )])
+    let (url, server) = mock_server(vec![
+        tool("write-1", "write", json!({"path":"ok.txt","content":"ok"})),
+        openai(json!({"content":"Wrote ok.txt."}), "stop"),
+    ])
     .await;
     let mut command = Command::new(common::exe());
     command.args([
@@ -912,10 +911,18 @@ async fn headless_default_permission_denies_a_real_model_write() {
         .env("COVE_API_KEY", "test-key");
     command.env("COVE_DATA_DIR", data.path());
     let output = command.launch().await.unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("需要批准"));
-    assert!(!dir.path().join("bad").exists());
-    assert_eq!(server.await.unwrap().len(), 1);
+    // Copilot-style default: a write inside the workspace needs no approval, so even
+    // a headless run completes it.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("ok.txt")).unwrap(),
+        "ok"
+    );
+    assert_eq!(server.await.unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -23,7 +23,9 @@ use shell::Dialect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
-    /// Asks for writes, network and shell lines that are not read-only.
+    /// Allows reads, read-only shell, local git and writes inside the project (the
+    /// Copilot-style default); asks for writes outside it, network, extension
+    /// processes and shell lines that are not read-only.
     #[value(alias = "ask")]
     Default,
     /// Read-only: file reading/search and read-only shell lines; everything else denied.
@@ -125,7 +127,10 @@ pub fn mode_default(
         (Mode::Auto, Effect::Shell(command)) if classify::auto_approvable(command, dialect) => {
             Decision::Allow
         }
-        (Mode::Auto, Effect::Write(path)) if roots.is_none_or(|roots| inside(roots, path)) => {
+        // Copilot-style default: editing inside the project needs no approval.
+        (Mode::Default | Mode::Auto, Effect::Write(path))
+            if roots.is_none_or(|roots| inside(roots, path)) =>
+        {
             Decision::Allow
         }
         (Mode::Auto, Effect::Network(_) | Effect::Process(_)) => Decision::Allow,
@@ -162,7 +167,7 @@ pub struct Permissions {
 }
 
 impl Permissions {
-    /// `project` scopes remembered rules; `roots` are where `auto` allows writes.
+    /// `project` scopes remembered rules; `roots` are where `default`/`auto` allow writes.
     pub fn new(
         mode: Mode,
         project: PathBuf,
@@ -285,18 +290,23 @@ impl Permissions {
 
     pub fn decide(&self, effect: &Effect) -> Decision {
         let mode = self.mode();
-        let mut rules = self
-            .rules
-            .read()
-            .map(|rules| rules.clone())
-            .unwrap_or_default();
-        if let Ok(session) = self.session.read() {
-            rules.extend(session.iter().cloned());
-        }
+        // Borrow the rule lists under the read locks; only a session with remembered
+        // rules pays for a merged copy, instead of every decision cloning them all.
+        let rules = self.rules.read().ok();
+        let session = self.session.read().ok();
+        let merged: Vec<PolicyRule>;
+        let borrowed: &[PolicyRule] = match (&rules, &session) {
+            (Some(rules), Some(session)) if !session.is_empty() => {
+                merged = rules.iter().chain(session.iter()).cloned().collect();
+                &merged
+            }
+            (Some(rules), _) => rules,
+            _ => &[],
+        };
         decide(
             mode,
             effect,
-            &rules,
+            borrowed,
             &self.project,
             Some(&self.roots),
             self.dialect,
@@ -533,7 +543,7 @@ impl Authorizer for LocalAuthorizer {
             let _turn = PROMPT.lock().await;
             let Some(input) = &self.input else {
                 return Err(Error::Approval(format!(
-                    "{description}；非交互模式无法询问（non-interactive）。请明确指定 --permission auto 或 bypass 以允许写入和 shell"
+                    "{description}；非交互模式无法询问（non-interactive）。请明确指定 --permission auto 或 bypass 以允许此类操作"
                 )));
             };
             let answer = input
@@ -830,6 +840,15 @@ mod tests {
         );
         assert_eq!(
             decide_posix(Mode::Auto, Effect::Write("/etc/a".into())),
+            Decision::Ask
+        );
+        // Default is the Copilot-style posture: project writes allowed, outside asks.
+        assert_eq!(
+            decide_posix(Mode::Default, Effect::Write("/p/a".into())),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_posix(Mode::Default, Effect::Write("/etc/a".into())),
             Decision::Ask
         );
         assert!(matches!(

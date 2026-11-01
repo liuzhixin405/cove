@@ -111,19 +111,24 @@ async fn writes_never_overwrite_and_traversal_is_rejected() {
 }
 
 #[tokio::test]
-async fn noninteractive_default_denies_mutation_and_shell() {
+async fn noninteractive_default_allows_workspace_writes_but_denies_shell() {
     let dir = tempfile::tempdir().unwrap();
     let tools = tools(dir.path(), Mode::Ask);
-    assert!(matches!(
-        tools
-            .execute(
-                "write".into(),
-                json!({"path":"file","content":"bad"}),
-                CancellationToken::new()
-            )
-            .await,
-        Err(Error::Approval(_))
-    ));
+    // Copilot-style default: writes confined to the workspace need no approval,
+    // even without a terminal to ask on.
+    let out = tools
+        .execute(
+            "write".into(),
+            json!({"path":"file","content":"ok"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!out.failed);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("file")).unwrap(),
+        "ok"
+    );
     assert!(matches!(
         tools
             .execute(
@@ -134,7 +139,7 @@ async fn noninteractive_default_denies_mutation_and_shell() {
             .await,
         Err(Error::Approval(_))
     ));
-    assert!(!dir.path().join("file").exists());
+    assert!(!dir.path().join("shell.txt").exists());
 }
 
 #[tokio::test]
@@ -566,10 +571,12 @@ async fn a_refused_call_goes_back_to_the_model_and_the_task_goes_on() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(FakeProvider {
         responses: Mutex::new(VecDeque::from([
+            // Default mode no longer asks for workspace writes; a mutating shell
+            // command is what still reaches the prompt and can be refused.
             response(vec![Block::ToolUse {
                 id: "call-1".into(),
-                name: "write".into(),
-                input: json!({"path":"refused.txt","content":"x"}),
+                name: "shell".into(),
+                input: json!({"command":"echo x > refused.txt"}),
                 extra: None,
             }]),
             response(vec![Block::Text("好的，不写了".into())]),

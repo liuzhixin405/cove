@@ -489,7 +489,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 | 参数 | 行为 |
 | --- | --- |
-| `--permission default` | 默认（旧名 `ask`）；`read`/`grep`/`glob`/`repo_map` 不需要审批，只读 Shell 命令（`ls`、`git status`、`rg`、只打印的 `sed -n`、`timeout` 包裹的只读命令、`strings`、`cygpath` 等）直接运行，本地 git 操作（`git add`、`git commit`、`git tag`，可与只读命令串联；`-f`/`--force`、`-d`、`-p`、`$(...)`、写文件的重定向除外）也直接运行；写文件、`git push` 等其他 Shell、网络访问和扩展进程逐次审批，没有终端则明确失败。`auto` 模式同样免审本地 git 操作 |
+| `--permission default` | 默认（旧名 `ask`，对齐 Copilot 默认姿态）；`read`/`grep`/`glob`/`repo_map` 不需要审批，只读 Shell 命令（`ls`、`git status`、`rg`、只打印的 `sed -n`、`timeout` 包裹的只读命令、`strings`、`cygpath` 等）直接运行，本地 git 操作（`git add`、`git commit`、`git tag`，可与只读命令串联；`-f`/`--force`、`-d`、`-p`、`$(...)`、写文件的重定向除外）也直接运行，项目内的文件修改直接放行；项目外写入、`git push` 等其他 Shell、网络访问和扩展进程逐次审批，没有终端则明确失败。`auto` 模式同样免审本地 git 操作 |
 | `--permission plan` | 只读（旧名 `readonly`）；允许阅读、搜索和只读 Shell 命令，其他操作拒绝，模型收到拒绝说明后可以继续 |
 | `--permission auto` | 另外自动允许构建/测试命令（`cargo test`、`go vet`、`npm run build` 等）、项目内文件修改、网络工具和已信任的扩展进程；其余 Shell 仍需审批，无终端时拒绝 |
 | `--permission bypass` | 除拒绝规则和灾难命令外全部允许；只用于可信任务 |
@@ -792,4 +792,4 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-[安全与闸门测试](../tests/safety.rs)用模拟 SSE 服务覆盖各权限模式、灾难命令拦截、拒绝规则、计划模式、熔断、复用模型自己的检查结果、验收报告、密钥提示和 `/mode save`。[核心测试](../tests/core.rs)覆盖权限、精确编辑、路径限制、搜索、费用阈值、进程输出/超时/取消及子进程树清理，以及审批被拒绝后理由交回模型、任务继续且不计为失败。[渲染单元测试](../src/app/render.rs)覆盖流式 Markdown 在任意分片下的样式（包括跨分片延续）、表格对齐、工具标题与结果摘要。[CLI 测试](../tests/cli.rs)用本地模拟 SSE 服务验证两类协议、真实编辑和命令检查、默认拒绝写入、断流以及任务 deadline。测试不需要真实 API key，不访问真实供应商。
+[安全与闸门测试](../tests/safety.rs)用模拟 SSE 服务覆盖各权限模式、灾难命令拦截、拒绝规则、计划模式、熔断、复用模型自己的检查结果、验收报告、密钥提示和 `/mode save`。[核心测试](../tests/core.rs)覆盖权限、精确编辑、路径限制、搜索、费用阈值、进程输出/超时/取消及子进程树清理，以及审批被拒绝后理由交回模型、任务继续且不计为失败。[渲染单元测试](../src/app/render.rs)覆盖流式 Markdown 在任意分片下的样式（包括跨分片延续）、表格对齐、工具标题与结果摘要。[CLI 测试](../tests/cli.rs)用本地模拟 SSE 服务验证两类协议、真实编辑和命令检查、默认模式放行项目内写入、断流以及任务 deadline。测试不需要真实 API key，不访问真实供应商。
