@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub(crate) const HELP: &str = "\
-/model [<name>|fast <name|off>|provider <name> [model]|profile [list|switch|save|delete|show] <name>]  查看或切换模型、快速模型、服务商和配置档
+/model [<name>|fast <name|off>|next <main|fast|auto>|provider <name> [model]|profile [list|switch|save|delete|show] <name>]  查看或切换模型、快速模型、服务商和配置档；next 指定下一个任务的模型（仅一次）
 /config <model|provider|api_key|base_url|system|budget|max_output_tokens> [value]  查看或修改设置   /config budget auto|off|<usd>|save  会话预算   /config setup  重新运行配置向导
 /attach [add] <files...>|list|remove <n>|clear  附加文件（也可在消息中写 @路径）   /status limits  速率限制";
 
@@ -393,6 +393,20 @@ impl Application {
             Ok(())
         })
         .await
+    }
+
+    /// `/model next <main|fast|auto|name>` pins the next task's model, once.
+    fn pin_next(&mut self, raw: &str) -> Result<()> {
+        let pinned = self
+            .models
+            .router
+            .pin_next_task(raw)
+            .map_err(Error::Session)?;
+        print_text(
+            &format!("下一个任务的模型：{pinned}（仅一次，之后恢复自动路由）\n"),
+            false,
+        )?;
+        Ok(())
     }
 
     async fn set_fast(&mut self, raw: &str) -> Result<()> {
@@ -1000,6 +1014,7 @@ pub(crate) async fn handle(
     match args {
         ["/model"] => app.show_models()?,
         ["/model", "fast", value @ ..] => app.set_fast(&value.join(" ")).await?,
+        ["/model", "next", value @ ..] => app.pin_next(&value.join(" "))?,
         ["/model", "provider", name] => app.set_provider(name, None).await?,
         ["/model", "provider", name, model] => app.set_provider(name, Some(model)).await?,
         ["/model", "profile", rest @ ..] => app.profile(rest).await?,

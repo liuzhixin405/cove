@@ -132,6 +132,8 @@ struct State {
     /// Explicit prices configured for the main model.
     configured_prices: Option<(f64, f64)>,
     task: Option<String>,
+    /// `/model next` pins the next task's model, once; routing resumes after it.
+    pin_next: Option<String>,
     routed_fast: bool,
     last: Option<String>,
     fell_back: bool,
@@ -295,6 +297,25 @@ impl ModelRouter {
     pub fn background(self: &Arc<Self>) -> Arc<dyn Provider> {
         Arc::new(Background(self.clone()))
     }
+
+    /// `/model next <main|fast|auto|<name>>`: pin the next task's model, once.
+    pub fn pin_next_task(&self, which: &str) -> std::result::Result<String, String> {
+        let mut state = self.state();
+        let model = match which.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => {
+                state.pin_next = None;
+                return Ok("auto（恢复自动路由）".into());
+            }
+            "main" => state.main.clone(),
+            "fast" => state
+                .fast_distinct()
+                .ok_or_else(|| "没有配置快速模型".to_owned())?
+                .to_owned(),
+            name => name.to_owned(),
+        };
+        state.pin_next = Some(model.clone());
+        Ok(model)
+    }
 }
 
 impl ModelPolicy for ModelRouter {
@@ -303,6 +324,12 @@ impl ModelPolicy for ModelRouter {
         state.fell_back = false;
         state.failed_batches = 0;
         state.routed_fast = false;
+        if let Some(pinned) = state.pin_next.take() {
+            state.routed_fast = state.fast_distinct() == Some(pinned.as_str());
+            state.announce = Some(format!("[model] {pinned}（用户用 /model next 指定）"));
+            state.task = Some(pinned);
+            return;
+        }
         let Some(fast) = state.fast_distinct().map(str::to_owned) else {
             state.task = Some(state.main.clone());
             return;
