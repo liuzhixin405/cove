@@ -1,0 +1,3 @@
+# Force LF in the worktree on every OS: stops git's per-file
+# "LF will be replaced by CRLF" warnings that flood shell output.
+* text=auto eol=lf

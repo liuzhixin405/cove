@@ -293,12 +293,11 @@ async fn shell_effects_are_explicitly_excluded_from_file_rollback() {
     let store = Store::open(data.path()).unwrap();
     let (workspace, tools) = setup(root.path(), &store);
     workspace.begin().unwrap();
-    let script =
-        if cove::process::Shell::current().kind == cove::process::ShellKind::PowerShell {
-            "Set-Content -LiteralPath shell.txt -Value shell"
-        } else {
-            "printf shell > shell.txt"
-        };
+    let script = if cove::process::Shell::current().kind == cove::process::ShellKind::PowerShell {
+        "Set-Content -LiteralPath shell.txt -Value shell"
+    } else {
+        "printf shell > shell.txt"
+    };
     assert!(
         !tools
             .execute(

@@ -933,10 +933,7 @@ async fn after_tool_hook_failure_does_not_replay_a_durable_successful_write() {
             .is_err()
     );
     drain.await.unwrap();
-    assert_eq!(
-        session.pending[0].state,
-        cove::session::CallState::Finished
-    );
+    assert_eq!(session.pending[0].state, cove::session::CallState::Finished);
     let mut loaded = store.load(&session.id).unwrap();
     loaded.hook_runs[0].state = HookState::Acknowledged;
     store.save(&loaded).unwrap();

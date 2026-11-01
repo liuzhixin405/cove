@@ -99,9 +99,7 @@ fn cli(root: &Path, data: &Path, url: &str, mode: &str) -> Command {
     ]);
     command.arg("--cwd").arg(root).arg("--data-dir").arg(data);
     command.env("COVE_API_KEY", "test-only-not-a-real-key");
-    command
-        .env_remove("COVE_CONFIG")
-        .env_remove("COVE_PROFILE");
+    command.env_remove("COVE_CONFIG").env_remove("COVE_PROFILE");
     command.kill_on_drop(true);
     command
 }

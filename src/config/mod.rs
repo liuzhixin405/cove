@@ -859,9 +859,7 @@ impl Settings {
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
             .or_else(|| default_model(info?.name).map(String::from))
-            .ok_or_else(|| {
-                NeedsSetup("请设置 --model、COVE_MODEL 或配置中的 \"model\"".into())
-            })?;
+            .ok_or_else(|| NeedsSetup("请设置 --model、COVE_MODEL 或配置中的 \"model\"".into()))?;
         anyhow::ensure!(!model.is_empty(), "model 不能为空");
 
         // COVE_API_KEY > provider.api_key > provider variables. Keys masked

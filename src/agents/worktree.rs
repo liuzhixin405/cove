@@ -214,14 +214,9 @@ async fn commit_args(dir: &Path, cancel: &CancellationToken) -> Vec<String> {
     if configured {
         Vec::new()
     } else {
-        [
-            "-c",
-            "user.name=cove",
-            "-c",
-            "user.email=cove@localhost",
-        ]
-        .map(str::to_owned)
-        .to_vec()
+        ["-c", "user.name=cove", "-c", "user.email=cove@localhost"]
+            .map(str::to_owned)
+            .to_vec()
     }
 }
 

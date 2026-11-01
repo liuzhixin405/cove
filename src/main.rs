@@ -56,10 +56,7 @@ async fn run() -> u8 {
     match start(double_clicked).await {
         Ok(code) => code,
         Err(error) => {
-            eprintln!(
-                "\n错误：{}",
-                cove::app::ui::visible(&format!("{error:#}"))
-            );
+            eprintln!("\n错误：{}", cove::app::ui::visible(&format!("{error:#}")));
             if double_clicked {
                 setup::pause();
             }

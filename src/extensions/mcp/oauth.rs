@@ -450,8 +450,7 @@ async fn callback(listener: &tokio::net::TcpListener, state: &str) -> Result<Str
                 Some(Err(failed("authorization", error))),
             )
         };
-        let page =
-            format!("<!doctype html><meta charset=utf-8><title>cove</title><p>{body}</p>");
+        let page = format!("<!doctype html><meta charset=utf-8><title>cove</title><p>{body}</p>");
         let _ = socket
             .write_all(
                 format!(
