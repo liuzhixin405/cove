@@ -304,6 +304,9 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
     let mut running: Vec<(String, String, bool)> = Vec::new();
     let mut open: Option<String> = None;
     let mut streamed = false;
+    // Reply deltas batch here; flushed on line boundaries, at 4 KiB, or before any
+    // other kind of output, so streaming does not write the terminal per token.
+    let mut buffered = String::new();
     // Hidden reasoning since then; a dim row says how long it took.
     let mut thinking: Option<std::time::Instant> = None;
     activity("思考中");
@@ -323,6 +326,12 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
         console::write(true, &out)
     };
     while let Some(event) = receiver.recv().await {
+        // Anything that is not reply text flushes buffered reply deltas first.
+        if !matches!(event, AgentEvent::Text(_)) && !buffered.is_empty() {
+            line_done = buffered.ends_with('\n');
+            console::write(true, &buffered)?;
+            buffered.clear();
+        }
         if !matches!(event, AgentEvent::Reasoning(_) | AgentEvent::Usage { .. })
             && let Some(since) = thinking.take()
         {
@@ -337,10 +346,11 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     activity("回复中");
                     open = None;
                 }
-                let out = markdown.push(&visible(&text));
-                if !out.is_empty() {
-                    line_done = out.ends_with('\n');
-                    console::write(true, &out)?;
+                buffered.push_str(&markdown.push(&visible(&text)));
+                if buffered.ends_with('\n') || buffered.len() >= 4096 {
+                    line_done = buffered.ends_with('\n');
+                    console::write(true, &buffered)?;
+                    buffered.clear();
                 }
             }
             AgentEvent::Reasoning(text) => {
@@ -436,6 +446,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 }
             }
         }
+    }
+    if !buffered.is_empty() {
+        line_done = buffered.ends_with('\n');
+        console::write(true, &buffered)?;
     }
     let mut out = markdown.finish();
     if !line_done || !out.is_empty() && !out.ends_with('\n') {

@@ -184,8 +184,11 @@ fn fuzzy(content: &str, old: &str, new: &str) -> Fuzzy {
     if lines.is_empty() || lines.len() > FUZZY_MAX_LINES || n > lines.len() {
         return Fuzzy::Missing(None);
     }
+    // Normalize each content line once; the window scans below compare without
+    // re-normalizing (and re-allocating) per window.
+    let content_normalized: Vec<String> = lines.iter().map(|line| normalize(line)).collect();
     let starts: Vec<usize> = (0..=lines.len() - n)
-        .filter(|&start| (0..n).all(|k| normalize(lines[start + k]) == normalized[k]))
+        .filter(|&start| (0..n).all(|k| content_normalized[start + k] == normalized[k]))
         .collect();
     if let [start] = starts[..] {
         let byte_start: usize = widths[..start].iter().sum();
@@ -245,9 +248,18 @@ fn fuzzy(content: &str, old: &str, new: &str) -> Fuzzy {
             ranges.join(", ")
         )));
     }
+    // Word sets are built once per line, not once per window.
+    let window_sets: Vec<HashSet<&str>> = content_normalized
+        .iter()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    let old_sets: Vec<HashSet<&str>> = normalized
+        .iter()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
     let mut best = (0, 0.0_f64);
     for start in 0..=lines.len() - n {
-        let score = similarity(&lines[start..start + n], &normalized);
+        let score = similarity(&window_sets[start..start + n], &old_sets);
         if score > best.1 {
             best = (start, score);
         }
@@ -265,22 +277,22 @@ fn fuzzy(content: &str, old: &str, new: &str) -> Fuzzy {
     )))
 }
 
-/// Mean per-line word-set Jaccard similarity; cheap enough for every window of a large file.
-fn similarity(window: &[&str], normalized: &[String]) -> f64 {
-    if window.is_empty() || window.len() != normalized.len() {
+/// Mean per-line word-set Jaccard similarity over precomputed word sets; cheap enough
+/// for every window of a large file. Splitting a whitespace-normalized line yields the
+/// same words as splitting the raw line.
+fn similarity(window: &[HashSet<&str>], old: &[HashSet<&str>]) -> f64 {
+    if window.is_empty() || window.len() != old.len() {
         return 0.0;
     }
     let total: f64 = window
         .iter()
-        .zip(normalized)
-        .map(|(line, old)| {
-            let a: HashSet<&str> = line.split_whitespace().collect();
-            let b: HashSet<&str> = old.split_whitespace().collect();
-            let union = a.union(&b).count();
+        .zip(old)
+        .map(|(a, b)| {
+            let union = a.union(b).count();
             if union == 0 {
                 1.0
             } else {
-                a.intersection(&b).count() as f64 / union as f64
+                a.intersection(b).count() as f64 / union as f64
             }
         })
         .sum();

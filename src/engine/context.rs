@@ -58,6 +58,22 @@ pub fn text_tokens(text: &str) -> usize {
     ascii.div_ceil(3) + other
 }
 
+/// Estimated tokens of a JSON value, walked in place instead of serialized to a
+/// fresh string on every turn's estimate.
+fn value_tokens(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match value {
+        Value::Null | Value::Bool(_) => 1,
+        Value::Number(number) => number.to_string().len().div_ceil(3),
+        Value::String(text) => text_tokens(text),
+        Value::Array(items) => items.iter().map(value_tokens).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| text_tokens(key) + value_tokens(value))
+            .sum(),
+    }
+}
+
 /// Estimated prompt tokens of `messages`, 4 per message for framing.
 pub fn tokens(messages: &[Message]) -> usize {
     messages
@@ -70,9 +86,9 @@ pub fn tokens(messages: &[Message]) -> usize {
                     Block::Text(text) | Block::Reasoning(text) => text_tokens(text),
                     Block::ToolResult { content, .. } => text_tokens(content) + 4,
                     Block::ToolUse { name, input, .. } => {
-                        text_tokens(name) + text_tokens(&input.to_string()) + 4
+                        text_tokens(name) + value_tokens(input) + 4
                     }
-                    Block::Thinking(value) => text_tokens(&value.to_string()),
+                    Block::Thinking(value) => value_tokens(value),
                     // A 1568 px image costs about 1600 tokens on every vision API.
                     Block::Image { .. } => IMAGE_TOKENS,
                 })

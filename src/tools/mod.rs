@@ -776,6 +776,30 @@ impl LocalTools {
         }
     }
 
+    /// Lines stripped from shell results for the model (the terminal still shows
+    /// everything live): git's per-file CRLF warnings, repeated on every git command,
+    /// and cargo's progress boilerplate.
+    fn quiet(text: &str) -> String {
+        const CARGO_PROGRESS: &[&str] = &[
+            "Compiling ",
+            "Finished ",
+            "Downloading ",
+            "Downloaded ",
+            "Updating ",
+            "Locking ",
+        ];
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("warning: in the working copy of '")
+                    && !trimmed.starts_with("warning: LF will be replaced by CRLF")
+                    && !trimmed.starts_with("warning: CRLF will be replaced by LF")
+                    && !CARGO_PROGRESS.iter().any(|verb| trimmed.starts_with(verb))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     async fn run_shell(&self, args: ShellArgs, cancel: CancellationToken) -> Result<ToolOutput> {
         let seconds = match (args.timeout_seconds, args.timeout) {
             (Some(seconds), _) => seconds,
@@ -810,8 +834,8 @@ impl LocalTools {
                 output.timed_out,
                 output.truncated,
                 output.encoding_warning,
-                output.stdout,
-                output.stderr
+                Self::quiet(&output.stdout),
+                Self::quiet(&output.stderr)
             ),
             ..Default::default()
         })

@@ -320,9 +320,7 @@ impl Browser {
         reach: Reach,
         cancel: &CancellationToken,
     ) -> Result<Self> {
-        let profile = tempfile::Builder::new()
-            .prefix("cove-browser-")
-            .tempdir()?;
+        let profile = tempfile::Builder::new().prefix("cove-browser-").tempdir()?;
         let args: Vec<String> = [
             "--headless=new",
             "--remote-debugging-port=0",

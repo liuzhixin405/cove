@@ -428,6 +428,7 @@ pub fn query(
         // Matches first, then the files most connected to them (callers and callees).
         let matched: HashSet<usize> = matched_symbols.keys().copied().collect();
         let defined: HashMap<&str, Vec<usize>> = definitions(&scanned);
+        let referenced: HashMap<&str, Vec<usize>> = references(&scanned);
         let mut related: HashMap<usize, f64> = HashMap::new();
         for &index in &matched {
             for name in &scanned[index].parsed.identifiers {
@@ -437,18 +438,16 @@ pub fn query(
                     }
                 }
             }
-            let own: HashSet<&str> = scanned[index]
-                .parsed
-                .symbols
-                .iter()
-                .map(|symbol| symbol.name.as_str())
-                .collect();
-            for (other, file) in scanned.iter().enumerate() {
-                if !matched.contains(&other)
-                    && own
-                        .iter()
-                        .any(|name| file.parsed.identifiers.contains(*name))
-                {
+            // Files using a symbol this file defines: inverted-index lookup instead of
+            // scanning every file's identifiers for every matched file.
+            let mut users: HashSet<usize> = HashSet::new();
+            for symbol in &scanned[index].parsed.symbols {
+                for &other in referenced.get(symbol.name.as_str()).into_iter().flatten() {
+                    users.insert(other);
+                }
+            }
+            for other in users {
+                if !matched.contains(&other) {
                     *related.entry(other).or_default() += ranks[other];
                 }
             }
@@ -503,6 +502,21 @@ pub fn query(
         return Ok(String::new());
     }
     Ok(out)
+}
+
+/// Identifier -> files that use it (each file once); the reverse of `definitions`,
+/// built once so "who uses a name this file defines" is a lookup, not a full scan.
+fn references(files: &[File]) -> HashMap<&str, Vec<usize>> {
+    let mut used: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        for name in &file.parsed.identifiers {
+            let entry = used.entry(name.as_str()).or_default();
+            if entry.last() != Some(&index) {
+                entry.push(index);
+            }
+        }
+    }
+    used
 }
 
 fn definitions(files: &[File]) -> HashMap<&str, Vec<usize>> {
