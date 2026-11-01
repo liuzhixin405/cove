@@ -1136,14 +1136,27 @@ impl State {
                     "[steer] 已有 {STEER_LIMIT} 条消息在等待，这条没有送达；等任务结束后再发送\n"
                 ));
             } else {
-                self.steer.push_back(line.trim().to_owned());
+                // Plain text is delivered automatically at the next tool or reply
+                // boundary; a `!` prefix interrupts the in-flight generation at once.
+                let trimmed = line.trim();
+                let immediate = trimmed.starts_with('!') && trimmed.len() > 1;
+                let text = if immediate {
+                    trimmed[1..].trim().to_owned()
+                } else {
+                    trimmed.to_owned()
+                };
+                self.steer.push_back(text);
                 self.steered += 1;
-                STEER_WAKE.notify_one();
+                if immediate {
+                    STEER_WAKE.notify_one();
+                }
                 let echo = self.user_echo(&line, "33", "");
-                self.notice(&format!(
-                    "{echo}{}\n",
-                    self.style("2", "  ↳ 将在下一次模型调用时交给正在运行的任务")
-                ));
+                let how = if immediate {
+                    "  ↳ 立即打断当前生成，带着这条重新回答"
+                } else {
+                    "  ↳ 将在工具结束或本轮回复完成时自动送入（! 开头可立即打断）"
+                };
+                self.notice(&format!("{echo}{}\n", self.style("2", how)));
             }
             return Action::None;
         }
@@ -2301,6 +2314,14 @@ mod tests {
         assert_eq!(
             state.steer.front().map(String::as_str),
             Some("use the v2 API")
+        );
+        // A `!` prefix steers immediately; the bang is stripped from the text.
+        typed(&mut state, "!stop this now");
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(lines.try_recv().is_err());
+        assert_eq!(
+            state.steer.back().map(String::as_str),
+            Some("stop this now")
         );
         typed(&mut state, "/status");
         press(&mut state, KeyCode::Enter, KeyModifiers::NONE);

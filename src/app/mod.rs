@@ -458,7 +458,7 @@ impl Application {
         let cwd = cwd.strip_prefix(r"\\?\").unwrap_or(&cwd).to_owned();
         if crate::app::console::rich() {
             return format!(
-                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · /exit 退出\x1b[0m\n",
+                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 开头立即插话 · /exit 退出\x1b[0m\n",
                 env!("CARGO_PKG_VERSION"),
                 self.settings.model,
                 self.settings.provider,
@@ -467,7 +467,7 @@ impl Application {
             );
         }
         format!(
-            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止正在运行的任务；/exit 保存并退出。\n",
+            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止任务；运行中输入文字自动插话、! 开头立即打断；/exit 保存并退出。\n",
             env!("CARGO_PKG_VERSION"),
             self.settings.model,
             self.settings.provider,
