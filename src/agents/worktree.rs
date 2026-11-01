@@ -54,15 +54,33 @@ pub async fn git(dir: &Path, args: &[&str], cancel: &CancellationToken) -> Resul
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|err| Error::Tool(format!("cannot run git: {err}")))?;
-    let output = tokio::select! {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Tool("git stdout not piped".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Tool("git stderr not piped".into()))?;
+    // Read both pipes while git runs, keeping at most GIT_OUTPUT_LIMIT + 1 bytes each:
+    // draining prevents a full-pipe deadlock, and the cap bounds memory during the run
+    // instead of clipping only after wait_with_output buffered everything.
+    let (stdout, stderr, status) = tokio::select! {
         _ = cancel.cancelled() => return Err(Error::Cancelled),
         _ = tokio::time::sleep(Duration::from_secs(120)) => {
             return Err(Error::Tool(format!("git {} timed out", args.join(" "))))
         }
-        output = child.wait_with_output() => output?,
+        result = async {
+            let (stdout, stderr, status) = tokio::join!(
+                read_capped(&mut stdout, GIT_OUTPUT_LIMIT),
+                read_capped(&mut stderr, GIT_OUTPUT_LIMIT),
+                child.wait()
+            );
+            Ok::<_, std::io::Error>((stdout?, stderr?, status?))
+        } => result?,
     };
     let clip = |bytes: &[u8]| {
         let text = String::from_utf8_lossy(bytes);
@@ -74,10 +92,32 @@ pub async fn git(dir: &Path, args: &[&str], cancel: &CancellationToken) -> Resul
         text
     };
     Ok(GitOutput {
-        ok: output.status.success(),
-        stdout: clip(&output.stdout),
-        stderr: clip(&output.stderr),
+        ok: status.success(),
+        stdout: clip(&stdout),
+        stderr: clip(&stderr),
     })
+}
+
+/// Reads a pipe to EOF, keeping at most `limit + 1` bytes (the extra byte marks
+/// truncation) but draining the rest so the child never blocks on a full pipe.
+async fn read_capped(
+    pipe: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = pipe.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        let room = (limit + 1).saturating_sub(kept.len());
+        if room > 0 {
+            kept.extend_from_slice(&buf[..read.min(room)]);
+        }
+    }
+    Ok(kept)
 }
 
 async fn git_ok(dir: &Path, args: &[&str], cancel: &CancellationToken) -> Result<String> {

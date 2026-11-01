@@ -450,7 +450,27 @@ impl AgentHub {
         let hub = self.clone();
         tokio::spawn(async move {
             let id = record.id.clone();
-            hub.drive(record, prompt, budget, cancel, park).await;
+            // Drive on a child task: a panic unwinds into a JoinError here, so the
+            // running slot, the done signal and the waiters are always released
+            // instead of leaving a ghost agent that cannot be stopped.
+            let body = tokio::spawn({
+                let hub = hub.clone();
+                async move { hub.drive(record, prompt, budget, cancel, park).await }
+            });
+            if let Err(error) = body.await
+                && error.is_panic()
+            {
+                let payload = error.into_panic();
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                let _ = crate::app::ui::print_text(
+                    &format!("[background agent {id} panicked: {message}]\n"),
+                    true,
+                );
+            }
             if let Ok(mut running) = hub.background.running.lock() {
                 running.remove(&id);
             }

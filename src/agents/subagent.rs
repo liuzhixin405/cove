@@ -614,9 +614,11 @@ impl ScopedTools {
             return Ok(None);
         };
         let paths: Vec<String> = match name {
-            "write" | "edit" => input
-                .get("path")
-                .and_then(Value::as_str)
+            // Same aliases the write/edit tools accept (tools/mod.rs), or a claim
+            // silently misses a parallel write spelled with file_path/filePath.
+            "write" | "edit" => ["path", "file_path", "filePath"]
+                .iter()
+                .find_map(|key| input.get(key).and_then(Value::as_str))
                 .map(|path| vec![path.to_owned()])
                 .unwrap_or_default(),
             "regression" => input
