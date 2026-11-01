@@ -190,10 +190,21 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
         | "done_verify_timeout_seconds"
         | "max_iterations"
         | "subagent_max_iterations"
-        | "max_turn_minutes"
         | "max_output_tokens"
         | "context_window"
         | "experimental_tools" => Class::Safe,
+        "max_turn_minutes" => {
+            // Default is 60 minutes (config/mod.rs); only tightening is safe, since a
+            // huge value would saturate into a nearly unlimited task timeout.
+            let base = root
+                .get("max_turn_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(60);
+            match value.as_u64() {
+                Some(new) if new > 0 && new <= base => Class::Safe,
+                _ => Class::Sensitive,
+            }
+        }
         "permission_mode" | "mode" => match value.as_str().map(|m| m.trim().to_ascii_lowercase()) {
             Some(mode) if matches!(mode.as_str(), "default" | "ask" | "plan" | "readonly") => {
                 Class::Safe
@@ -217,6 +228,15 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
                 Class::Sensitive
             }
         }
+        "commit_gate" => match value {
+            Value::Bool(false) => Class::Safe,
+            Value::String(text)
+                if matches!(text.trim().to_ascii_lowercase().as_str(), "off" | "false") =>
+            {
+                Class::Safe
+            }
+            _ => Class::Sensitive,
+        },
         "max_sessions" => match (
             value.as_i64(),
             root.get("max_sessions").and_then(Value::as_i64),
