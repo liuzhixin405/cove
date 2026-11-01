@@ -5,6 +5,9 @@
   "max_iterations": 40,
   "max_turn_minutes": 10,
   "subagent_max_iterations": 15,
+  "live_output": false,
+  "show_reasoning": false,
+  "verbose": false,
   "done_verify_commands": [
     "cargo check --all-targets",
     "cargo test"
