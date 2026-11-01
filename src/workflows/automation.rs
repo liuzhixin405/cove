@@ -481,6 +481,7 @@ pub async fn run_job(
                 Job {
                     worktree: &tree,
                     prompt: &spec.prompt,
+                    model: None,
                     budget: share,
                     max_turns: spec.max_turns,
                     timeout: (remaining * 3 / 4).max(Duration::from_secs(1)),

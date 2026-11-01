@@ -216,6 +216,36 @@ async fn history_lists_titles_resumes_by_number_and_exports_markdown() {
 }
 
 #[tokio::test]
+async fn replay_writes_a_standalone_html_report() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        tool("t1", "read", json!({"path": "src/<x>.rs"})),
+        openai(json!({"content": "fixed <ok>"}), "stop"),
+    ])
+    .await;
+    let (stdout, _) = repl(
+        cli(root.path(), data.path(), &url),
+        "Fix the <replay> bug\n/replay\n/exit\n",
+    )
+    .await;
+    server.await.unwrap();
+    assert!(stdout.contains("会话回放已生成"), "{stdout}");
+    let report = std::fs::read_dir(data.path().join("replay"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(report.extension().is_some_and(|ext| ext == "html"));
+    let html = std::fs::read_to_string(report).unwrap();
+    assert!(html.contains("Fix the &lt;replay&gt; bug"), "{html}");
+    assert!(html.contains("fixed &lt;ok&gt;"), "{html}");
+    assert!(html.contains("<code>read</code>"), "{html}");
+    assert!(!html.contains("<replay>"), "{html}");
+}
+
+#[tokio::test]
 async fn delete_and_clear_never_remove_the_current_session() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

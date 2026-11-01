@@ -3,8 +3,9 @@
 //! The child gets a private data directory and a minimal config (provider,
 //! model, prices, budget share; no profiles, extensions, MCP, hooks or
 //! automatic verification), runs with `--permission auto`, and refuses to start
-//! further race/automation workers. The API key travels only in the child's
-//! environment, never on disk.
+//! further race/automation workers. A job may override the configured model
+//! with an explicit `--model` argument. The API key travels only in the
+//! child's environment, never on disk.
 
 use std::{path::Path, time::Duration};
 
@@ -73,6 +74,8 @@ pub struct Execution {
 pub struct Job<'a> {
     pub worktree: &'a Path,
     pub prompt: &'a str,
+    /// Overrides the configured model with a child `--model` argument.
+    pub model: Option<&'a str>,
     pub budget: Option<f64>,
     pub max_turns: u32,
     pub timeout: Duration,
@@ -164,6 +167,10 @@ async fn spawn(
         // The child's own deadline plus room for its cleanup.
         .timeout(job.timeout + Duration::from_secs(20))
         .limit(256 * 1024);
+    if let Some(model) = job.model {
+        argv.args.push("--model".into());
+        argv.args.push(model.into());
+    }
     argv.env_remove = [
         "COVE_CONFIG",
         "COVE_PROFILE",

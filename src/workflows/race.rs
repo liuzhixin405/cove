@@ -5,6 +5,12 @@
 //! shared verifiers (exit codes only), then its patch is captured. Reports and
 //! patches live under `<data>/race/<run-id>/`; nothing is applied until an
 //! explicit `/changes apply race:<run>:<a|b> confirm`.
+//!
+//! An optional `models: [m1, m2]` races the candidates on different models:
+//! one prompt fills both lanes, two prompts pair up diagonally
+//! (prompt[i] × model[i]), and each lane's child gets `--model <name>`.
+//! Without `models` the behaviour is unchanged: exactly two distinct prompts
+//! on the parent's configured model.
 
 use std::{
     path::{Path, PathBuf},
@@ -30,6 +36,9 @@ pub struct Spec {
     #[serde(default)]
     pub version: Option<u32>,
     pub prompts: Vec<String>,
+    /// Exactly two models, one per candidate; allows a single shared prompt.
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
     pub verify: Vec<Vec<String>>,
     /// Total estimated USD; each candidate gets half.
     #[serde(default, alias = "total_budget_usd")]
@@ -57,11 +66,29 @@ impl Spec {
                 "不支持的 race 配置版本（version 应为 1）".into(),
             ));
         }
-        let [a, b] = self.prompts.as_slice() else {
-            return Err(Error::Tool("prompts 必须正好有两个".into()));
-        };
-        if a.trim().is_empty() || b.trim().is_empty() || a.trim() == b.trim() {
-            return Err(Error::Tool("两个 prompt 必须非空且互不相同".into()));
+        match self.prompts.as_slice() {
+            [prompt] if self.models.is_some() => {
+                if prompt.trim().is_empty() {
+                    return Err(Error::Tool("prompt 必须非空".into()));
+                }
+            }
+            [a, b] => {
+                if a.trim().is_empty() || b.trim().is_empty() || a.trim() == b.trim() {
+                    return Err(Error::Tool("两个 prompt 必须非空且互不相同".into()));
+                }
+            }
+            _ if self.models.is_some() => {
+                return Err(Error::Tool("设置 models 时 prompts 必须有一到两个".into()));
+            }
+            _ => return Err(Error::Tool("prompts 必须正好有两个".into())),
+        }
+        if let Some(models) = &self.models {
+            let [a, b] = models.as_slice() else {
+                return Err(Error::Tool("models 必须正好有两个".into()));
+            };
+            if a.trim().is_empty() || b.trim().is_empty() || a.trim() == b.trim() {
+                return Err(Error::Tool("两个 model 必须非空且互不相同".into()));
+            }
         }
         if self.verify.is_empty() {
             return Err(Error::Tool(
@@ -79,12 +106,34 @@ impl Spec {
         }
         Ok(())
     }
+
+    /// The two lanes as (prompt, model) pairs. A single prompt with two
+    /// models fills both lanes; two of each pair up diagonally
+    /// (prompt[i] × model[i]). Only meaningful after `validate`.
+    pub fn lanes(&self) -> [(&str, Option<&str>); 2] {
+        let prompt = |index: usize| {
+            self.prompts
+                .get(index)
+                .or(self.prompts.last())
+                .map_or("", String::as_str)
+        };
+        match &self.models {
+            Some(models) => [
+                (prompt(0), models.first().map(String::as_str)),
+                (prompt(1), models.get(1).map(String::as_str)),
+            ],
+            None => [(prompt(0), None), (prompt(1), None)],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: String,
     pub prompt: String,
+    /// The model this candidate raced on; `None` is the parent's default.
+    #[serde(default)]
+    pub model: Option<String>,
     pub budget_usd: Option<f64>,
     pub generation: Option<Execution>,
     pub checks: Vec<Check>,
@@ -232,6 +281,7 @@ async fn candidate(
     run_dir: &Path,
     id: &str,
     prompt: &str,
+    model: Option<&str>,
     budget: Option<f64>,
     verify: &[Vec<String>],
     deadline: tokio::time::Instant,
@@ -240,6 +290,7 @@ async fn candidate(
     let mut result = Candidate {
         id: id.into(),
         prompt: prompt.into(),
+        model: model.map(str::to_owned),
         budget_usd: budget,
         generation: None,
         checks: Vec::new(),
@@ -262,6 +313,7 @@ async fn candidate(
         Job {
             worktree: &tree,
             prompt,
+            model,
             budget,
             max_turns: 12,
             timeout: (remaining * 2 / 3).max(Duration::from_secs(1)),
@@ -351,13 +403,15 @@ pub async fn run(
             race.cancel();
         })
     };
+    let [lane_a, lane_b] = spec.lanes();
     let (a, b) = tokio::join!(
         candidate(
             config,
             &baseline,
             &run_dir,
             "a",
-            &spec.prompts[0],
+            lane_a.0,
+            lane_a.1,
             share,
             &spec.verify,
             deadline,
@@ -368,7 +422,8 @@ pub async fn run(
             &baseline,
             &run_dir,
             "b",
-            &spec.prompts[1],
+            lane_b.0,
+            lane_b.1,
             share,
             &spec.verify,
             deadline,
@@ -401,8 +456,12 @@ pub fn render(report: &Report) -> String {
     for candidate in &report.candidates {
         let generation = candidate.generation.as_ref();
         text.push_str(&format!(
-            "  {}: generation={:?} cost={} checks={} correct={} patch={} bytes {}{}\n",
+            "  {}{}: generation={:?} cost={} checks={} correct={} patch={} bytes {}{}\n",
             candidate.id,
+            candidate
+                .model
+                .as_ref()
+                .map_or(String::new(), |model| format!(" model={model}")),
             generation.map(|g| g.status),
             generation
                 .and_then(|g| g.cost_usd)
@@ -453,6 +512,48 @@ mod tests {
         assert!(spec(serde_json::json!({"version":1,"prompts":["a","b"],"verify":[["x"]],"total_budget_usd":1,"total_timeout_seconds":5})).is_ok());
     }
 
+    #[test]
+    fn two_models_can_share_one_prompt() {
+        // One prompt with two models validates and gives each lane its model.
+        let raced = spec(serde_json::json!(
+            {"prompts":["同一道题"],"models":["m1","m2"],"verify":[["x"]]}
+        ))
+        .unwrap();
+        let lanes = raced.lanes();
+        assert_eq!(lanes[0], ("同一道题", Some("m1")));
+        assert_eq!(lanes[1], ("同一道题", Some("m2")));
+        // Two of each pair up diagonally: prompt[i] × model[i].
+        let raced = spec(serde_json::json!(
+            {"prompts":["a","b"],"models":["m1","m2"],"verify":[["x"]]}
+        ))
+        .unwrap();
+        let lanes = raced.lanes();
+        assert_eq!(lanes[0], ("a", Some("m1")));
+        assert_eq!(lanes[1], ("b", Some("m2")));
+        // Without models, every lane falls back to the parent's model.
+        let raced = spec(serde_json::json!({"prompts":["a","b"],"verify":[["x"]]})).unwrap();
+        assert_eq!(raced.lanes(), [("a", None), ("b", None)]);
+        // models must be exactly two, non-empty and distinct.
+        assert!(
+            spec(serde_json::json!({"prompts":["a"],"models":["m"],"verify":[["x"]]})).is_err()
+        );
+        assert!(
+            spec(serde_json::json!({"prompts":["a"],"models":["m","m"],"verify":[["x"]]})).is_err()
+        );
+        assert!(
+            spec(serde_json::json!({"prompts":["a"],"models":["","m"],"verify":[["x"]]})).is_err()
+        );
+        // A single prompt without models is still refused, and prompts must
+        // not outnumber the lanes.
+        assert!(spec(serde_json::json!({"prompts":["a"],"verify":[["x"]]})).is_err());
+        assert!(
+            spec(
+                serde_json::json!({"prompts":["a","b","c"],"models":["m1","m2"],"verify":[["x"]]})
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn dirty_or_detached_projects_are_refused_before_any_worker() {
         let repo = changes::tests::repo();
@@ -470,6 +571,7 @@ mod tests {
         let spec = Spec {
             version: None,
             prompts: vec!["a".into(), "b".into()],
+            models: None,
             verify: vec![vec!["git".into(), "status".into()]],
             budget: None,
             timeout: Some(10),
