@@ -40,6 +40,28 @@ async fn read_body_capped(response: reqwest::Response, limit: usize) -> Option<V
     }
     Some(body)
 }
+
+/// A loopback server's self-reported per-request context window (llama.cpp `/props`;
+/// `n_ctx` there is already divided across parallel slots). `None` for remote or
+/// non-llama servers, or when the server does not answer within 2 s.
+pub async fn probe_local_window(base_url: &str) -> Option<usize> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+        return None;
+    }
+    let props = url.join("/props").ok()?;
+    let client = crate::model::net::apply(reqwest::Client::builder())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let value: Value = client.get(props).send().await.ok()?.json().await.ok()?;
+    let n_ctx = value
+        .pointer("/default_generation_settings/n_ctx")
+        .and_then(Value::as_u64)?;
+    usize::try_from(n_ctx)
+        .ok()
+        .filter(|n| (8192..=10_000_000).contains(n))
+}
 /// A rate-limited key rests this long when the server names no time.
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 /// Anthropic betas sent to the first-party API (not Bedrock).

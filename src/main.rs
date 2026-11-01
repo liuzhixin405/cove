@@ -146,7 +146,24 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
         && std::env::var("COVE_NO_SETUP").map_or(true, |value| value != "1")
         && std::io::stdin().is_terminal()
         && std::io::stderr().is_terminal();
-    let settings = match Settings::load(cli.clone()) {
+    /// True when the user pinned the context window via CLI or config (root or profile).
+    fn window_configured(settings: &Settings) -> bool {
+        if settings.cli.context_window.is_some()
+            || settings.file.get("context_window").is_some()
+            || settings.file.get("context_bytes").is_some()
+        {
+            return true;
+        }
+        settings
+            .profile
+            .as_deref()
+            .and_then(|profile| settings.file.get("profiles")?.get(profile))
+            .is_some_and(|profile| {
+                profile.get("context_window").is_some() || profile.get("context_bytes").is_some()
+            })
+    }
+
+    let mut settings = match Settings::load(cli.clone()) {
         Err(err) if interactive && err.downcast_ref::<NeedsSetup>().is_some() => {
             let path = match &cli.config {
                 Some(path) => path.clone(),
@@ -164,6 +181,22 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
         }
         Ok(settings) => settings,
     };
+    // A loopback server (llama.cpp etc.) knows its real per-request context; probing it
+    // once beats the built-in table's guess for local models. Skipped when the window
+    // was pinned by CLI or config, and in non-interactive runs (a scripted endpoint
+    // must not receive an extra probe request).
+    if interactive
+        && let Some(window) = cove::model::provider::probe_local_window(&settings.base_url).await
+        && window != settings.context_window
+        && !window_configured(&settings)
+    {
+        eprintln!(
+            "本地服务报告的上下文窗口为 {window} tokens，已按此调整（配置 context_window 可固定）"
+        );
+        settings.context_window = window;
+        settings.context_tokens =
+            cove::model::models::context_budget(window, settings.max_output_tokens).min(2_000_000);
+    }
     for warning in &settings.warnings {
         eprintln!("警告：{}", cove::app::ui::visible(warning));
     }
