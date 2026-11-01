@@ -26,6 +26,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "done_verify_tests",
     "done_self_review",
     "workflow",
+    "commit_gate",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +60,8 @@ pub struct GateConfig {
     pub self_review: Switch,
     /// Project tests join the automatic verification gate (default on).
     pub verify_tests: bool,
+    /// Pre-commit verification gate (default on); `off` keeps only the end-of-task check.
+    pub commit_gate: Switch,
 }
 
 impl GateConfig {
@@ -70,6 +73,7 @@ impl GateConfig {
                 .get("done_verify_tests")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            commit_gate: Switch::parse(file.get("commit_gate"), Switch::On),
         }
     }
 }
@@ -197,10 +201,13 @@ impl Evidence {
                     return;
                 }
                 // A line that may have changed files invalidates earlier passes.
-                // Formatters/autofixers are auto-approvable yet rewrite sources.
-                if !classify::auto_approvable(&command, Dialect::host())
-                    || classify::may_rewrite_sources(&command, Dialect::host())
-                {
+                // Formatters/autofixers are auto-approvable yet rewrite sources; local
+                // git bookkeeping (add/commit/tag) never touches the working tree, so
+                // it must not invalidate passing checks — or every commit in a row
+                // re-runs the whole verification suite for nothing.
+                let may_change_files = !classify::auto_approvable(&command, Dialect::host())
+                    && !classify::local_git(&command, Dialect::host());
+                if may_change_files || classify::may_rewrite_sources(&command, Dialect::host()) {
                     state.passed.clear();
                     state.outcome = None;
                 }
@@ -345,12 +352,11 @@ impl Assembly {
             Arc::new(verifier)
         });
         let gated: Arc<dyn crate::tools::ToolExecutor> = match &verifier {
-            Some(verifier) => Arc::new(commit::WithCommitGate::new(
-                parts.tools.clone(),
-                verifier.clone(),
-                root.clone(),
-            )),
-            None => parts.tools.clone(),
+            // commit_gate=off leaves the end-of-task verification but no per-commit run.
+            Some(verifier) if config.commit_gate != Switch::Off => Arc::new(
+                commit::WithCommitGate::new(parts.tools.clone(), verifier.clone(), root.clone()),
+            ),
+            _ => parts.tools.clone(),
         };
         let workflow_mode = settings
             .file
@@ -492,6 +498,31 @@ mod tests {
             &out(ok, false),
         );
         assert_eq!(evidence.snapshot().1[0].action, "commit");
+        // Local git bookkeeping never touches the working tree: evidence survives
+        // add/commit, so a row of commits does not re-run the checks each time.
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"cargo test"}),
+            &out(ok, false),
+        );
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"git add a.txt"}),
+            &out(ok, false),
+        );
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"git commit -m y"}),
+            &out(ok, false),
+        );
+        assert!(evidence.passed("cargo test"));
+        // A formatter rewrites sources: evidence must go.
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"cargo fmt"}),
+            &out(ok, false),
+        );
+        assert!(!evidence.passed("cargo test"));
     }
 
     #[test]

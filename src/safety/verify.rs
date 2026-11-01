@@ -438,15 +438,29 @@ impl CommandVerifier {
             let _ = self.workspace.note_shell();
             let timeout = self.timeout(command);
             let started = Instant::now();
-            let output = process::shell_live(
-                &self.root,
-                command,
-                timeout,
-                cancel.clone(),
-                self.progress.clone(),
-            )
-            .await?;
+            // No per-line streaming: the terminal stays quiet during checks; the finish
+            // line and, on failure, the detail tail carry the information.
+            let output =
+                process::shell_live(&self.root, command, timeout, cancel.clone(), None).await?;
             let duration_ms = started.elapsed().as_millis();
+            if let Some(progress) = &self.progress {
+                let state = if output.timed_out {
+                    "超时"
+                } else if output.code == Some(0) {
+                    "通过"
+                } else {
+                    "失败"
+                };
+                progress
+                    .line(
+                        format!(
+                            "[验证] {command} → {state}（{:.0}s）",
+                            duration_ms as f64 / 1000.0
+                        ),
+                        false,
+                    )
+                    .await;
+            }
             if output.code == Some(0) && !output.timed_out {
                 summary.push_str(&format!("passed   {command}\n"));
                 self.record(CheckRecord {

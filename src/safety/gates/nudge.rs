@@ -18,7 +18,7 @@ const MAX_CONTINUATION: u32 = 2;
 pub const EMPTY: &str = "[system: Your response was empty. Provide the answer or call a tool.]";
 pub const ANNOUNCED: &str = "[system: You announced a next step but did not perform it. Continue now by calling the required tools, or state clearly that the task is complete.]";
 pub const TOO_SHORT: &str = "[system: Your last message is too brief to be a final answer after doing work. Summarize what you changed for the latest request and what remains, or continue.]";
-pub const DONE_CHECK: &str = "[system: Before finishing, check whether the user's latest request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer about that request.]";
+pub const DONE_CHECK: &str = "[system: Before finishing, check whether the user's latest request has been fully met. If anything remains, continue working now; if everything is done, reply with the final answer about that request. If the remaining work goes beyond what the user asked for, stop and report it instead of expanding the scope.]";
 
 pub struct NudgeLimits {
     pub max_turns: u32,
@@ -86,6 +86,17 @@ impl Nudges {
         self.workspace
             .as_ref()
             .is_some_and(|workspace| workspace.fingerprint().ok().flatten().is_some())
+    }
+
+    /// True when at most one file changed: the final answer can speak for itself, so
+    /// the done_check round is skipped (the same idea as self_review's 40-line floor).
+    fn small_change(&self) -> bool {
+        self.workspace.as_ref().is_some_and(|workspace| {
+            workspace
+                .changed_paths()
+                .map(|paths| paths.len() <= 1)
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -305,7 +316,11 @@ impl TurnHook for Nudges {
                     ));
                 }
             }
-            if self.limits.done_check && !state.done_checked && self.files_changed() {
+            if self.limits.done_check
+                && !state.done_checked
+                && self.files_changed()
+                && !self.small_change()
+            {
                 state.done_checked = true;
                 return Some(DONE_CHECK.to_owned());
             }
