@@ -322,7 +322,18 @@ impl TurnHook for Nudges {
                 && !self.small_change()
             {
                 state.done_checked = true;
-                return Some(DONE_CHECK.to_owned());
+                let request: String = session
+                    .current_request
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect();
+                return Some(format!(
+                    "{DONE_CHECK}\nThe request, as the user wrote it: {request}"
+                ));
             }
             None
         })();

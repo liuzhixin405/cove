@@ -285,6 +285,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     .with_turn_hook(Arc::new(crate::app::console::SteerHook))
     .with_steer(remote.clone())
     .with_steer(Arc::new(crate::app::console::ConsoleSteer))
+    .with_turn_hook(Arc::new(crate::app::console::GoalHook))
     .with_turn_hook(Arc::new(crate::agents::background::NoticeHook {
         hub: agents.clone(),
     }));

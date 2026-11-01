@@ -256,6 +256,7 @@ impl Console {
         } else {
             state.queued = 0;
             state.steered = 0;
+            state.goal = None;
         }
         state.redraw();
     }
@@ -315,6 +316,13 @@ impl Console {
     pub fn set_hint(&self, hint: &str) {
         let mut state = self.lock();
         state.hint = (!hint.is_empty()).then(|| hint.to_owned());
+        state.redraw();
+    }
+
+    /// The running task's goal in its own words, shown first in the status row.
+    pub fn set_goal(&self, goal: Option<String>) {
+        let mut state = self.lock();
+        state.goal = goal;
         state.redraw();
     }
 
@@ -406,6 +414,35 @@ impl crate::domain::SteerSource for ConsoleSteer {
 
     fn take(&self) -> Option<String> {
         SteerHook::take()
+    }
+}
+
+/// The goal card: the task's own first line stays in the status row while it runs,
+/// so long output never drifts away from what was asked.
+pub struct GoalHook;
+
+impl TurnHook for GoalHook {
+    fn task_note<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async {
+            let goal = session
+                .current_request
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| line.chars().take(60).collect::<String>());
+            if let Some(console) = active() {
+                console.set_goal(goal);
+            }
+            None
+        })
+    }
+
+    fn task_end<'a>(&'a self, _session: &'a Session, _completed: bool) -> BoxFuture<'a, ()> {
+        Box::pin(async {
+            if let Some(console) = active() {
+                console.set_goal(None);
+            }
+        })
     }
 }
 
@@ -621,6 +658,8 @@ struct State {
     busy: bool,
     queued: usize,
     steered: usize,
+    /// The running task's goal in the user's own words (the status-row goal card).
+    goal: Option<String>,
     esc_armed: Option<Instant>,
     /// The running task: when it started, what it does, tokens in and out.
     started: Instant,
@@ -665,6 +704,7 @@ impl State {
             busy: false,
             queued: 0,
             steered: 0,
+            goal: None,
             esc_armed: None,
             started: Instant::now(),
             activity: String::new(),
@@ -1513,6 +1553,9 @@ impl State {
         } else if self.ask.is_some() {
             parts.push("等待你的回答".to_owned());
         } else if self.busy {
+            if let Some(goal) = &self.goal {
+                parts.push(format!("目标 {goal}"));
+            }
             let elapsed = self.started.elapsed().as_secs_f64();
             let activity = if self.activity.is_empty() {
                 "运行中"
