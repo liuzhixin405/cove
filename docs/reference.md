@@ -221,7 +221,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 附件与图片
 
 - 消息里的 `@路径`（可加引号：`@"带 空格.png"`）指向已存在的文件时作为附件发送，并从文字中去掉；不是文件的 `@xxx`（邮箱、`@Override` 等）原样保留。
-- `/attach [add] <文件…>` 预先挂载，`/attach list`、`/attach remove <序号>`、`/attach clear` 管理；挂载的文件随下一条消息发送一次后清空。
+- 消息中写 `@路径` 即附加该文件（状态行可见，Alt+Backspace 移除）；附件随下一条消息发送一次后清空。
 - PNG/JPEG/GIF/WebP 按文件头识别，作为图片发送：Anthropic 用 base64 source，OpenAI 兼容协议用 data URL 的 `image_url`。长边超过 1568 像素或超过 5 MB 时自动缩放、重新编码。UTF-8 文本文件作为文字附加（最多 200 KB）；其他二进制文件拒绝附加。
 - `read` 工具读到图片时返回图片本身（源文件不超过 5 MiB、边长不超过 4096 像素），模型可以直接“看”截图。
 - 当前模型不支持视觉时，如果 `model`/`model_fast` 中有支持视觉的模型，带图片的请求自动改用它；都不支持时，图片换成一行说明文字再发送。
@@ -325,12 +325,12 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | --- | --- |
 | `/help`、`/status` | 帮助、状态、上下文与累计用量 |
 | `/new` | 保存当前会话并新建；不回退文件 |
-| `/resume [list\|all]`、`/resume <n\|id>`（也可写 `/history`） | 列出当前工作区（`all`：所有工作区）会话，显示标题和对话轮数（从未提问的空会话不列出）；按编号或 ID（前缀）切换。列表后直接输入数字即可恢复该条；在交互控制台里列表同时以选择器打开，输入文字过滤，上下键选择，Enter 恢复。选中其他工作区的会话时，保存当前会话后在那个目录重启并恢复（同 `/cd`） |
+| `/resume [list\|all]`、`/resume <n\|id>` | 列出当前工作区（`all`：所有工作区）会话，显示标题和对话轮数（从未提问的空会话不列出）；按编号或 ID（前缀）切换。列表后直接输入数字即可恢复该条；在交互控制台里列表同时以选择器打开，输入文字过滤，上下键选择，Enter 恢复。选中其他工作区的会话时，保存当前会话后在那个目录重启并恢复（同 `/cd`） |
 | `/resume search <关键词>` | 按标题和用户请求检索所有工作区的会话（BM25，支持中文） |
 | `/resume detail\|delete <n\|id>` | 查看详情 / 删除会话（含归档和文件检查点）；不能删除当前会话 |
 | `/resume clear [all] [confirm]`、`/resume clean`、`/resume export [file]` | 批量清理（先预览，加 `confirm` 才执行）/ 修复历史（先备份）/ 导出 Markdown 记录 |
 | `/continue`、`/continue <n|id>` | 裸命令列出最近 5 个当前工作区会话并在交互终端打开选择器；指定编号或 ID 直接恢复。未完成任务会继续运行，已完成任务恢复上下文后等待新消息。结果不确定的工具调用会作为失败结果交回 Agent 检查，不会自动重放。 |
-| `/status usage`（或 `/usage`） | 当前会话的账户与用量：认证方式（供应商及 key 来源）、估算总费用、等待模型响应的累计时间（API 耗时）、会话创建至今的时间、文件工具新增/删除的行数、模型调用次数，以及每个模型的输入/输出/缓存读写 token、调用次数和费用（含子 Agent 的花费） |
+| `/status usage` | 当前会话的账户与用量：认证方式（供应商及 key 来源）、估算总费用、等待模型响应的累计时间（API 耗时）、会话创建至今的时间、文件工具新增/删除的行数、模型调用次数，以及每个模型的输入/输出/缓存读写 token、调用次数和费用（含子 Agent 的花费） |
 | `/status cost [period] [export [file]]` | 按供应商/模型统计用量与估算费用，可导出 CSV |
 | `/compact` | 付费摘要压缩，原始上下文先归档 |
 | `/diff` | 有 Git 快照时显示本任务首个快照以来的整树变更（含 Shell 改动）；否则显示文件工具跟踪的变更 |
@@ -381,7 +381,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - **显示规则**：模型回复的 Markdown 边接收边渲染：标题加粗（一、二级加下划线），`**粗体**`，反引号里的代码名、路径和命令为浅橙色，列表符号换成 `•`，引用以 `│` 开头，分隔线画成横线，代码块保留原文（围栏行为暗色）便于复制，表格收齐后按列对齐。工具调用一行写明动作和关键参数（读取的文件、搜索的内容、运行的命令），下面用 `└` 给出摘要（行数、匹配数、退出码等），`#n` 可用 `/expand n` 看完整输出。同时运行的多个工具，各自的标题和结果放在一起。`-p`、管道和简单模式保持原来的机器可读行（`[tool]`、`[ok]`、`[summary]`），供脚本和 worker 解析。
 
-- **任务运行中输入**：普通文字作为插话——模型正在生成时立即中断当前回复、带着插话重新回答（被中断的请求照常计费）；工具正在运行时则随该工具的结果在下一轮送达；插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
+- **任务运行中输入**：普通文字作为插话，默认在工具结束或本轮回复完成时自动送入；以 `!` 开头则立即打断在途生成、带着插话重新回答（被中断的请求照常计费）。插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
 - **中断**：任务运行中连按两次 **Esc**（2 秒内）或按 **Ctrl+C** 中断任务，`/continue` 可以继续。空闲时在空行上按 Ctrl+C 只提示用 `/exit` 或 Ctrl+D 退出；**Ctrl+D** 在空行上保存并退出。
 - **审批与提问**：在同一输入行上作答。审批显示在黄色边框里：第一行是“需要批准”和命令类型（只读、构建/测试、未识别等），然后是要执行的操作和红色的风险警告，接着是编号选项（参照 Claude Code 和 Codex）：`1. 允许这一次 (y)`、`2. 本次会话不再询问 (s)`、`3. 本项目以后都不再询问 (a)`、`4. 拒绝 (n)`，“不再询问”两项后面写明这条规则会放行什么（如“git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）”“以 `npm run` 开头的命令”“本项目内的文件修改”）。会话规则只在内存里，退出即失效；项目规则写入 policies.json；没有 policies.json 时不提供第 3 项，生成不了规则的操作（如扩展进程）只有 1 和拒绝。按 `y`/`s`/`a` 立即提交，上下键在选项间切换后回车；大写的 `N` 是默认值，直接回车即拒绝。输入 `n <原因>` 或任何不是选项的文字，都当作拒绝理由交给模型。也接受 `yes`/`always`/`session`/`no` 和中文“是、允许、本次会话、总是、否、拒绝”。Esc 或 Ctrl+C 取消当前提问。
 - **拒绝后任务继续**：拒绝一次调用不会结束任务。模型收到“用户拒绝了”和你的理由，被要求不要重试、也不要换个等价命令绕过，而是换别的办法或询问你；屏幕上这一步显示为 `└ 已拒绝：<理由>（已告诉模型）`。拒绝不算工具失败。后台 Agent 和远程审批的拒绝同样处理。
@@ -436,7 +436,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 命令行：
 
 - `-p` 会把**管道传入的 stdin** 附加到提示词后（`cat app.log | cove -p "解释"`，也可只用管道 `cove -p < prompt.txt`）：最多 8 MiB，去掉 PowerShell 写入的 UTF-8 BOM，截断时不切断多字节字符并给出警告。stdin 是普通文件或 stderr 是终端时一直等待数据；否则（IDE、CI、其他 Agent 启动且从不写入的 stdin）最多等 3 秒首字节，超时警告并忽略。
-- `--file <路径>`（可重复）把不超过 256 KiB 的 UTF-8 文本文件作为数据附加到 `-p` 提示词；`--image <路径>`（可重复）附加 PNG/JPEG/GIF/WebP 图片，处理方式与 `/attach` 相同（缩放到 ≤1568 px、≤5 MB）。
+- `--file <路径>`（可重复）把不超过 256 KiB 的 UTF-8 文本文件作为数据附加到 `-p` 提示词；`--image <路径>`（可重复）附加 PNG/JPEG/GIF/WebP 图片，处理方式与 `@路径` 附件相同（缩放到 ≤1568 px、≤5 MB）。
 - `-r` 是 `--resume` 的简写；`--dump-system-prompt` 打印本次调用的完整系统提示词后退出。
 - 退出码：`0` 成功，`1` 失败，`2` 参数错误（含 `-p` 缺少提示词），`130` 被 Ctrl+C 中断。
 
@@ -716,7 +716,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 {"prompts":["用方案 A 实现","用方案 B 实现"],"verify":[["cargo","test"]],"budget":2,"timeout":900}
 ```
 
-（`budget`、`timeout` 也可写作别名 `total_budget_usd`、`total_timeout_seconds`。）两个候选各自在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行子进程 `cove -p <prompt> --permission auto --max-turns 12`：私有临时数据目录与最小配置（只有 provider、模型、单价、预算份额；无 profile、扩展、MCP、Hooks 和自动验证门禁），API key 只通过子进程环境变量传递，不落盘。预算均分；不知道单价时不能设预算。随后在各自 worktree 运行同一组验证 argv（不经 Shell），清理被忽略文件后捕获二进制补丁（符号链接、子模块、`.git` 路径会使候选失败），报告与补丁存到 `<data-dir>/race/<run>/`，worktree 随后删除。总时限内约 2/3 留给生成。模型自评不能决定通过；只有通过验证的候选可以 `/changes apply race:<run>:a confirm`，一次运行只能应用一个候选。成本取子进程 `[summary]` 的估算，没有则为 unverified。
+（`budget`、`timeout` 也可写作别名 `total_budget_usd`、`total_timeout_seconds`。）可选 `models` 字段恰含两个模型名（非空、互不相同），用于同题双模竞速：此时 `prompts` 允许只有 1 个，两个候选用同一道题分别跑对应模型；`prompts` 仍是两个时取对角线组合 prompt[i] × model[i]。不带 `models` 时行为不变，`prompts` 必须正好两个。两个候选各自在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行子进程 `cove -p <prompt> --permission auto --max-turns 12`（设置 `models` 时追加 `--model <模型名>`）：私有临时数据目录与最小配置（只有 provider、模型、单价、预算份额；无 profile、扩展、MCP、Hooks 和自动验证门禁），API key 只通过子进程环境变量传递，不落盘。预算均分；不知道单价时不能设预算。随后在各自 worktree 运行同一组验证 argv（不经 Shell），清理被忽略文件后捕获二进制补丁（符号链接、子模块、`.git` 路径会使候选失败），报告与补丁存到 `<data-dir>/race/<run>/`，worktree 随后删除；报告记录每个候选所用的模型并在输出中显示。总时限内约 2/3 留给生成。模型自评不能决定通过；只有通过验证的候选可以 `/changes apply race:<run>:a confirm`，一次运行只能应用一个候选。成本取子进程 `[summary]` 的估算，没有则为 unverified。
 
 ### 自动化任务与收件箱
 

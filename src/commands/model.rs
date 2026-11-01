@@ -20,7 +20,7 @@ use crate::{
 pub(crate) const HELP: &str = "\
 /model [<name>|fast <name|off>|next <main|fast|auto>|provider <name> [model]|profile [list|switch|save|delete|show] <name>]  查看或切换模型、快速模型、服务商和配置档；next 指定下一个任务的模型（仅一次）
 /config <model|provider|api_key|base_url|system|budget|max_output_tokens> [value]  查看或修改设置   /config budget auto|off|<usd>|save  会话预算   /config setup  重新运行配置向导
-/attach [add] <files...>|list|remove <n>|clear  附加文件（也可在消息中写 @路径）   /status limits  速率限制";
+/status limits  速率限制";
 
 /// Live model state owned by the application.
 pub(crate) struct ModelState {
@@ -786,81 +786,6 @@ impl Application {
         .await
     }
 
-    fn attach(&mut self, line: &str) -> Result<()> {
-        let rest = line
-            .trim_start()
-            .strip_prefix("/attach")
-            .unwrap_or("")
-            .trim();
-        let words = split_quoted(rest)?;
-        match words
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [] | ["list"] => {
-                if self.models.attachments.is_empty() {
-                    print_text(
-                        "没有附件；用 /attach <files...> 或在消息中写 @路径\n",
-                        false,
-                    )?;
-                }
-                for (index, path) in self.models.attachments.iter().enumerate() {
-                    print_text(&format!("{}. {}\n", index + 1, path.display()), false)?;
-                }
-            }
-            ["clear"] => {
-                self.models.attachments.clear();
-                print_text("附件已清空\n", false)?;
-            }
-            ["remove", number] => {
-                let index = number
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| (1..=self.models.attachments.len()).contains(n))
-                    .ok_or_else(|| {
-                        Error::Session("没有这个编号的附件；/attach list 查看编号".into())
-                    })?;
-                let removed = self.models.attachments.remove(index - 1);
-                print_text(&format!("已移除 {}\n", removed.display()), false)?;
-            }
-            paths => {
-                let paths = match paths {
-                    ["add", rest @ ..] => rest,
-                    all => all,
-                };
-                if paths.is_empty() {
-                    return Err(Error::Session("用法：/attach [add] <files...>".into()));
-                }
-                let mut added = Vec::new();
-                for raw in paths {
-                    let path = self.resolve_attachment(raw.trim_start_matches('@'));
-                    if !path.is_file() {
-                        return Err(Error::Session(format!(
-                            "不是文件：{raw}；请检查路径（含空格的路径请加引号）"
-                        )));
-                    }
-                    added.push(path);
-                }
-                if self.models.attachments.len() + added.len() > 20 {
-                    return Err(Error::Session(
-                        "每条消息最多 20 个附件；可用 /attach remove <n> 或 /attach clear 腾出位置"
-                            .into(),
-                    ));
-                }
-                for path in added {
-                    print_text(
-                        &format!("已附加 {}（随下一条消息发送）\n", path.display()),
-                        false,
-                    )?;
-                    self.models.attachments.push(path);
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn resolve_attachment(&self, raw: &str) -> PathBuf {
         let path = PathBuf::from(raw);
         if path.is_absolute() {
@@ -914,38 +839,6 @@ async fn ask_key(prompt: &str) -> Result<String> {
         return Err(Error::Session("没有输入密钥，未做任何修改".into()));
     }
     Ok(key)
-}
-
-/// Splits on whitespace, keeping "double" or 'single' quoted parts together.
-fn split_quoted(input: &str) -> Result<Vec<String>> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut started = false;
-    for c in input.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => current.push(c),
-            None if c == '"' || c == '\'' => {
-                quote = Some(c);
-                started = true;
-            }
-            None if c.is_whitespace() => {
-                if started || !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None => current.push(c),
-        }
-    }
-    if quote.is_some() {
-        return Err(Error::Session("引号没有闭合；请补上结尾的引号".into()));
-    }
-    if started || !current.is_empty() {
-        words.push(current);
-    }
-    Ok(words)
 }
 
 /// Removes the `@path` tokens `wanted` accepts (an @ starting a word, optionally
@@ -1024,7 +917,6 @@ pub(crate) async fn handle(
             let value = rest_after(2);
             app.config_key(key, value.as_deref()).await?
         }
-        ["/attach", ..] => app.attach(line)?,
         ["/status", "limits"] => {
             print_text(&app.model_router().rate_limits().report(), false)?;
         }
@@ -1055,11 +947,6 @@ mod tests {
 
     #[test]
     fn quoting_redaction_and_model_names() {
-        assert_eq!(
-            split_quoted(r#"add "a b.png" c.txt 'd e'"#).unwrap(),
-            ["add", "a b.png", "c.txt", "d e"]
-        );
-        assert!(split_quoted("\"open").is_err());
         assert_eq!(redact("sk-1234567890abcd"), "sk-1****abcd");
         assert_eq!(redact("short"), "****");
         assert_eq!(

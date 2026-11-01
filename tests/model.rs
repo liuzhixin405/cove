@@ -362,7 +362,7 @@ async fn attachments_send_images_and_text_files_once() {
         .env("COVE_API_KEY", "k");
     let output = run(
         command,
-        Some("/attach notes.txt\n/attach list\ndescribe @shot.png please\nand again\n/exit\n"),
+        Some("describe @shot.png please @notes.txt\nand again\n/exit\n"),
     )
     .await;
     assert_success(&output);

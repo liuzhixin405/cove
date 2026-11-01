@@ -1385,7 +1385,7 @@ async fn usage_reports_spend_time_code_changes_and_models() {
     );
     let id = saved_id(data.path());
     let output = persistent_cli(root.path(), data.path(), &url)
-        .args(["--resume", &id, "-p", "/usage"])
+        .args(["--resume", &id, "-p", "/status usage"])
         .launch()
         .await
         .unwrap();

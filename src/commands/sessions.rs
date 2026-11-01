@@ -25,9 +25,10 @@ use crate::{
 };
 
 pub(crate) const HELP: &str = "\
-/resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）   /history  同上
+/resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）
 /continue [<n|id>]  列出最近 5 个当前工作区会话供选择，或直接恢复指定会话；未完成任务会继续运行
-/status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token   /usage  同上
+/replay [<n|id>]  会话回放：把会话渲染成零依赖的单文件 HTML 时间线报告（缺省为当前会话），写入数据目录 replay/ 并打印路径
+/status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token
 /status cost [month|YYYY-MM|30d|24h|today|all] [export [file]]  按服务商/模型统计用量；export 导出 CSV
 /undo [list|<#n|hash>|files <#n|hash> <file…>|confirm [token]]  文件工具回滚用 /undo confirm；快照可恢复整个工作区（含 Shell 的影响）
 /config memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  长期记忆：查看、添加、删除、搜索、整理";
@@ -378,19 +379,21 @@ pub(crate) async fn handle(
 ) -> Result<Option<bool>> {
     app.sessions.ledger.set_session(&app.session.id);
     let first = args.first().copied().unwrap_or_default();
-    if first != "/resume" && first != "/continue" {
+    if first != "/resume" && first != "/continue" && first != "/replay" {
         app.sessions.remember_list(None);
     }
     match args {
         ["/continue"] => continue_sessions(app, None).await?,
         ["/continue", reference] => continue_sessions(app, Some(*reference)).await?,
-        ["/resume" | "/history", rest @ ..] => {
+        ["/resume", rest @ ..] => {
             if history(app, line, rest).await? {
                 return Ok(Some(true));
             }
         }
+        ["/replay"] => replay(app, None).await?,
+        ["/replay", reference] => replay(app, Some(*reference)).await?,
         ["/status", "cost", rest @ ..] => cost(app, rest).await?,
-        ["/status", "usage"] | ["/usage"] => say(&usage(app))?,
+        ["/status", "usage"] => say(&usage(app))?,
         ["/undo", "list"] => undo_list(app).await?,
         ["/undo", "confirm", token] => undo_apply(app, token).await?,
         ["/undo", "files", target, files @ ..] if !files.is_empty() => {
@@ -980,6 +983,35 @@ fn detail(session: &Session) -> String {
     out
 }
 
+/// `/replay`: renders a session as a standalone HTML timeline report in the data
+/// directory and prints its path.
+async fn replay(app: &mut Application, reference: Option<&str>) -> Result<()> {
+    let session = match reference {
+        None => app.session.clone(),
+        Some(reference) => {
+            let id = pick(app, reference)?;
+            if id == app.session.id {
+                app.session.clone()
+            } else {
+                app.store.load(&id)?
+            }
+        }
+    };
+    let path = app
+        .store
+        .root()
+        .join("replay")
+        .join(format!("{}.html", session.id));
+    app.authorizer
+        .authorize(Effect::Write(path.clone()), CancellationToken::new())
+        .await?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, replay_html(&session))?;
+    say(&format!("会话回放已生成：{}\n", path.display()))
+}
+
 /// Markdown transcript including tool calls and (bounded) results; no secrets are
 /// stored in sessions, so none can be exported.
 pub fn markdown(session: &Session) -> String {
@@ -1047,6 +1079,229 @@ pub fn markdown(session: &Session) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------- replay
+
+/// HTML-escapes every dynamic string that goes into the report.
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The one-line gist of a tool call: the most telling argument, else compact JSON.
+fn param_summary(input: &serde_json::Value) -> String {
+    const KEYS: [&str; 6] = ["path", "file", "command", "query", "pattern", "url"];
+    for key in KEYS {
+        if let Some(value) = input.get(key).and_then(serde_json::Value::as_str) {
+            return clip(value, 120);
+        }
+    }
+    clip(&serde_json::to_string(input).unwrap_or_default(), 120)
+}
+
+/// The marker the agent loop prefixes automatic-verification failures with.
+const VERIFY_FAILED_PREFIX: &str = "[automatic verification failed";
+
+/// A standalone, dependency-free HTML timeline of a session: goal, rounds with tool
+/// calls (results behind <details>) and a usage summary. Everything dynamic is
+/// HTML-escaped and no external resource is referenced.
+pub fn replay_html(session: &Session) -> String {
+    // Tool results arrive in later user messages; index them by call id first.
+    let mut results: std::collections::HashMap<&str, (bool, &str)> =
+        std::collections::HashMap::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            if let Block::ToolResult {
+                id,
+                content,
+                is_error,
+            } = block
+            {
+                results.insert(id, (*is_error, content));
+            }
+        }
+    }
+
+    let goal = session
+        .first_request()
+        .and_then(|request| request.lines().next())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or("（没有用户请求）");
+
+    let mut timeline = String::new();
+    let mut round = 0usize;
+    let mut items: Vec<String> = Vec::new();
+    let mut verify_failures = 0u32;
+    let flush = |round: usize, items: &mut Vec<String>, timeline: &mut String| {
+        if round == 0 && items.is_empty() {
+            return;
+        }
+        timeline.push_str(&format!(
+            "<section class=\"round\"><h2>第 {round} 轮</h2>\n"
+        ));
+        for item in items.drain(..) {
+            timeline.push_str(&item);
+        }
+        timeline.push_str("</section>\n");
+    };
+    for message in &session.messages {
+        match message.role {
+            Role::User => {
+                let real = matches!(
+                    message.blocks.first(),
+                    Some(Block::Text(text)) if !text.trim_start().starts_with('[')
+                );
+                if real {
+                    flush(round, &mut items, &mut timeline);
+                    round += 1;
+                }
+                for block in &message.blocks {
+                    match block {
+                        Block::Text(text) => {
+                            if text.starts_with(VERIFY_FAILED_PREFIX) {
+                                verify_failures += 1;
+                            }
+                            let (class, label) = if real {
+                                ("user", "用户")
+                            } else {
+                                ("system", "系统")
+                            };
+                            items.push(format!(
+                                "<div class=\"msg {class}\"><div class=\"role\">{label}</div><pre>{}</pre></div>\n",
+                                html_escape(text.trim())
+                            ));
+                        }
+                        // Tool results render with their call, not as messages.
+                        Block::ToolResult { .. } => {}
+                        Block::Image { media_type, .. } => items.push(format!(
+                            "<div class=\"msg user\"><div class=\"role\">用户</div><p class=\"note\">[图片附件：{}]</p></div>\n",
+                            html_escape(media_type)
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            Role::Assistant => {
+                for block in &message.blocks {
+                    match block {
+                        Block::Text(text) => items.push(format!(
+                            "<div class=\"msg assistant\"><div class=\"role\">助手</div><pre>{}</pre></div>\n",
+                            html_escape(text.trim())
+                        )),
+                        Block::ToolUse { id, name, input, .. } => {
+                            let (badge, detail) = match results.get(id.as_str()) {
+                                Some((false, content)) => (
+                                    "<span class=\"badge ok\">成功</span>",
+                                    format!(
+                                        "<details><summary>结果</summary><pre>{}</pre></details>",
+                                        html_escape(&clip(content, 8 * 1024))
+                                    ),
+                                ),
+                                Some((true, content)) => (
+                                    "<span class=\"badge err\">失败</span>",
+                                    format!(
+                                        "<details><summary>结果（失败）</summary><pre>{}</pre></details>",
+                                        html_escape(&clip(content, 8 * 1024))
+                                    ),
+                                ),
+                                None => (
+                                    "<span class=\"badge pending\">无结果</span>",
+                                    String::new(),
+                                ),
+                            };
+                            items.push(format!(
+                                "<div class=\"tool\">{badge} <code>{}</code> <span class=\"args\">{}</span>{detail}</div>\n",
+                                html_escape(name),
+                                html_escape(&param_summary(input))
+                            ));
+                        }
+                        Block::Image { media_type, .. } => items.push(format!(
+                            "<p class=\"note\">[图片附件：{}]</p>\n",
+                            html_escape(media_type)
+                        )),
+                        // Results render with their call; reasoning stays internal.
+                        Block::ToolResult { .. }
+                        | Block::Reasoning(_)
+                        | Block::Thinking(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    flush(round, &mut items, &mut timeline);
+    if timeline.is_empty() {
+        timeline.push_str("<p class=\"note\">这个会话还没有对话内容。</p>\n");
+    }
+
+    let cost = session
+        .accounting
+        .cost
+        .map_or("未知".to_owned(), |cost| format!("${cost:.4}"));
+    let mut summary = format!(
+        "<table><tr><th>模型调用</th><td>{} 次</td></tr>\
+         <tr><th>Token</th><td>输入 {} / 输出 {}</td></tr>\
+         <tr><th>预估花费</th><td>{cost}</td></tr>",
+        session.accounting.model_calls,
+        session.accounting.usage.input,
+        session.accounting.usage.output
+    );
+    if verify_failures > 0 {
+        summary.push_str(&format!(
+            "<tr><th>验证结论</th><td>自动验证曾未通过 {verify_failures} 次</td></tr>"
+        ));
+    }
+    summary.push_str("</table>\n");
+
+    format!(
+        "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+<title>会话回放 - {}</title>\n<style>{CSS}</style>\n</head>\n<body>\n\
+<header><h1>会话回放</h1>\n<table class=\"meta\">\
+<tr><th>会话</th><td><code>{}</code></td></tr>\
+<tr><th>工作区</th><td>{}</td></tr>\
+<tr><th>模型</th><td>{}（{}）</td></tr>\
+<tr><th>创建</th><td>{} UTC</td></tr>\
+<tr><th>更新</th><td>{} UTC</td></tr></table>\n</header>\n\
+<section class=\"goal\"><h2>任务目标</h2><p>{}</p></section>\n\
+{timeline}\
+<section class=\"summary\"><h2>收尾</h2>{summary}</section>\n\
+</body>\n</html>\n",
+        html_escape(&session.display_title()),
+        html_escape(&session.id),
+        html_escape(&session.cwd.display().to_string()),
+        html_escape(&session.model),
+        html_escape(&session.protocol),
+        timestamp(session.created),
+        timestamp(session.updated),
+        html_escape(goal)
+    )
+}
+
+/// Dark, self-contained report styling; no external fonts or scripts.
+const CSS: &str = "\
+body{background:#1e1e2e;color:#cdd6f4;font-family:system-ui,sans-serif;max-width:60rem;margin:0 auto;padding:1.5rem;line-height:1.6}\
+h1{font-size:1.4rem}h2{font-size:1.1rem;color:#89b4fa;margin-bottom:.4rem}\
+table{border-collapse:collapse}th{text-align:left;color:#a6adc8;font-weight:normal;padding:.15rem 1rem .15rem 0;vertical-align:top}\
+code,pre{font-family:ui-monospace,Consolas,monospace}\
+pre{background:#181825;border-radius:6px;padding:.6rem .8rem;overflow-x:auto;white-space:pre-wrap;word-break:break-word;margin:.3rem 0}\
+.goal p{background:#313244;border-left:3px solid #89b4fa;border-radius:4px;padding:.6rem .8rem}\
+.round{border-top:1px solid #45475a;padding-top:.6rem;margin-top:1rem}\
+.msg{margin:.5rem 0}\
+.role{font-size:.8rem;color:#a6adc8}\
+.msg.system pre{color:#a6adc8;font-size:.85rem}\
+.tool{margin:.4rem 0;padding:.3rem .6rem;background:#181825;border-radius:6px}\
+.args{color:#a6adc8;font-size:.85rem}\
+.badge{display:inline-block;border-radius:4px;padding:0 .4rem;font-size:.75rem}\
+.badge.ok{background:#1e3a2f;color:#a6e3a1}\
+.badge.err{background:#3a1e24;color:#f38ba8}\
+.badge.pending{background:#3a3324;color:#f9e2af}\
+details{margin-top:.3rem}summary{cursor:pointer;color:#89b4fa;font-size:.85rem}\
+.note{color:#a6adc8;font-style:italic}\
+";
 
 // ---------------------------------------------------------------- cost
 
@@ -1581,6 +1836,63 @@ mod tests {
         let lines = history_lines(&[session.clone()], Some(&session.id), false);
         assert!(
             lines.contains("  1. ") && lines.contains("Fix the bug") && lines.contains("(current)")
+        );
+    }
+
+    #[test]
+    fn replay_html_escapes_content_and_shows_goal_tools_and_summary() {
+        let mut session = Session::new("/w".into(), "Openai".into(), "m".into(), Some((1.0, 2.0)));
+        session
+            .messages
+            .push(Message::user("修复 <bug> 导致的崩溃\n详细步骤见下"));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Text("我先看看 <main>。".into()),
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "src/<x>.rs"}),
+                    extra: None,
+                },
+            ],
+        });
+        session.messages.push(Message {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                id: "t1".into(),
+                content: "fn main() { println!(\"<hi>\"); }".into(),
+                is_error: false,
+            }],
+        });
+        session.accounting.model_calls = 1;
+        session.accounting.usage.input = 120;
+        session.accounting.usage.output = 34;
+        let html = replay_html(&session);
+        // The goal is the escaped first line of the first request.
+        assert!(
+            html.contains("<p>修复 &lt;bug&gt; 导致的崩溃</p>"),
+            "{html}"
+        );
+        assert!(html.contains("第 1 轮"), "{html}");
+        assert!(html.contains("我先看看 &lt;main&gt;。"), "{html}");
+        assert!(html.contains("<code>read</code>"), "{html}");
+        assert!(html.contains("src/&lt;x&gt;.rs"), "{html}");
+        assert!(html.contains(">成功</span>"), "{html}");
+        assert!(html.contains("<details><summary>结果</summary>"), "{html}");
+        assert!(html.contains("println!(&quot;&lt;hi&gt;&quot;)"), "{html}");
+        assert!(
+            html.contains("模型调用") && html.contains("输入 120 / 输出 34"),
+            "{html}"
+        );
+        // Nothing dynamic may survive unescaped, and no external resource is referenced.
+        assert!(!html.contains("<bug>") && !html.contains("<hi>"), "{html}");
+        assert!(
+            !html.contains("<script")
+                && !html.contains("<link")
+                && !html.contains("http://")
+                && !html.contains("https://"),
+            "{html}"
         );
     }
 }
