@@ -304,6 +304,8 @@ pub struct Browser {
     sessions: Arc<Mutex<HashMap<String, String>>>,
     pub guard: Arc<Guard>,
     interceptor: tokio::task::JoinHandle<()>,
+    /// Per-request / per-target tasks spawned by the interceptor, aborted on close.
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 pub struct Page<'a> {
@@ -381,10 +383,12 @@ impl Browser {
         let (cdp, mut events) = Cdp::connect(&endpoint).await?;
         let sessions: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let guard = Arc::new(Guard::default());
+        let tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
         let interceptor = {
             let cdp = cdp.clone();
             let sessions = sessions.clone();
             let guard = guard.clone();
+            let tasks = tasks.clone();
             tokio::spawn(async move {
                 let mut seen = HashSet::new();
                 while let Some(event) = events.recv().await {
@@ -424,17 +428,20 @@ impl Browser {
                             }
                             let cdp = cdp.clone();
                             let sessions = sessions.clone();
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 attach(&cdp, &child, &kind, &target).await;
                                 if let Ok(mut map) = sessions.lock() {
                                     map.insert(target, child);
                                 }
                             });
+                            if let Ok(mut list) = tasks.lock() {
+                                list.push(handle);
+                            }
                         }
                         "Fetch.requestPaused" => {
                             let cdp = cdp.clone();
                             let guard = guard.clone();
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 let id = params
                                     .get("requestId")
                                     .and_then(Value::as_str)
@@ -471,6 +478,9 @@ impl Browser {
                                     }
                                 }
                             });
+                            if let Ok(mut list) = tasks.lock() {
+                                list.push(handle);
+                            }
                         }
                         _ => {}
                     }
@@ -484,6 +494,7 @@ impl Browser {
             sessions,
             guard,
             interceptor,
+            tasks,
         };
         browser
             .cdp
@@ -568,6 +579,11 @@ impl Browser {
 
     pub async fn close(self) {
         self.interceptor.abort();
+        if let Ok(mut list) = self.tasks.lock() {
+            for task in list.drain(..) {
+                task.abort();
+            }
+        }
         let _ = tokio::time::timeout(
             Duration::from_secs(3),
             self.cdp.call("Browser.close", json!({}), None),

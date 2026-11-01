@@ -80,6 +80,16 @@ fn denied(reason: &str) -> ToolOutput {
     }
 }
 
+/// Resolves when any steering source has text waiting.
+fn steer_waiting(
+    sources: &[Arc<dyn crate::domain::SteerSource>],
+) -> futures_util::future::BoxFuture<'_, ()> {
+    let wakes: Vec<_> = sources.iter().map(|source| source.wake()).collect();
+    Box::pin(async move {
+        let _ = futures_util::future::select_all(wakes).await;
+    })
+}
+
 /// Adds `spent` to `total`; an unknown cost stays unknown.
 pub fn add_spend(total: &mut Accounting, spent: &Accounting) {
     total.model_calls = total.model_calls.saturating_add(spent.model_calls);
@@ -172,6 +182,8 @@ pub struct Agent {
     turn_note: Option<Arc<dyn TurnNote>>,
     user_input: Option<Arc<dyn UserInput>>,
     turn_hooks: Vec<Arc<dyn TurnHook>>,
+    /// Mid-task steering: a model call in flight is aborted when text arrives.
+    steer: Vec<Arc<dyn crate::domain::SteerSource>>,
     policy: Option<Arc<dyn ModelPolicy>>,
     output: Arc<OutputPolicy>,
 }
@@ -210,6 +222,7 @@ impl Agent {
             turn_note: None,
             user_input: None,
             turn_hooks: Vec::new(),
+            steer: Vec::new(),
             output: Arc::new(OutputPolicy::default()),
             policy: None,
         })
@@ -301,6 +314,12 @@ impl Agent {
     /// Registers a loop extension; hooks run in registration order.
     pub fn with_turn_hook(mut self, hook: Arc<dyn TurnHook>) -> Self {
         self.turn_hooks.push(hook);
+        self
+    }
+
+    /// A source of mid-task guidance; its signal aborts the in-flight model call.
+    pub fn with_steer(mut self, source: Arc<dyn crate::domain::SteerSource>) -> Self {
+        self.steer.push(source);
         self
     }
 
@@ -623,15 +642,14 @@ impl Agent {
         .await
     }
 
-    async fn request(
+    /// The pre-flight part of `request`: model policy and session accounting.
+    fn request_begin(
         &self,
         session: &mut Session,
         persistence: &dyn SessionPersistence,
         mut request: ModelRequest,
         purpose: Purpose,
-        events: mpsc::Sender<Event>,
-        cancel: CancellationToken,
-    ) -> Result<ModelResponse> {
+    ) -> Result<(ModelRequest, std::time::Instant, Option<f64>)> {
         if request.model.is_none()
             && let Some(policy) = &self.policy
         {
@@ -641,8 +659,18 @@ impl Agent {
         session.accounting.cost = None;
         session.accounting.model_calls += 1;
         persistence.save(session)?;
-        let started = std::time::Instant::now();
-        let result = self.provider.stream(request, events, cancel).await;
+        Ok((request, std::time::Instant::now(), previous_cost))
+    }
+
+    /// The landing part of `request`: api time, cost bookkeeping and error saving.
+    fn request_end(
+        &self,
+        session: &mut Session,
+        persistence: &dyn SessionPersistence,
+        started: std::time::Instant,
+        previous_cost: Option<f64>,
+        result: Result<ModelResponse>,
+    ) -> Result<ModelResponse> {
         session.accounting.api_ms = session
             .accounting
             .api_ms
@@ -660,6 +688,21 @@ impl Agent {
                 Err(err)
             }
         }
+    }
+
+    async fn request(
+        &self,
+        session: &mut Session,
+        persistence: &dyn SessionPersistence,
+        request: ModelRequest,
+        purpose: Purpose,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> Result<ModelResponse> {
+        let (request, started, previous_cost) =
+            self.request_begin(session, persistence, request, purpose)?;
+        let result = self.provider.stream(request, events, cancel).await;
+        self.request_end(session, persistence, started, previous_cost, result)
     }
 
     pub async fn run_in(
@@ -1194,29 +1237,68 @@ impl Agent {
                 estimated_tokens: Some(estimated_tokens),
                 model: None,
             };
-            let response = match self
-                .request(
-                    session,
-                    persistence,
-                    request,
-                    Purpose::Task,
-                    events.clone(),
-                    cancel.clone(),
-                )
-                .await
-            {
-                Ok(response) => response,
-                // The server's window is smaller than assumed: learn it, compact, retry once.
-                Err(err) if !overflow_retried && crate::model::provider::context_overflow(&err) => {
-                    overflow_retried = true;
-                    calls_used += 1;
-                    self.recover_overflow(session, persistence, &events, &cancel, &err)
-                        .await
-                        .map_err(|_| err)?;
-                    continue;
+            let (request, started, previous_cost) =
+                self.request_begin(session, persistence, request, Purpose::Task)?;
+            // The stream borrows only `&self`, so it can race steering text: when the
+            // user types mid-generation, the in-flight call is aborted and the text is
+            // answered at once, instead of waiting for the next call boundary.
+            let stream = futures_util::FutureExt::boxed(self.provider.stream(
+                request,
+                events.clone(),
+                cancel.clone(),
+            ));
+            let result = if self.steer.is_empty() {
+                stream.await
+            } else {
+                let outcome =
+                    futures_util::future::select(stream, steer_waiting(&self.steer)).await;
+                match outcome {
+                    futures_util::future::Either::Left((result, _wait)) => result,
+                    futures_util::future::Either::Right(((), stream)) => {
+                        drop(stream);
+                        let texts: Vec<String> = self
+                            .steer
+                            .iter()
+                            .filter_map(|source| source.take())
+                            .collect();
+                        if !texts.is_empty() {
+                            session.accounting.cost = previous_cost;
+                            session.messages.push(Message::user(texts.join("\n")));
+                            persistence.save(session)?;
+                            // The aborted call did reach the server; count it.
+                            calls_used += 1;
+                            report.model_calls += 1;
+                            emit(
+                                &events,
+                                &cancel,
+                                Event::Notice(
+                                    "[steer] 已中断当前生成，带着你刚输入的内容重新回答".into(),
+                                ),
+                            )
+                            .await?;
+                        } else {
+                            session.accounting.cost = previous_cost;
+                        }
+                        continue;
+                    }
                 }
-                Err(err) => return Err(err),
             };
+            let response =
+                match self.request_end(session, persistence, started, previous_cost, result) {
+                    Ok(response) => response,
+                    // The server's window is smaller than assumed: learn it, compact, retry once.
+                    Err(err)
+                        if !overflow_retried && crate::model::provider::context_overflow(&err) =>
+                    {
+                        overflow_retried = true;
+                        calls_used += 1;
+                        self.recover_overflow(session, persistence, &events, &cancel, &err)
+                            .await
+                            .map_err(|_| err)?;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
             calls_used += 1;
             report.model_calls += 1;
             report.usage.input = report.usage.input.saturating_add(response.usage.input);

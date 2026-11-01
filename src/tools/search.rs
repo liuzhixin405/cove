@@ -168,26 +168,83 @@ pub async fn ripgrep_search(
         .args(["-e", &options.pattern, "--", target])
         .current_dir(root)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let output = tokio::select! {
-        _ = cancel.cancelled() => return Err(Error::Cancelled),
-        output = command.output() => output?,
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Tool("rg stdout not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Tool("rg stderr not piped".into()))?;
+    // Drain stderr alongside, keeping a bounded tail, or rg could block on a full pipe.
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stderr = stderr;
+        let mut kept: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = stderr.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            let room = (64 * 1024usize).saturating_sub(kept.len());
+            if room > 0 {
+                kept.extend_from_slice(&buf[..read.min(room)]);
+            }
+        }
+        Ok::<_, std::io::Error>(kept)
+    });
+    // Stream matches instead of buffering all of rg's output: `--max-count` limits each
+    // file, not the total, so a broad pattern in a large repository could otherwise
+    // collect millions of lines. The result note is a lower bound ("at least N more"),
+    // which stopping early never breaks.
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut collected: Vec<String> = Vec::new();
+    let status = loop {
+        let line = tokio::select! {
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            line = lines.next_line() => line?,
+        };
+        match line {
+            Some(line) => {
+                collected.push(line);
+                if collected.len() > GREP_LINES * 10 {
+                    break None;
+                }
+            }
+            None => break Some(child.wait().await?),
+        }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match output.status.code() {
+    let status = match status {
+        Some(status) => Some(status),
+        None => {
+            let _ = child.kill().await;
+            None
+        }
+    };
+    let stderr = stderr_task
+        .await
+        .map_err(|err| Error::Tool(format!("rg stderr task failed: {err}")))??;
+    match status.and_then(|status| status.code()) {
         Some(0) => {}
         Some(1) => return Ok(Vec::new()),
-        // Exit 2 with output: some files were unreadable; the matches still answer.
-        _ if !stdout.trim().is_empty() => {}
+        // Stopped at the global cap (killed above), or exit 2 with output: some files
+        // were unreadable; the matches collected still answer.
+        _ if !collected.is_empty() => {}
         _ => {
             return Err(Error::Tool(format!(
                 "rg: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&stderr).trim()
             )));
         }
     }
-    Ok(stdout
-        .lines()
+    Ok(collected
+        .iter()
         .map(|line| {
             let line = line.trim_end_matches('\r');
             let line = line

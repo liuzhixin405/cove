@@ -392,6 +392,23 @@ impl Console {
     }
 }
 
+/// Wakes the agent the moment steering text arrives mid-task.
+static STEER_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The engine's view of mid-task typing: the in-flight model call is aborted so the
+/// guidance is answered at once instead of at the next call boundary.
+pub struct ConsoleSteer;
+
+impl crate::domain::SteerSource for ConsoleSteer {
+    fn wake(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async { STEER_WAKE.notified().await })
+    }
+
+    fn take(&self) -> Option<String> {
+        SteerHook::take()
+    }
+}
+
 /// Delivers what the user typed while a task ran at its next model call.
 pub struct SteerHook;
 
@@ -1081,6 +1098,7 @@ impl State {
             } else {
                 self.steer.push_back(line.trim().to_owned());
                 self.steered += 1;
+                STEER_WAKE.notify_one();
                 let echo = self.user_echo(&line, "33", "");
                 self.notice(&format!(
                     "{echo}{}\n",

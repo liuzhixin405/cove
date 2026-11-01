@@ -150,6 +150,16 @@ pub trait UserInput: Send + Sync {
     fn answer(&self, prompt: String, cancel: CancellationToken) -> BoxFuture<'_, Result<String>>;
 }
 
+/// Guidance typed while a task runs. The agent waits on it during a model call; when
+/// it fires, the in-flight call is aborted and the text is answered at once, instead
+/// of waiting for the next call boundary.
+pub trait SteerSource: Send + Sync {
+    /// Resolves when steering text may be waiting; must not fire spuriously in a loop.
+    fn wake(&self) -> BoxFuture<'_, ()>;
+    /// Drains the waiting text, already prefixed for the model; `None` on a lost race.
+    fn take(&self) -> Option<String>;
+}
+
 #[derive(Debug)]
 pub enum Event {
     Notice(String),

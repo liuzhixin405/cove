@@ -535,10 +535,12 @@ impl LocalTools {
             }
         }
         let lines = args.content.lines().count();
-        let existing = match std::fs::read(&path) {
-            Ok(_) => Some(self.read_bounded(&path)?),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.into()),
+        // read_bounded checks the 1 MiB limit before reading; a plain read first would
+        // allocate an oversize file in full, then read it again.
+        let existing = match self.read_bounded(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
         };
         let Some(existing) = existing else {
             let data = args.content.as_bytes();
@@ -990,12 +992,17 @@ impl ToolExecutor for LocalTools {
             };
             self.authorizer.authorize(effect, cancel.clone()).await?;
             // Images (sniffed by content) go to the model as native image parts.
-            if let Call::Read(args) = &call
-                && let Some(image) = crate::model::images::read_output(
-                    self.resolve(&args.path, false).ok().as_deref(),
-                )
-            {
-                return Ok(image);
+            // Decoding/resizing/base64 runs off the async workers.
+            if let Call::Read(args) = &call {
+                let path = self.resolve(&args.path, false).ok();
+                let image = tokio::task::spawn_blocking(move || {
+                    crate::model::images::read_output(path.as_deref())
+                })
+                .await
+                .map_err(|err| Error::Tool(format!("image read task failed: {err}")))?;
+                if let Some(image) = image {
+                    return Ok(image);
+                }
             }
             let result = match call {
                 Call::Shell(args) => return self.run_shell(args, cancel).await,

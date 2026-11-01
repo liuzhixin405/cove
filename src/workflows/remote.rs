@@ -101,6 +101,17 @@ struct State {
 pub struct Hub {
     state: Mutex<State>,
     resumed: tokio::sync::Notify,
+    steer_wake: tokio::sync::Notify,
+}
+
+impl crate::domain::SteerSource for Hub {
+    fn wake(&self) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(async { self.steer_wake.notified().await })
+    }
+
+    fn take(&self) -> Option<String> {
+        self.take_steer()
+    }
 }
 
 fn valid_request_id(id: &str) -> bool {
@@ -257,6 +268,7 @@ impl Hub {
                         Err("too many queued steer messages".into())
                     } else {
                         state.steer.push_back(text.to_owned());
+                        self.steer_wake.notify_one();
                         Ok(())
                     }
                 }

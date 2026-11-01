@@ -299,6 +299,101 @@ struct FakeProvider {
     requests: Mutex<Vec<ModelRequest>>,
 }
 
+/// First call hangs forever (a slow model mid-generation); later calls use `inner`.
+struct HangOnce {
+    first: std::sync::atomic::AtomicBool,
+    inner: FakeProvider,
+}
+
+impl Provider for HangOnce {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ModelResponse>> {
+        Box::pin(async move {
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Never completes; the agent must abort this call when steering arrives.
+                std::future::pending::<()>().await;
+                return Err(Error::Provider("unreachable".into()));
+            }
+            self.inner.stream(request, events, cancel).await
+        })
+    }
+}
+
+/// A test SteerSource: `push` is the user typing mid-task.
+struct TestSteer {
+    text: Mutex<Vec<String>>,
+    wake: tokio::sync::Notify,
+}
+
+impl TestSteer {
+    fn push(&self, text: &str) {
+        self.text.lock().unwrap().push(text.to_owned());
+        self.wake.notify_one();
+    }
+}
+
+impl cove::domain::SteerSource for TestSteer {
+    fn wake(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async { self.wake.notified().await })
+    }
+
+    fn take(&self) -> Option<String> {
+        let mut text = self.text.lock().unwrap();
+        (!text.is_empty()).then(|| text.drain(..).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+#[tokio::test]
+async fn steering_text_aborts_the_in_flight_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(HangOnce {
+        first: true.into(),
+        inner: FakeProvider {
+            responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits(),
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (result, _) = tokio::join!(
+        agent.run("write a function".into(), tx, CancellationToken::new()),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            steer.push("use iteration instead of recursion");
+        }
+    );
+    drain.await.unwrap();
+    let report = result.unwrap();
+    // The hung call was aborted and the question re-asked with the steer text.
+    assert_eq!(report.model_calls, 2);
+    let requests = provider.inner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].messages.iter().any(|message| {
+            message.role == Role::User
+                && message.blocks.iter().any(|block| {
+                    matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
+                })
+        }),
+        "steer text must reach the retried request"
+    );
+}
+
 impl Provider for FakeProvider {
     fn stream(
         &self,
