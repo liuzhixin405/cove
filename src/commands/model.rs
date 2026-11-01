@@ -309,6 +309,7 @@ impl Application {
         self.agent.set_context_tokens(next.context_tokens)?;
         self.agent.set_instructions(next.instructions.clone());
         crate::app::ui::set_show_reasoning(next.show_reasoning);
+        crate::app::ui::set_live_output(next.live_output);
         current.budget = budget;
         current.file = next.file;
         current.config_path = next.config_path;
@@ -323,6 +324,7 @@ impl Application {
         current.thinking = next.thinking;
         current.effort = next.effort;
         current.show_reasoning = next.show_reasoning;
+        current.live_output = next.live_output;
         current.instructions = next.instructions;
         current.context_window = next.context_window;
         current.context_tokens = next.context_tokens;

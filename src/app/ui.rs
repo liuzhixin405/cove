@@ -191,6 +191,14 @@ pub fn set_show_reasoning(show: bool) {
     SHOW_REASONING.store(show, std::sync::atomic::Ordering::Relaxed);
 }
 
+static LIVE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `live_output: false` streams nothing while a command runs; the finished summary
+/// prints a short tail instead (more lines and stderr when it failed).
+pub fn set_live_output(live: bool) {
+    LIVE_OUTPUT.store(live, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub async fn consume_events(
     mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>,
     cancel: CancellationToken,
@@ -380,6 +388,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 streamed = false;
             }
             AgentEvent::Output { line, stderr } => {
+                if !LIVE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Quiet: the finished summary prints a short tail instead.
+                    continue;
+                }
                 streamed = true;
                 let mut out = String::new();
                 if let Some((_, title, shown)) = running.last_mut()

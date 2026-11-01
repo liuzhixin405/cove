@@ -184,6 +184,7 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
         | "thinking"
         | "effort"
         | "show_reasoning"
+        | "live_output"
         | "disabled_skills"
         | "done_self_review"
         | "done_check"

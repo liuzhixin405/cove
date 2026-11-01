@@ -394,6 +394,7 @@ struct Profile {
     thinking: Option<String>,
     effort: Option<String>,
     show_reasoning: Option<bool>,
+    live_output: Option<bool>,
 }
 
 impl Profile {
@@ -419,6 +420,7 @@ impl Profile {
             thinking: self.thinking.or(base.thinking),
             effort: self.effort.or(base.effort),
             show_reasoning: self.show_reasoning.or(base.show_reasoning),
+            live_output: self.live_output.or(base.live_output),
         }
     }
 }
@@ -442,6 +444,7 @@ const PROFILE_KEYS: &[&str] = &[
     "thinking",
     "effort",
     "show_reasoning",
+    "live_output",
     "debug",
     "verbose",
 ];
@@ -717,6 +720,9 @@ pub struct Settings {
     pub effort: Option<String>,
     /// Print reasoning text live instead of hiding it.
     pub show_reasoning: bool,
+    /// Stream command output live in the console (default true); false shows only the
+    /// finished summary with a short tail.
+    pub live_output: bool,
     /// The command line this run started with, for reloading after live changes.
     pub cli: Cli,
     pub instructions: Option<String>,
@@ -1087,6 +1093,7 @@ impl Settings {
             thinking,
             effort,
             show_reasoning: config.show_reasoning.unwrap_or(false),
+            live_output: config.live_output.unwrap_or(true),
             cli: original,
             instructions,
             cwd,

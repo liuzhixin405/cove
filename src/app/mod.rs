@@ -100,6 +100,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     crate::app::blocks::VERBOSE.store(settings.verbose, std::sync::atomic::Ordering::Relaxed);
     let router = crate::commands::model::new_router(&settings)?;
     crate::app::ui::set_show_reasoning(settings.show_reasoning);
+    crate::app::ui::set_live_output(settings.live_output);
     let traced = |inner: Arc<dyn Provider>| -> Arc<dyn Provider> {
         Arc::new(crate::app::diagnostics::Traced {
             inner,
