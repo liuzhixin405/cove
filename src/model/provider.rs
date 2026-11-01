@@ -20,9 +20,26 @@ use crate::{
 
 const FRAME_LIMIT: usize = 1024 * 1024;
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+/// Error bodies and one-shot JSON answers are read with a hard cap.
+const BODY_CAP: usize = 4 * 1024 * 1024;
 const RETRIES: u32 = 3;
 /// Thinking models can be silent for minutes before the first token.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Reads a response body with a hard cap, so a misbehaving endpoint cannot make us
+/// buffer an unbounded body on paths outside the bounded streaming reader.
+async fn read_body_capped(response: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if body.len() + chunk.len() > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
 /// A rate-limited key rests this long when the server names no time.
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 /// Anthropic betas sent to the first-party API (not Bedrock).
@@ -601,7 +618,10 @@ impl HttpProvider {
         else {
             return Vec::new();
         };
-        let Ok(value) = response.json::<Value>().await else {
+        let value = read_body_capped(response, BODY_CAP)
+            .await
+            .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+        let Some(value) = value else {
             return Vec::new();
         };
         value["inferenceProfileSummaries"]
@@ -880,9 +900,21 @@ impl Provider for HttpProvider {
                 })?;
                 let (header, value) =
                     Self::key_header(self.protocol, self.runtime.is_some(), &key)?;
-                let sent = tokio::select! {
+                // `send` resolves once response headers arrive; without this cap a server
+                // that accepts the connection but never answers hangs until the user cancels.
+                let sent = match tokio::select! {
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    response = self.client.post(&endpoint).header(header, value).json(&body).send() => response,
+                    response = tokio::time::timeout(
+                        IDLE_TIMEOUT,
+                        self.client.post(&endpoint).header(header, value).json(&body).send(),
+                    ) => response,
+                } {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        return Err(Error::Provider(
+                            "no response headers within the idle timeout".into(),
+                        ));
+                    }
                 };
                 let (wait, reason) = match sent {
                     Ok(response) if response.status().is_success() => {
@@ -922,7 +954,10 @@ impl Provider for HttpProvider {
                         if attempt >= RETRIES
                             || !(status.as_u16() == 429 || status.is_server_error())
                         {
-                            let detail = response.text().await.unwrap_or_default();
+                            let detail = read_body_capped(response, BODY_CAP)
+                                .await
+                                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                                .unwrap_or_default();
                             return Err(Error::Provider(format!(
                                 "HTTP {status}{}{}",
                                 if attempt > 0 {

@@ -55,26 +55,32 @@ fn err(text: impl std::fmt::Display) -> HttpError {
 }
 
 /// Incremental `text/event-stream` parser: yields (event name, data) pairs.
+/// Bytes are buffered and only complete lines are decoded: `\n` never appears inside
+/// a multi-byte UTF-8 sequence, so a character split across chunks is never corrupted.
 #[derive(Default)]
 struct SseParser {
-    buffer: String,
+    buffer: Vec<u8>,
     event: String,
     data: Vec<String>,
+    /// Total bytes held in `data`; bounded by EVENT_LIMIT together with `buffer`.
+    data_len: usize,
 }
 
 impl SseParser {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<(String, String)>, HttpError> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-        if self.buffer.len() > EVENT_LIMIT {
+        self.buffer.extend_from_slice(chunk);
+        if self.buffer.len() + self.data_len > EVENT_LIMIT {
             return Err(err("MCP SSE event exceeds 4 MiB"));
         }
         let mut out = Vec::new();
-        while let Some(end) = self.buffer.find('\n') {
-            let line: String = self.buffer.drain(..=end).collect();
+        while let Some(end) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 if !self.data.is_empty() {
                     let event = std::mem::take(&mut self.event);
+                    self.data_len = 0;
                     out.push((
                         if event.is_empty() {
                             "message".into()
@@ -94,12 +100,31 @@ impl SseParser {
             let value = value.strip_prefix(' ').unwrap_or(value);
             match field {
                 "event" => self.event = value.to_owned(),
-                "data" => self.data.push(value.to_owned()),
+                "data" => {
+                    self.data_len += value.len() + 1;
+                    self.data.push(value.to_owned());
+                }
                 _ => {}
             }
         }
         Ok(out)
     }
+}
+
+/// Reads a response body, failing as soon as it grows past `limit` instead of
+/// buffering the whole body before the size is checked.
+async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, HttpError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(err)? {
+        if body.len() + chunk.len() > limit {
+            return Err(err("MCP response exceeds 4 MiB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn parse_messages(text: &str) -> Vec<ServerJsonRpcMessage> {
@@ -281,7 +306,10 @@ impl Transport<RoleClient> for HttpTransport {
             }
             let status = response.status();
             if !status.is_success() {
-                let text = response.text().await.unwrap_or_default();
+                let text = read_body_limited(response, EVENT_LIMIT)
+                    .await
+                    .map(|body| String::from_utf8_lossy(&body).into_owned())
+                    .unwrap_or_default();
                 return Err(err(format!(
                     "MCP POST: HTTP {status}: {}",
                     crate::extensions::skills::clip(&text, 500)
@@ -306,10 +334,7 @@ impl Transport<RoleClient> for HttpTransport {
             if kind.starts_with("text/event-stream") {
                 return pump(response, sender, None, stop).await;
             }
-            let bytes = response.bytes().await.map_err(err)?;
-            if bytes.len() > EVENT_LIMIT {
-                return Err(err("MCP response exceeds 4 MiB"));
-            }
+            let bytes = read_body_limited(response, EVENT_LIMIT).await?;
             if !bytes.is_empty() {
                 for message in parse_messages(&String::from_utf8_lossy(&bytes)) {
                     let _ = sender.send(message).await;

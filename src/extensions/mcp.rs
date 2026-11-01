@@ -473,7 +473,18 @@ impl Mcp {
             old.close().await?;
         }
         server.reconnected.store(false, Ordering::SeqCst);
-        let connection = self.connect(&server.config, &cancel).await?;
+        // A server that accepts the connection but never answers initialization must not
+        // hang the explicit connect command; the tools/list timeout covers connect too.
+        let connection = match tokio::select! {
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            connection = tokio::time::timeout(
+                Duration::from_secs(server.config.value.timeout_seconds),
+                self.connect(&server.config, &cancel),
+            ) => connection,
+        } {
+            Ok(connection) => connection?,
+            Err(_) => return Err(Error::Tool("MCP connect timed out".into())),
+        };
         let tools = tokio::time::timeout(
             Duration::from_secs(server.config.value.timeout_seconds),
             self.list_tools(server, &connection.client, &connection.changed),
