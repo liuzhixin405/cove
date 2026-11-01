@@ -605,8 +605,44 @@ pub fn critical_path(target: &str) -> bool {
         || HOME_REFS
             .iter()
             .any(|h| path.strip_prefix(h).is_some_and(|rest| rest == "/.."));
-    drive || home || SYSTEM_DIRS.contains(&path.as_str())
+    // A UNC share root (`\\server\share`): wiping it destroys another machine's data.
+    let unc_root = (trimmed.starts_with("\\\\") || trimmed.starts_with("//"))
+        && path.trim_start_matches('/').matches('/').count() == 1;
+    // Contents of true system directories are critical too; user-writable roots
+    // (/home, /mnt, c:/users, ...) stay exact-match only so projects inside them
+    // can still be deleted.
+    let system = SYSTEM_DIRS.contains(&path.as_str())
+        || SYSTEM_CONTENTS
+            .iter()
+            .any(|dir| path.starts_with(&format!("{dir}/")));
+    drive || home || unc_root || system
 }
+
+/// System directories whose *contents* are also critical (subset of SYSTEM_DIRS).
+const SYSTEM_CONTENTS: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "c:/windows",
+    "c:/program files",
+    "c:/program files (x86)",
+    "c:/programdata",
+    "$env:windir",
+    "$env:systemroot",
+    "%windir%",
+    "%systemroot%",
+    "$env:programfiles",
+    "%programfiles%",
+    "/c/windows",
+];
 
 fn strip_variables(text: &str) -> String {
     let mut out = String::new();

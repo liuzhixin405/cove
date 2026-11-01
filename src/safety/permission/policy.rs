@@ -119,13 +119,25 @@ pub fn glob(pattern: &str, value: &str) -> bool {
 }
 
 pub fn same_project(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
-        a.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']))
-    } else {
-        a == b
+    // Canonicalizing resolves symlinks and 8.3 short names, so a deny rule scoped to a
+    // project still applies when the same directory is reached by another spelling.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (a, b) = (canon(a), canon(b));
+    if !cfg!(windows) {
+        return a == b;
     }
+    let norm = |p: &Path| {
+        let mut text = p.to_string_lossy().replace('/', "\\");
+        // Strip the verbatim prefix canonicalize adds on Windows.
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            text = rest.to_owned();
+        }
+        while text.ends_with('\\') {
+            text.pop();
+        }
+        text.to_lowercase()
+    };
+    norm(&a) == norm(&b)
 }
 
 /// Simple commands of a shell line in both dialects, runner-stripped, lowercase program.

@@ -70,6 +70,35 @@ pub fn auto_approvable(command: &str, dialect: Dialect) -> bool {
     matches!(category, Category::Safe | Category::Build) && !line.commands().any(fetches)
 }
 
+/// True when an otherwise auto-approvable command can still rewrite project sources
+/// (formatters and autofixers): evidence of earlier checks must not survive it.
+pub fn may_rewrite_sources(command: &str, dialect: Dialect) -> bool {
+    let line = shell::parse(command, dialect);
+    line.commands().any(|simple| {
+        let argv: Vec<String> = simple.argv().iter().map(|w| (*w).to_owned()).collect();
+        let words = shell::strip_runners(&argv);
+        let Some(exe) = words.first() else {
+            return false;
+        };
+        let name = shell::program_name(exe);
+        let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+        let sub = args.first().copied().unwrap_or_default();
+        match name.as_str() {
+            "cargo" => {
+                matches!(sub, "fmt" | "fix")
+                    || (sub == "clippy" && args.iter().any(|a| a.starts_with("--fix")))
+            }
+            "go" => matches!(sub, "fmt" | "fix"),
+            "gofmt" | "shfmt" => args.iter().any(|a| *a == "-w" || a.starts_with("-w=")),
+            // rustfmt rewrites in place unless told to only check or print.
+            "rustfmt" => !args
+                .iter()
+                .any(|a| *a == "--check" || a.starts_with("--emit")),
+            _ => false,
+        }
+    })
+}
+
 /// Git steps that stay in the local repository and can be undone (`add`, `commit`,
 /// `tag`), alone or with read-only commands: no approval in default or auto mode.
 /// Push and anything forced, deleting or rewriting still asks.
@@ -194,9 +223,12 @@ pub fn classify_words(words: &[&str]) -> Category {
         | "tr" | "od" | "hexdump" | "md5sum" | "sha1sum" | "sha256sum" | "seq" | "column"
         | "expand" | "fold" | "paste" | "jq" => {
             if name == "sort"
-                && args
-                    .iter()
-                    .any(|a| a.starts_with("-o") || a.starts_with("--output"))
+                && args.iter().any(|a| {
+                    a.starts_with("-o")
+                        || a.starts_with("--output")
+                        // GNU sort runs this program on its temp files: arbitrary execution.
+                        || a.starts_with("--compress-program")
+                })
             {
                 Category::Unknown
             } else {

@@ -197,7 +197,10 @@ impl Evidence {
                     return;
                 }
                 // A line that may have changed files invalidates earlier passes.
-                if !classify::auto_approvable(&command, Dialect::host()) {
+                // Formatters/autofixers are auto-approvable yet rewrite sources.
+                if !classify::auto_approvable(&command, Dialect::host())
+                    || classify::may_rewrite_sources(&command, Dialect::host())
+                {
                     state.passed.clear();
                     state.outcome = None;
                 }
