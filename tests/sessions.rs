@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::Command,
 };
@@ -130,6 +130,188 @@ async fn one_shot(mut command: Command, prompt: &str) -> String {
     stdout
 }
 
+#[tokio::test]
+async fn suggestions_commands_persist_explicit_decisions_without_model_calls() {
+    use cove::{
+        domain::{Block, Message, Role},
+        session::{
+            Session, Store,
+            suggestions::{SuggestionState, SuggestionStore, analyze},
+        },
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "openai".into(),
+        "mock-model".into(),
+        None,
+    );
+    for id in ["one", "two"] {
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: id.into(),
+                name: "shell".into(),
+                input: json!({"command":"private-command"}),
+                extra: None,
+            }],
+        });
+        session.messages.push(Message {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                id: id.into(),
+                content: "private-output".into(),
+                is_error: true,
+            }],
+        });
+    }
+    Store::open(data.path()).unwrap().flush(&session).unwrap();
+    let id = analyze(&session)[0].id.clone();
+    let mut command = cli(root.path(), data.path(), "http://127.0.0.1:1/v1");
+    command.args(["--resume", &session.id]);
+    let input = format!(
+        "/suggestions analyze\n/suggestions accept {id}\n/suggestions revoke {id} obsolete\n/exit\n"
+    );
+    let (stdout, stderr) = repl(command, &input).await;
+    assert!(!stdout.contains("private-command"));
+    assert!(!stdout.contains("private-output"));
+    assert!(!stderr.contains("private-command"));
+    let records = SuggestionStore::open(data.path(), &session.id)
+        .unwrap()
+        .list()
+        .unwrap();
+    assert_eq!(records.len(), 1, "{stdout}\n{stderr}");
+    assert_eq!(
+        records[0].state,
+        SuggestionState::Revoked,
+        "{stdout}\n{stderr}"
+    );
+    let mut command = cli(root.path(), data.path(), "http://127.0.0.1:1/v1");
+    command.args(["--resume", &session.id]);
+    let (stdout, stderr) = repl(command, "/suggestions list\n/exit\n").await;
+    assert!(stdout.contains("revoked"), "{stdout}\n{stderr}");
+}
+
+#[tokio::test]
+async fn suggestions_analyze_respects_readonly_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut command = Command::new(common::exe());
+    command.args([
+        "--provider",
+        "openai",
+        "--model",
+        "mock-model",
+        "--base-url",
+        "http://127.0.0.1:1/v1",
+        "--permission",
+        "readonly",
+    ]);
+    command
+        .arg("--cwd")
+        .arg(root.path())
+        .arg("--data-dir")
+        .arg(data.path());
+    command.env("COVE_API_KEY", "test-only-not-a-real-key");
+    command.kill_on_drop(true);
+    let (stdout, stderr) = repl(command, "/suggestions analyze\n/exit\n").await;
+    assert!(
+        !data.path().join("suggestions").exists(),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn dream_restore_commands_preview_and_restore_one_project_entry() {
+    use cove::memory::store::{Memory, ProvenanceSource, Scope};
+    use cove::safety::permission::{LocalAuthorizer, Mode};
+    use std::{process::Stdio, sync::Arc};
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let memory = Memory::new(
+        data.path(),
+        root.path(),
+        Arc::new(LocalAuthorizer {
+            mode: Mode::Auto,
+            input: None,
+        }),
+    )
+    .unwrap();
+    let saved = memory
+        .save(
+            Scope::Project,
+            None,
+            "restore fact".into(),
+            "original value".into(),
+            "test".into(),
+            ProvenanceSource {
+                kind: "operator".into(),
+                ..ProvenanceSource::default()
+            },
+        )
+        .unwrap();
+    let id = saved["saved"].as_str().unwrap();
+    let backup_name = "dream-123-test";
+    let backup = data.path().join("memory/backups").join(backup_name);
+    std::fs::create_dir_all(backup.join("project")).unwrap();
+    std::fs::copy(
+        memory.directory(Scope::Project).join(format!("{id}.json")),
+        backup.join("project").join(format!("{id}.json")),
+    )
+    .unwrap();
+    cove::session::atomic_json(&backup.join("manifest.json"), &json!({
+        "version": 1, "project": memory.directory(Scope::Project).file_name().unwrap().to_str().unwrap()
+    })).unwrap();
+    memory.remove(Scope::Project, id).unwrap();
+
+    let mut command = cli(root.path(), data.path(), "http://127.0.0.1:9/v1");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    input.write_all(format!("/config memory dream backups\n/config memory dream show {backup_name}\n/config memory dream preview {backup_name} {id}\n").as_bytes()).await.unwrap();
+    let mut seen = String::new();
+    let token = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(output.read_line(&mut line).await.unwrap(), 0, "{seen}");
+            seen.push_str(&line);
+            if let Some((_, token)) = line.split_once("/config memory dream restore ") {
+                break token.trim().to_owned();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(seen.contains(backup_name));
+    assert!(seen.contains("restore fact"));
+    assert!(seen.contains("original value"));
+    assert!(memory.entries(Scope::Project).unwrap().is_empty());
+    input
+        .write_all(format!("/config memory dream restore {token}\n/exit\n").as_bytes())
+        .await
+        .unwrap();
+    drop(input);
+    let mut remaining = String::new();
+    output.read_to_string(&mut remaining).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "{seen}\n{remaining}");
+    let entries = memory.entries(Scope::Project).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, id);
+    assert_eq!(entries[0].content, "original value");
+    assert_eq!(entries[0].provenance[0].kind, "operator");
+}
+
 fn session_ids(data: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(data.join("sessions"))
         .unwrap()
@@ -213,6 +395,32 @@ async fn history_lists_titles_resumes_by_number_and_exports_markdown() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("Fix the login bug"));
+}
+
+#[tokio::test]
+async fn turns_lists_each_conversation_and_shows_the_complete_tool_result() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("note.txt"), "first line\nsecond line\n").unwrap();
+    let (url, server) = mock_server(vec![
+        tool("read-note", "read", json!({"path":"note.txt"})),
+        openai(json!({"content":"first answer"}), "stop"),
+        openai(json!({"content":"second answer"}), "stop"),
+    ])
+    .await;
+    let (stdout, stderr) = repl(
+        cli(root.path(), data.path(), &url),
+        "inspect the note\nsecond question\n/turns\n/turns 1\n/turns 2\n/turns 0\n/exit\n",
+    )
+    .await;
+    assert!(stdout.contains("1. inspect the note"), "{stdout}");
+    assert!(stdout.contains("2. second question"), "{stdout}");
+    assert!(stdout.contains("工具 read"), "{stdout}");
+    assert!(stdout.contains("second line"), "{stdout}");
+    assert!(stdout.contains("first answer"), "{stdout}");
+    assert!(stdout.contains("second answer"), "{stdout}");
+    assert!(stderr.contains("对话编号须在 1..2 之间"), "{stderr}");
+    assert_eq!(server.await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -537,6 +745,133 @@ async fn continue_in_a_new_session_goes_back_to_the_last_task_and_shows_it() {
         stderr.contains("会话已保存。下次在这里输入“继续”"),
         "{stderr}"
     );
+}
+
+#[tokio::test]
+async fn startup_and_continue_choose_the_latest_task_after_multiple_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.txt"), "old work").unwrap();
+    let (url, first) = mock_server(vec![
+        tool("read-old", "read", json!({"path":"notes.txt"})),
+        openai(json!({"content":"old work completed"}), "stop"),
+    ])
+    .await;
+    repl(
+        cli(root.path(), data.path(), &url),
+        "older detailed task\n/exit\n",
+    )
+    .await;
+    first.await.unwrap();
+
+    let (url, second) = mock_server(vec![openai(
+        json!({"content":"new work completed"}),
+        "stop",
+    )])
+    .await;
+    repl(cli(root.path(), data.path(), &url), "newest task\n/exit\n").await;
+    second.await.unwrap();
+
+    let store = cove::session::Store::open(data.path()).unwrap();
+    let (sessions, broken) = store.list_lenient();
+    assert!(broken.is_empty());
+    for session in sessions {
+        let updated = match session.display_title().as_str() {
+            "older detailed task" => 100,
+            "newest task" => 200,
+            _ => continue,
+        };
+        let path = data
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", session.id));
+        let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["updated"] = json!(updated);
+        snapshot["created"] = json!(updated);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+
+    let (url, third) =
+        mock_server(vec![openai(json!({"content":"continued newest"}), "stop")]).await;
+    let (stdout, stderr) = repl(cli(root.path(), data.path(), &url), "继续\n/exit\n").await;
+    assert!(
+        stderr.contains("上次在这里的任务：#1 newest task"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("[resume] 回到任务 #1：newest task"),
+        "{stdout}"
+    );
+    let requests = third.await.unwrap();
+    let messages = requests[0]["messages"].to_string();
+    assert!(messages.contains("newest task"), "{messages}");
+    assert!(!messages.contains("older detailed task"), "{messages}");
+}
+
+#[tokio::test]
+async fn startup_shows_the_latest_task_in_a_multi_task_session() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, first) = mock_server(vec![
+        openai(json!({"content":"first done"}), "stop"),
+        openai(json!({"content":"second done"}), "stop"),
+    ])
+    .await;
+    repl(
+        cli(root.path(), data.path(), &url),
+        "first task\nlatest task\n/exit\n",
+    )
+    .await;
+    first.await.unwrap();
+
+    let (url, second) = mock_server(vec![openai(json!({"content":"continued"}), "stop")]).await;
+    let (stdout, stderr) = repl(cli(root.path(), data.path(), &url), "继续\n/exit\n").await;
+    assert!(
+        stderr.contains("上次在这里的任务：#1 latest task"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("[resume] 回到任务 #1：latest task"),
+        "{stdout}"
+    );
+    let requests = second.await.unwrap();
+    let messages = requests[0]["messages"].to_string();
+    assert!(
+        messages.contains("first task") && messages.contains("latest task"),
+        "{messages}"
+    );
+}
+
+#[test]
+fn same_second_sessions_are_sorted_by_their_last_save() {
+    use cove::{
+        domain::Message,
+        session::{Session, Store},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let mut older_save = Session::new(root.path().to_owned(), "openai".into(), "mock".into(), None);
+    older_save.messages.push(Message::user("older save"));
+    store.flush(&older_save).unwrap();
+    let mut newer_save = Session::new(root.path().to_owned(), "openai".into(), "mock".into(), None);
+    newer_save.messages.push(Message::user("newer save"));
+    store.flush(&newer_save).unwrap();
+
+    for (session, created) in [(&older_save, 200), (&newer_save, 100)] {
+        let path = data
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", session.id));
+        let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["updated"] = json!(300);
+        snapshot["created"] = json!(created);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    let (sessions, broken) = store.list_lenient();
+    assert!(broken.is_empty());
+    assert_eq!(sessions[0].id, newer_save.id);
 }
 
 #[tokio::test]

@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 use crate::{
     domain::{Error, Result},
     engine::turn::TurnHook,
-    extensions::{Registry, Sourced, identifier},
+    extensions::{
+        Registry, Sourced, identifier,
+        skill_candidates::{Candidate, CandidateState},
+    },
     session::Session,
     tools::ToolOutput,
 };
@@ -132,6 +135,7 @@ pub enum Origin {
     Configured,
     Project,
     Auto,
+    Approved,
 }
 
 impl Origin {
@@ -143,6 +147,7 @@ impl Origin {
             Self::Configured => "configured",
             Self::Project => "project",
             Self::Auto => "auto",
+            Self::Approved => "approved",
         }
     }
 }
@@ -151,6 +156,7 @@ impl Origin {
 enum Body {
     Embedded(&'static str),
     File(PathBuf),
+    Candidate { id: String, text: String },
 }
 
 #[derive(Clone)]
@@ -447,6 +453,10 @@ fn skill_dirs(sources: &SkillSources) -> Vec<PathBuf> {
 /// A new skill directory changes its parent; a new or edited file changes itself.
 fn stamps(sources: &SkillSources) -> Vec<Stamp> {
     let mut stamps = Vec::new();
+    if !sources.data_dir.as_os_str().is_empty() {
+        let path = sources.data_dir.join("skill-candidates/records.json");
+        stamps.push((path.clone(), modified(&path)));
+    }
     for dir in skill_dirs(sources) {
         stamps.push((dir.clone(), modified(&dir)));
         let Ok(read) = std::fs::read_dir(&dir) else {
@@ -582,6 +592,30 @@ impl Skills {
                 }
             }
             skills.project_root = Some(root);
+        }
+        if let Some(data) = &skills.data_dir
+            && data.join("skill-candidates/records.json").exists()
+        {
+            match skills.candidate_store().and_then(|store| store.list()) {
+                Ok(candidates) => {
+                    for candidate in candidates
+                        .into_iter()
+                        .filter(|candidate| candidate.state == CandidateState::Approved)
+                    {
+                        if entries.contains_key(&candidate.name) {
+                            skills.warnings.push(format!(
+                                "approved candidate {} conflicts with an existing skill",
+                                candidate.name
+                            ));
+                        } else {
+                            entries.insert(candidate.name.clone(), candidate_skill(&candidate));
+                        }
+                    }
+                }
+                Err(err) => skills
+                    .warnings
+                    .push(format!("skill candidates not loaded: {err}")),
+            }
         }
         for name in &skills.disabled {
             entries.remove(name);
@@ -728,7 +762,8 @@ impl Skills {
                 json!({"name":skill.name,"origin":skill.origin.label(),"plugin":skill.plugin,
                 "description":clip(&skill.description, DESCRIPTION_LIMIT),"paths":skill.paths,
                 "allowed_tools":skill.allowed_tools,"steps":skill.steps.len(),
-                "source":source(&skill.body),"enabled":self.enabled(skill)?}),
+                "source":source(&skill.body),"enabled":self.enabled(skill)?,
+                "verification":(skill.origin == Origin::Auto).then_some("legacy-unverified")}),
             );
         }
         Ok(json!(list))
@@ -750,6 +785,17 @@ impl Skills {
                 "skill path replaced by a link; reload configuration".into(),
             ));
         }
+        if let Body::Candidate { id, .. } = &skill.body {
+            let current = self.candidate_store()?.list()?;
+            if !current
+                .iter()
+                .any(|candidate| candidate.id == *id && candidate.state == CandidateState::Approved)
+            {
+                return Err(Error::Tool(
+                    "candidate approval changed; reload configuration".into(),
+                ));
+            }
+        }
         Ok(skill)
     }
 
@@ -757,6 +803,7 @@ impl Skills {
         match &skill.body {
             Body::Embedded(text) => Ok(parse(text)?.body),
             Body::File(path) => Ok(parse(&read_text(path, FILE_LIMIT)?)?.body),
+            Body::Candidate { text, .. } => Ok(text.clone()),
         }
     }
 
@@ -789,9 +836,11 @@ impl Skills {
         let text = match &skill.body {
             Body::Embedded(text) => (*text).to_owned(),
             Body::File(path) => read_text(path, FILE_LIMIT)?,
+            Body::Candidate { text, .. } => text.clone(),
         };
         Ok(
-            json!({"name":skill.name,"origin":skill.origin.label(),"source":source(&skill.body),"content":text}),
+            json!({"name":skill.name,"origin":skill.origin.label(),"source":source(&skill.body),"content":text,
+                "verification":(skill.origin == Origin::Auto).then_some("legacy-unverified")}),
         )
     }
 
@@ -941,6 +990,122 @@ impl Skills {
             .is_some_and(|skill| skill.origin != Origin::Auto)
     }
 
+    pub fn candidate_store(&self) -> Result<crate::extensions::skill_candidates::CandidateStore> {
+        let data = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| Error::Tool("no skill directory".into()))?;
+        crate::extensions::skill_candidates::CandidateStore::open(data)
+    }
+
+    pub fn stage_legacy(&self, name: &str, target: &str, session: &str) -> Result<Candidate> {
+        if !identifier(target) || name == target || self.disabled.contains(target) {
+            return Err(Error::Tool(
+                "legacy migration requires a distinct available name".into(),
+            ));
+        }
+        let legacy = self
+            .read()
+            .get(name)
+            .cloned()
+            .filter(|skill| skill.origin == Origin::Auto)
+            .ok_or_else(|| Error::Tool("legacy auto skill not found".into()))?;
+        if self.read().contains_key(target)
+            || Self::load(self.sources.clone(), self.registry.clone())?.contains(target)
+        {
+            return Err(Error::Tool("migration target skill already exists".into()));
+        }
+        let Body::File(path) = legacy.body else {
+            return Err(Error::Tool("legacy skill is not a file".into()));
+        };
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink()
+            || path.canonicalize()? != path
+        {
+            return Err(Error::Tool(
+                "legacy skill path changed; reload configuration".into(),
+            ));
+        }
+        let content = read_text(&path, FILE_LIMIT)?;
+        let parsed = parse(&content)?;
+        if parsed.name.as_deref() != Some(name)
+            || !parsed.paths.is_empty()
+            || !parsed.allowed_tools.is_empty()
+            || !parsed.steps.is_empty()
+        {
+            return Err(Error::Tool(
+                "legacy skill metadata cannot be migrated safely".into(),
+            ));
+        }
+        if crate::tools::external::suspicious(&content)
+            || crate::extensions::skill_review::contains_secret(&content)
+        {
+            return Err(Error::Tool(
+                "legacy skill contains suspicious or sensitive content".into(),
+            ));
+        }
+        use sha2::Digest;
+        self.candidate_store()?.submit_legacy(
+            target,
+            &parsed.description,
+            &parsed.body,
+            session,
+            crate::extensions::skill_candidates::LegacySource {
+                name: name.into(),
+                content_hash: format!("{:x}", sha2::Sha256::digest(content.as_bytes())),
+                session: session.into(),
+            },
+        )
+    }
+
+    pub fn decide_candidate(
+        &self,
+        id: &str,
+        expected: CandidateState,
+        next: CandidateState,
+        actor: &str,
+        reason: &str,
+    ) -> Result<Candidate> {
+        let store = self.candidate_store()?;
+        let fresh = if next == CandidateState::Approved {
+            Some(Self::load(self.sources.clone(), self.registry.clone())?)
+        } else {
+            None
+        };
+        let mut entries = self.entries.write().unwrap_or_else(|err| err.into_inner());
+        if next == CandidateState::Approved {
+            let candidate = store
+                .list()?
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .ok_or_else(|| Error::Tool("candidate not found".into()))?;
+            if entries.contains_key(&candidate.name)
+                || fresh
+                    .as_ref()
+                    .is_some_and(|skills| skills.contains(&candidate.name))
+                || self.disabled.contains(&candidate.name)
+            {
+                return Err(Error::Tool(
+                    "skill name already exists or is disabled; not replaced".into(),
+                ));
+            }
+            if entries.len() >= MAX_SKILLS {
+                return Err(Error::Tool(format!("at most {MAX_SKILLS} skills")));
+            }
+        }
+        let candidate = store.decide(id, expected, next, actor, reason)?;
+        match next {
+            CandidateState::Approved => {
+                entries.insert(candidate.name.clone(), candidate_skill(&candidate));
+            }
+            CandidateState::Revoked
+                if entries.get(&candidate.name).is_some_and(|skill| matches!(&skill.body, Body::Candidate { id: current, .. } if current == id)) => {
+                entries.remove(&candidate.name);
+            }
+            _ => {}
+        }
+        Ok(candidate)
+    }
+
     /// Writes a learned skill to `<data_dir>/skills/auto-<slug>/SKILL.md` and registers it.
     /// Never shadows a curated skill and never replaces a file it did not generate.
     pub fn save_auto(
@@ -1014,6 +1179,23 @@ fn source(body: &Body) -> Value {
     match body {
         Body::Embedded(_) => json!("builtin"),
         Body::File(path) => json!(path),
+        Body::Candidate { id, .. } => json!({"candidate": id}),
+    }
+}
+
+fn candidate_skill(candidate: &Candidate) -> Skill {
+    Skill {
+        name: candidate.name.clone(),
+        description: candidate.description.clone(),
+        body: Body::Candidate {
+            id: candidate.id.clone(),
+            text: candidate.body.clone(),
+        },
+        plugin: None,
+        origin: Origin::Approved,
+        paths: Vec::new(),
+        allowed_tools: Vec::new(),
+        steps: Vec::new(),
     }
 }
 
@@ -1217,6 +1399,433 @@ mod tests {
         let bare = parse("# Title here\nmore").unwrap();
         assert!(!bare.has_frontmatter);
         assert_eq!(bare.description, "Title here");
+    }
+
+    #[test]
+    #[ignore]
+    fn skill_hot_paths_benchmark() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        for number in 0..16 {
+            write(
+                &project
+                    .path()
+                    .join(format!(".cove/skills/bench-{number}.md")),
+                &format!(
+                    "---\nname: bench-{number}\ndescription: benchmark {number}\npaths: [\"src/**/*.rs\"]\n---\ntest\n"
+                ),
+            );
+        }
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                cwd: project.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        let cwd = project.path().canonicalize().unwrap();
+        for _ in 0..5 {
+            let started = Instant::now();
+            for _ in 0..5_000 {
+                std::hint::black_box(skills.index().unwrap());
+            }
+            let index = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..5_000 {
+                std::hint::black_box(skills.matching("src/example.rs", &cwd));
+            }
+            let matching = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..5_000 {
+                std::hint::black_box(skills.refresh().unwrap());
+            }
+            let refresh = started.elapsed();
+            eprintln!("5000 operations: index={index:?} matching={matching:?} refresh={refresh:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn approved_candidate_load_benchmark() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        for count in [1, 64] {
+            let data = tempfile::tempdir().unwrap();
+            let sources = SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            };
+            let skills = Skills::load(sources, registry(data.path())).unwrap();
+            let store = skills.candidate_store().unwrap();
+            let body = "x".repeat(4096);
+            let mut first = None;
+            for number in 0..count {
+                let candidate = store
+                    .submit(&format!("bench-{number}"), "benchmark", &body, "session")
+                    .unwrap();
+                if first.is_none() {
+                    first = Some(candidate.id);
+                }
+            }
+            skills
+                .decide_candidate(
+                    first.as_deref().unwrap(),
+                    CandidateState::Candidate,
+                    CandidateState::Approved,
+                    "user",
+                    "",
+                )
+                .unwrap();
+            let started = Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(skills.render("bench-0", None).unwrap());
+            }
+            eprintln!(
+                "20 approved candidate loads, {count} records of 4096 bytes: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn approved_candidate_is_available_after_restart_and_revocation_disables_it() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let sources = SkillSources {
+            data_dir: data.path().into(),
+            builtin: true,
+            ..SkillSources::default()
+        };
+        let skills = Skills::load(sources.clone(), registry(data.path())).unwrap();
+        let candidate = skills
+            .candidate_store()
+            .unwrap()
+            .submit("deploy-flow", "When deploying", "build, ship", "session-1")
+            .unwrap();
+        assert!(!skills.contains("deploy-flow"));
+        skills
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Candidate,
+                CandidateState::Approved,
+                "user",
+                "",
+            )
+            .unwrap();
+        assert!(
+            skills
+                .render("deploy-flow", None)
+                .unwrap()
+                .contains("build, ship")
+        );
+        let restarted = Skills::load(sources, registry(data.path())).unwrap();
+        assert!(
+            restarted
+                .render("deploy-flow", None)
+                .unwrap()
+                .contains("build, ship")
+        );
+        restarted
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Approved,
+                CandidateState::Revoked,
+                "user",
+                "outdated",
+            )
+            .unwrap();
+        assert!(restarted.render("deploy-flow", None).is_err());
+        assert!(skills.render("deploy-flow", None).is_err());
+    }
+
+    #[test]
+    fn legacy_migration_stages_a_renamed_candidate_without_changing_the_original() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        let path = skills
+            .save_auto(
+                "legacy-flow",
+                "When deploying",
+                "build, ship",
+                "old-session",
+            )
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(
+            skills
+                .stage_legacy("legacy-flow", "legacy-flow", "review-session")
+                .is_err()
+        );
+        let candidate = skills
+            .stage_legacy("legacy-flow", "reviewed-flow", "review-session")
+            .unwrap();
+        assert_eq!(candidate.name, "reviewed-flow");
+        assert_eq!(candidate.description, "When deploying");
+        assert_eq!(candidate.body.trim(), "build, ship");
+        assert_eq!(candidate.state, CandidateState::Candidate);
+        assert_eq!(candidate.legacy_sources.len(), 1);
+        assert_eq!(candidate.legacy_sources[0].name, "legacy-flow");
+        assert_eq!(candidate.legacy_sources[0].session, "review-session");
+        assert_eq!(candidate.legacy_sources[0].content_hash.len(), 64);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            skills
+                .render("legacy-flow", None)
+                .unwrap()
+                .contains("build, ship")
+        );
+        assert!(!skills.contains("reviewed-flow"));
+        assert!(
+            skills
+                .stage_legacy("plan", "other-flow", "review-session")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_migration_rejects_changed_metadata_and_sensitive_content() {
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        let path = skills
+            .save_auto("legacy-flow", "Deploy", "build", "old-session")
+            .unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: legacy-flow\ndescription: Deploy\npaths: [src/**]\n---\nbuild\n",
+        )
+        .unwrap();
+        assert!(
+            skills
+                .stage_legacy("legacy-flow", "reviewed-flow", "review-session")
+                .is_err()
+        );
+        std::fs::write(
+            &path,
+            "---\nname: legacy-flow\ndescription: Deploy\n---\napi_key = abcdefgh12345\n",
+        )
+        .unwrap();
+        assert!(
+            skills
+                .stage_legacy("legacy-flow", "reviewed-flow", "review-session")
+                .is_err()
+        );
+        std::fs::write(
+            &path,
+            "---\nname: another-flow\ndescription: Deploy\n---\nbuild\n",
+        )
+        .unwrap();
+        assert!(
+            skills
+                .stage_legacy("legacy-flow", "reviewed-flow", "review-session")
+                .is_err()
+        );
+        assert!(skills.candidate_store().unwrap().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn approved_candidate_cannot_run_with_duplicate_records() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        let candidate = skills
+            .candidate_store()
+            .unwrap()
+            .submit("deploy-flow", "When deploying", "build, ship", "session-1")
+            .unwrap();
+        skills
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Candidate,
+                CandidateState::Approved,
+                "user",
+                "",
+            )
+            .unwrap();
+        assert!(skills.render("deploy-flow", None).is_ok());
+        let path = data.path().join("skill-candidates/records.json");
+        let mut records: serde_json::Value = crate::session::read_json(&path).unwrap();
+        let candidates = records["candidates"].as_array_mut().unwrap();
+        candidates.push(candidates[0].clone());
+        crate::session::atomic_json(&path, &records).unwrap();
+        assert!(skills.render("deploy-flow", None).is_err());
+    }
+
+    #[test]
+    fn candidate_approval_never_overwrites_existing_skills_or_uses_changed_content() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        skills
+            .save_auto("legacy-flow", "old", "original", "old-session")
+            .unwrap();
+        let store = skills.candidate_store().unwrap();
+        for name in ["plan", "legacy-flow"] {
+            let candidate = store
+                .submit(name, "new", "replacement", "session-1")
+                .unwrap();
+            assert!(
+                skills
+                    .decide_candidate(
+                        &candidate.id,
+                        CandidateState::Candidate,
+                        CandidateState::Approved,
+                        "user",
+                        ""
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item.id == candidate.id)
+                    .unwrap()
+                    .state,
+                CandidateState::Candidate
+            );
+        }
+        assert!(
+            skills
+                .render("legacy-flow", None)
+                .unwrap()
+                .contains("original")
+        );
+        let candidate = store
+            .submit("new-flow", "new", "approved text", "session-1")
+            .unwrap();
+        skills
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Candidate,
+                CandidateState::Approved,
+                "user",
+                "",
+            )
+            .unwrap();
+        let path = data.path().join("skill-candidates/records.json");
+        let mut records: Value = crate::session::read_json(&path).unwrap();
+        let items = records["candidates"].as_array_mut().unwrap();
+        items
+            .iter_mut()
+            .find(|item| item["id"] == candidate.id)
+            .unwrap()["body"] = "changed".into();
+        crate::session::atomic_json(&path, &records).unwrap();
+        assert!(skills.render("new-flow", None).is_err());
+        assert!(
+            skills
+                .render("legacy-flow", None)
+                .unwrap()
+                .contains("original")
+        );
+    }
+
+    #[test]
+    fn legacy_auto_skill_is_listed_as_unverified_without_changing_activation() {
+        let data = tempfile::tempdir().unwrap();
+        let sources = SkillSources {
+            data_dir: data.path().into(),
+            builtin: true,
+            ..SkillSources::default()
+        };
+        let skills = Skills::load(sources.clone(), registry(data.path())).unwrap();
+        skills
+            .save_auto("legacy-flow", "old", "original", "old-session")
+            .unwrap();
+        let restarted = Skills::load(sources, registry(data.path())).unwrap();
+        let listing = restarted.listing().unwrap();
+        let legacy = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "legacy-flow")
+            .unwrap();
+        assert_eq!(legacy["verification"], "legacy-unverified");
+        assert_eq!(legacy["enabled"], true);
+        assert!(
+            restarted
+                .render("legacy-flow", None)
+                .unwrap()
+                .contains("original")
+        );
+    }
+
+    #[test]
+    fn candidate_approval_refuses_skill_added_after_initial_load() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        let store = skills.candidate_store().unwrap();
+        let candidate = store
+            .submit("new-flow", "new", "candidate body", "session-1")
+            .unwrap();
+        let path = data.path().join("skills/new-flow/SKILL.md");
+        write(
+            &path,
+            "---\nname: new-flow\ndescription: user skill\n---\nuser body\n",
+        );
+        assert!(
+            skills
+                .decide_candidate(
+                    &candidate.id,
+                    CandidateState::Candidate,
+                    CandidateState::Approved,
+                    "user",
+                    ""
+                )
+                .is_err()
+        );
+        assert_eq!(store.list().unwrap()[0].state, CandidateState::Candidate);
+        assert!(std::fs::read_to_string(path).unwrap().contains("user body"));
     }
 
     #[test]

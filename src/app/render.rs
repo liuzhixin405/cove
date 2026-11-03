@@ -556,6 +556,11 @@ impl Markdown {
 /// A markdown table with its columns aligned: the header bold, `│` between
 /// cells, `─┼─` under the header; inline code and bold keep their styles.
 fn table(rows: &[String]) -> String {
+    let width = crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width));
+    table_with_width(rows, width)
+}
+
+fn table_with_width(rows: &[String], terminal_width: usize) -> String {
     let separator = |cells: &[String]| {
         cells.iter().all(|cell| {
             let cell = cell.trim_matches(':');
@@ -579,7 +584,7 @@ fn table(rows: &[String]) -> String {
         .map(|(_, cells)| cells.iter().map(|cell| inline(cell)).collect())
         .collect();
     let columns = body.iter().map(Vec::len).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..columns)
+    let natural: Vec<usize> = (0..columns)
         .map(|column| {
             body.iter()
                 .filter_map(|row| row.get(column).map(|(_, width)| *width))
@@ -587,34 +592,136 @@ fn table(rows: &[String]) -> String {
                 .unwrap_or(0)
         })
         .collect();
+    let available = terminal_width.saturating_sub(2 + columns.saturating_sub(1) * 3);
+    if available < columns * 2 {
+        let mut out = String::new();
+        let indent = if terminal_width >= 4 { "  " } else { "" };
+        let width = terminal_width.saturating_sub(indent.len()).max(2);
+        for (index, row) in body.iter().enumerate() {
+            if header && body.len() > 1 && index == 0 {
+                continue;
+            }
+            for (column, (text, _)) in row.iter().enumerate() {
+                let label = if header && body.len() > 1 {
+                    body[0]
+                        .get(column)
+                        .map_or("", |(text, _)| text.as_str())
+                        .to_owned()
+                } else {
+                    format!("列 {}", column + 1)
+                };
+                for (line, _) in wrap_cell(&format!("{label}:"), width) {
+                    out.push_str(&format!("{indent}{BOLD}{line}{RESET}\n"));
+                }
+                for (line, _) in wrap_cell(text, width) {
+                    out.push_str(&format!("{indent}{line}\n"));
+                }
+            }
+            out.push('\n');
+        }
+        return out;
+    }
+    let mut widths: Vec<usize> = natural.iter().map(|width| (*width).clamp(1, 2)).collect();
+    let mut remaining = available.saturating_sub(widths.iter().sum::<usize>());
+    while remaining > 0 {
+        let expandable = widths
+            .iter()
+            .zip(&natural)
+            .filter(|(width, max)| width < max)
+            .count();
+        if expandable == 0 {
+            break;
+        }
+        let share = (remaining / expandable).max(1);
+        for (width, max) in widths.iter_mut().zip(&natural) {
+            let add = share.min(max.saturating_sub(*width)).min(remaining);
+            *width += add;
+            remaining -= add;
+        }
+    }
+    let rule: Vec<String> = widths.iter().map(|width| "─".repeat(*width)).collect();
+    let rule = format!("  {DIM}{}{RESET}\n", rule.join("─┼─"));
     let mut out = String::new();
+    let mut previous_height = 1;
     for (index, row) in body.iter().enumerate() {
         let bold = header && index == 0;
-        let cells: Vec<String> = (0..columns)
+        let cells: Vec<Vec<(String, usize)>> = (0..columns)
             .map(|column| {
-                let (text, width) = row.get(column).cloned().unwrap_or_default();
-                let pad = " ".repeat(widths[column] - width);
-                if bold {
-                    format!("{BOLD}{text}{RESET}{pad}")
-                } else {
-                    format!("{text}{pad}")
-                }
+                let text = row.get(column).map_or("", |(text, _)| text.as_str());
+                wrap_cell(text, widths[column])
             })
             .collect();
-        out.push_str(&format!("  {}\n", cells.join(&format!(" {DIM}│{RESET} "))));
-        if bold {
-            let rule: Vec<String> = widths.iter().map(|width| "─".repeat(*width)).collect();
-            out.push_str(&format!("  {DIM}{}{RESET}\n", rule.join("─┼─")));
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        if index > usize::from(header) && (height > 1 || previous_height > 1) {
+            out.push_str(&rule);
         }
+        for line in 0..height {
+            let pieces: Vec<String> = (0..columns)
+                .map(|column| {
+                    let (text, width) = cells[column].get(line).cloned().unwrap_or_default();
+                    let pad = " ".repeat(widths[column].saturating_sub(width));
+                    if bold {
+                        format!("{BOLD}{text}{RESET}{pad}")
+                    } else {
+                        format!("{text}{pad}")
+                    }
+                })
+                .collect();
+            out.push_str(&format!("  {}\n", pieces.join(&format!(" {DIM}│{RESET} "))));
+        }
+        if bold {
+            out.push_str(&rule);
+        }
+        previous_height = height;
     }
     out
 }
 
+fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut active = String::new();
+    let mut width = 0;
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.starts_with('\x1b') {
+            let end = remaining.find('m').map_or(remaining.len(), |end| end + 1);
+            let sequence = &remaining[..end];
+            remaining = &remaining[end..];
+            if sequence == RESET {
+                active.clear();
+            } else {
+                active.push_str(sequence);
+            }
+            line.push_str(sequence);
+            continue;
+        }
+        let grapheme = remaining.graphemes(true).next().unwrap_or(remaining);
+        remaining = &remaining[grapheme.len()..];
+        let grapheme = if grapheme == "\t" { " " } else { grapheme };
+        let cell_width = grapheme.width();
+        if width > 0 && width + cell_width > max_width {
+            if !active.is_empty() {
+                line.push_str(RESET);
+            }
+            lines.push((line, width));
+            line = active.clone();
+            width = 0;
+        }
+        line.push_str(grapheme);
+        width += cell_width;
+    }
+    lines.push((line, width));
+    lines
+}
+
 /// A table cell with `code` and **bold** styled, and its width on screen.
 fn inline(cell: &str) -> (String, usize) {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
     let mut out = String::new();
-    let mut width = 0;
+    let mut visible = String::new();
     let (mut code, mut bold) = (false, false);
     let mut chars = cell.chars().peekable();
     while let Some(c) = chars.next() {
@@ -632,7 +739,7 @@ fn inline(cell: &str) -> (String, usize) {
                 out.push_str(if bold { BOLD } else { RESET });
             }
             c => {
-                width += c.width().unwrap_or(0);
+                visible.push(if c == '\t' { ' ' } else { c });
                 out.push(c);
             }
         }
@@ -640,7 +747,7 @@ fn inline(cell: &str) -> (String, usize) {
     if code || bold {
         out.push_str(RESET);
     }
-    (out, width)
+    (out, visible.width())
 }
 
 #[cfg(test)]
@@ -725,6 +832,66 @@ mod tests {
             plain(&out),
             "  链路   │ 从哪里看起\n  ───────┼───────────\n  行情   │ a → b     \n  保证金 │ c         \n\n完"
         );
+    }
+
+    #[test]
+    fn table_wraps_each_cell_with_visible_column_boundaries() {
+        let rows = [
+            "| 名称 | 说明 |",
+            "|---|---|",
+            "| 一 | 这是很长的说明内容 |",
+            "| 二 | 短 |",
+        ]
+        .map(str::to_owned);
+        let out = plain(&table_with_width(&rows, 17));
+        assert_eq!(
+            out,
+            "  名称 │ 说明    \n  ─────┼─────────\n  一   │ 这是很长\n       │ 的说明内\n       │ 容      \n  ─────┼─────────\n  二   │ 短      \n"
+        );
+        use unicode_width::UnicodeWidthStr;
+        assert!(out.lines().all(|line| line.width() <= 17));
+    }
+
+    #[test]
+    fn narrow_tables_show_column_labels_and_keep_graphemes_together() {
+        let rows = [
+            "| 名称 | 说明 | 状态 |",
+            "|---|---|---|",
+            "| 甲 | 👩‍💻测试 | 好 |",
+        ]
+        .map(str::to_owned);
+        let out = plain(&table_with_width(&rows, 8));
+        assert!(out.contains("名称:\n  甲\n"));
+        assert!(out.contains("说明:\n  👩‍💻测试\n"));
+        assert!(out.contains("状态:\n  好\n"));
+        use unicode_width::UnicodeWidthStr;
+        assert!(out.lines().all(|line| line.width() <= 8));
+    }
+
+    #[test]
+    fn wrapped_inline_code_keeps_its_style() {
+        let lines = wrap_cell(&inline("`abcdefgh`").0, 4);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, format!("{CODE}abcd{RESET}"));
+        assert_eq!(lines[1].0, format!("{CODE}efgh{RESET}"));
+    }
+
+    #[test]
+    fn narrow_tables_without_headers_number_the_columns() {
+        let rows = ["| first | second | third |"].map(str::to_owned);
+        let out = plain(&table_with_width(&rows, 8));
+        assert!(out.contains("列 1:\n  first\n"));
+        assert!(out.contains("列 2:\n  second\n"));
+        assert!(out.contains("列 3:\n  third\n"));
+    }
+
+    #[test]
+    fn narrow_header_only_table_keeps_its_content() {
+        let rows = ["| 名称 | 说明 | 状态 |", "|---|---|---|"].map(str::to_owned);
+        let out = plain(&table_with_width(&rows, 8));
+        assert!(out.contains("名称"));
+        assert!(out.contains("说明"));
+        assert!(out.contains("状态"));
     }
 
     #[test]

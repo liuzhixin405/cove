@@ -3,6 +3,7 @@
 pub mod hooks;
 pub mod mcp;
 pub mod plugins;
+pub mod skill_candidates;
 pub mod skill_review;
 pub mod skills;
 

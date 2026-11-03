@@ -413,7 +413,7 @@ impl MemoryRecall {
             out.push_str(header);
             if fresh {
                 let mut index = format!(
-                    "Memory index ({} entries; read one with the memory tool, action read):\n",
+                    "Memory index ({} entries; use memory action read with id and scope from [project] or [global]):\n",
                     entries.len()
                 );
                 for (scope, entry) in &entries {

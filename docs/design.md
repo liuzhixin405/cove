@@ -1,6 +1,6 @@
 # cove 架构设计
 
-版本：0.4.0。本文说明 cove 的目标、模块划分、设计原则和关键机制；使用方式、命令和实际限制见 [使用说明](../README.md)、[技术参考](reference.md)，扩展配置见 [扩展使用说明](extensions.md)。
+版本：0.5.0。本文说明 cove 的目标、模块划分、设计原则和关键机制；使用方式、命令和实际限制见 [使用说明](../README.md)、[技术参考](reference.md)，扩展配置见 [扩展使用说明](extensions.md)。
 
 ## 1. 目标与非目标
 
@@ -66,9 +66,9 @@ cove\
     tools\        模型可调用的工具：文件/搜索/Shell/提问/todo、repo_map、网页、画图、浏览器，以及扩展工具组合
     agents\       子 Agent：委派、后台 Agent 与生命周期、execute_plan、worktree、回归验证、实验性协作工具
     safety\       权限模式与规则（permission/）、Shell 分类与危险命令、完成闸门（gates/）、验证门禁
-    session\      会话存储（sessions/ 完整快照 + journals/ 追加日志，History 区分追加与改写）、文件检查点、Git 快照、费用账本、会话笔记
+    session\      会话存储（sessions/ 完整快照 + journals/ 追加日志，History 区分追加与改写）、文件检查点、Git 快照、费用账本、会话笔记、重复失败建议
     memory\       长期记忆：存储、检索注入、自动提取、dream 整理
-    extensions\   技能、插件、Hooks、MCP（stdio 与 HTTP/SSE）及启停注册表
+    extensions\   技能与技能候选审核、插件、Hooks、MCP（stdio 与 HTTP/SSE）及启停注册表
     workflows\    外围工作流：竞跑、自动化任务与收件箱、变更集、远程监督、浏览器验收
     commands\     斜杠命令，按功能区分文件，每个文件提供 HELP 与 handle
   tests\          集成测试，按功能区命名（cli、core、persistence、sessions、safety、tools、model、agents、extensions、integrations、project、workflows）

@@ -79,7 +79,7 @@ impl Nudges {
         if used + 1 >= u64::from(self.limits.max_turns) {
             return true;
         }
-        matches!((self.limits.budget, session.accounting.cost), (Some(budget), Some(cost)) if cost >= budget * 0.9)
+        matches!((self.limits.budget, session.accounting.budget_cost()), (Some(budget), Some(cost)) if cost >= budget * 0.9)
     }
 
     fn files_changed(&self) -> bool {

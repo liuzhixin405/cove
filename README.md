@@ -56,6 +56,7 @@ cove
 | 看它改了什么 | `/diff` |
 | 撤销它的修改 | `/undo` 先预览，`/undo confirm` 执行 |
 | 看完整的工具输出 | `/expand`，或 `/expand 3`（看 `#3`） |
+| 折叠浏览每轮对话 | 点击用户消息开头的三角，使用鼠标滚轮浏览对话 |
 | 换行（不发送） | Ctrl+J、Shift+Enter 或 Alt+Enter |
 | 翻历史输入 | 上下键；Ctrl+R 搜索 |
 | 退出 | `/exit` 或 Ctrl+D（会话自动保存） |

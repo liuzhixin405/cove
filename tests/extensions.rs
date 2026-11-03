@@ -553,6 +553,128 @@ async fn command_output(
 }
 
 #[tokio::test]
+async fn candidate_commands_approve_and_revoke_the_exact_version_across_restarts() {
+    let (root, data, home) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let store = cove::extensions::skill_candidates::CandidateStore::open(data.path()).unwrap();
+    let candidate = store
+        .submit(
+            "review-flow",
+            "When reviewing",
+            "inspect, test",
+            "session-1",
+        )
+        .unwrap();
+    let (ok, output, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/config skills candidates list",
+    )
+    .await;
+    assert!(
+        ok && output.contains(&candidate.id) && output.contains("candidate"),
+        "{output}"
+    );
+    let (ok, output, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        &format!("/config skills candidates show {}", candidate.id),
+    )
+    .await;
+    assert!(ok && output.contains("inspect, test"), "{output}");
+    let (ok, output, error) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        &format!("/config skills candidates approve {}", candidate.id),
+    )
+    .await;
+    assert!(ok && output.contains("approved"), "{output} {error}");
+    let (ok, output, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/config skills show review-flow",
+    )
+    .await;
+    assert!(ok && output.contains("inspect, test"), "{output}");
+    let (ok, output, error) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        &format!("/config skills candidates revoke {} outdated", candidate.id),
+    )
+    .await;
+    assert!(ok && output.contains("revoked"), "{output} {error}");
+    let (ok, _, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/config skills show review-flow",
+    )
+    .await;
+    assert!(!ok);
+}
+
+#[tokio::test]
+async fn legacy_migration_command_preserves_original_and_requires_candidate_approval() {
+    let (root, data, home) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let path = data.path().join("skills/auto-legacy-flow/SKILL.md");
+    let original = "---\nname: legacy-flow\ndescription: Deploy\ngenerated: \"1\"\nsource_session: \"old\"\n---\nbuild, ship\n";
+    write(&path, original);
+    let (ok, output, error) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/skills candidates migrate legacy-flow reviewed-flow",
+    )
+    .await;
+    assert!(
+        ok && output.contains("candidate") && output.contains("legacy-flow"),
+        "{output} {error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let store = cove::extensions::skill_candidates::CandidateStore::open(data.path()).unwrap();
+    let candidate = store.list().unwrap().pop().unwrap();
+    assert_eq!(candidate.legacy_sources[0].name, "legacy-flow");
+    assert_eq!(candidate.body.trim(), "build, ship");
+    let (ok, _, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/skills show reviewed-flow",
+    )
+    .await;
+    assert!(!ok);
+    let (ok, _, error) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        &format!("/skills candidates approve {}", candidate.id),
+    )
+    .await;
+    assert!(ok, "{error}");
+    let (ok, output, _) = command_output(
+        root.path(),
+        data.path(),
+        home.path(),
+        "/skills show reviewed-flow",
+    )
+    .await;
+    assert!(ok && output.contains("build, ship"), "{output}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[tokio::test]
 async fn the_built_in_marketplace_lists_and_installs_offline() {
     let (root, data, home) = (
         tempfile::tempdir().unwrap(),

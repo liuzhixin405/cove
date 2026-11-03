@@ -27,11 +27,13 @@ use crate::{
 pub(crate) const HELP: &str = "\
 /resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）
 /continue [<n|id>]  列出最近 5 个当前工作区会话供选择，或直接恢复指定会话；未完成任务会继续运行
+/turns [<n>]  浏览当前会话对话轮次；交互终端可展开、收起和翻页
 /replay [<n|id>]  会话回放：把会话渲染成零依赖的单文件 HTML 时间线报告（缺省为当前会话），写入数据目录 replay/ 并打印路径
+/suggestions [list|analyze|accept <hash>|reject <hash>|revoke <hash> <reason>]  当前会话的人工审核建议
 /status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token
 /status cost [month|YYYY-MM|30d|24h|today|all] [export [file]]  按服务商/模型统计用量；export 导出 CSV
 /undo [list|<#n|hash>|files <#n|hash> <file…>|confirm [token]]  文件工具回滚用 /undo confirm；快照可恢复整个工作区（含 Shell 的影响）
-/config memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  长期记忆：查看、添加、删除、搜索、整理";
+/config memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run|backups|show <backup>|preview <backup> <id>|restore <token>]]  长期记忆：查看、添加、删除、搜索、整理";
 
 /// A previewed snapshot restore waiting for `/undo confirm <token>`; kept on disk so a
 /// later one-shot invocation can confirm it.
@@ -208,7 +210,7 @@ fn usage(app: &Application) -> String {
     ));
     out.push_str(&format!("\n用量（会话 {}）\n", &app.session.id[..8]));
     let cost = accounting.cost.map_or(
-        "未知（该模型没有价格信息）".to_owned(),
+        "未知（缺少用量、价格或请求结果）".to_owned(),
         |cost| format!("${cost:.2}"),
     );
     out.push_str(&row("总花费", &cost));
@@ -351,7 +353,10 @@ pub(crate) async fn intercept(app: &mut Application, line: &str) -> Option<Resul
     };
     let (number, session) = target?;
     let note = if continuing {
-        format!("[resume] 回到任务 #{number}：{}\n", session.display_title())
+        format!(
+            "[resume] 回到任务 #{number}：{}\n",
+            latest_task_title(&session)
+        )
     } else {
         format!("[resume] 这个请求就是未完成的任务 #{number}；接着做，不从头开始\n")
     };
@@ -385,6 +390,8 @@ pub(crate) async fn handle(
     match args {
         ["/continue"] => continue_sessions(app, None).await?,
         ["/continue", reference] => continue_sessions(app, Some(*reference)).await?,
+        ["/turns"] => browse_turns(app, None)?,
+        ["/turns", number] => browse_turns(app, Some(number))?,
         ["/resume", rest @ ..] => {
             if history(app, line, rest).await? {
                 return Ok(Some(true));
@@ -392,6 +399,7 @@ pub(crate) async fn handle(
         }
         ["/replay"] => replay(app, None).await?,
         ["/replay", reference] => replay(app, Some(*reference)).await?,
+        ["/suggestions", rest @ ..] => suggestions(app, rest).await?,
         ["/status", "cost", rest @ ..] => cost(app, rest).await?,
         ["/status", "usage"] => say(&usage(app))?,
         ["/undo", "list"] => undo_list(app).await?,
@@ -414,6 +422,159 @@ pub(crate) async fn handle(
         _ => return Ok(None),
     }
     Ok(Some(false))
+}
+
+fn turn_views(session: &Session) -> Vec<crate::app::console::TurnView> {
+    session
+        .conversation_turns()
+        .into_iter()
+        .map(|messages| {
+            let input = messages
+                .first()
+                .and_then(|message| match message.blocks.first() {
+                    Some(Block::Text(text)) => {
+                        crate::session::conversation_input(text).map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "对话".into());
+            let title = messages
+                .first()
+                .and_then(|message| match message.blocks.first() {
+                    Some(Block::Text(text)) => {
+                        Some(crate::session::title_from(text).unwrap_or_else(|| clip(text, 60)))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "对话".into());
+            let mut content = String::new();
+            for (message_index, message) in messages.iter().enumerate() {
+                for (block_index, block) in message.blocks.iter().enumerate() {
+                    match block {
+                        Block::Text(text) => {
+                            let label = if message.role == Role::User {
+                                "用户"
+                            } else {
+                                "助手"
+                            };
+                            let text = if message_index == 0 && block_index == 0 {
+                                &input
+                            } else {
+                                text
+                            };
+                            content.push_str(&format!("{label}:\n{text}\n"));
+                        }
+                        Block::ToolUse { name, input, .. } => {
+                            content.push_str(&format!("工具 {name}: {input}\n"))
+                        }
+                        Block::ToolResult {
+                            content: result,
+                            is_error,
+                            ..
+                        } => content.push_str(&format!(
+                            "工具结果{}:\n{result}\n",
+                            if *is_error { "（失败）" } else { "" }
+                        )),
+                        Block::Image { media_type, .. } => {
+                            content.push_str(&format!("[图片附件：{media_type}]\n"))
+                        }
+                        Block::Reasoning(_) | Block::Thinking(_) => {}
+                    }
+                }
+            }
+            crate::app::console::TurnView {
+                title,
+                content,
+                input,
+            }
+        })
+        .collect()
+}
+
+fn browse_turns(app: &Application, number: Option<&str>) -> Result<()> {
+    let turns = turn_views(&app.session);
+    if turns.is_empty() {
+        return say("当前会话没有可浏览的对话。\n");
+    }
+    if let Some(number) = number {
+        let index = number
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .filter(|index| *index < turns.len())
+            .ok_or_else(|| Error::Session(format!("对话编号须在 1..{} 之间", turns.len())))?;
+        return say(&format!(
+            "第 {} 轮：{}\n{}",
+            index + 1,
+            turns[index].title,
+            turns[index].content
+        ));
+    }
+    if let Some(console) = crate::app::console::active() {
+        console.browse_turns(turns, app.session.compactions > 0);
+        return Ok(());
+    }
+    let mut text = String::from("当前对话（输入 /turns <编号> 查看完整内容）：\n");
+    if app.session.compactions > 0 {
+        text.push_str("早期对话已压缩，不在此列表中。\n");
+    }
+    for (index, turn) in turns.iter().enumerate() {
+        text.push_str(&format!("{}. {}\n", index + 1, turn.title));
+    }
+    say(&text)
+}
+
+async fn suggestions(app: &Application, args: &[&str]) -> Result<()> {
+    use crate::session::suggestions::{SuggestionState, SuggestionStore};
+    let store = SuggestionStore::open(app.store.root(), &app.session.id)?;
+    let target = app
+        .store
+        .root()
+        .join("suggestions")
+        .join(format!("{}.json", app.session.id));
+    let value = match args {
+        [] | ["list"] => serde_json::to_value(store.list()?)?,
+        ["analyze"] => {
+            app.authorizer
+                .authorize(Effect::Write(target), CancellationToken::new())
+                .await?;
+            serde_json::to_value(store.generate(&app.session)?)?
+        }
+        [action @ ("accept" | "reject"), id] => {
+            app.authorizer
+                .authorize(Effect::Write(target), CancellationToken::new())
+                .await?;
+            let next = if *action == "accept" {
+                SuggestionState::Accepted
+            } else {
+                SuggestionState::Rejected
+            };
+            serde_json::to_value(store.decide(
+                &app.session,
+                id,
+                SuggestionState::Candidate,
+                next,
+                "",
+            )?)?
+        }
+        ["revoke", id, reason @ ..] if !reason.is_empty() => {
+            app.authorizer
+                .authorize(Effect::Write(target), CancellationToken::new())
+                .await?;
+            serde_json::to_value(store.decide(
+                &app.session,
+                id,
+                SuggestionState::Accepted,
+                SuggestionState::Revoked,
+                &reason.join(" "),
+            )?)?
+        }
+        _ => return Err(Error::Session(
+            "用法：/suggestions [list|analyze|accept <hash>|reject <hash>|revoke <hash> <reason>]"
+                .into(),
+        )),
+    };
+    say(&format!("{}\n", crate::tools::json_output(value)?))
 }
 
 // ---------------------------------------------------------------- history
@@ -448,24 +609,30 @@ fn project_sessions(app: &Application, all: bool) -> Vec<Session> {
         .collect()
 }
 
-/// The session of this workspace most worth going back to (unfinished first, then
-/// real work), with its number in `/resume`'s list.
+/// The latest session of this workspace, with its number in `/resume`'s list.
 fn most_relevant(app: &Application) -> Option<(usize, Session)> {
-    let mut best: Option<(i32, usize, Session)> = None;
-    for (index, session) in project_sessions(app, false)
+    project_sessions(app, false)
         .into_iter()
         .enumerate()
-        .take(30)
-    {
-        let score = session.resume_score();
-        if session.id == app.session.id || score <= 0 {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(top, ..)| score > *top) {
-            best = Some((score, index + 1, session));
-        }
-    }
-    best.map(|(_, number, session)| (number, session))
+        .find(|(_, session)| session.id != app.session.id)
+        .map(|(index, session)| (index + 1, session))
+}
+
+fn latest_task_title(session: &Session) -> String {
+    crate::session::title_from(&session.current_request)
+        .or_else(|| {
+            session.messages.iter().rev().find_map(|message| {
+                if message.role != Role::User {
+                    return None;
+                }
+                match message.blocks.first() {
+                    Some(Block::Text(text)) => crate::session::conversation_input(text)
+                        .and_then(crate::session::title_from),
+                    _ => None,
+                }
+            })
+        })
+        .unwrap_or_else(|| session.display_title())
 }
 
 fn turns(count: usize) -> String {
@@ -495,7 +662,7 @@ pub(crate) fn startup_notice(app: &Application) -> Option<String> {
     };
     Some(format!(
         "上次在这里的任务：#{number} {}（{}，{state}，{}）。输入 /continue 选择会话，/resume 查看全部。\n",
-        session.display_title(),
+        latest_task_title(&session),
         turns(session.user_turns()),
         ago(session.updated)
     ))
@@ -700,7 +867,7 @@ fn resume_elsewhere(app: &mut Application, session: &Session) -> Result<bool> {
     Ok(true)
 }
 
-/// The last turns of a resumed session, so the conversation is on screen again.
+/// Shows restored conversation in the terminal's ordinary scrollback.
 pub(crate) fn show_conversation(session: &Session) -> Result<()> {
     const TURNS: usize = 3;
     let text = session.transcript(TURNS);
@@ -1766,6 +1933,17 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                         "，内容此后已改变"
                     }
                 ));
+                text.push_str(&format!(
+                    "    证据类型：{}；范围：{}；环境：{}；验证时间：{}\n",
+                    match source.evidence_type {
+                        Some(crate::memory::store::EvidenceType::UserStatement) => "用户陈述",
+                        Some(crate::memory::store::EvidenceType::ModelInference) => "模型推断",
+                        None => "未知",
+                    },
+                    source.scope.map_or("未知", Scope::name),
+                    source.environment.as_deref().unwrap_or("未知"),
+                    source.verified_at.map_or("未知".into(), timestamp),
+                ));
                 if !source.evidence.is_empty() {
                     for line in source.evidence.lines().take(12) {
                         text.push_str(&format!("    {line}\n"));
@@ -1774,6 +1952,32 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
             }
             text.push_str("出处只记录输入来源，不代表内容属实；依赖前请先核实。\n");
             say(&text)
+        }
+        ["dream", "backups"] => {
+            let dreamer = app.sessions.dreamer.clone();
+            let backups = blocking(move || dreamer.backups()).await?;
+            if backups.is_empty() { say("没有可验证的当前项目备份。\n") } else { say(&format!("{}\n", backups.join("\n"))) }
+        }
+        ["dream", "show", backup] => {
+            let dreamer = app.sessions.dreamer.clone();
+            let backup = backup.to_string();
+            let entries = blocking(move || dreamer.backup_entries(&backup)).await?;
+            let text = entries.into_iter().map(|(id, title)| format!("{id} {title}\n")).collect::<String>();
+            say(if text.is_empty() { "备份没有项目记忆。\n" } else { &text })
+        }
+        ["dream", "preview", backup, id] => {
+            let dreamer = app.sessions.dreamer.clone();
+            let backup = backup.to_string();
+            let id = id.to_string();
+            let (token, preview) = blocking(move || dreamer.preview_restore(&backup, &id)).await?;
+            say(&format!("{preview}\n确认恢复：/config memory dream restore {token}\n"))
+        }
+        ["dream", "restore", token] => {
+            memory.authorize_write(Scope::Project, CancellationToken::new()).await?;
+            let dreamer = app.sessions.dreamer.clone();
+            let token = token.to_string();
+            let id = blocking(move || dreamer.restore(&token)).await?;
+            say(&format!("已恢复项目记忆 {id}。\n"))
         }
         ["dream"] | ["dream", "status"] => say(&app.sessions.dreamer.status()),
         ["dream", "run"] => {
@@ -1796,7 +2000,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
             }
         }
         _ => Err(Error::Tool(
-            "用法：/config memory [list [project|global]|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]] 或 /config memory <tool JSON>".into(),
+            "用法：/config memory [list [project|global]|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run|backups|show <backup>|preview <backup> <id>|restore <token>]] 或 /config memory <tool JSON>".into(),
         )),
     }
 }
@@ -1804,6 +2008,31 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_views_keep_complete_conversation() {
+        let mut session = Session::new("/w".into(), "Openai".into(), "m".into(), None);
+        let long_answer = "long answer\n".repeat(100);
+        session.messages.push(Message::user("first request"));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::Text(long_answer.clone())],
+        });
+        session.messages.push(Message::user("second request"));
+        session.messages.push(Message::user(
+            "[sent while the previous task was running]\nverify again",
+        ));
+        session.compactions = 1;
+
+        let turns = turn_views(&session);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].title, "first request");
+        assert_eq!(turns[0].input, "first request");
+        assert!(turns[0].content.contains(&long_answer));
+        assert_eq!(turns[1].title, "second request");
+        assert_eq!(turns[2].input, "verify again");
+        assert_eq!(turns[2].content, "用户:\nverify again\n");
+    }
 
     #[test]
     fn markdown_export_includes_tool_calls_and_results() {

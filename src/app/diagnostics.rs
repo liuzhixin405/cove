@@ -2,8 +2,8 @@
 //! the error-code catalogue and the `/doctor` checks.
 //!
 //! Both logs are JSON lines under the data directory, size-capped and rotated once
-//! (`<name>.1`). The trace records sizes, counts, durations and outcomes only, never
-//! message text; the error log records a bounded, key-redacted error message.
+//! (`<name>.1`). Failed tool and model records may include bounded, key-redacted
+//! error text; these logs are not safe to share without inspection.
 
 use std::{
     io::Write,
@@ -746,7 +746,7 @@ pub fn trace_report(diagnostics: &Diagnostics, n: usize) -> String {
         );
     }
     let mut out = format!(
-        "跟踪记录：最近 {} 条（{}）；只记录大小与耗时，不含消息内容。\n",
+        "跟踪记录：最近 {} 条（{}）；失败摘要可能包含敏感内容，分享前请检查。\n",
         entries.len(),
         diagnostics.trace.path().display()
     );
@@ -755,6 +755,50 @@ pub fn trace_report(diagnostics: &Diagnostics, n: usize) -> String {
         out.push('\n');
     }
     out
+}
+
+pub fn support_report(diagnostics: &Diagnostics) -> String {
+    let entries = diagnostics.errors.tail(2000);
+    let mut groups = std::collections::BTreeMap::<&str, usize>::new();
+    for entry in &entries {
+        let code = lookup(text(entry, "code")).map_or("unknown", |known| known.code);
+        *groups.entry(code).or_default() += 1;
+    }
+    let compact_truncated = diagnostics
+        .trace
+        .tail(2000)
+        .iter()
+        .filter(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("compact")
+                && entry.get("complete").and_then(Value::as_bool) == Some(false)
+        })
+        .count();
+    let mut report = format!(
+        "# Cove 诊断报告\n\n版本: {}\n系统: {} / {}\n错误样本: {}（最多最近 2000 条）\n压缩截断: {}（最近最多 2000 条轨迹）\n\n## 错误分类\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        entries.len(),
+        compact_truncated
+    );
+    if groups.is_empty() {
+        report.push_str("无记录。\n");
+    }
+    for (code, count) in groups {
+        if let Some(known) = lookup(code) {
+            report.push_str(&format!(
+                "- {}: {} 次。{}；建议：{}\n",
+                known.code, count, known.message, known.recovery
+            ));
+        } else {
+            report.push_str(&format!("- 未分类: {count} 次。\n"));
+        }
+    }
+    if compact_truncated > 0 {
+        report.push_str("\n压缩摘要曾被截断：检查 /config max_output_tokens；压缩输出最多 8192 tokens。手动压缩可用 /compact 重试，中断任务可用 /continue。\n");
+    }
+    report.push_str("\n本报告不包含原始日志或会话内容；发送前请检查并按需编辑。\n");
+    report
 }
 
 /// `/doctor errors`: recorded failures grouped by code and message.
@@ -1345,6 +1389,38 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("认证失败"));
+    }
+
+    #[test]
+    fn support_report_only_uses_known_codes_and_aggregate_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::new(dir.path());
+        diagnostics.error(
+            "sensitive-source",
+            "HTTP 401 Unauthorized: secret-value C:\\private\\file",
+        );
+        diagnostics.error("sensitive-source", "HTTP 401 Unauthorized: another secret");
+        diagnostics.errors.write(
+            "error",
+            json!({"code":"secret-value", "message":"private contents"}),
+        );
+        diagnostics.trace.write(
+            "compact",
+            json!({"complete":false, "model":"secret-value", "error":"private contents"}),
+        );
+        let report = support_report(&diagnostics);
+        assert!(report.contains("E2004: 2 次"), "{report}");
+        assert!(report.contains("未分类: 1 次"), "{report}");
+        assert!(report.contains("压缩截断: 1"), "{report}");
+        assert!(report.contains("压缩输出最多 8192 tokens"), "{report}");
+        for secret in [
+            "secret-value",
+            "private",
+            "sensitive-source",
+            "another secret",
+        ] {
+            assert!(!report.contains(secret));
+        }
     }
 
     #[test]

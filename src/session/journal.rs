@@ -52,6 +52,8 @@ struct Head<'a> {
     created: u64,
     updated: u64,
     current_request: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<&'a str>,
     state: &'a State,
     pending: &'a [PendingCall],
     accounting: &'a Accounting,
@@ -78,6 +80,7 @@ impl<'a> Head<'a> {
             updated: _,
             messages: _,
             current_request,
+            task_id,
             state,
             pending,
             accounting,
@@ -98,6 +101,7 @@ impl<'a> Head<'a> {
             created: *created,
             updated,
             current_request,
+            task_id: task_id.as_deref(),
             state,
             pending,
             accounting,
@@ -262,13 +266,15 @@ fn write_snapshot(
 }
 
 /// Reads a session: the snapshot, then the journal records it does not include.
-pub fn load(snapshot: &Path, log: &Path) -> Result<Session> {
+pub fn load(snapshot: &Path, log: &Path) -> Result<(Session, u64)> {
     let data = read_limited(snapshot, STATE_LIMIT)?;
     let mut session: Session = serde_json::from_slice(&data)?;
     let mut seq = serde_json::from_slice::<SnapshotSeq>(&data)?.journal_seq;
     let journal = match read_limited(log, JOURNAL_READ_LIMIT) {
         Ok(journal) => journal,
-        Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => return Ok(session),
+        Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((session, seq));
+        }
         Err(err) => return Err(err),
     };
     for line in journal.split(|byte| *byte == b'\n') {
@@ -292,7 +298,7 @@ pub fn load(snapshot: &Path, log: &Path) -> Result<Session> {
         session.messages = History::from(messages);
         seq = record.seq;
     }
-    Ok(session)
+    Ok((session, seq))
 }
 
 fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -344,7 +350,16 @@ mod tests {
         session.compactions = 3;
         save(&snapshot, &log, &session).unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
-        let loaded = load(&snapshot, &log).unwrap();
+        let (loaded, sequence) = load(&snapshot, &log).unwrap();
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sequence, last["seq"].as_u64().unwrap());
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.current_request, "one");
         assert_eq!(loaded.compactions, 3);
@@ -373,7 +388,8 @@ mod tests {
             .unwrap()
             .write_all(b"{\"seq\":99999999999999999,\"at\":0,\"app")
             .unwrap();
-        let loaded = load(&snapshot, &log).unwrap();
+        let (loaded, sequence) = load(&snapshot, &log).unwrap();
+        assert!(sequence < 99999999999999999);
         let texts: Vec<String> = loaded
             .messages
             .iter()
@@ -401,7 +417,10 @@ mod tests {
         flush(&snapshot, &log, &session).unwrap();
         forget(&log);
         std::fs::write(&log, stale).unwrap();
-        let loaded = load(&snapshot, &log).unwrap();
+        let (loaded, sequence) = load(&snapshot, &log).unwrap();
+        let snapshot_sequence: SnapshotSeq =
+            serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+        assert_eq!(sequence, snapshot_sequence.journal_seq);
         assert_eq!(loaded.title.as_deref(), Some("newer"));
         assert_eq!(loaded.messages.len(), 1);
     }

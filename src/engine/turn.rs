@@ -37,4 +37,14 @@ pub trait TurnHook: Send + Sync {
     fn task_end<'a>(&'a self, _session: &'a Session, _completed: bool) -> BoxFuture<'a, ()> {
         Box::pin(async {})
     }
+
+    fn task_end_with_verification<'a>(
+        &'a self,
+        session: &'a Session,
+        completed: bool,
+        _verification: Option<crate::safety::verify::Outcome>,
+        _budget: Option<f64>,
+    ) -> BoxFuture<'a, ()> {
+        self.task_end(session, completed)
+    }
 }

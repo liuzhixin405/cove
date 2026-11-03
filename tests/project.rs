@@ -290,6 +290,184 @@ async fn doctor_runs_without_credentials_and_reports_codes() {
 }
 
 #[tokio::test]
+async fn doctor_report_is_local_private_and_export_requires_write_access() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("errors.log"),
+        format!(
+            "{}\n",
+            json!({
+                "kind":"error", "code":"E2004", "message":"secret-value C:\\private\\file"
+            })
+        ),
+    )
+    .unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", "/doctor report"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("E2004: 1 次"), "{stdout}");
+    assert!(!stdout.contains("secret-value") && !stdout.contains("private"));
+    assert!(!root.path().join("report.md").exists());
+
+    let mut command = Command::new(common::exe());
+    command.args([
+        "--provider",
+        "openai",
+        "--model",
+        "mock-model",
+        "--base-url",
+        NOWHERE,
+        "--permission",
+        "readonly",
+        "-p",
+        "/doctor report export report.md",
+    ]);
+    command
+        .arg("--cwd")
+        .arg(root.path())
+        .arg("--data-dir")
+        .arg(data.path());
+    command.env("COVE_API_KEY", "test-only-not-a-real-key");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(!root.path().join("report.md").exists());
+
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", "/doctor report export report.md"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let path = root.path().join("report.md");
+    let report = std::fs::read_to_string(&path).unwrap();
+    assert!(report.contains("E2004: 1 次"));
+    assert!(!report.contains("secret-value") && !report.contains("private"));
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", "/doctor report export report.md"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), report);
+}
+
+#[tokio::test]
+async fn doctor_report_analysis_sends_only_confirmed_whitelisted_report() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("errors.log"),
+        format!(
+            "{}\n",
+            json!({
+                "kind":"error", "code":"E2004", "message":"secret-value C:\\private\\file"
+            })
+        ),
+    )
+    .unwrap();
+    let (url, server) = mock_server(vec![openai(
+        json!({"content":"Check the configured credentials."}),
+        "stop",
+    )])
+    .await;
+    let mut command = cove(root.path(), data.path(), &url);
+    command.args(["-p", "/doctor report"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    let hash = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("确认 SHA-256: "))
+        .unwrap();
+    assert_eq!(hash.len(), 64);
+    let mut command = cove(root.path(), data.path(), &url);
+    command.args(["-p", &format!("/doctor report analyze confirm {hash}")]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("未验证，不自动执行")
+            && stdout.contains("Check the configured credentials.")
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = requests[0].to_string();
+    assert!(
+        request.contains("E2004")
+            && !request.contains("secret-value")
+            && !request.contains("private")
+    );
+    assert!(requests[0].get("tools").is_none());
+    let sessions = cove::session::Store::open(data.path())
+        .unwrap()
+        .list()
+        .unwrap();
+    let analyzed = sessions
+        .iter()
+        .find(|session| session.accounting.model_calls == 1)
+        .unwrap();
+    assert_eq!(analyzed.accounting.usage.input, 20);
+    assert_eq!(analyzed.accounting.usage.output, 10);
+}
+
+#[tokio::test]
+async fn doctor_report_analysis_obeys_readonly_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", "/doctor report"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    let hash = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("确认 SHA-256: "))
+        .unwrap();
+    let mut command = Command::new(common::exe());
+    command.args([
+        "--provider",
+        "openai",
+        "--model",
+        "mock-model",
+        "--base-url",
+        NOWHERE,
+        "--permission",
+        "readonly",
+        "-p",
+        &format!("/doctor report analyze confirm {hash}"),
+    ]);
+    command
+        .arg("--cwd")
+        .arg(root.path())
+        .arg("--data-dir")
+        .arg(data.path());
+    command.env("COVE_API_KEY", "test-only-not-a-real-key");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(!data.path().join("trace.jsonl").exists());
+}
+
+#[tokio::test]
+async fn doctor_report_analysis_rejects_stale_confirmation_before_network() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", "/doctor report"]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    let hash = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("确认 SHA-256: "))
+        .unwrap();
+    std::fs::write(
+        data.path().join("errors.log"),
+        format!("{}\n", json!({"kind":"error", "code":"E2004"})),
+    )
+    .unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.args(["-p", &format!("/doctor report analyze confirm {hash}")]);
+    let (output, stdout, stderr) = run(command).await;
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("报告已变化或哈希不匹配"), "{stderr}");
+    assert!(!data.path().join("trace.jsonl").exists());
+}
+
+#[tokio::test]
 async fn trace_and_error_logs_record_sizes_and_failures_but_no_text() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

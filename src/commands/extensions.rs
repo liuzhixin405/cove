@@ -13,6 +13,7 @@ use crate::{
     engine::agent::Agent,
     extensions::mcp::McpArgs,
     extensions::plugins::{self, Plugins},
+    extensions::skill_candidates::CandidateState,
     extensions::skills::{self, SkillSources, Skills},
     extensions::{
         Catalog, ExtensionConfig, HookConfig, Registry, Sourced, identifier, top_level_servers,
@@ -20,7 +21,7 @@ use crate::{
     safety::permission::Effect,
 };
 
-pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
+pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config skills candidates [list|show <hash>|approve <hash>|reject <hash>|revoke <hash> <reason>|migrate <old> <new>]  审核技能候选\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
 
 /// Top-level commands of the final command set; they win over skills of the same name.
 const BUILTIN: &[&str] = &[
@@ -34,6 +35,7 @@ const BUILTIN: &[&str] = &[
     "config",
     "new",
     "resume",
+    "suggestions",
     "continue",
     "compact",
     "diff",
@@ -141,6 +143,7 @@ pub(crate) fn turn_hooks(
     settings: &Settings,
     skills: &Arc<Skills>,
     background: Arc<dyn Provider>,
+    ledger: Arc<crate::session::usage::UsageLedger>,
 ) -> Agent {
     let agent = agent.with_turn_hook(Arc::new(skills::SkillNotes::new(
         skills.clone(),
@@ -149,11 +152,14 @@ pub(crate) fn turn_hooks(
     if settings.one_shot || !crate::extensions::skill_review::SkillReview::enabled(&settings.file) {
         return agent;
     }
-    agent.with_turn_hook(Arc::new(crate::extensions::skill_review::SkillReview::new(
-        background,
-        skills.clone(),
-        settings.max_output_tokens,
-    )))
+    agent.with_turn_hook(Arc::new(
+        crate::extensions::skill_review::SkillReview::new(
+            background,
+            skills.clone(),
+            settings.max_output_tokens,
+        )
+        .with_ledger(ledger, settings.provider.clone()),
+    ))
 }
 
 fn distance(a: &str, b: &str) -> usize {
@@ -269,7 +275,9 @@ pub(crate) async fn handle(
                 print_skill_list(&app.tools.skills.listing()?)?;
                 Ok(Some(false))
             }
-            [sub, ..] if ["show", "create", "install", "marketplace"].contains(sub) => {
+            [sub, ..]
+                if ["show", "create", "install", "marketplace", "candidates"].contains(sub) =>
+            {
                 let mut forwarded = vec!["skills"];
                 forwarded.extend_from_slice(&args[1..]);
                 configure(app, &forwarded).await
@@ -324,6 +332,11 @@ fn print_skill_list(listing: &serde_json::Value) -> Result<()> {
     for skill in &skills {
         let name = skill["name"].as_str().unwrap_or_default();
         let origin = skill["origin"].as_str().unwrap_or_default();
+        let legacy = if skill["verification"].as_str() == Some("legacy-unverified") {
+            "（历史技能，未验证）"
+        } else {
+            ""
+        };
         let disabled = if skill["enabled"].as_bool() == Some(false) {
             "（已禁用）"
         } else {
@@ -339,7 +352,7 @@ fn print_skill_list(listing: &serde_json::Value) -> Result<()> {
             .take(100)
             .collect();
         out.push_str(&format!(
-            "  {name:<width$}  [{origin}]{disabled}  {description}\n"
+            "  {name:<width$}  [{origin}]{disabled}{legacy}  {description}\n"
         ));
     }
     print_text(&out, false).map_err(Into::into)
@@ -353,6 +366,78 @@ async fn configure(app: &mut Application, args: &[&str]) -> Result<Option<bool>>
         ["skills", "create", name] => create_skill(app, name).await?,
         ["skills", "install", source] => install_skill(app, source).await?,
         ["skills", "marketplace", query @ ..] => skill_marketplace(app, &query.join(" ")).await?,
+        ["skills", "candidates"] | ["skills", "candidates", "list"] => {
+            let candidates = app.tools.skills.candidate_store()?.list()?;
+            let list: Vec<Value> = candidates.iter().map(|candidate| json!({
+                "id": candidate.id, "name": candidate.name, "description": candidate.description,
+                "state": candidate.state, "validation": candidate.validation,
+                "created_at": candidate.created_at, "sources": candidate.sessions.len()
+            })).collect();
+            show(json!(list))?;
+        }
+        ["skills", "candidates", "show", id] => {
+            let candidate = app
+                .tools
+                .skills
+                .candidate_store()?
+                .list()?
+                .into_iter()
+                .find(|candidate| candidate.id == *id)
+                .ok_or_else(|| Error::Tool("candidate not found".into()))?;
+            show(json!(candidate))?;
+        }
+        ["skills", "candidates", "migrate", name, target] => {
+            authorize(
+                app,
+                Effect::Write(app.store.root().join("skill-candidates/records.json")),
+            )
+            .await?;
+            let candidate = app
+                .tools
+                .skills
+                .stage_legacy(name, target, &app.session.id)?;
+            show(
+                json!({"id": candidate.id, "name": candidate.name, "state": candidate.state,
+                "validation": candidate.validation, "legacy_sources": candidate.legacy_sources}),
+            )?;
+        }
+        ["skills", "candidates", action @ ("approve" | "reject"), id] => {
+            authorize(
+                app,
+                Effect::Write(app.store.root().join("skill-candidates/records.json")),
+            )
+            .await?;
+            let next = if *action == "approve" {
+                CandidateState::Approved
+            } else {
+                CandidateState::Rejected
+            };
+            let candidate = app.tools.skills.decide_candidate(
+                id,
+                CandidateState::Candidate,
+                next,
+                "user",
+                "",
+            )?;
+            show(
+                json!({"id":candidate.id,"name":candidate.name,"state":candidate.state,"validation":candidate.validation}),
+            )?;
+        }
+        ["skills", "candidates", "revoke", id, reason @ ..] if !reason.is_empty() => {
+            authorize(
+                app,
+                Effect::Write(app.store.root().join("skill-candidates/records.json")),
+            )
+            .await?;
+            let candidate = app.tools.skills.decide_candidate(
+                id,
+                CandidateState::Approved,
+                CandidateState::Revoked,
+                "user",
+                &reason.join(" "),
+            )?;
+            show(json!({"id":candidate.id,"name":candidate.name,"state":candidate.state}))?;
+        }
         ["plugins"] | ["plugins", "list"] => list_plugins(app)?,
         ["plugins", "search", query @ ..] => search_plugins(app, &query.join(" ")).await?,
         ["plugins", "install", source]

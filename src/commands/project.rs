@@ -1,7 +1,11 @@
 //! Project commands: /init, /diff git, /commit, /cd, /restart, /expand, /clear,
 //! /doctor, and the grouped /help with suggestions for unknown commands.
 
-use std::{io::IsTerminal, path::Path, time::Duration};
+use std::{
+    io::{IsTerminal, Write},
+    path::Path,
+    time::Duration,
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +28,7 @@ pub(crate) const HELP: &str = "\
 /restart  保存并重启程序，继续当前会话
 /expand [n] [all]  工具结果 #n 的完整输出（默认最新一条；不加 all 时最多 200 行）
 /clear  清空屏幕和回滚缓冲（仅终端）
-/doctor [quick|errors|trace [N]|codes]  诊断：配置、密钥、网络、工具、数据目录、错误日志、跟踪";
+/doctor [quick|errors|trace [N]|codes|report [export <file>|analyze confirm <hash>]]  诊断与本地报告";
 
 /// Model call bound for drafting the instruction file.
 const INIT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -318,7 +322,7 @@ async fn draft_with_model(
         && app
             .session
             .accounting
-            .cost
+            .budget_cost()
             .is_none_or(|cost| cost >= budget)
     {
         return Err("预算已用完或会话花费未知".into());
@@ -337,6 +341,12 @@ async fn draft_with_model(
     let provider = app.background_provider();
     app.session.accounting.model_calls += 1;
     let previous_cost = app.session.accounting.cost.take();
+    let previous_budget = app
+        .session
+        .accounting
+        .renewed_budget
+        .as_mut()
+        .map(|budget| budget.cost.take());
     app.store
         .save(&app.session)
         .map_err(|err| err.to_string())?;
@@ -364,6 +374,17 @@ async fn draft_with_model(
                 }),
                 None => previous_cost,
             };
+            if let (Some(budget), Some(previous)) =
+                (&mut accounting.renewed_budget, previous_budget)
+            {
+                budget.cost = app.settings.prices.and_then(|(input, output)| {
+                    previous.map(|cost| {
+                        cost + (response.usage.input as f64 * input
+                            + response.usage.output as f64 * output)
+                            / 1_000_000.0
+                    })
+                });
+            }
         }
     }
     app.store
@@ -646,6 +667,106 @@ async fn doctor(app: &mut Application, args: &[&str]) -> Result<()> {
         }
         ["errors"] => diagnostics::errors_report(&app.diagnostics),
         ["codes"] => diagnostics::codes_report(),
+        ["report"] => {
+            let report = diagnostics::support_report(&app.diagnostics);
+            let model = app
+                .models
+                .router
+                .fast_model()
+                .unwrap_or_else(|| app.models.router.main_model());
+            let hash = report_confirmation(
+                &report,
+                &app.settings.provider,
+                &app.settings.base_url,
+                &model,
+            );
+            let endpoint = url::Url::parse(&app.settings.base_url)
+                .ok()
+                .and_then(|url| {
+                    url.host_str().map(|host| {
+                        format!(
+                            "{}://{}{}",
+                            url.scheme(),
+                            host,
+                            url.port().map_or(String::new(), |port| format!(":{port}"))
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "未知地址".into());
+            format!(
+                "{report}\n确认 SHA-256: {hash}\n可选模型分析将发送以上报告至 {} / {model} / {endpoint}，会产生一次模型调用和可能的费用；核对后运行 /doctor report analyze confirm {hash}\n",
+                app.settings.provider
+            )
+        }
+        ["report", "export", file] => {
+            let path = app.settings.cwd.join(file);
+            app.authorizer
+                .authorize(Effect::Write(path.clone()), CancellationToken::new())
+                .await?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(&path)?;
+            output.write_all(diagnostics::support_report(&app.diagnostics).as_bytes())?;
+            format!(
+                "诊断报告已导出：{}；请检查并按需编辑后再分享。\n",
+                path.display()
+            )
+        }
+        ["report", "analyze", "confirm", expected] => {
+            let report = diagnostics::support_report(&app.diagnostics);
+            let model = app
+                .models
+                .router
+                .fast_model()
+                .unwrap_or_else(|| app.models.router.main_model());
+            if report_confirmation(
+                &report,
+                &app.settings.provider,
+                &app.settings.base_url,
+                &model,
+            ) != *expected
+            {
+                return Err(Error::Session(
+                    "报告已变化或哈希不匹配；请重新运行 /doctor report 预览".into(),
+                ));
+            }
+            app.authorizer
+                .authorize(
+                    Effect::Network("向已配置的模型供应商发送诊断报告".into()),
+                    CancellationToken::new(),
+                )
+                .await?;
+            print_text(
+                "正在发送已确认的报告进行模型分析（一次计费调用；建议不自动执行）。\n",
+                true,
+            )?;
+            let (events, mut receiver) = mpsc::channel(64);
+            let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+            let cancel = CancellationToken::new();
+            let result = tokio::time::timeout(
+                app.settings.timeout.min(Duration::from_secs(120)),
+                app.agent.analyze_diagnostics(
+                    &mut app.session,
+                    &app.store,
+                    report,
+                    events,
+                    cancel.clone(),
+                ),
+            )
+            .await;
+            if result.is_err() {
+                cancel.cancel();
+            }
+            let _ = drain.await;
+            let analysis =
+                result.map_err(|_| Error::Limit("诊断分析超时；模型费用可能未知".into()))??;
+            format!("模型分析（未验证，不自动执行）：\n{analysis}\n")
+        }
         ["trace"] => diagnostics::trace_report(&app.diagnostics, 30),
         ["trace", n] => {
             let n = n
@@ -661,7 +782,7 @@ async fn doctor(app: &mut Application, args: &[&str]) -> Result<()> {
         }
         _ => {
             return Err(Error::Session(
-                "用法：/doctor [quick|errors|trace [N]|codes]".into(),
+                "用法：/doctor [quick|errors|trace [N]|codes|report [export <file>|analyze confirm <hash>]]".into(),
             ));
         }
     };
@@ -669,9 +790,40 @@ async fn doctor(app: &mut Application, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn report_confirmation(report: &str, provider: &str, endpoint: &str, model: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for field in [report, provider, endpoint, model] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_confirmation_binds_report_and_model_destination() {
+        let original = report_confirmation("report", "provider", "https://one", "model");
+        assert_ne!(
+            original,
+            report_confirmation("other", "provider", "https://one", "model")
+        );
+        assert_ne!(
+            original,
+            report_confirmation("report", "other", "https://one", "model")
+        );
+        assert_ne!(
+            original,
+            report_confirmation("report", "provider", "https://two", "model")
+        );
+        assert_ne!(
+            original,
+            report_confirmation("report", "provider", "https://one", "other")
+        );
+    }
 
     #[test]
     fn help_is_grouped_and_answers_single_commands() {

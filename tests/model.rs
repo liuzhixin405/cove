@@ -146,6 +146,102 @@ fn write_config(data: &Path, config: Value) {
     std::fs::write(data.join("config.json"), config.to_string()).unwrap();
 }
 
+#[tokio::test]
+async fn million_window_compaction_handles_stream_truncation_and_success() {
+    use cove::{
+        domain::{Block, Message, Role},
+        session::{Session, Store},
+    };
+
+    for protocol in ["openai", "anthropic"] {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            root.path().canonicalize().unwrap(),
+            protocol.into(),
+            "mock-model".into(),
+            None,
+        );
+        session.current_request = "Keep the exact current requirement".into();
+        let old_text = "context ".repeat(1000);
+        for index in 0..240 {
+            session.messages.push(Message {
+                role: if index % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                blocks: vec![Block::Text(old_text.clone())],
+            });
+        }
+        session
+            .messages
+            .push(Message::user(session.current_request.clone()));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::Text("recent response".into())],
+        });
+        let store = Store::open(data.path()).unwrap();
+        store.flush(&session).unwrap();
+        let summary = "summary ".repeat(1500);
+        let replies = if protocol == "anthropic" {
+            let stream = |content: &str, reason: &str| {
+                [
+                json!({"type":"message_start","message":{"usage":{"input_tokens":640000}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":4096}}),
+                json!({"type":"message_stop"}),
+            ].iter().map(|value| format!("data: {value}\n\n")).collect::<String>()
+            };
+            vec![
+                ok(stream("partial summary", "max_tokens")),
+                ok(stream(&summary, "end_turn")),
+            ]
+        } else {
+            vec![
+                ok(openai(json!({"content":"partial summary"}), "length")),
+                text(&summary),
+            ]
+        };
+        let (url, server) = mock_server(replies).await;
+        let mut command = cove(root.path(), data.path());
+        command.args([
+            "--provider",
+            protocol,
+            "--model",
+            "mock-model",
+            "--base-url",
+            &url,
+            "--context-window",
+            "1000000",
+            "--max-output-tokens",
+            "64000",
+            "--resume",
+            &session.id,
+        ]);
+        command.env("COVE_API_KEY", "test-only-not-a-real-key");
+        command.env("ANTHROPIC_API_KEY", "test-only-not-a-real-key");
+        let output = run(command, Some("/compact\n/compact\n/exit\n")).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(format!("{stdout}\n{stderr}").contains("输出上限 8192"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body["max_tokens"] == 8192)
+        );
+        assert!(requests[0].body.to_string().len() > 1_800_000);
+        let saved = store.load(&session.id).unwrap();
+        assert_eq!(saved.compactions, 1);
+        assert!(saved.messages.iter().any(|message| message.blocks.iter().any(|block| matches!(block, Block::Text(text) if text.contains(&summary) && text.contains("Keep the exact current requirement")))));
+    }
+}
+
 async fn run(mut command: Command, stdin: Option<&str>) -> std::process::Output {
     command
         .stdin(std::process::Stdio::piped())
@@ -267,6 +363,51 @@ async fn the_key_pool_skips_rejected_and_rate_limited_keys() {
     assert!(seen[0].headers.contains("authorization: bearer key-one"));
     assert!(seen[1].headers.contains("authorization: bearer key-two"));
     assert!(seen[2].headers.contains("authorization: bearer key-three"));
+}
+
+#[tokio::test]
+async fn setting_a_new_budget_after_unknown_cost_resumes_the_task() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        status(401, r#"{"error":{"message":"request rejected"}}"#),
+        text("task continued"),
+    ])
+    .await;
+    let mut command = cove(root.path(), data.path());
+    command
+        .args([
+            "--provider",
+            "openai",
+            "--model",
+            "test-model",
+            "--base-url",
+            &url,
+            "--input-price",
+            "1000",
+            "--output-price",
+            "1000",
+            "--budget",
+            "20",
+            "--no-auto",
+        ])
+        .env("COVE_API_KEY", "test-key");
+    let output = run(command, Some("original task\n/config budget 100\n/config budget\n/continue 1\n/config budget 200\n/config budget\n/exit\n")).await;
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("该金额是从现在起的新增预算"), "{stdout}");
+    assert!(
+        stdout.contains("新增预算已用 $0.0000；历史总费用仍未知"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("新增预算已用 $0.0300；历史总费用仍未知"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("task continued"), "{stdout}");
+    let seen = server.await.unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].body.to_string().contains("original task"));
 }
 
 #[tokio::test]

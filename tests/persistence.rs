@@ -154,6 +154,7 @@ async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
     struct ObservingProvider {
         store: Store,
         id: String,
+        renewed: bool,
     }
     impl Provider for ObservingProvider {
         fn stream(
@@ -165,6 +166,10 @@ async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
             Box::pin(async move {
                 let durable = self.store.load(&self.id)?;
                 assert!(durable.accounting.cost.is_none());
+                if self.renewed {
+                    assert!(durable.accounting.renewed_budget.is_some());
+                    assert_eq!(durable.accounting.budget_cost(), None);
+                }
                 assert_eq!(durable.accounting.model_calls, 1);
                 Ok(response(vec![Block::Text("done".into())]))
             })
@@ -183,6 +188,7 @@ async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
     let provider = Arc::new(ObservingProvider {
         store: store.clone(),
         id: session.id.clone(),
+        renewed: false,
     });
     let agent = Agent::new(
         provider,
@@ -211,6 +217,47 @@ async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
         store.load(&session.id).unwrap().accounting.cost,
         Some(0.000015)
     );
+
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "Openai".into(),
+        "mock".into(),
+        Some((1.0, 1.0)),
+    );
+    session.accounting.cost = None;
+    session.accounting.reset_budget_spend();
+    let provider = Arc::new(ObservingProvider {
+        store: store.clone(),
+        id: session.id.clone(),
+        renewed: true,
+    });
+    let agent = Agent::new(
+        provider,
+        tools,
+        Limits {
+            max_turns: 2,
+            max_output_tokens: 256,
+            budget: Some(1.0),
+            prices: Some((1.0, 1.0)),
+        },
+    )
+    .unwrap();
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some("task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    let saved = store.load(&session.id).unwrap();
+    assert_eq!(saved.accounting.cost, None);
+    assert_eq!(saved.accounting.budget_cost(), Some(0.000015));
 }
 
 #[tokio::test]
@@ -659,6 +706,226 @@ async fn compaction_archives_original_and_preserves_request_tool_pairs_and_signa
 }
 
 #[tokio::test]
+async fn compaction_uses_larger_output_budget_without_exceeding_configured_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let provider = Fake::new(vec![response(vec![Block::Text("Complete summary".into())])]);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_limit(16384)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 10_000;
+    let (tx, drain) = events();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].max_output_tokens, 8192);
+}
+
+#[tokio::test]
+async fn truncated_compaction_reports_limit_and_preserves_original_conversation() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let original = serde_json::to_vec(&session.messages).unwrap();
+    let mut truncated = response(vec![Block::Text("partial summary".into())]);
+    truncated.complete = false;
+    let provider = Fake::new(vec![truncated]);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_limit(16384)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 4096;
+    let (tx, drain) = events();
+    let error = agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap_err();
+    drain.await.unwrap();
+    assert!(error.to_string().contains("输出上限 4096"), "{error}");
+    assert!(error.to_string().contains("/compact"), "{error}");
+    assert!(serde_json::to_vec(&session.messages).unwrap() == original);
+    assert_eq!(session.compactions, 0);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].max_output_tokens, 4096);
+}
+
+fn million_window_history(session: &mut Session, count: usize) {
+    long_history(session);
+    let suffix = session.messages.to_vec();
+    let old_text = "context ".repeat(1000);
+    let mut messages: Vec<Message> = (0..count)
+        .map(|index| Message {
+            role: if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            blocks: vec![Block::Text(old_text.clone())],
+        })
+        .collect();
+    messages.extend(suffix);
+    session.messages = messages.into();
+}
+
+#[tokio::test]
+async fn million_window_compaction_preserves_history_on_truncation_and_persists_success() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 240);
+    let original = serde_json::to_vec(&session.messages).unwrap();
+    let before = cove::engine::context::tokens(&session.messages);
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    assert_eq!(budget, 850_000);
+    assert!(before >= budget * 3 / 4 && before < budget, "{before}");
+    store.save(&session).unwrap();
+    let mut truncated = response(vec![Block::Text("partial summary".into())]);
+    truncated.complete = false;
+    truncated.usage.output = 8192;
+    let summary = "summary ".repeat(1500);
+    assert!(cove::engine::context::text_tokens(&summary) > 2048);
+    let mut complete = response(vec![Block::Text(summary.clone())]);
+    complete.usage.output = 4000;
+    let provider = Fake::new(vec![truncated, complete]);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 64_000;
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .compact(&mut session, &store, tx, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    drain.await.unwrap();
+    assert!(serde_json::to_vec(&session.messages).unwrap() == original);
+    assert!(serde_json::to_vec(&store.load(&session.id).unwrap().messages).unwrap() == original);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    let (tx, drain) = events();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.max_output_tokens == 8192 && request.tools.is_empty())
+    );
+    assert!(requests[0].estimated_tokens.unwrap() > 600_000);
+    assert_eq!(session.compactions, 1);
+    assert!(cove::engine::context::tokens(&session.messages) < before);
+    let saved = store.load(&session.id).unwrap();
+    assert!(
+        serde_json::to_vec(&saved.messages).unwrap()
+            == serde_json::to_vec(&session.messages).unwrap()
+    );
+    assert!(saved.messages.iter().any(|message| message.blocks.iter().any(|block| matches!(block, Block::Text(text) if text.contains(&summary) && text.contains("preserve CRLF")))));
+    assert!(saved.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::ToolResult { id, .. } if id == "read"))
+    }));
+    assert_eq!(
+        std::fs::read_dir(data.path().join("archives"))
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn million_window_automatically_compacts_before_continuing_task() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 240);
+    let provider = Fake::new(vec![
+        response(vec![Block::Text("Old verified context".into())]),
+        response(vec![Block::Text("Task finished".into())]),
+    ]);
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 64_000;
+    let (tx, drain) = events();
+    let report = agent
+        .run_in(
+            &mut session,
+            Some("next task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    assert_eq!(report.model_calls, 2);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_output_tokens, 8192);
+    assert!(requests[0].estimated_tokens.unwrap() > 600_000);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .any(|block| matches!(block, Block::Text(text) if text.contains("next task")))
+    );
+}
+
+#[tokio::test]
+async fn million_window_compacts_near_context_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 314);
+    let before = cove::engine::context::tokens(&session.messages);
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    assert!(before > 830_000 && before < budget, "{before}");
+    let provider = Fake::new(vec![response(vec![Block::Text("Complete summary".into())])]);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 64_000;
+    let (tx, drain) = events();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].estimated_tokens.unwrap() > 830_000);
+    assert_eq!(requests[0].max_output_tokens, 8192);
+    assert!(cove::engine::context::tokens(&session.messages) < before);
+    assert_eq!(store.load(&session.id).unwrap().compactions, 1);
+}
+
+#[tokio::test]
 async fn failed_compaction_retains_original_conversation() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -788,6 +1055,154 @@ async fn provider_failure_makes_budget_unknown_and_blocks_further_dispatch() {
     ));
     drain.await.unwrap();
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "Openai".into(),
+        "mock".into(),
+        Some((1.0, 1.0)),
+    );
+    let provider = Fake::new(Vec::new());
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        Limits {
+            max_turns: 3,
+            max_output_tokens: 256,
+            budget: Some(0.000025),
+            prices: Some((1.0, 1.0)),
+        },
+    )
+    .unwrap();
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .run_in(
+                &mut session,
+                Some("task".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    drain.await.unwrap();
+    let mut loaded = store.load(&session.id).unwrap();
+    loaded.accounting.reset_budget_spend();
+    store.save(&loaded).unwrap();
+    let mut loaded = store.load(&session.id).unwrap();
+    provider.responses.lock().unwrap().extend([
+        response(vec![Block::Text("done".into())]),
+        response(vec![Block::Text("done again".into())]),
+    ]);
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .run_in(&mut loaded, None, &store, tx, CancellationToken::new())
+            .await
+            .is_ok()
+    );
+    drain.await.unwrap();
+    assert_eq!(loaded.accounting.cost, None);
+    assert_eq!(loaded.accounting.budget_cost(), Some(0.000015));
+    let (tx, drain) = events();
+    assert!(matches!(
+        agent
+            .run_in(
+                &mut loaded,
+                Some("next task".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            )
+            .await,
+        Err(Error::Limit(_))
+    ));
+    drain.await.unwrap();
+    assert_eq!(loaded.accounting.cost, None);
+    assert_eq!(loaded.accounting.budget_cost(), Some(0.00003));
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn renewed_budget_blocks_again_when_a_response_has_no_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "Openai".into(),
+        "mock".into(),
+        Some((1.0, 1.0)),
+    );
+    session.accounting.cost = None;
+    session.accounting.reset_budget_spend();
+    let mut missing_usage = response(vec![Block::Text("done".into())]);
+    missing_usage.usage_reported = false;
+    let provider = Fake::new(vec![missing_usage]);
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        Limits {
+            max_turns: 3,
+            max_output_tokens: 256,
+            budget: Some(1.0),
+            prices: Some((1.0, 1.0)),
+        },
+    )
+    .unwrap();
+    let (tx, drain) = events();
+    assert!(matches!(
+        agent
+            .run_in(
+                &mut session,
+                Some("task".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            )
+            .await,
+        Err(Error::Limit(_))
+    ));
+    drain.await.unwrap();
+    let mut loaded = store.load(&session.id).unwrap();
+    assert_eq!(loaded.accounting.cost, None);
+    assert_eq!(loaded.accounting.budget_cost(), None);
+    let (tx, drain) = events();
+    assert!(matches!(
+        agent
+            .run_in(&mut loaded, None, &store, tx, CancellationToken::new())
+            .await,
+        Err(Error::Limit(_))
+    ));
+    drain.await.unwrap();
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn renewed_budget_includes_subagent_spend_and_preserves_unknowns() {
+    let mut accounting = cove::session::Accounting::default();
+    accounting.reset_budget_spend();
+    cove::engine::agent::add_spend(
+        &mut accounting,
+        &cove::session::Accounting {
+            cost: Some(0.25),
+            ..Default::default()
+        },
+    );
+    assert_eq!(accounting.cost, None);
+    assert_eq!(accounting.budget_cost(), Some(0.25));
+    cove::engine::agent::add_spend(&mut accounting, &cove::session::Accounting::default());
+    assert_eq!(accounting.budget_cost(), None);
 }
 
 #[tokio::test]

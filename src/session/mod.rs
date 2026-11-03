@@ -4,6 +4,7 @@ pub mod history;
 mod journal;
 pub mod notes;
 pub mod snapshot;
+pub mod suggestions;
 pub mod usage;
 pub mod workspace;
 
@@ -71,6 +72,8 @@ pub struct Accounting {
     pub usage: Usage,
     pub model_calls: u64,
     pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_budget: Option<BudgetSpend>,
     /// Spend per model that actually served the requests (a session may switch models).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub by_model: std::collections::BTreeMap<String, ModelSpend>,
@@ -82,6 +85,11 @@ pub struct Accounting {
     pub lines_added: u64,
     #[serde(default)]
     pub lines_removed: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct BudgetSpend {
+    pub cost: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -107,6 +115,16 @@ impl ModelSpend {
 }
 
 impl Accounting {
+    pub fn budget_cost(&self) -> Option<f64> {
+        self.renewed_budget
+            .as_ref()
+            .map_or(self.cost, |budget| budget.cost)
+    }
+
+    pub fn reset_budget_spend(&mut self) {
+        self.renewed_budget = Some(BudgetSpend { cost: Some(0.0) });
+    }
+
     /// Adds the per-model records of `other` (a sub-agent's spend).
     pub fn merge_models(&mut self, other: &Accounting) {
         for (model, spend) in &other.by_model {
@@ -136,6 +154,8 @@ pub struct Session {
     #[serde(default)]
     pub messages: History,
     pub current_request: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub state: State,
     pub pending: Vec<PendingCall>,
     pub accounting: Accounting,
@@ -163,6 +183,7 @@ impl Session {
             updated: now(),
             messages: History::new(),
             current_request: String::new(),
+            task_id: None,
             state: State::Idle,
             pending: Vec::new(),
             accounting: Accounting {
@@ -193,10 +214,19 @@ impl Session {
                 "unsupported session version or invalid ID".into(),
             ));
         }
+        if self.task_id.as_ref().is_some_and(|id| !valid_id(id)) {
+            return Err(Error::Session("invalid task ID".into()));
+        }
         if self
             .accounting
             .cost
             .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+            || self
+                .accounting
+                .renewed_budget
+                .as_ref()
+                .and_then(|budget| budget.cost)
+                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
             || self.prices.is_some_and(|(input, output)| {
                 !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0
             })
@@ -437,7 +467,12 @@ impl Store {
     }
 
     pub fn load(&self, id: &str) -> Result<Session> {
-        let mut session = journal::load(&self.path("sessions", id)?, &self.journal_path(id)?)?;
+        self.load_with_sequence(id).map(|(session, _)| session)
+    }
+
+    fn load_with_sequence(&self, id: &str) -> Result<(Session, u64)> {
+        let (mut session, sequence) =
+            journal::load(&self.path("sessions", id)?, &self.journal_path(id)?)?;
         session.validate()?;
         if session.id != id {
             return Err(Error::Session("session ID does not match its file".into()));
@@ -456,7 +491,7 @@ impl Store {
         {
             session.interrupted("上次进程在任务中途停止；继续前请检查结果不确定的工具".into());
         }
-        Ok(session)
+        Ok((session, sequence))
     }
 
     pub fn list(&self) -> Result<Vec<Session>> {
@@ -641,6 +676,30 @@ fn synthetic(text: &str) -> bool {
         || text.starts_with("Operator ")
         || text.starts_with("File-tool rollback")
         || text.starts_with("Workspace restored")
+}
+
+pub(crate) fn conversation_input(text: &str) -> Option<&str> {
+    for prefix in [
+        "[the user typed this while the task ran; treat it as an instruction from the user]\n",
+        "[sent while the previous task was running]\n",
+    ] {
+        if let Some(input) = text.strip_prefix(prefix) {
+            return Some(input);
+        }
+    }
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('[') {
+        return (![
+            "[system",
+            "[model call limit reached;",
+            "[automatic verification failed;",
+            "[self_review;",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix)))
+        .then_some(text);
+    }
+    (!synthetic(text)).then_some(text)
 }
 
 /// Inputs too short to describe a session ("continue", "继续", "ok").
@@ -843,6 +902,30 @@ impl Session {
         out
     }
 
+    pub fn conversation_turns(&self) -> Vec<&[Message]> {
+        let starts: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (message.role == crate::domain::Role::User
+                && matches!(message.blocks.first(), Some(Block::Text(text)) if conversation_input(text).is_some()))
+                .then_some(index)
+            })
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(index, start)| {
+                &self.messages[*start
+                    ..starts
+                        .get(index + 1)
+                        .copied()
+                        .unwrap_or(self.messages.len())]
+            })
+            .collect()
+    }
+
     pub fn user_turns(&self) -> usize {
         self.messages
             .iter()
@@ -901,13 +984,18 @@ impl Store {
         let mut sessions = Vec::new();
         let mut broken = Vec::new();
         for (id, path) in self.session_files().unwrap_or_default() {
-            match self.load(&id) {
+            match self.load_with_sequence(&id) {
                 Ok(session) => sessions.push(session),
                 Err(err) => broken.push((path, err.to_string())),
             }
         }
-        sessions.sort_by_key(|session| std::cmp::Reverse((session.updated, session.created)));
-        (sessions, broken)
+        sessions.sort_by_key(|(session, sequence)| {
+            std::cmp::Reverse((session.updated, *sequence, session.created))
+        });
+        (
+            sessions.into_iter().map(|(session, _)| session).collect(),
+            broken,
+        )
     }
 
     /// Deletes a session with its archives and file checkpoints. The caller holds its
@@ -1195,6 +1283,70 @@ mod tests {
         assert_eq!(session.display_title(), "重构配置加载");
         session.title = Some("stored".into());
         assert_eq!(session.display_title(), "stored");
+    }
+
+    #[test]
+    fn conversation_turns_keep_tool_results_and_system_notices_with_their_request() {
+        let mut session = Session::new(PathBuf::new(), String::new(), String::new(), None);
+        session.messages.push(Message::user("first request"));
+        session.messages.push(Message {
+            role: crate::domain::Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "call".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path":"file"}),
+                extra: None,
+            }],
+        });
+        session.messages.push(Message {
+            role: crate::domain::Role::User,
+            blocks: vec![Block::ToolResult {
+                id: "call".into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+        });
+        session
+            .messages
+            .push(Message::user("[system notice] retry"));
+        session.messages.push(Message::user("second request"));
+        session.messages.push(Message {
+            role: crate::domain::Role::Assistant,
+            blocks: vec![Block::Text("answer".into())],
+        });
+        let turns = session.conversation_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].len(), 4);
+        assert_eq!(turns[1].len(), 2);
+        assert!(
+            matches!(&turns[0][2].blocks[0], Block::ToolResult { content, .. } if content == "result")
+        );
+        assert!(matches!(&turns[1][1].blocks[0], Block::Text(text) if text == "answer"));
+    }
+
+    #[test]
+    fn conversation_turns_keep_steering_as_a_user_turn() {
+        let mut session = Session::new(PathBuf::new(), String::new(), String::new(), None);
+        session.messages.push(Message::user("first request"));
+        session.messages.push(Message::user("[the user typed this while the task ran; treat it as an instruction from the user]\nuse the new API"));
+        session.messages.push(Message::user(
+            "[sent while the previous task was running]\nverify again",
+        ));
+        session
+            .messages
+            .push(Message::user("[system notice] retry"));
+        session.messages.push(Message::user("[bug] inspect this"));
+        let turns = session.conversation_turns();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(turns[2].len(), 2);
+        assert_eq!(
+            conversation_input("[bug] inspect this"),
+            Some("[bug] inspect this")
+        );
+        assert_eq!(
+            conversation_input("[sent while the previous task was running]\nverify again"),
+            Some("verify again")
+        );
     }
 
     #[test]

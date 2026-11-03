@@ -61,6 +61,19 @@ fn signature(name: &str, input: &Value) -> (String, u64) {
     (name.to_owned(), hash((name, input.to_string())))
 }
 
+fn failure_group<'a>(name: &'a str, input: &Value) -> &'a str {
+    if name == "memory"
+        && !matches!(
+            input.get("scope").and_then(Value::as_str),
+            Some("project" | "global")
+        )
+    {
+        "memory (invalid scope)"
+    } else {
+        name
+    }
+}
+
 /// Tool plus the start of its main argument: `shell:cargo test --`, `edit:src/main.rs`.
 fn pattern(name: &str, input: &Value) -> String {
     let main = ["command", "path", "pattern", "query", "url", "prompt"]
@@ -250,7 +263,7 @@ impl TurnHook for ToolGuard {
             return Some(STOPPED.into());
         }
         let sig = signature(name, input);
-        match Self::guardrail(&mut state, name, &sig) {
+        match Self::guardrail(&mut state, failure_group(name, input), &sig) {
             Err(block) => return Some(block),
             Ok(Some(warning)) => {
                 state.warnings.insert(sig.clone(), warning);
@@ -296,20 +309,21 @@ impl TurnHook for ToolGuard {
     fn tool_note(&self, name: &str, input: &Value, output: &ToolOutput) -> Option<String> {
         let mut state = self.state.lock().ok()?;
         let sig = signature(name, input);
+        let group = failure_group(name, input);
         let mut notes: Vec<String> = state.warnings.remove(&sig).into_iter().collect();
         if output.failed {
             state
                 .recent_failures
-                .push_back((Instant::now(), name.to_owned()));
+                .push_back((Instant::now(), group.to_owned()));
             if state.recent_failures.len() > 100 {
                 state.recent_failures.pop_front();
             }
             *state.exact_failures.entry(sig.clone()).or_default() += 1;
-            *state.tool_failures.entry(name.to_owned()).or_default() += 1;
+            *state.tool_failures.entry(group.to_owned()).or_default() += 1;
         } else {
-            state.recent_failures.retain(|(_, tool)| tool != name);
+            state.recent_failures.retain(|(_, tool)| tool != group);
             state.exact_failures.remove(&sig);
-            state.tool_failures.insert(name.to_owned(), 0);
+            state.tool_failures.insert(group.to_owned(), 0);
             if IDEMPOTENT.contains(&name) {
                 let result = hash(&output.content);
                 if state.idempotent_result.get(&sig) == Some(&result) {
@@ -442,6 +456,44 @@ mod tests {
         assert!(
             guard
                 .before_tool("shell", &input)
+                .unwrap()
+                .contains("blocked")
+        );
+    }
+
+    #[test]
+    fn corrected_memory_scope_is_not_blocked_by_missing_scope_failures() {
+        let guard = ToolGuard::new(None);
+        for index in 0..5 {
+            let input = json!({"action":"read", "id":format!("entry-{index}")});
+            assert!(guard.before_tool("memory", &input).is_none());
+            guard.tool_note("memory", &input, &output("missing field `scope`", true));
+        }
+        let invalid = json!({"action":"read", "id":"another"});
+        assert!(
+            guard
+                .before_tool("memory", &invalid)
+                .unwrap()
+                .contains("blocked")
+        );
+        let corrected = json!({"action":"read", "id":"entry-0", "scope":"project"});
+        assert!(guard.before_tool("memory", &corrected).is_none());
+        guard.tool_note("memory", &corrected, &output("saved note", false));
+        assert!(
+            guard
+                .before_tool("memory", &invalid)
+                .unwrap()
+                .contains("blocked")
+        );
+        for index in 0..5 {
+            let input =
+                json!({"action":"read", "id":format!("missing-{index}"), "scope":"project"});
+            assert!(guard.before_tool("memory", &input).is_none());
+            guard.tool_note("memory", &input, &output("not found", true));
+        }
+        assert!(
+            guard
+                .before_tool("memory", &corrected)
                 .unwrap()
                 .contains("blocked")
         );

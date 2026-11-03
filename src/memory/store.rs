@@ -86,6 +86,13 @@ pub const TOTAL_LIMIT: usize = 300 * 1024;
 const ENTRIES_LIMIT: usize = 256;
 const SOURCES_KEPT: usize = 8;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceType {
+    UserStatement,
+    ModelInference,
+}
+
 /// What produced one revision of a memory: inputs, not proof of truth.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ProvenanceSource {
@@ -105,6 +112,16 @@ pub struct ProvenanceSource {
     /// Hash of the content this source produced; differs after an external edit.
     #[serde(default)]
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_type: Option<EvidenceType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -150,7 +167,204 @@ pub struct Memory {
     authorizer: Arc<dyn Authorizer>,
 }
 
+pub(crate) struct RestoreSnapshot {
+    pub(crate) entry: Entry,
+    pub(crate) current: Option<Entry>,
+    backup_hash: String,
+    current_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MergeRequest {
+    pub(crate) survivor: String,
+    pub(crate) duplicate: String,
+    pub(crate) survivor_revision: String,
+    pub(crate) duplicate_revision: String,
+    pub(crate) title: String,
+    pub(crate) content: String,
+    pub(crate) source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DreamUpdate {
+    pub(crate) id: String,
+    pub(crate) revision: String,
+    pub(crate) title: String,
+    pub(crate) content: String,
+    pub(crate) source: String,
+}
+
+pub(crate) enum RestoreFailure {
+    Rejected(Error),
+    Write(Error),
+}
+
+impl From<Error> for RestoreFailure {
+    fn from(error: Error) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl From<std::io::Error> for RestoreFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self::Rejected(error.into())
+    }
+}
+
 impl Memory {
+    pub(crate) fn revision(entry: &Entry) -> Result<String> {
+        Ok(content_hash(&serde_json::to_string(entry)?))
+    }
+
+    pub(crate) fn update_dream(
+        &self,
+        request: &DreamUpdate,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let scope = Scope::Project;
+        let _lock = self.lock(scope)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let current = self.read(scope, &request.id)?;
+        if Self::revision(&current)? != request.revision {
+            return Err(Error::Tool(
+                "memory changed since it was read; review again".into(),
+            ));
+        }
+        if current.provenance.is_empty()
+            || current
+                .provenance
+                .iter()
+                .any(|source| source.evidence_type != Some(EvidenceType::ModelInference))
+        {
+            return Err(Error::Tool(
+                "dream cannot replace user statements or unknown evidence; review manually".into(),
+            ));
+        }
+        if current.provenance.len() >= SOURCES_KEPT {
+            return Err(Error::Tool(
+                "update would discard provenance; review manually".into(),
+            ));
+        }
+        let others = self
+            .entries(scope)?
+            .iter()
+            .filter(|entry| entry.id != request.id)
+            .map(|entry| entry.content.len())
+            .sum();
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        self.write(
+            scope,
+            Some(current),
+            request.id.clone(),
+            request.title.clone(),
+            request.content.clone(),
+            request.source.clone(),
+            ProvenanceSource {
+                kind: "dream".into(),
+                evidence: crate::memory::recall::clip(&request.source, 256),
+                ..ProvenanceSource::default()
+            },
+            others,
+        )
+    }
+
+    pub(crate) fn merge_project(
+        &self,
+        request: &MergeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let scope = Scope::Project;
+        let _lock = self.lock(scope)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if request.survivor == request.duplicate {
+            return Err(Error::Tool("cannot merge a memory into itself".into()));
+        }
+        let mut survivor = self.read(scope, &request.survivor)?;
+        let duplicate = self.read(scope, &request.duplicate)?;
+        if Self::revision(&survivor)? != request.survivor_revision
+            || Self::revision(&duplicate)? != request.duplicate_revision
+        {
+            return Err(Error::Tool(
+                "memory changed since it was read; review again".into(),
+            ));
+        }
+        if survivor.content.trim().is_empty()
+            || duplicate.content.trim().is_empty()
+            || !request.content.contains(survivor.content.trim())
+            || !request.content.contains(duplicate.content.trim())
+        {
+            return Err(Error::Tool(
+                "merge must retain both original contents; review manually".into(),
+            ));
+        }
+        for source in &duplicate.provenance {
+            if !survivor.provenance.contains(source) {
+                survivor.provenance.push(source.clone());
+            }
+        }
+        let evidence = format!(
+            "merged from {}; original source: {}",
+            duplicate.id,
+            crate::memory::recall::clip(&duplicate.source, 512)
+        );
+        screen(&evidence)?;
+        survivor.provenance.push(ProvenanceSource {
+            kind: "merge_input".into(),
+            evidence,
+            at: duplicate.updated,
+            content_hash: content_hash(&duplicate.content),
+            scope: Some(scope),
+            project: self
+                .project
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+            ..ProvenanceSource::default()
+        });
+        if survivor.provenance.len() >= SOURCES_KEPT {
+            return Err(Error::Tool(
+                "merge would discard provenance; review manually".into(),
+            ));
+        }
+        let entries = self.entries(scope)?;
+        let others = entries
+            .iter()
+            .filter(|entry| entry.id != survivor.id)
+            .map(|entry| entry.content.len())
+            .sum();
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        self.write(
+            scope,
+            Some(survivor),
+            request.survivor.clone(),
+            request.title.clone(),
+            request.content.clone(),
+            request.source.clone(),
+            ProvenanceSource {
+                kind: "dream".into(),
+                evidence: "merged project memories".into(),
+                ..ProvenanceSource::default()
+            },
+            others,
+        )?;
+        std::fs::remove_file(self.path(scope, &request.duplicate)?).map_err(|error| {
+            Error::Tool(format!(
+                "survivor was updated but duplicate was not removed; inspect both entries: {error}"
+            ))
+        })?;
+        Ok(json!({"merged":request.survivor,"removed":request.duplicate}))
+    }
+
     pub fn new(data: &Path, root: &Path, authorizer: Arc<dyn Authorizer>) -> Result<Self> {
         let root = root.canonicalize()?;
         if !root.is_dir() {
@@ -230,7 +444,7 @@ impl Memory {
     }
 
     /// Cross-process write lock of one scope; waits up to five seconds.
-    fn lock(&self, scope: Scope) -> Result<std::fs::File> {
+    pub(crate) fn lock(&self, scope: Scope) -> Result<std::fs::File> {
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -249,6 +463,101 @@ impl Memory {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
+    }
+
+    fn restore_snapshot_locked(&self, backup: &Path, id: &str) -> Result<RestoreSnapshot> {
+        let scope = Scope::Project;
+        let current_path = self.path(scope, id)?;
+        let backup_path = backup.join(format!("{id}.json"));
+        let metadata = std::fs::symlink_metadata(&backup_path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Error::Tool("backup entry must be a regular file".into()));
+        }
+        let backup_text = text(&backup_path, 128 * 1024)?;
+        let entry: Entry = serde_json::from_str(&backup_text)?;
+        if entry.version != 1 || entry.id != id {
+            return Err(Error::Tool(
+                "backup memory identity/version mismatch".into(),
+            ));
+        }
+        let (current, current_hash) = if current_path.try_exists()? {
+            let current_text = text(&current_path, 128 * 1024)?;
+            let entry: Entry = serde_json::from_str(&current_text)?;
+            if entry.version != 1 || entry.id != id {
+                return Err(Error::Tool(
+                    "current memory identity/version mismatch".into(),
+                ));
+            }
+            (Some(entry), Some(content_hash(&current_text)))
+        } else {
+            (None, None)
+        };
+        Ok(RestoreSnapshot {
+            entry,
+            current,
+            backup_hash: content_hash(&backup_text),
+            current_hash,
+        })
+    }
+
+    pub(crate) fn preview_restore_entry(&self, backup: &Path, id: &str) -> Result<RestoreSnapshot> {
+        let _lock = self.lock(Scope::Project)?;
+        self.restore_snapshot_locked(backup, id)
+    }
+
+    pub(crate) fn restore_entry(
+        &self,
+        backup: &Path,
+        id: &str,
+        preview: &RestoreSnapshot,
+    ) -> std::result::Result<(), RestoreFailure> {
+        let scope = Scope::Project;
+        let _lock = self.lock(scope)?;
+        let current = self.restore_snapshot_locked(backup, id)?;
+        if current.backup_hash != preview.backup_hash
+            || current.current_hash != preview.current_hash
+        {
+            return Err(
+                Error::Tool("memory or backup changed since preview; review again".into()).into(),
+            );
+        }
+        let entry = &current.entry;
+        if entry.title.trim().is_empty()
+            || entry.title.len() > 256
+            || entry.content.trim().is_empty()
+            || entry.content.len() > ENTRY_LIMIT
+            || entry.source.trim().is_empty()
+            || entry.source.len() > 1024
+        {
+            return Err(Error::Tool("backup memory exceeds limits or is invalid".into()).into());
+        }
+        screen(&entry.title)?;
+        screen(&entry.content)?;
+        let mut count = 0;
+        let mut bytes = entry.content.len();
+        for (scanned, file) in std::fs::read_dir(self.directory(scope))?.enumerate() {
+            if scanned >= 512 {
+                return Err(Error::Tool("memory directory exceeds 512 files".into()).into());
+            }
+            let path = file?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let other_id = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| Error::Tool("invalid memory filename".into()))?;
+            let other = self.read(scope, other_id)?;
+            if other_id != id {
+                count += 1;
+                bytes += other.content.len();
+            }
+        }
+        if count >= ENTRIES_LIMIT || bytes > TOTAL_LIMIT {
+            return Err(Error::Tool("restored memory would exceed scope limits".into()).into());
+        }
+        atomic_json(&self.path(scope, id)?, entry).map_err(RestoreFailure::Write)?;
+        Ok(())
     }
 
     /// Every readable entry of `scope`, sorted by ID; unreadable files are skipped.
@@ -544,6 +853,22 @@ impl Memory {
         provenance.at = now;
         provenance.content_hash = content_hash(&content);
         provenance.evidence = crate::memory::recall::clip(&provenance.evidence, 4096);
+        if provenance.evidence_type.is_none() {
+            provenance.evidence_type = match provenance.kind.as_str() {
+                "operator" => Some(EvidenceType::UserStatement),
+                "extraction" | "dream" => Some(EvidenceType::ModelInference),
+                _ => None,
+            };
+        }
+        provenance.scope = Some(scope);
+        provenance.project = if scope == Scope::Project {
+            self.project
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        } else {
+            None
+        };
         let (created, mut sources) = previous
             .map(|entry| (entry.created, entry.provenance))
             .unwrap_or((now, Vec::new()));

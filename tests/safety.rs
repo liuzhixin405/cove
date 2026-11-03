@@ -242,6 +242,76 @@ async fn plan_mode_refuses_changes_with_guidance() {
 }
 
 #[tokio::test]
+async fn memory_can_be_read_after_repeated_missing_scope_errors() {
+    use cove::{
+        memory::store::{Memory, MemoryArgs, Scope},
+        safety::permission::{LocalAuthorizer, Mode},
+    };
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let memory = Memory::new(
+        data.path(),
+        root.path(),
+        Arc::new(LocalAuthorizer {
+            mode: Mode::Auto,
+            input: None,
+        }),
+    )
+    .unwrap();
+    let saved = memory
+        .execute(
+            MemoryArgs::Add {
+                scope: Scope::Project,
+                title: "analysis".into(),
+                content: "previous analysis is available".into(),
+                source: "test".into(),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let id = saved["saved"].as_str().unwrap();
+    let mut responses: Vec<String> = (0..5)
+        .map(|index| {
+            tool(
+                &format!("bad-{index}"),
+                "memory",
+                json!({"action":"read", "id":id}),
+            )
+        })
+        .collect();
+    responses.push(tool(
+        "corrected",
+        "memory",
+        json!({"action":"read", "id":id, "scope":"project"}),
+    ));
+    responses.push(text("Analysis recovered."));
+    let (url, server) = mock_server(responses).await;
+    let output = cli(root.path(), data.path(), &url, "auto")
+        .args(["--no-auto", "-p", "read the saved analysis"])
+        .launch()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 7);
+    let definition = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "memory")
+        .unwrap();
+    assert_eq!(
+        definition["function"]["parameters"]["required"],
+        json!(["action", "scope"])
+    );
+    assert!(tool_result(&requests[5]).contains("missing field"));
+    assert!(tool_result(&requests[6]).contains("previous analysis is available"));
+}
+
+#[tokio::test]
 async fn guardrail_blocks_an_exact_call_that_keeps_failing() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

@@ -372,6 +372,25 @@ impl Console {
         true
     }
 
+    pub fn browse_turns(&self, turns: Vec<TurnView>, compacted: bool) -> bool {
+        let mut state = self.lock();
+        if state.ask.is_some() || turns.is_empty() {
+            return false;
+        }
+        state.choices = None;
+        state.candidates.clear();
+        let selected = turns.len() - 1;
+        state.turn_browser = Some(TurnBrowser {
+            turns,
+            selected,
+            expanded: false,
+            scroll: 0,
+            compacted,
+        });
+        state.redraw();
+        true
+    }
+
     /// Whether the agent panel is open (Alt+M).
     pub fn panel_open(&self) -> bool {
         self.lock().panel.is_some()
@@ -576,18 +595,19 @@ fn keyboard(console: &'static Arc<Console>) {
                     }
                 }
                 Event::Paste(text) => {
-                    if !state.attach_pasted(&text) {
-                        state.editor.insert_text(&text);
-                        state.edited();
-                    }
+                    state.paste_text(&text);
                     Action::None
                 }
+                Event::Mouse(_) => Action::None,
+                Event::Resize(_, _) => Action::None,
                 _ => Action::None,
             };
             match action {
                 Action::None => {}
                 Action::Interrupt => console.interrupt.notify_waiters(),
                 Action::Panel => console.panel_wake.notify_waiters(),
+                #[cfg(windows)]
+                Action::Paste => state.paste_clipboard(),
             }
             state.dirty = true;
         }
@@ -608,6 +628,8 @@ enum Action {
     None,
     Interrupt,
     Panel,
+    #[cfg(windows)]
+    Paste,
 }
 
 /// One entry of a picker.
@@ -623,6 +645,80 @@ struct Choices {
     title: String,
     items: Vec<Choice>,
     selected: usize,
+}
+
+pub struct TurnView {
+    pub title: String,
+    pub content: String,
+    pub input: String,
+}
+
+struct TurnBrowser {
+    turns: Vec<TurnView>,
+    selected: usize,
+    expanded: bool,
+    scroll: usize,
+    compacted: bool,
+}
+
+fn wrap_display(text: &str, columns: usize) -> Vec<String> {
+    wrap_display_rows(text, columns)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+fn wrap_display_rows(text: &str, columns: usize) -> Vec<(String, bool)> {
+    let columns = columns.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut style = String::new();
+    let mut column = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            let mut sequence = String::from("\x1b");
+            if chars.next_if_eq(&'[').is_some() {
+                sequence.push('[');
+                for next in chars.by_ref() {
+                    sequence.push(next);
+                    if next.is_ascii_alphabetic() {
+                        if next == 'm' {
+                            if !*NO_COLOR {
+                                if sequence == "\x1b[0m" || sequence == "\x1b[m" {
+                                    style.clear();
+                                } else {
+                                    style.push_str(&sequence);
+                                }
+                                row.push_str(&sequence);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '\n' {
+            rows.push((std::mem::take(&mut row), false));
+            row.push_str(&style);
+            column = 0;
+            continue;
+        }
+        let character = if character == '\t' { ' ' } else { character };
+        let next = character.width().unwrap_or(0);
+        if column + next > columns && column > 0 {
+            rows.push((std::mem::take(&mut row), true));
+            row.push_str(&style);
+            column = 0;
+        }
+        row.push(character);
+        column += next;
+    }
+    if column > 0 || rows.is_empty() {
+        rows.push((row, false));
+    }
+    rows
 }
 
 struct Ask {
@@ -683,6 +779,7 @@ struct State {
     /// Images for the next line, with their status-row descriptions.
     attachments: Vec<(PathBuf, String)>,
     choices: Option<Choices>,
+    turn_browser: Option<TurnBrowser>,
     /// The agent panel's lines while it is open.
     panel: Option<Vec<String>>,
 }
@@ -721,6 +818,7 @@ impl State {
             scratch: std::env::temp_dir(),
             attachments: Vec::new(),
             choices: None,
+            turn_browser: None,
             panel: None,
         }
     }
@@ -737,6 +835,28 @@ impl State {
             self.attach(path);
         }
         true
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        if self.busy {
+            self.turn_browser = None;
+        }
+        if self.turn_browser.is_none() && !self.attach_pasted(text) {
+            self.editor.insert_text(text);
+            self.edited();
+        }
+    }
+
+    #[cfg(windows)]
+    fn paste_clipboard(&mut self) {
+        if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+            self.hint = Some("远程会话无法读取本机剪贴板，请使用终端的粘贴命令".into());
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => self.paste_text(&text),
+            Err(_) => self.hint = Some("无法读取剪贴板文本，请重试粘贴".into()),
+        }
     }
 
     fn attach(&mut self, path: PathBuf) {
@@ -821,6 +941,7 @@ impl State {
 
     fn ask(&mut self, prompt: &str, masked: bool) -> oneshot::Receiver<Result<String>> {
         let (reply, receiver) = oneshot::channel();
+        self.turn_browser = None;
         self.end_ask(Err(Error::Cancelled));
         // A question's leading lines are output; its last line is the prompt.
         let (head, tail) = prompt.rsplit_once('\n').unwrap_or(("", prompt));
@@ -889,6 +1010,53 @@ impl State {
     fn key(&mut self, key: KeyEvent) -> Action {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        #[cfg(windows)]
+        if control && !alt && matches!(key.code, KeyCode::Char('v' | 'V')) {
+            return Action::Paste;
+        }
+        if self.busy && matches!(key.code, KeyCode::Char(_) | KeyCode::Esc) {
+            self.turn_browser = None;
+        }
+        if let Some(browser) = &mut self.turn_browser {
+            match key.code {
+                KeyCode::Esc => self.turn_browser = None,
+                KeyCode::Char('c') if control => self.turn_browser = None,
+                KeyCode::Up => {
+                    browser.selected = browser.selected.saturating_sub(1);
+                    browser.expanded = false;
+                    browser.scroll = 0;
+                }
+                KeyCode::Down => {
+                    browser.selected = (browser.selected + 1).min(browser.turns.len() - 1);
+                    browser.expanded = false;
+                    browser.scroll = 0;
+                }
+                KeyCode::Enter => {
+                    browser.expanded = !browser.expanded;
+                    browser.scroll = 0;
+                }
+                KeyCode::PageUp if browser.expanded => {
+                    browser.scroll = browser.scroll.saturating_sub(turn_page_size())
+                }
+                KeyCode::PageDown if browser.expanded => {
+                    let columns = usize::from(
+                        crossterm::terminal::size()
+                            .map_or(80, |(columns, _)| columns)
+                            .max(20),
+                    );
+                    let lines = wrap_turn_content(
+                        &browser.turns[browser.selected].content,
+                        columns.saturating_sub(3),
+                    );
+                    browser.scroll = browser
+                        .scroll
+                        .saturating_add(turn_page_size())
+                        .min(lines.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.search.is_some() {
             return self.search_key(key, control);
         }
@@ -1328,7 +1496,7 @@ impl State {
         usize::from(
             crossterm::terminal::size()
                 .map_or(80, |(columns, _)| columns)
-                .max(20),
+                .max(2),
         )
     }
 
@@ -1372,11 +1540,10 @@ impl State {
         let mut column = self.out_col;
         let mut escape = false;
         let mut sequence = String::new();
-        for c in visible(text).chars() {
-            if escape || c == '\x1b' {
-                // Styles take no room; NO_COLOR drops them.
-                sequence.push(c);
-                escape = c == '\x1b' || !c.is_ascii_alphabetic();
+        for character in visible(text).chars() {
+            if escape || character == '\x1b' {
+                sequence.push(character);
+                escape = character == '\x1b' || !character.is_ascii_alphabetic();
                 if !escape {
                     if !*NO_COLOR || !sequence.ends_with('m') {
                         self.pending.push_str(&sequence);
@@ -1385,7 +1552,7 @@ impl State {
                 }
                 continue;
             }
-            match c {
+            match character {
                 '\n' => {
                     self.pending.push_str("\r\n");
                     column = 0;
@@ -1395,19 +1562,18 @@ impl State {
                     self.pending.push_str(&" ".repeat(spaces.max(1)));
                     column += spaces.max(1);
                 }
-                c => {
-                    let width = c.width().unwrap_or(0);
+                character => {
+                    let width = character.width().unwrap_or(0);
                     if column + width > columns {
                         column = 0;
                     }
-                    self.pending.push(c);
+                    self.pending.push(character);
                     column += width;
                 }
             }
             column = column.min(columns);
         }
         if column >= columns {
-            // The terminal waits at the margin; the next row starts clean.
             self.pending.push_str("\r\n");
             column = 0;
         } else if column > 0 {
@@ -1482,18 +1648,17 @@ impl State {
             self.panel(columns),
             self.choice_rows(columns),
             self.agent_rows(columns),
+            self.turn_rows(columns),
         ];
         for row in rows.into_iter().flatten() {
             screen.newline();
             screen.text(&row);
         }
         let (text, end) = screen.finish();
+        let height = usize::from(crossterm::terminal::size().map_or(24, |(_, height)| height));
+        let (text, row, column, input_height) = fit_input(text, cursor, end, columns, height);
         self.pending.push_str(&text);
-        let (row, column) = if cursor.1 >= columns {
-            (cursor.0 + 1, 0)
-        } else {
-            cursor
-        };
+        let end = input_height.saturating_sub(1);
         if end > row {
             self.pending.push_str(&format!("\x1b[{}A", end - row));
         }
@@ -1681,6 +1846,68 @@ impl State {
         rows
     }
 
+    fn turn_rows(&self, columns: usize) -> Vec<String> {
+        let Some(browser) = &self.turn_browser else {
+            return Vec::new();
+        };
+        let mut rows = vec![self.style(
+            "2",
+            &clip(
+                "对话 | 上下选轮 Enter 展开/收起 PgUp/PgDn 翻页 Esc 关闭",
+                columns - 1,
+            ),
+        )];
+        if browser.compacted {
+            rows.push(self.style("2", &clip("早期对话已压缩，不在列表中", columns - 1)));
+        }
+        let selected = browser.selected;
+        if browser.expanded {
+            rows.push(clip(
+                &format!(
+                    "▼ {}. {}",
+                    selected + 1,
+                    visible_text(&browser.turns[selected].title)
+                ),
+                columns - 1,
+            ));
+            let lines =
+                wrap_turn_content(&browser.turns[selected].content, columns.saturating_sub(3));
+            let start = browser.scroll.min(lines.len().saturating_sub(1));
+            let page = turn_page_size();
+            rows.extend(
+                lines
+                    .iter()
+                    .skip(start)
+                    .take(page)
+                    .map(|line| format!("  {line}")),
+            );
+            rows.push(self.style(
+                "2",
+                &clip(
+                    &format!(
+                        "  行 {}-{} / {}",
+                        start + 1,
+                        (start + page).min(lines.len()),
+                        lines.len()
+                    ),
+                    columns - 1,
+                ),
+            ));
+        } else {
+            let start = selected
+                .saturating_sub(2)
+                .min(browser.turns.len().saturating_sub(5));
+            for (index, turn) in browser.turns.iter().enumerate().skip(start).take(5) {
+                let marker = if index == selected { ">" } else { " " };
+                rows.push(clip(
+                    &format!("{marker} ▶ {}. {}", index + 1, visible_text(&turn.title)),
+                    columns - 1,
+                ));
+            }
+        }
+        rows
+    }
+
     /// The agent panel (Alt+M), at most eight rows.
     fn agent_rows(&self, columns: usize) -> Vec<String> {
         let Some(lines) = &self.panel else {
@@ -1739,6 +1966,36 @@ impl State {
     }
 }
 
+fn fit_input(
+    text: String,
+    cursor: (usize, usize),
+    end: usize,
+    columns: usize,
+    height: usize,
+) -> (String, usize, usize, usize) {
+    let (row, column) = if cursor.1 >= columns {
+        (cursor.0 + 1, 0)
+    } else {
+        cursor
+    };
+    let limit = height.saturating_sub(1).max(1);
+    if end + 1 <= limit {
+        return (text, row, column, end + 1);
+    }
+    let mut rows = wrap_display(&text.replace("\r\n", "\n"), columns);
+    while rows.len() <= row {
+        rows.push(String::new());
+    }
+    let start = row.saturating_add(1).saturating_sub(limit);
+    let shown = rows
+        .iter()
+        .skip(start)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    (shown.join("\x1b[0m\r\n"), row - start, column, shown.len())
+}
+
 /// Indexes of the choices whose label or description contains `query`.
 fn filter(items: &[Choice], query: &str) -> Vec<usize> {
     items
@@ -1763,6 +2020,34 @@ fn visible_text(text: &str) -> String {
             c => c,
         })
         .collect()
+}
+
+fn turn_page_size() -> usize {
+    usize::from(crossterm::terminal::size().map_or(24, |(_, height)| height))
+        .saturating_sub(6)
+        .clamp(1, 8)
+}
+
+fn wrap_turn_content(text: &str, columns: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let columns = columns.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let line = visible_text(line);
+        let mut row = String::new();
+        let mut used = 0;
+        for cluster in line.graphemes(true) {
+            let next = UnicodeWidthStr::width(cluster);
+            if used + next > columns && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push_str(cluster);
+            used += next;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// `COVE_ESC_INTERRUPT=0` keeps a bare Esc from interrupting tasks.
@@ -2252,6 +2537,150 @@ fn enable_virtual_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ctrl_v_requests_clipboard_text() {
+        let (mut state, _) = state();
+        assert!(matches!(
+            state.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Action::Paste
+        ));
+    }
+
+    #[test]
+    fn pasted_text_is_inserted_without_submitting_or_control_characters() {
+        let (mut state, mut receiver) = state();
+        state.paste_text("first\r\nsecond\tthird\u{7}");
+        assert_eq!(line(&state), "first\nsecond third");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn display_wrap_preserves_styles_and_streamed_lines() {
+        let expected = if *NO_COLOR {
+            vec!["ab", "cd", "ne", "xt"]
+        } else {
+            vec!["\x1b[31mab", "\x1b[31mcd\x1b[0m", "ne", "xt"]
+        };
+        assert_eq!(wrap_display("\x1b[31mabcd\x1b[0m\nnext", 2), expected);
+    }
+
+    #[test]
+    fn small_terminal_keeps_the_input_cursor_visible() {
+        let (text, row, column, height) =
+            fit_input("one\r\ntwo\r\nthree\r\nfour".into(), (3, 2), 3, 20, 3);
+        assert_eq!(text, "three\x1b[0m\r\nfour");
+        assert_eq!((row, column, height), (1, 2, 2));
+    }
+
+    #[test]
+    fn drawing_the_input_does_not_clear_the_terminal_scrollback() {
+        let (mut state, _) = state();
+        state.running = true;
+        state.draw();
+        assert!(!state.pending.contains("\x1b[2J"));
+        assert!(!state.pending.contains("\x1b[?1049h"));
+    }
+
+    #[test]
+    fn turn_browser_expands_scrolls_changes_selection_and_closes() {
+        let (mut state, _) = state();
+        state.turn_browser = Some(TurnBrowser {
+            turns: vec![
+                TurnView {
+                    title: "第一轮".into(),
+                    content: (0..20).map(|index| format!("line {index}\n")).collect(),
+                    input: "第一轮".into(),
+                },
+                TurnView {
+                    title: "第二轮".into(),
+                    content: "second answer".into(),
+                    input: "第二轮".into(),
+                },
+            ],
+            selected: 0,
+            expanded: false,
+            scroll: 0,
+            compacted: true,
+        });
+        assert!(state.turn_rows(80).iter().any(|row| row.contains("第一轮")));
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.turn_rows(80).iter().any(|row| row.contains("line 0")));
+        press(&mut state, KeyCode::PageDown, KeyModifiers::NONE);
+        assert!(state.turn_browser.as_ref().unwrap().scroll > 0);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!state.turn_browser.as_ref().unwrap().expanded);
+        press(&mut state, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            state
+                .turn_rows(80)
+                .iter()
+                .any(|row| row.contains("second answer"))
+        );
+        press(&mut state, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(state.turn_browser.is_none());
+    }
+
+    #[test]
+    fn turn_browser_wraps_without_losing_text_and_neutralizes_terminal_controls() {
+        let rows = wrap_turn_content("中文abcd\n\x1b[31mred", 4);
+        assert_eq!(rows.join(""), "中文abcd�[31mred");
+        assert!(rows.iter().all(|row| width(row) <= 4));
+    }
+
+    #[test]
+    fn incoming_question_closes_turn_browser() {
+        let (mut state, _) = state();
+        state.turn_browser = Some(TurnBrowser {
+            turns: vec![TurnView {
+                title: "turn".into(),
+                content: "content".into(),
+                input: "turn".into(),
+            }],
+            selected: 0,
+            expanded: false,
+            scroll: 0,
+            compacted: false,
+        });
+        let _answer = state.ask("approve?", false);
+        assert!(state.turn_browser.is_none());
+        typed(&mut state, "yes");
+        assert_eq!(line(&state), "yes");
+    }
+
+    #[test]
+    fn restored_browser_does_not_block_running_task_input_or_interrupt() {
+        let (mut state, _) = state();
+        let browser = || TurnBrowser {
+            turns: vec![TurnView {
+                title: "turn".into(),
+                content: "content".into(),
+                input: "turn".into(),
+            }],
+            selected: 0,
+            expanded: false,
+            scroll: 0,
+            compacted: false,
+        };
+        state.busy = true;
+        state.turn_browser = Some(browser());
+        typed(&mut state, "continue with this");
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            state.steer.front().map(String::as_str),
+            Some("continue with this")
+        );
+
+        state.turn_browser = Some(browser());
+        assert!(press(&mut state, KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(state.turn_browser.is_none());
+
+        state.turn_browser = Some(browser());
+        assert!(!press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
+        assert!(press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
+    }
 
     #[test]
     fn the_usage_row_names_context_session_and_when_to_compact() {

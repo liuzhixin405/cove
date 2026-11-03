@@ -243,7 +243,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         memory,
         authorizer.clone(),
         background,
-        usage,
+        usage.clone(),
     )
     .await;
     let agent_tools = sessions.wrap_tools(agent_tools, settings.permission);
@@ -297,8 +297,13 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         agent = agent.with_turn_hook(hook);
     }
     // Skill review uses the cheap background model when one is configured.
-    let agent =
-        crate::commands::extensions::turn_hooks(agent, &settings, &skills, router.background());
+    let agent = crate::commands::extensions::turn_hooks(
+        agent,
+        &settings,
+        &skills,
+        router.background(),
+        usage.clone(),
+    );
     if settings.dump_system_prompt {
         print_text(&format!("{}\n", agent.system_prompt()), false)?;
         return Ok(());

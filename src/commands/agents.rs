@@ -241,7 +241,7 @@ fn main_line(app: &Application) -> String {
 fn remaining(app: &Application) -> Option<f64> {
     app.settings
         .budget
-        .map(|budget| budget - app.session.accounting.cost.unwrap_or(budget))
+        .map(|budget| budget - app.session.accounting.budget_cost().unwrap_or(budget))
 }
 
 fn is_main(app: &Application, id: &str) -> bool {

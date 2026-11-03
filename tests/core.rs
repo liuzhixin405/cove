@@ -11,6 +11,7 @@ use cove::{
     engine::agent::{Agent, Limits},
     process,
     safety::permission::{LocalAuthorizer, Mode},
+    session::{Ephemeral, Session, State, Store},
     tools::{LocalTools, ToolExecutor},
 };
 use futures_util::future::BoxFuture;
@@ -299,6 +300,90 @@ struct FakeProvider {
     requests: Mutex<Vec<ModelRequest>>,
 }
 
+type RecordedEvidence = (Option<String>, bool, Option<cove::safety::verify::Outcome>);
+
+#[derive(Default)]
+struct EndEvidence(Mutex<Vec<RecordedEvidence>>);
+
+struct SequenceVerifier(Mutex<VecDeque<Option<cove::safety::verify::Verification>>>);
+
+impl cove::safety::verify::Verifier for SequenceVerifier {
+    fn verify(
+        &self,
+        _: CancellationToken,
+    ) -> BoxFuture<'_, Result<Option<cove::safety::verify::Verification>>> {
+        Box::pin(async move { Ok(self.0.lock().unwrap().pop_front().unwrap()) })
+    }
+}
+
+impl cove::engine::turn::TurnHook for EndEvidence {
+    fn task_end_with_verification<'a>(
+        &'a self,
+        session: &'a Session,
+        completed: bool,
+        verification: Option<cove::safety::verify::Outcome>,
+        _budget: Option<f64>,
+    ) -> BoxFuture<'a, ()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((session.task_id.clone(), completed, verification));
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test]
+async fn task_end_hooks_receive_distinct_persisted_task_ids_and_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            response(vec![Block::Text("first done".into())]),
+            response(vec![Block::Text("second done".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let evidence = Arc::new(EndEvidence::default());
+    let verifier = Arc::new(SequenceVerifier(Mutex::new(VecDeque::from([
+        Some(cove::safety::verify::Verification {
+            outcome: cove::safety::verify::Outcome::Passed,
+            summary: "checks passed".into(),
+            detail: String::new(),
+        }),
+        None,
+    ]))));
+    let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits())
+        .unwrap()
+        .with_turn_hook(evidence.clone())
+        .with_verifier(Some(verifier));
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), None);
+    for prompt in ["first", "second"] {
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        agent
+            .run_in(
+                &mut session,
+                Some(prompt.into()),
+                &store,
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        drain.await.unwrap();
+        assert_eq!(store.load(&session.id).unwrap().task_id, session.task_id);
+    }
+    let entries = evidence.0.lock().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].0.is_some());
+    assert!(entries[1].0.is_some());
+    assert_ne!(entries[0].0, entries[1].0);
+    assert!(entries.iter().all(|(_, completed, _)| *completed));
+    assert_eq!(entries[0].2, Some(cove::safety::verify::Outcome::Passed));
+    assert_eq!(entries[1].2, None);
+}
+
 /// First call hangs forever (a slow model mid-generation); later calls use `inner`.
 struct HangOnce {
     first: std::sync::atomic::AtomicBool,
@@ -315,6 +400,31 @@ impl Provider for HangOnce {
         Box::pin(async move {
             if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 // Never completes; the agent must abort this call when steering arrives.
+                std::future::pending::<()>().await;
+                return Err(Error::Provider("unreachable".into()));
+            }
+            self.inner.stream(request, events, cancel).await
+        })
+    }
+}
+
+struct HangTwice {
+    calls: std::sync::atomic::AtomicUsize,
+    started: tokio::sync::Notify,
+    inner: FakeProvider,
+}
+
+impl Provider for HangTwice {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ModelResponse>> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < 2 {
+                self.started.notify_one();
                 std::future::pending::<()>().await;
                 return Err(Error::Provider("unreachable".into()));
             }
@@ -392,6 +502,251 @@ async fn steering_text_aborts_the_in_flight_model_call() {
         }),
         "steer text must reach the retried request"
     );
+}
+
+#[tokio::test]
+async fn steering_keeps_interrupted_request_cost_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(HangOnce {
+        first: true.into(),
+        inner: FakeProvider {
+            responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let prices = Some((1.0, 1.0));
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits { prices, ..limits() },
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (result, _) = tokio::join!(
+        agent.run_in(
+            &mut session,
+            Some("write a function".into()),
+            &Ephemeral,
+            tx,
+            CancellationToken::new()
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            steer.push("use iteration instead of recursion");
+        }
+    );
+    drain.await.unwrap();
+    assert!(result.is_ok());
+    assert_eq!(session.accounting.model_calls, 2);
+    assert_eq!(session.accounting.cost, None);
+    assert_eq!(provider.inner.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn steering_repeated_interruptions_preserve_both_messages_and_unknown_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(HangTwice {
+        calls: 0.into(),
+        started: tokio::sync::Notify::new(),
+        inner: FakeProvider {
+            responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let prices = Some((1.0, 1.0));
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits { prices, ..limits() },
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            agent.run_in(
+                &mut session,
+                Some("write a function".into()),
+                &Ephemeral,
+                tx,
+                CancellationToken::new()
+            ),
+            async {
+                provider.started.notified().await;
+                steer.push("first adjustment");
+                provider.started.notified().await;
+                steer.push("second adjustment");
+            }
+        )
+    })
+    .await
+    .expect("repeated steering timed out");
+    drain.await.unwrap();
+    assert_eq!(result.unwrap().model_calls, 3);
+    assert_eq!(session.accounting.cost, None);
+    let requests = provider.inner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    for text in ["first adjustment", "second adjustment"] {
+        assert!(requests[0].messages.iter().any(|message| {
+            message.role == Role::User
+                && message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, Block::Text(content) if content.contains(text)))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn steering_with_budget_persists_text_before_stopping_for_unknown_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let provider = Arc::new(HangOnce {
+        first: true.into(),
+        inner: FakeProvider {
+            responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let prices = Some((1.0, 1.0));
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits {
+            prices,
+            budget: Some(1.0),
+            ..limits()
+        },
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (result, _) = tokio::join!(
+        agent.run_in(
+            &mut session,
+            Some("write a function".into()),
+            &store,
+            tx,
+            CancellationToken::new()
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            steer.push("use iteration instead of recursion");
+        }
+    );
+    drain.await.unwrap();
+    assert!(matches!(result, Err(Error::Limit(_))));
+    let mut saved = store.load(&session.id).unwrap();
+    assert_eq!(saved.accounting.cost, None);
+    assert_eq!(saved.accounting.model_calls, 1);
+    assert!(matches!(saved.state, State::Interrupted(_)));
+    assert!(saved.messages.iter().any(|message| {
+        message.role == Role::User
+            && message.blocks.iter().any(|block| {
+                matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
+            })
+    }));
+    assert!(provider.inner.requests.lock().unwrap().is_empty());
+
+    let resumed = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits { prices, ..limits() },
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = resumed
+        .run_in(&mut saved, None, &store, tx, CancellationToken::new())
+        .await;
+    drain.await.unwrap();
+    assert!(result.is_ok());
+    let saved = store.load(&session.id).unwrap();
+    assert_eq!(saved.accounting.cost, None);
+    let requests = provider.inner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        message.role == Role::User
+            && message.blocks.iter().any(|block| {
+                matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
+            })
+    }));
+}
+
+#[tokio::test]
+async fn steering_empty_wakeup_counts_interrupted_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(HangOnce {
+        first: true.into(),
+        inner: FakeProvider {
+            responses: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let prices = Some((1.0, 1.0));
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits {
+            prices,
+            max_turns: 1,
+            ..limits()
+        },
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (result, _) = tokio::join!(
+        agent.run_in(
+            &mut session,
+            Some("write a function".into()),
+            &Ephemeral,
+            tx,
+            CancellationToken::new()
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            steer.wake.notify_one();
+        }
+    );
+    drain.await.unwrap();
+    assert!(matches!(result, Err(Error::Limit(_))));
+    assert_eq!(session.accounting.model_calls, 2);
+    assert_eq!(session.accounting.cost, None);
+    let requests = provider.inner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].tools.is_empty());
+    assert!(requests[0].messages.iter().any(|message| {
+        message.blocks.iter().any(
+            |block| matches!(block, Block::Text(text) if text.contains("model call limit reached")),
+        )
+    }));
 }
 
 impl Provider for FakeProvider {

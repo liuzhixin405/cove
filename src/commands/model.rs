@@ -15,6 +15,7 @@ use crate::{
     domain::{Block, Error, Result},
     model::provider::{HttpProvider, ProviderOptions},
     model::routing::ModelRouter,
+    session::SessionPersistence,
 };
 
 pub(crate) const HELP: &str = "\
@@ -594,17 +595,27 @@ impl Application {
 
     async fn budget(&mut self, value: Option<&str>) -> Result<()> {
         let spent = self.session.accounting.cost;
+        let budget_spent = self.session.accounting.budget_cost();
         let current = self.agent.limits().budget;
         let label = |budget: Option<f64>| budget.map_or("关闭".into(), |b| format!("${b:.2}"));
-        let set = |app: &mut Self, budget: Option<f64>| -> Result<()> {
+        let set = |app: &mut Self, budget: Option<f64>| -> Result<bool> {
             if budget.is_some() && app.agent.limits().prices.is_none() {
                 return Err(Error::Session(
                     "设置预算需要已知价格；请在配置中设置 input_price 和 output_price，或用 /config budget off".into(),
                 ));
             }
+            let renewed = budget.is_some() && app.session.accounting.budget_cost().is_none();
+            if renewed {
+                let previous = app.session.accounting.renewed_budget.clone();
+                app.session.accounting.reset_budget_spend();
+                if let Err(err) = app.store.save(&app.session) {
+                    app.session.accounting.renewed_budget = previous;
+                    return Err(err);
+                }
+            }
             app.agent.limits_mut().budget = budget;
             app.settings.budget = budget;
-            Ok(())
+            Ok(renewed)
         };
         match value.map(str::trim) {
             None | Some("") => {
@@ -620,6 +631,15 @@ impl Application {
                     ),
                     false,
                 )?;
+                if self.session.accounting.renewed_budget.is_some() {
+                    print_text(
+                        &format!(
+                            "新增预算已用 {}；历史总费用仍未知\n",
+                            budget_spent.map_or("未知".into(), |cost| format!("${cost:.4}"))
+                        ),
+                        false,
+                    )?;
+                }
             }
             Some("off") => {
                 set(self, None)?;
@@ -630,9 +650,15 @@ impl Application {
             }
             Some("auto") => {
                 // Ten dollars beyond what is already spent, never lower than the current cap.
-                let budget = (spent.unwrap_or(0.0) + 10.0).max(current.unwrap_or(0.0));
-                set(self, Some(budget))?;
+                let budget = (budget_spent.unwrap_or(0.0) + 10.0).max(current.unwrap_or(0.0));
+                let renewed = set(self, Some(budget))?;
                 print_text(&format!("本会话预算 {}\n", label(Some(budget))), false)?;
+                if renewed {
+                    print_text(
+                        "历史总费用未知；该金额是从现在起的新增预算，不是会话总费用上限。\n",
+                        false,
+                    )?;
+                }
             }
             Some("save") => {
                 let budget = current.ok_or_else(|| {
@@ -662,7 +688,7 @@ impl Application {
                                 .into(),
                         )
                     })?;
-                set(self, Some(budget))?;
+                let renewed = set(self, Some(budget))?;
                 print_text(
                     &format!(
                         "本会话预算 {}（/config budget save 写入配置）\n",
@@ -670,6 +696,12 @@ impl Application {
                     ),
                     false,
                 )?;
+                if renewed {
+                    print_text(
+                        "历史总费用未知；该金额是从现在起的新增预算，不是会话总费用上限。\n",
+                        false,
+                    )?;
+                }
             }
         }
         Ok(())

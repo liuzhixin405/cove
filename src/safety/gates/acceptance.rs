@@ -34,6 +34,8 @@ pub struct GitState {
 pub struct Report {
     pub version: u32,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub cwd: PathBuf,
     pub request: String,
     pub started_at: u64,
@@ -206,6 +208,7 @@ impl TurnHook for Acceptance {
             let report = Report {
                 version: 1,
                 session_id: session.id.clone(),
+                task_id: session.task_id.clone(),
                 cwd: self.root.clone(),
                 request: session.current_request.clone(),
                 started_at,
