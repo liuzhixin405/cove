@@ -99,7 +99,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ### 配置文件
 
-配置是一个 JSON 文件：顶层写通用设置，`profiles` 里按名字写多套模型配置（各自的 provider 块、权限与限额字段），`active_profile` 选默认的一套。加载顺序如下：
+配置是一个 JSON 文件：顶层用 `active_profile` 选择默认配置，并集中存放公共设置；`profiles` 中的每套配置指定模型、供应商及其他需要覆盖的设置。加载顺序如下：
 
 1. 传了 `--config <文件>`（或 `COVE_CONFIG`），就读这个文件；
 2. 否则读 `<数据目录>/config.json`，默认是 `%USERPROFILE%\.cove\config.json`，文件存在才读；
@@ -110,15 +110,11 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ```json
 {
   "active_profile": "deepseek",
-  "permission_mode": "default",
+  "mcp_servers": {},
   "profiles": {
     "deepseek": {
       "model": "deepseek-v4-pro",
-      "provider": { "name": "deepseek", "base_url": "https://api.deepseek.com/v1" },
-      "max_output_tokens": 8192,
-      "input_price": 0.27,
-      "output_price": 1.1,
-      "max_budget_usd": 10
+      "provider": { "name": "deepseek" }
     },
     "local": {
       "model": "qwen3.6-27b",
@@ -140,37 +136,38 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `thinking` | Anthropic 扩展思考：`adaptive` 或 `disabled`；不写则不发送该字段 | 无 |
 | `effort` | Anthropic `output_config.effort`：`low`/`medium`/`high`/`xhigh`/`max` | 无 |
 | `show_reasoning` | `true` 时实时显示模型的推理/思考文本（stderr，终端里为暗色斜体，以 `✻ 思考过程` 开头）；默认隐藏，交互控制台只留一行 `✻ 思考了 Ns` | 无 |
-| `model_context_windows`（仅顶层） | 按模型名（小写）记录的上下文窗口；服务端报“上下文超长”时自动写入 | 无 |
+| `model_context_windows` | 兼容旧配置中的模型窗口记录；通常不需要设置 | 无 |
 | `permission_mode` | `default`、`plan`、`auto`、`bypass`；旧写法 `ask`=default、`readonly`=plan | `--permission` |
 | `max_iterations` | 每个任务最多调用模型的次数 | `--max-turns` |
 | `max_turn_minutes` | 任务总时限（分钟，必须为正数） | `--timeout`（秒） |
-| `max_budget_usd` | 预算；必须同时配置两个单价，否则忽略并给出警告 | `--budget` |
-| `system_prompt` | 附加在内置安全规则之后的自定义指令，不替换内置规则 | 无 |
+| `max_budget_usd` | 预算；支持费用回传的 OpenRouter 无需单价，其他未知价格的模型需配置两个单价，否则忽略并给出警告 | `--budget` |
+| `system_prompt` | 可选的自定义指令，附加在内置规则之后；默认指导已内置，无需配置 | 无 |
 | `max_output_tokens`、`context_window`、`context_bytes`、`input_price`、`output_price` | 含义同命令行参数 | 同名参数 |
 | `subagent_max_iterations` | 每个子 Agent 最多调用模型的次数，默认 60 | 无 |
-| `agent_types`（仅顶层） | 自定义子 Agent 类型：`{"名字": {"description", "instructions", "tools": [...], "readonly": bool}}`，不能覆盖内置类型 | 无 |
-| `max_background_agents`（仅顶层） | 同时运行的后台 Agent 上限，1–16，默认 4 | 无 |
-| `regression_command`（仅顶层） | `regression` 工具 `runner=command` 使用的命令，必须含 `{filter}` 占位符 | 无 |
-| `experimental_tools`（仅顶层） | 默认 `false`；为 `true` 时启用 task/team/send_message/brief/sleep 等实验工具 | 无 |
-| `done_verify_commands`（仅顶层） | 完成前检查命令列表；配置后替代自动推断，写空数组 `[]` 表示关闭门禁 | 无 |
-| `done_verify_auto`（仅顶层） | 默认 `true`：按项目文件自动推断检查命令。`Cargo.toml` → `cargo check --all-targets`，`go.mod` → `go build ./...`，`tsconfig.json` 且已安装 typescript → `npx tsc --noEmit`，`package.json` 有 build 脚本且已安装依赖 → `npm run build --if-present`，`pyproject.toml`/`setup.py` → `python -m compileall -q .`，`*.sln`/`*.csproj` → `dotnet build` | 无 |
-| `done_verify_tests`（仅顶层） | 默认 `true`：自动推断时再加上项目测试，并按本轮改动收窄范围：Cargo workspace 只测改动所在的包（`cargo test -p a -p b`），Go 项目（`go test`）只测改动的包目录，另有 `dotnet test`、`npm test`（有真实 test 脚本时）、`python -m pytest -q`（有 pytest 配置或 tests 目录时） | 无 |
-| `done_check`（仅顶层） | `on`/`off`/`auto`（默认）：改过文件后，模型收尾前追问一次“需求是否全部完成”。`auto` 只在交互会话且非 Anthropic 供应商时开启 | 无 |
-| `done_self_review`（仅顶层） | `off`（默认）/`on`/`auto`：收尾前让只读子 Agent 审阅本轮 diff（最多 40 KB），`auto` 只在改动不少于 40 行时启用 | 无 |
-| `workflow`（仅顶层） | `direct`（默认）/`review`/`once`，含义见下文“计划模式与审阅流程” | 无 |
-| `done_verify_timeout_seconds`（仅顶层） | 每条检查命令的时限；默认 120 秒，dotnet/npm/npx 为 300 秒 | 无 |
-| `shell`（仅顶层） | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`，或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
-| `web_search`（仅顶层） | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
-| `skills_registry`（仅顶层） | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
+| `agent_types` | 自定义子 Agent 类型：`{"名字": {"description", "instructions", "tools": [...], "readonly": bool}}`，不能覆盖内置类型 | 无 |
+| `max_background_agents` | 同时运行的后台 Agent 上限，1–16，默认 4 | 无 |
+| `regression_command` | `regression` 工具 `runner=command` 使用的命令，必须含 `{filter}` 占位符 | 无 |
+| `experimental_tools` | 默认 `false`；为 `true` 时启用 task/team/send_message/brief/sleep 等实验工具 | 无 |
+| `done_verify_commands` | 完成前检查命令列表；配置后替代自动推断，写空数组 `[]` 表示关闭门禁 | 无 |
+| `done_verify_auto` | 默认 `true`：按项目文件自动推断检查命令。`Cargo.toml` → `cargo check --all-targets`，`go.mod` → `go build ./...`，`tsconfig.json` 且已安装 typescript → `npx tsc --noEmit`，`package.json` 有 build 脚本且已安装依赖 → `npm run build --if-present`，`pyproject.toml`/`setup.py` → `python -m compileall -q .`，`*.sln`/`*.csproj` → `dotnet build` | 无 |
+| `done_verify_tests` | 默认 `true`：自动推断时再加上项目测试，并按本轮改动收窄范围：Cargo workspace 只测改动所在的包（`cargo test -p a -p b`），Go 项目（`go test`）只测改动的包目录，另有 `dotnet test`、`npm test`（有真实 test 脚本时）、`python -m pytest -q`（有 pytest 配置或 tests 目录时） | 无 |
+| `done_check` | `on`/`off`/`auto`（默认）：改过文件后，模型收尾前追问一次“需求是否全部完成”。`auto` 只在交互会话且非 Anthropic 供应商时开启 | 无 |
+| `done_self_review` | `off`（默认）/`on`/`auto`：收尾前让只读子 Agent 审阅本轮 diff（最多 40 KB），`auto` 只在改动不少于 40 行时启用 | 无 |
+| `workflow` | `direct`（默认）/`review`/`once`，含义见下文“计划模式与审阅流程” | 无 |
+| `done_verify_timeout_seconds` | 每条检查命令的时限；默认 120 秒，dotnet/npm/npx 为 300 秒 | 无 |
+| `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`，或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
+| `web_search` | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
+| `skills_registry` | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
 
 - **优先级**：命令行/环境变量 > 选中的 profile > 顶层字段 > 内置默认值。profile 由 `--profile <名>` / `COVE_PROFILE` 选择，没有指定时用 `active_profile`；profile 名不存在时报错。
+- **公共配置与差异**：通用设置写在顶层，profile 只写各自的模型、供应商和其他差异；profile 字段优先于顶层。`/model profile save` 会保留当前 profile 的设置，但省略与顶层相同的字段，以便继续继承公共值。
 - **provider 块整体替换**：profile 里写了 `provider`，就整体替换顶层的 `provider`（不逐字段合并）；命令行传 `--provider` 时，配置里的整个 provider 块（包括 key 和地址）都不再使用，避免把一家的 key 发给另一家。
 - **支持的供应商**：`openai`、`openai-compatible`、`anthropic`、`deepseek`、`glm`、`kimi`、`qwen`、`doubao`、`openrouter`、`siliconflow`、`groq`、`together`、`fireworks`、`xai`、`mistral`、`bedrock`，也接受别名 `claude`、`moonshot`、`zhipu`、`dashscope` 等。其中 `anthropic` 和 `bedrock` 走 Anthropic Messages 协议，其余走 OpenAI 兼容协议。不认识的名字按 OpenAI 兼容协议处理，但必须写 `base_url`。Anthropic 协议的根地址缺少 `/v1` 时会自动补上。`bedrock` 只支持 Bedrock API key（`AWS_BEARER_TOKEN_BEDROCK` 或 `provider.api_key`），不支持 SigV4 签名。
 - **Bedrock**：默认走 AWS 原生的 Bedrock Runtime 接口（`https://bedrock-runtime.<区域>.amazonaws.com`，区域取 `AWS_REGION`/`AWS_DEFAULT_REGION`，默认 `us-east-1`），与 Claude Code 的 `CLAUDE_CODE_USE_BEDROCK` 相同：按 AWS 账号授权，不按调用方 IP 所在地区限制。也可以把 `base_url` 设为 Anthropic 兼容端点 `bedrock-mantle`，但该端点会拒绝不受支持地区的 IP（报 “unsupported countries”）。模型可写短名（`anthropic.claude-haiku-4-5`），首次请求时查询账号可用的推理配置，解析为完整 ID（`us.anthropic.claude-haiku-4-5-20251001-v1:0`），优先与区域对应的 `us.`/`eu.`/`apac.`，其次 `global.`；Claude Code 的 `[1m]` 后缀会开启 1M 上下文。
 - **网络代理**：默认跟随系统代理（Windows“Internet 选项”/macOS 网络设置，VPN 客户端开启“系统代理”模式时写入）以及 `HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；本机地址始终直连。也可用配置 `"proxy": "http://127.0.0.1:7890"`（支持 `http`、`https`、`socks5`、`socks5h`）、命令行 `--proxy` 或环境变量 `COVE_PROXY` 指定，`none` 表示全部直连。`/status` 显示当前代理。`web_fetch` 为防止访问内网，只使用显式指定的代理。
 - **调试与输出**：`debug`（或 `-d`/`--debug`）把每次模型调用、工具调用和压缩的轨迹记录（不含正文）实时打印到 stderr；`verbose`（或 `--verbose`）完整显示工具结果，不只显示摘要（交互控制台）或前 12 行（`-p` 和管道输出）；`live_output`（默认 true）控制命令输出是否逐行直播，`false` 时只在结束时显示摘要和结尾几行（失败时更多）。已废弃的 `telemetry`、`thinking_tokens` 会被静默忽略。
 - **API key 查找顺序**：`COVE_API_KEY` > `provider.api_key`/`provider.api_keys` > 供应商对应的环境变量（例如 `DEEPSEEK_API_KEY`、`KIMI_API_KEY`/`MOONSHOT_API_KEY`）。每一处都可以用逗号分隔写多个 key。带 `****` 的已掩码 key 会被忽略。key 写进配置文件时，文件必须保持私有；Unix 下如果其他用户可读，启动时会给出警告。
-- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。顶层的 `mcp_servers`、`disabled_skills`、`skill_review` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
+- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。`mcp_servers`、`disabled_skills`、`skill_review` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
 - `/status` 会显示当前生效的供应商、协议、模型、地址、profile 和配置文件路径。
 
 配置文件还支持 `extensions` 对象。最小例子：
@@ -216,7 +213,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **OpenAI 兼容**：o1/o3/o4/gpt-5 系列用 `max_completion_tokens`；`deepseek-reasoner`/`deepseek-r1` 不发送工具定义；`reasoning_content` 只在带工具调用的助手消息上回传。
 - **多 key 轮换**：`provider.api_keys`（或逗号分隔的环境变量）轮流使用。429 让该 key 休息（按 `Retry-After`，没有则 60 秒），有其他 key 时立即换用；401/403 把该 key 标为失效并立即用下一个重试。
 - **限流信息**：记录响应里的 `x-ratelimit-*` / `anthropic-ratelimit-*` 头，`/status limits` 显示剩余请求数、token 数和重置倒计时。
-- **上下文超长**：服务端报上下文超长时，自动压缩并重试一次；错误里写明了窗口大小时，按它缩小本会话的上下文预算，并写入用户配置的 `model_context_windows`，下次启动直接生效。
+- **上下文超长**：服务端报上下文超长时，自动压缩并重试一次；错误里写明窗口大小时，缩小本会话的上下文预算，并按供应商、接口和模型写入独立运行缓存，下次启动继续使用，不改写用户配置。
 
 ### 附件与图片
 
@@ -242,7 +239,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/config setup` | 重新运行设置向导（含验证请求） |
 | `/status limits` | 最近一次响应的限流信息 |
 
-修改立即生效，并原子写入用户配置文件：只改相关字段，其他字段保持不变；当前有 profile 时写入该 profile。新配置先完整加载校验，失败时不写文件、不生效。启动时用 `--model`/`--provider`/`--base-url` 指定的值会在第一次修改时一并写入，配置文件始终与正在运行的设置一致；环境变量里的 key 不写入文件。
+修改立即生效，并原子写入用户配置文件：只改相关字段，其他字段保持不变；当前有 profile 时通常写入该 profile。`/config system` 更新原有作用域：公共提示词写回顶层，profile 独立提示词写回该 profile。新配置先完整加载校验，失败时不写文件、不生效。启动时用 `--model`/`--provider`/`--base-url` 指定的值会在第一次修改时一并写入，配置文件始终与正在运行的设置一致；环境变量里的 key 不写入文件。
 
 会话不再绑定模型和供应商：恢复的会话可以换模型或供应商继续，每次请求按实际模型记账；工作区必须一致。
 
@@ -357,9 +354,9 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 状态行下面常驻一行用量，空闲和运行时都显示：`上下文 52.1k/200k（26%）· 本会话 1.2M tokens · $3.20`。
 - **上下文**：模型调用后取服务商报告的本次输入 token（含缓存读写），即模型实际读到的对话长度；启动、压缩、`/new`、`/resume` 之后历史变了，改用估算值（消息、系统提示和工具定义之和）。
 - **窗口**：当前模型的上下文窗口。
-- **本会话**：会话账本里的输入、输出和缓存读写 token 之和，以及估算花费（价格未知时不显示）。
+- **本会话**：会话账本里的输入和输出 token 之和（输入已包含缓存读写），以及估算花费（价格未知时不显示）。
 
-上下文达到自动压缩线（上下文预算的 75%，与 `/status` 显示的一致）的 80% 时，这一行变成黄色，并提示可先 `/compact`。窗口未知时不显示这一行。
+上下文达到自动压缩线的 80% 时，这一行变成黄色，显示自动压缩线占窗口的百分比，并提示可先 `/compact`。自动压缩线与 `/status` 显示的一致，按对话消息估算；状态栏用量还包含系统提示和工具定义，两者口径不同。窗口未知时不显示这一行。
 
 一次任务在屏幕上是这样的：
 
@@ -386,7 +383,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - **显示规则**：模型回复的 Markdown 边接收边渲染：标题加粗（一、二级加下划线），`**粗体**`，反引号里的代码名、路径和命令为浅橙色，列表符号换成 `•`，引用以 `│` 开头，分隔线画成横线，代码块保留原文（围栏行为暗色）便于复制。表格收齐后按终端宽度对齐，长单元格在列内换行并分隔多行记录；列太多时改为带列名的纵向展示。工具调用一行写明动作和关键参数（读取的文件、搜索的内容、运行的命令），下面用 `└` 给出摘要（行数、匹配数、退出码等），`#n` 可用 `/expand n` 看完整输出。同时运行的多个工具，各自的标题和结果放在一起。`-p`、管道和简单模式保持原来的机器可读行（`[tool]`、`[ok]`、`[summary]`），供脚本和 worker 解析。
 
-- **任务运行中输入**：普通文字作为插话，默认在工具结束或本轮回复完成时自动送入；以 `!` 开头则立即打断在途生成、带着插话重新回答（被中断的请求照常计费）。插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
+- **任务运行中输入**：普通文字作为插话，默认在工具结束或本轮回复完成时自动送入；以 `!` 开头则优先插话。未启用预算时立即打断生成，被中断的请求可能照常计费；启用预算时先保存插话，等待当前请求返回用量，不采纳该请求的回复和工具调用（等待期间仍可能显示流式文字），再带着插话继续。若请求失败、被取消或未返回用量，费用仍可能未知，须明确设置新增预算或关闭预算后继续。插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
 - **中断**：任务运行中连按两次 **Esc**（2 秒内）或按 **Ctrl+C** 中断任务，`/continue` 可以继续。空闲时在空行上按 Ctrl+C 只提示用 `/exit` 或 Ctrl+D 退出；**Ctrl+D** 在空行上保存并退出。
 - **审批与提问**：在同一输入行上作答。审批显示在黄色边框里：第一行是“需要批准”和命令类型（只读、构建/测试、未识别等），然后是要执行的操作和红色的风险警告，接着是编号选项（参照 Claude Code 和 Codex）：`1. 允许这一次 (y)`、`2. 本次会话不再询问 (s)`、`3. 本项目以后都不再询问 (a)`、`4. 拒绝 (n)`，“不再询问”两项后面写明这条规则会放行什么（如“git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）”“以 `npm run` 开头的命令”“本项目内的文件修改”）。会话规则只在内存里，退出即失效；项目规则写入 policies.json；没有 policies.json 时不提供第 3 项，生成不了规则的操作（如扩展进程）只有 1 和拒绝。按 `y`/`s`/`a` 立即提交，上下键在选项间切换后回车；大写的 `N` 是默认值，直接回车即拒绝。输入 `n <原因>` 或任何不是选项的文字，都当作拒绝理由交给模型。也接受 `yes`/`always`/`session`/`no` 和中文“是、允许、本次会话、总是、否、拒绝”。Esc 或 Ctrl+C 取消当前提问。
 - **拒绝后任务继续**：拒绝一次调用不会结束任务。模型收到“用户拒绝了”和你的理由，被要求不要重试、也不要换个等价命令绕过，而是换别的办法或询问你；屏幕上这一步显示为 `└ 已拒绝：<理由>（已告诉模型）`。拒绝不算工具失败。后台 Agent 和远程审批的拒绝同样处理。
@@ -487,7 +484,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ## 上下文与回退边界
 
-- 上下文按估算 token 计算（ASCII 约 3 字节 1 个 token，其他字符 1 个），窗口取自内置模型表，可用 `context_window`（或 `--context-window`）指定，服务端报告上下文超长时会学习真实窗口并保存。预算为窗口的 85%，并保证给回复留出空间；达到预算的 75% 时自动压缩（用 `model_fast`，未配置时用主模型），摘要同样收费并占模型调用额度。旧的 `--context-bytes` 仍可用。
+- 上下文按估算 token 计算（ASCII 约 3 字节 1 个 token，其他字符 1 个）。交互启动时可探测支持 `/props` 的本地服务；否则使用已学习的窗口、旧配置记录或内置模型表。服务端超限错误报告窗口时会自动学习并缓存，但并非所有服务都会提供该信息；可用 `context_window`（或 `--context-window`）显式指定。预算最多为窗口的 85%，同时为回复和安全余量留出空间；超过预算的 90% 时自动压缩（用 `model_fast`，未配置时用主模型），摘要同样收费并占模型调用额度。旧的 `--context-bytes` 仍可用。
 - 保留当前需求原文、近期完整消息/工具交换和相应 thinking signature；更早历史归档后摘要化。不会保留所有历史决策原文，必要时检查归档。压缩摘要的输出上限为配置的 `max_output_tokens` 与 8192 中较小者；实际输出和思考用量由供应商计费，不会自动重试。摘要失败、不完整或不能缩小时，保留原上下文并明确停止；截断时显示实际输出上限，手动压缩可用 `/compact` 重试，中断任务可用 `/continue`。
 - 最新不可拆分交换本身过大时明确失败，不静默截断需求。会话超过 `max_sessions` 时自动清理最旧的会话及其归档。
 - 单个工具结果按模型窗口限长：read/grep 约 6000 token，shell 和网络工具约 3000，其他约 4000；窗口大于 128K 时按比例放大（最多 4 倍，且不超过窗口的 1/8）。被截断的 read 结果末尾给出正确的 `[next: offset=N]`。
@@ -508,12 +505,12 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `--max-turns 20` | 每个任务/继续窗口最多 20 次模型请求，含自动压缩，不是用户对话数 |
 | `--timeout 300` | 任务总时限，秒；达到后取消并有界清理 |
 | `--max-output-tokens 4096` | 每次模型响应的输出 token 上限 |
-| `--budget <USD>` | 估算预算，必须同时指定两类 token 价格 |
+| `--budget <USD>` | 会话预算；OpenRouter 可使用返回费用，其他未知价格的模型需要两类 token 价格 |
 | `--input-price` / `--output-price` | 每百万 token 的美元价格 |
 
 `-p` 永不读取审批输入，也不会注册提问工具；不要通过管道传入 `y` 来绕过审批。非交互运行中需要审批的操作会报错并停止，错误里写明可选的 `--permission auto`、`bypass` 或允许规则；需要无交互执行时必须显式选择。
 
-预算按会话累计，在请求前及响应后检查，进行中的请求可能超额。计费使用供应商报告的 input/output token 和用户提供的单价，不精确建模缓存、分层或特殊推理计费，不是供应商账单。每次请求发送前先落盘“费用未知”，收到 usage 后再更新，避免进程崩溃漏记可能收费的请求。缺少 usage 或请求失败/断流时，有预算的会话停止执行。此时可用 `/config budget <金额>` 或 `/config budget auto` 设置从当前时刻开始计算的新增预算，再 `/continue`；历史总费用仍显示未知，新预算不是会话总费用上限。也可用 `/config budget off` 关闭本会话预算。新增预算再次遇到未知费用时同样会停止，需要重新设置或关闭预算。
+预算按会话累计，在请求前及响应后检查，进行中的请求可能超额。OpenRouter 官方端点优先使用响应中的 `usage.cost`，这是 OpenRouter 账户的费用；使用自带上游密钥时，上游单独收取的费用可能不包含在内。其他情况使用供应商报告的 token 用量和已知单价估算，不能视为完整账单。每次请求发送前先落盘“费用未知”，收到用量和费用后再更新，避免进程崩溃漏记可能收费的请求。缺少可计算的费用或请求失败/断流时，有预算的会话停止执行。此时可用 `/config budget <金额>` 或 `/config budget auto` 设置从当前时刻开始计算的新增预算，再 `/continue`；历史总费用仍显示未知，新预算不是会话总费用上限。也可用 `/config budget off` 关闭本会话预算。新增预算再次遇到未知费用时同样会停止，需要重新设置或关闭预算。
 
 文件工具限制在解析后的工作区内，拒绝父目录穿越、外部链接目标、直接访问 Git 元数据和 Windows ADS；这不是对恶意并发文件系统变化的沙箱。Shell 具有宿主权限，可能修改工作区外的数据、访问网络或启动程序。授权前务必检查命令。
 
@@ -578,7 +575,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - Shell 结果包含退出码、stdout、stderr、超时和截断标记。运行中逐行实时显示，每个流最多实时显示 256 KiB，超出部分只保留在结果里。这是按行刷新的输出，不是 TUI 面板，进度条这类原地刷新的输出会显示成多行。
 - 写入或命令已经产生的副作用不会因取消或网络错误自动撤销。
 - 流式响应缺终止事件、参数不完整或输出截断时，不执行该响应内的工具；不自动重试并重放副作用。
-- 工具失败会作为错误结果交给模型；任务若出现过失败工具，最终退出码保守地保持非零，即使模型声称已恢复。用户拒绝的调用不算失败。
+- 工具失败会作为错误结果交给模型；任务结束时按整次任务统计历史失败，不能据此判断问题是否已解决。交互模式显示提醒，可用 `/doctor trace` 查看失败记录或用 `/expand <n>` 查看工具输出；单次执行的退出码保守地保持非零，即使模型声称已恢复。用户拒绝的调用不算失败。
 - 模型正常结束不等于通过独立验收；没有实际测试证据时不能声称验证通过。
 - **验证门禁的结果**写在任务结束的汇总行里（交互控制台是 `✓ 完成 · …`，`-p` 和管道是 `[summary] …`）：`验证通过`、`验证未通过`、`验证未运行`（审批被拒、plan 模式下无法运行，或检查超时），或 `无自动验证`（无检查命令，或本轮没有文件改动；交互控制台不显示这一项）。3 轮后仍失败，退出码为非零。门禁只看文件工具产生的改动；单纯通过 Shell 修改文件不会触发它。没有运行就不算通过。
 - **网络工具**：`web_fetch` 只访问 https（http 自动升级）。每次请求和每次重定向前，都会解析目标地址，拒绝本机、私网、链路本地和 CGNAT 地址，并固定解析结果，防止 DNS rebinding；TUN 模式（“fake-IP”）代理返回的 `198.18.0.0/15`、`2001:db8::/32` 地址视为公网，因为局域网不会用到它们。不走系统代理。响应正文最多读 2 MiB，每次返回 32 KiB 文本，可以用 `offset` 翻页。网络访问被拒绝时，工具返回失败结果，模型可以不联网继续，任务不会被中断。搜索词会发送给第三方服务。

@@ -366,24 +366,18 @@ async fn draft_with_model(
             .saturating_add(response.usage.output);
         // Same rule as the kernel: unreported usage leaves the cost unknown.
         if response.usage_reported {
-            accounting.cost = match app.settings.prices {
-                Some((input, output)) => previous_cost.map(|cost| {
-                    cost + (response.usage.input as f64 * input
-                        + response.usage.output as f64 * output)
-                        / 1_000_000.0
-                }),
-                None => previous_cost,
-            };
+            let call_cost = response.reported_cost.or_else(|| {
+                crate::session::usage::bill(
+                    app.settings.prices,
+                    response.usage.input,
+                    response.usage.output,
+                )
+            });
+            accounting.cost = previous_cost.zip(call_cost).map(|(cost, call)| cost + call);
             if let (Some(budget), Some(previous)) =
                 (&mut accounting.renewed_budget, previous_budget)
             {
-                budget.cost = app.settings.prices.and_then(|(input, output)| {
-                    previous.map(|cost| {
-                        cost + (response.usage.input as f64 * input
-                            + response.usage.output as f64 * output)
-                            / 1_000_000.0
-                    })
-                });
+                budget.cost = previous.zip(call_cost).map(|(cost, call)| cost + call);
             }
         }
     }

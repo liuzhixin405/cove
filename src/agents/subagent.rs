@@ -1113,7 +1113,7 @@ impl AgentHub {
             truncated: false,
             output: String::new(),
             spent: Accounting {
-                cost: self.settings.prices.map(|_| 0.0),
+                cost: Some(0.0),
                 ..Accounting::default()
             },
             tools_failed: 0,

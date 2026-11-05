@@ -45,27 +45,32 @@ pub(crate) fn build_provider(settings: &Settings) -> Result<Arc<HttpProvider>> {
     )?))
 }
 
-/// The router, with learned windows saved to the user config.
+/// The router, with learned windows saved separately from the user config.
 pub(crate) fn new_router(settings: &Settings) -> Result<Arc<ModelRouter>> {
     let router = Arc::new(ModelRouter::new(
         build_provider(settings)?,
         settings.model_fast.clone(),
         settings.prices,
     ));
-    let path = config_target(settings);
+    set_window_sink(&router, settings);
+    Ok(router)
+}
+
+fn set_window_sink(router: &ModelRouter, settings: &Settings) {
+    let path = settings
+        .data_dir
+        .join(crate::config::MODEL_CONTEXT_WINDOWS_CACHE);
+    let provider = settings.provider.clone();
+    let base_url = settings.base_url.clone();
     router.on_window_learned(Box::new(move |model, window| {
-        let _ = edit_file(&path, |root| {
-            let windows = object(root)
-                .entry("model_context_windows")
-                .or_insert_with(|| json!({}));
-            if !windows.is_object() {
-                *windows = json!({});
-            }
-            windows[model.to_ascii_lowercase()] = json!(window);
+        let _ = edit_file(&path, |cache| {
+            object(cache).insert(
+                crate::config::model_context_cache_key(&provider, &base_url, model),
+                json!(window),
+            );
             Ok(())
         });
     }));
-    Ok(router)
 }
 
 fn config_target(settings: &Settings) -> PathBuf {
@@ -115,6 +120,23 @@ fn target<'a>(root: &'a mut Value, profile: Option<&str>) -> &'a mut Map<String,
     match profile {
         Some(name) if exists => object(root.pointer_mut(&pointer(name)).expect("checked")),
         _ => object(root),
+    }
+}
+
+fn existing_target<'a>(
+    root: &'a mut Value,
+    profile: Option<&str>,
+    key: &str,
+) -> &'a mut Map<String, Value> {
+    let profile_has_key = profile.is_some_and(|name| {
+        root.pointer(&pointer(name))
+            .and_then(|profile| profile.get(key))
+            .is_some()
+    });
+    if !profile_has_key && root.get(key).is_some() {
+        object(root)
+    } else {
+        target(root, profile)
     }
 }
 
@@ -292,10 +314,11 @@ impl Application {
         self.models
             .router
             .replace(provider, next.model_fast.clone(), next.prices);
+        set_window_sink(&self.models.router, &next);
         let current = &mut self.settings;
         let mut notes = Vec::new();
         let budget = match (self.agent.limits().budget, next.prices) {
-            (Some(_), None) => {
+            (Some(_), None) if !crate::model::provider::supports_reported_cost(&next.base_url) => {
                 notes.push("预算已关闭：新模型的价格未知".to_owned());
                 None
             }
@@ -529,7 +552,13 @@ impl Application {
             }
             ["save", name] => {
                 let settings = &self.settings;
-                let mut profile = Map::new();
+                let mut profile = settings
+                    .profile
+                    .as_deref()
+                    .and_then(|name| profiles.get(name))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
                 profile.insert("model".into(), json!(settings.model));
                 let mut block = Map::new();
                 provider_block(&mut block, settings);
@@ -554,6 +583,7 @@ impl Application {
                 }
                 let name = (*name).to_owned();
                 edit_file(&path, |root| {
+                    profile.retain(|key, value| root.get(key) != Some(value));
                     let profiles = object(root).entry("profiles").or_insert_with(|| json!({}));
                     object(profiles).insert(name.clone(), Value::Object(profile));
                     Ok(())
@@ -599,7 +629,10 @@ impl Application {
         let current = self.agent.limits().budget;
         let label = |budget: Option<f64>| budget.map_or("关闭".into(), |b| format!("${b:.2}"));
         let set = |app: &mut Self, budget: Option<f64>| -> Result<bool> {
-            if budget.is_some() && app.agent.limits().prices.is_none() {
+            if budget.is_some()
+                && app.agent.limits().prices.is_none()
+                && !crate::model::provider::supports_reported_cost(&app.settings.base_url)
+            {
                 return Err(Error::Session(
                     "设置预算需要已知价格；请在配置中设置 input_price 和 output_price，或用 /config budget off".into(),
                 ));
@@ -615,6 +648,14 @@ impl Application {
             }
             app.agent.limits_mut().budget = budget;
             app.settings.budget = budget;
+            if budget.is_some()
+                && crate::model::provider::supports_reported_cost(&app.settings.base_url)
+            {
+                print_text(
+                    "OpenRouter 预算仅计入其账户报告的费用；自带上游密钥时，上游另收费用可能不包含在内\n",
+                    false,
+                )?;
+            }
             Ok(renewed)
         };
         match value.map(str::trim) {
@@ -770,7 +811,8 @@ impl Application {
                 let text = text.trim().to_owned();
                 let clear = matches!(text.as_str(), "off" | "none" | "clear");
                 self.change(Reload::Seeded, None, |root, settings| {
-                    let target = target(root, settings.profile.as_deref());
+                    let target =
+                        existing_target(root, settings.profile.as_deref(), "system_prompt");
                     if clear {
                         target.insert("system_prompt".into(), json!(""));
                     } else {

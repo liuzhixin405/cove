@@ -414,6 +414,39 @@ struct HangTwice {
     inner: FakeProvider,
 }
 
+struct SettleOnce {
+    first: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    usage_reported: bool,
+    inner: FakeProvider,
+}
+
+impl Provider for SettleOnce {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ModelResponse>> {
+        Box::pin(async move {
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+                let mut result = response(vec![Block::ToolUse {
+                    id: "obsolete".into(),
+                    name: "write".into(),
+                    input: json!({"path":"obsolete.txt","content":"wrong"}),
+                    extra: None,
+                }]);
+                result.usage_reported = self.usage_reported;
+                return Ok(result);
+            }
+            self.inner.stream(request, events, cancel).await
+        })
+    }
+}
+
 impl Provider for HangTwice {
     fn stream(
         &self,
@@ -611,12 +644,15 @@ async fn steering_repeated_interruptions_preserve_both_messages_and_unknown_cost
 }
 
 #[tokio::test]
-async fn steering_with_budget_persists_text_before_stopping_for_unknown_cost() {
+async fn steering_with_budget_waits_for_usage_before_continuing() {
     let dir = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
-    let provider = Arc::new(HangOnce {
+    let provider = Arc::new(SettleOnce {
         first: true.into(),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        usage_reported: true,
         inner: FakeProvider {
             responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
             requests: Mutex::new(Vec::new()),
@@ -640,7 +676,17 @@ async fn steering_with_budget_persists_text_before_stopping_for_unknown_cost() {
     .with_steer(steer.clone());
     let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
     let (tx, mut rx) = mpsc::channel(64);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let drain_provider = provider.clone();
+    let drain_steer = steer.clone();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, Event::Notice(text) if text.contains("等待当前请求返回用量"))
+            {
+                drain_steer.push("also keep the original interface");
+                drain_provider.release.notify_one();
+            }
+        }
+    });
     let (result, _) = tokio::join!(
         agent.run_in(
             &mut session,
@@ -650,39 +696,23 @@ async fn steering_with_budget_persists_text_before_stopping_for_unknown_cost() {
             CancellationToken::new()
         ),
         async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            provider.started.notified().await;
             steer.push("use iteration instead of recursion");
         }
     );
     drain.await.unwrap();
-    assert!(matches!(result, Err(Error::Limit(_))));
-    let mut saved = store.load(&session.id).unwrap();
-    assert_eq!(saved.accounting.cost, None);
-    assert_eq!(saved.accounting.model_calls, 1);
-    assert!(matches!(saved.state, State::Interrupted(_)));
+    assert_eq!(result.unwrap().model_calls, 2);
+    let saved = store.load(&session.id).unwrap();
+    assert_eq!(saved.accounting.cost, Some(0.00003));
+    assert_eq!(saved.accounting.model_calls, 2);
+    assert!(matches!(saved.state, State::Completed));
     assert!(saved.messages.iter().any(|message| {
         message.role == Role::User
             && message.blocks.iter().any(|block| {
                 matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
             })
     }));
-    assert!(provider.inner.requests.lock().unwrap().is_empty());
-
-    let resumed = Agent::new(
-        provider.clone(),
-        Arc::new(tools(dir.path(), Mode::Auto)),
-        Limits { prices, ..limits() },
-    )
-    .unwrap();
-    let (tx, mut rx) = mpsc::channel(64);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = resumed
-        .run_in(&mut saved, None, &store, tx, CancellationToken::new())
-        .await;
-    drain.await.unwrap();
-    assert!(result.is_ok());
-    let saved = store.load(&session.id).unwrap();
-    assert_eq!(saved.accounting.cost, None);
+    assert!(!dir.path().join("obsolete.txt").exists());
     let requests = provider.inner.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].messages.iter().any(|message| {
@@ -691,6 +721,84 @@ async fn steering_with_budget_persists_text_before_stopping_for_unknown_cost() {
                 matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
             })
     }));
+    assert!(requests[0].messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(block, Block::Text(text) if text.contains("also keep the original interface"))
+        })
+    }));
+}
+
+#[tokio::test]
+async fn steering_with_budget_stops_when_usage_is_missing_or_budget_is_spent() {
+    for (usage_reported, budget) in [(false, 1.0), (true, 0.00001)] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let provider = Arc::new(SettleOnce {
+            first: true.into(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            usage_reported,
+            inner: FakeProvider {
+                responses: Mutex::new(VecDeque::new()),
+                requests: Mutex::new(Vec::new()),
+            },
+        });
+        let steer = Arc::new(TestSteer {
+            text: Mutex::new(Vec::new()),
+            wake: tokio::sync::Notify::new(),
+        });
+        let prices = Some((1.0, 1.0));
+        let agent = Agent::new(
+            provider.clone(),
+            Arc::new(tools(dir.path(), Mode::Auto)),
+            Limits {
+                prices,
+                budget: Some(budget),
+                ..limits()
+            },
+        )
+        .unwrap()
+        .with_steer(steer.clone());
+        let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain_provider = provider.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, Event::Notice(text) if text.contains("等待当前请求返回用量"))
+                {
+                    drain_provider.release.notify_one();
+                }
+            }
+        });
+        let (result, _) = tokio::join!(
+            agent.run_in(
+                &mut session,
+                Some("task".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            ),
+            async {
+                provider.started.notified().await;
+                steer.push("change the task");
+            }
+        );
+        drain.await.unwrap();
+        assert!(matches!(result, Err(Error::Limit(_))));
+        let saved = store.load(&session.id).unwrap();
+        assert_eq!(saved.accounting.cost, usage_reported.then_some(0.000015));
+        assert_eq!(saved.accounting.model_calls, 1);
+        assert!(matches!(saved.state, State::Interrupted(_)));
+        assert!(saved.messages.iter().any(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text(text) if text.contains("change the task")))
+        }));
+        assert!(provider.inner.requests.lock().unwrap().is_empty());
+        assert!(!dir.path().join("obsolete.txt").exists());
+    }
 }
 
 #[tokio::test]
@@ -780,6 +888,7 @@ fn response(blocks: Vec<Block>) -> ModelResponse {
         },
         complete: true,
         usage_reported: true,
+        reported_cost: None,
         model: None,
     }
 }
@@ -1127,4 +1236,136 @@ async fn missing_usage_cannot_be_treated_as_free_when_budgeted() {
         agent.run("task".into(), tx, CancellationToken::new()).await,
         Err(Error::Limit(_))
     ));
+}
+
+#[tokio::test]
+async fn reported_cost_enforces_budget_without_static_prices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut result = response(vec![Block::Text("done".into())]);
+    result.reported_cost = Some(0.5);
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([result])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut limits = limits();
+    limits.budget = Some(0.1);
+    limits.prices = None;
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits,
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(64);
+    assert!(matches!(
+        agent.run("task".into(), tx, CancellationToken::new()).await,
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reported_cost_takes_precedence_over_estimated_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut result = response(vec![Block::Text("done".into())]);
+    result.reported_cost = Some(0.5);
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([result])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut limits = limits();
+    limits.budget = Some(0.1);
+    limits.prices = Some((1.0, 1.0));
+    let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits).unwrap();
+    let (tx, _rx) = mpsc::channel(64);
+    assert!(matches!(
+        agent.run("task".into(), tx, CancellationToken::new()).await,
+        Err(Error::Limit(_))
+    ));
+}
+
+#[tokio::test]
+async fn reported_cost_is_recorded_in_usage_ledger() {
+    let data = tempfile::tempdir().unwrap();
+    let mut result = response(vec![Block::Text("done".into())]);
+    result.reported_cost = Some(0.5);
+    let inner = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([result])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let ledger = Arc::new(cove::session::usage::UsageLedger::new(data.path()));
+    let metered = cove::session::usage::Metered {
+        inner,
+        ledger: ledger.clone(),
+        provider: "openrouter".into(),
+        model: "model".into(),
+        prices: Some((1.0, 1.0)),
+        source: "session",
+    };
+    let request = ModelRequest {
+        system: String::new(),
+        messages: vec![Message::user("hello")],
+        tools: Vec::new(),
+        max_output_tokens: 100,
+        estimated_tokens: None,
+        model: None,
+    };
+    let (tx, _rx) = mpsc::channel(64);
+    metered
+        .stream(request, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let entries = ledger.load(0, u64::MAX).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cost, Some(0.5));
+}
+
+#[tokio::test]
+async fn missing_reported_cost_stops_budget_without_static_prices() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut limits = limits();
+    limits.budget = Some(1.0);
+    limits.prices = None;
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits,
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(64);
+    assert!(matches!(
+        agent.run("task".into(), tx, CancellationToken::new()).await,
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reported_cost_accumulates_without_static_prices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut result = response(vec![Block::Text("done".into())]);
+    result.reported_cost = Some(0.05);
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([result])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut limits = limits();
+    limits.budget = Some(0.1);
+    limits.prices = None;
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits,
+    )
+    .unwrap();
+    let (result, accounting, _) = agent
+        .run_detached("task".into(), CancellationToken::new())
+        .await;
+    assert!(result.is_ok());
+    assert_eq!(accounting.cost, Some(0.05));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }

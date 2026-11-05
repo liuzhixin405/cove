@@ -461,6 +461,25 @@ pub struct HttpProvider {
     limits: Arc<RateLimits>,
 }
 
+pub fn supports_reported_cost(base_url: &str) -> bool {
+    url::Url::parse(base_url).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && matches!(
+                url.host_str(),
+                Some("openrouter.ai" | "eu.openrouter.ai" | "us.openrouter.ai")
+            )
+            && url.port().is_none_or(|port| port == 443)
+            && matches!(
+                url.path().trim_end_matches('/'),
+                "/api/v1" | "/api/v1/chat/completions"
+            )
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 impl HttpProvider {
     pub fn new(protocol: Protocol, base_url: &str, model: String, api_key: &str) -> Result<Self> {
         Self::with_options(
@@ -571,6 +590,10 @@ impl HttpProvider {
     /// Default model, used when a request names none.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn reports_cost(&self) -> bool {
+        supports_reported_cost(&self.endpoint)
     }
 
     pub fn rate_limits(&self) -> Arc<RateLimits> {
@@ -1074,6 +1097,9 @@ impl Provider for HttpProvider {
                 }
                 if collector.done {
                     let mut response = collector.finish()?;
+                    if !supports_reported_cost(&self.endpoint) {
+                        response.reported_cost = None;
+                    }
                     response.model = Some(model);
                     return Ok(response);
                 }
@@ -1157,6 +1183,7 @@ struct Collector {
     blocks: BTreeMap<u64, AnthropicBlock>,
     usage: Usage,
     usage_reported: bool,
+    reported_cost: Option<f64>,
     stop: Option<String>,
     done: bool,
 }
@@ -1171,6 +1198,7 @@ impl Collector {
             blocks: BTreeMap::new(),
             usage: Usage::default(),
             usage_reported: false,
+            reported_cost: None,
             stop: None,
             done: false,
         }
@@ -1202,6 +1230,9 @@ impl Collector {
                         .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
                         .unwrap_or(0)
                         .min(self.usage.input);
+                    self.reported_cost = usage["cost"]
+                        .as_f64()
+                        .filter(|cost| cost.is_finite() && *cost >= 0.0);
                     self.usage_reported = true;
                 }
                 if let Some(choice) = value["choices"]
@@ -1406,6 +1437,7 @@ impl Collector {
             usage: self.usage,
             complete,
             usage_reported: self.usage_reported,
+            reported_cost: self.reported_cost,
             model: None,
         })
     }
@@ -1429,6 +1461,32 @@ fn block_index(value: &Value) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::domain::ToolDefinition;
+
+    #[tokio::test]
+    async fn local_window_probe_uses_server_report() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let size = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /props "));
+            let body = r#"{"default_generation_settings":{"n_ctx":65536}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        assert_eq!(
+            probe_local_window(&format!("http://{address}/v1")).await,
+            Some(65536)
+        );
+        server.await.unwrap();
+        assert_eq!(probe_local_window("https://example.com/v1").await, None);
+    }
 
     #[test]
     fn short_bedrock_names_resolve_to_inference_profiles() {
@@ -1647,6 +1705,36 @@ mod tests {
         let mut c = Collector::new(Protocol::Openai);
         c.accept(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"prompt_cache_hit_tokens":30}}"#).unwrap();
         assert_eq!(c.usage.cache_read, 30);
+    }
+
+    #[test]
+    fn openai_usage_cost_is_parsed_when_valid() {
+        let mut collector = Collector::new(Protocol::Openai);
+        collector.accept(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"cost":0.012}}"#).unwrap();
+        assert_eq!(collector.reported_cost, Some(0.012));
+        collector
+            .accept(
+                r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"cost":-1}}"#,
+            )
+            .unwrap();
+        assert_eq!(collector.reported_cost, None);
+        assert!(supports_reported_cost("https://openrouter.ai/api/v1"));
+        assert!(!supports_reported_cost(
+            "https://openrouter.ai.example.com/api/v1"
+        ));
+        assert!(!supports_reported_cost("https://openrouter.ai:444/api/v1"));
+        assert!(!supports_reported_cost("https://openrouter.ai/other"));
+    }
+
+    #[test]
+    fn reported_cost_survives_stream_completion() {
+        let mut collector = Collector::new(Protocol::Openai);
+        collector
+            .accept(r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#)
+            .unwrap();
+        collector.accept(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"cost":0.012}}"#).unwrap();
+        collector.accept("[DONE]").unwrap();
+        assert_eq!(collector.finish().unwrap().reported_cost, Some(0.012));
     }
 
     #[test]

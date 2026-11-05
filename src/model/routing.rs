@@ -394,7 +394,11 @@ impl ModelPolicy for ModelRouter {
     }
 
     fn prices(&self, model: &str) -> Option<Prices> {
+        let reported_cost = self.provider().reports_cost();
         let state = self.state();
+        if reported_cost && state.configured_prices.is_none() {
+            return None;
+        }
         let main = models::prices_for(&state.main, state.configured_prices);
         if model == state.main {
             return main;
@@ -617,5 +621,19 @@ mod tests {
             router.prices("claude-haiku-4-5").map(|p| p.input),
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn reported_cost_provider_does_not_use_builtin_prices() {
+        let provider = HttpProvider::new(
+            Protocol::Openai,
+            "https://openrouter.ai/api/v1",
+            "gpt-4o".into(),
+            "key",
+        )
+        .unwrap();
+        let router = ModelRouter::new(Arc::new(provider), Some("claude-sonnet-4-5".into()), None);
+        assert!(router.prices("gpt-4o").is_none());
+        assert!(router.prices("claude-sonnet-4-5").is_none());
     }
 }

@@ -187,7 +187,7 @@ impl Session {
             state: State::Idle,
             pending: Vec::new(),
             accounting: Accounting {
-                cost: prices.map(|_| 0.0),
+                cost: Some(0.0),
                 ..Default::default()
             },
             prices,

@@ -63,6 +63,7 @@ fn response(blocks: Vec<Block>) -> ModelResponse {
         },
         complete: true,
         usage_reported: true,
+        reported_cost: None,
         model: None,
     }
 }
@@ -852,13 +853,47 @@ async fn million_window_compaction_preserves_history_on_truncation_and_persists_
 }
 
 #[tokio::test]
-async fn million_window_automatically_compacts_before_continuing_task() {
+async fn million_window_does_not_compact_before_new_threshold() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let (_, tools) = setup(root.path(), &store);
     let mut session = session(root.path());
     million_window_history(&mut session, 240);
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    let before = cove::engine::context::tokens(&session.messages);
+    assert!(before > budget * 3 / 4 && before < budget * 9 / 10);
+    let provider = Fake::new(vec![
+        response(vec![Block::Text("Task finished".into())]),
+        response(vec![Block::Text("Unexpected extra request".into())]),
+    ]);
+    let agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some("next task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(session.compactions, 0);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn million_window_automatically_compacts_before_continuing_task() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 300);
     let provider = Fake::new(vec![
         response(vec![Block::Text("Old verified context".into())]),
         response(vec![Block::Text("Task finished".into())]),
@@ -893,6 +928,45 @@ async fn million_window_automatically_compacts_before_continuing_task() {
             .flat_map(|message| &message.blocks)
             .any(|block| matches!(block, Block::Text(text) if text.contains("next task")))
     );
+}
+
+#[tokio::test]
+async fn multi_million_window_automatically_compacts_before_continuing_task() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 870);
+    let budget = cove::model::models::context_budget(3_000_000, 64_000);
+    let before = cove::engine::context::tokens(&session.messages);
+    assert!(before > budget * 9 / 10 && before < budget, "{before}");
+    let provider = Fake::new(vec![
+        response(vec![Block::Text("Old verified context".into())]),
+        response(vec![Block::Text("Task finished".into())]),
+    ]);
+    let mut agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    agent.limits_mut().max_output_tokens = 64_000;
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some("next task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].estimated_tokens.unwrap() > 2_000_000);
+    assert_eq!(requests[0].max_output_tokens, 8192);
+    assert_eq!(store.load(&session.id).unwrap().compactions, 1);
 }
 
 #[tokio::test]

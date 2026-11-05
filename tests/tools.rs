@@ -641,6 +641,7 @@ fn reply(blocks: Vec<Block>) -> ModelResponse {
         },
         complete: true,
         usage_reported: true,
+        reported_cost: None,
         model: None,
     }
 }

@@ -228,7 +228,33 @@ async fn exit_codes_distinguish_usage_errors_and_dump_prints_the_system_prompt()
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
     assert!(stdout.starts_with("You are Cove") && stdout.contains("Project rule: use tabs."));
+    assert!(stdout.contains("你是 Cove，一个高效的 AI 编程助手。"));
     assert!(sessions(data.path()).is_empty());
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({"system_prompt":"你是 Cove，一个高效的 AI 编程助手。先理解任务，再用工具完成它；需要时读取、搜索、修改、执行、验证并给出真实结果，遇到问题要诚实说明。"}).to_string(),
+    )
+    .unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.arg("--dump-system-prompt");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stdout
+            .matches("你是 Cove，一个高效的 AI 编程助手。")
+            .count(),
+        1
+    );
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({"system_prompt":"custom instruction"}).to_string(),
+    )
+    .unwrap();
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.arg("--dump-system-prompt");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("custom instruction"));
 }
 
 #[tokio::test]
@@ -634,6 +660,38 @@ async fn commit_takes_staged_content_or_a_selection_and_never_pushes() {
     command.args(["-p", "/commit --only ../x --"]);
     let (output, _, stderr) = run(command).await;
     assert!(!output.status.success() && stderr.contains("必须在仓库内"));
+}
+
+#[tokio::test]
+async fn interactive_tool_failure_is_a_historical_warning_not_a_task_error() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("found.txt"), "correct file\n").unwrap();
+    let (url, server) = mock_server(vec![
+        tool("missing", "read", json!({"path":"missing.txt"})),
+        tool("found", "read", json!({"path":"found.txt"})),
+        openai(json!({"content":"Read the correct file."}), "stop"),
+        openai(json!({"content":"Next task finished."}), "stop"),
+    ])
+    .await;
+    let (output, _, stderr) = repl(
+        cove(root.path(), data.path(), &url),
+        "read the file\nnext task\n/exit\n",
+    )
+    .await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("[failed] read"), "{stderr}");
+    assert!(stderr.contains("[ok] read"), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("[提醒] 任务过程中有 1 个工具调用失败")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("错误：tool: 任务"), "{stderr}");
+    assert!(stderr.contains("/doctor trace") && stderr.contains("/expand <n>"));
+    assert_eq!(server.await.unwrap().len(), 4);
 }
 
 #[tokio::test]

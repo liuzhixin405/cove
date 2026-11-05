@@ -451,10 +451,7 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
             }
             AgentEvent::Usage { tokens, .. } => {
                 if let Some(console) = console {
-                    console.add_tokens(
-                        tokens.input + tokens.cache_read + tokens.cache_write,
-                        tokens.output,
-                    );
+                    console.add_tokens(tokens);
                 }
             }
         }

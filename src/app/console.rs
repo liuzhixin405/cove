@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     app::completion::{self, Candidate, Completer},
-    domain::{Error, Result},
+    domain::{Error, Result, Usage},
     engine::turn::TurnHook,
     session::Session,
     tools::ToolOutput,
@@ -70,6 +70,13 @@ pub struct Meter {
 }
 
 impl Meter {
+    fn add_usage(&mut self, usage: Usage) {
+        self.context = usage.input;
+        self.session = self
+            .session
+            .saturating_add(usage.input.saturating_add(usage.output));
+    }
+
     /// The row and whether the context nears the compaction point (from 80% of it).
     pub fn row(&self) -> Option<(String, bool)> {
         use crate::app::render::short_count;
@@ -88,9 +95,12 @@ impl Meter {
         }
         let near = self.compact_at > 0 && self.context * 5 >= self.compact_at * 4;
         if near {
+            let tenths =
+                (self.compact_at as u128 * 1000 + self.window as u128 / 2) / self.window as u128;
             row.push_str(&format!(
-                " · 快到 {} 自动压缩了，可先输入 /compact",
-                short_count(self.compact_at)
+                " · 自动压缩阈值约 {}.{}%（按对话估算），可输入 /compact",
+                tenths / 10,
+                tenths % 10
             ));
         }
         Some((row, near))
@@ -270,14 +280,12 @@ impl Console {
         }
     }
 
-    /// Tokens a model call of the running task used; `input` (with cache) is also
-    /// how full the context was for that call.
-    pub fn add_tokens(&self, input: u64, output: u64) {
+    /// Tokens a model call used; input already includes cache reads and writes.
+    pub fn add_tokens(&self, usage: Usage) {
         let mut state = self.lock();
-        state.tokens.0 += input;
-        state.tokens.1 += output;
-        state.meter.context = input;
-        state.meter.session += input + output;
+        state.tokens.0 += usage.input;
+        state.tokens.1 += usage.output;
+        state.meter.add_usage(usage);
         state.redraw();
     }
 
@@ -1304,8 +1312,6 @@ impl State {
                     "[steer] 已有 {STEER_LIMIT} 条消息在等待，这条没有送达；等任务结束后再发送\n"
                 ));
             } else {
-                // Plain text is delivered automatically at the next tool or reply
-                // boundary; a `!` prefix interrupts the in-flight generation at once.
                 let trimmed = line.trim();
                 let immediate = trimmed.starts_with('!') && trimmed.len() > 1;
                 let text = if immediate {
@@ -1320,9 +1326,9 @@ impl State {
                 }
                 let echo = self.user_echo(&line, "33", "");
                 let how = if immediate {
-                    "  ↳ 立即打断当前生成，带着这条重新回答"
+                    "  ↳ 插话已提交；有预算时等待当前请求返回用量"
                 } else {
-                    "  ↳ 将在工具结束或本轮回复完成时自动送入（! 开头可立即打断）"
+                    "  ↳ 将在工具结束或本轮回复完成时自动送入（! 开头可优先插话）"
                 };
                 self.notice(&format!("{echo}{}\n", self.style("2", how)));
             }
@@ -1680,7 +1686,7 @@ impl State {
             let placeholder = if self.ask.is_some() {
                 ""
             } else if self.busy {
-                "(输入文字可引导当前任务；/命令会排队执行)"
+                "(! 插话；预算开启需等待用量；文字引导任务；/命令排队)"
             } else {
                 if cfg!(windows) {
                     "(/ 查看命令，@路径 或 Alt+V 添加附件，Ctrl+J 换行)"
@@ -2701,10 +2707,27 @@ mod tests {
         meter.context = 110_000;
         let (row, near) = meter.row().unwrap();
         assert!(
-            near && row.ends_with("快到 127.5k 自动压缩了，可先输入 /compact"),
+            near && row.ends_with("自动压缩阈值约 63.8%（按对话估算），可输入 /compact"),
             "{row}"
         );
+        meter.window = 1_000_000;
+        meter.compact_at = 765_000;
+        meter.context = 732_600;
+        assert!(meter.row().unwrap().0.contains("76.5%"));
         assert_eq!(Meter::default().row(), None);
+    }
+
+    #[test]
+    fn meter_does_not_count_cached_input_twice() {
+        let mut meter = Meter::default();
+        meter.add_usage(Usage {
+            input: 100,
+            output: 5,
+            cache_read: 80,
+            cache_write: 10,
+        });
+        assert_eq!(meter.context, 100);
+        assert_eq!(meter.session, 105);
     }
 
     fn state() -> (State, mpsc::UnboundedReceiver<Input>) {
@@ -2927,6 +2950,21 @@ mod tests {
             ))
         );
         assert!(state.attachments.is_empty());
+    }
+
+    #[test]
+    fn busy_input_mentions_immediate_steering_in_narrow_terminals() {
+        let (mut state, _) = state();
+        state.busy = true;
+        for columns in [30, 80] {
+            let mut screen = Screen::new(columns);
+            state.draw_input(&mut screen, columns);
+            let (output, _) = screen.finish();
+            assert!(output.contains("! 插话"), "{output}");
+            if columns == 80 {
+                assert!(output.contains("预算开启需等待用量") && output.contains("/命令排队"));
+            }
+        }
     }
 
     #[test]

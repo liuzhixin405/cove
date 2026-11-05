@@ -133,6 +133,7 @@ pub struct ModelResponse {
     pub usage: Usage,
     pub complete: bool,
     pub usage_reported: bool,
+    pub reported_cost: Option<f64>,
     /// Model that actually served the request, when the provider knows it.
     pub model: Option<String>,
 }

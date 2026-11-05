@@ -369,7 +369,9 @@ impl Provider for Metered {
                     output: usage.output,
                     cache_read: usage.cache_read,
                     cache_write: usage.cache_write,
-                    cost: bill(self.prices, usage.input, usage.output),
+                    cost: response
+                        .reported_cost
+                        .or_else(|| bill(self.prices, usage.input, usage.output)),
                 });
             }
             Ok(response)

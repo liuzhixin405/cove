@@ -464,7 +464,7 @@ impl Application {
         let cwd = cwd.strip_prefix(r"\\?\").unwrap_or(&cwd).to_owned();
         if crate::app::console::rich() {
             return format!(
-                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 开头立即插话 · /exit 退出\x1b[0m\n",
+                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 插话（有预算时等用量） · /exit 退出\x1b[0m\n",
                 env!("CARGO_PKG_VERSION"),
                 self.settings.model,
                 self.settings.provider,
@@ -473,7 +473,7 @@ impl Application {
             );
         }
         format!(
-            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止任务；运行中输入文字自动插话、! 开头立即打断；/exit 保存并退出。\n",
+            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止任务；运行中输入文字自动插话、! 优先插话（有预算时等用量）；/exit 保存并退出。\n",
             env!("CARGO_PKG_VERSION"),
             self.settings.model,
             self.settings.provider,
@@ -639,8 +639,8 @@ impl Application {
         console.set_meter(
             context,
             self.settings.context_window as u64,
-            (self.settings.context_tokens * 3 / 4) as u64,
-            usage.input + usage.output + usage.cache_read + usage.cache_write,
+            (self.agent.context_limit() * 9 / 10) as u64,
+            usage.input + usage.output,
             self.session.accounting.cost,
         );
     }
@@ -1078,10 +1078,14 @@ impl Application {
             ));
         }
         if report.tools_failed > 0 {
-            return Err(Error::Tool(format!(
-                "任务已结束，但有 {} 个工具调用失败；请查看上面标红的工具结果（/expand <n> 看完整输出），需要时让模型重试",
+            let warning = format!(
+                "任务过程中有 {} 个工具调用失败，最终结果仍需核对；可用 /doctor trace 查看失败记录，或 /expand <n> 查看工具输出",
                 report.tools_failed
-            )));
+            );
+            if self.settings.one_shot {
+                return Err(Error::Tool(warning));
+            }
+            print_text(&format!("[提醒] {warning}\n"), true)?;
         }
         Ok(())
     }
@@ -1142,7 +1146,7 @@ impl Application {
                         crate::model::net::describe(),
                         self.session.messages.len(),
                         crate::engine::context::tokens(&self.session.messages),
-                        self.settings.context_tokens * 3 / 4,
+                        self.agent.context_limit() * 9 / 10,
                         self.settings.context_window,
                         self.session.compactions,
                         self.session.accounting.model_calls,

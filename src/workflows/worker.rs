@@ -49,6 +49,10 @@ impl WorkerConfig {
             instructions: settings.instructions.clone(),
         }
     }
+
+    pub fn can_track_cost(&self) -> bool {
+        self.prices.is_some() || crate::model::provider::supports_reported_cost(&self.base_url)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,9 +147,9 @@ async fn spawn(
     if let Some((input, output)) = config.prices {
         file["input_price"] = json!(input);
         file["output_price"] = json!(output);
-        if let Some(budget) = job.budget {
-            file["max_budget_usd"] = json!(budget);
-        }
+    }
+    if let Some(budget) = job.budget {
+        file["max_budget_usd"] = json!(budget);
     }
     if let Some(instructions) = &config.instructions {
         file["system_prompt"] = json!(instructions);
@@ -225,5 +229,22 @@ mod tests {
         let chinese = "[summary] calls=1 tools=0 预估费用 $0.250000；未自动验证
 ";
         assert_eq!(reported_cost(chinese), Some(0.25));
+    }
+
+    #[test]
+    fn reported_cost_provider_supports_budget_without_prices() {
+        let mut config = WorkerConfig {
+            provider: "openai".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "model".into(),
+            api_key: "key".into(),
+            prices: None,
+            context_window: 128_000,
+            max_output_tokens: 4096,
+            instructions: None,
+        };
+        assert!(config.can_track_cost());
+        config.base_url = "https://other.example/v1".into();
+        assert!(!config.can_track_cost());
     }
 }

@@ -195,7 +195,7 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
         );
         settings.context_window = window;
         settings.context_tokens =
-            cove::model::models::context_budget(window, settings.max_output_tokens).min(2_000_000);
+            cove::model::models::context_budget(window, settings.max_output_tokens).min(10_000_000);
     }
     for warning in &settings.warnings {
         eprintln!("警告：{}", cove::app::ui::visible(warning));

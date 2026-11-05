@@ -13,6 +13,7 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::safety::permission::Mode;
 
@@ -479,6 +480,16 @@ const ROOT_KEYS: &[&str] = &[
     "workflow",
 ];
 const PROVIDER_KEYS: &[&str] = &["name", "api_key", "api_keys", "base_url"];
+pub const MODEL_CONTEXT_WINDOWS_CACHE: &str = "model-context-windows.json";
+
+pub fn model_context_cache_key(provider: &str, base_url: &str, model: &str) -> String {
+    let mut hash = Sha256::new();
+    for part in [provider, base_url, &model.to_ascii_lowercase()] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    format!("{:x}", hash.finalize())
+}
 
 #[derive(Default, Deserialize)]
 struct FileConfig {
@@ -617,12 +628,17 @@ fn unknown_keys(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let root: Vec<&str> = PROFILE_KEYS.iter().chain(ROOT_KEYS).copied().collect();
     object_keys(value, "", &root, &mut out);
+    let profile_keys: Vec<&str> = root
+        .iter()
+        .copied()
+        .filter(|key| !matches!(*key, "active_profile" | "profiles"))
+        .collect();
     if let Some(profiles) = value.get("profiles").and_then(Value::as_object) {
         for (name, profile) in profiles {
             object_keys(
                 profile,
                 &format!("profiles.{name}."),
-                PROFILE_KEYS,
+                &profile_keys,
                 &mut out,
             );
         }
@@ -808,6 +824,8 @@ impl Settings {
         );
         let (profile, config) = file.resolve(cli.profile)?;
         let file_json = effective_json(&raw, profile.as_deref());
+        let mut file: FileConfig =
+            serde_json::from_value(file_json.clone()).context("parse effective configuration")?;
         let debug = cli.debug || flag(&file_json, "debug");
         let proxy = cli
             .proxy
@@ -952,6 +970,18 @@ impl Settings {
             .context_window
             .or(config.context_window)
             .or_else(|| {
+                read_json_file(&data_dir.join(MODEL_CONTEXT_WINDOWS_CACHE))
+                    .ok()?
+                    .get(model_context_cache_key(
+                        info.map_or(provider_name.as_str(), |provider| provider.name),
+                        &base_url,
+                        &model,
+                    ))?
+                    .as_u64()
+                    .and_then(|window| usize::try_from(window).ok())
+                    .filter(|window| (8192..=10_000_000).contains(window))
+            })
+            .or_else(|| {
                 file.model_context_windows
                     .get(&model.to_ascii_lowercase())
                     .copied()
@@ -984,7 +1014,7 @@ impl Settings {
                 bytes / 3
             }
             None => crate::model::models::context_budget(context_window, max_output_tokens)
-                .min(2_000_000),
+                .min(10_000_000),
         };
         anyhow::ensure!(
             max_turns > 0 && timeout > 0 && max_output_tokens > 0,
@@ -1003,6 +1033,7 @@ impl Settings {
                 Some((input, output))
             }
             // Built-in list prices; unknown models stay "cost unknown".
+            (None, None) if crate::model::provider::supports_reported_cost(&base_url) => None,
             (None, None) => crate::model::models::prices(&model),
             _ => anyhow::bail!("请同时提供两个有限的非负 token 价格（input_price、output_price）"),
         };
@@ -1011,7 +1042,10 @@ impl Settings {
             // The default cap, when the model's price is known.
             (None, None) if prices.is_some() => Some(10.0),
             // A configured budget without prices cannot be enforced.
-            (None, Some(budget)) if prices.is_none() => {
+            (None, Some(budget))
+                if prices.is_none()
+                    && !crate::model::provider::supports_reported_cost(&base_url) =>
+            {
                 warnings.push(format!(
                     "config：已忽略 max_budget_usd {budget}；需同时设置 input_price 和 output_price 才能生效"
                 ));
@@ -1021,9 +1055,15 @@ impl Settings {
         };
         if let Some(budget) = budget {
             anyhow::ensure!(
-                budget.is_finite() && budget > 0.0 && prices.is_some(),
+                budget.is_finite()
+                    && budget > 0.0
+                    && (prices.is_some()
+                        || crate::model::provider::supports_reported_cost(&base_url)),
                 "预算必须为正数，并且需要同时设置两个 token 价格（input_price、output_price）"
             );
+            if crate::model::provider::supports_reported_cost(&base_url) {
+                warnings.push("OpenRouter 预算仅计入其账户报告的费用；自带上游密钥时，上游另收费用可能不包含在内".into());
+            }
         }
         let permission = match (cli.permission, config.permission_mode) {
             (Some(mode), _) => mode,
@@ -1191,12 +1231,99 @@ mod tests {
     }
 
     #[test]
+    fn profile_can_hold_global_settings() {
+        let value = serde_json::json!({
+            "active_profile": "a",
+            "profiles": {"a": {
+                "model": "m",
+                "provider": {"name": "openai", "api_key": "test-key"},
+                "model_context_windows": {"m": 123456},
+                "done_verify_commands": ["cargo test"],
+                "web_search": {"provider": "tavily"},
+                "mcp_servers": {},
+                "extensions": {}
+            }}
+        });
+        assert!(unknown_keys(&value).is_empty());
+        let effective = effective_json(&value, Some("a"));
+        let file: FileConfig = serde_json::from_value(effective).unwrap();
+        assert_eq!(file.model_context_windows.get("m"), Some(&123456));
+        assert_eq!(file.done_verify_commands.unwrap(), ["cargo test"]);
+        assert_eq!(file.web_search.unwrap().provider.as_deref(), Some("tavily"));
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli = Cli::parse_from(["cove"]);
+        cli.cwd = directory.path().to_path_buf();
+        cli.data_dir = Some(directory.path().to_path_buf());
+        cli.config = None;
+        cli.profile = None;
+        cli.provider = None;
+        cli.model = None;
+        cli.base_url = None;
+        cli.context_window = None;
+        let settings = Settings::load_with(cli.clone(), Some(value.clone())).unwrap();
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+        assert_eq!(settings.context_window, 123456);
+        assert_eq!(settings.verify_commands, ["cargo test"]);
+        assert_eq!(settings.web_search.provider.as_deref(), Some("tavily"));
+        assert!(settings.file.get("mcp_servers").is_some());
+        write_json_file(
+            &directory.path().join(MODEL_CONTEXT_WINDOWS_CACHE),
+            &serde_json::json!({model_context_cache_key(&settings.provider, &settings.base_url, "m"): 234567}),
+        )
+        .unwrap();
+        let cached = Settings::load_with(cli.clone(), Some(value.clone())).unwrap();
+        assert_eq!(cached.context_window, 234567);
+        let mut other_endpoint = cli.clone();
+        other_endpoint.base_url = Some("https://other.example/v1".into());
+        let other = Settings::load_with(other_endpoint, Some(value.clone())).unwrap();
+        assert_eq!(other.context_window, 123456);
+        cli.context_window = Some(65432);
+        let pinned = Settings::load_with(cli, Some(value)).unwrap();
+        assert_eq!(pinned.context_window, 65432);
+    }
+
+    #[test]
+    fn reported_cost_provider_keeps_configured_budget_without_static_prices() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli = Cli::parse_from(["cove"]);
+        cli.cwd = directory.path().to_path_buf();
+        cli.data_dir = Some(directory.path().to_path_buf());
+        let config = serde_json::json!({
+            "model": "gpt-4o",
+            "provider": {"name": "openai", "base_url": "https://openrouter.ai/api/v1", "api_key": "test-key"},
+            "max_budget_usd": 2.0
+        });
+        let settings = Settings::load_with(cli, Some(config)).unwrap();
+        assert_eq!(settings.prices, None);
+        assert_eq!(settings.budget, Some(2.0));
+        assert!(
+            !settings
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("已忽略 max_budget_usd"))
+        );
+    }
+
+    #[test]
     fn documented_example_config_loads_without_warnings() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/config.example.json");
         let mut warnings = Vec::new();
-        let (mut file, _) = FileConfig::read(&path, &mut warnings).unwrap();
+        let (mut file, raw) = FileConfig::read(&path, &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(file.done_verify_commands.as_ref().map(Vec::len), Some(2));
+        let effective: FileConfig =
+            serde_json::from_value(effective_json(&raw, Some("deepseek"))).unwrap();
+        assert!(effective.done_verify_commands.is_none());
+        assert!(raw.get("system_prompt").is_none());
+        assert_eq!(raw["mcp_servers"], serde_json::json!({}));
+        assert!(raw["profiles"]["deepseek"].get("context_bytes").is_none());
+        assert!(raw["profiles"]["deepseek"].get("input_price").is_none());
+        assert!(raw["profiles"]["deepseek"].get("output_price").is_none());
+        assert!(raw["profiles"]["deepseek"].get("max_budget_usd").is_none());
+        assert!(raw["profiles"]["gemini"].get("max_budget_usd").is_none());
+        for profile in raw["profiles"].as_object().unwrap().values() {
+            assert!(profile.get("system_prompt").is_none());
+            assert!(profile.get("done_verify_commands").is_none());
+        }
         for name in ["deepseek", "claude", "bedrock", "local"] {
             let (_, profile) = FileConfig {
                 profiles: file.profiles.clone(),
@@ -1213,7 +1340,7 @@ mod tests {
         .resolve(Some("bedrock".into()))
         .unwrap();
         assert_eq!(bedrock.max_budget_usd, Some(500.0));
-        assert_eq!(bedrock.max_output_tokens, Some(16000));
+        assert!(bedrock.max_output_tokens.is_none());
         assert_eq!(bedrock.thinking.as_deref(), Some("adaptive"));
         assert_eq!(file.resolve(None).unwrap().0.as_deref(), Some("deepseek"));
     }

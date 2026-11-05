@@ -36,6 +36,7 @@ const CONCURRENT_TOOLS: usize = 8;
 
 /// Start of the compaction request's system prompt; the trace tells compactions apart by it.
 pub const COMPACT_SYSTEM_PREFIX: &str = "You summarize coding context.";
+const DEFAULT_SYSTEM_GUIDANCE: &str = "你是 Cove，一个高效的 AI 编程助手。先理解任务，再用工具完成它；需要时读取、搜索、修改、执行、验证并给出真实结果，遇到问题要诚实说明。";
 
 pub struct Limits {
     pub max_turns: u32,
@@ -206,11 +207,9 @@ impl Agent {
             return Err(Error::Limit("token 价格必须是有限的非负数".into()));
         }
         if let Some(budget) = limits.budget
-            && (!budget.is_finite() || budget <= 0.0 || limits.prices.is_none())
+            && (!budget.is_finite() || budget <= 0.0)
         {
-            return Err(Error::Limit(
-                "预算需要正数金额并明确设置价格（input_price、output_price）".into(),
-            ));
+            return Err(Error::Limit("预算需要正数金额".into()));
         }
         Ok(Self {
             hooks: None,
@@ -256,9 +255,9 @@ impl Agent {
     }
 
     pub fn set_context_tokens(&self, tokens: usize) -> Result<()> {
-        if !(4096..=2_000_000).contains(&tokens) {
+        if !(4096..=10_000_000).contains(&tokens) {
             return Err(Error::Limit(
-                "上下文预算必须在 4096..2000000 tokens 之间".into(),
+                "上下文预算必须在 4096..10000000 tokens 之间".into(),
             ));
         }
         self.context_limit.store(tokens, Ordering::Relaxed);
@@ -279,11 +278,11 @@ impl Agent {
         self.with_context_tokens(bytes / 3)
     }
 
-    /// Context budget in estimated tokens; compaction starts at three quarters of it.
+    /// Context budget in estimated tokens; compaction starts at 90% of it.
     pub fn with_context_tokens(mut self, tokens: usize) -> Result<Self> {
-        if !(4096..=2_000_000).contains(&tokens) {
+        if !(4096..=10_000_000).contains(&tokens) {
             return Err(Error::Limit(
-                "上下文预算必须在 4096..2000000 tokens 之间".into(),
+                "上下文预算必须在 4096..10000000 tokens 之间".into(),
             ));
         }
         *self.context_limit.get_mut() = tokens;
@@ -494,7 +493,7 @@ impl Agent {
             })?;
             if cost >= budget {
                 return Err(Error::Limit(
-                    "已达到本会话的预算（估算），没有再发出请求或运行工具；用 /config budget <美元> 提高预算后输入 /continue 继续"
+                    "已达到本会话的预算，没有再发出请求或运行工具；用 /config budget <美元> 提高预算后输入 /continue 继续"
                         .into(),
                 ));
             }
@@ -530,9 +529,11 @@ impl Agent {
                 .prices
                 .and_then(|pair| crate::model::models::prices_for(&model, Some(pair))),
         };
-        let cost = prices
-            .filter(|_| response.usage_reported)
-            .map(|prices| prices.cost(&response.usage));
+        let cost = response.reported_cost.or_else(|| {
+            prices
+                .filter(|_| response.usage_reported)
+                .map(|prices| prices.cost(&response.usage))
+        });
         session.accounting.cost = session.accounting.cost.zip(cost).map(|(a, b)| a + b);
         if let Some(budget) = &mut session.accounting.renewed_budget {
             budget.cost = budget.cost.zip(cost).map(|(a, b)| a + b);
@@ -1324,7 +1325,7 @@ impl Agent {
                 emit(&events, &cancel, Event::Notice(masked)).await?;
             }
             let mut estimated_tokens = context::tokens(&session.messages);
-            if estimated_tokens > self.context_limit() * 3 / 4 {
+            if estimated_tokens > self.context_limit() * 9 / 10 {
                 self.compact(session, persistence, events.clone(), cancel.clone())
                     .await?;
                 calls_used += 1;
@@ -1346,9 +1347,6 @@ impl Agent {
             };
             let (request, started, previous_cost, previous_budget) =
                 self.request_begin(session, persistence, request, Purpose::Task)?;
-            // The stream borrows only `&self`, so it can race steering text: when the
-            // user types mid-generation, the in-flight call is aborted and the text is
-            // answered at once, instead of waiting for the next call boundary.
             let stream = futures_util::FutureExt::boxed(self.provider.stream(
                 request,
                 events.clone(),
@@ -1362,27 +1360,70 @@ impl Agent {
                 match outcome {
                     futures_util::future::Either::Left((result, _wait)) => result,
                     futures_util::future::Either::Right(((), stream)) => {
-                        drop(stream);
                         let texts: Vec<String> = self
                             .steer
                             .iter()
                             .filter_map(|source| source.take())
                             .collect();
-                        calls_used += 1;
-                        report.model_calls += 1;
-                        if !texts.is_empty() {
-                            session.messages.push(Message::user(texts.join("\n")));
-                            persistence.save(session)?;
-                            emit(
+                        if texts.is_empty() && self.limits.budget.is_some() {
+                            stream.await
+                        } else {
+                            calls_used += 1;
+                            report.model_calls += 1;
+                            if !texts.is_empty() {
+                                session.messages.push(Message::user(texts.join("\n")));
+                                persistence.save(session)?;
+                                emit(
                                 &events,
                                 &cancel,
                                 Event::Notice(
-                                    "[steer] 已中断当前生成，带着你刚输入的内容重新回答".into(),
+                                    if self.limits.budget.is_some() {
+                                        "[steer] 已保存插话；为核算预算，等待当前请求返回用量，不会执行其工具调用"
+                                    } else {
+                                        "[steer] 已中断当前生成，带着你刚输入的内容重新回答"
+                                    }.into(),
                                 ),
                             )
                             .await?;
+                            }
+                            if self.limits.budget.is_some() {
+                                let response = self.request_end(
+                                    session,
+                                    persistence,
+                                    started,
+                                    previous_cost,
+                                    previous_budget,
+                                    stream.await,
+                                )?;
+                                let additional: Vec<String> = self
+                                    .steer
+                                    .iter()
+                                    .filter_map(|source| source.take())
+                                    .collect();
+                                if !additional.is_empty() {
+                                    session.messages.push(Message::user(additional.join("\n")));
+                                    persistence.save(session)?;
+                                }
+                                report.usage.input =
+                                    report.usage.input.saturating_add(response.usage.input);
+                                report.usage.output =
+                                    report.usage.output.saturating_add(response.usage.output);
+                                self.account(session, &response, persistence)?;
+                                report.estimated_cost = session.accounting.cost;
+                                emit(
+                                    &events,
+                                    &cancel,
+                                    Event::Usage {
+                                        tokens: response.usage,
+                                        cost: report.estimated_cost,
+                                    },
+                                )
+                                .await?;
+                            } else {
+                                drop(stream);
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             };
@@ -1564,7 +1605,7 @@ impl Agent {
         if let Some(window) = crate::model::provider::reported_window(err) {
             let budget =
                 crate::model::models::context_budget(window, self.limits.max_output_tokens)
-                    .min(2_000_000);
+                    .min(10_000_000);
             if budget < self.context_limit() {
                 self.context_limit.store(budget, Ordering::Relaxed);
             }
@@ -1609,7 +1650,11 @@ impl Agent {
         if let Some(context) = &self.project_context {
             system.push_str(context);
         }
-        if let Some(instructions) = &self.instructions {
+        system.push_str("\n\n");
+        system.push_str(DEFAULT_SYSTEM_GUIDANCE);
+        if let Some(instructions) = &self.instructions
+            && instructions.trim() != DEFAULT_SYSTEM_GUIDANCE
+        {
             system.push_str("\n\nUser-configured instructions:\n");
             system.push_str(instructions);
         }

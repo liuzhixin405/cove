@@ -881,6 +881,7 @@ mod tests {
                     usage: Usage::default(),
                     complete: true,
                     usage_reported: true,
+                    reported_cost: None,
                     model: None,
                 })
             })

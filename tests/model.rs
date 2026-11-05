@@ -450,6 +450,110 @@ async fn live_model_and_config_changes_apply_and_are_saved() {
 }
 
 #[tokio::test]
+async fn system_prompt_updates_its_existing_scope() {
+    for has_override in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut profile =
+            json!({"model":"mock-model", "provider":{"name":"openai", "api_key":"test-key"}});
+        if has_override {
+            profile["system_prompt"] = json!("profile instruction");
+        }
+        write_config(
+            data.path(),
+            json!({
+                "active_profile":"a",
+                "system_prompt":"shared instruction",
+                "profiles":{"a":profile}
+            }),
+        );
+        let output = run(
+            cove(root.path(), data.path()),
+            Some("/config system updated instruction\n/exit\n"),
+        )
+        .await;
+        assert_success(&output);
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap())
+                .unwrap();
+        if has_override {
+            assert_eq!(saved["system_prompt"], "shared instruction");
+            assert_eq!(
+                saved["profiles"]["a"]["system_prompt"],
+                "updated instruction"
+            );
+        } else {
+            assert_eq!(saved["system_prompt"], "updated instruction");
+            assert!(saved["profiles"]["a"].get("system_prompt").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn saved_profile_inherits_values_equal_to_root() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![text("inherited")]).await;
+    write_config(
+        data.path(),
+        json!({
+            "model": "original-model",
+            "provider": {"name": "openai", "api_key": "test-key", "base_url": url},
+            "system_prompt": "original instruction",
+            "show_reasoning": false
+        }),
+    );
+    let output = run(
+        cove(root.path(), data.path()),
+        Some("/model profile save copy\n/exit\n"),
+    )
+    .await;
+    assert_success(&output);
+    let mut saved: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
+    assert_eq!(saved["profiles"]["copy"], json!({}));
+    saved["model"] = json!("updated-model");
+    saved["system_prompt"] = json!("updated instruction");
+    write_config(data.path(), saved);
+    let output = run(
+        cove(root.path(), data.path()),
+        Some("/model profile switch copy\nhello\n/exit\n"),
+    )
+    .await;
+    assert_success(&output);
+    let seen = server.await.unwrap();
+    assert_eq!(seen[0].body["model"], "updated-model");
+    assert!(seen[0].body.to_string().contains("updated instruction"));
+    assert!(!seen[0].body.to_string().contains("original instruction"));
+}
+
+#[tokio::test]
+async fn saved_profile_keeps_profile_specific_global_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    write_config(
+        data.path(),
+        json!({"active_profile":"a", "profiles":{"a":{
+            "model":"mock-model",
+            "provider":{"name":"openai", "api_key":"test-key"},
+            "mcp_servers":{"remote":{"type":"http", "url":"https://example.com"}},
+            "model_context_windows":{"mock-model":123456},
+            "done_verify_commands":[]
+        }}}),
+    );
+    let output = run(
+        cove(root.path(), data.path()),
+        Some("/model profile save copy\n/exit\n"),
+    )
+    .await;
+    assert_success(&output);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
+    assert_eq!(saved["profiles"]["copy"], saved["profiles"]["a"]);
+    assert!(saved.get("mcp_servers").is_none());
+}
+
+#[tokio::test]
 async fn profiles_can_be_saved_switched_and_shown_redacted() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -464,13 +568,13 @@ async fn profiles_can_be_saved_switched_and_shown_redacted() {
     );
     let output = run(
         cove(root.path(), data.path()),
-        Some("/model profile save copy\n/model profile show copy\n/model profile switch work\n/model profile list\nhello\n/exit\n"),
+        Some("/model profile save copy\n/model profile show work\n/model profile switch work\n/model profile list\nhello\n/exit\n"),
     )
     .await;
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("secr****6789") && !stdout.contains("secret-key-0123456789"),
+        stdout.contains("work****6789") && !stdout.contains("work-key-0123456789"),
         "{stdout}"
     );
     assert!(stdout.contains("* work"), "{stdout}");
@@ -480,7 +584,7 @@ async fn profiles_can_be_saved_switched_and_shown_redacted() {
     let saved: Value =
         serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
     assert_eq!(saved["active_profile"], "work");
-    assert_eq!(saved["profiles"]["copy"]["model"], "home-model");
+    assert_eq!(saved["profiles"]["copy"], json!({}));
 }
 
 #[tokio::test]
@@ -649,9 +753,145 @@ async fn context_overflow_compacts_retries_and_learns_the_window() {
             .unwrap()
             .contains("Summarize")
     );
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(data.path().join("model-context-windows.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache[cove::config::model_context_cache_key("openai", &url, "mock-model")],
+        20000
+    );
+}
+
+#[tokio::test]
+async fn learned_window_is_saved_outside_user_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        text("first answer"),
+        status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 20000 tokens."}}"#,
+        ),
+        text("short summary"),
+        text("second answer"),
+    ])
+    .await;
+    let config = json!({
+        "active_profile":"a",
+        "profiles":{"a":{"model":"mock-model", "provider":{"name":"openai", "api_key":"k", "base_url":url}}}
+    });
+    write_config(data.path(), config.clone());
+    let input = format!("{}\nsecond task\n/exit\n", "describe this: ".repeat(300));
+    let output = run(cove(root.path(), data.path()), Some(&input)).await;
+    assert_success(&output);
+    assert_eq!(server.await.unwrap().len(), 4);
     let saved: Value =
         serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
-    assert_eq!(saved["model_context_windows"]["mock-model"], 20000);
+    assert_eq!(saved, config);
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(data.path().join("model-context-windows.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache[cove::config::model_context_cache_key("openai", &url, "mock-model")],
+        20000
+    );
+}
+
+#[tokio::test]
+async fn learned_window_preserves_shared_window_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        text("first answer"),
+        status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 20000 tokens."}}"#,
+        ),
+        text("short summary"),
+        text("second answer"),
+    ])
+    .await;
+    write_config(
+        data.path(),
+        json!({
+            "active_profile":"a",
+            "model_context_windows":{"other-model":100000},
+            "profiles":{"a":{"model":"mock-model", "provider":{"name":"openai", "api_key":"k", "base_url":url}}}
+        }),
+    );
+    let input = format!("{}\nsecond task\n/exit\n", "describe this: ".repeat(300));
+    let output = run(cove(root.path(), data.path()), Some(&input)).await;
+    assert_success(&output);
+    assert_eq!(server.await.unwrap().len(), 4);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
+    assert_eq!(saved["model_context_windows"]["other-model"], 100000);
+    assert!(saved["model_context_windows"].get("mock-model").is_none());
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(data.path().join("model-context-windows.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache[cove::config::model_context_cache_key("openai", &url, "mock-model")],
+        20000
+    );
+    assert!(
+        saved["profiles"]["a"]
+            .get("model_context_windows")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn learned_window_does_not_modify_the_selected_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        text("first answer"),
+        status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 20000 tokens."}}"#,
+        ),
+        text("short summary"),
+        text("second answer"),
+    ])
+    .await;
+    let profile =
+        json!({"model":"mock-model", "provider":{"name":"openai", "api_key":"k", "base_url":url}});
+    write_config(
+        data.path(),
+        json!({"active_profile":"a", "profiles":{"a":profile,"b":profile}}),
+    );
+    let input = format!(
+        "/model profile switch b\n{}\nsecond task\n/exit\n",
+        "describe this: ".repeat(300)
+    );
+    let output = run(cove(root.path(), data.path()), Some(&input)).await;
+    assert_success(&output);
+    assert_eq!(server.await.unwrap().len(), 4);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
+    assert!(
+        saved["profiles"]["b"]
+            .get("model_context_windows")
+            .is_none()
+    );
+    assert!(saved.get("model_context_windows").is_none());
+    assert!(
+        saved["profiles"]["a"]
+            .get("model_context_windows")
+            .is_none()
+    );
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(data.path().join("model-context-windows.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache[cove::config::model_context_cache_key("openai", &url, "mock-model")],
+        20000
+    );
 }
 
 #[tokio::test]

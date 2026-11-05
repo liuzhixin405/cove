@@ -161,12 +161,11 @@ pub fn max_output_tokens(model: &str, window: usize) -> u32 {
         .map_or(reserve, |(_, cap)| reserve.min(*cap))
 }
 
-/// Context budget the agent compacts at three quarters of: 85% of the window,
-/// but compaction must still leave room for the reply and a safety margin.
+/// Context budget: at most 85% of the window, leaving room for the reply and a safety margin.
 pub fn context_budget(window: usize, max_output: u32) -> usize {
     let margin = (window / 8).clamp(1024, 8000);
     let room = window.saturating_sub(max_output as usize + margin);
-    (window * 85 / 100).min(room * 4 / 3).max(4096)
+    (window * 85 / 100).min(room).max(4096)
 }
 
 /// List prices per million tokens; `None` for models the table does not know.
@@ -329,7 +328,8 @@ mod tests {
     #[test]
     fn budget_leaves_room_for_the_reply() {
         let budget = context_budget(32_000, 8000);
-        assert!(budget * 3 / 4 + 8000 + 4000 <= 32_000, "{budget}");
+        assert!(budget + 8000 + 4000 <= 32_000, "{budget}");
         assert_eq!(context_budget(1_000_000, 64_000), 850_000);
+        assert_eq!(context_budget(10_000_000, 64_000), 8_500_000);
     }
 }
