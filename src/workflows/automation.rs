@@ -459,10 +459,7 @@ pub async fn run_job(
     })?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(spec.timeout_seconds);
     let attempts = spec.retries + 1;
-    let share = spec
-        .budget_usd
-        .filter(|_| config.can_track_cost())
-        .map(|budget| budget / f64::from(attempts));
+    let share = spec.budget_usd.map(|budget| budget / f64::from(attempts));
     let scratch = store.dir.join("worktrees");
     std::fs::create_dir_all(&scratch)?;
     let mut patch = Vec::new();

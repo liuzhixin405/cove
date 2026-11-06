@@ -103,7 +103,16 @@ pub fn may_rewrite_sources(command: &str, dialect: Dialect) -> bool {
 /// `tag`), alone or with read-only commands: no approval in default or auto mode.
 /// Push and anything forced, deleting or rewriting still asks.
 pub fn local_git(command: &str, dialect: Dialect) -> bool {
-    const LOCAL: &[&str] = &["add", "commit", "tag"];
+    git_only(command, dialect, &["add", "commit", "tag"])
+}
+
+/// `git push`/`git fetch`, alone or with read-only commands: they never touch the
+/// working tree. Only for check evidence; approval rules are unchanged.
+pub fn remote_git(command: &str, dialect: Dialect) -> bool {
+    git_only(command, dialect, &["push", "fetch"])
+}
+
+fn git_only(command: &str, dialect: Dialect, subcommands: &[&str]) -> bool {
     let (category, line) = classify_parsed(command, dialect);
     if category > Category::Git || !line.opaque.is_empty() {
         return false;
@@ -118,7 +127,7 @@ pub fn local_git(command: &str, dialect: Dialect) -> bool {
         let local = words
             .first()
             .is_some_and(|program| shell::program_name(program) == "git")
-            && git_subcommand(&words[1..]).is_some_and(|(sub, _)| LOCAL.contains(&sub))
+            && git_subcommand(&words[1..]).is_some_and(|(sub, _)| subcommands.contains(&sub))
             && git.is_some_and(|group| group.covers(&words))
             && simple
                 .redirects
@@ -200,6 +209,17 @@ pub fn classify_words(words: &[&str]) -> Category {
     let Some(exe) = words.first() else {
         return Category::Unknown;
     };
+    // The project's own Maven/Gradle wrapper runs the build like the tool itself.
+    let wrapper = match exe.trim_start_matches("./").trim_start_matches(".\\") {
+        "gradlew" | "gradlew.bat" | "gradlew.cmd" => Some("gradle"),
+        "mvnw" | "mvnw.cmd" => Some("mvn"),
+        _ => None,
+    };
+    if let Some(name) = wrapper
+        && exe.starts_with('.')
+    {
+        return classify_build(name, &words[1..]);
+    }
     if exe.contains(['/', '\\', '$', '=', '*', '?', '[']) || exe.starts_with('-') {
         return Category::Unknown;
     }
@@ -318,14 +338,14 @@ pub fn classify_words(words: &[&str]) -> Category {
         "python" | "python3" | "py" => match args {
             [
                 "-m",
-                "pytest" | "unittest" | "compileall" | "mypy" | "ruff",
+                "pytest" | "unittest" | "compileall" | "py_compile" | "mypy" | "ruff",
                 ..,
             ] => Category::Build,
             ["--version" | "-V"] => Category::Safe,
             _ => Category::Unknown,
         },
         "node" | "rustup" | "npx" if matches!(args, ["--version" | "-v"]) => Category::Safe,
-        "npm" | "yarn" | "pnpm" | "pip" | "pip3" | "gem" | "composer" | "nuget" | "apt"
+        "npm" | "yarn" | "pnpm" | "bun" | "pip" | "pip3" | "gem" | "composer" | "nuget" | "apt"
         | "apt-get" | "yum" | "dnf" | "brew" | "choco" | "winget" | "pacman" | "zypper"
         | "snap" | "flatpak" => classify_package(&name, args),
         "docker" | "podman" | "nerdctl" => classify_docker(args),
@@ -592,6 +612,21 @@ fn classify_build(name: &str, args: &[&str]) -> Category {
     if matches!(name, "cargo" | "rustc") && matches!(*sub, "--version" | "-V") {
         return Category::Safe;
     }
+    // Gradle takes several tasks, each maybe module-qualified (`:app:test`).
+    if name == "gradle" {
+        let tasks = args.iter().filter(|a| !a.starts_with('-'));
+        let known = tasks.clone().all(|task| {
+            matches!(
+                task.rsplit(':').next().unwrap_or(task),
+                "build" | "test" | "check" | "assemble" | "compileJava" | "compileKotlin"
+            )
+        });
+        return if known && tasks.count() > 0 && !has(args, &["--init-script", "-I"]) {
+            Category::Build
+        } else {
+            Category::Unknown
+        };
+    }
     match *sub {
         "build" | "test" | "bench" | "compile" | "lint" | "vet" | "fmt" | "check" | "clippy"
         | "doc" | "metadata" | "tree" => Category::Build,
@@ -622,7 +657,7 @@ fn classify_package(name: &str, args: &[&str]) -> Category {
     let Some((sub, rest)) = args.split_first() else {
         return Category::Install;
     };
-    if matches!(name, "npm" | "pnpm" | "yarn") {
+    if matches!(name, "npm" | "pnpm" | "yarn" | "bun") {
         let script = match *sub {
             "run" | "run-script" => rest
                 .first()
@@ -1071,6 +1106,27 @@ mod tests {
         assert_eq!(ps("Set-Content x.txt hi"), Category::Unknown);
         assert_eq!(ps("dotnet test"), Category::Build);
         assert_eq!(ps("Get-Content a.txt > b.txt"), Category::Unknown);
+    }
+
+    #[test]
+    fn per_language_verification_commands_are_builds() {
+        let posix = |c| classify(c, Dialect::Posix);
+        for command in [
+            "./gradlew :app:test :libs:core:test",
+            "gradle test",
+            "./mvnw test -q -pl core -am",
+            "mvn test -q",
+            "python -m py_compile a.py",
+            "bun run test",
+            "pnpm test -- --findRelatedTests src/a.ts",
+            "dotnet test tests/App.Tests/App.Tests.csproj",
+        ] {
+            assert_eq!(posix(command), Category::Build, "{command}");
+        }
+        assert_eq!(classify(r".\gradlew.bat test", Dialect::PowerShell), Category::Build);
+        assert_eq!(posix("./gradlew publish"), Category::Unknown);
+        assert_eq!(posix("./gradlew test --init-script x.gradle"), Category::Unknown);
+        assert_eq!(posix("tools/gradlew test"), Category::Unknown);
     }
 
     #[test]

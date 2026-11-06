@@ -354,7 +354,10 @@ impl ModelPolicy for ModelRouter {
             reason = "简短的追问沿用上一个高级模型".into();
         }
         state.routed_fast = model == fast;
-        state.announce = Some(format!("[model] {model} ({reason})"));
+        // Only a switch away from the main model is worth a line.
+        state.announce = state
+            .routed_fast
+            .then(|| format!("[model] {model} ({reason})"));
         state.task = Some(model);
     }
 

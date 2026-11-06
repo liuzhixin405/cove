@@ -158,6 +158,11 @@ impl Evidence {
             .unwrap_or(false)
     }
 
+    /// A gate check passed; it stays valid until a later change, like a model-run check.
+    pub fn record_pass(&self, command: &str) {
+        self.with(|state| state.passed.insert(normalize_command(command)));
+    }
+
     pub fn did_work(&self) -> bool {
         self.with(|state| state.did_work).unwrap_or(false)
     }
@@ -206,7 +211,8 @@ impl Evidence {
                 // it must not invalidate passing checks — or every commit in a row
                 // re-runs the whole verification suite for nothing.
                 let may_change_files = !classify::auto_approvable(&command, Dialect::host())
-                    && !classify::local_git(&command, Dialect::host());
+                    && !classify::local_git(&command, Dialect::host())
+                    && !classify::remote_git(&command, Dialect::host());
                 if may_change_files || classify::may_rewrite_sources(&command, Dialect::host()) {
                     state.passed.clear();
                     state.outcome = None;
@@ -310,6 +316,25 @@ pub struct Parts {
     pub trust: std::sync::Arc<dyn crate::safety::verify::ProjectTrust>,
 }
 
+fn verification_preapproved(
+    mode: crate::safety::permission::Mode,
+    trusted: bool,
+    command: &str,
+) -> bool {
+    if trusted {
+        return true;
+    }
+    match mode {
+        crate::safety::permission::Mode::Auto | crate::safety::permission::Mode::Bypass => true,
+        crate::safety::permission::Mode::Default => {
+            let dialect = crate::safety::permission::shell::Dialect::host();
+            crate::safety::permission::classify::auto_approvable(command, dialect)
+                && !crate::safety::permission::classify::may_rewrite_sources(command, dialect)
+        }
+        crate::safety::permission::Mode::Plan => false,
+    }
+}
+
 impl Assembly {
     pub fn new(settings: &crate::config::Settings, parts: Parts) -> Self {
         use std::sync::Arc;
@@ -339,13 +364,12 @@ impl Assembly {
                     (parts.permissions.clone(), parts.trust.clone(), root.clone());
                 verifier = verifier.with_detection(
                     tests,
-                    Arc::new(move || {
-                        trust.trusted(&root)
-                            || matches!(
-                                permissions.mode(),
-                                crate::safety::permission::Mode::Auto
-                                    | crate::safety::permission::Mode::Bypass
-                            )
+                    Arc::new(move |command| {
+                        verification_preapproved(
+                            permissions.mode(),
+                            trust.trusted(&root),
+                            command,
+                        )
                     }),
                 );
             }
@@ -463,6 +487,17 @@ mod tests {
     }
 
     #[test]
+    fn default_verification_preapproval_matches_shell_build_policy() {
+        use crate::safety::permission::Mode;
+        assert!(verification_preapproved(Mode::Default, false, "cargo check"));
+        assert!(verification_preapproved(Mode::Default, false, "cargo test"));
+        assert!(!verification_preapproved(Mode::Default, false, "cargo fmt"));
+        assert!(!verification_preapproved(Mode::Default, false, "cargo install x"));
+        assert!(!verification_preapproved(Mode::Plan, false, "cargo check"));
+        assert!(verification_preapproved(Mode::Default, true, "cargo fmt"));
+    }
+
+    #[test]
     fn passed_commands_are_invalidated_by_later_changes() {
         let evidence = Evidence::default();
         let ok = "exit_code=Some(0) timed_out=false truncated=false";
@@ -516,6 +551,28 @@ mod tests {
             &out(ok, false),
         );
         assert!(evidence.passed("cargo test"));
+        for command in [
+            "git push -u origin main 2>&1 | tail -n 8",
+            "git fetch origin",
+        ] {
+            evidence.observe(
+                "shell",
+                &serde_json::json!({"command":command}),
+                &out(ok, false),
+            );
+            assert!(evidence.passed("cargo test"), "{command}");
+        }
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"git pull"}),
+            &out(ok, false),
+        );
+        assert!(!evidence.passed("cargo test"));
+        evidence.observe(
+            "shell",
+            &serde_json::json!({"command":"cargo test"}),
+            &out(ok, false),
+        );
         // A formatter rewrites sources: evidence must go.
         evidence.observe(
             "shell",

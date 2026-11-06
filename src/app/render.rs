@@ -3,6 +3,7 @@
 //! (`-p`, piped) output keeps the machine-readable lines in `ui`.
 
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -103,6 +104,134 @@ pub fn tool_title(name: &str, input: &Value) -> String {
 /// The `●` row that opens a tool call.
 pub fn tool_started(title: &str) -> String {
     format!("{CYAN}●{RESET} {BOLD}{title}{RESET}\n")
+}
+
+/// A helper script the model writes, reads or runs for itself (a one-off Python check,
+/// a file under `target/` or the temp directory) rather than project code.
+pub fn scratch_call(name: &str, input: &Value, root: &Path) -> bool {
+    match name {
+        "read" | "write" | "edit" => field(input, &["path", "file_path", "filePath"])
+            .is_some_and(|path| scratch_script(path, root)),
+        "shell" => field(input, &["command"]).is_some_and(|command| scratch_command(command, root)),
+        _ => false,
+    }
+}
+
+/// Interpreters whose one-off scripts are hidden, and the flags that pass code inline.
+const INTERPRETERS: &[(&str, &[&str])] = &[
+    ("python", &["-c"]),
+    ("py", &["-c"]),
+    ("node", &["-e", "-p", "--eval", "--print"]),
+    ("ruby", &["-e"]),
+    ("perl", &["-e", "-E"]),
+    ("php", &["-r"]),
+    ("deno", &["eval"]),
+    ("bun", &["-e", "--eval"]),
+];
+
+fn scratch_command(command: &str, root: &Path) -> bool {
+    // `@'...'@ | python -`, `cat x.py | python`: code piped into an interpreter.
+    let piped = command.split('|').skip(1).any(|part| {
+        let mut words = part.split_whitespace();
+        words.next().is_some_and(|word| interpreter(word).is_some())
+            && words.all(|word| word == "-" || word.starts_with('-'))
+    });
+    if piped {
+        return true;
+    }
+    // The first command after any `cd` decides: an interpreter on inline code or a scratch script.
+    let Some(words) = command
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split(['&', ';'])
+        .map(|part| part.split_whitespace().collect::<Vec<_>>())
+        .find(|words| {
+            !words.first().is_none_or(|word| {
+                matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "cd" | "pushd" | "set-location" | "sl"
+                )
+            })
+        })
+    else {
+        return false;
+    };
+    let Some(inline) = words.first().and_then(|word| interpreter(word)) else {
+        return false;
+    };
+    for word in words.iter().skip(1).map(|word| word.trim_matches(['"', '\''])) {
+        if word == "-" || word.starts_with("<<") || inline.contains(&word) {
+            return true;
+        }
+        if word == "-m" {
+            return false;
+        }
+        if word == "run" || word.starts_with('-') {
+            continue;
+        }
+        return scratch_script(word, root);
+    }
+    false
+}
+
+/// The interpreter a program word names (`python3.exe`, `/usr/bin/node`) with its inline flags.
+fn interpreter(word: &str) -> Option<&'static [&'static str]> {
+    let word = word.trim_matches(['"', '\'', '&', ' ']);
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS
+        .iter()
+        .find(|(interpreter, _)| *interpreter == base)
+        .map(|(_, inline)| *inline)
+}
+
+/// A script file that is not project code: in a scratch location, or in a language the
+/// project does not use (a `.py` file in a project without Python packaging).
+fn scratch_script(path: &str, root: &Path) -> bool {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let markers: &[&str] = match extension.as_str() {
+        "py" => &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"],
+        "js" | "mjs" | "cjs" => &["package.json"],
+        "rb" => &["Gemfile"],
+        "pl" => &["Makefile.PL", "cpanfile"],
+        "php" => &["composer.json"],
+        "ps1" | "sh" | "bash" | "bat" | "cmd" => &[],
+        _ => return false,
+    };
+    (!markers.is_empty() && !markers.iter().any(|marker| root.join(marker).exists()))
+        || scratch_location(path, root)
+}
+
+/// Outside the project, in the temp directory, or under a build/scratch directory.
+fn scratch_location(path: &str, root: &Path) -> bool {
+    let plain = |path: &Path| {
+        let text = path.to_string_lossy();
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+    };
+    let path = Path::new(path);
+    let full = if path.is_absolute() {
+        plain(path)
+    } else {
+        plain(root).join(path)
+    };
+    if full.starts_with(plain(&std::env::temp_dir())) {
+        return true;
+    }
+    let Ok(relative) = full.strip_prefix(plain(root)) else {
+        return true;
+    };
+    relative.components().any(|component| {
+        matches!(
+            component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
+            "target" | "tmp" | "temp" | ".tmp" | "scratch" | ".cove" | "node_modules" | "__pycache__"
+        )
+    })
 }
 
 /// One dim live-output row of a running command.
@@ -909,6 +1038,38 @@ mod tests {
         let input = serde_json::json!({"command": "cargo test\ncargo build"});
         assert_eq!(tool_title("shell", &input), "运行 cargo test…");
         assert_eq!(tool_title("todo", &serde_json::json!({})), "更新待办");
+    }
+
+    #[test]
+    fn helper_scripts_are_told_from_project_code() {
+        // Not under the temp directory, which itself counts as scratch.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let shell = |command: &str| {
+            scratch_call("shell", &serde_json::json!({"command": command}), &root)
+        };
+        let write = |path: &str| scratch_call("write", &serde_json::json!({"path": path}), &root);
+        assert!(shell("python -c \"import json; print(1)\""));
+        assert!(shell("python3 - <<'EOF'\nprint(1)\nEOF"));
+        assert!(shell("@'\nprint(1)\n'@ | python -"));
+        assert!(shell("cd sub && py -3 target/tmp/check.py"));
+        assert!(shell("node -e \"console.log(1)\""));
+        assert!(!shell("python -m pytest"));
+        assert!(shell("python repro.py"));
+        assert!(!shell("cargo test -- --nocapture"));
+        assert!(!shell("git log | head"));
+        // No Python packaging: a `.py` file is a helper; with it, project code.
+        assert!(write("repro.py"));
+        assert!(write("target/tmp/x.ps1"));
+        assert!(!write("build.bat"));
+        assert!(!write("src/main.rs"));
+        std::fs::write(root.join("pyproject.toml"), "").unwrap();
+        assert!(!write("repro.py"));
+        assert!(!shell("python tools/gen.py"));
+        assert!(write("tmp/repro.py"));
     }
 
     #[test]

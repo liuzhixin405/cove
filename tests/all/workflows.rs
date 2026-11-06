@@ -1,8 +1,7 @@
 //! CLI-level tests for draw_image, browser, /changes (race, apply, verify-browser),
 //! automations and remote supervision.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},

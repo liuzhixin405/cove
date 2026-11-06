@@ -149,7 +149,6 @@ struct Running {
     cancel: CancellationToken,
     park: Arc<AtomicBool>,
     done: watch::Receiver<bool>,
-    budget: Option<f64>,
 }
 
 struct Notice {
@@ -303,34 +302,13 @@ impl AgentHub {
             })
     }
 
-    fn reserved(&self) -> f64 {
-        self.background.running.lock().map_or(0.0, |running| {
-            running.values().filter_map(|run| run.budget).sum()
-        })
-    }
-
-    /// Budget for a new background run: what is left of the session, minus what running
-    /// background agents may still spend.
-    fn allot(&self, remaining: Option<f64>) -> Result<Option<f64>> {
-        let Some(remaining) = remaining else {
-            return Ok(None);
-        };
-        let left = remaining - self.reserved();
-        if left <= 0.0 {
-            return Err(Error::Limit(
-                "no session budget left for another background agent".into(),
-            ));
-        }
-        Ok(Some(left))
-    }
-
     pub async fn spawn_background(
         self: &Arc<Self>,
         kind: AgentType,
         description: String,
         prompt: String,
         isolated: bool,
-        remaining: Option<f64>,
+        _remaining: Option<f64>,
         cancel: &CancellationToken,
     ) -> Result<String> {
         if self.running_count() >= self.settings.max_background {
@@ -339,7 +317,7 @@ impl AgentHub {
                 self.settings.max_background
             )));
         }
-        let budget = self.allot(remaining)?;
+        let budget = None;
         let id = new_id();
         let short = id[..8].to_owned();
         let (worktree, branch, base) = if isolated {
@@ -443,7 +421,6 @@ impl AgentHub {
                     cancel: cancel.clone(),
                     park: park.clone(),
                     done,
-                    budget,
                 },
             );
         }
@@ -745,7 +722,7 @@ impl AgentHub {
         id: &str,
         message: Option<String>,
         confirm: bool,
-        remaining: Option<f64>,
+        _remaining: Option<f64>,
     ) -> Result<String> {
         let mut record = self.find_record(id)?;
         if record.kind == Kind::Main {
@@ -776,7 +753,7 @@ impl AgentHub {
                 "the agent's worktree no longer exists".into(),
             ));
         }
-        let budget = self.allot(remaining)?;
+        let budget = None;
         let mut session = self.store.load(&record.session_id)?;
         let uncertain: Vec<String> = session
             .pending

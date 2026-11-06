@@ -57,7 +57,7 @@ pub enum Input {
 static CONSOLE: OnceLock<Arc<Console>> = OnceLock::new();
 
 /// How full the context is and what the session has used, for the usage row.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Meter {
     /// Tokens of the conversation as the model sees it.
     pub context: u64,
@@ -67,6 +67,10 @@ pub struct Meter {
     /// Tokens the session has used, input and output.
     pub session: u64,
     pub cost: Option<f64>,
+    /// The thinking level requests use (`high`, `关闭`); empty leaves it out.
+    pub thinking: String,
+    /// Seconds the last finished turn took.
+    pub turn: Option<f64>,
 }
 
 impl Meter {
@@ -78,7 +82,8 @@ impl Meter {
     }
 
     /// The row and whether the context nears the compaction point (from 80% of it).
-    pub fn row(&self) -> Option<(String, bool)> {
+    /// `running`: seconds the turn in progress has taken so far.
+    pub fn row(&self, running: Option<f64>) -> Option<(String, bool)> {
         use crate::app::render::short_count;
         if self.window == 0 {
             return None;
@@ -92,6 +97,12 @@ impl Meter {
         );
         if let Some(cost) = self.cost {
             row.push_str(&format!(" · ${cost:.2}"));
+        }
+        if !self.thinking.is_empty() {
+            row.push_str(&format!(" · 思考 {}", self.thinking));
+        }
+        if let Some(seconds) = running.or(self.turn) {
+            row.push_str(&format!(" · 本轮 {}", crate::app::render::duration(seconds)));
         }
         let near = self.compact_at > 0 && self.context * 5 >= self.compact_at * 4;
         if near {
@@ -264,6 +275,10 @@ impl Console {
             state.started = Instant::now();
             state.tokens = (0, 0);
         } else {
+            // Only turns that called the model; a slash command keeps the last time.
+            if state.tokens != (0, 0) {
+                state.meter.turn = Some(state.started.elapsed().as_secs_f64());
+            }
             state.queued = 0;
             state.steered = 0;
             state.goal = None;
@@ -298,6 +313,7 @@ impl Console {
         compact_at: u64,
         session: u64,
         cost: Option<f64>,
+        thinking: String,
     ) {
         let mut state = self.lock();
         if let Some(context) = context {
@@ -307,7 +323,13 @@ impl Console {
         state.meter.compact_at = compact_at;
         state.meter.session = session;
         state.meter.cost = cost;
+        state.meter.thinking = thinking;
         state.redraw();
+    }
+
+    /// The project directory the console resolves paths against.
+    pub fn cwd(&self) -> PathBuf {
+        self.lock().cwd.clone()
     }
 
     /// Seconds since the running task started.
@@ -1326,7 +1348,7 @@ impl State {
                 }
                 let echo = self.user_echo(&line, "33", "");
                 let how = if immediate {
-                    "  ↳ 插话已提交；有预算时等待当前请求返回用量"
+                    "  ↳ 插话已提交"
                 } else {
                     "  ↳ 将在工具结束或本轮回复完成时自动送入（! 开头可优先插话）"
                 };
@@ -1631,7 +1653,8 @@ impl State {
             screen.text(&self.style("2", &clip(&status, columns - 1)));
             screen.newline();
         }
-        if let Some((meter, near)) = self.meter.row() {
+        let running = self.busy.then(|| self.started.elapsed().as_secs_f64());
+        if let Some((meter, near)) = self.meter.row(running) {
             screen.text(&self.style(if near { "33" } else { "2" }, &clip(&meter, columns - 1)));
             screen.newline();
         }
@@ -1686,7 +1709,7 @@ impl State {
             let placeholder = if self.ask.is_some() {
                 ""
             } else if self.busy {
-                "(! 插话；预算开启需等待用量；文字引导任务；/命令排队)"
+                "(! 插话；文字引导任务；/命令排队)"
             } else {
                 if cfg!(windows) {
                     "(/ 查看命令，@路径 或 Alt+V 添加附件，Ctrl+J 换行)"
@@ -2696,16 +2719,22 @@ mod tests {
             compact_at: 127_500,
             session: 1_250_000,
             cost: Some(3.2),
+            thinking: String::new(),
+            turn: None,
         };
         assert_eq!(
-            meter.row(),
+            meter.row(None),
             Some((
                 "  上下文 52.1k/200k（26%）· 本会话 1.2M tokens · $3.20".into(),
                 false
             ))
         );
+        meter.thinking = "high".into();
+        meter.turn = Some(65.0);
+        assert!(meter.row(None).unwrap().0.ends_with("· $3.20 · 思考 high · 本轮 1m05s"));
+        assert!(meter.row(Some(3.0)).unwrap().0.ends_with("· 本轮 3s"));
         meter.context = 110_000;
-        let (row, near) = meter.row().unwrap();
+        let (row, near) = meter.row(None).unwrap();
         assert!(
             near && row.ends_with("自动压缩阈值约 63.8%（按对话估算），可输入 /compact"),
             "{row}"
@@ -2713,8 +2742,8 @@ mod tests {
         meter.window = 1_000_000;
         meter.compact_at = 765_000;
         meter.context = 732_600;
-        assert!(meter.row().unwrap().0.contains("76.5%"));
-        assert_eq!(Meter::default().row(), None);
+        assert!(meter.row(None).unwrap().0.contains("76.5%"));
+        assert_eq!(Meter::default().row(None), None);
     }
 
     #[test]
@@ -2962,7 +2991,7 @@ mod tests {
             let (output, _) = screen.finish();
             assert!(output.contains("! 插话"), "{output}");
             if columns == 80 {
-                assert!(output.contains("预算开启需等待用量") && output.contains("/命令排队"));
+                assert!(output.contains("! 插话") && output.contains("/命令排队"));
             }
         }
     }

@@ -340,8 +340,8 @@ pub const CODES: &[Code] = &[
     code(
         "E5004",
         "engine",
-        "预算用尽",
-        "调高 --budget / max_budget_usd，或开新会话",
+        "旧版预算限制",
+        "新版预算仅作费用提醒，不会因超额停止；实际费用以供应商账单为准",
     ),
     code(
         "E5007",

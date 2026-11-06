@@ -1,7 +1,6 @@
 //! Area G1: project commands, diagnostics and CLI behavior, end to end.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{path::Path, process::Stdio, time::Duration};
 
 use serde_json::{Value, json};
@@ -540,6 +539,37 @@ async fn trace_and_error_logs_record_sizes_and_failures_but_no_text() {
 }
 
 #[tokio::test]
+async fn init_uses_model_after_budget_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        openai(json!({"content":"task complete"}), "stop"),
+        openai(
+            json!({"content":"# Project instructions\nUse the project test command."}),
+            "stop",
+        ),
+    ])
+    .await;
+    let mut command = cove(root.path(), data.path(), &url);
+    command.args([
+        "--budget",
+        "0.00001",
+        "--input-price",
+        "1",
+        "--output-price",
+        "1",
+        "--no-auto",
+    ]);
+    let (output, stdout, stderr) = repl(command, "task\n/init\n/exit\n").await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("Use the project test command."),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn init_drafts_with_the_model_and_applies_without_overwriting() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -550,9 +580,19 @@ async fn init_drafts_with_the_model_and_applies_without_overwriting() {
     )])
     .await;
     let mut command = cove(root.path(), data.path(), &url);
-    command.args(["-p", "/init"]);
+    command.args([
+        "--budget",
+        "0.00001",
+        "--input-price",
+        "1",
+        "--output-price",
+        "1",
+        "-p",
+        "/init",
+    ]);
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("[预算超限]"), "{stderr}");
     assert!(stdout.contains("+++ CLAUDE.md") && stdout.contains("+Run `make test`."));
     assert!(!root.path().join("CLAUDE.md").exists());
     let requests = server.await.unwrap();
@@ -682,15 +722,10 @@ async fn interactive_tool_failure_is_a_historical_warning_not_a_task_error() {
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("[failed] read"), "{stderr}");
     assert!(stderr.contains("[ok] read"), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("[提醒] 任务过程中有 1 个工具调用失败")
-            .count(),
-        1,
-        "{stderr}"
-    );
+    // The failure count is in the summary; no separate warning repeats it.
+    assert!(stderr.contains("（失败 1）"), "{stderr}");
+    assert!(!stderr.contains("[提醒]"), "{stderr}");
     assert!(!stderr.contains("错误：tool: 任务"), "{stderr}");
-    assert!(stderr.contains("/doctor trace") && stderr.contains("/expand <n>"));
     assert_eq!(server.await.unwrap().len(), 4);
 }
 

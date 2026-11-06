@@ -127,6 +127,13 @@ pub fn mode_default(
         (Mode::Auto, Effect::Shell(command)) if classify::auto_approvable(command, dialect) => {
             Decision::Allow
         }
+        // Builds and tests run without asking; formatters and autofixers still ask.
+        (Mode::Default, Effect::Shell(command))
+            if classify::auto_approvable(command, dialect)
+                && !classify::may_rewrite_sources(command, dialect) =>
+        {
+            Decision::Allow
+        }
         // Copilot-style default: editing inside the project needs no approval.
         (Mode::Default | Mode::Auto, Effect::Write(path))
             if roots.is_none_or(|roots| inside(roots, path)) =>
@@ -351,16 +358,30 @@ impl Permissions {
             options.len() + 1
         ));
         keys.push("N");
-        let answer = input
-            .answer(
-                format!(
-                    "{head}\n{description}{warnings}\n{}\n是否允许？[{}] ",
-                    options.join("\n"),
-                    keys.join("/")
-                ),
-                cancel,
-            )
-            .await?;
+        // A long inline script is folded; `v` shows it whole and asks again.
+        let folded = fold(&description);
+        let mut full = folded.is_none();
+        let answer = loop {
+            let shown = match (&folded, full) {
+                (Some(folded), false) => folded,
+                _ => &description,
+            };
+            let answer = input
+                .answer(
+                    format!(
+                        "{head}\n{shown}{warnings}\n{}\n是否允许？[{}] ",
+                        options.join("\n"),
+                        keys.join("/")
+                    ),
+                    cancel.clone(),
+                )
+                .await?;
+            if !full && answer.trim().eq_ignore_ascii_case("v") {
+                full = true;
+                continue;
+            }
+            break answer;
+        };
         let deny = options.len().to_string();
         let answer = match answer.trim() {
             "1" => "y",
@@ -393,6 +414,20 @@ impl Permissions {
             _ => Err(Error::Denied(description)),
         }
     }
+}
+
+/// The first lines of a description longer than `FOLD_AFTER` lines, else `None`.
+fn fold(description: &str) -> Option<String> {
+    const FOLD_AFTER: usize = 8;
+    const KEEP: usize = 4;
+    let total = description.lines().count();
+    if total <= FOLD_AFTER {
+        return None;
+    }
+    let mut out: Vec<&str> = description.lines().take(KEEP).collect();
+    let note = format!("…（共 {total} 行，已折叠；输入 v 查看完整内容）");
+    out.push(&note);
+    Some(out.join("\n"))
 }
 
 /// What "don't ask again" will let through, in the user's words.
@@ -591,6 +626,30 @@ mod tests {
             let answer = self.0.lock().unwrap().remove(0);
             Box::pin(async move { Ok(answer) })
         }
+    }
+
+    #[tokio::test]
+    async fn long_scripts_are_folded_until_asked_for() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["v".into(), "n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        let script: String = (1..=20).map(|n| format!("print({n})\n")).collect();
+        let command = format!("python - <<'EOF'\n{script}EOF");
+        let denied = permissions
+            .authorize(Effect::Shell(command), CancellationToken::new())
+            .await;
+        assert!(matches!(denied, Err(Error::Denied(_))));
+        let prompts = input.1.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("共 22 行，已折叠") && !prompts[0].contains("print(20)"));
+        assert!(prompts[1].contains("print(20)") && !prompts[1].contains("已折叠"));
     }
 
     #[tokio::test]
@@ -824,6 +883,18 @@ mod tests {
         );
         assert_eq!(
             decide_posix(Mode::Default, shell("cargo test")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_posix(Mode::Default, shell("cargo check")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_posix(Mode::Default, shell("cargo fmt")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide_posix(Mode::Default, shell("cargo install x")),
             Decision::Ask
         );
         assert_eq!(

@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 use cove::{
     domain::{Block, Event, Message, ModelRequest, ModelResponse, Provider, Result, Role, Usage},
     engine::agent::{Agent, Limits},

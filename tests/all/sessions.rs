@@ -1,8 +1,7 @@
 //! Area D: history, cost ledger, Git snapshots with /undo, memory commands and the
 //! bare `继续` shortcut, through the real binary against a mock SSE server.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::time::Duration;
 
 use serde_json::{Value, json};

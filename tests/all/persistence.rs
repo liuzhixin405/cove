@@ -151,7 +151,7 @@ fn workspace_has_a_single_cli_owner_per_data_directory() {
 }
 
 #[tokio::test]
-async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
+async fn model_dispatch_preserves_cost_before_contacting_provider() {
     struct ObservingProvider {
         store: Store,
         id: String,
@@ -166,10 +166,12 @@ async fn model_dispatch_persists_unknown_cost_before_contacting_provider() {
         ) -> BoxFuture<'_, Result<ModelResponse>> {
             Box::pin(async move {
                 let durable = self.store.load(&self.id)?;
-                assert!(durable.accounting.cost.is_none());
                 if self.renewed {
+                    assert_eq!(durable.accounting.cost, None);
                     assert!(durable.accounting.renewed_budget.is_some());
-                    assert_eq!(durable.accounting.budget_cost(), None);
+                    assert_eq!(durable.accounting.budget_cost(), Some(0.0));
+                } else {
+                    assert_eq!(durable.accounting.cost, Some(0.0));
                 }
                 assert_eq!(durable.accounting.model_calls, 1);
                 Ok(response(vec![Block::Text("done".into())]))
@@ -1080,7 +1082,7 @@ fn checkpoint_cannot_be_loaded_for_another_workspace() {
 }
 
 #[tokio::test]
-async fn provider_failure_makes_budget_unknown_and_blocks_further_dispatch() {
+async fn unknown_usage_counts_as_zero_and_preserves_known_spend() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
@@ -1091,6 +1093,70 @@ async fn provider_failure_makes_budget_unknown_and_blocks_further_dispatch() {
         "mock".into(),
         Some((1.0, 1.0)),
     );
+    session.accounting.cost = Some(0.25);
+    let mut missing_usage = response(vec![Block::Text("first".into())]);
+    missing_usage.usage_reported = false;
+    let provider = Fake::new(vec![
+        missing_usage,
+        response(vec![Block::Text("second".into())]),
+    ]);
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        Limits {
+            max_turns: 3,
+            max_output_tokens: 256,
+            budget: Some(1.0),
+            prices: Some((1.0, 1.0)),
+        },
+    )
+    .unwrap();
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .run_in(
+                &mut session,
+                Some("first".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            )
+            .await
+            .is_ok()
+    );
+    drain.await.unwrap();
+    assert_eq!(session.accounting.cost, Some(0.25));
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .run_in(
+                &mut session,
+                Some("second".into()),
+                &store,
+                tx,
+                CancellationToken::new()
+            )
+            .await
+            .is_ok()
+    );
+    drain.await.unwrap();
+    assert_eq!(session.accounting.cost, Some(0.250015));
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn provider_failure_counts_as_zero_and_allows_continuation() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "Openai".into(),
+        "mock".into(),
+        Some((1.0, 1.0)),
+    );
+    session.accounting.cost = Some(0.25);
     let provider = Fake::new(Vec::new());
     let agent = Agent::new(
         provider.clone(),
@@ -1118,17 +1184,62 @@ async fn provider_failure_makes_budget_unknown_and_blocks_further_dispatch() {
     );
     drain.await.unwrap();
     let mut loaded = store.load(&session.id).unwrap();
-    assert!(loaded.accounting.cost.is_none());
+    assert_eq!(loaded.accounting.cost, Some(0.25));
     assert_eq!(loaded.accounting.model_calls, 1);
+    provider
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(response(vec![Block::Text("done".into())]));
     let (tx, drain) = events();
-    assert!(matches!(
+    assert!(
         agent
             .run_in(&mut loaded, None, &store, tx, CancellationToken::new())
-            .await,
-        Err(Error::Limit(_))
-    ));
+            .await
+            .is_ok()
+    );
     drain.await.unwrap();
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(loaded.accounting.cost, Some(0.250015));
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn legacy_unknown_cost_resumes_with_a_new_budget_counter() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = Session::new(
+        root.path().canonicalize().unwrap(),
+        "Openai".into(),
+        "mock".into(),
+        Some((1.0, 1.0)),
+    );
+    session.accounting.cost = None;
+    session.state = cove::session::State::Interrupted("old unknown cost".into());
+    let provider = Fake::new(vec![response(vec![Block::Text("done".into())])]);
+    let agent = Agent::new(
+        provider,
+        tools,
+        Limits {
+            max_turns: 3,
+            max_output_tokens: 256,
+            budget: Some(1.0),
+            prices: Some((1.0, 1.0)),
+        },
+    )
+    .unwrap();
+    let (tx, drain) = events();
+    assert!(
+        agent
+            .run_in(&mut session, None, &store, tx, CancellationToken::new())
+            .await
+            .is_ok()
+    );
+    drain.await.unwrap();
+    let loaded = store.load(&session.id).unwrap();
+    assert_eq!(loaded.accounting.cost, None);
+    assert_eq!(loaded.accounting.budget_cost(), Some(0.000015));
 }
 
 #[tokio::test]
@@ -1170,6 +1281,7 @@ async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
     );
     drain.await.unwrap();
     let mut loaded = store.load(&session.id).unwrap();
+    loaded.accounting.cost = None;
     loaded.accounting.reset_budget_spend();
     store.save(&loaded).unwrap();
     let mut loaded = store.load(&session.id).unwrap();
@@ -1188,7 +1300,7 @@ async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
     assert_eq!(loaded.accounting.cost, None);
     assert_eq!(loaded.accounting.budget_cost(), Some(0.000015));
     let (tx, drain) = events();
-    assert!(matches!(
+    assert!(
         agent
             .run_in(
                 &mut loaded,
@@ -1197,9 +1309,9 @@ async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
                 tx,
                 CancellationToken::new()
             )
-            .await,
-        Err(Error::Limit(_))
-    ));
+            .await
+            .is_ok()
+    );
     drain.await.unwrap();
     assert_eq!(loaded.accounting.cost, None);
     assert_eq!(loaded.accounting.budget_cost(), Some(0.00003));
@@ -1207,7 +1319,7 @@ async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
 }
 
 #[tokio::test]
-async fn renewed_budget_blocks_again_when_a_response_has_no_usage() {
+async fn renewed_budget_counts_missing_usage_as_zero() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
@@ -1235,7 +1347,7 @@ async fn renewed_budget_blocks_again_when_a_response_has_no_usage() {
     )
     .unwrap();
     let (tx, drain) = events();
-    assert!(matches!(
+    assert!(
         agent
             .run_in(
                 &mut session,
@@ -1244,26 +1356,18 @@ async fn renewed_budget_blocks_again_when_a_response_has_no_usage() {
                 tx,
                 CancellationToken::new()
             )
-            .await,
-        Err(Error::Limit(_))
-    ));
+            .await
+            .is_ok()
+    );
     drain.await.unwrap();
-    let mut loaded = store.load(&session.id).unwrap();
+    let loaded = store.load(&session.id).unwrap();
     assert_eq!(loaded.accounting.cost, None);
-    assert_eq!(loaded.accounting.budget_cost(), None);
-    let (tx, drain) = events();
-    assert!(matches!(
-        agent
-            .run_in(&mut loaded, None, &store, tx, CancellationToken::new())
-            .await,
-        Err(Error::Limit(_))
-    ));
-    drain.await.unwrap();
+    assert_eq!(loaded.accounting.budget_cost(), Some(0.0));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
 
 #[test]
-fn renewed_budget_includes_subagent_spend_and_preserves_unknowns() {
+fn renewed_budget_counts_unknown_subagent_spend_as_zero() {
     let mut accounting = cove::session::Accounting::default();
     accounting.reset_budget_spend();
     cove::engine::agent::add_spend(
@@ -1276,7 +1380,7 @@ fn renewed_budget_includes_subagent_spend_and_preserves_unknowns() {
     assert_eq!(accounting.cost, None);
     assert_eq!(accounting.budget_cost(), Some(0.25));
     cove::engine::agent::add_spend(&mut accounting, &cove::session::Accounting::default());
-    assert_eq!(accounting.budget_cost(), None);
+    assert_eq!(accounting.budget_cost(), Some(0.25));
 }
 
 #[tokio::test]

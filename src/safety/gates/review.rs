@@ -133,10 +133,6 @@ impl TurnHook for SelfReview {
             if let Ok(mut reviewed) = self.reviewed.lock() {
                 *reviewed = true;
             }
-            let budget = self.ledger.remaining_budget();
-            if budget.is_some_and(|budget| budget <= 0.0) {
-                return None;
-            }
             self.say(&format!(
                 "[self-review] reviewing this task's changes ({} files, {lines} lines)…",
                 files.len()
@@ -148,7 +144,7 @@ impl TurnHook for SelfReview {
                 Limits {
                     max_turns: self.settings.max_turns,
                     max_output_tokens: self.settings.max_output_tokens,
-                    budget,
+                    budget: None,
                     prices: self.settings.prices,
                 },
             )

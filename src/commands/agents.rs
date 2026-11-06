@@ -131,8 +131,16 @@ pub(crate) fn hub(
 /// Background spend recorded since the last tool round goes into the session.
 fn absorb(app: &mut Application) -> Result<()> {
     if let Some(spent) = app.agents.ledger.take_background() {
+        let previous = app.session.accounting.budget_cost();
         add_spend(&mut app.session.accounting, &spent);
         app.store.save(&app.session)?;
+        if let Some(text) = crate::engine::agent::budget_message(
+            app.settings.budget,
+            previous,
+            app.session.accounting.budget_cost(),
+        ) {
+            let _ = crate::app::ui::print_budget_notice(&text);
+        }
     }
     Ok(())
 }
@@ -238,10 +246,8 @@ fn main_line(app: &Application) -> String {
     )
 }
 
-fn remaining(app: &Application) -> Option<f64> {
-    app.settings
-        .budget
-        .map(|budget| budget - app.session.accounting.budget_cost().unwrap_or(budget))
+fn remaining(_app: &Application) -> Option<f64> {
+    None
 }
 
 fn is_main(app: &Application, id: &str) -> bool {

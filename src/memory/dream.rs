@@ -271,7 +271,6 @@ pub struct Dreamer {
     prices: Option<(f64, f64)>,
     /// `Some(reason)` when automatic runs are off (`--no-auto`, local provider).
     auto_off: Option<String>,
-    budget: Option<f64>,
     running: Arc<AtomicBool>,
     dreamed: Mutex<Vec<String>>,
     cancel: CancellationToken,
@@ -296,7 +295,7 @@ impl Dreamer {
         cwd: PathBuf,
         prices: Option<(f64, f64)>,
         auto_off: Option<String>,
-        budget: Option<f64>,
+        _budget: Option<f64>,
     ) -> Self {
         let directories = vec![
             memory
@@ -311,7 +310,6 @@ impl Dreamer {
             cwd,
             prices,
             auto_off,
-            budget,
             running: Arc::new(AtomicBool::new(false)),
             dreamed: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
@@ -767,14 +765,6 @@ Finish with a brief summary of what you merged, updated or pruned (or that nothi
     fn due(&self, session: &Session) -> bool {
         let (config, _) = DreamConfig::load(&self.data_dir);
         if !config.enabled || self.auto_off.is_some() || self.running.load(Ordering::Relaxed) {
-            return false;
-        }
-        if let Some(budget) = self.budget
-            && session
-                .accounting
-                .cost
-                .is_none_or(|cost| cost >= budget * 0.9)
-        {
             return false;
         }
         let last = self.last().map_or(0, |last| last.at);

@@ -361,15 +361,6 @@ pub async fn run_tasks(
                     })
             });
             let Some(position) = ready else { break };
-            let budget = hub
-                .ledger
-                .remaining_budget()
-                .map(|budget| budget / (running.len() as f64 + 1.0));
-            if budget.is_some_and(|budget| budget <= 0.0) {
-                nodes[position].state = NodeState::Failed;
-                nodes[position].error = "session budget exhausted; not started".into();
-                continue;
-            }
             nodes[position].state = NodeState::Running;
             let task = nodes[position].task.clone();
             let mut prompt = format!(
@@ -401,7 +392,7 @@ pub async fn run_tasks(
                 agent_type: node.task.agent_type.clone(),
                 description: node.task.title.clone(),
                 prompt,
-                budget,
+                budget: None,
                 worktree: None,
                 claims: claims
                     .as_ref()

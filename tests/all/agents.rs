@@ -1,8 +1,7 @@
 //! Area F: sub-agent types, plans, regression verification, background agents and the
 //! agent lifecycle (interrupt, park, wake, merge) through the real CLI and a mock provider.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
@@ -248,6 +247,73 @@ fn repo() -> tempfile::TempDir {
 
 fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
+}
+
+#[tokio::test]
+async fn plan_runs_after_parent_exceeds_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool(
+                    "plan",
+                    "todo",
+                    json!({"todos":[{"content":"investigate","status":"pending"}]}),
+                )),
+                Some(tool("run", "execute_plan", json!({"parallel":true}))),
+                Some(text("finished")),
+            ],
+        ),
+        ("todo-1", vec![Some(text("investigation complete"))]),
+    ])
+    .await;
+    let (ok, _, stderr) = run(cli(root.path(), data.path(), &server.url).args([
+        "--budget",
+        "0.00001",
+        "--input-price",
+        "1",
+        "--output-price",
+        "1",
+        "-p",
+        "investigate",
+    ]))
+    .await;
+    assert!(ok, "{stderr}");
+    assert_eq!(server.requests("todo-1").len(), 1);
+    assert!(
+        server.requests("parent")[2]
+            .to_string()
+            .contains("investigation complete")
+    );
+}
+
+#[tokio::test]
+async fn background_spend_warns_without_blocking() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let server = mock(vec![
+        ("parent", vec![
+            Some(tool("spawn", "agent", json!({"description":"inspect","prompt":"inspect","type":"explore","background":true}))),
+            Some(text("Started.")),
+        ]),
+        ("bg", vec![Some(text("Inspected."))]),
+    ]).await;
+    let (ok, _, stderr) = run(cli(root.path(), data.path(), &server.url).args([
+        "--budget",
+        "0.00007",
+        "--input-price",
+        "1",
+        "--output-price",
+        "1",
+        "-p",
+        "inspect",
+    ]))
+    .await;
+    assert!(ok, "{stderr}");
+    assert_eq!(server.requests("bg").len(), 1);
+    assert!(stderr.contains("[预算超限]"), "{stderr}");
 }
 
 #[tokio::test]

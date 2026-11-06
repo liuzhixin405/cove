@@ -178,7 +178,6 @@ pub struct Extractor {
     provider: Arc<dyn Provider>,
     /// `Some(reason)` when automatic extraction is off (`--no-auto`, local provider).
     disabled: Option<String>,
-    budget: Option<f64>,
     max_output_tokens: u32,
     state: Arc<Mutex<State>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -189,13 +188,12 @@ impl Extractor {
         memory: Arc<Memory>,
         provider: Arc<dyn Provider>,
         disabled: Option<String>,
-        budget: Option<f64>,
+        _budget: Option<f64>,
     ) -> Self {
         Self {
             memory,
             provider,
             disabled,
-            budget,
             max_output_tokens: 2000,
             state: Arc::new(Mutex::new(State::default())),
             tasks: Mutex::new(Vec::new()),
@@ -224,14 +222,6 @@ impl Extractor {
     fn skip(&self, session: &Session) -> Option<&'static str> {
         if self.disabled.is_some() {
             return Some("disabled");
-        }
-        if let Some(budget) = self.budget
-            && session
-                .accounting
-                .cost
-                .is_none_or(|cost| cost >= budget * 0.95)
-        {
-            return Some("over budget");
         }
         (session.messages.len() < 4).then_some("too short")
     }

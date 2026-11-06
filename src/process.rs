@@ -2,10 +2,11 @@ use std::{
     collections::VecDeque,
     path::Path,
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
+use futures_util::future::BoxFuture;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -40,6 +41,23 @@ pub struct CommandOutput {
 const LIVE_LIMIT: usize = 256 * 1024;
 const LIVE_LINE: usize = 4096;
 const LIVE_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Told when a command blocks on a lock another process holds; `child` is the
+/// command's own process, so its descendants are not the holder.
+pub trait LockWait: Send + Sync {
+    /// Output fragments that mean "waiting on another process's lock".
+    fn patterns(&self) -> &'static [&'static str];
+    /// `line` is the output line that matched.
+    fn waiting(&self, child: u32, line: String, cancel: CancellationToken)
+    -> BoxFuture<'static, ()>;
+}
+
+static LOCK_HANDLER: OnceLock<Arc<dyn LockWait>> = OnceLock::new();
+
+/// Installs the lock-wait handler (once per process; later calls are ignored).
+pub fn set_lock_wait(handler: Arc<dyn LockWait>) {
+    let _ = LOCK_HANDLER.set(handler);
+}
 
 /// Splits a stream into display lines for `Progress`.
 struct Live {
@@ -198,10 +216,49 @@ impl HeadTail {
     }
 }
 
+/// Watches a stream's lines for a lock-wait message; reports the first match only.
+struct LockWatch {
+    patterns: &'static [&'static str],
+    found: tokio::sync::mpsc::UnboundedSender<String>,
+    line: Vec<u8>,
+}
+
+impl LockWatch {
+    /// Feeds raw bytes; returns false once a match was reported (stop watching).
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &byte in bytes {
+            if byte != b'\n' && byte != b'\r' {
+                if self.line.len() < LIVE_LINE {
+                    self.line.push(byte);
+                }
+                continue;
+            }
+            let (text, _) = crate::tools::text_encoding::decode_output_line(&self.line);
+            let lower = text.to_lowercase();
+            if self.patterns.iter().any(|pattern| lower.contains(pattern)) {
+                let _ = self.found.send(text.trim().to_owned());
+                return false;
+            }
+            self.line.clear();
+        }
+        true
+    }
+}
+
 async fn capture(
+    pipe: impl AsyncRead + Unpin,
+    live: Option<Live>,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    capture_watched(pipe, live, limit, None).await
+}
+
+/// `capture` that also reports the first line saying the command waits on a lock.
+async fn capture_watched(
     mut pipe: impl AsyncRead + Unpin,
     mut live: Option<Live>,
     limit: usize,
+    mut lock: Option<LockWatch>,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = HeadTail::new(limit);
     let mut buffer = [0_u8; 4096];
@@ -210,6 +267,9 @@ async fn capture(
         let count = pipe.read(&mut buffer).await?;
         if count == 0 {
             break;
+        }
+        if lock.as_mut().is_some_and(|watch| !watch.feed(&buffer[..count])) {
+            lock = None;
         }
         if let Some(live) = &mut live {
             live.feed(&buffer[..count]).await;
@@ -406,16 +466,50 @@ async fn run(
         })
     };
     let (out_live, err_live) = (live(false), live(true));
-    readers.spawn(async move { (true, capture(stdout, out_live, STDOUT_LIMIT).await) });
-    readers.spawn(async move { (false, capture(stderr, err_live, STDERR_LIMIT).await) });
+    let (found, mut lock) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let watch = || {
+        LOCK_HANDLER.get().map(|handler| LockWatch {
+            patterns: handler.patterns(),
+            found: found.clone(),
+            line: Vec::new(),
+        })
+    };
+    let (out_watch, err_watch) = (watch(), watch());
+    drop(found);
+    readers.spawn(async move {
+        (
+            true,
+            capture_watched(stdout, out_live, STDOUT_LIMIT, out_watch).await,
+        )
+    });
+    readers.spawn(async move {
+        (
+            false,
+            capture_watched(stderr, err_live, STDERR_LIMIT, err_watch).await,
+        )
+    });
     let mut cancelled = false;
     let mut timed_out = false;
-    let status = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => { cancelled = true; None },
-        _ = tokio::time::sleep(timeout) => { timed_out = true; None },
-        status = child.wait() => Some(status?),
+    let deadline = tokio::time::Instant::now() + timeout;
+    let child_pid = child.id();
+    // Ends the lock question once the command is over, answered or not.
+    let ask = cancel.child_token();
+    let mut asked = false;
+    let status = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => { cancelled = true; break None },
+            _ = tokio::time::sleep_until(deadline) => { timed_out = true; break None },
+            status = child.wait() => break Some(status?),
+            Some(line) = lock.recv(), if !asked => {
+                asked = true;
+                if let (Some(handler), Some(pid)) = (LOCK_HANDLER.get(), child_pid) {
+                    tokio::spawn(handler.waiting(pid, line, ask.clone()));
+                }
+            }
+        }
     };
+    ask.cancel();
     drop(tree);
     if status.is_none() {
         child.kill().await?;
@@ -569,5 +663,28 @@ mod tests {
         let mut small = HeadTail::new(100);
         small.push(b"short\n");
         assert_eq!(small.finish(), (b"short\n".to_vec(), false));
+    }
+
+    #[tokio::test]
+    async fn a_lock_wait_line_is_reported_even_when_split_across_reads() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (found, mut lock) = tokio::sync::mpsc::unbounded_channel();
+        let watch = LockWatch {
+            patterns: &["blocking waiting for file lock"],
+            found,
+            line: Vec::new(),
+        };
+        let capture = tokio::spawn(capture_watched(reader, None, 1024, Some(watch)));
+        use tokio::io::AsyncWriteExt;
+        writer.write_all(b"   Compiling a\n   Blocking waiting fo").await.unwrap();
+        writer.flush().await.unwrap();
+        tokio::task::yield_now().await;
+        writer.write_all(b"r file lock on build directory\n").await.unwrap();
+        drop(writer);
+        let line = tokio::time::timeout(Duration::from_secs(5), lock.recv())
+            .await
+            .expect("lock wait not detected");
+        assert_eq!(line.as_deref(), Some("Blocking waiting for file lock on build directory"));
+        capture.await.unwrap().unwrap();
     }
 }

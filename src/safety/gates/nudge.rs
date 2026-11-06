@@ -1,6 +1,6 @@
 //! Nudges when the model ends a turn: an empty reply, a step announced but not done,
 //! a too-short ending after real work, an open todo list, and one "is the request fully
-//! met?" check after file changes. Skipped near the call or budget limit.
+//! met?" check after file changes. Skipped near the call limit.
 
 use std::sync::{Arc, Mutex};
 
@@ -76,10 +76,7 @@ impl Nudges {
             .accounting
             .model_calls
             .saturating_sub(state.start_calls);
-        if used + 1 >= u64::from(self.limits.max_turns) {
-            return true;
-        }
-        matches!((self.limits.budget, session.accounting.budget_cost()), (Some(budget), Some(cost)) if cost >= budget * 0.9)
+        used + 1 >= u64::from(self.limits.max_turns)
     }
 
     fn files_changed(&self) -> bool {

@@ -1,7 +1,6 @@
 //! Area A: file tools, shell, search, question/todo, concurrent dispatch and output caps.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{
     collections::VecDeque,
     sync::{

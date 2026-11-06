@@ -372,15 +372,7 @@ pub async fn run(
     let started = std::time::Instant::now();
     let timeout = Duration::from_secs(spec.timeout.unwrap_or(900));
     let deadline = tokio::time::Instant::now() + timeout;
-    let share = match spec.budget {
-        Some(budget) if config.can_track_cost() => Some(budget / 2.0),
-        Some(_) => {
-            return Err(Error::Tool(
-                "race 的预算需要已知的 token 价格（input_price/output_price）".into(),
-            ));
-        }
-        None => None,
-    };
+    let share = spec.budget.map(|budget| budget / 2.0);
     let mut report = Report {
         version: 1,
         id: new_id(),

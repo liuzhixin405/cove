@@ -47,6 +47,7 @@ const READ_LINE_CHARS: usize = 2000;
 const READ_OUTPUT: usize = 256 * 1024;
 const DIRECTORY_LIMIT: usize = 1000;
 const SHELL_TIMEOUT: u64 = 120;
+const SHELL_SLOW_TIMEOUT: u64 = 300;
 const SHELL_MAX_TIMEOUT: u64 = 600;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
@@ -804,6 +805,9 @@ impl LocalTools {
         let seconds = match (args.timeout_seconds, args.timeout) {
             (Some(seconds), _) => seconds,
             (None, Some(millis)) => millis.div_ceil(1000),
+            (None, None) if crate::safety::verify::slow_command(&args.command) => {
+                SHELL_SLOW_TIMEOUT
+            }
             (None, None) => SHELL_TIMEOUT,
         };
         if args.command.trim().is_empty()
@@ -939,7 +943,7 @@ impl ToolExecutor for LocalTools {
                 "shell",
                 &format!(
                     "Run a command in {} in the workspace directory; write that shell's syntax. Non-interactive: no pager, editor or credential prompt, colours off. \
-                     Default timeout 120 s, at most 600 (timeout_seconds). Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). No background jobs. Host access is NOT sandboxed. \
+                     Default timeout 120 s (300 s for builds and test suites), at most 600 (timeout_seconds). Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). No background jobs. Host access is NOT sandboxed. \
                      Not for reading or searching files: read, grep and glob are faster, need no approval and skip ignored directories.",
                     self.shell.describe()
                 ),

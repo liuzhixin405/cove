@@ -28,6 +28,51 @@ fn tools(root: &std::path::Path, mode: Mode) -> LocalTools {
 }
 
 #[tokio::test]
+async fn large_context_warns_once_with_compact_and_new_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            response(vec![Block::Text("one".into())]),
+            response(vec![Block::Text("two".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits())
+        .unwrap()
+        .with_context_tokens(850_000)
+        .unwrap();
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), None);
+    session.messages.push(Message::user("x".repeat(1_300_000)));
+    session.messages.push(Message {
+        role: Role::Assistant,
+        blocks: vec![Block::Text("ok".into())],
+    });
+    let mut notices = Vec::new();
+    for prompt in ["first", "second"] {
+        let (tx, mut rx) = mpsc::channel(256);
+        agent
+            .run_in(
+                &mut session,
+                Some(prompt.into()),
+                &Ephemeral,
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Notice(text) = event
+                && text.starts_with("[上下文]")
+            {
+                notices.push(text);
+            }
+        }
+    }
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("/compact") && notices[0].contains("/new"));
+}
+
+#[tokio::test]
 async fn editing_preserves_crlf_and_rejects_ambiguous_changes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("中文.txt");
@@ -538,7 +583,7 @@ async fn steering_text_aborts_the_in_flight_model_call() {
 }
 
 #[tokio::test]
-async fn steering_keeps_interrupted_request_cost_unknown() {
+async fn steering_counts_interrupted_request_as_zero() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(HangOnce {
         first: true.into(),
@@ -555,7 +600,11 @@ async fn steering_keeps_interrupted_request_cost_unknown() {
     let agent = Agent::new(
         provider.clone(),
         Arc::new(tools(dir.path(), Mode::Auto)),
-        Limits { prices, ..limits() },
+        Limits {
+            prices,
+            budget: Some(1.0),
+            ..limits()
+        },
     )
     .unwrap()
     .with_steer(steer.clone());
@@ -578,12 +627,12 @@ async fn steering_keeps_interrupted_request_cost_unknown() {
     drain.await.unwrap();
     assert!(result.is_ok());
     assert_eq!(session.accounting.model_calls, 2);
-    assert_eq!(session.accounting.cost, None);
+    assert_eq!(session.accounting.cost, Some(0.000015));
     assert_eq!(provider.inner.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn steering_repeated_interruptions_preserve_both_messages_and_unknown_cost() {
+async fn steering_repeated_interruptions_preserve_both_messages_and_known_cost() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(HangTwice {
         calls: 0.into(),
@@ -629,7 +678,7 @@ async fn steering_repeated_interruptions_preserve_both_messages_and_unknown_cost
     .expect("repeated steering timed out");
     drain.await.unwrap();
     assert_eq!(result.unwrap().model_calls, 3);
-    assert_eq!(session.accounting.cost, None);
+    assert_eq!(session.accounting.cost, Some(0.000015));
     let requests = provider.inner.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     for text in ["first adjustment", "second adjustment"] {
@@ -644,7 +693,7 @@ async fn steering_repeated_interruptions_preserve_both_messages_and_unknown_cost
 }
 
 #[tokio::test]
-async fn steering_with_budget_waits_for_usage_before_continuing() {
+async fn steering_with_budget_does_not_wait_for_usage() {
     let dir = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
@@ -676,17 +725,7 @@ async fn steering_with_budget_waits_for_usage_before_continuing() {
     .with_steer(steer.clone());
     let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
     let (tx, mut rx) = mpsc::channel(64);
-    let drain_provider = provider.clone();
-    let drain_steer = steer.clone();
-    let drain = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if matches!(event, Event::Notice(text) if text.contains("等待当前请求返回用量"))
-            {
-                drain_steer.push("also keep the original interface");
-                drain_provider.release.notify_one();
-            }
-        }
-    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let (result, _) = tokio::join!(
         agent.run_in(
             &mut session,
@@ -703,7 +742,7 @@ async fn steering_with_budget_waits_for_usage_before_continuing() {
     drain.await.unwrap();
     assert_eq!(result.unwrap().model_calls, 2);
     let saved = store.load(&session.id).unwrap();
-    assert_eq!(saved.accounting.cost, Some(0.00003));
+    assert_eq!(saved.accounting.cost, Some(0.000015));
     assert_eq!(saved.accounting.model_calls, 2);
     assert!(matches!(saved.state, State::Completed));
     assert!(saved.messages.iter().any(|message| {
@@ -721,15 +760,10 @@ async fn steering_with_budget_waits_for_usage_before_continuing() {
                 matches!(block, Block::Text(text) if text.contains("use iteration instead of recursion"))
             })
     }));
-    assert!(requests[0].messages.iter().any(|message| {
-        message.blocks.iter().any(|block| {
-            matches!(block, Block::Text(text) if text.contains("also keep the original interface"))
-        })
-    }));
 }
 
 #[tokio::test]
-async fn steering_with_budget_stops_when_usage_is_missing_or_budget_is_spent() {
+async fn steering_with_budget_continues_when_spent() {
     for (usage_reported, budget) in [(false, 1.0), (true, 0.00001)] {
         let dir = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -740,7 +774,7 @@ async fn steering_with_budget_stops_when_usage_is_missing_or_budget_is_spent() {
             release: tokio::sync::Notify::new(),
             usage_reported,
             inner: FakeProvider {
-                responses: Mutex::new(VecDeque::new()),
+                responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
                 requests: Mutex::new(Vec::new()),
             },
         });
@@ -762,15 +796,7 @@ async fn steering_with_budget_stops_when_usage_is_missing_or_budget_is_spent() {
         .with_steer(steer.clone());
         let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
         let (tx, mut rx) = mpsc::channel(64);
-        let drain_provider = provider.clone();
-        let drain = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                if matches!(event, Event::Notice(text) if text.contains("等待当前请求返回用量"))
-                {
-                    drain_provider.release.notify_one();
-                }
-            }
-        });
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let (result, _) = tokio::join!(
             agent.run_in(
                 &mut session,
@@ -785,18 +811,18 @@ async fn steering_with_budget_stops_when_usage_is_missing_or_budget_is_spent() {
             }
         );
         drain.await.unwrap();
-        assert!(matches!(result, Err(Error::Limit(_))));
+        assert!(result.is_ok());
         let saved = store.load(&session.id).unwrap();
-        assert_eq!(saved.accounting.cost, usage_reported.then_some(0.000015));
-        assert_eq!(saved.accounting.model_calls, 1);
-        assert!(matches!(saved.state, State::Interrupted(_)));
+        assert_eq!(saved.accounting.cost, Some(0.000015));
+        assert_eq!(saved.accounting.model_calls, 2);
+        assert!(matches!(saved.state, State::Completed));
         assert!(saved.messages.iter().any(|message| {
             message
                 .blocks
                 .iter()
                 .any(|block| matches!(block, Block::Text(text) if text.contains("change the task")))
         }));
-        assert!(provider.inner.requests.lock().unwrap().is_empty());
+        assert_eq!(provider.inner.requests.lock().unwrap().len(), 1);
         assert!(!dir.path().join("obsolete.txt").exists());
     }
 }
@@ -846,7 +872,7 @@ async fn steering_empty_wakeup_counts_interrupted_request() {
     drain.await.unwrap();
     assert!(matches!(result, Err(Error::Limit(_))));
     assert_eq!(session.accounting.model_calls, 2);
-    assert_eq!(session.accounting.cost, None);
+    assert_eq!(session.accounting.cost, Some(0.0));
     let requests = provider.inner.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_empty());
@@ -1031,27 +1057,42 @@ fn headless_tool_catalogue_does_not_offer_questions() {
 }
 
 #[tokio::test]
-async fn exact_budget_threshold_stops_before_a_write() {
+async fn budget_threshold_warns_and_allows_write() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(FakeProvider {
-        responses: Mutex::new(VecDeque::from([response(vec![Block::ToolUse {
-            id: "call".into(),
-            name: "write".into(),
-            input: json!({"path":"bad","content":"bad"}),
-            extra: None,
-        }])])),
+        responses: Mutex::new(VecDeque::from([
+            response(vec![Block::ToolUse {
+                id: "call".into(),
+                name: "write".into(),
+                input: json!({"path":"bad","content":"bad"}),
+                extra: None,
+            }]),
+            response(vec![Block::Text("done".into())]),
+        ])),
         requests: Mutex::new(Vec::new()),
     });
     let mut limits = limits();
     limits.prices = Some((1.0, 2.0));
     limits.budget = Some(20.0 / 1_000_000.0);
     let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits).unwrap();
-    let (tx, _rx) = mpsc::channel(64);
-    assert!(matches!(
-        agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
-    ));
-    assert!(!dir.path().join("bad").exists());
+    let (tx, mut rx) = mpsc::channel(64);
+    assert!(
+        agent
+            .run("task".into(), tx, CancellationToken::new())
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("bad")).unwrap(),
+        "bad"
+    );
+    let mut warned = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, Event::Notice(text) if text.contains("[预算超限]")) {
+            warned = true;
+        }
+    }
+    assert!(warned);
 }
 
 #[tokio::test]
@@ -1197,6 +1238,34 @@ async fn truncated_response_cannot_execute_a_tool() {
 }
 
 #[tokio::test]
+async fn a_truncated_reply_is_retried_once_with_a_note_kept_out_of_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cut = response(vec![Block::Text("partial".into())]);
+    cut.complete = false;
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([cut, response(vec![Block::Text("done".into())])])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits(),
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(64);
+    agent
+        .run("task".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    // The cut-off reply is dropped; only the note is added, and only to this request.
+    assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 1);
+    let note = format!("{:?}", requests[1].messages.last().unwrap());
+    assert!(note.contains("output token limit"), "{note}");
+}
+
+#[tokio::test]
 async fn model_call_limit_stops_without_claiming_completion() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(FakeProvider {
@@ -1219,7 +1288,7 @@ async fn model_call_limit_stops_without_claiming_completion() {
 }
 
 #[tokio::test]
-async fn missing_usage_cannot_be_treated_as_free_when_budgeted() {
+async fn missing_usage_counts_as_zero_when_budgeted() {
     let dir = tempfile::tempdir().unwrap();
     let mut result = response(vec![Block::Text("done".into())]);
     result.usage_reported = false;
@@ -1232,14 +1301,16 @@ async fn missing_usage_cannot_be_treated_as_free_when_budgeted() {
     limits.prices = Some((1.0, 2.0));
     let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits).unwrap();
     let (tx, _rx) = mpsc::channel(64);
-    assert!(matches!(
-        agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
-    ));
+    assert!(
+        agent
+            .run("task".into(), tx, CancellationToken::new())
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
-async fn reported_cost_enforces_budget_without_static_prices() {
+async fn reported_cost_warns_without_static_prices() {
     let dir = tempfile::tempdir().unwrap();
     let mut result = response(vec![Block::Text("done".into())]);
     result.reported_cost = Some(0.5);
@@ -1256,11 +1327,16 @@ async fn reported_cost_enforces_budget_without_static_prices() {
         limits,
     )
     .unwrap();
-    let (tx, _rx) = mpsc::channel(64);
-    assert!(matches!(
-        agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
-    ));
+    let (tx, mut rx) = mpsc::channel(64);
+    let report = agent
+        .run("task".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.estimated_cost, Some(0.5));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, Event::Notice(text) if text.contains("[预算超限]")))
+    );
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
 
@@ -1277,11 +1353,16 @@ async fn reported_cost_takes_precedence_over_estimated_cost() {
     limits.budget = Some(0.1);
     limits.prices = Some((1.0, 1.0));
     let agent = Agent::new(provider, Arc::new(tools(dir.path(), Mode::Auto)), limits).unwrap();
-    let (tx, _rx) = mpsc::channel(64);
-    assert!(matches!(
-        agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
-    ));
+    let (tx, mut rx) = mpsc::channel(64);
+    let report = agent
+        .run("task".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.estimated_cost, Some(0.5));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, Event::Notice(text) if text.contains("[预算超限]")))
+    );
 }
 
 #[tokio::test]
@@ -1321,7 +1402,7 @@ async fn reported_cost_is_recorded_in_usage_ledger() {
 }
 
 #[tokio::test]
-async fn missing_reported_cost_stops_budget_without_static_prices() {
+async fn missing_reported_cost_counts_as_zero_without_static_prices() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(FakeProvider {
         responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
@@ -1337,10 +1418,12 @@ async fn missing_reported_cost_stops_budget_without_static_prices() {
     )
     .unwrap();
     let (tx, _rx) = mpsc::channel(64);
-    assert!(matches!(
-        agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
-    ));
+    assert!(
+        agent
+            .run("task".into(), tx, CancellationToken::new())
+            .await
+            .is_ok()
+    );
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
 

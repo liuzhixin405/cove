@@ -312,21 +312,16 @@ async fn init(app: &mut Application) -> Result<()> {
     Ok(())
 }
 
-/// One tool-free model call, metered like any other; refused when the budget is spent.
+/// One tool-free model call, metered like any other.
 async fn draft_with_model(
     app: &mut Application,
     target: &str,
     digest: &str,
 ) -> std::result::Result<String, String> {
-    if let Some(budget) = app.settings.budget
-        && app
-            .session
-            .accounting
-            .budget_cost()
-            .is_none_or(|cost| cost >= budget)
-    {
-        return Err("预算已用完或会话花费未知".into());
+    if app.settings.budget.is_some() && app.session.accounting.budget_cost().is_none() {
+        app.session.accounting.reset_budget_spend();
     }
+    let previous = app.session.accounting.budget_cost();
     let request = ModelRequest {
         system: onboarding::INIT_SYSTEM.into(),
         messages: vec![Message::user(onboarding::prompt(target, digest))],
@@ -340,13 +335,6 @@ async fn draft_with_model(
     let cancel = CancellationToken::new();
     let provider = app.background_provider();
     app.session.accounting.model_calls += 1;
-    let previous_cost = app.session.accounting.cost.take();
-    let previous_budget = app
-        .session
-        .accounting
-        .renewed_budget
-        .as_mut()
-        .map(|budget| budget.cost.take());
     app.store
         .save(&app.session)
         .map_err(|err| err.to_string())?;
@@ -364,26 +352,35 @@ async fn draft_with_model(
             .usage
             .output
             .saturating_add(response.usage.output);
-        // Same rule as the kernel: unreported usage leaves the cost unknown.
-        if response.usage_reported {
-            let call_cost = response.reported_cost.or_else(|| {
-                crate::session::usage::bill(
-                    app.settings.prices,
-                    response.usage.input,
-                    response.usage.output,
-                )
-            });
-            accounting.cost = previous_cost.zip(call_cost).map(|(cost, call)| cost + call);
-            if let (Some(budget), Some(previous)) =
-                (&mut accounting.renewed_budget, previous_budget)
-            {
-                budget.cost = previous.zip(call_cost).map(|(cost, call)| cost + call);
-            }
+        let call_cost = response
+            .reported_cost
+            .or_else(|| {
+                if response.usage_reported {
+                    crate::session::usage::bill(
+                        app.settings.prices,
+                        response.usage.input,
+                        response.usage.output,
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
+        accounting.cost = accounting.cost.map(|cost| cost + call_cost);
+        if let Some(budget) = &mut accounting.renewed_budget {
+            budget.cost = budget.cost.map(|cost| cost + call_cost);
         }
     }
     app.store
         .save(&app.session)
         .map_err(|err| err.to_string())?;
+    if let Some(text) = crate::engine::agent::budget_message(
+        app.settings.budget,
+        previous,
+        app.session.accounting.budget_cost(),
+    ) {
+        let _ = crate::app::ui::print_budget_notice(&text);
+    }
     let response = result?;
     if !response.complete {
         return Err("模型回答被截断".into());

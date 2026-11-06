@@ -1,7 +1,6 @@
 //! CLI tests for permission modes, safety blocks, policies, guards and completion gates.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};
@@ -360,10 +359,7 @@ async fn verification_reuses_the_models_own_passing_check_and_records_acceptance
     let stderr = String::from_utf8_lossy(&output.stderr);
     server.await.unwrap();
     assert!(output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("already run successfully after the last edit"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("验证通过"), "{stderr}");
     let ledger = std::fs::read_to_string(data.path().join("verify_ledger.jsonl")).unwrap();
     assert!(ledger.contains("\"reused\""), "{ledger}");
     let session = std::fs::read_dir(data.path().join("acceptance"))

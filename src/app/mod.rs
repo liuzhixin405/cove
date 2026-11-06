@@ -5,6 +5,7 @@ pub mod completion;
 pub mod console;
 pub mod diagnostics;
 pub mod launch;
+pub mod locks;
 pub mod onboarding;
 pub mod paste;
 pub mod render;
@@ -45,6 +46,9 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     } else {
         None
     };
+    crate::process::set_lock_wait(Arc::new(crate::app::locks::ToolLocks {
+        input: input.clone(),
+    }));
     let store = Store::open(&settings.data_dir)?;
     // Started in the home directory (or with the data directory inside the project):
     // the data directory stays out of every tool's reach.
@@ -464,7 +468,7 @@ impl Application {
         let cwd = cwd.strip_prefix(r"\\?\").unwrap_or(&cwd).to_owned();
         if crate::app::console::rich() {
             return format!(
-                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 插话（有预算时等用量） · /exit 退出\x1b[0m\n",
+                "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 插话 · /exit 退出\x1b[0m\n",
                 env!("CARGO_PKG_VERSION"),
                 self.settings.model,
                 self.settings.provider,
@@ -473,7 +477,7 @@ impl Application {
             );
         }
         format!(
-            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止任务；运行中输入文字自动插话、! 优先插话（有预算时等用量）；/exit 保存并退出。\n",
+            "cove {} · {}（{}）· 模式 {} · {cwd}{branch}\n/help 查看命令，输入 / 或 @ 可补全；按两次 Esc 或 Ctrl+C 停止任务；运行中输入文字自动插话、! 优先插话；/exit 保存并退出。\n",
             env!("CARGO_PKG_VERSION"),
             self.settings.model,
             self.settings.provider,
@@ -635,6 +639,14 @@ impl Application {
             (tokens(&self.session.messages) + text_tokens(&self.agent.system_prompt()) + tools)
                 as u64
         });
+        // Only the Anthropic protocol sends thinking and effort; others use the model's own.
+        let thinking = if !matches!(self.settings.protocol, crate::config::Protocol::Anthropic) {
+            "默认".to_owned()
+        } else if self.settings.thinking == Some(crate::model::provider::Thinking::Disabled) {
+            "关闭".to_owned()
+        } else {
+            self.settings.effort.clone().unwrap_or_else(|| "默认".into())
+        };
         let usage = &self.session.accounting.usage;
         console.set_meter(
             context,
@@ -642,6 +654,7 @@ impl Application {
             (self.agent.context_limit() * 9 / 10) as u64,
             usage.input + usage.output,
             self.session.accounting.cost,
+            thinking,
         );
     }
 
@@ -1077,15 +1090,11 @@ impl Application {
                 "自动验证仍未通过，任务尚未完成；可让模型继续修复，或用 /diff 查看改动".into(),
             ));
         }
-        if report.tools_failed > 0 {
-            let warning = format!(
+        if report.tools_failed > 0 && self.settings.one_shot {
+            return Err(Error::Tool(format!(
                 "任务过程中有 {} 个工具调用失败，最终结果仍需核对；可用 /doctor trace 查看失败记录，或 /expand <n> 查看工具输出",
                 report.tools_failed
-            );
-            if self.settings.one_shot {
-                return Err(Error::Tool(warning));
-            }
-            print_text(&format!("[提醒] {warning}\n"), true)?;
+            )));
         }
         Ok(())
     }

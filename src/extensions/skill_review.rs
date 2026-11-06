@@ -236,24 +236,13 @@ impl SkillReview {
         session: &'a Session,
         completed: bool,
         verification: Option<Outcome>,
-        budget: Option<f64>,
+        _budget: Option<f64>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let request = {
                 let Ok(mut state) = self.state.lock() else {
                     return;
                 };
-                if budget.is_some() {
-                    let running = state.running;
-                    *state = State {
-                        session: session.id.clone(),
-                        seen: session.messages.len(),
-                        start_known: true,
-                        running,
-                        ..State::default()
-                    };
-                    return;
-                }
                 if state.session != session.id {
                     let running = state.running;
                     *state = State {
@@ -834,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_review_does_not_dispatch_outside_an_active_budget() {
+    async fn skill_review_dispatches_with_an_active_budget() {
         let data = tempfile::tempdir().unwrap();
         let skills = Arc::new(
             Skills::load(
@@ -847,8 +836,10 @@ mod tests {
             .unwrap(),
         );
         let review = SkillReview::new(
-            Arc::new(Fixed("SKILL: flow | work | test".into())),
-            skills,
+            Arc::new(Fixed(
+                "SKILL: review-flow | When reviewing | inspect, test".into(),
+            )),
+            skills.clone(),
             1000,
         );
         let mut session = Session::new(
@@ -872,9 +863,17 @@ mod tests {
                 .task_end_with_verification(&session, true, None, Some(1.0))
                 .await;
         }
-        let state = review.state.lock().unwrap();
-        assert_eq!(state.tasks, 0);
-        assert!(!state.running);
+        let store = skills.candidate_store().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if store.list().is_ok_and(|candidates| !candidates.is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

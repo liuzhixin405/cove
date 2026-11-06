@@ -155,6 +155,9 @@ struct Journal {
     saved: usize,
     seq: u64,
     bytes: u64,
+    /// Last `sync_data`; appends between syncs are in the OS cache, which a process
+    /// crash keeps and only a power loss can drop (a torn record ends replay).
+    synced: std::time::Instant,
 }
 
 /// Open journals by path; process-wide because every `Store` value of a data
@@ -163,6 +166,9 @@ static JOURNALS: LazyLock<Mutex<HashMap<PathBuf, Journal>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Journal appends are synced to disk at most this often.
+const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Increasing within the process and, being microseconds since the epoch, above
 /// whatever an earlier process wrote.
@@ -203,10 +209,14 @@ pub fn save(snapshot: &Path, log: &Path, session: &Session) -> Result<()> {
         };
         let mut line = serde_json::to_vec(&record)?;
         line.push(b'\n');
+        let sync = journal.synced.elapsed() >= SYNC_INTERVAL;
         if line.len() as u64 <= STATE_LIMIT
             && journal.file.write_all(&line).is_ok()
-            && journal.file.sync_data().is_ok()
+            && (!sync || journal.file.sync_data().is_ok())
         {
+            if sync {
+                journal.synced = std::time::Instant::now();
+            }
             journal.saved = session.messages.len();
             journal.seq = seq;
             journal.bytes += line.len() as u64;
@@ -260,6 +270,7 @@ fn write_snapshot(
             saved: session.messages.len(),
             seq,
             bytes: 0,
+            synced: std::time::Instant::now(),
         },
     );
     Ok(())

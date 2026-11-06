@@ -307,11 +307,16 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
     let mut block = Block::None;
     // Whether the last character written ended a line.
     let mut line_done = true;
-    // Running tools: name, title and whether the title was written; the title row
+    // Running tools: name, title, whether the title was written and whether the call
+    // is a hidden helper script; the title row
     // last written, while nothing followed it except its own live output.
-    let mut running: Vec<(String, String, bool)> = Vec::new();
+    let mut running: Vec<(String, String, bool, bool)> = Vec::new();
     let mut open: Option<String> = None;
     let mut streamed = false;
+    // `/expand` ids of helper-script calls left out of the transcript.
+    let mut hidden: Vec<u64> = Vec::new();
+    let verbose = crate::app::blocks::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
+    let root = console.map(|console| console.cwd());
     // Reply deltas batch here; flushed on line boundaries, at 4 KiB, or before any
     // other kind of output, so streaming does not write the terminal per token.
     let mut buffered = String::new();
@@ -380,21 +385,32 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 // The title is written with the first live output or the result,
                 // so calls running side by side do not leave a row of bare titles.
                 let title = render::tool_title(&name, &input);
+                let scratch = !verbose
+                    && root
+                        .as_deref()
+                        .is_some_and(|root| render::scratch_call(&name, &input, root));
+                if scratch {
+                    activity("运行辅助脚本");
+                    running.push((name, title, false, true));
+                    continue;
+                }
                 if block != Block::Tool || !line_done {
                     open_block(&mut block, Block::Tool, &mut line_done, &mut markdown)?;
                 }
                 activity(&title);
-                running.push((name, title, false));
+                running.push((name, title, false, false));
                 streamed = false;
             }
             AgentEvent::Output { line, stderr } => {
-                if !LIVE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+                if !LIVE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+                    || running.last().is_some_and(|(_, _, _, scratch)| *scratch)
+                {
                     // Quiet: the finished summary prints a short tail instead.
                     continue;
                 }
                 streamed = true;
                 let mut out = String::new();
-                if let Some((_, title, shown)) = running.last_mut()
+                if let Some((_, title, shown, _)) = running.last_mut()
                     && !*shown
                 {
                     *shown = true;
@@ -410,10 +426,23 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 output,
             } => {
                 let id = crate::app::blocks::BLOCKS.add(&name, failed, &output);
-                let title = running
+                let finished = running
                     .iter()
-                    .position(|(running, _, _)| *running == name)
-                    .map(|at| running.remove(at).1);
+                    .position(|(running, _, _, _)| *running == name)
+                    .map(|at| running.remove(at));
+                let next = |running: &[(String, String, bool, bool)]| {
+                    match running.last() {
+                        Some((_, _, _, true)) => "运行辅助脚本".to_owned(),
+                        Some((_, title, _, _)) => title.clone(),
+                        None => "思考中".to_owned(),
+                    }
+                };
+                if let Some((_, _, _, true)) = finished {
+                    hidden.push(id);
+                    activity(&next(&running));
+                    continue;
+                }
+                let title = finished.map(|(_, title, _, _)| title);
                 let mut out = String::new();
                 if let Some(title) = title
                     && open.as_ref() != Some(&title)
@@ -421,8 +450,6 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     out.push_str(&render::tool_started(&visible(&title)));
                 }
                 // `verbose`: the whole result above its summary (output shown live is not repeated).
-                let verbose =
-                    crate::app::blocks::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
                 if verbose && !streamed {
                     for line in output.lines() {
                         out.push_str(&render::output_line(&visible(line), false));
@@ -437,16 +464,17 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 ));
                 console::write(false, &out)?;
                 open = None;
-                activity(match running.last() {
-                    Some((_, title, _)) => title,
-                    None => "思考中",
-                });
+                activity(&next(&running));
             }
             AgentEvent::Notice(text) => {
                 if !line_done || block != Block::None {
                     open_block(&mut block, Block::None, &mut line_done, &mut markdown)?;
                 }
-                console::write(false, &format!("\x1b[33m!\x1b[0m {}\n", visible(&text)))?;
+                if text.starts_with("[预算超限]") {
+                    console::write(false, &format!("\x1b[31m! {}\x1b[0m\n", visible(&text)))?;
+                } else {
+                    console::write(false, &format!("\x1b[33m!\x1b[0m {}\n", visible(&text)))?;
+                }
                 open = None;
             }
             AgentEvent::Usage { tokens, .. } => {
@@ -464,7 +492,19 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
     if !line_done || !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    console::write(true, &out)
+    console::write(true, &out)?;
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = hidden.iter().map(|id| format!("#{id}")).collect();
+    console::write(
+        false,
+        &format!(
+            "\x1b[2m（{} 个辅助脚本调用未展示：{}，/expand 查看）\x1b[0m\n",
+            hidden.len(),
+            ids.join(" ")
+        ),
+    )
 }
 
 /// The row standing for hidden reasoning; the first one tells how to show it.
@@ -549,6 +589,19 @@ impl ReplInput {
 
 pub fn print_text(text: &str, diagnostic: bool) -> std::io::Result<()> {
     console::write(!diagnostic, &visible(text))
+}
+
+pub(crate) fn print_budget_notice(text: &str) -> std::io::Result<()> {
+    if console::rich() {
+        let color = if text.starts_with("[预算超限]") {
+            31
+        } else {
+            33
+        };
+        console::write(false, &format!("\x1b[{color}m{}\x1b[0m\n", visible(text)))
+    } else {
+        print_text(&format!("{text}\n"), true)
+    }
 }
 
 pub fn print_error(text: &str) -> std::io::Result<()> {

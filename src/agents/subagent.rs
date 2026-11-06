@@ -1279,10 +1279,7 @@ impl WithSubAgent {
             Ok(kind) => kind,
             Err(err) => return failed(err.to_string()),
         };
-        let budget = self.hub.ledger.remaining_budget();
-        if budget.is_some_and(|budget| budget <= 0.0) {
-            return failed("session budget exhausted; sub-agent not started");
-        }
+        let budget = None;
         if args.background {
             if args.worktree.is_some() {
                 return failed(

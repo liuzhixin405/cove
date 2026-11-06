@@ -1041,26 +1041,16 @@ impl Settings {
             (Some(budget), _) => Some(budget),
             // The default cap, when the model's price is known.
             (None, None) if prices.is_some() => Some(10.0),
-            // A configured budget without prices cannot be enforced.
-            (None, Some(budget))
-                if prices.is_none()
-                    && !crate::model::provider::supports_reported_cost(&base_url) =>
-            {
-                warnings.push(format!(
-                    "config：已忽略 max_budget_usd {budget}；需同时设置 input_price 和 output_price 才能生效"
-                ));
-                None
-            }
             (None, budget) => budget,
         };
         if let Some(budget) = budget {
-            anyhow::ensure!(
-                budget.is_finite()
-                    && budget > 0.0
-                    && (prices.is_some()
-                        || crate::model::provider::supports_reported_cost(&base_url)),
-                "预算必须为正数，并且需要同时设置两个 token 价格（input_price、output_price）"
-            );
+            anyhow::ensure!(budget.is_finite() && budget > 0.0, "预算提醒金额必须为正数");
+            if prices.is_none() && !crate::model::provider::supports_reported_cost(&base_url) {
+                warnings.push(
+                    "模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用，请以供应商账单为准"
+                        .into(),
+                );
+            }
             if crate::model::provider::supports_reported_cost(&base_url) {
                 warnings.push("OpenRouter 预算仅计入其账户报告的费用；自带上游密钥时，上游另收费用可能不包含在内".into());
             }
@@ -1280,6 +1270,28 @@ mod tests {
         cli.context_window = Some(65432);
         let pinned = Settings::load_with(cli, Some(value)).unwrap();
         assert_eq!(pinned.context_window, 65432);
+    }
+
+    #[test]
+    fn unknown_price_keeps_budget_and_warns() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli = Cli::parse_from(["cove"]);
+        cli.cwd = directory.path().to_path_buf();
+        cli.data_dir = Some(directory.path().to_path_buf());
+        cli.budget = Some(2.0);
+        let config = serde_json::json!({
+            "model": "unknown-model",
+            "provider": {"name": "openai", "base_url": "https://example.com/v1", "api_key": "test-key"}
+        });
+        let settings = Settings::load_with(cli, Some(config)).unwrap();
+        assert_eq!(settings.prices, None);
+        assert_eq!(settings.budget, Some(2.0));
+        assert!(
+            settings
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("低估"))
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::{
 
 pub(crate) const HELP: &str = "\
 /model [<name>|fast <name|off>|next <main|fast|auto>|provider <name> [model]|profile [list|switch|save|delete|show] <name>]  查看或切换模型、快速模型、服务商和配置档；next 指定下一个任务的模型（仅一次）
-/config <model|provider|api_key|base_url|system|budget|max_output_tokens> [value]  查看或修改设置   /config budget auto|off|<usd>|save  会话预算   /config setup  重新运行配置向导
+/config <model|provider|api_key|base_url|system|budget|max_output_tokens> [value]  查看或修改设置   /config budget auto|off|<usd>|save  会话预算   /config effort low|medium|high|xhigh|max|default  思考强度（越低越快）   /config setup  重新运行配置向导
 /status limits  速率限制";
 
 /// Live model state owned by the application.
@@ -317,13 +317,13 @@ impl Application {
         set_window_sink(&self.models.router, &next);
         let current = &mut self.settings;
         let mut notes = Vec::new();
-        let budget = match (self.agent.limits().budget, next.prices) {
-            (Some(_), None) if !crate::model::provider::supports_reported_cost(&next.base_url) => {
-                notes.push("预算已关闭：新模型的价格未知".to_owned());
-                None
-            }
-            (budget, _) => budget,
-        };
+        let budget = self.agent.limits().budget;
+        if budget.is_some()
+            && next.prices.is_none()
+            && !crate::model::provider::supports_reported_cost(&next.base_url)
+        {
+            notes.push("新模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用".to_owned());
+        }
         {
             let limits = self.agent.limits_mut();
             limits.max_output_tokens = next.max_output_tokens;
@@ -633,9 +633,10 @@ impl Application {
                 && app.agent.limits().prices.is_none()
                 && !crate::model::provider::supports_reported_cost(&app.settings.base_url)
             {
-                return Err(Error::Session(
-                    "设置预算需要已知价格；请在配置中设置 input_price 和 output_price，或用 /config budget off".into(),
-                ));
+                print_text(
+                    "模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用，请以供应商账单为准\n",
+                    true,
+                )?;
             }
             let renewed = budget.is_some() && app.session.accounting.budget_cost().is_none();
             if renewed {
@@ -838,6 +839,38 @@ impl Application {
                 })
                 .await?
             }
+            ("effort", None) => show(format!(
+                "effort={}（low|medium|high|xhigh|max|default；越低越快，复杂任务效果可能下降）",
+                self.settings.effort.as_deref().unwrap_or("default")
+            ))?,
+            ("effort", Some(value)) => {
+                let value = value.trim().to_ascii_lowercase();
+                let effort = match value.as_str() {
+                    "default" | "off" | "none" => None,
+                    "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
+                    _ => {
+                        return Err(Error::Session(
+                            "effort 只能是 low|medium|high|xhigh|max|default，例如 /config effort medium".into(),
+                        ));
+                    }
+                };
+                self.change(Reload::Seeded, None, |root, settings| {
+                    let target = existing_target(root, settings.profile.as_deref(), "effort");
+                    match &effort {
+                        Some(effort) => target.insert("effort".into(), json!(effort)),
+                        None => target.remove("effort"),
+                    };
+                    Ok(())
+                })
+                .await?;
+                show(format!(
+                    "effort={}",
+                    self.settings.effort.as_deref().unwrap_or("default")
+                ))?;
+                if !matches!(self.settings.protocol, crate::config::Protocol::Anthropic) {
+                    print_text("注意：effort 只对 Anthropic 协议（含 Bedrock）生效\n", true)?;
+                }
+            }
             _ => unreachable!("dispatch only passes known keys"),
         }
         Ok(())
@@ -962,6 +995,7 @@ const CONFIG_KEYS: &[&str] = &[
     "system",
     "budget",
     "max_output_tokens",
+    "effort",
 ];
 
 pub(crate) async fn handle(

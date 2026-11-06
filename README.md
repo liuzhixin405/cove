@@ -169,7 +169,7 @@ Get-Content error.log | cove -p "这个报错是什么原因"   # 把管道内�
 ## 配置
 
 - 配置文件：`%USERPROFILE%\.cove\config.json`。`/config setup` 可以重新走一遍设置向导。
-- 常用设置可以在界面里直接改：`/model <名称>`、`/config api_key`、`/config budget 5`（本会话花费上限 5 美元）。
+- 常用设置可以在界面里直接改：`/model <名称>`、`/config api_key`、`/config budget 5`（本会话花费提醒阈值 5 美元，不会停止任务）。
 - 项目目录里可以放 `.cove.json` 写项目专属设置；其中涉及执行或花钱的设置，要先运行 `/config trust` 信任项目才生效。
 - 完整的配置示例见 [config.example.json](docs/config.example.json)。
 

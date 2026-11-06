@@ -1,7 +1,6 @@
 //! CLI-level tests for area E: skills, plugin commands, hooks.json, MCP over HTTP, trust.
 
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};

@@ -98,8 +98,8 @@ fn judge(root: &Path, observation: &Observation) -> Verdict {
                 return Verdict::Failed;
             }
             match (observation.steering_seen, observation.cost_unknown) {
-                (Some(false), _) | (_, Some(false)) => Verdict::Failed,
-                (Some(true), Some(true)) => Verdict::Passed,
+                (Some(false), _) | (_, Some(true)) => Verdict::Failed,
+                (Some(true), Some(false)) => Verdict::Passed,
                 _ => Verdict::Unknown,
             }
         }
@@ -453,8 +453,13 @@ async fn independent_fixture_verify(root: &Path) -> Verdict {
         return Verdict::Unknown;
     };
     let mut command = tokio::process::Command::new(executable);
+    // Test names are module paths without the crate name (`evaluation::...`).
+    let worker = match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::independent_fixture_worker"),
+        None => "independent_fixture_worker".to_owned(),
+    };
     command
-        .args(["--exact", "independent_fixture_worker", "--nocapture"])
+        .args(["--exact", &worker, "--nocapture"])
         .env_clear()
         .env("COVE_OFFLINE_EVAL_FIXTURE", root)
         .stdin(std::process::Stdio::null())
@@ -606,7 +611,7 @@ fn evaluator_rejects_bad_artifacts_missing_cases_and_unknown_results() {
 }
 
 #[test]
-fn evaluator_requires_steering_delivery_and_unknown_interrupted_cost() {
+fn evaluator_requires_steering_delivery_and_known_interrupted_cost() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("protected.txt"), "original").unwrap();
     std::fs::write(root.path().join("target.txt"), "fixed").unwrap();
@@ -618,26 +623,26 @@ fn evaluator_requires_steering_delivery_and_unknown_interrupted_cost() {
         infrastructure_error: false,
         failed_tools: Some(0),
         steering_seen: Some(false),
-        cost_unknown: Some(true),
+        cost_unknown: Some(false),
         independent: None,
     };
     assert_eq!(judge(root.path(), &observation), Verdict::Failed);
     observation.steering_seen = Some(true);
-    observation.cost_unknown = Some(false);
+    observation.cost_unknown = Some(true);
     assert_eq!(judge(root.path(), &observation), Verdict::Failed);
     observation.cost_unknown = None;
     assert_eq!(judge(root.path(), &observation), Verdict::Unknown);
-    observation.cost_unknown = Some(true);
+    observation.cost_unknown = Some(false);
     assert_eq!(judge(root.path(), &observation), Verdict::Passed);
 }
 
 #[tokio::test]
-async fn offline_steering_reaches_the_resumed_request_and_preserves_unknown_cost() {
+async fn offline_steering_reaches_the_resumed_request_and_keeps_cost_known() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("protected.txt"), "original").unwrap();
     let observation = run_fake_steering_task(root.path()).await;
     assert_eq!(observation.steering_seen, Some(true));
-    assert_eq!(observation.cost_unknown, Some(true));
+    assert_eq!(observation.cost_unknown, Some(false));
     assert_eq!(judge(root.path(), &observation), Verdict::Passed);
 }
 

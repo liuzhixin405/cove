@@ -1,5 +1,4 @@
-mod common;
-use common::Launch;
+use crate::common::{self, Launch};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -1126,7 +1125,7 @@ async fn verification_gate_feeds_failures_back_until_checks_pass() {
     );
     assert!(requests[5].to_string().contains("exit_code=Some(3)"));
     assert!(
-        stderr.contains("passed") && stderr.contains("验证通过"),
+        stderr.contains("→ 通过") && stderr.contains("验证通过"),
         "{stderr}"
     );
     // The refused first write still counts as a failed tool call.

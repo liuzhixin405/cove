@@ -1,7 +1,7 @@
 //! Model capabilities through the CLI: routing, fallback, key pool, live
 //! switching, attachments, images, caching and context-overflow recovery.
 
-mod common;
+use crate::common;
 use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};
@@ -306,6 +306,7 @@ async fn simple_tasks_route_to_the_fast_model_and_complex_ones_to_premium() {
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("[model] fast-model"), "{stderr}");
+    assert!(!stderr.contains("[model] premium-model"), "{stderr}");
     let seen = server.await.unwrap();
     assert_eq!(seen[0].body["model"], "fast-model");
     assert_eq!(seen[1].body["model"], "premium-model");
@@ -366,7 +367,7 @@ async fn the_key_pool_skips_rejected_and_rate_limited_keys() {
 }
 
 #[tokio::test]
-async fn setting_a_new_budget_after_unknown_cost_resumes_the_task() {
+async fn failed_request_can_continue_without_resetting_budget() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let (url, server) = mock_server(vec![
@@ -392,18 +393,14 @@ async fn setting_a_new_budget_after_unknown_cost_resumes_the_task() {
             "--no-auto",
         ])
         .env("COVE_API_KEY", "test-key");
-    let output = run(command, Some("original task\n/config budget 100\n/config budget\n/continue 1\n/config budget 200\n/config budget\n/exit\n")).await;
+    let output = run(
+        command,
+        Some("original task\n/continue 1\n/config budget\n/exit\n"),
+    )
+    .await;
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("该金额是从现在起的新增预算"), "{stdout}");
-    assert!(
-        stdout.contains("新增预算已用 $0.0000；历史总费用仍未知"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("新增预算已用 $0.0300；历史总费用仍未知"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("已花费 $0.0300"), "{stdout}");
     assert!(stdout.contains("task continued"), "{stdout}");
     let seen = server.await.unwrap();
     assert_eq!(seen.len(), 2);
@@ -713,6 +710,48 @@ async fn anthropic_requests_use_prompt_caching_and_bill_cache_reads() {
     );
     assert_eq!(seen[0].body["thinking"]["type"], "adaptive");
     assert_eq!(seen[0].body["output_config"]["effort"], "medium");
+}
+
+#[tokio::test]
+async fn effort_is_changed_from_the_console_and_saved() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let frames = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        json!({"type":"message_stop"}),
+    ];
+    let body: String = frames.iter().map(|v| format!("data: {v}\n\n")).collect();
+    let (url, server) = mock_server(vec![ok(body.clone()), ok(body)]).await;
+    write_config(
+        data.path(),
+        json!({"model":"claude-sonnet-4-5","effort":"high",
+               "provider":{"name":"anthropic","api_key":"k","base_url":url}}),
+    );
+    let output = run(
+        cove(root.path(), data.path()),
+        Some("/config effort medium\nfirst\n/config effort\n/config effort fast\n/config effort default\nsecond\n/exit\n"),
+    )
+    .await;
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("effort=medium"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("low|medium|high|xhigh|max|default"),
+        "{stderr}"
+    );
+    let seen = server.await.unwrap();
+    assert_eq!(seen[0].body["output_config"]["effort"], "medium");
+    assert!(
+        seen[1].body.get("output_config").is_none(),
+        "{}",
+        seen[1].body
+    );
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("config.json")).unwrap()).unwrap();
+    assert!(saved.get("effort").is_none(), "{saved}");
 }
 
 #[tokio::test]
