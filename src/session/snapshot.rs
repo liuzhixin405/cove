@@ -675,7 +675,7 @@ fn prune_empty(root: &Path, mut dir: Option<&Path>) {
 pub fn read_only_shell(command: &str) -> bool {
     crate::safety::permission::classify::read_only(
         command,
-        crate::safety::permission::shell::Dialect::host(),
+        crate::safety::permission::shell::Dialect::for_command(command),
     )
 }
 

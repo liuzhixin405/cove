@@ -210,10 +210,11 @@ impl Evidence {
                 // git bookkeeping (add/commit/tag) never touches the working tree, so
                 // it must not invalidate passing checks — or every commit in a row
                 // re-runs the whole verification suite for nothing.
-                let may_change_files = !classify::auto_approvable(&command, Dialect::host())
-                    && !classify::local_git(&command, Dialect::host())
-                    && !classify::remote_git(&command, Dialect::host());
-                if may_change_files || classify::may_rewrite_sources(&command, Dialect::host()) {
+                let dialect = Dialect::for_command(&command);
+                let may_change_files = !classify::auto_approvable(&command, dialect)
+                    && !classify::local_git(&command, dialect)
+                    && !classify::remote_git(&command, dialect);
+                if may_change_files || classify::may_rewrite_sources(&command, dialect) {
                     state.passed.clear();
                     state.outcome = None;
                 }
@@ -245,7 +246,7 @@ impl Evidence {
 
 /// `commit`/`push` subcommands of git in a shell line.
 pub fn git_actions(command: &str) -> Vec<&'static str> {
-    let line = crate::safety::permission::shell::parse(command, Dialect::host());
+    let line = crate::safety::permission::shell::parse(command, Dialect::for_command(command));
     let mut out = Vec::new();
     for simple in line.commands() {
         let argv: Vec<String> = simple.argv().iter().map(|w| (*w).to_owned()).collect();
@@ -327,9 +328,8 @@ fn verification_preapproved(
     match mode {
         crate::safety::permission::Mode::Auto | crate::safety::permission::Mode::Bypass => true,
         crate::safety::permission::Mode::Default => {
-            let dialect = crate::safety::permission::shell::Dialect::host();
-            crate::safety::permission::classify::auto_approvable(command, dialect)
-                && !crate::safety::permission::classify::may_rewrite_sources(command, dialect)
+            let dialect = crate::safety::permission::shell::Dialect::for_command(command);
+            crate::safety::permission::risk::reasons(command, dialect).is_empty()
         }
         crate::safety::permission::Mode::Plan => false,
     }

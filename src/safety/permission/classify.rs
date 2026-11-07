@@ -2,7 +2,7 @@
 
 use super::{
     safety,
-    shell::{self, Dialect, Line, Simple},
+    shell::{self, Dialect, Line, Simple, Word},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -150,7 +150,7 @@ fn fetches(simple: &Simple) -> bool {
     })
 }
 
-fn discards(target: &str) -> bool {
+pub(crate) fn discards(target: &str) -> bool {
     let target = target.to_ascii_lowercase();
     target.starts_with('&')
         || matches!(
@@ -159,13 +159,195 @@ fn discards(target: &str) -> bool {
         )
 }
 
+/// Installed toolchains whose version/help/listing flags only print.
+const TOOLCHAINS: &[&str] = &[
+    "dotnet", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "python", "python3", "py",
+    "pip", "pip3", "go", "rustc", "cargo", "rustup", "java", "javac", "mvn", "gradle", "git",
+    "pwsh", "powershell", "cmake", "make", "ninja", "gcc", "g++", "clang", "tsc", "ruby", "gem",
+    "php", "composer", "perl", "dart", "flutter", "kotlin", "swift", "nuget", "msbuild",
+    "docker", "kubectl", "helm", "terraform", "gh", "uv", "poetry", "conda",
+];
+
+const INFO_ARGS: &[&str] = &[
+    "--version", "-version", "-v", "-V", "version", "--help", "-h", "--info", "--list-sdks",
+    "--list-runtimes",
+];
+
+/// Subcommands that only query: package searches, dependency listings, status views.
+/// Matched against the leading non-option arguments.
+const QUERIES: &[(&str, &[&str])] = &[
+    ("dotnet", &["package", "search"]),
+    ("dotnet", &["package", "list"]),
+    ("dotnet", &["list", "package"]),
+    ("dotnet", &["list", "reference"]),
+    ("dotnet", &["sdk", "check"]),
+    ("dotnet", &["workload", "list"]),
+    ("dotnet", &["tool", "list"]),
+    ("dotnet", &["tool", "search"]),
+    ("dotnet", &["new", "list"]),
+    ("dotnet", &["nuget", "why"]),
+    ("cargo", &["search"]),
+    ("cargo", &["version"]),
+    ("cargo", &["locate-project"]),
+    ("cargo", &["pkgid"]),
+    ("cargo", &["verify-project"]),
+    ("cargo", &["read-manifest"]),
+    ("cargo", &["info"]),
+    ("rustup", &["show"]),
+    ("rustup", &["which"]),
+    ("rustup", &["toolchain", "list"]),
+    ("rustup", &["target", "list"]),
+    ("rustup", &["component", "list"]),
+    ("go", &["doc"]),
+    ("pip", &["index", "versions"]),
+    ("pip3", &["index", "versions"]),
+    ("gh", &["pr", "view"]),
+    ("gh", &["pr", "list"]),
+    ("gh", &["pr", "status"]),
+    ("gh", &["pr", "diff"]),
+    ("gh", &["pr", "checks"]),
+    ("gh", &["issue", "view"]),
+    ("gh", &["issue", "list"]),
+    ("gh", &["repo", "view"]),
+    ("gh", &["run", "list"]),
+    ("gh", &["run", "view"]),
+    ("gh", &["release", "list"]),
+    ("gh", &["release", "view"]),
+    ("kubectl", &["get"]),
+    ("kubectl", &["describe"]),
+    ("kubectl", &["logs"]),
+    ("kubectl", &["explain"]),
+    ("kubectl", &["api-resources"]),
+    ("helm", &["list"]),
+    ("helm", &["status"]),
+    ("conda", &["list"]),
+    ("conda", &["info"]),
+    ("conda", &["env", "list"]),
+    ("uv", &["tree"]),
+    ("uv", &["pip", "list"]),
+    ("uv", &["pip", "show"]),
+    ("poetry", &["show"]),
+];
+
+/// `args` start with one of `program`'s query subcommands and write no output file.
+fn query(program: &str, args: &[&str]) -> bool {
+    let positional: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    let writes = args.iter().any(|a| {
+        *a == "-o" || a.starts_with("--output") || a.starts_with("--out") || a.starts_with("--web")
+    });
+    !writes
+        && QUERIES.iter().any(|(name, sub)| {
+            *name == program
+                && positional.len() >= sub.len()
+                && positional.iter().zip(sub.iter()).all(|(a, b)| a == b)
+        })
+}
+
+/// Programs that only read and have no option that writes, deletes or runs something:
+/// an argument whose value is unknown (`"$f"`, `$_.FullName`, `%1`) cannot change that.
+const PURE: &[&str] = &[
+    "cat", "head", "tail", "wc", "ls", "dir", "pwd", "echo", "printf", "true", "false", ":",
+    "test", "[", "[[", "read", "cd", "chdir", "pushd", "popd", "basename", "dirname", "realpath",
+    "readlink", "stat", "du", "df", "grep", "egrep", "fgrep", "cut", "tr", "nl", "diff", "cmp",
+    "comm", "rev", "tac", "od", "hexdump", "md5sum", "sha1sum", "sha256sum", "seq", "column",
+    "expand", "fold", "paste", "jq", "which", "where", "type", "whoami", "uname", "cygpath",
+    "strings", "findstr", "more", "fc", "sleep", "exit", "return", "break", "continue", "shift",
+    // Only reaches classification as `command -v NAME` (otherwise it is a runner).
+    "command",
+    "get-childitem", "gci", "get-content", "gc", "select-string", "sls", "test-path", "get-item",
+    "gi", "resolve-path", "split-path", "join-path", "get-location", "gl", "set-location", "sl",
+    "write-output", "write-host", "measure-object", "sort-object", "select-object",
+    "format-list", "format-table", "out-string", "get-filehash", "get-itemproperty",
+    "get-command", "gcm",
+];
+
+/// The words of `simple` that form a command, past control-flow keywords: `None` for
+/// constructs never judged (`case`, `function`, cmd `if`/`for`), an empty slice for a
+/// keyword alone (`done`, `fi`, a `for` header, `rem`).
+pub(crate) fn command_words(words: &[Word], dialect: Dialect) -> Option<&[Word]> {
+    let mut rest = words;
+    while let Some(first) = rest.first().filter(|word| !word.quoted && !word.dynamic) {
+        let keyword = first.text.to_ascii_lowercase();
+        match (dialect, keyword.as_str()) {
+            (
+                Dialect::Posix,
+                "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "time",
+            ) => rest = &rest[1..],
+            (Dialect::Posix, "fi" | "done" | "for") => return Some(&[]),
+            (Dialect::Posix, "case" | "esac" | "select" | "function" | "coproc") => return None,
+            (Dialect::Cmd, "rem") => return Some(&[]),
+            (Dialect::Cmd, "if" | "for" | "call" | "goto") => return None,
+            _ => break,
+        }
+    }
+    Some(rest)
+}
+
+/// Variables that change what the shell itself runs or how it splits words: a plain
+/// assignment of any other name only affects later expansions in the same line.
+const SHELL_CONTROL: &[&str] = &[
+    "PATH", "IFS", "CDPATH", "PS4", "PROMPT_COMMAND", "BASH_ENV", "ENV", "SHELLOPTS",
+    "BASHOPTS", "GLOBIGNORE", "HOME", "BASH_FUNC",
+];
+
+/// Exported, a variable also reaches child processes: these make them load or run code.
+fn runs_code_in_children(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "LD_", "DYLD_", "GIT_", "PYTHON", "NODE_", "NPM_CONFIG_", "RUSTC", "CARGO_", "PERL5",
+        "RUBY", "JAVA_", "_JAVA_", "DOTNET_", "MSBUILD", "COMSPEC", "PSMODULEPATH", "EDITOR",
+        "VISUAL", "PAGER", "SSH_", "LESSOPEN", "BROWSER",
+    ];
+    let upper = name.to_ascii_uppercase();
+    SHELL_CONTROL.contains(&upper.as_str())
+        || PREFIXES.iter().any(|prefix| upper.starts_with(prefix))
+        || upper == "RUSTFLAGS"
+}
+
+/// `NAME=value` (or a bare `NAME` for `unset`/`local`) that cannot change what later
+/// commands run; `exported` for `export`/`declare -x`, which reach child processes.
+pub(crate) fn harmless_variable(word: &str, exported: bool) -> bool {
+    let (name, value) = word.split_once('=').unwrap_or((word, ""));
+    shell::is_assignment(&format!("{name}="))
+        && if exported {
+            !runs_code_in_children(name) || inert_value(name, value)
+        } else {
+            !SHELL_CONTROL.contains(&name.to_ascii_uppercase().as_str())
+        }
+}
+
+/// A value that names no program, library or path to load: `GIT_PAGER=cat`,
+/// `GIT_TERMINAL_PROMPT=0`, `PYTHONIOENCODING=utf-8`. `GIT_CONFIG_KEY_n` only names a
+/// setting; its value is judged through `GIT_CONFIG_VALUE_n`.
+fn inert_value(name: &str, value: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper == "GIT_CONFIG_COUNT" {
+        return value.chars().all(|c| c.is_ascii_digit());
+    }
+    if upper.starts_with("GIT_CONFIG_KEY_") {
+        return !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    }
+    !SHELL_CONTROL.contains(&upper.as_str())
+        && matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "1" | "true" | "false" | "yes" | "no" | "cat" | ":" | "dumb" | "never"
+                | "always" | "auto" | "utf-8" | "utf8" | "off" | "on"
+        )
+}
+
+/// A PowerShell statement that is a value, not a command: `$_.Length -gt 1` in a
+/// `Where-Object` block. Assignments are not values.
+pub(crate) fn powershell_value(words: &[Word]) -> bool {
+    words.iter().all(|word| {
+        let text = word.text.as_str();
+        !word.block && !(text.ends_with('=') && !text.starts_with('-'))
+    })
+}
+
 fn classify_simple(simple: &Simple, dialect: Dialect) -> Category {
-    if simple.words.is_empty()
-        || simple.words[0].dynamic
-        || simple
-            .redirects
-            .iter()
-            .any(|r| !r.op.starts_with('<') && !discards(&r.target))
+    if simple
+        .redirects
+        .iter()
+        .any(|r| !r.op.starts_with('<') && !discards(&r.target))
         || simple
             .redirects
             .iter()
@@ -173,22 +355,72 @@ fn classify_simple(simple: &Simple, dialect: Dialect) -> Category {
     {
         return Category::Unknown;
     }
-    let words: Vec<&str> = simple.argv();
-    if dialect == Dialect::PowerShell
-        && matches!(
-            shell::program_name(words[0]).as_str(),
-            "where"
-                | "where-object"
-                | "?"
-                | "foreach"
-                | "foreach-object"
-                | "%"
-                | "invoke-expression"
-                | "iex"
-        )
+    let Some(words) = command_words(&simple.words, dialect) else {
+        return Category::Unknown;
+    };
+    let Some(first) = words.first() else {
+        return Category::Safe;
+    };
+    if first.block {
+        // A script block literal does not run; its commands are judged on their own.
+        return Category::Safe;
+    }
+    if first.dynamic {
+        return if dialect == Dialect::PowerShell
+            && first.text.starts_with('$')
+            && powershell_value(words)
+        {
+            Category::Safe
+        } else {
+            Category::Unknown
+        };
+    }
+    let argv: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+    let rest = shell::strip_runners(&argv);
+    let offset = argv.len() - rest.len();
+    let Some(program) = rest.first() else {
+        // Only assignments: harmless unless they set what later commands run with.
+        // (`env` or `timeout 5` alone also strip to nothing, but are not assignments.)
+        return if argv
+            .iter()
+            .all(|word| shell::is_assignment(word) && harmless_variable(word, false))
+        {
+            Category::Safe
+        } else {
+            Category::Unknown
+        };
+    };
+    let name = shell::program_name(program);
+    if dialect == Dialect::PowerShell {
+        let args = &words[offset + 1..];
+        match name.as_str() {
+            "invoke-expression" | "iex" => return Category::Unknown,
+            // Filters run their block (judged separately) or compare properties.
+            "where-object" | "where" | "?" => {
+                return if args.iter().any(|w| w.dynamic) {
+                    Category::Unknown
+                } else {
+                    Category::Safe
+                };
+            }
+            // Without a block, `ForEach-Object Delete` calls a method on every item.
+            "foreach-object" | "foreach" | "%" => {
+                return if args.iter().all(|w| w.block || w.text.starts_with('-')) {
+                    Category::Safe
+                } else {
+                    Category::Unknown
+                };
+            }
+            _ => {}
+        }
+    }
+    if words[..offset].iter().any(|w| w.dynamic)
+        || (words[offset + 1..].iter().any(|w| w.dynamic || w.block)
+            && !PURE.contains(&name.as_str()))
     {
         return Category::Unknown;
     }
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     classify_words(&words)
 }
 
@@ -220,6 +452,10 @@ pub fn classify_words(words: &[&str]) -> Category {
     {
         return classify_build(name, &words[1..]);
     }
+    // `[ -f x ]` and `[[ ... ]]` only test.
+    if matches!(*exe, "[" | "[[") {
+        return Category::Safe;
+    }
     if exe.contains(['/', '\\', '$', '=', '*', '?', '[']) || exe.starts_with('-') {
         return Category::Unknown;
     }
@@ -227,6 +463,20 @@ pub fn classify_words(words: &[&str]) -> Category {
     let args = &words[1..];
     if args.iter().any(|arg| unc(arg)) {
         return Category::Unknown;
+    }
+    // A known toolchain asked only for its version, help or installed SDKs.
+    if TOOLCHAINS.contains(&name.as_str())
+        && !args.is_empty()
+        && args.iter().all(|arg| INFO_ARGS.contains(arg))
+    {
+        return Category::Safe;
+    }
+    // Any installed program asked only for its version or usage prints and exits.
+    if matches!(args, ["--version" | "--help"]) {
+        return Category::Safe;
+    }
+    if query(&name, args) {
+        return Category::Safe;
     }
     match name.as_str() {
         "git" => classify_git(args),
@@ -241,18 +491,66 @@ pub fn classify_words(words: &[&str]) -> Category {
         | "format-table" | "out-string" | "get-filehash" | "split-path" | "join-path"
         | "get-itemproperty" | "strings" | "cygpath" | "file" | "readlink" | "tac" | "rev"
         | "tr" | "od" | "hexdump" | "md5sum" | "sha1sum" | "sha256sum" | "seq" | "column"
-        | "expand" | "fold" | "paste" | "jq" => {
+        | "expand" | "fold" | "paste" | "jq" | "read" | "test" | "printf" | "false" | ":"
+        | "findstr" | "ver" | "vol" | "chdir" | "more" | "fc" | "sleep" | "exit" | "return"
+        | "break" | "continue" | "shift" | "wait" => {
+            let positional = args.iter().filter(|a| !a.starts_with('-')).count();
             if name == "sort"
                 && args.iter().any(|a| {
                     a.starts_with("-o")
                         || a.starts_with("--output")
+                        // cmd's `sort /o file` writes too.
+                        || a.eq_ignore_ascii_case("/o")
                         // GNU sort runs this program on its temp files: arbitrary execution.
                         || a.starts_with("--compress-program")
                 })
+                // `uniq IN OUT` writes OUT.
+                || name == "uniq" && positional > 1
             {
                 Category::Unknown
             } else {
                 Category::Safe
+            }
+        }
+        // Shell state only; uppercase names (PATH, IFS, LD_PRELOAD) change what later commands do.
+        "set" | "export" | "unset" | "local" | "declare" | "typeset" | "readonly" => {
+            let flags_only = args.iter().all(|a| {
+                a.starts_with('-')
+                    || a.starts_with('+')
+                    || matches!(*a, "pipefail" | "errexit" | "nounset" | "xtrace")
+            });
+            let exported = matches!(name.as_str(), "export" | "declare" | "typeset" | "readonly")
+                && (name == "export" || args.iter().any(|a| a.starts_with('-') && a.contains('x')));
+            let names_only = name != "set"
+                && args
+                    .iter()
+                    .all(|a| a.starts_with('-') || harmless_variable(a, exported));
+            if flags_only || names_only {
+                Category::Safe
+            } else {
+                Category::Unknown
+            }
+        }
+        // Runs one command per input line; the input is unknown, so only pure readers.
+        "xargs" => {
+            let mut rest = args;
+            while let Some(first) = rest.first().filter(|a| a.starts_with('-')) {
+                rest = match *first {
+                    "-I" | "-n" | "-P" | "-L" | "-d" | "-E" | "-s" | "-a" => {
+                        rest.get(2..).unwrap_or(&[])
+                    }
+                    _ => &rest[1..],
+                };
+            }
+            match rest.first() {
+                None => Category::Safe,
+                Some(program)
+                    if PURE.contains(&shell::program_name(program).as_str())
+                        && classify_words(rest) == Category::Safe =>
+                {
+                    Category::Safe
+                }
+                Some(_) => Category::Unknown,
             }
         }
         "command" if args.len() >= 2 && matches!(args[0], "-v" | "-V") => Category::Safe,
@@ -318,7 +616,6 @@ pub fn classify_words(words: &[&str]) -> Category {
             Some(&("test" | "build" | "run")) if !args.iter().any(|a| a.starts_with("--force")) => {
                 Category::Build
             }
-            Some(&("--version" | "--info" | "--list-sdks")) => Category::Safe,
             _ => Category::Unknown,
         },
         "pytest" | "gofmt" | "rustfmt" | "jest" | "vitest" | "mocha" | "eslint" | "prettier"
@@ -360,7 +657,7 @@ pub fn classify_words(words: &[&str]) -> Category {
 /// `sed` that only prints: no in-place editing, no script file, and scripts made of
 /// address/print commands or substitutions without the `w` and `e` flags (the
 /// commands that write files or run programs).
-fn sed_prints_only(args: &[&str]) -> bool {
+pub(crate) fn sed_prints_only(args: &[&str]) -> bool {
     let mut scripts = Vec::new();
     let mut iter = args.iter();
     let mut positional = Vec::new();
@@ -436,7 +733,7 @@ fn sed_script_prints_only(script: &str) -> bool {
     }
 }
 
-fn git_subcommand<'a>(args: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+pub(crate) fn git_subcommand<'a>(args: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
     let mut rest = args;
     while let Some(first) = rest.first().filter(|a| a.starts_with('-')) {
         match *first {
@@ -478,7 +775,7 @@ const GIT_READ_ONLY: &[&str] = &[
     "show-branch",
 ];
 
-fn classify_git(args: &[&str]) -> Category {
+pub(crate) fn classify_git(args: &[&str]) -> Category {
     if matches!(args, ["--version" | "--help"]) {
         return Category::Safe;
     }
@@ -1078,7 +1375,9 @@ mod tests {
         assert_eq!(posix("git status; cargo build"), Category::Build);
         assert_eq!(posix("echo hi > file.txt"), Category::Unknown);
         assert_eq!(posix("echo hi 2>/dev/null"), Category::Safe);
-        assert_eq!(posix("cat $(which x)"), Category::Unknown);
+        // The substitution is judged on its own; `cat` cannot be turned into a writer.
+        assert_eq!(posix("cat $(which x)"), Category::Safe);
+        assert_eq!(posix("sort $(cat opts.txt) a.txt"), Category::Unknown);
         assert_eq!(posix("find . -name x -delete"), Category::Unknown);
         assert_eq!(posix("git diff --ext-diff"), Category::Unknown);
         assert_eq!(posix("rm -rf /"), Category::Dangerous);
@@ -1093,6 +1392,120 @@ mod tests {
     }
 
     #[test]
+    fn listing_source_files_with_find_sed_sort_head_is_read_only() {
+        let command = r"find /g/hytech/quote-hub/src -maxdepth 3 -type f \( -name '*.cs' -o -name '*.csproj' \) | sed 's#^/g/hytech/quote-hub/##' | sort | head -200";
+        assert!(read_only(command, Dialect::Posix));
+    }
+
+    #[test]
+    fn control_flow_and_substitutions_are_judged_command_by_command() {
+        let posix = |c| classify(c, Dialect::Posix);
+        for safe in [
+            r#"cd /g/hytech/quote-hub && git ls-files 'src/QuoteHub.Sources.Crypto/**' | while read f; do wc -l "$f"; done | sort -n"#,
+            r#"for f in *.rs; do cat "$f"; done"#,
+            "if [ -f a ]; then cat a; else echo none; fi",
+            "cat $(git ls-files '*.md')",
+            "( cd src && ls )",
+            "{ ls; pwd; }",
+            "set -euo pipefail; ls",
+            "f=README.md; wc -l \"$f\"",
+            "git ls-files | xargs wc -l",
+            "uniq a.txt",
+        ] {
+            assert_eq!(posix(safe), Category::Safe, "{safe}");
+        }
+        for unknown in [
+            r#"for f in *; do rm "$f"; done"#,
+            "echo $(touch x)",
+            "sort $opts a.txt",
+            "git ls-files | xargs rm",
+            "uniq a.txt b.txt",
+            "f() { ls; }; f",
+            "case $x in a) ls;; esac",
+            "PATH=/tmp:$PATH; ls",
+            "$cmd -x",
+        ] {
+            assert_eq!(posix(unknown), Category::Unknown, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn powershell_blocks_and_cmd_builtins() {
+        let ps = |c| classify(c, Dialect::PowerShell);
+        for safe in [
+            "Get-ChildItem -Recurse | Where-Object { $_.Length -gt 1 } | Select-Object FullName",
+            "Get-ChildItem *.cs | ForEach-Object { Get-Content $_.FullName | Measure-Object -Line }",
+            "Get-ChildItem | Where-Object Name -like '*.rs'",
+        ] {
+            assert_eq!(ps(safe), Category::Safe, "{safe}");
+        }
+        for unknown in [
+            "Get-ChildItem | ForEach-Object { Remove-Item $_ }",
+            "Get-ChildItem | ForEach-Object Delete",
+            "Get-ChildItem | Where-Object { $x = 1 }",
+            "Get-ChildItem | Where-Object $filter",
+            "$items.Delete()",
+        ] {
+            assert_eq!(ps(unknown), Category::Unknown, "{unknown}");
+        }
+        let cmd = |c| classify(c, Dialect::Cmd);
+        for safe in ["dir /s /b src", "type a.txt | findstr foo", "echo %PATH%", "rem note"] {
+            assert_eq!(cmd(safe), Category::Safe, "{safe}");
+        }
+        for unknown in ["del /q x", "if exist a (del a)", "sort /o out.txt in.txt", "for %f in (*) do del %f"] {
+            assert_eq!(cmd(unknown), Category::Unknown, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn the_host_dialect_is_the_shell_the_tool_runs() {
+        assert_eq!(
+            Dialect::host(),
+            Dialect::of(crate::process::Shell::current().kind)
+        );
+        // A neutral line stays on the default shell; a PowerShell one goes to PowerShell when installed.
+        assert_eq!(Dialect::for_command("git status"), Dialect::host());
+        if crate::process::Shell::available(crate::process::ShellKind::PowerShell).is_some() {
+            assert_eq!(
+                Dialect::for_command("Get-ChildItem | Select-String x"),
+                Dialect::PowerShell
+            );
+        }
+    }
+
+    #[test]
+    fn toolchain_version_and_listing_flags_are_read_only() {
+        for command in [
+            "dotnet --list-sdks && dotnet --list-runtimes | head -30",
+            "node -v && npm --version",
+            "java -version",
+            "python --version; go version",
+            "docker version",
+            "dotnet package search Pomelo.EntityFrameworkCore.MySql --take 10 2>&1 | head -60",
+            "cargo search serde --limit 3",
+            "gh pr view 12 --json title",
+            r#"P=/c/Users/v/AppData/Local/hermes/venv/Scripts; echo "--- dir ---"; ls -la "$P" | head -30; echo; hermes --version 2>&1 | head -20; echo "exit=$?""#,
+            r#"echo "$PATH" | tr ':' '\n'; for n in herness harness hermes; do printf '%-10s -> ' "$n"; command -v "$n" 2>/dev/null || echo "(not found)"; done"#,
+            "export FOO=1; echo $FOO",
+        ] {
+            assert!(read_only(command, Dialect::Posix), "{command}");
+        }
+        for command in [
+            "dotnet --list-sdks --install x",
+            "dotnet package add x",
+            "npm -v install",
+            "./node -v",
+            "gh pr view 12 --web",
+            "hermes --version --upgrade",
+            "IFS=x; ls",
+            "export LD_PRELOAD=/tmp/x.so; ls",
+            "export GIT_SSH_COMMAND=x",
+        ] {
+            assert!(!read_only(command, Dialect::Posix), "{command}");
+        }
+    }
+
+    #[test]
     fn powershell_lines() {
         let ps = |c| classify(c, Dialect::PowerShell);
         assert_eq!(
@@ -1101,7 +1514,7 @@ mod tests {
         );
         assert_eq!(
             ps("Get-ChildItem | Where-Object { $_.Length -gt 1 }"),
-            Category::Unknown
+            Category::Safe
         );
         assert_eq!(ps("Set-Content x.txt hi"), Category::Unknown);
         assert_eq!(ps("dotnet test"), Category::Build);

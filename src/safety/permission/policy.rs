@@ -143,7 +143,7 @@ pub fn same_project(a: &Path, b: &Path) -> bool {
 /// Simple commands of a shell line in both dialects, runner-stripped, lowercase program.
 fn simple_commands(command: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    for dialect in [Dialect::Posix, Dialect::PowerShell] {
+    for dialect in Dialect::ALL {
         let line = shell::parse(command, dialect);
         for simple in line.commands() {
             let argv: Vec<String> = simple.argv().iter().map(|w| (*w).to_owned()).collect();

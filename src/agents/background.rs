@@ -106,13 +106,19 @@ impl Authorizer for BackgroundAuthorizer {
             }
             // Same decision as the foreground task, judged in the agent's own tree.
             let roots = [self.root.clone()];
+            let dialect = match &effect {
+                Effect::Shell(command) => {
+                    crate::safety::permission::shell::Dialect::for_command(command)
+                }
+                _ => crate::safety::permission::shell::Dialect::host(),
+            };
             let decision = crate::safety::permission::decide(
                 self.mode,
                 &effect,
                 &[],
                 &self.root,
                 Some(&roots),
-                crate::safety::permission::shell::Dialect::host(),
+                dialect,
             );
             let description = describe(&effect);
             match decision {

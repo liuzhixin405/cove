@@ -21,7 +21,7 @@ fn catastrophic_at(command: &str, depth: usize) -> Option<String> {
     if let Some(name) = fork_bomb(&strip_quoted(&command)) {
         return Some(format!("fork bomb {name}()"));
     }
-    for dialect in [Dialect::Posix, Dialect::PowerShell] {
+    for dialect in Dialect::ALL {
         let line = shell::parse(&command, dialect);
         for inner in &line.substitutions {
             if let Some(why) = catastrophic_at(inner, depth + 1) {
@@ -321,13 +321,13 @@ fn file_key(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-enum Nested {
+pub(crate) enum Nested {
     Text(String),
     Encoded,
 }
 
 /// The script text a nested shell runs: `sh -c '...'`, `cmd /c ...`, `powershell -Command ...`.
-fn unwrap_shell(words: &[String]) -> Option<Nested> {
+pub(crate) fn unwrap_shell(words: &[String]) -> Option<Nested> {
     let exe = words.first()?;
     let name = shell::program_name(exe);
     let args = &words[1..];
@@ -409,7 +409,7 @@ fn git_shell_aliases(args: &[String]) -> Vec<String> {
 }
 
 /// The command `xargs` starts, without xargs' own options.
-fn xargs_command(args: &[String]) -> Vec<String> {
+pub(crate) fn xargs_command(args: &[String]) -> Vec<String> {
     let mut index = 0;
     while let Some(arg) = args.get(index) {
         if !arg.starts_with('-') {
@@ -837,7 +837,7 @@ fn find_check(args: &[String]) -> Option<String> {
 /// Commands that are allowed but deserve a warning: history rewrites and working-tree wipes.
 pub fn risky(command: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for dialect in [Dialect::Posix, Dialect::PowerShell] {
+    for dialect in Dialect::ALL {
         let line = shell::parse(command, dialect);
         for simple in line.commands() {
             let argv = argv(simple);

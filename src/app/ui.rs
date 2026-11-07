@@ -24,6 +24,13 @@ pub struct ConsoleInput;
 impl UserInput for ConsoleInput {
     fn answer(&self, prompt: String, cancel: CancellationToken) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
+            // One question at a time: a new one would withdraw the one being answered
+            // (approvals, lock waits, gates, the question tool, loop detection).
+            static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _turn = tokio::select! {
+                turn = TURN.lock() => turn,
+                () = cancel.cancelled() => return Err(Error::Cancelled),
+            };
             if let Some(console) = console::active() {
                 let prompt = if console::rich() {
                     approval_box(&prompt)

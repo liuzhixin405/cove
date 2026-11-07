@@ -16,6 +16,8 @@ pub enum ShellKind {
     Posix,
     /// Windows PowerShell or pwsh; the script is fed through stdin.
     PowerShell,
+    /// Windows cmd.exe, run with `/d /s /c`.
+    Cmd,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,34 +58,85 @@ impl Shell {
 
     /// Git Bash, then a non-WSL bash on PATH, then PowerShell on Windows; bash or sh elsewhere.
     pub fn detect() -> Self {
+        Self::bash().unwrap_or_else(Self::powershell)
+    }
+
+    /// bash or sh; on Windows Git Bash or a non-WSL bash on PATH, if any.
+    fn bash() -> Option<Self> {
         if !cfg!(windows) {
             let path = which::which("bash")
                 .or_else(|_| which::which("sh"))
                 .unwrap_or_else(|_| "/bin/sh".into());
-            return Self {
+            return Some(Self {
                 kind: ShellKind::Posix,
                 path,
-            };
+            });
         }
         if let Some(path) = git_bash(
             which::which("git").ok().as_deref(),
             &|name| std::env::var(name).ok(),
             &|path| path.is_file(),
         ) {
-            return Self {
+            return Some(Self {
                 kind: ShellKind::Posix,
                 path,
-            };
+            });
         }
-        if let Ok(path) = which::which("bash")
-            && !is_wsl_launcher(&path)
-        {
-            return Self {
+        which::which("bash")
+            .ok()
+            .filter(|path| !is_wsl_launcher(path))
+            .map(|path| Self {
                 kind: ShellKind::Posix,
                 path,
-            };
+            })
+    }
+
+    fn cmd() -> Option<Self> {
+        if !cfg!(windows) {
+            return None;
         }
-        Self::powershell()
+        let path = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| which::which("cmd").ok())?;
+        Some(Self {
+            kind: ShellKind::Cmd,
+            path,
+        })
+    }
+
+    /// An installed interpreter of `kind`, found once per process.
+    pub fn available(kind: ShellKind) -> Option<&'static Shell> {
+        static FOUND: [OnceLock<Option<Shell>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        let current = Self::current();
+        if current.kind == kind {
+            return Some(current);
+        }
+        FOUND[kind as usize]
+            .get_or_init(|| match kind {
+                ShellKind::Posix => Self::bash(),
+                ShellKind::PowerShell => {
+                    let found = Self::powershell();
+                    (cfg!(windows) || found.path.is_absolute()).then_some(found)
+                }
+                ShellKind::Cmd => Self::cmd(),
+            })
+            .as_ref()
+    }
+
+    /// The interpreter for `command`: the default one, unless the command is plainly
+    /// written for another installed shell (PowerShell cmdlets, cmd `%VAR%`, bash loops).
+    /// Permission checks and execution both use this, so a line is judged in the
+    /// syntax it runs in.
+    pub fn route(command: &str) -> &'static Shell {
+        let current = Self::current();
+        let wanted = match crate::safety::permission::shell::detect(command) {
+            Some(crate::safety::permission::shell::Dialect::Posix) => ShellKind::Posix,
+            Some(crate::safety::permission::shell::Dialect::PowerShell) => ShellKind::PowerShell,
+            Some(crate::safety::permission::shell::Dialect::Cmd) => ShellKind::Cmd,
+            None => return current,
+        };
+        Self::available(wanted).unwrap_or(current)
     }
 
     /// `auto`, `bash`, `powershell`/`pwsh`, `sh`, or a path to a bash/sh/PowerShell executable.
@@ -92,6 +145,7 @@ impl Shell {
         Ok(match value.to_ascii_lowercase().as_str() {
             "" | "auto" => Self::detect(),
             "powershell" | "pwsh" => Self::powershell(),
+            "cmd" => Self::cmd().ok_or_else(|| Error::Tool("shell \"cmd\" is only on Windows".into()))?,
             "bash" | "sh" => {
                 let detected = Self::detect();
                 if detected.kind == ShellKind::Posix {
@@ -111,6 +165,8 @@ impl Shell {
                     .unwrap_or_default();
                 let kind = if stem == "pwsh" || stem == "powershell" {
                     ShellKind::PowerShell
+                } else if stem == "cmd" {
+                    ShellKind::Cmd
                 } else {
                     ShellKind::Posix
                 };
@@ -138,6 +194,7 @@ impl Shell {
     pub fn dialect(&self) -> &'static str {
         match self.kind {
             ShellKind::PowerShell => "PowerShell",
+            ShellKind::Cmd => "cmd",
             ShellKind::Posix => {
                 let stem = self
                     .path

@@ -58,6 +58,62 @@ pub fn json_output(value: Value) -> Result<String> {
     )?))
 }
 
+/// Why `shell` could not run a command written for another shell, read from its errors
+/// (English and Chinese Windows messages).
+fn dialect_mismatch(shell: &Shell, output: &process::CommandOutput) -> Option<&'static str> {
+    let text = format!("{}\n{}", output.stderr, output.stdout).to_lowercase();
+    let signs: &[(&str, &'static str)] = match shell.kind {
+        process::ShellKind::PowerShell => &[
+            ("is not a valid statement separator", "syntax error"),
+            ("不是此版本中的有效语句分隔符", "syntax error"),
+            ("parsererror", "syntax error"),
+            ("unexpected token", "syntax error"),
+            ("意外的标记", "syntax error"),
+            ("is not recognized as the name of a cmdlet", "command not found"),
+            ("识别为 cmdlet", "command not found"),
+        ],
+        process::ShellKind::Posix => &[
+            ("syntax error near unexpected token", "syntax error"),
+            ("command not found", "command not found"),
+            ("未找到命令", "command not found"),
+        ],
+        process::ShellKind::Cmd => &[
+            ("is not recognized as an internal or external command", "command not found"),
+            ("不是内部或外部命令", "command not found"),
+            ("was unexpected at this time", "syntax error"),
+            ("此时不应有", "syntax error"),
+        ],
+    };
+    signs
+        .iter()
+        .find(|(sign, _)| text.contains(sign))
+        .map(|(_, why)| *why)
+}
+
+/// Another installed shell that reads `command` as read-only, so it may run again there
+/// without a new approval: the shell its syntax names first, then the others.
+fn retry_shell(shell: &Shell, command: &str, _why: &str) -> Option<&'static Shell> {
+    use crate::safety::permission::shell::Dialect;
+    let mut order: Vec<process::ShellKind> = Vec::new();
+    if let Some(dialect) = crate::safety::permission::shell::detect(command) {
+        order.push(match dialect {
+            Dialect::Posix => process::ShellKind::Posix,
+            Dialect::PowerShell => process::ShellKind::PowerShell,
+            Dialect::Cmd => process::ShellKind::Cmd,
+        });
+    }
+    order.extend([
+        process::ShellKind::Posix,
+        process::ShellKind::PowerShell,
+        process::ShellKind::Cmd,
+    ]);
+    order
+        .into_iter()
+        .filter(|kind| *kind != shell.kind)
+        .filter(|kind| crate::safety::permission::classify::read_only(command, Dialect::of(*kind)))
+        .find_map(Shell::available)
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {
     pub content: String,
@@ -821,19 +877,56 @@ impl LocalTools {
         if let Some(workspace) = &self.workspace {
             workspace.note_shell()?;
         }
-        let output = process::run_shell(
-            &self.shell,
+        // Routed like the permission check judged it, unless a shell was set explicitly.
+        let shell = if self.shell == *Shell::current() {
+            Shell::route(&args.command)
+        } else {
+            &self.shell
+        };
+        let mut output = process::run_shell(
+            shell,
             &self.root,
             &args.command,
             Duration::from_secs(seconds),
-            cancel,
+            cancel.clone(),
             self.progress.clone(),
         )
         .await?;
+        let mut note = String::new();
+        if (output.code != Some(0) && !output.timed_out)
+            && let Some(mismatch) = dialect_mismatch(shell, &output)
+        {
+            match retry_shell(shell, &args.command, mismatch) {
+                Some(other) => {
+                    output = process::run_shell(
+                        other,
+                        &self.root,
+                        &args.command,
+                        Duration::from_secs(seconds),
+                        cancel,
+                        self.progress.clone(),
+                    )
+                    .await?;
+                    note = format!(
+                        "[note: {} could not run this ({mismatch}); it was run read-only in {} instead. Write {} syntax next time.]\n",
+                        shell.dialect(),
+                        other.dialect(),
+                        other.dialect()
+                    );
+                }
+                None => {
+                    note = format!(
+                        "[hint: {} could not run this ({mismatch}). The shell tool runs {}; rewrite the command in that syntax.]\n",
+                        shell.dialect(),
+                        shell.describe()
+                    );
+                }
+            }
+        }
         Ok(ToolOutput {
             failed: output.code != Some(0) || output.timed_out,
             content: format!(
-                "exit_code={:?} timed_out={} truncated={} encoding_warning={}\nstdout:\n{}\nstderr:\n{}",
+                "{note}exit_code={:?} timed_out={} truncated={} encoding_warning={}\nstdout:\n{}\nstderr:\n{}",
                 output.code,
                 output.timed_out,
                 output.truncated,
@@ -942,7 +1035,7 @@ impl ToolExecutor for LocalTools {
             definition(
                 "shell",
                 &format!(
-                    "Run a command in {} in the workspace directory; write that shell's syntax. Non-interactive: no pager, editor or credential prompt, colours off. \
+                    "Run a command in {} in the workspace directory; write that shell's syntax. A command plainly written for another installed shell (PowerShell cmdlets, cmd %VAR%) runs in that shell. Non-interactive: no pager, editor or credential prompt, colours off. \
                      Default timeout 120 s (300 s for builds and test suites), at most 600 (timeout_seconds). Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). No background jobs. Host access is NOT sandboxed. \
                      Not for reading or searching files: read, grep and glob are faster, need no approval and skip ignored directories.",
                     self.shell.describe()
@@ -1052,5 +1145,49 @@ impl ToolExecutor for LocalTools {
                 Err(err) => Ok(failed(err.to_string())),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(stderr: &str) -> process::CommandOutput {
+        process::CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            truncated: false,
+            timed_out: false,
+            encoding_warning: false,
+        }
+    }
+
+    #[test]
+    fn dialect_mismatches_are_read_from_english_and_chinese_errors() {
+        let shell = |kind| Shell {
+            kind,
+            path: "x".into(),
+        };
+        let ps = shell(process::ShellKind::PowerShell);
+        assert_eq!(
+            dialect_mismatch(&ps, &output("标记“&&”不是此版本中的有效语句分隔符。")),
+            Some("syntax error")
+        );
+        assert_eq!(
+            dialect_mismatch(&ps, &output("无法将“grep”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。")),
+            Some("command not found")
+        );
+        let bash = shell(process::ShellKind::Posix);
+        assert_eq!(
+            dialect_mismatch(&bash, &output("bash: Get-ChildItem: command not found")),
+            Some("command not found")
+        );
+        let cmd = shell(process::ShellKind::Cmd);
+        assert_eq!(
+            dialect_mismatch(&cmd, &output("'grep' 不是内部或外部命令，也不是可运行的程序")),
+            Some("command not found")
+        );
+        assert_eq!(dialect_mismatch(&bash, &output("error: test failed")), None);
     }
 }

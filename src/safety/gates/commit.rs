@@ -78,7 +78,7 @@ const FLAG_OPTIONS: &[&str] = &[
 
 /// A commit the gate can judge: exactly `git commit` with options that keep the staged set.
 fn check_shape(command: &str) -> std::result::Result<(), String> {
-    let line = shell::parse(command, Dialect::host());
+    let line = shell::parse(command, Dialect::for_command(command));
     let commands: Vec<_> = line.commands().collect();
     let split = "the pre-commit gate needs the commit on its own: stage with a separate `git add`, then run `git commit -m ...` alone (no cd, chaining or push in the same command)";
     if !line.opaque.is_empty() || commands.len() != 1 || !commands[0].redirects.is_empty() {

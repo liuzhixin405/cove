@@ -312,7 +312,8 @@ pub async fn shell(
     shell_configured(cwd, script, timeout, cancel, None).await
 }
 
-/// `shell` that also forwards output lines to `progress` while the command runs.
+/// Runs `script` in the shell it is routed to (as permission checks judge it),
+/// forwarding output lines to `progress` while it runs.
 pub async fn shell_live(
     cwd: &Path,
     script: &str,
@@ -321,7 +322,7 @@ pub async fn shell_live(
     progress: Option<Arc<Progress>>,
 ) -> Result<CommandOutput> {
     run(
-        &Shell::legacy(),
+        Shell::route(script),
         cwd,
         script,
         timeout,
@@ -390,6 +391,26 @@ fn command_for(shell: &Shell, script: &str) -> (Command, Option<String>) {
                 command.stdin(Stdio::null());
                 (command, None)
             }
+        }
+        ShellKind::Cmd => {
+            // `/c` runs one line: join the lines as `&`-separated commands.
+            let line = script
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" & ");
+            #[cfg(windows)]
+            {
+                // cmd does not follow the usual argv quoting; `/s` strips exactly the outer quotes.
+                command.raw_arg(format!("/d /s /c \"{line}\""));
+            }
+            #[cfg(unix)]
+            command.args(["/d", "/s", "/c", &line]);
+            // Otherwise cmd runs `git.bat` from the workspace before the real git.
+            command.env("NoDefaultCurrentDirectoryInExePath", "1");
+            command.stdin(Stdio::null());
+            (command, None)
         }
     }
 }
@@ -686,5 +707,25 @@ mod tests {
             .expect("lock wait not detected");
         assert_eq!(line.as_deref(), Some("Blocking waiting for file lock on build directory"));
         capture.await.unwrap().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_runs_quoted_and_multi_line_scripts() {
+        let shell = Shell::available(ShellKind::Cmd).expect("cmd.exe");
+        let dir = tempfile::tempdir().unwrap();
+        let output = run_shell(
+            shell,
+            dir.path(),
+            "echo \"a & b\"\necho %OS%",
+            Duration::from_secs(20),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.code, Some(0), "{}", output.stderr);
+        assert!(output.stdout.contains("\"a & b\""), "{}", output.stdout);
+        assert!(output.stdout.contains("Windows_NT"), "{}", output.stdout);
     }
 }

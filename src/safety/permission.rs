@@ -6,6 +6,7 @@
 
 pub mod classify;
 pub mod policy;
+pub mod risk;
 pub mod safety;
 pub mod shell;
 
@@ -116,21 +117,13 @@ pub fn mode_default(
             Decision::Allow
         }
         (Mode::Plan, _) => Decision::Deny("plan mode: only read operations are allowed".into()),
-        (Mode::Default, Effect::Shell(command)) if classify::read_only(command, dialect) => {
-            Decision::Allow
-        }
-        (Mode::Default | Mode::Auto, Effect::Shell(command))
-            if classify::local_git(command, dialect) =>
-        {
-            Decision::Allow
-        }
         (Mode::Auto, Effect::Shell(command)) if classify::auto_approvable(command, dialect) => {
             Decision::Allow
         }
-        // Builds and tests run without asking; formatters and autofixers still ask.
-        (Mode::Default, Effect::Shell(command))
-            if classify::auto_approvable(command, dialect)
-                && !classify::may_rewrite_sources(command, dialect) =>
+        // Only lines that change files, remote state or the system, or run code that
+        // cannot be read first, ask; everything else runs.
+        (Mode::Default | Mode::Auto, Effect::Shell(command))
+            if risk::reasons(command, dialect).is_empty() =>
         {
             Decision::Allow
         }
@@ -141,8 +134,14 @@ pub fn mode_default(
             Decision::Allow
         }
         (Mode::Auto, Effect::Network(_) | Effect::Process(_)) => Decision::Allow,
+        (Mode::Default, Effect::Network(request)) if reads_web(request) => Decision::Allow,
         _ => Decision::Ask,
     }
+}
+
+/// The web tools' searches and page fetches only read, like `curl https://...`.
+fn reads_web(request: &str) -> bool {
+    request.starts_with("web search via ") || request.starts_with("fetch ")
 }
 
 /// Who put the session in plan mode; the model may only leave a plan mode it entered.
@@ -170,7 +169,16 @@ pub struct Permissions {
     project: PathBuf,
     roots: Vec<PathBuf>,
     input: Option<Arc<dyn UserInput>>,
-    dialect: Dialect,
+    /// One question at a time: a new one would withdraw the one being answered.
+    asking: tokio::sync::Mutex<()>,
+}
+
+/// The syntax a shell effect is judged in: that of the shell it will run in.
+fn dialect_of(effect: &Effect) -> Dialect {
+    match effect {
+        Effect::Shell(command) => Dialect::for_command(command),
+        _ => Dialect::host(),
+    }
 }
 
 impl Permissions {
@@ -192,7 +200,7 @@ impl Permissions {
             project,
             roots,
             input,
-            dialect: Dialect::host(),
+            asking: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -316,7 +324,7 @@ impl Permissions {
             borrowed,
             &self.project,
             Some(&self.roots),
-            self.dialect,
+            dialect_of(effect),
         )
     }
 
@@ -327,8 +335,13 @@ impl Permissions {
         let mut head = "需要批准".to_owned();
         let mut warnings = String::new();
         if let Effect::Shell(command) = &effect {
-            let category = classify::classify(command, self.dialect);
-            head.push_str(&format!(" · 命令类型：{}", category.label()));
+            let reasons = risk::reasons(command, dialect_of(&effect));
+            if reasons.is_empty() {
+                let category = classify::classify(command, dialect_of(&effect));
+                head.push_str(&format!(" · 命令类型：{}", category.label()));
+            } else {
+                head.push_str(&format!(" · 原因：{}", reasons.join("；")));
+            }
             for warning in safety::risky(command) {
                 warnings.push_str(&format!("\n警告：{warning}"));
             }
@@ -340,7 +353,7 @@ impl Permissions {
         };
         // Choices in the manner of Claude Code and Codex: once, this session, always in
         // this project (naming what the rule will cover), or no with a reason.
-        let rule = policy::remember_rule(&effect, &self.project, self.dialect);
+        let rule = policy::remember_rule(&effect, &self.project, dialect_of(&effect));
         let lasting = self.store.is_some();
         let mut options = vec!["1. 允许这一次 (y)".to_owned()];
         let mut keys = vec!["y"];
@@ -544,7 +557,15 @@ impl Authorizer for Permissions {
     fn authorize(&self, effect: Effect, cancel: CancellationToken) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let decision = self.decide(&effect);
-            match authorize_with(decision, effect, &cancel).await? {
+            let Some(effect) = authorize_with(decision, effect, &cancel).await? else {
+                return Ok(());
+            };
+            let _turn = tokio::select! {
+                turn = self.asking.lock() => turn,
+                () = cancel.cancelled() => return Err(Error::Cancelled),
+            };
+            // An answer given while this one waited ("this session", "always") may cover it.
+            match authorize_with(self.decide(&effect), effect, &cancel).await? {
                 None => Ok(()),
                 Some(effect) => self.ask(effect, cancel).await,
             }
@@ -567,7 +588,7 @@ impl Authorizer for LocalAuthorizer {
                 &[],
                 Path::new(""),
                 None,
-                Dialect::host(),
+                dialect_of(&effect),
             );
             let Some(effect) = authorize_with(decision, effect, &cancel).await? else {
                 return Ok(());
@@ -692,9 +713,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_session_approval_reuses_only_the_identical_compound_command() {
+    async fn concurrent_questions_wait_their_turn_and_reuse_a_session_answer() {
         let input = Arc::new(Answers(
-            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::new(vec!["s".into()]),
             std::sync::Mutex::default(),
         ));
         let permissions = Permissions::new(
@@ -703,17 +724,45 @@ mod tests {
             Vec::new(),
             Some(input.clone()),
         );
-        let command = r#""/d/tools/llama-server.exe" --list --devices"#;
+        let ask = || permissions.authorize(Effect::Shell("rm -rf build".into()), CancellationToken::new());
+        let (first, second, third) = tokio::join!(ask(), ask(), ask());
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        assert_eq!(input.1.lock().unwrap().len(), 1);
+        // Searching and reading pages are reads.
         permissions
-            .authorize(Effect::Shell(command.into()), CancellationToken::new())
+            .authorize(
+                Effect::Network("web search via duckduckgo: x".into()),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
-        // The same command does not ask again.
-        permissions
-            .authorize(Effect::Shell(command.into()), CancellationToken::new())
-            .await
-            .unwrap();
-        // A changed pipeline is a new command and still asks.
+        assert_eq!(input.1.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_programs_run_but_an_appended_deletion_asks_with_its_reason() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["n".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let permissions = Permissions::new(
+            Mode::Default,
+            std::env::temp_dir(),
+            Vec::new(),
+            Some(input.clone()),
+        );
+        for command in [
+            r#""/d/tools/llama-server.exe" --list --devices"#,
+            r#"cd "/d/llama" && ./llama-bench.exe --help 2>&1 | head -200"#,
+            r#"cd "/d/llama" && ./llama-fit-params.exe -ub 128"#,
+        ] {
+            permissions
+                .authorize(Effect::Shell(command.into()), CancellationToken::new())
+                .await
+                .unwrap();
+        }
         assert!(
             permissions
                 .authorize(
@@ -724,19 +773,14 @@ mod tests {
                 .is_err()
         );
         let prompts = input.1.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
-        assert!(
-            prompts[0].contains("程序 /d/tools/llama-server.exe 的后续调用（参数可变）"),
-            "{}",
-            prompts[0]
-        );
-        assert!(prompts[0].trim_end().ends_with("[y/s/N]"), "{}", prompts[0]);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("原因：删除文件（rm）"), "{}", prompts[0]);
     }
 
     #[tokio::test]
-    async fn local_completion_session_approval_allows_new_prompts_to_the_same_target() {
+    async fn local_completion_queries_into_temp_files_run_without_asking() {
         let input = Arc::new(Answers(
-            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
+            std::sync::Mutex::new(Vec::new()),
             std::sync::Mutex::default(),
         ));
         let permissions = Permissions::new(
@@ -750,117 +794,13 @@ mod tests {
                 "curl -s http://127.0.0.1:9931/completion -H \"Content-Type: application/json\" -d '{{\"prompt\":\"{prompt}\",\"n_predict\":64}}' > {output}; cat {output}"
             )
         };
-        permissions
-            .authorize(
-                Effect::Shell(command("Hello", "/tmp/llama_timing.json")),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        permissions
-            .authorize(
-                Effect::Shell(command("Summarize", "/tmp/llama_timing.json")),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
+        for (prompt, output) in [("Hello", "/tmp/llama_timing.json"), ("Summarize", "/tmp/other.json")] {
             permissions
-                .authorize(
-                    Effect::Shell(command("Summarize", "/tmp/other.json")),
-                    CancellationToken::new()
-                )
+                .authorize(Effect::Shell(command(prompt, output)), CancellationToken::new())
                 .await
-                .is_err()
-        );
-        let prompts = input.1.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
-        assert!(prompts[0].contains("本地模型接口 http://127.0.0.1:9931/completion"));
-        assert!(prompts[0].contains("结果只写入 /tmp/llama_timing.json"));
-    }
-
-    #[tokio::test]
-    async fn help_query_session_approval_covers_binaries_in_that_directory() {
-        let input = Arc::new(Answers(
-            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
-            std::sync::Mutex::default(),
-        ));
-        let permissions = Permissions::new(
-            Mode::Default,
-            std::env::temp_dir(),
-            Vec::new(),
-            Some(input.clone()),
-        );
-        permissions
-            .authorize(
-                Effect::Shell(
-                    r#"cd "/d/llama" && ./llama-bench.exe --help 2>&1 | head -200"#.into(),
-                ),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        permissions
-            .authorize(
-                Effect::Shell(
-                    r#"cd "/d/llama" && ./llama-server.exe --help 2>&1 | head -100"#.into(),
-                ),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            permissions
-                .authorize(
-                    Effect::Shell(r#"cd "/d/other" && ./llama-server.exe --help"#.into()),
-                    CancellationToken::new()
-                )
-                .await
-                .is_err()
-        );
-        let prompts = input.1.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
-        assert!(prompts[0].contains("目录 /d/llama 下程序的只读 --help/--version 查询"));
-    }
-
-    #[tokio::test]
-    async fn executable_session_approval_reuses_only_the_same_program_path() {
-        let input = Arc::new(Answers(
-            std::sync::Mutex::new(vec!["s".into(), "n".into()]),
-            std::sync::Mutex::default(),
-        ));
-        let permissions = Permissions::new(
-            Mode::Default,
-            std::env::temp_dir(),
-            Vec::new(),
-            Some(input.clone()),
-        );
-        permissions
-            .authorize(
-                Effect::Shell(r#"cd "/d/llama" && ./llama-fit-params.exe -ub 128"#.into()),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        permissions
-            .authorize(
-                Effect::Shell(r#"cd "/d/llama" && ./llama-fit-params.exe -ub 256"#.into()),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            permissions
-                .authorize(
-                    Effect::Shell(r#"cd "/d/llama" && ./llama-bench.exe --help"#.into()),
-                    CancellationToken::new()
-                )
-                .await
-                .is_err()
-        );
-        let prompts = input.1.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
-        assert!(prompts[0].contains("程序 /d/llama/llama-fit-params.exe 的后续调用（参数可变）"));
+                .unwrap();
+        }
+        assert!(input.1.lock().unwrap().is_empty());
     }
 
     fn decide_posix(mode: Mode, effect: Effect) -> Decision {

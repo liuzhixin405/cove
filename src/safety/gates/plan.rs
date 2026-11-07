@@ -317,13 +317,13 @@ impl Workflow {
 pub fn mutating(name: &str, input: &Value) -> bool {
     match name {
         "write" | "edit" => true,
-        "shell" => !classify::read_only(
-            input
+        "shell" => {
+            let command = input
                 .get("command")
                 .and_then(Value::as_str)
-                .unwrap_or_default(),
-            Dialect::host(),
-        ),
+                .unwrap_or_default();
+            !classify::read_only(command, Dialect::for_command(command))
+        }
         "agent" => input.get("mode").and_then(Value::as_str) == Some("write"),
         "memory" | "mcp" => input
             .get("action")
