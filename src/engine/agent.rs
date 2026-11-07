@@ -34,6 +34,8 @@ const VERIFY_ROUNDS: u32 = 3;
 /// Read-only tool calls of one batch that run at the same time.
 const CONCURRENT_TOOLS: usize = 8;
 const TRUNCATED_RETRY: &str = "[automatic retry: your previous reply hit the output token limit and was discarded; no tools ran. Redo it with shorter output: split large file contents across several smaller write/edit calls.]";
+/// Cut-off reply streams asked for again (after 2s, 4s, 8s) before the task fails.
+const STREAM_RETRIES: u32 = 3;
 const MALFORMED_RETRY: &str = "[automatic retry: your previous reply was discarded because it had no valid assistant content or its tool calls had missing, duplicate or non-object id/input; no tools ran. Reply again.]";
 
 /// Every tool call has a fresh, non-empty id and an object input.
@@ -1355,6 +1357,7 @@ impl Agent {
         // into the retried request, never into the saved history.
         let mut retry_note: Option<&'static str> = None;
         let mut retried = false;
+        let mut stream_retries = 0;
         loop {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -1472,8 +1475,28 @@ impl Agent {
                         .map_err(|_| err)?;
                     continue;
                 }
+                Err(err)
+                    if stream_retries < STREAM_RETRIES
+                        && crate::model::provider::interrupted_stream(&err) =>
+                {
+                    stream_retries += 1;
+                    emit(
+                        &events,
+                        &cancel,
+                        Event::Notice(format!(
+                            "模型服务连接中途断开（{err}），没有执行任何工具；自动重试 {stream_retries}/{STREAM_RETRIES}"
+                        )),
+                    )
+                    .await?;
+                    tokio::select! {
+                        () = cancel.cancelled() => return Err(Error::Cancelled),
+                        () = tokio::time::sleep(std::time::Duration::from_secs(1 << stream_retries)) => {}
+                    }
+                    continue;
+                }
                 Err(err) => return Err(err),
             };
+            stream_retries = 0;
             calls_used += 1;
             report.model_calls += 1;
             report.usage.input = report.usage.input.saturating_add(response.usage.input);

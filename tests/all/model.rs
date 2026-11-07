@@ -755,6 +755,28 @@ async fn effort_is_changed_from_the_console_and_saved() {
 }
 
 #[tokio::test]
+async fn a_reply_stream_cut_off_midway_is_requested_again() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let cut = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]})
+    );
+    let (url, server) = mock_server(vec![ok(cut), text("whole answer")]).await;
+    let mut command = cove(root.path(), data.path());
+    command
+        .args(["--provider", "openai", "--model", "mock-model", "--base-url", &url])
+        .env("COVE_API_KEY", "k");
+    let output = run(command, Some("hello\n/exit\n")).await;
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("whole answer"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("自动重试 1/3"), "{stderr}");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn context_overflow_compacts_retries_and_learns_the_window() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

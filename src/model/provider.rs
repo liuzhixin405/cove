@@ -112,6 +112,22 @@ pub fn http_status(err: &Error) -> Option<u16> {
     }
 }
 
+/// The reply stream broke off before it finished; nothing from it was used.
+pub fn interrupted_stream(err: &Error) -> bool {
+    let Error::Provider(message) = err else {
+        return false;
+    };
+    [
+        "stream ended without its terminal event",
+        "stream disconnected",
+        "stream idle timeout",
+        "stream frame was not valid JSON",
+        "stream interrupted by a server error",
+    ]
+    .iter()
+    .any(|sign| message.starts_with(sign))
+}
+
 /// The server refused the prompt as larger than its context window.
 pub fn context_overflow(err: &Error) -> bool {
     let Error::Provider(message) = err else {
@@ -1209,9 +1225,24 @@ impl Collector {
             self.done = true;
             return Ok(Vec::new());
         }
-        let value: Value = serde_json::from_str(data)?;
+        let value: Value = serde_json::from_str(data).map_err(|err| {
+            Error::Provider(format!("stream frame was not valid JSON ({err})"))
+        })?;
         if value.get("error").is_some() || value["type"] == "error" {
-            return Err(Error::Provider("server reported a streaming error".into()));
+            let error = value.get("error").unwrap_or(&value);
+            let detail = error["message"]
+                .as_str()
+                .or_else(|| error["type"].as_str())
+                .or_else(|| error.as_str())
+                .unwrap_or_default();
+            let kind = format!("{} {}", error["type"].as_str().unwrap_or_default(), error["code"]);
+            // Overload, rate limits and server faults pass; the reply is asked for again.
+            let transient = ["overload", "rate_limit", "server", "internal", "timeout", "unavailable", "api_error", "529", "503", "502", "500"]
+                .iter()
+                .any(|sign| kind.to_ascii_lowercase().contains(sign) || detail.to_ascii_lowercase().contains(sign));
+            let prefix = if transient { "stream interrupted by a server error" } else { "server reported a streaming error" };
+            let detail: String = detail.chars().take(300).collect();
+            return Err(Error::Provider(format!("{prefix}: {detail}")));
         }
         let mut events = Vec::new();
         match self.protocol {
@@ -1689,6 +1720,24 @@ mod tests {
         );
         assert_eq!(body["thinking"]["type"], "disabled");
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn mid_stream_overload_and_bad_frames_are_retried_and_keep_their_message() {
+        let fail = |protocol, data: &str| Collector::new(protocol).accept(data).unwrap_err();
+        let overloaded = fail(
+            Protocol::Anthropic,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        assert!(interrupted_stream(&overloaded), "{overloaded}");
+        assert!(overloaded.to_string().contains("Overloaded"));
+        assert!(interrupted_stream(&fail(Protocol::Openai, "{\"choices\":[")));
+        let invalid = fail(
+            Protocol::Openai,
+            r#"{"error":{"type":"invalid_request_error","message":"bad tool schema"}}"#,
+        );
+        assert!(!interrupted_stream(&invalid));
+        assert!(invalid.to_string().contains("bad tool schema"));
     }
 
     #[test]
