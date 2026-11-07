@@ -223,7 +223,7 @@ App（组装根）→ Agent 执行内核
 ### 6.2 工具与调度
 
 - 每个工具用专有输入类型反序列化；仅在协议边界使用动态 JSON。
-- `shell` 区分 Git Bash/POSIX sh 与 PowerShell 方言，工具描述写明实际解释器。
+- `shell` 区分 Git Bash/POSIX sh、PowerShell 与 cmd 方言，按命令实际运行的 Shell 判断并执行，工具描述写明实际解释器。
 - 连续的只读调用（read/glob/grep/repo_map、web_fetch/web_search）有界并发；修改类调用逐个执行。工具完成顺序可以不同，但写入历史的结果顺序与调用关联是确定的。
 - `repo_map` 按文件修改时间和大小缓存解析结果，缓存未命中的文件在作用域线程上并行解析。
 - 输出有字节/行数限制；旧工具输出外置到数据目录时有访问边界、生命周期和明确引用。

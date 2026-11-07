@@ -10,7 +10,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 
 - OpenAI Chat Completions 兼容协议、Anthropic Messages 协议的 SSE 流式调用。
 - 文件工具：`read` 读文件（默认 2000 行，可用 `offset`/`limit` 续读）或列目录，支持 GBK/GB18030；`write` 自动建父目录，覆盖前必须读过当前版本；`edit` 支持 `replace_all`、空白容错匹配和缩进映射；`grep`（有 ripgrep 时优先用 rg）和 `glob`（支持 `**`）。详见下文“文件、输出与失败语义”。
-- Shell 自动选择解释器：Windows 上优先 Git Bash，没有时用 PowerShell；工具描述和系统提示会写明实际方言。
+- Shell 自动选择解释器：Windows 上优先 Git Bash，没有时用 PowerShell；工具描述和系统提示会写明实际方言。命令明显是给另一种已安装的 Shell 写的（PowerShell cmdlet、cmd 的 `%VAR%`、bash 循环）时改用那个 Shell 运行，审批也按同一方言判断。
 - `question` 交互式提问：一次可问多个问题，每个问题可带编号选项，按编号或自由文本回答（仅交互模式）；对带选项的问题用自己的话回答时，问卷就此结束，剩下的问题不会拿这段话去作答。
 - `todo` 任务计划清单：多步任务中维护待办项，支持 `priority`、`cancelled`、`id` 和 `depends` 依赖；同一时间至多一项进行中。
 - 连续的只读工具调用（read/glob/grep/repo_map/web_fetch/web_search）并发执行（最多 8 个），结果顺序和日志顺序保持确定；写入和 Shell 仍逐个执行。
@@ -19,7 +19,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - 完成前验证门禁：本轮通过文件工具改过文件时，模型宣布完成后自动运行检查命令；失败输出回给模型继续修，最多 3 轮。
 - `web_fetch` / `web_search`：抓取公网 https 页面（拒绝内网和本机地址），以及通过 Tavily、Brave 或 DuckDuckGo 搜索网页。
 - 子 Agent：六种内置类型（general/explore/plan/review/test/verify）加配置里的自定义类型；`execute_plan` 按 todo 依赖图并行执行计划；worktree 工具；回归验证工具；可持久化、可中断/暂存/唤醒的后台 Agent（各自独立的 git worktree）。详见下文“子 Agent、计划、Worktree 与回归验证”。
-- 集中权限检查：`default`、`plan`、`auto`、`bypass` 四种模式（`ask`/`readonly` 仍可用作别名），交互中用 `/mode` 即时切换；按 sh/PowerShell 语法切分命令的风险分类器；任何模式都拦截的灾难命令；`policies.json` 允许/拒绝/询问规则，审批时可“本项目总是允许”。
+- 集中权限检查：`default`、`plan`、`auto`、`bypass` 四种模式（`ask`/`readonly` 仍可用作别名），交互中用 `/mode` 即时切换；按命令实际运行的 Shell 语法切分、给出“会改动什么”原因的风险判断；任何模式都拦截的灾难命令；`policies.json` 允许/拒绝/询问规则，审批时可“本项目总是允许”。
 - 任务守卫与完成闸门：重复失败熔断、循环检测、收尾催促（空回复、只说不做、todo 未完成、完成自检）、计划模式与 review/once 审阅流程、提交前验证、自审子 Agent、每个任务的验收报告。
 - 有界模型调用次数、输出、上下文、请求空闲时间、任务与命令超时。
 - Ctrl+C 取消、子进程树回收；Windows 使用 Job Object，在加入 Job 后才发送用户脚本。
@@ -157,7 +157,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `done_self_review` | `off`（默认）/`on`/`auto`：收尾前让只读子 Agent 审阅本轮 diff（最多 40 KB），`auto` 只在改动不少于 40 行时启用 | 无 |
 | `workflow` | `direct`（默认）/`review`/`once`，含义见下文“计划模式与审阅流程” | 无 |
 | `done_verify_timeout_seconds` | 每条检查命令的时限；默认 120 秒，dotnet/npm/npx 为 300 秒 | 无 |
-| `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`，或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
+| `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`、`cmd`（仅 Windows），或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
 | `web_search` | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
 | `skills_registry` | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
 
@@ -388,7 +388,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - **任务运行中输入**：普通文字作为插话，默认在工具结束或本轮回复完成时自动送入；以 `!` 开头则优先插话并打断生成。被中断的请求可能照常计费，但未返回的费用按零累计。插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
 - **中断**：任务运行中连按两次 **Esc**（2 秒内）或按 **Ctrl+C** 中断任务，`/continue` 可以继续。空闲时在空行上按 Ctrl+C 只提示用 `/exit` 或 Ctrl+D 退出；**Ctrl+D** 在空行上保存并退出。
-- **审批与提问**：在同一输入行上作答。审批显示在黄色边框里：第一行是“需要批准”和命令类型（只读、构建/测试、未识别等），然后是要执行的操作和红色的风险警告，接着是编号选项（参照 Claude Code 和 Codex）：`1. 允许这一次 (y)`、`2. 本次会话不再询问 (s)`、`3. 本项目以后都不再询问 (a)`、`4. 拒绝 (n)`，“不再询问”两项后面写明这条规则会放行什么（如“git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）”“以 `npm run` 开头的命令”“本项目内的文件修改”）。会话规则只在内存里，退出即失效；项目规则写入 policies.json；没有 policies.json 时不提供第 3 项，生成不了规则的操作（如扩展进程）只有 1 和拒绝。按 `y`/`s`/`a` 立即提交，上下键在选项间切换后回车；大写的 `N` 是默认值，直接回车即拒绝。输入 `n <原因>` 或任何不是选项的文字，都当作拒绝理由交给模型。也接受 `yes`/`always`/`session`/`no` 和中文“是、允许、本次会话、总是、否、拒绝”。Esc 或 Ctrl+C 取消当前提问。
+- **审批与提问**：在同一输入行上作答。审批显示在黄色边框里：第一行是“需要批准”，接着是命令类型（只读、构建/测试、未识别等）或需要审批的原因（如“删除文件（rm）”“推送到远端（git push）”），然后是要执行的操作和红色的风险警告，接着是编号选项（参照 Claude Code 和 Codex）：`1. 允许这一次 (y)`、`2. 本次会话不再询问 (s)`、`3. 本项目以后都不再询问 (a)`、`4. 拒绝 (n)`，“不再询问”两项后面写明这条规则会放行什么（如“git 常规操作（push、pull、merge 等；--force、reset、clean 仍会询问）”“以 `npm run` 开头的命令”“本项目内的文件修改”）。会话规则只在内存里，退出即失效；项目规则写入 policies.json；没有 policies.json 时不提供第 3 项，生成不了规则的操作（如扩展进程）只有 1 和拒绝。按 `y`/`s`/`a` 立即提交，上下键在选项间切换后回车；大写的 `N` 是默认值，直接回车即拒绝。输入 `n <原因>` 或任何不是选项的文字，都当作拒绝理由交给模型。也接受 `yes`/`always`/`session`/`no` 和中文“是、允许、本次会话、总是、否、拒绝”。Esc 或 Ctrl+C 取消当前提问。
 - **拒绝后任务继续**：拒绝一次调用不会结束任务。模型收到“用户拒绝了”和你的理由，被要求不要重试、也不要换个等价命令绕过，而是换别的办法或询问你；屏幕上这一步显示为 `└ 已拒绝：<理由>（已告诉模型）`。拒绝不算工具失败。后台 Agent 和远程审批的拒绝同样处理。
 - **补全**：Tab 补全斜杠命令、子命令（由 `/help` 的用法行自动生成，新增子命令无需另外登记）、技能名、插件命令和 `@路径`；候选列在输入行下方，上下键选择。
 - **历史**：提交的输入保存在 `<data_dir>/input_history.jsonl`（最多 1000 条），上下键翻阅，**Ctrl+R** 反向搜索（再按 Ctrl+R 找更早的匹配，Enter 采用，Esc 取消）。含 API key、token、密码等疑似密钥的输入（包括 `/config api_key …`、带账号的 base_url）不写入历史。
@@ -501,9 +501,9 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 | 参数 | 行为 |
 | --- | --- |
-| `--permission default` | 默认（旧名 `ask`，对齐 Copilot 默认姿态）；`read`/`grep`/`glob`/`repo_map` 不需要审批，只读 Shell 命令（`ls`、`git status`、`rg`、只打印的 `sed -n`、`timeout` 包裹的只读命令、`strings`、`cygpath` 等）直接运行，本地 git 操作（`git add`、`git commit`、`git tag`，可与只读命令串联；`-f`/`--force`、`-d`、`-p`、`$(...)`、写文件的重定向除外）也直接运行，项目内的文件修改直接放行；项目外写入、`git push` 等其他 Shell、网络访问和扩展进程逐次审批，没有终端则明确失败。`auto` 模式同样免审本地 git 操作 |
+| `--permission default` | 默认（旧名 `ask`，对齐 Copilot 默认姿态）；`read`/`grep`/`glob`/`repo_map` 不需要审批；Shell 命令按“会改动什么”判断，什么都改不了的直接运行（读取、构建、测试、项目脚本、本地 git 操作、参数普通的陌生工具，可与只读命令串联），会改文件或删除、推远端、装软件、改系统设置和服务、结束进程、执行读不到内容的代码（`eval`、`python -c`、`bash -c '...'`、`find -exec`、程序名来自变量等）才审批，并写明原因；项目内的文件修改直接放行；`web_fetch`/`web_search` 只读取，不需要审批；项目外写入和扩展进程逐次审批，没有终端则明确失败 |
 | `--permission plan` | 只读（旧名 `readonly`）；允许阅读、搜索和只读 Shell 命令，其他操作拒绝，模型收到拒绝说明后可以继续 |
-| `--permission auto` | 另外自动允许构建/测试命令（`cargo test`、`go vet`、`npm run build` 等）、项目内文件修改、网络工具和已信任的扩展进程；其余 Shell 仍需审批，无终端时拒绝 |
+| `--permission auto` | 在 default 的 Shell 判断之外，另外自动放行网络工具和已信任的扩展进程；仍然需要审批的 Shell 命令（改文件、推远端、装软件等）照常询问，无终端时拒绝 |
 | `--permission bypass` | 除拒绝规则和灾难命令外全部允许；只用于可信任务 |
 | `--max-turns 20` | 每个任务/继续窗口最多 20 次模型请求，含自动压缩，不是用户对话数 |
 | `--timeout 300` | 任务总时限，秒；达到后取消并有界清理 |
@@ -521,7 +521,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 判定顺序：灾难命令拦截 → 拒绝规则 → plan 模式（只放行只读操作）→ bypass → 允许/询问规则（按优先级，同级时询问优先）→ 模式默认。
 
-- **命令分类**：Shell 命令先按实际 Shell 语法切分（Windows 上按 PowerShell，其他平台按 sh），处理引号、转义、管道、`&&`/`||`/`;`、重定向和 here-doc，再逐条判断类别：只读、构建/测试、Git、安装、未知、危险，整行取最高风险。Windows `certutil -hashfile` 和常见摘要工具按只读命令处理。命令替换 `$(...)`、反引号、PowerShell 脚本块 `{...}`、调用运算符 `&`、写文件的重定向、隐藏字符等无法静态判断的写法一律算“未知”，需要审批。
+- **命令分类**：Shell 命令先按它将要运行的 Shell 语法切分（命令明显是给另一种已安装的 Shell 写的就按那种：PowerShell cmdlet、cmd 的 `%VAR%`、bash 循环；否则 Windows 上按 bash/PowerShell，其他平台按 sh），处理引号、转义、管道、`&&`/`||`/`;`、重定向和 here-doc，再逐条给出“会改动什么”的原因：写入或删除文件、改远端、装软件、改系统设置或服务、结束进程、执行读不到内容的代码、提权，整行合并去重；原因列表为空就直接运行，非空则需要审批并显示这些原因。Windows `certutil -hashfile` 和常见摘要工具按只读命令处理。命令替换 `$(...)`、反引号、PowerShell 脚本块 `{...}`、调用运算符 `&`、写文件的重定向、隐藏字符等无法静态判断的写法一律需要审批。
 - **交互中切换**：`/mode` 显示当前模式、审阅流程和规则；`/mode default|plan|auto|bypass` 立即生效，不需要重启；加 `save` 写入配置文件（`permission_mode`）。
 - **policies.json**：放在数据目录（`<data_dir>/policies.json`），是一个规则数组：
 
@@ -571,13 +571,13 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - 文件改动上限 1 MiB（非 UTF-8 内容 4 MiB，例如 `draw_image`/`browser` 截图写出的 PNG）；`write`/`edit` 都经过检查点日志和漂移检查。
 - 临时文件原子替换不是与外部编辑器的原子 CAS；检查点也不是宿主沙箱，建议先在干净分支或临时副本上试用。
 - **搜索**遵守 ignore 文件（没有 Git 仓库时也遵守 `.gitignore`），不跟随目录链接，不检索 Git 元数据。`grep` 有 ripgrep 时调用 `rg`，否则用内置搜索，结果格式相同（`路径:行号:内容`，上下文行用 `-`，组之间用 `--`）；参数 `include`（文件名 glob）、`path`（文件或目录）、`ignore_case`、`context`（0–10）、`files_only`；最多 100 行，超出时提示“at least N more”。`glob` 的模式不含 `/` 时匹配文件名，含 `/` 时匹配相对 `path` 的路径，`**` 可跨目录；最多 200 条，超出时提示 `... and N more`。路径一律相对工作区、用 `/` 分隔。
-- **Shell 解释器**：Windows 上优先使用 Git for Windows 的 bash（按 git 所在目录和 Program Files 查找，跳过 WSL 的 bash 启动器），没有时用 PowerShell；其他平台用 bash，没有时用 sh。可用配置 `shell` 或环境变量 `COVE_SHELL` 指定。工具描述和系统提示中的环境行都写明实际解释器。Hooks 和验证门禁命令仍按原方言运行（Windows 上为 PowerShell）。两种解释器都在进程加入 Job Object 之后才从 stdin 收到脚本。
+- **Shell 解释器**：Windows 上优先使用 Git for Windows 的 bash（按 git 所在目录和 Program Files 查找，跳过 WSL 的 bash 启动器），没有时用 PowerShell；其他平台用 bash，没有时用 sh。可用配置 `shell` 或环境变量 `COVE_SHELL` 指定（`auto`、`bash`、`powershell`、`cmd` 或解释器路径）。命令明显是给另一种已安装的 Shell 写的就改用那个 Shell 运行，审批按同一方言判断；在原 Shell 里失败且错误表明方言不对时，用能只读解释它的另一种 Shell 重跑一次，并在结果开头注明。工具描述和系统提示中的环境行都写明实际解释器。Hooks 和验证门禁命令仍按原方言运行（Windows 上为 PowerShell）。bash 和 PowerShell 在进程加入 Job Object 之后才从 stdin 收到脚本；cmd 用 `/d /s /c` 传入单行脚本（多行以 `&` 连接，`NoDefaultCurrentDirectoryInExePath` 避免先运行工作区里的同名 `.bat`）。
 - **非交互环境**：命令运行时设置 `GIT_TERMINAL_PROMPT=0`、`GIT_EDITOR=true`、`GIT_PAGER=cat`、`PAGER=cat`、`NO_COLOR=1`、`TERM=dumb` 等，不会等待编辑器、分页器或凭据输入；通过 `GIT_CONFIG_*` 关闭仓库配置的 `core.fsmonitor` 并设 `safe.bareRepository=explicit`（保留用户已有的 `GIT_CONFIG_COUNT` 条目）。
 - **Shell 时限**：`timeout_seconds` 默认 120 秒，最多 600 秒（也接受毫秒单位的 `timeout`）；可选 `description` 说明命令用途。
 - **输出截取**：stdout 最多保留约 30 KB，stderr 约 10 KB，超出时保留开头 40% 和结尾 60%（在行边界切开），中间注明省略的字节数；管道始终排空，避免堵塞。Windows 上非 UTF-8 的输出行（控制台代码页 GBK）按 GBK 解码；仍无法解码时标记 `encoding_warning`，不假装无损。
 - Shell 结果包含退出码、stdout、stderr、超时和截断标记。运行中逐行实时显示，每个流最多实时显示 256 KiB，超出部分只保留在结果里。这是按行刷新的输出，不是 TUI 面板，进度条这类原地刷新的输出会显示成多行。
 - 写入或命令已经产生的副作用不会因取消或网络错误自动撤销。
-- 流式响应缺终止事件、参数不完整或输出截断时，不执行该响应内的工具；不自动重试并重放副作用。
+- 流式响应缺终止事件或中途断开（连接中断、空闲超时、服务端过载）时，不执行该响应内的工具；断开的部分没有生效，自动重新发起这次请求，最多 3 次（间隔 2、4、8 秒），仍失败才结束任务。请求本身有错（如工具 schema 不合法）不重试，错误信息带上服务端给的说明。输出截断或工具参数不完整时，同样不执行该响应内的工具，回复作废并让模型重做。
 - 工具失败会作为错误结果交给模型；任务结束时按整次任务统计历史失败，不能据此判断问题是否已解决。交互模式显示提醒，可用 `/doctor trace` 查看失败记录或用 `/expand <n>` 查看工具输出；单次执行的退出码保守地保持非零，即使模型声称已恢复。用户拒绝的调用不算失败。
 - 模型正常结束不等于通过独立验收；没有实际测试证据时不能声称验证通过。
 - **验证门禁的结果**写在任务结束的汇总行里（交互控制台是 `✓ 完成 · …`，`-p` 和管道是 `[summary] …`）：`验证通过`、`验证未通过`、`验证未运行`（审批被拒、plan 模式下无法运行，或检查超时），或 `无自动验证`（无检查命令，或本轮没有文件改动；交互控制台不显示这一项）。3 轮后仍失败，退出码为非零。门禁只看文件工具产生的改动；单纯通过 Shell 修改文件不会触发它。没有运行就不算通过。
