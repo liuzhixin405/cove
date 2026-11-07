@@ -616,7 +616,16 @@ pub fn file_holders(_: &Path) -> String {
 /// replaces the file anyway, as it does on Unix.
 pub fn replace_with(file: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
     let temporary = file.into_temp_path();
-    std::fs::rename(&temporary, path)?;
+    // A scanner or indexer that opened the target without delete sharing holds it only
+    // briefly; wait it out instead of failing the save (about 1.5s in all).
+    let mut attempt = 0;
+    while let Err(err) = std::fs::rename(&temporary, path) {
+        if attempt >= 5 || err.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(err);
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+    }
     let _ = temporary.keep();
     Ok(())
 }
