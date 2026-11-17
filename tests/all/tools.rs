@@ -322,6 +322,140 @@ async fn edit_replaces_all_lists_ambiguous_lines_and_matches_whitespace_variants
     );
 }
 
+#[tokio::test]
+async fn long_exact_edits_report_where_they_landed_not_the_text_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(dir.path().join("a.txt"), &body).unwrap();
+    let tools = tools(dir.path());
+    let new_block: String = (1..=20)
+        .map(|n| format!("rewritten line number {n}\n"))
+        .collect();
+    let out = run(
+        &tools,
+        "edit",
+        json!({"path":"a.txt","old":"line 10\nline 11\n","new":new_block}),
+    )
+    .await;
+    assert!(!out.failed, "{}", out.content);
+    assert!(
+        out.content.ends_with("1 replacement(s) at lines 10-29"),
+        "{}",
+        out.content
+    );
+    assert!(!out.content.contains("rewritten line number 5"));
+    // A short edit still shows the lines around it.
+    let out = run(
+        &tools,
+        "edit",
+        json!({"path":"a.txt","old":"line 30\n","new":"line thirty\n"}),
+    )
+    .await;
+    assert!(out.content.contains(": line thirty"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn line_endings_are_kept_per_line_and_new_files_follow_the_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let bytes = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+    std::fs::write(path("mixed.txt"), b"a\r\nb\nc\r\nd\r\n").unwrap();
+    std::fs::write(path("lf.txt"), b"p\nq\nr\n").unwrap();
+    std::fs::write(path("crlf.txt"), b"x\r\ny\r\n").unwrap();
+    std::fs::write(
+        path(".editorconfig"),
+        "root = true\n[*.cs]\nend_of_line = crlf\n",
+    )
+    .unwrap();
+    let tools = tools(dir.path());
+
+    // A mixed file matches exactly (no whitespace-tolerant fallback); untouched lines keep
+    // their endings and the replaced lines inherit theirs.
+    let out = run(
+        &tools,
+        "edit",
+        json!({"path":"mixed.txt","old":"b\nc","new":"X\nY"}),
+    )
+    .await;
+    assert!(
+        !out.failed && !out.content.contains("whitespace"),
+        "{}",
+        out.content
+    );
+    assert_eq!(bytes("mixed.txt"), b"a\r\nX\nY\r\nd\r\n");
+
+    // CRLF sent by the model never mixes an LF file.
+    let out = run(
+        &tools,
+        "edit",
+        json!({"path":"lf.txt","old":"q\r\nr","new":"Q\r\nR"}),
+    )
+    .await;
+    assert!(!out.failed, "{}", out.content);
+    assert_eq!(bytes("lf.txt"), b"p\nQ\nR\n");
+
+    // Old and new differing only in `\r` change the endings on purpose, byte for byte.
+    let out = run(
+        &tools,
+        "edit",
+        json!({"path":"lf.txt","old":"Q\nR","new":"Q\r\nR"}),
+    )
+    .await;
+    assert!(
+        out.content.contains("line endings changed as written"),
+        "{}",
+        out.content
+    );
+    assert_eq!(bytes("lf.txt"), b"p\nQ\r\nR\n");
+
+    // read says which endings a file has.
+    let read = run(&tools, "read", json!({"path":"mixed.txt"})).await;
+    assert!(
+        read.content.contains("mixed line endings (3 CRLF, 1 LF)"),
+        "{}",
+        read.content
+    );
+    let read = run(&tools, "read", json!({"path":"crlf.txt"})).await;
+    assert!(
+        read.content.contains("CRLF line endings"),
+        "{}",
+        read.content
+    );
+
+    // Overwriting rewrites only the changed lines' endings.
+    let out = run(
+        &tools,
+        "write",
+        json!({"path":"mixed.txt","content":"a\nX\nY changed\nd\ne\n"}),
+    )
+    .await;
+    assert!(!out.failed, "{}", out.content);
+    assert_eq!(bytes("mixed.txt"), b"a\r\nX\nY changed\r\nd\r\ne\r\n");
+
+    // New files follow .editorconfig (then Git, then LF); explicit `\r` stays as written.
+    run(
+        &tools,
+        "write",
+        json!({"path":"New.cs","content":"class A {}\nclass B {}\n"}),
+    )
+    .await;
+    assert_eq!(bytes("New.cs"), b"class A {}\r\nclass B {}\r\n");
+    run(
+        &tools,
+        "write",
+        json!({"path":"notes.md","content":"one\ntwo\n"}),
+    )
+    .await;
+    assert_eq!(bytes("notes.md"), b"one\ntwo\n");
+    run(
+        &tools,
+        "write",
+        json!({"path":"raw.cs","content":"x\ny\r\n"}),
+    )
+    .await;
+    assert_eq!(bytes("raw.cs"), b"x\ny\r\n");
+}
+
 async fn grep_and_glob_semantics(ripgrep: bool) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
@@ -849,7 +983,11 @@ async fn cli_reads_in_parallel_keeps_gbk_and_adds_subdirectory_instructions() {
     assert!(output.status.success(), "{stderr}");
     let requests = server.await.unwrap();
     let read = tool_result(&requests[1], "r1");
-    assert!(read.contains("File: pkg/mod.c (2 lines total)"), "{read}");
+    // The CRLF file says so: lines are shown without `\r`.
+    assert!(
+        read.contains("File: pkg/mod.c (2 lines total; CRLF line endings"),
+        "{read}"
+    );
     assert!(
         read.contains("GBK-encoded") && read.contains("1: /* 模块 */"),
         "{read}"

@@ -465,6 +465,7 @@ const ROOT_KEYS: &[&str] = &[
     "disabled_skills",
     "skills_registry",
     "skill_review",
+    "skill_review_auto",
     "browser_path",
     "shell",
     "max_sessions",

@@ -222,7 +222,7 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
                 _ => Class::Sensitive,
             }
         }
-        "done_verify_auto" | "done_verify_tests" | "skill_review" => {
+        "done_verify_auto" | "done_verify_tests" | "skill_review" | "skill_review_auto" => {
             if value == &Value::Bool(false) {
                 Class::Safe
             } else {

@@ -101,6 +101,28 @@ fn match_lines(content: &str, old: &str) -> String {
     format!("lines {}", parts.join(", "))
 }
 
+/// The line ranges of the changed regions of `result`: "lines 12-18, 40".
+pub fn regions(result: &str, spots: &[usize], inserted_len: usize) -> String {
+    let mut parts = Vec::new();
+    for &start in spots {
+        if start > result.len() {
+            continue;
+        }
+        let end = (start + inserted_len).min(result.len());
+        let first = result[..start].matches('\n').count() + 1;
+        let mut last = first + result[start..end].matches('\n').count();
+        if end > start && result.as_bytes()[end - 1] == b'\n' && last > first {
+            last -= 1;
+        }
+        parts.push(if last > first {
+            format!("{first}-{last}")
+        } else {
+            first.to_string()
+        });
+    }
+    format!("lines {}", parts.join(", "))
+}
+
 /// Each changed region of `result` with two lines of context, numbered like `read` output.
 pub fn snippets(result: &str, spots: &[usize], inserted_len: usize) -> String {
     let mut lines: Vec<&str> = result.split('\n').collect();

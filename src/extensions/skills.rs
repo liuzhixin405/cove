@@ -381,6 +381,9 @@ pub struct SkillSources {
     pub plugins: Vec<(String, PathBuf)>,
     pub disabled: Vec<String>,
     pub builtin: bool,
+    /// Learned skills go live, update and retire without a person (config
+    /// `skill_review_auto`, on unless set to `false`). Off: proposals stay pending candidates.
+    pub auto_learn: bool,
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -598,10 +601,11 @@ impl Skills {
         {
             match skills.candidate_store().and_then(|store| store.list()) {
                 Ok(candidates) => {
-                    for candidate in candidates
-                        .into_iter()
-                        .filter(|candidate| candidate.state == CandidateState::Approved)
-                    {
+                    let scope = skills.scope_key();
+                    for candidate in candidates.into_iter().filter(|candidate| {
+                        candidate.state == CandidateState::Approved
+                            && candidate.visible_in(scope.as_deref())
+                    }) {
                         if entries.contains_key(&candidate.name) {
                             skills.warnings.push(format!(
                                 "approved candidate {} conflicts with an existing skill",
@@ -625,6 +629,11 @@ impl Skills {
         }
         skills.entries = RwLock::new(entries);
         Ok(skills)
+    }
+
+    /// Learned skills go live, update and retire on their own (`skill_review_auto`).
+    fn automatic(&self) -> bool {
+        self.sources.auto_learn
     }
 
     /// Layout: `<dir>/<name>/SKILL.md` and `<dir>/*.md`. Invalid files are warnings.
@@ -811,6 +820,12 @@ impl Skills {
     /// directive, the body and, for `/<skill> args`, the user's arguments.
     pub fn render(&self, name: &str, arguments: Option<&str>) -> Result<String> {
         let skill = self.get(name)?;
+        // A learned skill in use is safe from retirement. Best effort: never fails the skill.
+        if let Body::Candidate { id, .. } = &skill.body
+            && let Ok(store) = self.candidate_store()
+        {
+            let _ = store.touch(id);
+        }
         let mut out = format!("[Skill: {}]\n\n", skill.name);
         if !skill.steps.is_empty() {
             out.push_str("Follow these steps in order. Do not skip ahead or reorder them; treat each one as a checkpoint to complete (and verify) before starting the next:\n");
@@ -998,6 +1013,83 @@ impl Skills {
         crate::extensions::skill_candidates::CandidateStore::open(data)
     }
 
+    /// The project a learned skill is scoped to: the project root loaded from cwd.
+    pub fn scope_key(&self) -> Option<String> {
+        self.project_root
+            .as_ref()
+            .map(|root| root.display().to_string())
+    }
+
+    /// Pending and approved learned skills visible in this project.
+    pub fn learned(&self) -> Result<Vec<Candidate>> {
+        let scope = self.scope_key();
+        Ok(self
+            .candidate_store()?
+            .list()?
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.state,
+                    CandidateState::Candidate | CandidateState::Approved
+                ) && candidate.visible_in(scope.as_deref())
+            })
+            .collect())
+    }
+
+    /// True when `name` belongs to a skill that was not learned (built-in, plugin, user or
+    /// project files) or is disabled: learning never touches those.
+    fn taken(&self, name: &str) -> bool {
+        self.disabled.contains(name)
+            || self
+                .read()
+                .get(name)
+                .is_some_and(|skill| !matches!(skill.body, Body::Candidate { .. }))
+    }
+
+    /// Stores a reviewed proposal for this project. With [`SkillSources::auto_learn`] no
+    /// person is in the loop: skills that are activated or updated take effect at once,
+    /// retired ones stop loading. Off, proposals only become pending candidates.
+    pub fn learn(
+        &self,
+        proposal: &crate::extensions::skill_candidates::Proposal,
+        session: &str,
+        sources: &[crate::extensions::skill_candidates::TaskSource],
+    ) -> Result<crate::extensions::skill_candidates::LearnOutcome> {
+        use crate::extensions::skill_candidates::{LearnOutcome, Learned};
+        if self.taken(&proposal.name) {
+            return Ok(LearnOutcome {
+                learned: Learned::Skipped,
+                retired: Vec::new(),
+            });
+        }
+        let outcome = self.candidate_store()?.learn(
+            proposal,
+            self.scope_key().as_deref(),
+            session,
+            sources,
+            &crate::extensions::skill_candidates::Rules {
+                automatic: self.automatic(),
+                taken: &|name| self.taken(name),
+            },
+        )?;
+        let mut entries = self.entries.write().unwrap_or_else(|err| err.into_inner());
+        for gone in &outcome.retired {
+            if entries.get(&gone.name).is_some_and(
+                |skill| matches!(&skill.body, Body::Candidate { id, .. } if *id == gone.id),
+            ) {
+                entries.remove(&gone.name);
+            }
+        }
+        if let Learned::Activated(candidate) | Learned::Updated(candidate) = &outcome.learned
+            && entries
+                .get(&candidate.name)
+                .is_none_or(|skill| matches!(skill.body, Body::Candidate { .. }))
+        {
+            entries.insert(candidate.name.clone(), candidate_skill(candidate));
+        }
+        Ok(outcome)
+    }
+
     pub fn stage_legacy(&self, name: &str, target: &str, session: &str) -> Result<Candidate> {
         if !identifier(target) || name == target || self.disabled.contains(target) {
             return Err(Error::Tool(
@@ -1094,7 +1186,7 @@ impl Skills {
         }
         let candidate = store.decide(id, expected, next, actor, reason)?;
         match next {
-            CandidateState::Approved => {
+            CandidateState::Approved if candidate.visible_in(self.scope_key().as_deref()) => {
                 entries.insert(candidate.name.clone(), candidate_skill(&candidate));
             }
             CandidateState::Revoked
@@ -2057,5 +2149,37 @@ mod tests {
             .save_auto("deploy-check", "Check deploys", "2. again", "s2")
             .unwrap();
         assert_ne!(slug("K8s Deploy"), slug("k8s-deploy"));
+    }
+
+    #[test]
+    fn rendering_a_learned_skill_counts_its_use() {
+        use crate::extensions::skill_candidates::CandidateState;
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                ..SkillSources::default()
+            },
+            Arc::new(Registry::open(data.path()).unwrap()),
+        )
+        .unwrap();
+        let store = skills.candidate_store().unwrap();
+        let candidate = store
+            .submit("deploy-flow", "When deploying", "build, ship", "s1")
+            .unwrap();
+        skills
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Candidate,
+                CandidateState::Approved,
+                "user",
+                "",
+            )
+            .unwrap();
+        skills.render("deploy-flow", None).unwrap();
+        skills.render("deploy-flow", None).unwrap();
+        let record = store.list().unwrap().remove(0);
+        assert_eq!(record.uses, 2);
+        assert!(record.last_used.is_some());
     }
 }

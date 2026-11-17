@@ -18,7 +18,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - Shell 实时输出：命令运行时逐行显示 stdout 和 stderr（交互控制台里是 `│` 开头的暗色行，stderr 为红色；`-p` 和管道输出里分别以 `|`、`!` 开头），验证命令同样实时显示；结束后只再打印一行状态，不重复正文。
 - 完成前验证门禁：本轮通过文件工具改过文件时，模型宣布完成后自动运行检查命令；失败输出回给模型继续修，最多 3 轮。
 - `web_fetch` / `web_search`：抓取公网 https 页面（拒绝内网和本机地址），以及通过 Tavily、Brave 或 DuckDuckGo 搜索网页。
-- 子 Agent：六种内置类型（general/explore/plan/review/test/verify）加配置里的自定义类型；`execute_plan` 按 todo 依赖图并行执行计划；worktree 工具；回归验证工具；可持久化、可中断/暂存/唤醒的后台 Agent（各自独立的 git worktree）。详见下文“子 Agent、计划、Worktree 与回归验证”。
+- 子 Agent：六种内置类型（general/explore/plan/review/test/verify）加配置里的自定义类型（所有子 Agent 都被要求最终答复先给结论、控制在约 400 词内，因为答复会留在主 Agent 的上下文里）；`execute_plan` 按 todo 依赖图并行执行计划；worktree 工具；回归验证工具；可持久化、可中断/暂存/唤醒的后台 Agent（各自独立的 git worktree）。详见下文“子 Agent、计划、Worktree 与回归验证”。
 - 集中权限检查：`default`、`plan`、`auto`、`bypass` 四种模式（`ask`/`readonly` 仍可用作别名），交互中用 `/mode` 即时切换；按命令实际运行的 Shell 语法切分、给出“会改动什么”原因的风险判断；任何模式都拦截的灾难命令；`policies.json` 允许/拒绝/询问规则，审批时可“本项目总是允许”。
 - 任务守卫与完成闸门：重复失败熔断、循环检测、收尾催促（空回复、只说不做、todo 未完成、完成自检）、计划模式与 review/once 审阅流程、提交前验证、自审子 Agent、每个任务的验收报告。
 - 有界模型调用次数、输出、上下文、请求空闲时间、任务与命令超时。
@@ -33,7 +33,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - 文件工具变更的 unified diff、检查点预览与确认回退；发现用户后续修改时拒绝覆盖。
 - 会话历史（标题、列表、详情、删除、清理、修复、Markdown 导出、`max_sessions` 自动清理）；按月费用账本与 `/status cost`；覆盖 Shell 改动、可再撤销的 Git 快照 `/undo`；BM25 记忆检索与注入、自动提取、dream 整理和会话笔记。
 - MCP 客户端：stdio、Streamable HTTP 与旧版 HTTP+SSE 三种传输，支持 `extensions.mcp` 和顶层 `mcp_servers` 两种写法；连接后工具清单写进 `mcp` 工具描述，处理 `tools/list_changed`，断线自动重连一次，从不重试失败调用。
-- Skills：内置 12 个技能，多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；后台复盘生成待审批技能候选；项目/全局带来源记忆的检索和增删改。
+- Skills：内置 12 个技能，多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；后台复盘自动学到技能（分本项目与全局；默认自动启用、更新和退役，可改为人工审核）；项目/全局带来源记忆的检索和增删改。
 - 同步生命周期 Hooks 与兼容 Claude Code 格式的 `hooks.json`（`PreToolUse` 可阻止工具调用）；插件（`manifest.json` 或 `.claude-plugin/plugin.json`，`commands/*.md` 斜杠命令、git 安装、市场搜索）和本地插件清单。
 - 项目信任：`.cove.json` 未信任时只应用安全字段，`/config trust` 后才应用 MCP、系统提示、校验命令等敏感字段。
 - `draw_image` 画 PNG、`browser` 用无头 Chrome/Edge 渲染网页或截图；浏览器实操验收、双方案竞跑、自动化任务与收件箱、统一变更集（`/changes`）和远程监督（`/remote`），见[外围工作流](#外围工作流changesautoremote)。
@@ -160,6 +160,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`、`cmd`（仅 Windows），或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
 | `web_search` | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
 | `skills_registry` | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
+| `skill_review` | 默认 `true`：交互会话中由后台模型复盘，学到可复用的做事步骤（技能候选）；`false` 完全关闭复盘 | 无 |
+| `skill_review_auto` | 默认 `true`：学到的技能自动启用、自动更新、长期不用自动退役，不需要人工审核；`false` 改为人工审核（候选只待审，用 `/config skills candidates approve` 批准）。步骤见下文“扩展”一节的“改为人工审核” | 无 |
 
 - **优先级**：命令行/环境变量 > 选中的 profile > 顶层字段 > 内置默认值。profile 由 `--profile <名>` / `COVE_PROFILE` 选择，没有指定时用 `active_profile`；profile 名不存在时报错。
 - **公共配置与差异**：通用设置写在顶层，profile 只写各自的模型、供应商和其他差异；profile 字段优先于顶层。`/model profile save` 会保留当前 profile 的设置，但省略与顶层相同的字段，以便继续继承公共值。
@@ -169,7 +171,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **网络代理**：默认跟随系统代理（Windows“Internet 选项”/macOS 网络设置，VPN 客户端开启“系统代理”模式时写入）以及 `HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；本机地址始终直连。也可用配置 `"proxy": "http://127.0.0.1:7890"`（支持 `http`、`https`、`socks5`、`socks5h`）、命令行 `--proxy` 或环境变量 `COVE_PROXY` 指定，`none` 表示全部直连。`/status` 显示当前代理。`web_fetch` 为防止访问内网，只使用显式指定的代理。
 - **调试与输出**：`debug`（或 `-d`/`--debug`）把每次模型调用、工具调用和压缩的轨迹记录（不含正文）实时打印到 stderr；`verbose`（或 `--verbose`）完整显示工具结果，不只显示摘要（交互控制台）或前 12 行（`-p` 和管道输出）；`live_output`（默认 true）控制命令输出是否逐行直播，`false` 时只在结束时显示摘要和结尾几行（失败时更多）。已废弃的 `telemetry`、`thinking_tokens` 会被静默忽略。
 - **API key 查找顺序**：`COVE_API_KEY` > `provider.api_key`/`provider.api_keys` > 供应商对应的环境变量（例如 `DEEPSEEK_API_KEY`、`KIMI_API_KEY`/`MOONSHOT_API_KEY`）。每一处都可以用逗号分隔写多个 key。带 `****` 的已掩码 key 会被忽略。key 写进配置文件时，文件必须保持私有；Unix 下如果其他用户可读，启动时会给出警告。
-- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。`mcp_servers`、`disabled_skills`、`skill_review` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
+- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。`mcp_servers`、`disabled_skills`、`skill_review`、`skill_review_auto` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
 - `/status` 会显示当前生效的供应商、协议、模型、地址、profile 和配置文件路径。
 
 配置文件还支持 `extensions` 对象。最小例子：
@@ -258,8 +260,21 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **安全**：项目技能文件如果是指向项目外的链接，拒绝加载并警告；技能正文始终作为不可信数据交给模型，`allowed_tools` 只是收窄工具选择的提示，不授予任何权限。配置 `disabled_skills: ["名字"]` 可整体移除技能。
 - **调用**：`/<技能名> [参数]` 把技能（编号步骤清单、工具限制说明、正文和你的参数）作为一次新任务发给模型。内置命令同名时内置命令优先；输错命令会提示“你是不是想输入 /…”。模型也可以用 `skill` 工具按需加载。
 - **按文件类型提示**：带 `paths` 的技能在 read/write/edit 触及匹配文件时，于该次工具结果后附 `<relevant_skills>`，每个会话每个技能只提示一次。
-- **自动技能候选**：交互会话满足复盘条件时，后台模型的提议经筛查后存入 `<data_dir>/skill-candidates/records.json`，不会自动启用。筛查和任务完成不等于验证通过；候选验证状态可为 `unknown`。`"skill_review": false` 关闭；`-p` 单次任务不复盘。设置预算不阻止复盘。
-- **候选审核**：`/skills candidates list`、`show <完整哈希>`、`approve <完整哈希>`、`reject <完整哈希>`、`revoke <完整哈希> <原因>`。批准前检查状态、内容和同名技能；撤销后不可调用。记录中存在重复候选 ID 或同名多个批准版本时拒绝读取及调用。候选存储锁被占用时审核操作会立即报忙；后台复盘写入针对锁竞争最多等待 250 毫秒，仍未取得锁则提示失败。旧自动技能保持原有启停状态并标记 `legacy-unverified`，不会自动迁移。
+- **自动技能候选**：交互会话满足复盘条件时（至少一个任务完成且验证未失败），后台模型的提议经筛查后存入 `<data_dir>/skill-candidates/records.json`。复盘会看到本项目和全局已有的学到的技能，优先输出 `UPDATE:` 改进已有技能；新技能分 `NEW: project`（只在本项目加载）和 `NEW: global`。名字相近的提案并入已有候选（记一次出现），与被拒绝或手动撤销的名字相近的直接丢弃；每次最多 2 条，正文不超过 2KB。只出现过一次、超过 30 天的待审候选自动清理。筛查和任务完成不等于验证通过；候选验证状态可为 `unknown`。`"skill_review": false` 关闭复盘；`-p` 单次任务不复盘。设置预算不阻止复盘。
+- **自动启用**（`skill_review_auto`，默认开）：候选在 2 个会话中出现，或来源任务验证通过，即自动启用；`UPDATE` 直接更新已批准的技能并立即生效；60 天未调用的学到的技能自动退役（可再次学到），每个项目最多 20 条、全局最多 30 条，超出时退役最久未用的。启用、更新、退役各提示一行（以 `[skills]` 开头），不需要审核。
+- **改为人工审核**：
+  1. 在用户配置 `%USERPROFILE%\.cove\config.json`（或 `<数据目录>/config.json`）顶层加一行 `"skill_review_auto": false`，例如：
+     ```json
+     {
+       "skill_review_auto": false
+     }
+     ```
+     也可以只对某个项目关闭：写在该项目的 `.cove.json` 里（设为 `false` 属于只做减法的安全字段，无需信任项目）。
+  2. 重启 cove 生效。
+  3. 之后复盘只生成待审候选，不会自动启用；`UPDATE` 不会改动已批准的技能；也不会自动退役。用下面“候选审核”的命令处理：先 `/config skills candidates list` 查看（复制 `id` 字段的完整哈希），再 `approve <哈希>` 启用或 `reject <哈希>` 拒绝，已启用的用 `revoke <哈希> <原因>` 撤销。
+  4. 想恢复自动：删掉这一行或改为 `true`，重启即可。已批准的技能两种模式下都保留。
+  - 完全不想学技能：`"skill_review": false`（关闭复盘本身）。
+- **候选审核**（人工审核模式下使用；自动模式下也可用来手动批准、拒绝或撤销）：`/skills candidates list`（待审在前，按出现次数排序，显示作用域）、`prune [天数]`（清理 N 天前只出现过一次的待审候选，默认 30，`0` 为清空待审）、`show <完整哈希>`、`approve <完整哈希>`、`reject <完整哈希>`、`revoke <完整哈希> <原因>`。批准前检查状态、内容和同名技能；撤销后不可调用。记录中存在重复候选 ID 或同名多个批准版本时拒绝读取及调用。候选存储锁被占用时审核操作会立即报忙；后台复盘写入针对锁竞争最多等待 250 毫秒，仍未取得锁则提示失败。旧自动技能保持原有启停状态并标记 `legacy-unverified`，不会自动迁移。
 - **旧技能迁移**：`/skills candidates migrate <旧名> <新名>` 将旧自动技能复制为不同名称的待审批候选，记录原文件内容摘要及当前会话；原文件与启停状态不变。目标名称必须可用；无法无损迁移的元数据、可疑指令或敏感内容会被拒绝。迁移与筛查不代表原技能已验证，仍需人工审核批准。
 - **改进建议**：`/suggestions analyze` 显式分析当前会话，`/suggestions list` 查看，`/suggestions accept <完整哈希>`、`reject <完整哈希>` 和 `revoke <完整哈希> <原因>` 记录人工决定。仅在显式分析时扫描最近 256 条消息，每条最多 32 个内容块；目前只识别白名单工具相同输入至少两次失败，重复调用 ID 或结果存在歧义时不作为证据。接受前重新核对当前会话证据，历史压缩或修改可能使证据位置失效；拒绝及撤销仍可关闭过期建议。接受仅记录决定，不执行建议、不改动提示词、技能或权限，也不发起模型请求。
 - 建议记录保存在 `<data_dir>/suggestions/<会话ID>.json`，每个会话最多 128 条，不自动清理；记录工具名、输入摘要和消息位置，不复制工具输入或输出。摘要不是匿名化手段，低熵输入可能被猜出；撤销原因由用户填写并持久保存。记录仅做一致性校验，不能防止能修改本地文件的人伪造记录。
@@ -317,7 +332,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 项目信任与 `.cove.json`
 
 - 启动时读取 cwd 下的 `.cove.json`（必须是不超过 1 MiB 的普通文件，不跟随链接；格式错误只警告）。它合并到用户配置的顶层，选中的 profile 仍覆盖其上。
-- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、调低的 `max_budget_usd`、只做减法的 `done_verify_auto`/`done_verify_tests`/`skill_review`（设为 `false`）、`done_verify_timeout_seconds`、`done_self_review`、`done_check`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`max_iterations` 等限额。
+- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、调低的 `max_budget_usd`、只做减法的 `done_verify_auto`/`done_verify_tests`/`skill_review`/`skill_review_auto`（设为 `false`）、`done_verify_timeout_seconds`、`done_self_review`、`done_check`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`max_iterations` 等限额。
 - **需要信任**的敏感字段：`auto`/`bypass` 权限、调高预算、`system_prompt`、`mcp_servers`、`done_verify_commands`、开启校验、`web_search`、`provider`、`memory_embedding`、`skills_registry`、单价等。未信任时启动会列出被忽略的字段；不支持的字段（如 `profiles`、`extensions`）单独列出。
 - `/config trust` 把项目根目录（git 根，否则 cwd）记为可信，并按**本次启动读到的内容**记录 `.cove.json` 的 sha256，写入 `<data_dir>/trusted_projects.json`；文件之后再改动就需要重新信任。重启后生效。可信项目等同于加了 `--trust-extensions`，自动验证门禁也通过 `cove::trust::is_trusted(cwd)` 查询同一份记录。
 
@@ -467,8 +482,18 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ### Git 快照与 `/undo`
 
-- 每个会产生副作用的工具调用（`write`、`edit`、非只读 Shell、写模式子 Agent、`execute_plan`）执行前，把整个工作区快照到私有的 Git 仓库 `<数据目录>/checkpoints/git`：每个项目一个 ref、一个独立 index，不碰项目自己的 `.git`；工作区没变化时不新增快照。遵守项目 `.gitignore`，并排除 `.git`、`target/`、`node_modules/`、`dist/`、`build/`、`.venv`、`__pycache__` 等。只读权限模式下不做快照。需要本机安装 `git`；没有时只剩文件工具回退。
-- 每个项目保留最新 50 个快照，超过 60 个时修剪，后台 `git gc` 只回收 1 小时前的对象。
+- 每个会产生副作用的工具调用（`write`、`edit`、非只读 Shell、写模式子 Agent、`execute_plan`）执行前，把整个工作区快照到私有的 Git 仓库 `<数据目录>/checkpoints/git`：每个项目一个 ref、一个独立 index，不碰项目自己的 `.git`；工作区没变化时不新增快照。排除规则由项目本身推导，每次快照前更新（结果复用 30 秒）：
+  - 项目自己的 Git 忽略的一切：`.gitignore`、`.git/info/exclude` 和全局 `core.excludesFile`（快照用的是独立仓库，单靠它只能看到 `.gitignore`，所以改为直接询问项目的 Git）；
+  - 项目 Git 未跟踪的隐藏（`.` 开头）文件和目录，如索引、缓存、IDE 设置（`.codeatlas/`、`.vscode/`、`.env`）；项目跟踪的 `.github/` 等照常快照；
+  - 项目 Git 未跟踪且大于 2 MB 的文件（数据库、数据转储、模型等；与 OpenCode 相同）；
+  - 项目 Git 未跟踪、且其中超过 2000 个文件的目录（整批放进来的 SDK、数据集等）；
+  - 不在 Git 项目里时，所有隐藏文件和目录，以及大于 2 MB 的文件；
+  - 项目根目录 `.coveignore` 里的补充规则（语法同 `.gitignore`），需要时自己加，无需改代码；
+  - 另有固定排除：`.git`、`target/`、`node_modules/`、`dist/`、`build/`、`.venv`、`__pycache__` 等。
+  以前快照进去、现在被排除的条目会从快照索引中移除；还原旧快照时也不会触碰这些路径。只读权限模式下不做快照。需要本机安装 `git`；没有时只剩文件工具回退。
+- 工具调用最多等快照 10 秒：超时则本次调用不做快照照常执行，结果里注明 `/undo` 无法还原这次的效果；已开始的暂存在后台继续完成（不记录快照），之后的快照就快了。后台暂存期间的调用同样跳过快照、不计为超时。同一会话两次超时后，本会话不再自动快照。大项目第一次快照可能需要几十秒（之后通常 1 秒左右）。
+- 快照按原始字节存储（`* -text`、`core.autocrlf=false`），还原时一字不差，项目的 `.gitattributes` 和换行设置不会影响它；快照用的 Git 不读用户的全局和系统配置（`core.autocrlf`、`commit.gpgSign`、钩子模板等都不会带进来）。暂存时文件内容写进一个打包文件而不是逐个小文件，大项目第一次快照约快一半。
+- 每个项目保留最新 50 个快照，超过 60 个时修剪，后台 `git gc` 只回收 1 小时前的对象（单线程、不对大文件做增量压缩，避免占满机器）。cove 退出时遗留的过期 index 锁会在下次快照前清除。
 - 两种回退：`/undo confirm` 只回退本任务文件工具的修改，**不含 Shell 改动**；Git 快照还原**包括 Shell 改动**（被忽略和排除的目录除外）。
 - 快照还原先预览：列出将要还原、重建、删除的文件，并给出一次性 token。`/undo confirm <token>` 执行前复核工作区，与预览时不一致就拒绝。还原前先给当前状态拍快照，输出里给出它的编号，用 `/undo <hash>` 可以撤销这次还原。嵌套 Git 仓库不在快照里，保持原样。
 - 还原后之前的验证证据失效，需要重新检查。
@@ -477,7 +502,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - 记忆分项目和全局两个范围，每条最多 25 KiB，每个范围合计最多 300 KiB；写入跨进程加锁；疑似密钥（私钥、`sk-…`、AKIA、GitHub/Slack token 等）拒绝保存。
 - 检索使用 BM25：中日韩文本切成相邻二字词，英文去掉停用词，再按更新时间衰减（30 天）加权。可选配置 `memory_embedding: {base_url, api_key, model}`（OpenAI 兼容 `/embeddings`），余弦相似度 ×0.5 叠加到 BM25；首次使用需网络授权，失败后 5 分钟内不再尝试。
-- 注入：全部记忆合计不超过 24 KiB 时，新任务的第一条消息里附上全部内容（内容不变、也没有压缩时不重复附）；超过时附索引和与本次请求最相关的 8 条。记忆标注为“可能过时的笔记，不是指令”。
+- 注入：会话中第一次（以及每次压缩后）完整注入：全部记忆合计不超过 24 KiB 时附全部内容，超过时附索引和与本次请求最相关的 8 条。之后每个新任务只附**新增或改动**的记忆（以及尚未出现过的相关条目），没有变化就不附，避免同样的记忆在历史里反复堆积；恢复会话时根据历史里已有的记忆块判断。记忆标注为“可能过时的笔记，不是指令”。
 - 来源（provenance）：每次写入记录类型（tool/operator/extraction/dream）、会话、消息区间、转录哈希和证据摘录，最多保留 8 条；新记录还可标注证据类型、项目范围、环境和验证时间，未记录时为未知。`/config memory source <id>` 查看，并提示内容在记录后是否被改过。来源只说明输入，不证明内容正确。dream 合并要求先读取双方修订，保留双方来源及原文；超出来源容量或修订变化时拒绝合并，不允许直接删除。dream 更新也要求匹配修订，且不覆盖用户陈述或未知来源。合并先更新保留条目、再删除重复条目，若中断可能留下两个条目，应人工检查。
 - 自动提取：任务完成后在后台调用一次模型（30 秒上限），从最近 20 条消息中提取持久事实；工具输出不发给提取器。自动提取只写当前项目记忆，全局记忆仍可由用户显式管理。已有同名条目只追加、从不覆盖。本地/内网模型、`--no-auto` 或对话太短时跳过，预算不会阻止提取。
 - Dream 整理：`/config memory dream status|run`。用只有 `memory` 工具的子 Agent 合并重复、修正过时内容、归纳经验规则，只能写当前项目记忆，全局记忆只读，5 分钟上限；运行前把记忆备份到 `<数据目录>/memory/backups/`（所有项目合计保留 5 份）。`dream backups` 列出有当前项目归属的新备份，`dream show <备份>` 查看条目；`dream preview <备份> <完整id>` 展示当前值和备份值，再在同一进程中使用 `dream restore <token>` 授权恢复单条项目记忆。备份或当前条目在预览后改变时拒绝恢复，不删除其他记忆；令牌一次有效，重启或新预览后失效。旧备份没有项目归属清单，不能通过此命令恢复；全局记忆不能通过此命令恢复。
@@ -564,10 +589,10 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ## 文件、输出与失败语义
 
-- **read**：返回 `File: 路径 (N lines total)` 加带行号的内容，默认从 `offset`（1 起）读 2000 行，`limit` 可改；旧参数 `start_line`/`lines` 仍可用。单行超过 2000 字符截断并标注 `…[+N chars]`。还有剩余时末尾给出 `[next: offset=X]`。传入目录时列出目录项，子目录以 `/` 结尾。文件最大 32 MiB。
+- **read**：返回 `File: 路径 (N lines total)`（CRLF 或混合换行的文件在括号里注明，例如 `CRLF line endings`；显示的行不带 `\r`） 加带行号的内容，默认从 `offset`（1 起）读 2000 行，`limit` 可改；旧参数 `start_line`/`lines` 仍可用。单行超过 2000 字符截断并标注 `…[+N chars]`。还有剩余时末尾给出 `[next: offset=X]`。传入目录时列出目录项，子目录以 `/` 结尾。文件最大 32 MiB。
 - **编码**：含 NUL 的二进制文件和 UTF-16 文件拒绝读取（UTF-16 会给出转换建议）；非 UTF-8 文件如果能按 GBK/GB18030 解码且能逐字节还原，就解码显示，并注明编码；其他旧编码照原样显示并提示乱码，`edit`/`write` 会拒绝这类文件。图片文件暂不读取。
-- **write**：自动创建缺失的父目录（目录本身不随 `/undo` 删除）。覆盖已有文件前，本会话必须读过它的当前版本（按大小和 SHA-256 判断，部分读取也算；本工具自己写过的文件自动记为已读；只读子 Agent 读过也算）；文件之后被用户或命令改过，要先重新读。`overwrite` 参数仍接受，但已不需要。覆盖时保留原文件的 CRLF、UTF-8 BOM 和 GBK 编码；内容中有 GBK 无法表示的字符时拒绝写入。参数名也接受 `file_path`/`filePath`、`text`。
-- **edit**：`old` 必须唯一匹配，多处匹配时报告所在行号，可用 `replace_all=true` 全部替换。CRLF 文件中，`old`/`new` 的换行自动转成 CRLF；GBK 文件编辑后仍写回 GBK。没有精确匹配时，按“忽略空白差异”逐行比较：只有唯一匹配才替换，并把 `new` 的缩进换成文件的缩进单位；缩进对应关系不一致（混用 Tab/空格或层级不齐）时拒绝多行替换；超过 20000 行的文件不做这种匹配。仍找不到时给出最相近的候选位置和相似度。成功结果显示最多 3 处改动及前后各 2 行。`edit` 不要求先读，但修改都经过检查点，可以 `/undo`。
+- **write**：自动创建缺失的父目录（目录本身不随 `/undo` 删除）。覆盖已有文件前，本会话必须读过它的当前版本（按大小和 SHA-256 判断，部分读取也算；本工具自己写过的文件自动记为已读；只读子 Agent 读过也算）；文件之后被用户或命令改过，要先重新读。`overwrite` 参数仍接受，但已不需要。覆盖时保留原文件的 UTF-8 BOM 和 GBK 编码，换行按行保留：没改的行原样不动，改动的行沿用它所替换那一行的换行，新增的行用文件的多数换行（不会因为一次覆盖把整个文件的换行统一掉）。新建文件的换行按项目约定：`.editorconfig` 的 `end_of_line` → 项目 Git 检出该路径时的换行（`eol`/`text` 属性、`core.autocrlf`、`core.eol`）→ LF；内容里自带 `\r` 时视为有意指定，原样写入。内容中有 GBK 无法表示的字符时拒绝写入。参数名也接受 `file_path`/`filePath`、`text`。
+- **edit**：`old` 必须唯一匹配，多处匹配时报告所在行号，可用 `replace_all=true` 全部替换。换行按行处理：匹配在去掉 `\r` 的视图上进行（混合换行的文件也能精确匹配），写回时没改的行原样不动，改动的行沿用它所替换那一行的换行，新增的行用文件的多数换行；模型发来的 `old`/`new` 里的 `\r` 会先去掉，不会把 LF 文件写成混合换行。`old` 和 `new` 只差 `\r` 时视为有意修改换行，按字节原样替换。GBK 文件编辑后仍写回 GBK。没有精确匹配时，按“忽略空白差异”逐行比较：只有唯一匹配才替换，并把 `new` 的缩进换成文件的缩进单位；缩进对应关系不一致（混用 Tab/空格或层级不齐）时拒绝多行替换；超过 20000 行的文件不做这种匹配。仍找不到时给出最相近的候选位置和相似度。成功结果显示最多 3 处改动及前后各 2 行；精确匹配且改动片段超过 400 字节时，只报告改动所在的行号（模型刚发出的内容不再原样回显），按空白差异匹配的替换始终显示改动后的内容。`edit` 不要求先读，但修改都经过检查点，可以 `/undo`。
 - 文件改动上限 1 MiB（非 UTF-8 内容 4 MiB，例如 `draw_image`/`browser` 截图写出的 PNG）；`write`/`edit` 都经过检查点日志和漂移检查。
 - 临时文件原子替换不是与外部编辑器的原子 CAS；检查点也不是宿主沙箱，建议先在干净分支或临时副本上试用。
 - **搜索**遵守 ignore 文件（没有 Git 仓库时也遵守 `.gitignore`），不跟随目录链接，不检索 Git 元数据。`grep` 有 ripgrep 时调用 `rg`，否则用内置搜索，结果格式相同（`路径:行号:内容`，上下文行用 `-`，组之间用 `--`）；参数 `include`（文件名 glob）、`path`（文件或目录）、`ignore_case`、`context`（0–10）、`files_only`；最多 100 行，超出时提示“at least N more”。`glob` 的模式不含 `/` 时匹配文件名，含 `/` 时匹配相对 `path` 的路径，`**` 可跨目录；最多 200 条，超出时提示 `... and N more`。路径一律相对工作区、用 `/` 分隔。
@@ -581,7 +606,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - 工具失败会作为错误结果交给模型；任务结束时按整次任务统计历史失败，不能据此判断问题是否已解决。交互模式显示提醒，可用 `/doctor trace` 查看失败记录或用 `/expand <n>` 查看工具输出；单次执行的退出码保守地保持非零，即使模型声称已恢复。用户拒绝的调用不算失败。
 - 模型正常结束不等于通过独立验收；没有实际测试证据时不能声称验证通过。
 - **验证门禁的结果**写在任务结束的汇总行里（交互控制台是 `✓ 完成 · …`，`-p` 和管道是 `[summary] …`）：`验证通过`、`验证未通过`、`验证未运行`（审批被拒、plan 模式下无法运行，或检查超时），或 `无自动验证`（无检查命令，或本轮没有文件改动；交互控制台不显示这一项）。3 轮后仍失败，退出码为非零。门禁只看文件工具产生的改动；单纯通过 Shell 修改文件不会触发它。没有运行就不算通过。
-- **网络工具**：`web_fetch` 只访问 https（http 自动升级）。每次请求和每次重定向前，都会解析目标地址，拒绝本机、私网、链路本地和 CGNAT 地址，并固定解析结果，防止 DNS rebinding；TUN 模式（“fake-IP”）代理返回的 `198.18.0.0/15`、`2001:db8::/32` 地址视为公网，因为局域网不会用到它们。不走系统代理。响应正文最多读 2 MiB，每次返回 32 KiB 文本，可以用 `offset` 翻页。网络访问被拒绝时，工具返回失败结果，模型可以不联网继续，任务不会被中断。搜索词会发送给第三方服务。
+- **网络工具**：`web_fetch` 只访问 https（http 自动升级）。每次请求和每次重定向前，都会解析目标地址，拒绝本机、私网、链路本地和 CGNAT 地址，并固定解析结果，防止 DNS rebinding；TUN 模式（“fake-IP”）代理返回的 `198.18.0.0/15`、`2001:db8::/32` 地址视为公网，因为局域网不会用到它们。不走系统代理。响应正文最多读 2 MiB，每次返回 12 KiB 文本，可以用 `offset` 翻页。带 `prompt`（要从页面里找什么）且页面超过 4 KiB 时，由后台模型（`model_fast`，未配置时用当前模型）只根据页面内容回答，返回简短答案而不是整页；需要原文时不带 `prompt`。提取失败时退回返回页面本身。网络访问被拒绝时，工具返回失败结果，模型可以不联网继续，任务不会被中断。搜索词会发送给第三方服务。
 
 ## 子 Agent、计划、Worktree 与回归验证
 

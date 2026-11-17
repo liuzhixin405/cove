@@ -4,6 +4,7 @@ pub mod browser;
 pub mod draw;
 pub mod extension_tools;
 pub mod external;
+pub mod line_endings;
 pub mod repomap;
 pub mod text_encoding;
 pub mod web;
@@ -47,6 +48,9 @@ const READ_LINE_CHARS: usize = 2000;
 const READ_OUTPUT: usize = 256 * 1024;
 const DIRECTORY_LIMIT: usize = 1000;
 const SHELL_TIMEOUT: u64 = 120;
+/// Edit results show the changed lines up to this size; past it, only their line numbers
+/// (unless a whitespace-tolerant match applied the edit, which the model should see).
+const SHORT_SNIPPET: usize = 400;
 const SHELL_SLOW_TIMEOUT: u64 = 300;
 const SHELL_MAX_TIMEOUT: u64 = 600;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
@@ -549,7 +553,11 @@ impl LocalTools {
         let total = content.lines().count();
         let offset = args.offset.unwrap_or(1);
         let limit = args.limit.unwrap_or(READ_WINDOW);
-        let mut out = format!("File: {shown} ({total} lines total)\n");
+        // Lines are shown without `\r`; say so when the file has them, so shell edits
+        // (sed, echo, cat <<EOF write LF) do not mix endings unknowingly.
+        let endings =
+            line_endings::describe(content).map_or(String::new(), |note| format!("; {note}"));
+        let mut out = format!("File: {shown} ({total} lines total{endings})\n");
         if let Some(note) = note {
             out.push_str(&note);
             out.push('\n');
@@ -600,7 +608,8 @@ impl LocalTools {
             Err(err) => return Err(err),
         };
         let Some(existing) = existing else {
-            let data = args.content.as_bytes();
+            let content = line_endings::for_new_file(&self.root, &path, &args.content);
+            let data = content.as_bytes();
             self.replace(&path, None, data)?;
             self.files.record(&path, data);
             return Ok(format!(
@@ -641,25 +650,44 @@ impl LocalTools {
         let shown = self.shown(&path);
         let existing = self.read_bounded(&path)?;
         let decoded = text::decode_editable(&existing, &shown).map_err(Error::Tool)?;
-        // read shows lines without `\r`, so the model writes LF; match in the file's style.
-        let (old, new) = if text::uses_crlf(&decoded.text) {
-            (text::to_crlf(&args.old), text::to_crlf(&args.new))
+        // read shows lines without `\r`, so the model works in LF: match the file's LF view
+        // and give every line back its own ending (see `line_endings`).
+        let (old, new) = (
+            line_endings::to_lf(&args.old),
+            line_endings::to_lf(&args.new),
+        );
+        let (applied, written) = if old != new {
+            let applied = edit::apply(
+                &line_endings::to_lf(&decoded.text),
+                &old,
+                &new,
+                args.replace_all,
+            )
+            .map_err(Error::Tool)?;
+            let written = line_endings::restore(&decoded.text, &applied.result);
+            (applied, written)
+        } else if args.old != args.new {
+            // Only `\r` differs: the model changes line endings on purpose, byte for byte.
+            let mut applied = edit::apply(&decoded.text, &args.old, &args.new, args.replace_all)
+                .map_err(|err| {
+                    Error::Tool(format!(
+                        "{err} (old and new differ only in line endings, so old must match the file's bytes, \\r included)"
+                    ))
+                })?;
+            applied.note.push_str(" (line endings changed as written)");
+            let written = applied.result.clone();
+            (applied, written)
         } else {
-            (args.old, args.new)
-        };
-        if old == new {
             return Err(Error::Tool("old and new must differ".into()));
-        }
-        let applied =
-            edit::apply(&decoded.text, &old, &new, args.replace_all).map_err(Error::Tool)?;
+        };
         let data = match decoded.legacy {
-            Some(legacy) => legacy.encode(&applied.result).map_err(|err| {
+            Some(legacy) => legacy.encode(&written).map_err(|err| {
                 Error::Tool(format!(
                     "{shown} is {0}-encoded, and {err} in new. The file was left unchanged.",
                     legacy.name()
                 ))
             })?,
-            None => applied.result.clone().into_bytes(),
+            None => written.into_bytes(),
         };
         self.replace(&path, Some(&existing), &data)?;
         self.files.record(&path, &data);
@@ -668,7 +696,16 @@ impl LocalTools {
             applied.replacements, applied.note
         );
         let snippets = edit::snippets(&applied.result, &applied.spots, applied.inserted_len);
-        if !snippets.is_empty() {
+        if applied.note.is_empty() && snippets.len() > SHORT_SNIPPET {
+            // An exact replacement wrote what the model just sent: where it landed is enough.
+            out.push_str(&format!(
+                " at {}",
+                edit::regions(&applied.result, &applied.spots, applied.inserted_len)
+            ));
+            if applied.replacements > applied.spots.len() {
+                out.push_str(&format!(" (first {} listed)", applied.spots.len()));
+            }
+        } else if !snippets.is_empty() {
             out.push('\n');
             out.push_str(&snippets);
             if applied.replacements > applied.spots.len() {

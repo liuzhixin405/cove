@@ -14,7 +14,10 @@ use crate::{
     domain::{Block, Message, ModelRequest, Provider, Role},
     engine::turn::TurnHook,
     extensions::{
-        skill_candidates::{TaskSource, ValidationState},
+        skill_candidates::{
+            CandidateState, LearnOutcome, Learned, Proposal, ProposalKind, TaskSource,
+            ValidationState,
+        },
         skills::{Skills, clip},
     },
     safety::verify::Outcome,
@@ -26,10 +29,14 @@ use crate::{
 
 const MIN_TASKS: u32 = 3;
 const MIN_MESSAGES: usize = 4;
-const MAX_PROPOSALS: usize = 8;
+const MAX_PROPOSALS: usize = 2;
+/// Known skills listed with their steps; the rest by name and description only.
+const KNOWN_WITH_STEPS: usize = 10;
+/// Upper bound on the known-skills list sent with each review.
+const MAX_KNOWN_BYTES: usize = 4 * 1024;
 const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
-const PROMPT: &str = "You review a coding-agent conversation excerpt and decide whether it shows a reusable workflow (steps that solved a specific kind of problem) worth saving as a skill.\n\nOutput one line per workflow, exactly:\nSKILL: <short-name> | <one sentence: when to use it> | <brief ordered steps>\n\nDo not output one-off task details, obvious facts, user preferences, project facts or code. If nothing is worth saving, output only NONE.";
+const PROMPT: &str = "You review a coding-agent conversation excerpt and decide whether it shows a reusable workflow (steps that solved a specific kind of problem and would solve it again) worth saving as a skill.\n\nThe known learned skills are listed after the excerpt. Prefer improving one of them over adding a new one.\n\nOutput at most two lines, each exactly one of:\nUPDATE: <known skill name> | <one sentence: when to use it> | <complete revised ordered steps>\nNEW: project | <short-name> | <one sentence: when to use it> | <brief ordered steps>\nNEW: global | <short-name> | <one sentence: when to use it> | <brief ordered steps>\n\nUse UPDATE when the workflow is the same as or overlaps a known skill and the conversation taught something it lacks; write the full merged steps, not only the change, and keep them under 1500 characters by dropping detail that did not matter. If a known skill already covers it, output NONE. Use project when the steps depend on this repository (its services, files, scripts or conventions) and global when they work in any project. Only save workflows from tasks that succeeded. Do not output one-off task details, obvious facts, user preferences, project facts or code. If nothing is worth saving, output only NONE.";
 
 static SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(api[_-]?key|secret|passw(or)?d|token|bearer)\s*[:=]\s*\S{8,}|\bsk-[A-Za-z0-9_-]{16,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{30,}|\bxox[abp]-[A-Za-z0-9-]{10,}")
@@ -126,11 +133,25 @@ fn identifier_name(raw: &str) -> String {
     name.trim_end_matches('-').chars().take(64).collect()
 }
 
-/// Parses `SKILL:` lines into (name, description, steps).
-pub fn proposals(answer: &str) -> Vec<(String, String, String)> {
+/// Parses `UPDATE:` and `NEW: project|global` lines (and the older `SKILL:` form, read as a
+/// project workflow).
+pub fn proposals(answer: &str) -> Vec<Proposal> {
     let mut out = Vec::new();
     for line in answer.lines().map(str::trim) {
-        let Some(rest) = line.strip_prefix("SKILL:") else {
+        let (kind, rest) = if let Some(rest) = line.strip_prefix("UPDATE:") {
+            (ProposalKind::Update, rest)
+        } else if let Some(rest) = line.strip_prefix("NEW:") {
+            let Some((scope, rest)) = rest.split_once('|') else {
+                continue;
+            };
+            match scope.trim().to_ascii_lowercase().as_str() {
+                "global" => (ProposalKind::Global, rest),
+                "project" => (ProposalKind::Project, rest),
+                _ => continue,
+            }
+        } else if let Some(rest) = line.strip_prefix("SKILL:") {
+            (ProposalKind::Project, rest)
+        } else {
             continue;
         };
         let parts: Vec<&str> = rest.split('|').map(str::trim).collect();
@@ -146,14 +167,25 @@ pub fn proposals(answer: &str) -> Vec<(String, String, String)> {
         if name.is_empty() || body.trim().is_empty() {
             continue;
         }
-        out.push((name, description, body));
+        out.push(Proposal {
+            kind,
+            name,
+            description,
+            body,
+        });
     }
     out
 }
 
-/// Screens and saves proposals; returns the saved names.
+/// Screens and saves proposals; returns the names that were stored or changed.
 pub fn apply(skills: &Skills, answer: &str, session: &str) -> Vec<String> {
-    apply_with_sources(skills, answer, session, &[]).0
+    apply_with_sources(skills, answer, session, &[])
+        .0
+        .into_iter()
+        .filter_map(|(name, outcome)| {
+            (!matches!(outcome.learned, Learned::Skipped)).then_some(name)
+        })
+        .collect()
 }
 
 fn apply_with_sources(
@@ -161,19 +193,18 @@ fn apply_with_sources(
     answer: &str,
     session: &str,
     sources: &[TaskSource],
-) -> (Vec<String>, Vec<String>) {
-    let mut saved = Vec::new();
+) -> (Vec<(String, LearnOutcome)>, Vec<String>) {
+    let mut results = Vec::new();
     let mut errors = Vec::new();
     if answer.len() > MAX_ANSWER_BYTES {
-        return (saved, vec!["复盘输出过大，未保存候选".into()]);
+        return (results, vec!["复盘输出过大，未保存候选".into()]);
     }
-    let store = match skills.candidate_store() {
-        Ok(store) => store,
-        Err(err) => return (saved, vec![format!("无法打开候选存储：{err}")]),
-    };
     let mut attempted = 0;
-    for (name, description, body) in proposals(answer) {
-        let all = format!("{name}\n{description}\n{body}");
+    for proposal in proposals(answer) {
+        let all = format!(
+            "{}\n{}\n{}",
+            proposal.name, proposal.description, proposal.body
+        );
         if crate::tools::external::suspicious(&all) || contains_secret(&all) {
             continue;
         }
@@ -181,12 +212,104 @@ fn apply_with_sources(
             break;
         }
         attempted += 1;
-        match store.submit_review_with_sources(&name, &description, &body, session, sources) {
-            Ok(_) => saved.push(name),
-            Err(err) => errors.push(format!("候选 {name} 未保存：{err}")),
+        match skills.learn(&proposal, session, sources) {
+            Ok(outcome) => results.push((proposal.name, outcome)),
+            Err(err) => errors.push(format!("技能 {} 未保存：{err}", proposal.name)),
         }
     }
-    (saved, errors)
+    (results, errors)
+}
+
+fn scope_label(candidate: &crate::extensions::skill_candidates::Candidate) -> &'static str {
+    if candidate.scope.is_some() {
+        "本项目"
+    } else {
+        "全局"
+    }
+}
+
+/// Lines worth interrupting for: skills that went live, changed or retired. Pending
+/// candidates are silent; nobody has to act on them.
+fn notices(outcome: &LearnOutcome) -> Vec<String> {
+    let mut out = Vec::new();
+    match &outcome.learned {
+        Learned::Activated(candidate) => out.push(format!(
+            "[skills] 已自动启用技能（{}）：{}（{}）\n",
+            scope_label(candidate),
+            candidate.name,
+            candidate
+                .history
+                .first()
+                .map_or("", |decision| decision.reason.as_str())
+        )),
+        Learned::Updated(candidate) => out.push(format!(
+            "[skills] 已自动更新技能（{}）：{}\n",
+            scope_label(candidate),
+            candidate.name
+        )),
+        Learned::New(_) | Learned::Recurred(_) | Learned::Revised(_) | Learned::Skipped => {}
+    }
+    for gone in &outcome.retired {
+        out.push(format!(
+            "[skills] 已退役技能（{}）：{}（{}）\n",
+            scope_label(gone),
+            gone.name,
+            gone.history
+                .last()
+                .map_or("", |decision| decision.reason.as_str())
+        ));
+    }
+    out
+}
+
+/// Known learned skills as prompt lines, approved and most-recurring first: the first
+/// [`KNOWN_WITH_STEPS`] with a step summary, the rest by name, all within
+/// [`MAX_KNOWN_BYTES`].
+fn known(skills: &Skills) -> String {
+    let Ok(mut learned) = skills.learned() else {
+        return String::new();
+    };
+    learned.sort_by_key(|candidate| {
+        std::cmp::Reverse((
+            candidate.state == CandidateState::Approved,
+            candidate.sessions.len(),
+            candidate.created_at,
+        ))
+    });
+    let mut out = String::new();
+    for (index, candidate) in learned.iter().enumerate() {
+        let scope = if candidate.scope.is_some() {
+            "project"
+        } else {
+            "global"
+        };
+        let line = if index < KNOWN_WITH_STEPS {
+            format!(
+                "- {} ({scope}): {} | {}\n",
+                candidate.name,
+                clip(&candidate.description, 160),
+                clip(&candidate.body.replace('\n', " "), 300)
+            )
+        } else {
+            format!(
+                "- {} ({scope}): {}\n",
+                candidate.name,
+                clip(&candidate.description, 120)
+            )
+        };
+        if out.len() + line.len() > MAX_KNOWN_BYTES {
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// Worth reviewing only when some task finished without a failed verification.
+fn succeeded(sources: &[TaskSource]) -> bool {
+    sources.iter().any(|source| {
+        source.completed == Some(true) && source.verification != ValidationState::Failed
+    })
 }
 
 fn worked(messages: &[Message]) -> bool {
@@ -293,6 +416,10 @@ impl SkillReview {
                     .into_iter()
                     .filter(|source| source.message_end > excerpt_start)
                     .collect();
+                if !succeeded(&sources) {
+                    state.running = false;
+                    return;
+                }
                 text.push_str("\nTask evidence (not proof that a proposed skill works):\n");
                 for source in &sources {
                     text.push_str(&format!(
@@ -303,6 +430,13 @@ impl SkillReview {
                             .map_or("unknown", |completed| if completed { "yes" } else { "no" }),
                         source.verification
                     ));
+                }
+                text.push_str(
+                    "\nKnown learned skills (update one of these rather than adding a near-duplicate):\n",
+                );
+                match known(&self.skills) {
+                    list if list.is_empty() => text.push_str("(none)\n"),
+                    list => text.push_str(&list),
                 }
                 (
                     ModelRequest {
@@ -403,23 +537,22 @@ impl SkillReview {
                         {
                             errors.push(format!("复盘用量未记录：{err}"));
                         }
-                        let (names, apply_errors) = answer.map_or_else(
+                        let (results, apply_errors) = answer.map_or_else(
                             || (Vec::new(), Vec::new()),
                             |answer| apply_with_sources(&skills, &answer, &id, &request.1),
                         );
                         errors.extend(apply_errors);
-                        (names, errors)
+                        let notices: Vec<String> = results
+                            .iter()
+                            .flat_map(|(_, outcome)| notices(outcome))
+                            .collect();
+                        (notices, errors)
                     })
                     .await
                     {
-                        Ok((names, errors)) => {
-                            for name in names {
-                                let _ = crate::app::ui::print_text(
-                                    &format!(
-                                        "[skills] 生成待审核技能候选：{name}；用 /config skills candidates list 查看\n"
-                                    ),
-                                    true,
-                                );
+                        Ok((notices, errors)) => {
+                            for notice in notices {
+                                let _ = crate::app::ui::print_text(&notice, true);
                             }
                             for error in errors {
                                 let _ = crate::app::ui::print_text(
@@ -523,15 +656,38 @@ mod tests {
     #[test]
     fn proposals_are_parsed_and_screened() {
         let parsed = proposals(
-            "x\nSKILL: Release Check | Before tagging | 1. test 2. tag\nSKILL: bad\nNONE",
+            "x\nSKILL: Release Check | Before tagging | 1. test 2. tag\nSKILL: bad\nNONE\n\
+             NEW: global | aws-sso | When AWS denies | unset keys | relogin\n\
+             NEW: elsewhere | x | y | z\nUPDATE: release-check | Before tagging | test, tag, push",
         );
+        let proposal = |kind, name: &str, description: &str, body: &str| Proposal {
+            kind,
+            name: name.into(),
+            description: description.into(),
+            body: body.into(),
+        };
         assert_eq!(
             parsed,
-            [(
-                "release-check".into(),
-                "Before tagging".into(),
-                "1. test 2. tag".into()
-            )]
+            [
+                proposal(
+                    ProposalKind::Project,
+                    "release-check",
+                    "Before tagging",
+                    "1. test 2. tag"
+                ),
+                proposal(
+                    ProposalKind::Global,
+                    "aws-sso",
+                    "When AWS denies",
+                    "unset keys | relogin"
+                ),
+                proposal(
+                    ProposalKind::Update,
+                    "release-check",
+                    "Before tagging",
+                    "test, tag, push"
+                ),
+            ]
         );
         assert!(contains_secret("api_key = abcdefgh12345"));
         assert!(contains_secret("sk-abcdefghijklmnopqrstu"));
@@ -630,8 +786,11 @@ mod tests {
             .map(|number| format!("SKILL: flow-{number} | task | run tests\n"))
             .collect::<String>();
         let saved = apply(&skills, &answer, "session-1");
-        assert_eq!(saved.len(), 8);
-        assert_eq!(skills.candidate_store().unwrap().list().unwrap().len(), 8);
+        assert_eq!(saved.len(), MAX_PROPOSALS);
+        assert_eq!(
+            skills.candidate_store().unwrap().list().unwrap().len(),
+            MAX_PROPOSALS
+        );
     }
 
     #[tokio::test]
@@ -947,5 +1106,190 @@ mod tests {
         assert!(!skills.contains("leak"));
         assert!(skills.is_curated("plan"));
         assert!(!SkillReview::enabled(&json!({"skill_review": false})));
+    }
+
+    /// Records the prompt it was sent and answers with a fixed text.
+    struct Capturing {
+        answer: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Provider for Capturing {
+        fn stream(
+            &self,
+            request: ModelRequest,
+            _events: mpsc::Sender<crate::domain::Event>,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<ModelResponse>> {
+            let text = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .filter_map(|block| match block {
+                    Block::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<String>();
+            self.seen.lock().unwrap().push(text);
+            let answer = self.answer.clone();
+            Box::pin(async move {
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        blocks: vec![Block::Text(answer)],
+                    },
+                    usage: Usage::default(),
+                    complete: true,
+                    usage_reported: true,
+                    reported_cost: None,
+                    model: None,
+                })
+            })
+        }
+    }
+
+    fn project_skills(data: &std::path::Path, cwd: &std::path::Path) -> Arc<Skills> {
+        Arc::new(
+            Skills::load(
+                SkillSources {
+                    data_dir: data.into(),
+                    cwd: cwd.into(),
+                    // These tests exercise the automatic lifecycle (`skill_review_auto`).
+                    auto_learn: true,
+                    ..SkillSources::default()
+                },
+                Arc::new(Registry::open(data).unwrap()),
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn run_three_tasks(review: &SkillReview, data: &std::path::Path, completed: bool) {
+        let mut session = Session::new(data.into(), "Openai".into(), "m".into(), None);
+        for task in 0..3 {
+            session.messages.push(Message::user(format!("task {task}")));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolUse {
+                    id: format!("c{task}"),
+                    name: "write".into(),
+                    input: json!({"path":"a"}),
+                    extra: None,
+                }],
+            });
+            review.task_end(&session, completed).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while review.state.lock().unwrap().running {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_review_skips_batches_where_no_task_succeeded() {
+        let data = tempfile::tempdir().unwrap();
+        let skills = project_skills(data.path(), data.path());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let review = SkillReview::new(
+            Arc::new(Capturing {
+                answer: "NEW: project | deploy-flow | When deploying | build".into(),
+                seen: seen.clone(),
+            }),
+            skills.clone(),
+            1000,
+        );
+        run_three_tasks(&review, data.path(), false).await;
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(skills.candidate_store().unwrap().list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_review_lists_known_skills_and_auto_updates_approved_ones() {
+        use crate::extensions::skill_candidates::CandidateState;
+
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skills = project_skills(data.path(), project.path());
+        let scope = skills.scope_key().unwrap();
+        let first = SkillReview::new(
+            Arc::new(Capturing {
+                answer: "NEW: project | deploy-flow | When deploying | build, ship".into(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }),
+            skills.clone(),
+            1000,
+        );
+        run_three_tasks(&first, data.path(), true).await;
+        let candidate = skills.learned().unwrap().remove(0);
+        assert_eq!(candidate.scope.as_deref(), Some(scope.as_str()));
+        skills
+            .decide_candidate(
+                &candidate.id,
+                CandidateState::Candidate,
+                CandidateState::Approved,
+                "user",
+                "",
+            )
+            .unwrap();
+        assert!(
+            skills
+                .render("deploy-flow", None)
+                .unwrap()
+                .contains("build, ship")
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let second = SkillReview::new(
+            Arc::new(Capturing {
+                answer: "UPDATE: deploy-flow | When deploying | build, test, ship".into(),
+                seen: seen.clone(),
+            }),
+            skills.clone(),
+            1000,
+        );
+        run_three_tasks(&second, data.path(), true).await;
+        assert!(
+            seen.lock().unwrap()[0]
+                .contains("- deploy-flow (project): When deploying | build, ship")
+        );
+        // Updated without review and active at once.
+        let rendered = skills.render("deploy-flow", None).unwrap();
+        assert!(rendered.contains("build, test, ship"), "{rendered}");
+        let records = skills.candidate_store().unwrap().list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, CandidateState::Approved);
+
+        // A project-scoped skill is not loaded in another project.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = project_skills(data.path(), elsewhere.path());
+        assert!(!other.contains("deploy-flow"));
+        assert!(project_skills(data.path(), project.path()).contains("deploy-flow"));
+    }
+
+    #[test]
+    fn skill_review_never_overwrites_curated_skills() {
+        let data = tempfile::tempdir().unwrap();
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            Arc::new(Registry::open(data.path()).unwrap()),
+        )
+        .unwrap();
+        assert!(skills.is_curated("plan"));
+        assert!(
+            apply(
+                &skills,
+                "UPDATE: plan | shadow | x\nNEW: global | plan | shadow | x",
+                "s"
+            )
+            .is_empty()
+        );
+        assert!(skills.candidate_store().unwrap().list().unwrap().is_empty());
     }
 }

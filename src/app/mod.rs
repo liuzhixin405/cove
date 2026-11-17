@@ -172,7 +172,10 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         skills: skills.clone(),
         memory: memory.clone(),
         mcp,
-        web: Arc::new(Web::new(settings.web_search.clone(), authorizer.clone())),
+        web: Arc::new(
+            Web::new(settings.web_search.clone(), authorizer.clone())
+                .with_extractor(background.clone()),
+        ),
         authorizer: authorizer.clone(),
     });
     let project_context = {

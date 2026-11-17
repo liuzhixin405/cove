@@ -21,7 +21,7 @@ use crate::{
     safety::permission::Effect,
 };
 
-pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config skills candidates [list|show <hash>|approve <hash>|reject <hash>|revoke <hash> <reason>|migrate <old> <new>]  审核技能候选\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
+pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config skills candidates [list|show <hash>|approve <hash>|reject <hash>|revoke <hash> <reason>|migrate <old> <new>|prune [days]]  审核技能候选（prune：清理 N 天前只出现过一次的待审候选，默认 30，0 为清空待审）\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
 
 /// Top-level commands of the final command set; they win over skills of the same name.
 const BUILTIN: &[&str] = &[
@@ -128,6 +128,11 @@ pub(crate) fn load(
                 .collect(),
             disabled,
             builtin: true,
+            auto_learn: settings
+                .file
+                .get("skill_review_auto")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false),
         },
         registry,
     )?;
@@ -367,13 +372,46 @@ async fn configure(app: &mut Application, args: &[&str]) -> Result<Option<bool>>
         ["skills", "install", source] => install_skill(app, source).await?,
         ["skills", "marketplace", query @ ..] => skill_marketplace(app, &query.join(" ")).await?,
         ["skills", "candidates"] | ["skills", "candidates", "list"] => {
-            let candidates = app.tools.skills.candidate_store()?.list()?;
+            // Pending first, then the ones that keep coming back: recurrence is the signal.
+            let mut candidates = app.tools.skills.candidate_store()?.list()?;
+            candidates.sort_by_key(|candidate| {
+                (
+                    candidate.state != CandidateState::Candidate,
+                    std::cmp::Reverse(candidate.sessions.len()),
+                    std::cmp::Reverse(candidate.created_at),
+                )
+            });
+            let here = app.tools.skills.scope_key();
             let list: Vec<Value> = candidates.iter().map(|candidate| json!({
                 "id": candidate.id, "name": candidate.name, "description": candidate.description,
                 "state": candidate.state, "validation": candidate.validation,
+                "scope": match &candidate.scope {
+                    None => "global".to_owned(),
+                    Some(scope) if Some(scope) == here.as_ref() => "project (this)".to_owned(),
+                    Some(scope) => format!("project {scope}"),
+                },
                 "created_at": candidate.created_at, "sources": candidate.sessions.len()
             })).collect();
             show(json!(list))?;
+        }
+        ["skills", "candidates", "prune", days @ ..] if days.len() <= 1 => {
+            let days: u64 = match days.first() {
+                Some(days) => days
+                    .parse()
+                    .map_err(|_| Error::Tool("usage: candidates prune [days]".into()))?,
+                None => crate::extensions::skill_candidates::STALE_SECS / 86_400,
+            };
+            authorize(
+                app,
+                Effect::Write(app.store.root().join("skill-candidates/records.json")),
+            )
+            .await?;
+            let removed = app
+                .tools
+                .skills
+                .candidate_store()?
+                .prune(days.saturating_mul(86_400))?;
+            show(json!({"removed": removed, "older_than_days": days}))?;
         }
         ["skills", "candidates", "show", id] => {
             let candidate = app

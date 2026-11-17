@@ -791,6 +791,12 @@ async fn experimental_tools_and_custom_agent_types_come_from_the_config() {
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(tools, ["read", "glob"]);
+    // Every sub-agent, custom types included, is asked for a short final answer.
+    assert!(
+        docs.to_string()
+            .contains("Your final answer is read by the parent agent"),
+        "{docs}"
+    );
     assert!(
         requests[3]
             .to_string()

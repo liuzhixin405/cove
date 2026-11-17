@@ -57,6 +57,11 @@ pub const WRITE_TOOLS: &[&str] = &[
     "regression",
 ];
 
+/// Every sub-agent's final answer lands in the parent's context and stays there.
+pub const REPORT_INSTRUCTIONS: &str = "Your final answer is read by the parent agent and stays in its context for the rest of the task, so keep it short: \
+    lead with the conclusion, then only the facts that support it (file:line references instead of quoted code, exact commands and results). \
+    Aim for at most about 400 words; do not restate the task, list what you looked at, or repeat yourself.";
+
 const READ_INSTRUCTIONS: &str = "You are a delegated read-only sub-agent (explore). You cannot edit files, run shell commands or ask the user. \
     Investigate only the assigned question with read/glob/grep/repo_map (and web tools when sources outside the repository matter), then answer concisely with concrete file paths, line numbers and findings. \
     State what you could not determine; do not guess.";
@@ -1020,6 +1025,8 @@ impl AgentHub {
         inbox_key: &str,
     ) -> Result<Agent> {
         let mut instructions = kind.instructions.clone();
+        instructions.push_str("\n\n");
+        instructions.push_str(REPORT_INSTRUCTIONS);
         if let Some(extra) = extra {
             instructions.push_str("\n\n");
             instructions.push_str(&extra);

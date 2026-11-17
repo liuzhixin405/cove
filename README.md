@@ -141,6 +141,10 @@ cove
 
 技能是预先写好的做事方法，比如代码审查、TDD、调试、写提交信息。`/skills` 列出全部，`/技能名` 直接使用。`/config skills marketplace` 浏览技能市场（内置在程序里，不联网也能用）。
 
+cove 还会从你完成的任务里**自动学到技能**：后台复盘发现可复用的做法时，记为本项目或全局的技能候选；同一做法在 2 个会话里出现过、或任务验证通过，就自动启用，之后再学到改进会自动更新，60 天不用会自动退役。每次启用、更新、退役都会提示一行 `[skills] …`，默认不需要你审核。
+
+想改成人工审核：在 `%USERPROFILE%\.cove\config.json` 里加 `"skill_review_auto": false`，重启后学到的技能只进入待审列表，用 `/config skills candidates list` 查看、`approve <哈希>` 批准、`reject <哈希>` 拒绝。完全关闭学习用 `"skill_review": false`。详见[技术参考](docs/reference.md)“扩展”一节。
+
 **其他常用命令**
 
 | 命令 | 作用 |

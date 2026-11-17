@@ -163,27 +163,22 @@ pub fn utf16_advice(path: &str) -> String {
     )
 }
 
-/// Whether most line breaks of `text` are CRLF.
-pub fn uses_crlf(text: &str) -> bool {
-    let crlf = text.matches("\r\n").count();
-    crlf > 0 && crlf >= text.matches('\n').count() - crlf
-}
-
-pub fn to_crlf(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\n', "\r\n")
-}
-
-/// Adapts text the model wrote (LF, no BOM) to the conventions of the file it replaces.
+/// Adapts text the model wrote (LF, no BOM) to the file it replaces: the BOM stays, and
+/// line endings are kept per line (unchanged lines keep theirs; see `line_endings`).
+/// Text containing `\r` is the model's deliberate choice of endings and is kept as written.
 pub fn match_existing(text: &str, existing: &str) -> String {
-    let mut text = if uses_crlf(existing) {
-        to_crlf(text)
+    let bom = existing.starts_with(UTF8_BOM) || text.starts_with(UTF8_BOM);
+    let body = existing.strip_prefix(UTF8_BOM).unwrap_or(existing);
+    let written = text.strip_prefix(UTF8_BOM).unwrap_or(text);
+    let mut out = if written.contains('\r') {
+        written.to_owned()
     } else {
-        text.to_owned()
+        crate::tools::line_endings::restore(body, written)
     };
-    if existing.starts_with(UTF8_BOM) && !text.starts_with(UTF8_BOM) {
-        text.insert_str(0, UTF8_BOM);
+    if bom {
+        out.insert_str(0, UTF8_BOM);
     }
-    text
+    out
 }
 
 /// One line of process output: UTF-8 as is; otherwise (Windows console code page) GBK
@@ -269,7 +264,6 @@ mod tests {
             "\u{feff}a\r\nb\r\n"
         );
         assert_eq!(match_existing("a\nb", "x\ny"), "a\nb");
-        assert!(!uses_crlf("a\nb\r\nc\n"));
     }
 
     #[test]
