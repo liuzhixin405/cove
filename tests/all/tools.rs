@@ -766,6 +766,7 @@ fn reply(blocks: Vec<Block>) -> ModelResponse {
         message: Message {
             role: Role::Assistant,
             blocks,
+            origin: cove::domain::Origin::Unknown,
         },
         usage: Usage {
             input: 1,

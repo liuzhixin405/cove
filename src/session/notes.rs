@@ -347,6 +347,7 @@ mod tests {
             blocks: vec![Block::Text(
                 "It turns out grep was missing on Windows.".into(),
             )],
+            origin: crate::domain::Origin::Unknown,
         });
         session.compactions = 1;
         notes.task_end(&session, true).await;

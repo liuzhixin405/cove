@@ -41,6 +41,10 @@ const HISTORY_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const INPUT_ROWS: usize = 12;
 /// Steering messages waiting for the running task.
 const STEER_LIMIT: usize = 16;
+/// What the user typed, in the transcript: bright bold text on a shaded band, so a
+/// question stands apart from replies in the default colour. Yellow while queued.
+const USER_TEXT: &str = "1;96;48;5;237";
+const USER_TEXT_QUEUED: &str = "1;93;48;5;237";
 
 const STEER_PREFIX: &str =
     "[the user typed this while the task ran; treat it as an instruction from the user]";
@@ -102,7 +106,10 @@ impl Meter {
             row.push_str(&format!(" · 思考 {}", self.thinking));
         }
         if let Some(seconds) = running.or(self.turn) {
-            row.push_str(&format!(" · 本轮 {}", crate::app::render::duration(seconds)));
+            row.push_str(&format!(
+                " · 本轮 {}",
+                crate::app::render::duration(seconds)
+            ));
         }
         let near = self.compact_at > 0 && self.context * 5 >= self.compact_at * 4;
         if near {
@@ -209,6 +216,7 @@ pub fn stop() {
     if let Some(console) = CONSOLE.get() {
         let mut state = console.lock();
         if state.running {
+            state.close_history();
             state.erase();
             state.pending.push_str("\x1b[?2004l\x1b[0m");
             state.running = false;
@@ -402,23 +410,45 @@ impl Console {
         true
     }
 
-    pub fn browse_turns(&self, turns: Vec<TurnView>, compacted: bool) -> bool {
+    /// Opens the history panel below the input, or the reader alone (`/turns`).
+    /// False while a question waits.
+    pub fn browse_history(&self, view: crate::app::history::HistoryView) -> bool {
         let mut state = self.lock();
-        if state.ask.is_some() || turns.is_empty() {
+        if state.ask.is_some() || view.is_empty() {
             return false;
         }
-        state.choices = None;
+        state.editor.take();
         state.candidates.clear();
-        let selected = turns.len() - 1;
-        state.turn_browser = Some(TurnBrowser {
-            turns,
-            selected,
-            expanded: false,
-            scroll: 0,
-            compacted,
-        });
+        state.choices = None;
+        state.history_view = Some(view);
+        state.sync_alternate();
         state.redraw();
         true
+    }
+
+    /// A session got a new title: the open history panel shows it, and for the
+    /// session in use so does the window's title bar.
+    pub fn retitle(&self, id: &str, title: &str, current: bool) {
+        let mut state = self.lock();
+        if let Some(view) = state.history_view.as_mut() {
+            view.retitle(id, title);
+        }
+        if current {
+            state.window_title(title);
+        }
+        state.redraw();
+    }
+
+    /// The terminal window's title: `cove · <title>`.
+    pub fn set_window_title(&self, title: &str) {
+        let mut state = self.lock();
+        state.window_title(title);
+        state.flush();
+    }
+
+    /// Whether colors are used (`NO_COLOR` unset).
+    pub fn color(&self) -> bool {
+        !*NO_COLOR
     }
 
     /// Whether the agent panel is open (Alt+M).
@@ -565,6 +595,12 @@ fn keyboard(console: &'static Arc<Console>) {
                 Err(_) => break,
             },
         };
+        // Mouse capture reports every move; only buttons and the wheel matter.
+        if let Event::Mouse(mouse) = &event
+            && mouse.kind == event::MouseEventKind::Moved
+        {
+            continue;
+        }
         // A console without bracketed paste delivers a pasted newline as Enter
         // and a pasted tab as Tab; nobody types on within a few milliseconds.
         let mut pasted = false;
@@ -628,8 +664,16 @@ fn keyboard(console: &'static Arc<Console>) {
                     state.paste_text(&text);
                     Action::None
                 }
-                Event::Mouse(_) => Action::None,
-                Event::Resize(_, _) => Action::None,
+                Event::Mouse(mouse) => {
+                    state.history_mouse(mouse);
+                    Action::None
+                }
+                Event::Resize(_, _) => {
+                    if let Some(view) = state.history_view.as_mut() {
+                        view.resized();
+                    }
+                    Action::None
+                }
                 _ => Action::None,
             };
             match action {
@@ -675,20 +719,6 @@ struct Choices {
     title: String,
     items: Vec<Choice>,
     selected: usize,
-}
-
-pub struct TurnView {
-    pub title: String,
-    pub content: String,
-    pub input: String,
-}
-
-struct TurnBrowser {
-    turns: Vec<TurnView>,
-    selected: usize,
-    expanded: bool,
-    scroll: usize,
-    compacted: bool,
 }
 
 fn wrap_display(text: &str, columns: usize) -> Vec<String> {
@@ -809,9 +839,13 @@ struct State {
     /// Images for the next line, with their status-row descriptions.
     attachments: Vec<(PathBuf, String)>,
     choices: Option<Choices>,
-    turn_browser: Option<TurnBrowser>,
     /// The agent panel's lines while it is open.
     panel: Option<Vec<String>>,
+    /// The history panel or reader (`/continue`, `/resume`, `/turns`).
+    history_view: Option<crate::app::history::HistoryView>,
+    /// The reader holds the alternate screen; output waits in `deferred` meanwhile.
+    alternate: bool,
+    deferred: String,
 }
 
 impl State {
@@ -848,8 +882,10 @@ impl State {
             scratch: std::env::temp_dir(),
             attachments: Vec::new(),
             choices: None,
-            turn_browser: None,
             panel: None,
+            history_view: None,
+            alternate: false,
+            deferred: String::new(),
         }
     }
 
@@ -868,10 +904,14 @@ impl State {
     }
 
     fn paste_text(&mut self, text: &str) {
-        if self.busy {
-            self.turn_browser = None;
+        if let Some(view) = self.history_view.as_mut() {
+            if !view.reading() {
+                self.editor.insert_text(&text.replace(['\r', '\n'], " "));
+                view.filter_changed();
+            }
+            return;
         }
-        if self.turn_browser.is_none() && !self.attach_pasted(text) {
+        if !self.attach_pasted(text) {
             self.editor.insert_text(text);
             self.edited();
         }
@@ -971,7 +1011,7 @@ impl State {
 
     fn ask(&mut self, prompt: &str, masked: bool) -> oneshot::Receiver<Result<String>> {
         let (reply, receiver) = oneshot::channel();
-        self.turn_browser = None;
+        self.close_history();
         self.end_ask(Err(Error::Cancelled));
         // A question's leading lines are output; its last line is the prompt.
         let (head, tail) = prompt.rsplit_once('\n').unwrap_or(("", prompt));
@@ -1036,56 +1076,166 @@ impl State {
         self.out_col = 0;
     }
 
+    /// Keys while the history panel or reader is open.
+    fn history_key(&mut self, key: KeyEvent) -> Action {
+        use crate::app::history::{ListAction, ReaderAction};
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(view) = self.history_view.as_mut() else {
+            return Action::None;
+        };
+        if view.reading() {
+            match view.reader_key(key) {
+                ReaderAction::None => {}
+                ReaderAction::Leave => {
+                    if view.reader_only() {
+                        self.history_view = None;
+                    }
+                }
+                ReaderAction::Submit(line) => {
+                    self.history_view = None;
+                    self.sync_alternate();
+                    return self.submit(line);
+                }
+            }
+            self.sync_alternate();
+            return Action::None;
+        }
+        let query: String = self.editor.buffer.iter().collect();
+        match view.list_key(key, &query) {
+            ListAction::None => {}
+            ListAction::Close => {
+                self.history_view = None;
+                self.editor.take();
+            }
+            ListAction::Submit(line) => {
+                self.history_view = None;
+                return self.submit(line);
+            }
+            ListAction::Prefill(text) => {
+                self.history_view = None;
+                self.editor.restore(text.chars().collect());
+            }
+            ListAction::Edit => {
+                match key.code {
+                    KeyCode::Char(c) if !control => self.editor.insert(c),
+                    KeyCode::Backspace => self.editor.backspace(),
+                    _ => {}
+                }
+                if let Some(view) = self.history_view.as_mut() {
+                    view.filter_changed();
+                }
+            }
+        }
+        self.sync_alternate();
+        Action::None
+    }
+
+    /// Submits `line` as if typed (a choice made in a panel).
+    fn submit(&mut self, line: String) -> Action {
+        self.editor.restore(line.chars().collect());
+        self.enter()
+    }
+
+    /// The reader holds the alternate screen and the mouse; the panel and the input
+    /// do not. Leaving gives the main screen back as it was, then writes what was
+    /// output meanwhile.
+    fn sync_alternate(&mut self) {
+        let want = self
+            .history_view
+            .as_ref()
+            .is_some_and(crate::app::history::HistoryView::reading);
+        if want == self.alternate || !self.running {
+            return;
+        }
+        if want {
+            self.erase();
+            self.pending.push_str("\x1b[?1049h\x1b[?25l");
+            self.flush();
+            let _ = crossterm::execute!(std::io::stderr(), crossterm::event::EnableMouseCapture);
+            self.alternate = true;
+        } else {
+            let _ = crossterm::execute!(std::io::stderr(), crossterm::event::DisableMouseCapture);
+            self.pending.push_str("\x1b[?1049l\x1b[?25h");
+            self.alternate = false;
+            self.drawn = None;
+            self.flush();
+            let deferred = std::mem::take(&mut self.deferred);
+            if !deferred.is_empty() {
+                self.output(false, &deferred);
+            }
+        }
+    }
+
+    fn window_title(&mut self, title: &str) {
+        if !self.running {
+            return;
+        }
+        let title: String = title.chars().filter(|c| !c.is_control()).take(80).collect();
+        let shown = if title.trim().is_empty() {
+            "cove".to_owned()
+        } else {
+            format!("cove · {title}")
+        };
+        self.pending.push_str(&format!("\x1b]0;{shown}\x07"));
+    }
+
+    fn close_history(&mut self) {
+        if self.history_view.take().is_some() {
+            self.sync_alternate();
+        }
+    }
+
+    fn history_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        if let Some(view) = self.history_view.as_mut() {
+            view.mouse(event);
+        }
+    }
+
+    /// The reader on the whole alternate screen.
+    fn draw_reader(&mut self) {
+        let (columns, rows) = crossterm::terminal::size().map_or((80, 24), |(columns, rows)| {
+            (usize::from(columns), usize::from(rows))
+        });
+        let Some(view) = &self.history_view else {
+            return;
+        };
+        let lines = view.reader_lines(columns, rows.max(8));
+        self.pending.push_str("\x1b[H");
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                self.pending.push_str("\r\n");
+            }
+            self.pending.push_str(line);
+            self.pending.push_str("\x1b[0m\x1b[K");
+        }
+        self.pending.push_str("\x1b[J");
+        self.drawn = None;
+    }
+
+    /// The history panel below the input.
+    fn history_rows(&self, columns: usize, max_rows: usize) -> Vec<String> {
+        match &self.history_view {
+            Some(view) if !view.reading() => {
+                let query: String = self.editor.buffer.iter().collect();
+                view.list_rows(&query, columns, max_rows)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Applies one key press.
     fn key(&mut self, key: KeyEvent) -> Action {
+        if self.busy && self.history_view.is_some() {
+            self.close_history();
+        }
+        if self.history_view.is_some() {
+            return self.history_key(key);
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         #[cfg(windows)]
         if control && !alt && matches!(key.code, KeyCode::Char('v' | 'V')) {
             return Action::Paste;
-        }
-        if self.busy && matches!(key.code, KeyCode::Char(_) | KeyCode::Esc) {
-            self.turn_browser = None;
-        }
-        if let Some(browser) = &mut self.turn_browser {
-            match key.code {
-                KeyCode::Esc => self.turn_browser = None,
-                KeyCode::Char('c') if control => self.turn_browser = None,
-                KeyCode::Up => {
-                    browser.selected = browser.selected.saturating_sub(1);
-                    browser.expanded = false;
-                    browser.scroll = 0;
-                }
-                KeyCode::Down => {
-                    browser.selected = (browser.selected + 1).min(browser.turns.len() - 1);
-                    browser.expanded = false;
-                    browser.scroll = 0;
-                }
-                KeyCode::Enter => {
-                    browser.expanded = !browser.expanded;
-                    browser.scroll = 0;
-                }
-                KeyCode::PageUp if browser.expanded => {
-                    browser.scroll = browser.scroll.saturating_sub(turn_page_size())
-                }
-                KeyCode::PageDown if browser.expanded => {
-                    let columns = usize::from(
-                        crossterm::terminal::size()
-                            .map_or(80, |(columns, _)| columns)
-                            .max(20),
-                    );
-                    let lines = wrap_turn_content(
-                        &browser.turns[browser.selected].content,
-                        columns.saturating_sub(3),
-                    );
-                    browser.scroll = browser
-                        .scroll
-                        .saturating_add(turn_page_size())
-                        .min(lines.len().saturating_sub(1));
-                }
-                _ => {}
-            }
-            return Action::None;
         }
         if self.search.is_some() {
             return self.search_key(key, control);
@@ -1307,7 +1457,11 @@ impl State {
                 .iter()
                 .find(|(_, label)| *label == line)
                 .map_or(line.clone(), |(number, _)| number.clone());
-            let echo = format!("{}{}\n", ask.prompt, visible(&shown));
+            let echo = format!(
+                "{}{}\n",
+                ask.prompt,
+                self.style(USER_TEXT, &format!(" {} ", visible(&shown)))
+            );
             self.notice(&echo);
             self.end_ask(Ok(answer));
             return Action::None;
@@ -1495,14 +1649,20 @@ impl State {
 
     /// A submitted line as the user's turn: a blank row, `>` and the text on a
     /// shaded band, so it stands apart from replies and tool rows.
+    /// The text takes the bright form of the marker's colour (cyan, or yellow while
+    /// queued), so a question is easy to find among replies in the default colour.
     fn user_echo(&self, line: &str, marker: &str, tag: &str) -> String {
+        let text = match marker {
+            "33" => USER_TEXT_QUEUED,
+            _ => USER_TEXT,
+        };
         let mut out = String::from("\n");
         for (index, row) in visible(line).lines().enumerate() {
             let lead = if index == 0 { ">" } else { " " };
             out.push_str(&format!(
                 "{} {}",
                 self.style(&format!("1;{marker}"), lead),
-                self.style("48;5;237", &format!(" {row} "))
+                self.style(text, &format!(" {row} "))
             ));
             if index == 0 {
                 out.push_str(&self.style("2", tag));
@@ -1557,6 +1717,10 @@ impl State {
             return;
         }
         if !self.running {
+            return;
+        }
+        if self.alternate {
+            self.deferred.push_str(text);
             return;
         }
         let columns = self.columns();
@@ -1647,6 +1811,10 @@ impl State {
         if !self.running {
             return;
         }
+        if self.alternate {
+            self.draw_reader();
+            return;
+        }
         let columns = self.columns();
         let mut screen = Screen::new(columns);
         if let Some(status) = self.status() {
@@ -1673,11 +1841,13 @@ impl State {
         } else {
             self.draw_input(&mut screen, columns)
         };
+        let screen_rows = usize::from(crossterm::terminal::size().map_or(24, |(_, rows)| rows));
+        let room = screen_rows.saturating_sub(screen.position().0 + 2);
         let rows = [
             self.panel(columns),
             self.choice_rows(columns),
             self.agent_rows(columns),
-            self.turn_rows(columns),
+            self.history_rows(columns, room),
         ];
         for row in rows.into_iter().flatten() {
             screen.newline();
@@ -1875,68 +2045,6 @@ impl State {
         rows
     }
 
-    fn turn_rows(&self, columns: usize) -> Vec<String> {
-        let Some(browser) = &self.turn_browser else {
-            return Vec::new();
-        };
-        let mut rows = vec![self.style(
-            "2",
-            &clip(
-                "对话 | 上下选轮 Enter 展开/收起 PgUp/PgDn 翻页 Esc 关闭",
-                columns - 1,
-            ),
-        )];
-        if browser.compacted {
-            rows.push(self.style("2", &clip("早期对话已压缩，不在列表中", columns - 1)));
-        }
-        let selected = browser.selected;
-        if browser.expanded {
-            rows.push(clip(
-                &format!(
-                    "▼ {}. {}",
-                    selected + 1,
-                    visible_text(&browser.turns[selected].title)
-                ),
-                columns - 1,
-            ));
-            let lines =
-                wrap_turn_content(&browser.turns[selected].content, columns.saturating_sub(3));
-            let start = browser.scroll.min(lines.len().saturating_sub(1));
-            let page = turn_page_size();
-            rows.extend(
-                lines
-                    .iter()
-                    .skip(start)
-                    .take(page)
-                    .map(|line| format!("  {line}")),
-            );
-            rows.push(self.style(
-                "2",
-                &clip(
-                    &format!(
-                        "  行 {}-{} / {}",
-                        start + 1,
-                        (start + page).min(lines.len()),
-                        lines.len()
-                    ),
-                    columns - 1,
-                ),
-            ));
-        } else {
-            let start = selected
-                .saturating_sub(2)
-                .min(browser.turns.len().saturating_sub(5));
-            for (index, turn) in browser.turns.iter().enumerate().skip(start).take(5) {
-                let marker = if index == selected { ">" } else { " " };
-                rows.push(clip(
-                    &format!("{marker} ▶ {}. {}", index + 1, visible_text(&turn.title)),
-                    columns - 1,
-                ));
-            }
-        }
-        rows
-    }
-
     /// The agent panel (Alt+M), at most eight rows.
     fn agent_rows(&self, columns: usize) -> Vec<String> {
         let Some(lines) = &self.panel else {
@@ -2049,34 +2157,6 @@ fn visible_text(text: &str) -> String {
             c => c,
         })
         .collect()
-}
-
-fn turn_page_size() -> usize {
-    usize::from(crossterm::terminal::size().map_or(24, |(_, height)| height))
-        .saturating_sub(6)
-        .clamp(1, 8)
-}
-
-fn wrap_turn_content(text: &str, columns: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthStr;
-    let columns = columns.max(1);
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        let line = visible_text(line);
-        let mut row = String::new();
-        let mut used = 0;
-        for cluster in line.graphemes(true) {
-            let next = UnicodeWidthStr::width(cluster);
-            if used + next > columns && !row.is_empty() {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
-            }
-            row.push_str(cluster);
-            used += next;
-        }
-        rows.push(row);
-    }
-    rows
 }
 
 /// `COVE_ESC_INTERRUPT=0` keeps a bare Esc from interrupting tasks.
@@ -2612,89 +2692,75 @@ mod tests {
         assert!(!state.pending.contains("\x1b[?1049h"));
     }
 
+    fn history_view() -> crate::app::history::HistoryView {
+        let turn = crate::session::TurnRecord {
+            input: "turn".into(),
+            reply: "content".into(),
+            images: 0,
+            steer: false,
+            archived: false,
+        };
+        let summary = crate::session::SessionSummary {
+            id: "abcdef12".into(),
+            title: "session".into(),
+            cwd: ".".into(),
+            updated: crate::session::now(),
+            unfinished: false,
+            interrupted: false,
+            turns: vec![turn],
+            model: String::new(),
+            cost: None,
+            lines_added: 0,
+            lines_removed: 0,
+            compacted: false,
+        };
+        crate::app::history::HistoryView::new(
+            "恢复会话",
+            vec![crate::app::history::HistoryEntry {
+                summary,
+                command: "/resume abcdef12".into(),
+                current: false,
+            }],
+            false,
+            false,
+        )
+    }
+
     #[test]
-    fn turn_browser_expands_scrolls_changes_selection_and_closes() {
-        let (mut state, _) = state();
-        state.turn_browser = Some(TurnBrowser {
-            turns: vec![
-                TurnView {
-                    title: "第一轮".into(),
-                    content: (0..20).map(|index| format!("line {index}\n")).collect(),
-                    input: "第一轮".into(),
-                },
-                TurnView {
-                    title: "第二轮".into(),
-                    content: "second answer".into(),
-                    input: "第二轮".into(),
-                },
-            ],
-            selected: 0,
-            expanded: false,
-            scroll: 0,
-            compacted: true,
-        });
-        assert!(state.turn_rows(80).iter().any(|row| row.contains("第一轮")));
-        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(state.turn_rows(80).iter().any(|row| row.contains("line 0")));
-        press(&mut state, KeyCode::PageDown, KeyModifiers::NONE);
-        assert!(state.turn_browser.as_ref().unwrap().scroll > 0);
-        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(!state.turn_browser.as_ref().unwrap().expanded);
-        press(&mut state, KeyCode::Down, KeyModifiers::NONE);
-        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    fn the_history_panel_filters_with_the_input_and_submits_the_choice() {
+        let (mut state, mut lines) = state();
+        state.history_view = Some(history_view());
+        typed(&mut state, "sess");
+        assert_eq!(line(&state), "sess");
         assert!(
             state
-                .turn_rows(80)
+                .history_rows(80, 30)
                 .iter()
-                .any(|row| row.contains("second answer"))
+                .any(|row| row.contains("1 条"))
         );
-        press(&mut state, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(state.turn_browser.is_none());
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.history_view.is_none());
+        assert_eq!(
+            lines.try_recv(),
+            Ok(Input::Line("/resume abcdef12".into(), Vec::new()))
+        );
     }
 
     #[test]
-    fn turn_browser_wraps_without_losing_text_and_neutralizes_terminal_controls() {
-        let rows = wrap_turn_content("中文abcd\n\x1b[31mred", 4);
-        assert_eq!(rows.join(""), "中文abcd�[31mred");
-        assert!(rows.iter().all(|row| width(row) <= 4));
-    }
-
-    #[test]
-    fn incoming_question_closes_turn_browser() {
+    fn incoming_question_closes_the_history_view() {
         let (mut state, _) = state();
-        state.turn_browser = Some(TurnBrowser {
-            turns: vec![TurnView {
-                title: "turn".into(),
-                content: "content".into(),
-                input: "turn".into(),
-            }],
-            selected: 0,
-            expanded: false,
-            scroll: 0,
-            compacted: false,
-        });
+        state.history_view = Some(history_view());
         let _answer = state.ask("approve?", false);
-        assert!(state.turn_browser.is_none());
+        assert!(state.history_view.is_none());
         typed(&mut state, "yes");
         assert_eq!(line(&state), "yes");
     }
 
     #[test]
-    fn restored_browser_does_not_block_running_task_input_or_interrupt() {
+    fn the_history_view_does_not_block_running_task_input_or_interrupt() {
         let (mut state, _) = state();
-        let browser = || TurnBrowser {
-            turns: vec![TurnView {
-                title: "turn".into(),
-                content: "content".into(),
-                input: "turn".into(),
-            }],
-            selected: 0,
-            expanded: false,
-            scroll: 0,
-            compacted: false,
-        };
         state.busy = true;
-        state.turn_browser = Some(browser());
+        state.history_view = Some(history_view());
         typed(&mut state, "continue with this");
         press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -2702,11 +2768,11 @@ mod tests {
             Some("continue with this")
         );
 
-        state.turn_browser = Some(browser());
+        state.history_view = Some(history_view());
         assert!(press(&mut state, KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(state.turn_browser.is_none());
+        assert!(state.history_view.is_none());
 
-        state.turn_browser = Some(browser());
+        state.history_view = Some(history_view());
         assert!(!press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
         assert!(press(&mut state, KeyCode::Esc, KeyModifiers::NONE));
     }
@@ -2731,7 +2797,13 @@ mod tests {
         );
         meter.thinking = "high".into();
         meter.turn = Some(65.0);
-        assert!(meter.row(None).unwrap().0.ends_with("· $3.20 · 思考 high · 本轮 1m05s"));
+        assert!(
+            meter
+                .row(None)
+                .unwrap()
+                .0
+                .ends_with("· $3.20 · 思考 high · 本轮 1m05s")
+        );
         assert!(meter.row(Some(3.0)).unwrap().0.ends_with("· 本轮 3s"));
         meter.context = 110_000;
         let (row, near) = meter.row(None).unwrap();

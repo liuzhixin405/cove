@@ -378,6 +378,7 @@ mod tests {
         crate::domain::Message {
             role: crate::domain::Role::Assistant,
             blocks,
+            origin: crate::domain::Origin::Unknown,
         }
     }
 

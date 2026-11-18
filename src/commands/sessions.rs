@@ -20,14 +20,18 @@ use crate::{
     session::notes::SessionNotes,
     session::snapshot::{SnapshotInfo, Snapshots, Snapshotting},
     session::usage::{UsageLedger, aggregate, csv, parse_period, render, timestamp},
-    session::{MAX_SESSIONS, Session, SessionPersistence, State, Store, history_lines},
+    session::{
+        MAX_SESSIONS, Session, SessionPersistence, SessionScope, State, Store, TitleSource,
+        history_lines,
+    },
     tools::ToolExecutor,
 };
 
 pub(crate) const HELP: &str = "\
-/resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）
-/continue [<n|id>]  列出最近 5 个当前工作区会话供选择，或直接恢复指定会话；未完成任务会继续运行
-/turns [<n>]  浏览当前会话对话轮次；交互终端可展开、收起和翻页
+/resume [list|all|search <words>|<n|id>|detail <n|id>|rename <n|id> <名字>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）
+/continue [<n|id>]  列出当前工作区的会话供选择，或直接恢复指定会话；未完成任务会继续运行
+/rename <名字>  给当前会话改名（AI 生成的标题不会再覆盖它）
+/turns [<n>]  查看当前会话每一轮的提问和结论；交互终端打开阅读器
 /replay [<n|id>]  会话回放：把会话渲染成零依赖的单文件 HTML 时间线报告（缺省为当前会话），写入数据目录 replay/ 并打印路径
 /suggestions [list|analyze|accept <hash>|reject <hash>|revoke <hash> <reason>]  当前会话的人工审核建议
 /status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token
@@ -53,6 +57,7 @@ pub(crate) struct Services {
     pub(crate) recall: Arc<MemoryRecall>,
     pub(crate) notes: Arc<SessionNotes>,
     pub(crate) extractor: Arc<Extractor>,
+    pub(crate) titler: Arc<crate::session::titles::Titler>,
     pub(crate) dreamer: Arc<Dreamer>,
     max_sessions: i64,
     last_list: Mutex<Option<Vec<String>>>,
@@ -117,6 +122,24 @@ impl Services {
                 auto_off.clone(),
                 settings.budget,
             )),
+            titler: {
+                let titler = Arc::new(crate::session::titles::Titler::new(
+                    background.clone(),
+                    if settings.one_shot {
+                        Some("-p".to_owned())
+                    } else {
+                        auto_off.clone()
+                    },
+                ));
+                // New titles show at once: in an open history panel, and in the
+                // window's title bar for the session in use.
+                titler.set_listener(Arc::new(|id: &str, title: &str, current: bool| {
+                    if let Some(console) = crate::app::console::active() {
+                        console.retitle(id, title, current);
+                    }
+                }));
+                titler
+            },
             dreamer: Arc::new(Dreamer::new(
                 memory.clone(),
                 background,
@@ -160,6 +183,7 @@ impl Services {
         hooks.push(self.recall.clone());
         hooks.push(self.notes.clone());
         hooks.push(self.extractor.clone());
+        hooks.push(self.titler.clone());
         hooks.push(Arc::new(self.dreamer.clone()));
         hooks
     }
@@ -183,7 +207,36 @@ impl Services {
     /// Lets background extraction finish (bounded) and stops a running dream.
     pub(crate) async fn shutdown(&self) {
         self.extractor.wait(Duration::from_secs(10)).await;
+        self.titler.wait(Duration::from_secs(10)).await;
         self.dreamer.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Puts titles the model finished in the background into their sessions: the
+    /// one in use in memory (true: it needs saving), others in the store when no
+    /// process holds them. A name the user gave is kept.
+    pub(crate) fn apply_titles(&self, session: &mut Session, store: &Store) -> bool {
+        let mut changed = false;
+        for (id, title) in self.titler.take_all() {
+            if id == session.id {
+                if session.title_source != TitleSource::User {
+                    session.title = Some(title);
+                    session.title_source = TitleSource::Ai;
+                    changed = true;
+                }
+                continue;
+            }
+            let Ok(_lease) = store.acquire(&id) else {
+                continue;
+            };
+            if let Ok(mut other) = store.load(&id)
+                && other.title_source != TitleSource::User
+            {
+                other.title = Some(title);
+                other.title_source = TitleSource::Ai;
+                let _ = store.save(&other);
+            }
+        }
+        changed
     }
 
     fn remember_list(&self, ids: Option<Vec<String>>) {
@@ -339,12 +392,11 @@ pub(crate) async fn intercept(app: &mut Application, line: &str) -> Option<Resul
     let target = if continuing {
         most_relevant(app)
     } else {
-        project_sessions(app, false)
+        listed_sessions(app, false)
             .into_iter()
             .enumerate()
             .find(|(_, session)| {
-                session.id != app.session.id
-                    && session.unfinished()
+                session.unfinished()
                     && session
                         .first_request()
                         .is_some_and(|first| same_request(first, trimmed))
@@ -390,6 +442,7 @@ pub(crate) async fn handle(
     match args {
         ["/continue"] => continue_sessions(app, None).await?,
         ["/continue", reference] => continue_sessions(app, Some(*reference)).await?,
+        ["/rename", ..] => rename(app, line)?,
         ["/turns"] => browse_turns(app, None)?,
         ["/turns", number] => browse_turns(app, Some(number))?,
         ["/resume", rest @ ..] => {
@@ -424,76 +477,42 @@ pub(crate) async fn handle(
     Ok(Some(false))
 }
 
-fn turn_views(session: &Session) -> Vec<crate::app::console::TurnView> {
-    session
-        .conversation_turns()
-        .into_iter()
-        .map(|messages| {
-            let input = messages
-                .first()
-                .and_then(|message| match message.blocks.first() {
-                    Some(Block::Text(text)) => {
-                        crate::session::conversation_input(text).map(str::to_owned)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "对话".into());
-            let title = messages
-                .first()
-                .and_then(|message| match message.blocks.first() {
-                    Some(Block::Text(text)) => {
-                        Some(crate::session::title_from(text).unwrap_or_else(|| clip(text, 60)))
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "对话".into());
-            let mut content = String::new();
-            for (message_index, message) in messages.iter().enumerate() {
-                for (block_index, block) in message.blocks.iter().enumerate() {
-                    match block {
-                        Block::Text(text) => {
-                            let label = if message.role == Role::User {
-                                "用户"
-                            } else {
-                                "助手"
-                            };
-                            let text = if message_index == 0 && block_index == 0 {
-                                &input
-                            } else {
-                                text
-                            };
-                            content.push_str(&format!("{label}:\n{text}\n"));
-                        }
-                        Block::ToolUse { name, input, .. } => {
-                            content.push_str(&format!("工具 {name}: {input}\n"))
-                        }
-                        Block::ToolResult {
-                            content: result,
-                            is_error,
-                            ..
-                        } => content.push_str(&format!(
-                            "工具结果{}:\n{result}\n",
-                            if *is_error { "（失败）" } else { "" }
-                        )),
-                        Block::Image { media_type, .. } => {
-                            content.push_str(&format!("[图片附件：{media_type}]\n"))
-                        }
-                        Block::Reasoning(_) | Block::Thinking(_) => {}
-                    }
-                }
-            }
-            crate::app::console::TurnView {
-                title,
-                content,
-                input,
-            }
-        })
-        .collect()
+/// One turn as plain text: the request and the conclusion.
+fn turn_text(index: usize, turn: &crate::session::TurnRecord) -> String {
+    let reply = if turn.reply.is_empty() {
+        "（这一轮没有文字回复）"
+    } else {
+        turn.reply.as_str()
+    };
+    format!(
+        "第 {} 轮{}：\n用户：\n{}\n\n结论：\n{}\n",
+        index + 1,
+        if turn.archived { "（已压缩）" } else { "" },
+        turn.input.trim(),
+        reply.trim()
+    )
 }
 
+/// The numbered requests of a session, for plain output.
+fn turn_list(turns: &[crate::session::TurnRecord]) -> String {
+    let mut text = String::from("当前对话（输入 /turns <编号> 查看这一轮的提问和结论）：\n");
+    for (index, turn) in turns.iter().enumerate() {
+        let title =
+            crate::session::title_from(&turn.input).unwrap_or_else(|| clip(&turn.input, 60));
+        text.push_str(&format!(
+            "{}. {title}{}\n",
+            index + 1,
+            if turn.archived { "（已压缩）" } else { "" }
+        ));
+    }
+    text
+}
+
+/// `/turns`: each turn's request and conclusion, also turns a compaction removed.
+/// The console opens the reader on the current session.
 fn browse_turns(app: &Application, number: Option<&str>) -> Result<()> {
-    let turns = turn_views(&app.session);
-    if turns.is_empty() {
+    let summary = app.store.summary(&app.session);
+    if summary.turns.is_empty() {
         return say("当前会话没有可浏览的对话。\n");
     }
     if let Some(number) = number {
@@ -501,27 +520,28 @@ fn browse_turns(app: &Application, number: Option<&str>) -> Result<()> {
             .parse::<usize>()
             .ok()
             .and_then(|number| number.checked_sub(1))
-            .filter(|index| *index < turns.len())
-            .ok_or_else(|| Error::Session(format!("对话编号须在 1..{} 之间", turns.len())))?;
-        return say(&format!(
-            "第 {} 轮：{}\n{}",
-            index + 1,
-            turns[index].title,
-            turns[index].content
-        ));
+            .filter(|index| *index < summary.turns.len())
+            .ok_or_else(|| {
+                Error::Session(format!("对话编号须在 1..{} 之间", summary.turns.len()))
+            })?;
+        return say(&turn_text(index, &summary.turns[index]));
     }
     if let Some(console) = crate::app::console::active() {
-        console.browse_turns(turns, app.session.compactions > 0);
-        return Ok(());
+        let turns = summary.turns.clone();
+        let entry = crate::app::history::HistoryEntry {
+            summary,
+            command: String::new(),
+            current: true,
+        };
+        let view =
+            crate::app::history::HistoryView::new("当前会话", vec![entry], false, console.color())
+                .reading_alone();
+        if console.browse_history(view) {
+            return Ok(());
+        }
+        return say(&turn_list(&turns));
     }
-    let mut text = String::from("当前对话（输入 /turns <编号> 查看完整内容）：\n");
-    if app.session.compactions > 0 {
-        text.push_str("早期对话已压缩，不在此列表中。\n");
-    }
-    for (index, turn) in turns.iter().enumerate() {
-        text.push_str(&format!("{}. {}\n", index + 1, turn.title));
-    }
-    say(&text)
+    say(&turn_list(&summary.turns))
 }
 
 async fn suggestions(app: &Application, args: &[&str]) -> Result<()> {
@@ -579,74 +599,125 @@ async fn suggestions(app: &Application, args: &[&str]) -> Result<()> {
 
 // ---------------------------------------------------------------- history
 
-/// On the console, the listed sessions also open as a picker.
-fn offer_picker(app: &Application, sessions: &[Session], show_cwd: bool) {
-    let Some(console) = crate::app::console::active() else {
-        return;
-    };
-    let lines = crate::session::history_lines(sessions, Some(&app.session.id), show_cwd);
-    let choices = sessions
-        .iter()
-        .zip(lines.lines())
-        .filter(|(session, _)| session.id != app.session.id)
-        .map(|(session, line)| crate::app::console::Choice {
-            value: format!("/resume {}", session.id),
-            label: line.trim().to_owned(),
-            description: String::new(),
-        })
-        .collect();
-    console.choose("恢复会话", choices);
+/// `/rename <name>`: the user's name for the session; model titles no longer replace it.
+fn rename(app: &mut Application, line: &str) -> Result<()> {
+    let name = line
+        .trim()
+        .strip_prefix("/rename")
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.is_empty() {
+        return Err(Error::Session(format!(
+            "用法：/rename <名字>（当前标题：{}）",
+            app.session.display_title()
+        )));
+    }
+    let name: String = name.chars().take(crate::session::TITLE_CHARS).collect();
+    app.session.title = Some(name.clone());
+    app.session.title_source = TitleSource::User;
+    app.store.save(&app.session)?;
+    if let Some(console) = crate::app::console::active() {
+        console.set_window_title(&name);
+    }
+    say(&format!("会话已改名为：{name}\n"))
 }
 
-/// Sessions of this workspace (or all), newest first; sessions in which nothing was
-/// ever asked are left out (a fresh current session too: it has nothing to show).
-fn project_sessions(app: &Application, all: bool) -> Vec<Session> {
-    let (sessions, _) = app.store.list_lenient();
+/// The sessions every history list shows, newest first: this workspace's (or all
+/// workspaces'), without the session in use and without empty ones. Numbers typed
+/// after a list (`/resume 2`, `/continue 1`, `#1` in the startup line) count here.
+fn listed_sessions(app: &Application, all: bool) -> Vec<Session> {
+    let scope = if all {
+        SessionScope::everywhere()
+    } else {
+        SessionScope::workspace(&app.settings.cwd)
+    };
+    app.store.sessions(&scope.excluding(&app.session.id))
+}
+
+/// What `/continue` offers: the session in use first while its task is unfinished
+/// (continuing it is what `/continue` is mostly for), then the listed sessions.
+fn continue_candidates(app: &Application) -> Vec<Session> {
+    let mut sessions = Vec::new();
+    if app.session.unfinished() && app.session.has_conversation() {
+        sessions.push(app.session.clone());
+    }
+    sessions.extend(listed_sessions(app, false));
     sessions
-        .into_iter()
-        .filter(|session| all || session.cwd == app.settings.cwd)
-        .filter(Session::has_conversation)
-        .collect()
+}
+
+/// Shows `sessions` as the console's history panel; false without a console (the
+/// caller prints the text list instead). `command` is what choosing one runs.
+fn offer_history(
+    app: &Application,
+    title: &str,
+    sessions: &[Session],
+    command: &str,
+    all: bool,
+    note: Option<String>,
+) -> bool {
+    let Some(console) = crate::app::console::active() else {
+        return false;
+    };
+    let entries: Vec<_> = sessions
+        .iter()
+        .map(|session| crate::app::history::HistoryEntry {
+            summary: app.store.summary(session),
+            command: format!("{command} {}", session.id),
+            current: session.id == app.session.id,
+        })
+        .collect();
+    let title = if all {
+        title.to_owned()
+    } else {
+        let workspace = app
+            .settings
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("{title} · {workspace}")
+    };
+    let other = if all { "/resume" } else { "/resume all" };
+    let view = crate::app::history::HistoryView::new(&title, entries, all, console.color())
+        .with_note(note)
+        .with_other_scope(other);
+    if !console.browse_history(view) {
+        return false;
+    }
+    // Listed sessions still titled by their first request get a model title now.
+    let others: Vec<Session> = sessions
+        .iter()
+        .filter(|session| session.id != app.session.id)
+        .cloned()
+        .collect();
+    app.sessions.titler.backfill(app.store.clone(), &others);
+    true
 }
 
 /// The latest session of this workspace, with its number in `/resume`'s list.
 fn most_relevant(app: &Application) -> Option<(usize, Session)> {
-    project_sessions(app, false)
+    listed_sessions(app, false)
         .into_iter()
-        .enumerate()
-        .find(|(_, session)| session.id != app.session.id)
-        .map(|(index, session)| (index + 1, session))
+        .next()
+        .map(|session| (1, session))
 }
 
 fn latest_task_title(session: &Session) -> String {
     crate::session::title_from(&session.current_request)
         .or_else(|| {
-            session.messages.iter().rev().find_map(|message| {
-                if message.role != Role::User {
-                    return None;
-                }
-                match message.blocks.first() {
-                    Some(Block::Text(text)) => crate::session::conversation_input(text)
-                        .and_then(crate::session::title_from),
-                    _ => None,
-                }
-            })
+            session
+                .turns()
+                .iter()
+                .rev()
+                .find_map(|turn| crate::session::title_from(turn.input))
         })
         .unwrap_or_else(|| session.display_title())
 }
 
 fn turns(count: usize) -> String {
     format!("{count} 轮")
-}
-
-fn ago(secs: u64) -> String {
-    let age = crate::session::now().saturating_sub(secs);
-    match age {
-        0..60 => "刚刚".into(),
-        60..3600 => format!("{} 分钟前", age / 60),
-        3600..86400 => format!("{} 小时前", age / 3600),
-        _ => format!("{} 天前", age / 86400),
-    }
 }
 
 /// The line shown at startup when this workspace has work to go back to.
@@ -663,8 +734,8 @@ pub(crate) fn startup_notice(app: &Application) -> Option<String> {
     Some(format!(
         "上次在这里的任务：#{number} {}（{}，{state}，{}）。输入 /continue 选择会话，/resume 查看全部。\n",
         latest_task_title(&session),
-        turns(session.user_turns()),
-        ago(session.updated)
+        turns(app.store.history(&session).len()),
+        crate::session::time::ago(session.updated)
     ))
 }
 
@@ -672,7 +743,24 @@ pub(crate) fn startup_notice(app: &Application) -> Option<String> {
 /// selected session. Completed sessions restore context without an automatic turn.
 async fn continue_sessions(app: &mut Application, reference: Option<&str>) -> Result<()> {
     if let Some(reference) = reference {
-        let id = pick(app, reference)?;
+        // A number counts in `/continue`'s own list when none was shown.
+        let unlisted = app
+            .sessions
+            .last_list
+            .lock()
+            .map(|list| list.is_none())
+            .unwrap_or(true);
+        let id = match reference.parse::<usize>() {
+            Ok(number) if unlisted && reference.len() < 6 => continue_candidates(app)
+                .get(number.wrapping_sub(1))
+                .map(|session| session.id.clone())
+                .ok_or_else(|| {
+                    Error::Session(format!(
+                        "没有第 {number} 个可继续的会话；输入 /continue 查看列表"
+                    ))
+                })?,
+            _ => pick(app, reference)?,
+        };
         if id != app.session.id {
             resume(app, &id, false).await?;
         }
@@ -684,33 +772,21 @@ async fn continue_sessions(app: &mut Application, reference: Option<&str>) -> Re
         return Ok(());
     }
 
-    let sessions: Vec<_> = project_sessions(app, false).into_iter().take(5).collect();
+    let sessions = continue_candidates(app);
     if sessions.is_empty() {
         say("没有可继续的历史会话。\n")?;
         return Ok(());
     }
-    let lines = history_lines(&sessions, Some(&app.session.id), false);
-    say(&format!(
-        "最近会话（输入 /continue <编号> 选择）：\n{lines}\n"
-    ))?;
     app.sessions.remember_list(Some(
         sessions.iter().map(|session| session.id.clone()).collect(),
     ));
-    if let Some(console) = crate::app::console::active() {
-        let choices = sessions
-            .iter()
-            .zip(lines.lines())
-            .map(|(session, line)| crate::app::console::Choice {
-                value: format!("/continue {}", session.id),
-                label: line.trim().to_owned(),
-                description: if session.unfinished() {
-                    "恢复并继续未完成任务".to_owned()
-                } else {
-                    "恢复会话上下文".to_owned()
-                },
-            })
-            .collect();
-        console.choose("继续哪个会话？", choices);
+    // The console shows the panel; plain output prints the list (never both).
+    if !offer_history(app, "继续会话", &sessions, "/continue", false, None) {
+        let summaries: Vec<_> = sessions.iter().map(|s| app.store.summary(s)).collect();
+        say(&format!(
+            "最近会话（输入 /continue <编号> 选择）：\n{}\n",
+            history_lines(&summaries, Some(&app.session.id), false)
+        ))?;
     }
     Ok(())
 }
@@ -741,7 +817,7 @@ fn pick(app: &Application, reference: &str) -> Result<String> {
             .ok()
             .and_then(|list| list.clone())
             .unwrap_or_else(|| {
-                project_sessions(app, false)
+                listed_sessions(app, false)
                     .into_iter()
                     .map(|session| session.id)
                     .collect()
@@ -814,7 +890,7 @@ async fn resume(app: &mut Application, id: &str, show_continue_hint: bool) -> Re
         app.session.id,
         app.session.display_title()
     ))?;
-    show_conversation(&app.session)?;
+    show_conversation(&app.store, &app.session)?;
     if show_continue_hint && matches!(app.session.state, State::Interrupted(_)) {
         say("这个会话有被中断的任务：输入 /continue 恢复，或直接发送新消息。\n")?;
     }
@@ -867,23 +943,29 @@ fn resume_elsewhere(app: &mut Application, session: &Session) -> Result<bool> {
     Ok(true)
 }
 
-/// Shows restored conversation in the terminal's ordinary scrollback.
-pub(crate) fn show_conversation(session: &Session) -> Result<()> {
+/// The last turns of a resumed session, as requests and conclusions (the tool
+/// calls in between are left out); the turn count includes compacted turns.
+pub(crate) fn show_conversation(store: &Store, session: &Session) -> Result<()> {
     const TURNS: usize = 3;
-    let text = session.transcript(TURNS);
-    if text.trim().is_empty() {
+    let records = store.history(session);
+    if records.is_empty() {
         return Ok(());
     }
-    let turns = session.user_turns();
-    let shown = if turns > TURNS {
-        format!("共 {turns} 轮，显示最后 {TURNS} 轮")
+    let mut text = String::new();
+    for turn in &records[records.len().saturating_sub(TURNS)..] {
+        text.push_str(&format!("\n> {}\n", clip(turn.input.trim(), 800)));
+        if !turn.reply.is_empty() {
+            text.push_str(&format!("{}\n", clip(&turn.reply, 2000)));
+        }
+    }
+    let shown = if records.len() > TURNS {
+        format!("共 {} 轮，显示最后 {TURNS} 轮", records.len())
     } else {
-        self::turns(turns)
+        turns(records.len())
     };
     print_text(
         &format!(
-            "── 之前的对话（{shown}；/resume detail {} 查看更多）──{text}── 之前的对话到此结束；模型保有完整上下文 ──\n",
-            &session.id[..session.id.len().min(8)]
+            "── 之前的对话（{shown}；/turns 查看全部）──{text}── 之前的对话到此结束；模型保有完整上下文 ──\n"
         ),
         true,
     )?;
@@ -895,42 +977,53 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
     match rest {
         [] | ["list"] | ["all"] => {
             let all = rest == ["all"];
-            let sessions = project_sessions(app, all);
+            let sessions = listed_sessions(app, all);
+            let scope = if all {
+                SessionScope::everywhere()
+            } else {
+                SessionScope::workspace(&app.settings.cwd)
+            }
+            .excluding(&app.session.id);
+            let empty = app.store.sessions(&scope.with_empty()).len() - sessions.len();
             let hidden = if all {
                 0
             } else {
-                app.store.list_lenient().0.len() - sessions.len()
+                listed_sessions(app, true).len() - sessions.len()
             };
-            let mut text = history_lines(&sessions, Some(&app.session.id), all);
-            let empty = app
-                .store
-                .list_lenient()
-                .0
-                .iter()
-                .filter(|s| (all || s.cwd == app.settings.cwd) && !s.has_conversation())
-                .count();
-            let hidden = hidden.saturating_sub(empty);
+            let mut notes = Vec::new();
             if empty > 0 {
-                text.push_str(&format!("{empty} 个空会话未列出。\n"));
+                notes.push(format!("{empty} 个空会话未列出"));
             }
             if hidden > 0 {
-                text.push_str(&format!(
-                    "另有 {hidden} 个其他工作区的会话未显示；/resume all 可列出。\n"
+                notes.push(format!(
+                    "另有 {hidden} 个其他工作区的会话未显示，/resume all 可列出"
                 ));
             }
-            if sessions.is_empty() {
-                text.push_str("这里还没有会话记录；直接输入请求即可开始。\n");
-            } else {
-                text.push_str("输入编号即可恢复，或用 /resume detail <n> 查看详情。\n");
-            }
-            say(&text)?;
-            offer_picker(app, &sessions, all);
             app.sessions
-                .remember_list(Some(sessions.into_iter().map(|s| s.id).collect()));
+                .remember_list(Some(sessions.iter().map(|s| s.id.clone()).collect()));
+            let note = (!notes.is_empty()).then(|| notes.join("；"));
+            let title = if all {
+                "恢复会话 · 全部工作区"
+            } else {
+                "恢复会话"
+            };
+            if !offer_history(app, title, &sessions, "/resume", all, note) {
+                let summaries: Vec<_> = sessions.iter().map(|s| app.store.summary(s)).collect();
+                let mut text = history_lines(&summaries, None, all);
+                for note in &notes {
+                    text.push_str(&format!("{note}。\n"));
+                }
+                if sessions.is_empty() {
+                    text.push_str("这里还没有会话记录；直接输入请求即可开始。\n");
+                } else {
+                    text.push_str("输入编号即可恢复，或用 /resume detail <n> 查看详情。\n");
+                }
+                say(&text)?;
+            }
         }
         ["search", words @ ..] if !words.is_empty() => {
             let query = words.join(" ");
-            let sessions = project_sessions(app, true);
+            let sessions = listed_sessions(app, true);
             let documents: Vec<(String, u64)> = sessions
                 .iter()
                 .map(|session| (search_text(session), session.updated))
@@ -941,16 +1034,43 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
                     .take(20)
                     .map(|(index, _)| sessions[index].clone())
                     .collect();
-            let mut text = history_lines(&found, Some(&app.session.id), true);
-            if found.is_empty() {
-                text.push_str("没有找到匹配的会话；换个关键词再试，或用 /resume all 列出全部。\n");
-            } else {
-                text.push_str("输入编号即可恢复。\n");
-            }
-            say(&text)?;
-            offer_picker(app, &found, true);
             app.sessions
-                .remember_list(Some(found.into_iter().map(|s| s.id).collect()));
+                .remember_list(Some(found.iter().map(|s| s.id.clone()).collect()));
+            let title = format!("搜索：{query}");
+            if found.is_empty() {
+                say("没有找到匹配的会话；换个关键词再试，或用 /resume all 列出全部。\n")?;
+            } else if !offer_history(app, &title, &found, "/resume", true, None) {
+                let summaries: Vec<_> = found.iter().map(|s| app.store.summary(s)).collect();
+                let mut text = history_lines(&summaries, None, true);
+                text.push_str("输入编号即可恢复。\n");
+                say(&text)?;
+            }
+        }
+        ["rename", reference, name @ ..] if !name.is_empty() => {
+            let id = pick(app, reference)?;
+            let name: String = name
+                .join(" ")
+                .chars()
+                .take(crate::session::TITLE_CHARS)
+                .collect();
+            if id == app.session.id {
+                app.session.title = Some(name.clone());
+                app.session.title_source = TitleSource::User;
+                app.store.save(&app.session)?;
+                if let Some(console) = crate::app::console::active() {
+                    console.set_window_title(&name);
+                }
+            } else {
+                let _lease = app.store.acquire(&id)?;
+                let mut session = app.store.load(&id)?;
+                session.title = Some(name.clone());
+                session.title_source = TitleSource::User;
+                app.store.save(&session)?;
+            }
+            say(&format!(
+                "会话 {} 已改名为：{name}\n",
+                &id[..id.len().min(8)]
+            ))?;
         }
         ["detail", reference] => {
             let id = pick(app, reference)?;
@@ -959,7 +1079,7 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
             } else {
                 app.store.load(&id)?
             };
-            say(&detail(&session))?;
+            say(&detail(&app.store, &session))?;
         }
         ["delete", reference] => {
             let id = pick(app, reference)?;
@@ -1077,7 +1197,7 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
         }
         _ => {
             return Err(Error::Session(
-                "用法：/resume [list|all|search <words>|<n|id>|detail <n|id>|delete <n|id>|clear [all] [confirm]|clean|export [file]]".into(),
+                "用法：/resume [list|all|search <words>|<n|id>|detail <n|id>|rename <n|id> <名字>|delete <n|id>|clear [all] [confirm]|clean|export [file]]".into(),
             ));
         }
     }
@@ -1087,15 +1207,11 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
 /// Title and user requests (bounded) of a session, for `/resume search`.
 fn search_text(session: &Session) -> String {
     let mut text = session.display_title();
-    for message in &session.messages {
-        if message.role == Role::User
-            && let Some(Block::Text(request)) = message.blocks.first()
-        {
-            text.push('\n');
-            text.push_str(&clip(request, 1024));
-            if text.len() > 8 * 1024 {
-                break;
-            }
+    for turn in session.turns() {
+        text.push('\n');
+        text.push_str(&clip(turn.input, 1024));
+        if text.len() > 8 * 1024 {
+            break;
         }
     }
     text
@@ -1110,7 +1226,7 @@ async fn authorize_store(app: &Application) -> Result<()> {
         .await
 }
 
-fn detail(session: &Session) -> String {
+fn detail(store: &Store, session: &Session) -> String {
     let mut out = format!(
         "{}\nid={} state={:?}\nworkspace={}\nmodel={} ({})\ncreated={} updated={}\nmessages={} user_turns={} compactions={} model_calls={} input_tokens={} output_tokens={} estimated_cost={}\n",
         session.display_title(),
@@ -1122,7 +1238,7 @@ fn detail(session: &Session) -> String {
         timestamp(session.created),
         timestamp(session.updated),
         session.messages.len(),
-        session.user_turns(),
+        store.history(session).len(),
         session.compactions,
         session.accounting.model_calls,
         session.accounting.usage.input,
@@ -1133,13 +1249,9 @@ fn detail(session: &Session) -> String {
             .map_or("unknown".into(), |cost| format!("${cost:.4}"))
     );
     let requests: Vec<String> = session
-        .messages
+        .turns()
         .iter()
-        .filter(|message| message.role == Role::User)
-        .filter_map(|message| match message.blocks.first() {
-            Some(Block::Text(text)) => crate::session::title_from(text),
-            _ => None,
-        })
+        .filter_map(|turn| crate::session::title_from(turn.input))
         .collect();
     if !requests.is_empty() {
         out.push_str("最近的请求：\n");
@@ -1204,13 +1316,31 @@ pub fn markdown(session: &Session) -> String {
         format!("{ticks}{lang}\n{}\n{ticks}\n\n", text.trim_end())
     };
     for message in &session.messages {
-        out.push_str(match message.role {
-            Role::User => "## 用户\n\n",
-            Role::Assistant => "## 助手\n\n",
+        // Turns are told apart by the shared rule: what the user wrote is shown on
+        // its own; context the program attached to it (memories, notes, environment)
+        // is left out, and the program's notices are labeled as such.
+        let mark = crate::session::turns::mark(message);
+        let user_input = match &mark {
+            crate::session::turns::Mark::Start { input, .. } => Some(*input),
+            _ => None,
+        };
+        out.push_str(match (message.role, &mark) {
+            (Role::User, crate::session::turns::Mark::Start { .. }) => "## 用户\n\n",
+            (Role::User, crate::session::turns::Mark::Summary { .. }) => "## 压缩摘要\n\n",
+            (Role::User, _) if matches!(message.blocks.first(), Some(Block::Text(_))) => {
+                "## 系统提示\n\n"
+            }
+            (Role::User, _) => "",
+            (Role::Assistant, _) => "## 助手\n\n",
         });
-        for block in &message.blocks {
+        for (index, block) in message.blocks.iter().enumerate() {
             match block {
+                Block::Text(_) if user_input.is_some() && index > 0 => {}
                 Block::Text(text) => {
+                    let text = match user_input {
+                        Some(input) if index == 0 => input,
+                        _ => text,
+                    };
                     out.push_str(text.trim());
                     out.push_str("\n\n");
                 }
@@ -1318,24 +1448,27 @@ pub fn replay_html(session: &Session) -> String {
     for message in &session.messages {
         match message.role {
             Role::User => {
-                let real = matches!(
-                    message.blocks.first(),
-                    Some(Block::Text(text)) if !text.trim_start().starts_with('[')
-                );
+                // The shared turn rule decides where a round starts; what the program
+                // attached to a request (memories, notes, environment) is not shown.
+                let input = match crate::session::turns::mark(message) {
+                    crate::session::turns::Mark::Start { input, .. } => Some(input),
+                    _ => None,
+                };
+                let real = input.is_some();
                 if real {
                     flush(round, &mut items, &mut timeline);
                     round += 1;
                 }
-                for block in &message.blocks {
+                for (index, block) in message.blocks.iter().enumerate() {
                     match block {
+                        Block::Text(_) if real && index > 0 => {}
                         Block::Text(text) => {
                             if text.starts_with(VERIFY_FAILED_PREFIX) {
                                 verify_failures += 1;
                             }
-                            let (class, label) = if real {
-                                ("user", "用户")
-                            } else {
-                                ("system", "系统")
+                            let (class, label, text) = match input {
+                                Some(input) => ("user", "用户", input),
+                                None => ("system", "系统", text.as_str()),
                             };
                             items.push(format!(
                                 "<div class=\"msg {class}\"><div class=\"role\">{label}</div><pre>{}</pre></div>\n",
@@ -1676,7 +1809,7 @@ async fn undo_apply(app: &mut Application, token: &str) -> Result<()> {
             CancellationToken::new(),
         )
         .await?;
-    app.session.messages.push(Message::user(format!(
+    app.session.messages.push(Message::notice(format!(
         "Operator requested a Git snapshot restore to {}. Inspect files before further editing.",
         pending.target.short()
     )));
@@ -1688,7 +1821,7 @@ async fn undo_apply(app: &mut Application, token: &str) -> Result<()> {
     } else {
         format!("{} files", pending.paths.len())
     };
-    app.session.messages.push(Message::user(format!(
+    app.session.messages.push(Message::notice(format!(
         "Workspace restored: {scope} from snapshot {}; prior file and verification evidence is stale. The pre-restore state is snapshot {}.",
         pending.target.short(),
         &backup[..10]
@@ -1887,6 +2020,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                 }
             ));
             text.push_str(&app.sessions.extractor.status());
+            text.push_str(&app.sessions.titler.status());
             text.push_str(&format!(
                 "会话笔记：{}\n",
                 app.sessions.notes.path().display()
@@ -2010,28 +2144,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn turn_views_keep_complete_conversation() {
+    fn turns_show_each_request_and_its_conclusion() {
         let mut session = Session::new("/w".into(), "Openai".into(), "m".into(), None);
         let long_answer = "long answer\n".repeat(100);
-        session.messages.push(Message::user("first request"));
+        session.messages.push(Message::human("first request"));
         session.messages.push(Message {
             role: Role::Assistant,
             blocks: vec![Block::Text(long_answer.clone())],
+            origin: crate::domain::Origin::Unknown,
         });
-        session.messages.push(Message::user("second request"));
+        session.messages.push(Message::human("second request"));
         session.messages.push(Message::user(
             "[sent while the previous task was running]\nverify again",
         ));
-        session.compactions = 1;
-
-        let turns = turn_views(&session);
+        let turns: Vec<_> = session.turns().iter().map(|turn| turn.record()).collect();
         assert_eq!(turns.len(), 3);
-        assert_eq!(turns[0].title, "first request");
-        assert_eq!(turns[0].input, "first request");
-        assert!(turns[0].content.contains(&long_answer));
-        assert_eq!(turns[1].title, "second request");
-        assert_eq!(turns[2].input, "verify again");
-        assert_eq!(turns[2].content, "用户:\nverify again\n");
+        let list = turn_list(&turns);
+        assert!(
+            list.contains("1. first request\n") && list.contains("3. verify again\n"),
+            "{list}"
+        );
+        let first = turn_text(0, &turns[0]);
+        assert!(first.contains("用户：\nfirst request") && first.contains(long_answer.trim()));
+        assert!(turn_text(2, &turns[2]).contains("（这一轮没有文字回复）"));
     }
 
     #[test]
@@ -2049,6 +2184,7 @@ mod tests {
                     extra: None,
                 },
             ],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -2057,12 +2193,17 @@ mod tests {
                 content: "fn main() {} ```".into(),
                 is_error: true,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         let text = markdown(&session);
         assert!(text.starts_with("# Fix the bug\n"));
         assert!(text.contains("**工具调用 `read`**\n\n```json\n{\n  \"path\": \"a.rs\"\n}\n```"));
         assert!(text.contains("**工具结果（失败）**\n\n````text\nfn main() {} ```\n````"));
-        let lines = history_lines(&[session.clone()], Some(&session.id), false);
+        let lines = history_lines(
+            &[crate::session::SessionSummary::live(&session)],
+            Some(&session.id),
+            false,
+        );
         assert!(
             lines.contains("  1. ") && lines.contains("Fix the bug") && lines.contains("(current)")
         );
@@ -2085,6 +2226,7 @@ mod tests {
                     extra: None,
                 },
             ],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -2093,6 +2235,7 @@ mod tests {
                 content: "fn main() { println!(\"<hi>\"); }".into(),
                 is_error: false,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         session.accounting.model_calls = 1;
         session.accounting.usage.input = 120;

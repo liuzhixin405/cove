@@ -218,7 +218,7 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
             })?;
             baseline.apply(&patch, &set.patch_sha256, &cancel).await?;
             record(app, &set, Decision::Applied)?;
-            app.session.messages.push(Message::user(format!(
+            app.session.messages.push(Message::notice(format!(
                 "Operator applied changeset {} ({} bytes) to the workspace outside the file tools; earlier file and verification evidence may be stale.",
                 set.id,
                 patch.len()

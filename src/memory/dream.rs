@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    domain::{Block, Error, Provider, Result, Role, ToolDefinition},
+    domain::{Error, Provider, Result, Role, ToolDefinition},
     engine::agent::{Agent, Limits},
     engine::turn::TurnHook,
     memory::recall::clip,
@@ -652,26 +652,18 @@ impl Dreamer {
     fn prompt(&self, sessions: &[Session]) -> String {
         let mut digest = String::new();
         for session in sessions {
-            let replies: Vec<String> = session
-                .messages
-                .iter()
-                .filter(|message| message.role == Role::Assistant)
-                .filter_map(|message| {
-                    message.blocks.iter().find_map(|block| match block {
-                        Block::Text(text) if !text.trim().is_empty() => Some(text.clone()),
-                        _ => None,
-                    })
-                })
-                .collect();
+            // The conclusion of the last turn, by the shared turn rule.
+            let turns = session.turns();
+            let reply = turns
+                .last()
+                .and_then(|turn| turn.reply())
+                .unwrap_or_default();
             digest.push_str(&format!(
                 "### session {} ({}): {}\nfinal reply: {}\n",
                 &session.id[..8],
                 crate::session::usage::timestamp(session.updated),
-                clip(
-                    session.title.as_deref().unwrap_or(&session.current_request),
-                    300
-                ),
-                clip(replies.last().map_or("", String::as_str), 600)
+                clip(&session.display_title(), 300),
+                clip(reply, 600)
             ));
             if digest.len() > DIGEST_LIMIT {
                 digest = clip(&digest, DIGEST_LIMIT);
@@ -820,7 +812,7 @@ impl TurnHook for Arc<Dreamer> {
 mod tests {
     use super::*;
     use crate::{
-        domain::{Event, Message, ModelRequest, ModelResponse, Usage},
+        domain::{Block, Event, Message, ModelRequest, ModelResponse, Usage},
         memory::store::{ProvenanceSource, Scope},
         safety::permission::{LocalAuthorizer, Mode},
     };
@@ -867,6 +859,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         blocks,
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: Usage::default(),
                     complete: true,

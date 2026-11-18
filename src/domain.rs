@@ -86,14 +86,60 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub blocks: Vec<Block>,
+    /// Who wrote a user-role message, recorded when it is written so history views
+    /// need not guess from the text. Never sent to the model.
+    #[serde(default, skip_serializing_if = "Origin::is_unknown")]
+    pub origin: Origin,
+}
+
+/// Where a user-role message came from. Sessions written before this was recorded
+/// load as `Unknown`, which history views classify by the text instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Unknown,
+    /// A request the user typed (its first block); later blocks may be injected context.
+    Human,
+    /// Text the user typed while a task ran, delivered mid-task.
+    Steer,
+    /// The summary that replaced earlier messages at compaction.
+    Summary,
+    /// A notice the program added (verification failed, operator actions, limits).
+    Notice,
+}
+
+impl Origin {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
 }
 
 impl Message {
+    /// A user-role text message of unknown origin (one-off requests, tests).
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             blocks: vec![Block::Text(text.into())],
+            origin: Origin::Unknown,
         }
+    }
+
+    pub fn human(text: impl Into<String>) -> Self {
+        Self::user(text).with_origin(Origin::Human)
+    }
+
+    pub fn steer(text: impl Into<String>) -> Self {
+        Self::user(text).with_origin(Origin::Steer)
+    }
+
+    pub fn notice(text: impl Into<String>) -> Self {
+        Self::user(text).with_origin(Origin::Notice)
+    }
+
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 

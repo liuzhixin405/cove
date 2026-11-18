@@ -156,6 +156,7 @@ async fn suggestions_commands_persist_explicit_decisions_without_model_calls() {
                 input: json!({"command":"private-command"}),
                 extra: None,
             }],
+            origin: cove::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -164,6 +165,7 @@ async fn suggestions_commands_persist_explicit_decisions_without_model_calls() {
                 content: "private-output".into(),
                 is_error: true,
             }],
+            origin: cove::domain::Origin::Unknown,
         });
     }
     Store::open(data.path()).unwrap().flush(&session).unwrap();
@@ -345,10 +347,9 @@ async fn history_lists_titles_resumes_by_number_and_exports_markdown() {
         .lines()
         .filter(|line| line.trim_start().starts_with("1.") || line.trim_start().starts_with("2."))
         .collect();
+    // `/resume` lists the other sessions: switching to the one in use means nothing.
     assert!(
-        listed
-            .iter()
-            .any(|line| line.contains("Add retry logic") && line.contains("(current)"))
+        !listed.iter().any(|line| line.contains("Add retry logic"))
             && listed.iter().any(|line| line.contains("Fix the login bug")),
         "{stdout}"
     );
@@ -397,7 +398,7 @@ async fn history_lists_titles_resumes_by_number_and_exports_markdown() {
 }
 
 #[tokio::test]
-async fn turns_lists_each_conversation_and_shows_the_complete_tool_result() {
+async fn turns_list_each_request_and_show_its_conclusion() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("note.txt"), "first line\nsecond line\n").unwrap();
@@ -414,8 +415,9 @@ async fn turns_lists_each_conversation_and_shows_the_complete_tool_result() {
     .await;
     assert!(stdout.contains("1. inspect the note"), "{stdout}");
     assert!(stdout.contains("2. second question"), "{stdout}");
-    assert!(stdout.contains("工具 read"), "{stdout}");
-    assert!(stdout.contains("second line"), "{stdout}");
+    // A turn shows what was asked and the conclusion, not the tool calls in between.
+    assert!(!stdout.contains("工具 read"), "{stdout}");
+    assert!(!stdout.contains("second line"), "{stdout}");
     assert!(stdout.contains("first answer"), "{stdout}");
     assert!(stdout.contains("second answer"), "{stdout}");
     assert!(stderr.contains("对话编号须在 1..2 之间"), "{stderr}");

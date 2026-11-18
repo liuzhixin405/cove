@@ -428,6 +428,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         blocks: vec![Block::Text(text)],
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: Usage::default(),
                     complete: true,
@@ -563,6 +564,7 @@ mod tests {
                     input: serde_json::json!({}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             },
             Message {
                 role: Role::User,
@@ -571,10 +573,12 @@ mod tests {
                     content: "SECRET TOOL OUTPUT".into(),
                     is_error: false,
                 }],
+                origin: crate::domain::Origin::Unknown,
             },
             Message {
                 role: Role::Assistant,
                 blocks: vec![Block::Text("Done.".into())],
+                origin: crate::domain::Origin::Unknown,
             },
         ]);
         extractor.task_end(&session, true).await;

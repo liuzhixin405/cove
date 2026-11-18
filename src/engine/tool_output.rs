@@ -291,6 +291,7 @@ mod tests {
                 input: json!({}),
                 extra: None,
             }],
+            origin: crate::domain::Origin::Unknown,
         }
     }
 
@@ -302,6 +303,7 @@ mod tests {
                 content,
                 is_error: false,
             }],
+            origin: crate::domain::Origin::Unknown,
         }
     }
 

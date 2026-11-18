@@ -506,7 +506,7 @@ impl Agent {
         if !session.pending.is_empty() {
             return Ok(());
         }
-        let note = Message::user(
+        let note = Message::notice(
             "[model call limit reached; this is a system notice, not a new request] Without tools, briefly summarize what is done, what was verified, and what remains.",
         );
         let mut messages = session.messages.to_vec();
@@ -912,7 +912,7 @@ impl Agent {
             if let Some(policy) = &self.policy {
                 policy.begin_task(&prompt, None);
             }
-            let mut message = Message::user(prompt);
+            let mut message = Message::human(prompt);
             message.blocks.extend(attachments);
             if let Some(note) = &self.turn_note {
                 let note = note.clone();
@@ -1404,7 +1404,7 @@ impl Agent {
             }
             let mut messages = session.messages.to_vec();
             if let Some(note) = retry_note.take() {
-                messages.push(Message::user(note));
+                messages.push(Message::notice(note));
             }
             let request = ModelRequest {
                 system: system.clone(),
@@ -1441,7 +1441,7 @@ impl Agent {
                         }
                         report.model_calls += 1;
                         if !texts.is_empty() {
-                            session.messages.push(Message::user(texts.join("\n")));
+                            session.messages.push(Message::steer(texts.join("\n")));
                             persistence.save(session)?;
                             emit(
                                 &events,
@@ -1584,7 +1584,13 @@ impl Agent {
                         .await?;
                 }
                 if let Some(message) = nudge {
-                    session.messages.push(Message::user(message));
+                    // The steer hook hands over what the user typed; other nudges are notices.
+                    let message = if crate::session::is_steer(&message) {
+                        Message::steer(message)
+                    } else {
+                        Message::notice(message)
+                    };
+                    session.messages.push(message);
                     persistence.save(session)?;
                     continue;
                 }
@@ -1611,7 +1617,7 @@ impl Agent {
                             emit(&events, &cancel, Event::Notice(notice)).await?;
                         }
                         if verify_failures < VERIFY_ROUNDS {
-                            session.messages.push(Message::user(format!(
+                            session.messages.push(Message::notice(format!(
                                 "[automatic verification failed; this is tool output, not a new request]\n{}\nFix the cause within the original task, then finish. Do not claim success without passing checks.",
                                 verification.detail
                             )));

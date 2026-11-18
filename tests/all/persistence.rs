@@ -55,6 +55,7 @@ fn response(blocks: Vec<Block>) -> ModelResponse {
         message: Message {
             role: Role::Assistant,
             blocks,
+            origin: cove::domain::Origin::Unknown,
         },
         usage: Usage {
             input: 10,
@@ -446,6 +447,7 @@ async fn crash_intents_are_uncertain_and_never_replayed_automatically() {
                 input: json!({"path":"bad","content":"bad"}),
                 extra: None,
             }],
+            origin: cove::domain::Origin::Unknown,
         },
     ]
     .into();
@@ -481,6 +483,7 @@ fn orphan_tool_results_are_rejected_on_load() {
             content: "fake success".into(),
             is_error: false,
         }],
+        origin: cove::domain::Origin::Unknown,
     });
     assert!(session.validate().is_err());
 }
@@ -543,6 +546,7 @@ async fn partially_finished_batch_skips_saved_steps_and_executes_only_planned_ca
     session.messages.push(Message {
         role: Role::Assistant,
         blocks,
+        origin: cove::domain::Origin::Unknown,
     });
     session.state = State::Running;
     store.save(&session).unwrap();
@@ -631,6 +635,7 @@ fn long_history(session: &mut Session) {
         Message {
             role: Role::Assistant,
             blocks: vec![Block::Text("old detail ".repeat(3000))],
+            origin: cove::domain::Origin::Unknown,
         },
         Message::user(session.current_request.clone()),
         Message {
@@ -646,6 +651,7 @@ fn long_history(session: &mut Session) {
                     extra: None,
                 },
             ],
+            origin: cove::domain::Origin::Unknown,
         },
         Message {
             role: Role::User,
@@ -654,10 +660,12 @@ fn long_history(session: &mut Session) {
                 content: "actual output".into(),
                 is_error: false,
             }],
+            origin: cove::domain::Origin::Unknown,
         },
         Message {
             role: Role::Assistant,
             blocks: vec![Block::Text("recent response".into())],
+            origin: cove::domain::Origin::Unknown,
         },
     ]
     .into();
@@ -775,6 +783,7 @@ fn million_window_history(session: &mut Session, count: usize) {
                 Role::Assistant
             },
             blocks: vec![Block::Text(old_text.clone())],
+            origin: cove::domain::Origin::Unknown,
         })
         .collect();
     messages.extend(suffix);

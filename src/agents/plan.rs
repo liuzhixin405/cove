@@ -685,10 +685,12 @@ mod tests {
             Message {
                 role: crate::domain::Role::Assistant,
                 blocks: vec![use_block("1", "first"), use_block("2", "broken")],
+                origin: crate::domain::Origin::Unknown,
             },
             Message {
                 role: crate::domain::Role::User,
                 blocks: vec![result("1", false), result("2", true)],
+                origin: crate::domain::Origin::Unknown,
             },
         ];
         let state = PlanState::default();

@@ -239,6 +239,7 @@ mod tests {
         session.messages.push(Message {
             role: Role::Assistant,
             blocks: vec![call("a", "first")],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -247,10 +248,12 @@ mod tests {
                 content: "ok".into(),
                 is_error: false,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::Assistant,
             blocks: vec![call("b", "")],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -259,6 +262,7 @@ mod tests {
                 content: "bad".into(),
                 is_error: true,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         let todos = latest_todos(&session).unwrap();
         assert_eq!(todos[0].content, "first");

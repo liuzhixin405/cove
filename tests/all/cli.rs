@@ -170,6 +170,7 @@ fn save_uncertain_write(
                 input: input.clone(),
                 extra: None,
             }],
+            origin: cove::domain::Origin::Unknown,
         },
     ]
     .into();
@@ -492,6 +493,7 @@ async fn explicit_uncertain_resolution_never_fabricates_success_or_replays_the_c
                 input: input.clone(),
                 extra: None,
             }],
+            origin: cove::domain::Origin::Unknown,
         },
     ]
     .into();
@@ -1473,6 +1475,7 @@ async fn a_new_message_moves_on_from_a_task_stopped_during_a_question() {
                 input: input.clone(),
                 extra: None,
             }],
+            origin: cove::domain::Origin::Unknown,
         },
     ]
     .into();

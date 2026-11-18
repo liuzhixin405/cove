@@ -1225,9 +1225,8 @@ impl Collector {
             self.done = true;
             return Ok(Vec::new());
         }
-        let value: Value = serde_json::from_str(data).map_err(|err| {
-            Error::Provider(format!("stream frame was not valid JSON ({err})"))
-        })?;
+        let value: Value = serde_json::from_str(data)
+            .map_err(|err| Error::Provider(format!("stream frame was not valid JSON ({err})")))?;
         if value.get("error").is_some() || value["type"] == "error" {
             let error = value.get("error").unwrap_or(&value);
             let detail = error["message"]
@@ -1235,12 +1234,35 @@ impl Collector {
                 .or_else(|| error["type"].as_str())
                 .or_else(|| error.as_str())
                 .unwrap_or_default();
-            let kind = format!("{} {}", error["type"].as_str().unwrap_or_default(), error["code"]);
+            let kind = format!(
+                "{} {}",
+                error["type"].as_str().unwrap_or_default(),
+                error["code"]
+            );
             // Overload, rate limits and server faults pass; the reply is asked for again.
-            let transient = ["overload", "rate_limit", "server", "internal", "timeout", "unavailable", "api_error", "529", "503", "502", "500"]
-                .iter()
-                .any(|sign| kind.to_ascii_lowercase().contains(sign) || detail.to_ascii_lowercase().contains(sign));
-            let prefix = if transient { "stream interrupted by a server error" } else { "server reported a streaming error" };
+            let transient = [
+                "overload",
+                "rate_limit",
+                "server",
+                "internal",
+                "timeout",
+                "unavailable",
+                "api_error",
+                "529",
+                "503",
+                "502",
+                "500",
+            ]
+            .iter()
+            .any(|sign| {
+                kind.to_ascii_lowercase().contains(sign)
+                    || detail.to_ascii_lowercase().contains(sign)
+            });
+            let prefix = if transient {
+                "stream interrupted by a server error"
+            } else {
+                "server reported a streaming error"
+            };
             let detail: String = detail.chars().take(300).collect();
             return Err(Error::Provider(format!("{prefix}: {detail}")));
         }
@@ -1464,6 +1486,7 @@ impl Collector {
             message: Message {
                 role: Role::Assistant,
                 blocks,
+                origin: crate::domain::Origin::Unknown,
             },
             usage: self.usage,
             complete,
@@ -1622,6 +1645,7 @@ mod tests {
                         extra: None,
                     },
                 ],
+                origin: crate::domain::Origin::Unknown,
             },
             Message {
                 role: Role::User,
@@ -1636,10 +1660,12 @@ mod tests {
                         data_base64: "AAAA".into(),
                     },
                 ],
+                origin: crate::domain::Origin::Unknown,
             },
             Message {
                 role: Role::Assistant,
                 blocks: vec![Block::Reasoning("plain".into()), Block::Text("done".into())],
+                origin: crate::domain::Origin::Unknown,
             },
         ]
     }
@@ -1731,7 +1757,10 @@ mod tests {
         );
         assert!(interrupted_stream(&overloaded), "{overloaded}");
         assert!(overloaded.to_string().contains("Overloaded"));
-        assert!(interrupted_stream(&fail(Protocol::Openai, "{\"choices\":[")));
+        assert!(interrupted_stream(&fail(
+            Protocol::Openai,
+            "{\"choices\":["
+        )));
         let invalid = fail(
             Protocol::Openai,
             r#"{"error":{"type":"invalid_request_error","message":"bad tool schema"}}"#,

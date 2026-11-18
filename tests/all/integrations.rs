@@ -465,6 +465,7 @@ fn response(blocks: Vec<Block>) -> ModelResponse {
         message: Message {
             role: Role::Assistant,
             blocks,
+            origin: cove::domain::Origin::Unknown,
         },
         usage: Usage::default(),
         complete: true,

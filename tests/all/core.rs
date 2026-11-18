@@ -46,6 +46,7 @@ async fn large_context_warns_once_with_compact_and_new_hints() {
     session.messages.push(Message {
         role: Role::Assistant,
         blocks: vec![Block::Text("ok".into())],
+        origin: cove::domain::Origin::Unknown,
     });
     let mut notices = Vec::new();
     for prompt in ["first", "second"] {
@@ -906,6 +907,7 @@ fn response(blocks: Vec<Block>) -> ModelResponse {
         message: Message {
             role: Role::Assistant,
             blocks,
+            origin: cove::domain::Origin::Unknown,
         },
         usage: Usage {
             input: 10,
@@ -1243,7 +1245,10 @@ async fn a_truncated_reply_is_retried_once_with_a_note_kept_out_of_history() {
     let mut cut = response(vec![Block::Text("partial".into())]);
     cut.complete = false;
     let provider = Arc::new(FakeProvider {
-        responses: Mutex::new(VecDeque::from([cut, response(vec![Block::Text("done".into())])])),
+        responses: Mutex::new(VecDeque::from([
+            cut,
+            response(vec![Block::Text("done".into())]),
+        ])),
         requests: Mutex::new(Vec::new()),
     });
     let agent = Agent::new(

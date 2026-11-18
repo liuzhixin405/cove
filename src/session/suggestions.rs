@@ -387,6 +387,7 @@ mod tests {
                     input: json!({"command":"secret-command"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             session.messages.push(Message {
                 role: Role::User,
@@ -395,6 +396,7 @@ mod tests {
                     content: "secret-output".into(),
                     is_error: true,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
         }
         let suggestions = analyze(&session);
@@ -412,6 +414,7 @@ mod tests {
                 input: json!({}),
                 extra: None,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         assert!(analyze(&session).is_empty());
         session.messages.rewrite().pop();
@@ -426,6 +429,7 @@ mod tests {
                 content: "later failure".into(),
                 is_error: true,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         assert!(analyze(&session).is_empty());
     }
@@ -444,6 +448,7 @@ mod tests {
                     input: json!({"pattern":"x"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             session.messages.push(Message {
                 role: Role::User,
@@ -452,6 +457,7 @@ mod tests {
                     content: "failed".into(),
                     is_error: true,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
         }
         let store = SuggestionStore::open(root.path(), &session.id).unwrap();
@@ -523,6 +529,7 @@ mod tests {
                     input: json!({"pattern":"x"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             session.messages.push(Message {
                 role: Role::User,
@@ -531,6 +538,7 @@ mod tests {
                     content: "failed".into(),
                     is_error: true,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
         }
         let store = SuggestionStore::open(root.path(), &session.id).unwrap();

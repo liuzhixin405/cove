@@ -5,6 +5,10 @@ mod journal;
 pub mod notes;
 pub mod snapshot;
 pub mod suggestions;
+pub mod summary;
+pub mod time;
+pub mod titles;
+pub mod turns;
 pub mod usage;
 pub mod workspace;
 
@@ -20,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use history::History;
+pub use summary::{SessionScope, SessionSummary, history_lines};
+pub use turns::{TurnRecord, is_steer};
 
 use crate::{
     domain::{Block, Error, Message, Result, Usage},
@@ -165,9 +171,29 @@ pub struct Session {
     pub compactions: u32,
     #[serde(default)]
     pub task_failures: u32,
-    /// First real user request (at most 60 characters), for history lists.
+    /// The session's name in history lists (at most 60 characters): the first real
+    /// request, then a title the model gave it, or the name the user chose.
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "TitleSource::is_prompt")]
+    pub title_source: TitleSource,
+}
+
+/// Where a session's title came from. A model's title is replaced as the
+/// conversation grows; a name the user gave never is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    #[default]
+    Prompt,
+    Ai,
+    User,
+}
+
+impl TitleSource {
+    pub fn is_prompt(&self) -> bool {
+        *self == Self::Prompt
+    }
 }
 
 impl Session {
@@ -196,6 +222,7 @@ impl Session {
             compactions: 0,
             task_failures: 0,
             title: None,
+            title_source: TitleSource::Prompt,
         }
     }
 
@@ -336,6 +363,7 @@ impl Session {
         self.messages.push(Message {
             role: crate::domain::Role::User,
             blocks,
+            origin: crate::domain::Origin::Unknown,
         });
         Ok(())
     }
@@ -678,37 +706,7 @@ const ORPHAN_AGE: u64 = 3600;
 
 /// Notices the program itself adds as user messages; never a title.
 fn synthetic(text: &str) -> bool {
-    let text = text.trim();
-    text.is_empty()
-        || text.starts_with('[')
-        || text.starts_with("Earlier conversation summary")
-        || text.starts_with("Operator ")
-        || text.starts_with("File-tool rollback")
-        || text.starts_with("Workspace restored")
-}
-
-pub(crate) fn conversation_input(text: &str) -> Option<&str> {
-    for prefix in [
-        "[the user typed this while the task ran; treat it as an instruction from the user]\n",
-        "[sent while the previous task was running]\n",
-    ] {
-        if let Some(input) = text.strip_prefix(prefix) {
-            return Some(input);
-        }
-    }
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('[') {
-        return (![
-            "[system",
-            "[model call limit reached;",
-            "[automatic verification failed;",
-            "[self_review;",
-        ]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix)))
-        .then_some(text);
-    }
-    (!synthetic(text)).then_some(text)
+    turns::is_notice(text)
 }
 
 /// Inputs too short to describe a session ("continue", "继续", "ok").
@@ -756,18 +754,25 @@ impl Session {
         if let Some(title) = self.title.as_ref().filter(|title| !title.trim().is_empty()) {
             return title.clone();
         }
-        self.derived_title().unwrap_or_else(|| "(untitled)".into())
+        // Only "继续"/"好的"-like requests: the start of the first conclusion says more.
+        self.derived_title()
+            .or_else(|| {
+                self.turns().iter().find_map(|turn| {
+                    turn.reply()
+                        .and_then(|reply| reply.lines().find(|line| !line.trim().is_empty()))
+                        .map(|line| {
+                            let line: String = line.trim().chars().take(TITLE_CHARS - 2).collect();
+                            format!("（{line}）")
+                        })
+                })
+            })
+            .unwrap_or_else(|| "(untitled)".into())
     }
 
     pub fn derived_title(&self) -> Option<String> {
-        self.messages
+        self.turns()
             .iter()
-            .filter(|message| message.role == crate::domain::Role::User)
-            .filter_map(|message| match message.blocks.first() {
-                Some(Block::Text(text)) => title_from(text),
-                _ => None,
-            })
-            .next()
+            .find_map(|turn| title_from(turn.input))
             .or_else(|| title_from(&self.current_request))
     }
 
@@ -784,16 +789,7 @@ impl Session {
 
     /// The first real user request, for matching a retyped request.
     pub fn first_request(&self) -> Option<&str> {
-        self.messages
-            .iter()
-            .find_map(|message| match message.blocks.first() {
-                Some(Block::Text(text))
-                    if message.role == crate::domain::Role::User && !synthetic(text) =>
-                {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
+        self.turns().first().map(|turn| turn.input)
     }
 
     /// How worth resuming this session is: a real conversation with tool work scores
@@ -837,112 +833,10 @@ impl Session {
         score
     }
 
-    /// The last `turns` user turns as the terminal showed them: requests after `> `,
-    /// the assistant's text, tool calls by name and the first line of each result.
-    pub fn transcript(&self, turns: usize) -> String {
-        let real_turn = |message: &Message| {
-            message.role == crate::domain::Role::User
-                && matches!(message.blocks.first(), Some(Block::Text(text)) if !synthetic(text))
-        };
-        let starts: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| real_turn(message))
-            .map(|(index, _)| index)
-            .collect();
-        let Some(&start) = starts
-            .len()
-            .checked_sub(turns.max(1))
-            .and_then(|at| starts.get(at))
-            .or(starts.first())
-        else {
-            return String::new();
-        };
-        let clip = |text: &str, limit: usize| {
-            let text = text.trim();
-            if text.chars().count() <= limit {
-                text.to_owned()
-            } else {
-                let cut: String = text.chars().take(limit).collect();
-                format!("{cut}…")
-            }
-        };
-        let mut out = String::new();
-        for message in &self.messages[start..] {
-            for block in &message.blocks {
-                match (message.role, block) {
-                    (crate::domain::Role::User, Block::Text(text)) if !synthetic(text) => {
-                        out.push_str(&format!("\n> {}\n", clip(text, 800)));
-                    }
-                    (crate::domain::Role::Assistant, Block::Text(text))
-                        if !text.trim().is_empty() =>
-                    {
-                        out.push_str(&format!("{}\n", clip(text, 2000)));
-                    }
-                    (_, Block::ToolUse { name, input, .. }) => {
-                        let detail = ["path", "command", "pattern", "query", "url", "description"]
-                            .iter()
-                            .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
-                            .map(|value| format!(" {}", clip(value, 100)))
-                            .unwrap_or_default();
-                        out.push_str(&format!("[tool] {name}{detail}\n"));
-                    }
-                    (
-                        _,
-                        Block::ToolResult {
-                            content, is_error, ..
-                        },
-                    ) => {
-                        let first = content
-                            .lines()
-                            .find(|line| !line.trim().is_empty())
-                            .unwrap_or_default();
-                        out.push_str(&format!(
-                            "  [{}] {}\n",
-                            if *is_error { "failed" } else { "ok" },
-                            clip(first, 160)
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out
-    }
-
-    pub fn conversation_turns(&self) -> Vec<&[Message]> {
-        let starts: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                (message.role == crate::domain::Role::User
-                && matches!(message.blocks.first(), Some(Block::Text(text)) if conversation_input(text).is_some()))
-                .then_some(index)
-            })
-            .collect();
-        starts
-            .iter()
-            .enumerate()
-            .map(|(index, start)| {
-                &self.messages[*start
-                    ..starts
-                        .get(index + 1)
-                        .copied()
-                        .unwrap_or(self.messages.len())]
-            })
-            .collect()
-    }
-
+    /// Turns of the live session (see [`turns`]); compaction may have removed earlier
+    /// ones, which [`Store::history`] restores from the archives.
     pub fn user_turns(&self) -> usize {
-        self.messages
-            .iter()
-            .filter(|message| {
-                message.role == crate::domain::Role::User
-                    && matches!(message.blocks.first(), Some(Block::Text(text)) if !synthetic(text))
-            })
-            .count()
+        self.turns().len()
     }
 }
 
@@ -972,6 +866,37 @@ fn age(path: &Path) -> u64 {
 }
 
 impl Store {
+    /// Every turn of `session`, also those a compaction removed from it: the
+    /// archives taken before each compaction are joined with the live session.
+    pub fn history(&self, session: &Session) -> Vec<TurnRecord> {
+        let live: Vec<TurnRecord> = session.turns().iter().map(turns::Turn::record).collect();
+        if session.compactions == 0 {
+            return live;
+        }
+        let prefix = format!("{}-", session.id);
+        let mut snapshots: Vec<Session> = std::fs::read_dir(self.root.join("archives"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .filter_map(|entry| read_json::<Session>(&entry.path()).ok())
+            .filter(|snapshot| snapshot.compactions < session.compactions)
+            .collect();
+        // One snapshot per compaction: the fullest one taken before it.
+        snapshots.sort_by_key(|snapshot| (snapshot.compactions, snapshot.messages.len()));
+        let mut levels: Vec<(u32, Vec<TurnRecord>)> = Vec::new();
+        for snapshot in &snapshots {
+            let turns = snapshot.turns().iter().map(turns::Turn::record).collect();
+            match levels.last_mut() {
+                Some((level, kept)) if *level == snapshot.compactions => *kept = turns,
+                _ => levels.push((snapshot.compactions, turns)),
+            }
+        }
+        let mut levels: Vec<Vec<TurnRecord>> = levels.into_iter().map(|(_, turns)| turns).collect();
+        levels.push(live);
+        turns::stitch(levels)
+    }
+
     fn session_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(self.root.join("sessions"))? {
@@ -1173,44 +1098,6 @@ impl Store {
     }
 }
 
-/// One history line per session, numbered from 1.
-pub fn history_lines(sessions: &[Session], current: Option<&str>, show_cwd: bool) -> String {
-    let mut out = String::new();
-    for (index, session) in sessions.iter().enumerate() {
-        let state = match &session.state {
-            State::Idle => "空闲",
-            State::Running => "运行中",
-            State::Interrupted(_) => "已中断",
-            State::Completed => "已完成",
-        };
-        out.push_str(&format!(
-            "{:>3}. {}  {}{} {:>3} 轮  {}  [{}]{}{}\n",
-            index + 1,
-            crate::session::usage::timestamp(session.updated),
-            state,
-            // CJK characters take two columns; pad to the widest state word.
-            " ".repeat(6 - 2 * state.chars().count()),
-            session.user_turns(),
-            session.display_title(),
-            &session.id[..8],
-            if Some(session.id.as_str()) == current {
-                " (current)"
-            } else {
-                ""
-            },
-            if show_cwd {
-                format!("  {}", session.cwd.display())
-            } else {
-                String::new()
-            }
-        ));
-    }
-    if out.is_empty() {
-        out.push_str("没有保存的会话。\n");
-    }
-    out
-}
-
 /// `--list-sessions [all]`, without model credentials.
 pub fn list_sessions(
     data_dir: &std::path::Path,
@@ -1219,12 +1106,13 @@ pub fn list_sessions(
 ) -> Result<String> {
     let store = Store::open(data_dir)?;
     let cwd = cwd.canonicalize()?;
-    let (sessions, broken) = store.list_lenient();
-    let sessions: Vec<Session> = sessions
-        .into_iter()
-        .filter(|session| all || session.cwd == cwd)
-        .collect();
-    let mut out = history_lines(&sessions, None, all);
+    let scope = if all {
+        SessionScope::everywhere()
+    } else {
+        SessionScope::workspace(&cwd)
+    };
+    let mut out = history_lines(&store.summaries(&scope), None, all);
+    let broken = store.list_lenient().1;
     if !broken.is_empty() {
         out.push_str(&format!(
             "有 {} 个会话文件无法读取；输入 /resume clean 清理。\n",
@@ -1295,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_turns_keep_tool_results_and_system_notices_with_their_request() {
+    fn turns_keep_tool_results_and_system_notices_with_their_request() {
         let mut session = Session::new(PathBuf::new(), String::new(), String::new(), None);
         session.messages.push(Message::user("first request"));
         session.messages.push(Message {
@@ -1306,6 +1194,7 @@ mod tests {
                 input: serde_json::json!({"path":"file"}),
                 extra: None,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         session.messages.push(Message {
             role: crate::domain::Role::User,
@@ -1314,6 +1203,7 @@ mod tests {
                 content: "result".into(),
                 is_error: false,
             }],
+            origin: crate::domain::Origin::Unknown,
         });
         session
             .messages
@@ -1322,19 +1212,20 @@ mod tests {
         session.messages.push(Message {
             role: crate::domain::Role::Assistant,
             blocks: vec![Block::Text("answer".into())],
+            origin: crate::domain::Origin::Unknown,
         });
-        let turns = session.conversation_turns();
+        let turns = session.turns();
         assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].len(), 4);
-        assert_eq!(turns[1].len(), 2);
+        assert_eq!(turns[0].messages.len(), 4);
+        assert_eq!(turns[1].messages.len(), 2);
         assert!(
-            matches!(&turns[0][2].blocks[0], Block::ToolResult { content, .. } if content == "result")
+            matches!(&turns[0].messages[2].blocks[0], Block::ToolResult { content, .. } if content == "result")
         );
-        assert!(matches!(&turns[1][1].blocks[0], Block::Text(text) if text == "answer"));
+        assert!(matches!(&turns[1].messages[1].blocks[0], Block::Text(text) if text == "answer"));
     }
 
     #[test]
-    fn conversation_turns_keep_steering_as_a_user_turn() {
+    fn turns_keep_steering_as_a_user_turn() {
         let mut session = Session::new(PathBuf::new(), String::new(), String::new(), None);
         session.messages.push(Message::user("first request"));
         session.messages.push(Message::user("[the user typed this while the task ran; treat it as an instruction from the user]\nuse the new API"));
@@ -1345,17 +1236,13 @@ mod tests {
             .messages
             .push(Message::user("[system notice] retry"));
         session.messages.push(Message::user("[bug] inspect this"));
-        let turns = session.conversation_turns();
+        let turns = session.turns();
         assert_eq!(turns.len(), 4);
-        assert_eq!(turns[2].len(), 2);
-        assert_eq!(
-            conversation_input("[bug] inspect this"),
-            Some("[bug] inspect this")
-        );
-        assert_eq!(
-            conversation_input("[sent while the previous task was running]\nverify again"),
-            Some("verify again")
-        );
+        assert_eq!(turns[2].messages.len(), 2);
+        assert_eq!(turns[1].input, "use the new API");
+        assert!(turns[1].steer);
+        assert_eq!(turns[2].input, "verify again");
+        assert_eq!(turns[3].input, "[bug] inspect this");
     }
 
     #[test]

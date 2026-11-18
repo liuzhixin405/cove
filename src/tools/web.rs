@@ -895,6 +895,7 @@ mod live {
                     message: Message {
                         role: crate::domain::Role::Assistant,
                         blocks: vec![Block::Text(answer)],
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: crate::domain::Usage::default(),
                     complete: true,

@@ -160,7 +160,11 @@ fn scratch_command(command: &str, root: &Path) -> bool {
     let Some(inline) = words.first().and_then(|word| interpreter(word)) else {
         return false;
     };
-    for word in words.iter().skip(1).map(|word| word.trim_matches(['"', '\''])) {
+    for word in words
+        .iter()
+        .skip(1)
+        .map(|word| word.trim_matches(['"', '\'']))
+    {
         if word == "-" || word.starts_with("<<") || inline.contains(&word) {
             return true;
         }
@@ -178,7 +182,11 @@ fn scratch_command(command: &str, root: &Path) -> bool {
 /// The interpreter a program word names (`python3.exe`, `/usr/bin/node`) with its inline flags.
 fn interpreter(word: &str) -> Option<&'static [&'static str]> {
     let word = word.trim_matches(['"', '\'', '&', ' ']);
-    let name = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
     let base = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     INTERPRETERS
@@ -196,7 +204,13 @@ fn scratch_script(path: &str, root: &Path) -> bool {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let markers: &[&str] = match extension.as_str() {
-        "py" => &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"],
+        "py" => &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+        ],
         "js" | "mjs" | "cjs" => &["package.json"],
         "rb" => &["Gemfile"],
         "pl" => &["Makefile.PL", "cpanfile"],
@@ -228,8 +242,19 @@ fn scratch_location(path: &str, root: &Path) -> bool {
     };
     relative.components().any(|component| {
         matches!(
-            component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
-            "target" | "tmp" | "temp" | ".tmp" | "scratch" | ".cove" | "node_modules" | "__pycache__"
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_str(),
+            "target"
+                | "tmp"
+                | "temp"
+                | ".tmp"
+                | "scratch"
+                | ".cove"
+                | "node_modules"
+                | "__pycache__"
         )
     })
 }
@@ -806,7 +831,7 @@ fn table_with_width(rows: &[String], terminal_width: usize) -> String {
     out
 }
 
-fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
+pub(crate) fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
     let mut lines = Vec::new();
@@ -1048,9 +1073,8 @@ mod tests {
         let dir = tempfile::tempdir_in(base).unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let shell = |command: &str| {
-            scratch_call("shell", &serde_json::json!({"command": command}), &root)
-        };
+        let shell =
+            |command: &str| scratch_call("shell", &serde_json::json!({"command": command}), &root);
         let write = |path: &str| scratch_call("write", &serde_json::json!({"path": path}), &root);
         assert!(shell("python -c \"import json; print(1)\""));
         assert!(shell("python3 - <<'EOF'\nprint(1)\nEOF"));

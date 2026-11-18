@@ -601,6 +601,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         blocks: vec![Block::Text(text)],
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: Usage::default(),
                     complete: true,
@@ -638,6 +639,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         blocks: vec![Block::Text("NONE".into())],
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: Usage {
                         input: 123,
@@ -820,6 +822,7 @@ mod tests {
                     input: json!({"path":"a"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             review.task_end(&session, true).await;
         }
@@ -875,6 +878,7 @@ mod tests {
                         input: json!({"path":"a"}),
                         extra: None,
                     }],
+                    origin: crate::domain::Origin::Unknown,
                 });
                 review.task_end(&session, true).await;
             }
@@ -944,6 +948,7 @@ mod tests {
                     input: json!({"path":"a"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             review
                 .task_end_with_verification(&session, task != 1, verification, None)
@@ -1017,6 +1022,7 @@ mod tests {
                     input: json!({"path":"a"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             review
                 .task_end_with_verification(&session, true, None, Some(1.0))
@@ -1065,6 +1071,7 @@ mod tests {
                     input: json!({"path":"a"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             review.task_end(&session, task != 1).await;
         }
@@ -1137,6 +1144,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         blocks: vec![Block::Text(answer)],
+                        origin: crate::domain::Origin::Unknown,
                     },
                     usage: Usage::default(),
                     complete: true,
@@ -1176,6 +1184,7 @@ mod tests {
                     input: json!({"path":"a"}),
                     extra: None,
                 }],
+                origin: crate::domain::Origin::Unknown,
             });
             review.task_end(&session, completed).await;
         }

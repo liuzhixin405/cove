@@ -4,6 +4,7 @@ pub mod blocks;
 pub mod completion;
 pub mod console;
 pub mod diagnostics;
+pub mod history;
 pub mod launch;
 pub mod locks;
 pub mod onboarding;
@@ -372,6 +373,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         server.stop().await;
     }
     app.sessions.shutdown().await;
+    app.apply_titles();
     crate::commands::agents::shutdown(&mut app).await;
     let cleanup = app.close_session().await;
     match (outcome, cleanup) {
@@ -443,8 +445,9 @@ impl Application {
         // The banner carries its own styles; print_text would show them as text.
         crate::app::console::write(true, &self.banner())?;
         self.refresh_meter(true);
+        self.show_window_title();
         if self.session.has_conversation() {
-            crate::commands::sessions::show_conversation(&self.session)?;
+            crate::commands::sessions::show_conversation(&self.store, &self.session)?;
         } else if let Some(notice) = crate::commands::sessions::startup_notice(self) {
             print_text(&notice, true)?;
         }
@@ -491,6 +494,7 @@ impl Application {
     async fn repl_lines(&mut self, reader: &mut ReplInput) -> Result<()> {
         loop {
             crate::commands::agents::between_tasks(self).await?;
+            self.apply_titles();
             let console = crate::app::console::active();
             // Steering the last task ended before taking runs as the next task.
             let line = if let Some(text) = console.and_then(|console| console.take_steer()) {
@@ -520,6 +524,8 @@ impl Application {
             if line.is_empty() {
                 continue;
             }
+            // A title finished while the line was typed is in place before it runs.
+            self.apply_titles();
             self.models.attachments.append(&mut reader.attachments);
             if let Some(console) = console {
                 console.set_busy(true);
@@ -541,6 +547,9 @@ impl Application {
             };
             if let Some(console) = console {
                 console.set_busy(false);
+            }
+            if before.0 != self.session.id {
+                self.show_window_title();
             }
             // Another session, a compaction or a shorter history: estimate again.
             self.refresh_meter(
@@ -624,6 +633,26 @@ pub(crate) struct Application {
 }
 
 impl Application {
+    /// Applies session titles the model finished in the background (`session::titles`).
+    pub(crate) fn apply_titles(&mut self) {
+        if self.sessions.apply_titles(&mut self.session, &self.store) {
+            let _ = self.store.save(&self.session);
+            self.show_window_title();
+        }
+    }
+
+    /// The session's title in the terminal window's title bar.
+    pub(crate) fn show_window_title(&self) {
+        if let Some(console) = crate::app::console::active() {
+            let title = if self.session.has_conversation() {
+                self.session.display_title()
+            } else {
+                String::new()
+            };
+            console.set_window_title(&title);
+        }
+    }
+
     /// Updates the console's usage row. `rebuilt`: the history changed in a way the
     /// last model call does not reflect (start, compaction, another session), so the
     /// context is estimated: messages, system prompt and tool definitions.
@@ -648,7 +677,10 @@ impl Application {
         } else if self.settings.thinking == Some(crate::model::provider::Thinking::Disabled) {
             "关闭".to_owned()
         } else {
-            self.settings.effort.clone().unwrap_or_else(|| "默认".into())
+            self.settings
+                .effort
+                .clone()
+                .unwrap_or_else(|| "默认".into())
         };
         let usage = &self.session.accounting.usage;
         console.set_meter(
@@ -1251,12 +1283,12 @@ impl Application {
                         CancellationToken::new(),
                     )
                     .await?;
-                self.session.messages.push(Message::user("Operator requested a file-tool checkpoint rollback. Checkpoint journal is authoritative; inspect files before further editing."));
+                self.session.messages.push(Message::notice("Operator requested a file-tool checkpoint rollback. Checkpoint journal is authoritative; inspect files before further editing."));
                 self.store.save(&self.session)?;
                 self.workspace.undo()?;
                 self.session.checkpoints.pop();
                 self.session.current_checkpoint = self.session.checkpoints.last().cloned();
-                self.session.messages.push(Message::user("File-tool rollback completed; prior file/verification evidence is stale. Shell effects were not rolled back."));
+                self.session.messages.push(Message::notice("File-tool rollback completed; prior file/verification evidence is stale. Shell effects were not rolled back."));
                 self.session.state = State::Completed;
                 self.store.save(&self.session)?;
                 self.workspace

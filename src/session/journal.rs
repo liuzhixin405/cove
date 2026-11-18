@@ -30,8 +30,8 @@ use crate::{
     domain::{Error, Message, Result},
     extensions::hooks::HookRun,
     session::{
-        Accounting, PendingCall, STATE_LIMIT, Session, State, atomic_json, history::History,
-        io_context, now,
+        Accounting, PendingCall, STATE_LIMIT, Session, State, TitleSource, atomic_json,
+        history::History, io_context, now,
     },
 };
 
@@ -63,6 +63,8 @@ struct Head<'a> {
     compactions: u32,
     task_failures: u32,
     title: Option<&'a str>,
+    #[serde(skip_serializing_if = "TitleSource::is_prompt")]
+    title_source: TitleSource,
 }
 
 impl<'a> Head<'a> {
@@ -90,6 +92,7 @@ impl<'a> Head<'a> {
             compactions,
             task_failures,
             title,
+            title_source,
         } = session;
         Self {
             hook_runs,
@@ -111,6 +114,7 @@ impl<'a> Head<'a> {
             compactions: *compactions,
             task_failures: *task_failures,
             title: title.as_deref(),
+            title_source: *title_source,
         }
     }
 }

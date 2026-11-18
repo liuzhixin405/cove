@@ -172,6 +172,7 @@ async fn million_window_compaction_handles_stream_truncation_and_success() {
                     Role::Assistant
                 },
                 blocks: vec![Block::Text(old_text.clone())],
+                origin: cove::domain::Origin::Unknown,
             });
         }
         session
@@ -180,6 +181,7 @@ async fn million_window_compaction_handles_stream_truncation_and_success() {
         session.messages.push(Message {
             role: Role::Assistant,
             blocks: vec![Block::Text("recent response".into())],
+            origin: cove::domain::Origin::Unknown,
         });
         let store = Store::open(data.path()).unwrap();
         store.flush(&session).unwrap();
@@ -765,7 +767,14 @@ async fn a_reply_stream_cut_off_midway_is_requested_again() {
     let (url, server) = mock_server(vec![ok(cut), text("whole answer")]).await;
     let mut command = cove(root.path(), data.path());
     command
-        .args(["--provider", "openai", "--model", "mock-model", "--base-url", &url])
+        .args([
+            "--provider",
+            "openai",
+            "--model",
+            "mock-model",
+            "--base-url",
+            &url,
+        ])
         .env("COVE_API_KEY", "k");
     let output = run(command, Some("hello\n/exit\n")).await;
     assert_success(&output);
