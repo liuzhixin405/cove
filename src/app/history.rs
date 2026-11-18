@@ -1268,22 +1268,32 @@ fn copy_text(text: &str, what: &str) -> String {
     if text.trim().is_empty() {
         return "没有可复制的文字".into();
     }
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return "远程会话无法写入本机剪贴板；请用 o 在编辑器中打开后复制".into();
+    // `arboard` is a Windows-only dependency (see Cargo.toml), like the image paste
+    // path in `paste.rs`; elsewhere the reader's editor is the way to copy.
+    #[cfg(not(windows))]
+    {
+        let _ = what;
+        "仅 Windows 支持写入本机剪贴板；请用 o 在编辑器中打开后复制".into()
     }
-    let mut failure = String::new();
-    for _ in 0..10 {
-        match arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
-        {
-            Ok(()) => {
-                return format!("✓ 已复制{what}（{} 字）到剪贴板", text.chars().count());
-            }
-            Err(error) => failure = error.to_string(),
+    #[cfg(windows)]
+    {
+        if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+            return "远程会话无法写入本机剪贴板；请用 o 在编辑器中打开后复制".into();
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut failure = String::new();
+        for _ in 0..10 {
+            match arboard::Clipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
+            {
+                Ok(()) => {
+                    return format!("✓ 已复制{what}（{} 字）到剪贴板", text.chars().count());
+                }
+                Err(error) => failure = error.to_string(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        format!("复制失败：{failure}")
     }
-    format!("复制失败：{failure}")
 }
 
 /// Saves the turn as Markdown in the temp directory and opens it in an editor
@@ -1543,5 +1553,10 @@ mod tests {
             "{screen}"
         );
         assert!(view.reader_only());
+    }
+
+    #[test]
+    fn copying_nothing_says_so_without_touching_the_clipboard() {
+        assert_eq!(copy_text("  \n", "选中内容"), "没有可复制的文字");
     }
 }
