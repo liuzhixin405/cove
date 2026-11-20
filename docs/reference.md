@@ -24,19 +24,19 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - 有界模型调用次数、输出、上下文、请求空闲时间、任务与命令超时。
 - Ctrl+C 取消、子进程树回收；Windows 使用 Job Object，在加入 Job 后才发送用户脚本。
 - 工具调用 ID 配对、完整参数校验、reasoning/Anthropic thinking signature 回传。
-- 可选费用估算和预算提醒；单次费用未知时按零累计，实际费用可能更高。
+- 统计并显示 token 和费用估算，不设花费上限；单次费用未知时按零累计，实际费用可能更高。
 - 模型文本写 stdout；工具结果、退出码和诊断写 stderr。
 - 常驻交互控制台：任务运行时输入行留在输出下方，可随时插话引导、排队命令或中断；审批和提问在输入行上作答；命令、技能和 `@路径` 补全，输入历史与搜索，多行输入，粘贴图片。不同内容分开显示：你的输入在灰底色块里，模型回复渲染 Markdown（标题、粗体、代码、列表、引用、表格），工具调用是一行标题加结果摘要，状态行首段是本任务的目标卡（请求原文第一行），随后是进度、耗时和 token。启动时对回环地址的本地服务（llama.cpp 等）自动探测真实上下文窗口并采用，显式配置 `context_window`/`context_bytes` 时不探测。详见下文“交互控制台”。
 - 简体中文界面：提示、错误、帮助和命令输出都是中文，错误会说明下一步怎么做；发给模型的系统提示和工具结果保持英文。
 - 会话保存/恢复、显式继续；会话以完整快照加追加日志落盘，已经完成的工具调用不重放。
 - 手动/自动上下文压缩；保留完整历史归档、当前需求和最近完整工具交换。
 - 文件工具变更的 unified diff、检查点预览与确认回退；发现用户后续修改时拒绝覆盖。
-- 会话历史（标题、列表、详情、删除、清理、修复、Markdown 导出、`max_sessions` 自动清理）；按月费用账本与 `/status cost`；覆盖 Shell 改动、可再撤销的 Git 快照 `/undo`；BM25 记忆检索与注入、自动提取、dream 整理和会话笔记。
+- 会话历史（标题、列表、详情、删除、清理、修复、Markdown 导出、`max_sessions` 自动清理）；按月费用账本与 `/status cost`；覆盖 Shell 改动、可再撤销的 Git 快照 `/undo`；BM25 记忆检索与注入、自动提取和 dream 整理。
 - MCP 客户端：stdio、Streamable HTTP 与旧版 HTTP+SSE 三种传输，支持 `extensions.mcp` 和顶层 `mcp_servers` 两种写法；连接后工具清单写进 `mcp` 工具描述，处理 `tools/list_changed`，断线自动重连一次，从不重试失败调用。
-- Skills：内置 12 个技能，多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；后台复盘自动学到技能（分本项目与全局；默认自动启用、更新和退役，可改为人工审核）；项目/全局带来源记忆的检索和增删改。
+- Skills：内置 12 个技能，多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；项目/全局带来源记忆的检索和增删改。
 - 同步生命周期 Hooks 与兼容 Claude Code 格式的 `hooks.json`（`PreToolUse` 可阻止工具调用）；插件（`manifest.json` 或 `.claude-plugin/plugin.json`，`commands/*.md` 斜杠命令、git 安装、市场搜索）和本地插件清单。
 - 项目信任：`.cove.json` 未信任时只应用安全字段，`/config trust` 后才应用 MCP、系统提示、校验命令等敏感字段。
-- `draw_image` 画 PNG、`browser` 用无头 Chrome/Edge 渲染网页或截图；浏览器实操验收、双方案竞跑、自动化任务与收件箱、统一变更集（`/changes`）和远程监督（`/remote`），见[外围工作流](#外围工作流changesautoremote)。
+- `draw_image` 画 PNG、`browser` 用无头 Chrome/Edge 渲染网页或截图；浏览器实操验收、一个需求两个方案（`/race`）、统一变更集（`/changes`）和远程监督（`/remote`），见[外围工作流](#外围工作流racechangesremote)。
 
 架构以 [执行内核](../src/engine/agent.rs)为中心，依赖 Provider、ToolExecutor、UserInput、SessionPersistence 和 Lifecycle 小接口。协议适配在 [provider](../src/model/provider.rs)，工具调度在 [tools](../src/tools/mod.rs)，权限在 [permission](../src/safety/permission.rs)，进程在 [process](../src/process.rs)，会话存储在 [session](../src/session/mod.rs)，压缩在 [context](../src/engine/context.rs)，文件检查点在 [workspace](../src/session/workspace.rs)，终端交互在 [ui](../src/app/ui.rs)，由 [app](../src/app/mod.rs)组装。扩展工具通过 [组合工具适配器](../src/tools/extension_tools.rs)复用同一条持久化执行路径，不引入另一套 Agent 引擎或通用插件框架。
 
@@ -135,6 +135,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `provider.api_keys` | 多个 key 的数组，轮流使用（见下文“模型、供应商与切换”） | 无 |
 | `model_fast` | 快速模型：简单任务和后台调用（压缩等）用它；`"off"` 关闭 | `/model fast <名>` |
 | `commit_gate` | 提交前验证门禁（默认 on）；`"off"` 关闭后只保留任务收尾验证 | - |
+| `commit_review` | 提交前 AI 审查（默认 on）：用快速模型按真实缺陷和项目规则审查暂存内容；`"auto"` 只审改动不少于 40 行的提交，`"off"` 关闭 | `/commit --no-review` 单次跳过 |
 | `thinking` | Anthropic 扩展思考：`adaptive` 或 `disabled`；不写则不发送该字段 | 无 |
 | `effort` | Anthropic `output_config.effort`：`low`/`medium`/`high`/`xhigh`/`max` | 无 |
 | `show_reasoning` | `true` 时实时显示模型的推理/思考文本（stderr，终端里为暗色斜体，以 `✻ 思考过程` 开头）；默认隐藏，交互控制台只留一行 `✻ 思考了 Ns` | 无 |
@@ -142,7 +143,6 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `permission_mode` | `default`、`plan`、`auto`、`bypass`；旧写法 `ask`=default、`readonly`=plan | `--permission` |
 | `max_iterations` | 每个任务最多调用模型的次数 | `--max-turns` |
 | `max_turn_minutes` | 任务总时限（分钟，必须为正数） | `--timeout`（秒） |
-| `max_budget_usd` | 费用提醒阈值；OpenRouter 可使用返回费用，价格未知时仍保留阈值并提示费用可能低估 | `--budget` |
 | `system_prompt` | 可选的自定义指令，附加在内置规则之后；默认指导已内置，无需配置 | 无 |
 | `max_output_tokens`、`context_window`、`context_bytes`、`input_price`、`output_price` | 含义同命令行参数 | 同名参数 |
 | `subagent_max_iterations` | 每个子 Agent 最多调用模型的次数，默认 60 | 无 |
@@ -160,8 +160,6 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`、`cmd`（仅 Windows），或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
 | `web_search` | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
 | `skills_registry` | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
-| `skill_review` | 默认 `true`：交互会话中由后台模型复盘，学到可复用的做事步骤（技能候选）；`false` 完全关闭复盘 | 无 |
-| `skill_review_auto` | 默认 `true`：学到的技能自动启用、自动更新、长期不用自动退役，不需要人工审核；`false` 改为人工审核（候选只待审，用 `/config skills candidates approve` 批准）。步骤见下文“扩展”一节的“改为人工审核” | 无 |
 
 - **优先级**：命令行/环境变量 > 选中的 profile > 顶层字段 > 内置默认值。profile 由 `--profile <名>` / `COVE_PROFILE` 选择，没有指定时用 `active_profile`；profile 名不存在时报错。
 - **公共配置与差异**：通用设置写在顶层，profile 只写各自的模型、供应商和其他差异；profile 字段优先于顶层。`/model profile save` 会保留当前 profile 的设置，但省略与顶层相同的字段，以便继续继承公共值。
@@ -171,7 +169,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **网络代理**：默认跟随系统代理（Windows“Internet 选项”/macOS 网络设置，VPN 客户端开启“系统代理”模式时写入）以及 `HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；本机地址始终直连。也可用配置 `"proxy": "http://127.0.0.1:7890"`（支持 `http`、`https`、`socks5`、`socks5h`）、命令行 `--proxy` 或环境变量 `COVE_PROXY` 指定，`none` 表示全部直连。`/status` 显示当前代理。`web_fetch` 为防止访问内网，只使用显式指定的代理。
 - **调试与输出**：`debug`（或 `-d`/`--debug`）把每次模型调用、工具调用和压缩的轨迹记录（不含正文）实时打印到 stderr；`verbose`（或 `--verbose`）完整显示工具结果，不只显示摘要（交互控制台）或前 12 行（`-p` 和管道输出）；`live_output`（默认 true）控制命令输出是否逐行直播，`false` 时只在结束时显示摘要和结尾几行（失败时更多）。已废弃的 `telemetry`、`thinking_tokens` 会被静默忽略。
 - **API key 查找顺序**：`COVE_API_KEY` > `provider.api_key`/`provider.api_keys` > 供应商对应的环境变量（例如 `DEEPSEEK_API_KEY`、`KIMI_API_KEY`/`MOONSHOT_API_KEY`）。每一处都可以用逗号分隔写多个 key。带 `****` 的已掩码 key 会被忽略。key 写进配置文件时，文件必须保持私有；Unix 下如果其他用户可读，启动时会给出警告。
-- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。`mcp_servers`、`disabled_skills`、`skill_review`、`skill_review_auto` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
+- **未知字段**：不认识的字段只给出警告（“ignoring keys not supported by cove”）并忽略，不会报错。`mcp_servers`、`disabled_skills` 见下文“扩展”。顶层 `base_url` 会报错，请写到 `provider.base_url`。
 - `/status` 会显示当前生效的供应商、协议、模型、地址、profile 和配置文件路径。
 
 配置文件还支持 `extensions` 对象。最小例子：
@@ -200,20 +198,20 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ### 快速模型与路由
 
-配置 `model_fast` 后，同一个供应商上有两个模型：`model`（高级模型）和 `model_fast`（快速模型）。每个新任务开始时打一次分，决定整个任务用哪个模型；选用快速模型时在 stderr 显示 `[model] <模型> (score ...)`，使用主模型时不提示：
+配置 `model_fast` 后，同一个供应商上有两个模型：`model`（高级模型）和 `model_fast`（快速模型）。每个新任务开始时打一次分，决定整个任务用哪个模型；选用快速模型时显示一行"简单任务，交给快速模型 <模型>"，使用主模型时不提示；`/model next` 指定时显示"本任务用 <模型>（/model next 指定）"。打分规则：
 
-- 复杂度关键词（refactor、architecture、debug、optimize… 及对应中文“重构、架构、调试、优化、性能、安全审计”等）+0.45；消息长度最多 +0.20（1000 字符封顶）；提到的文件路径最多 +0.15；近期快速模型失败率最多 +0.10。预算不影响路由。
+- 复杂度关键词（refactor、architecture、debug、optimize… 及对应中文“重构、架构、调试、优化、性能、安全审计”等）+0.45；消息长度最多 +0.20（1000 字符封顶）；提到的文件路径最多 +0.15；近期快速模型失败率最多 +0.10。费用不影响路由。
 - 总分 ≥ 0.35 用高级模型；消息不少于 2000 字符一律用高级模型。
 - 上一个任务跑在高级模型上时，40 字以内的简短追问（如“继续”）留在高级模型，避免中途换模型丢掉提示缓存。
 - **升级**：快速模型上验证门禁失败，或连续 3 批工具调用全部失败，本任务剩余部分改用高级模型。
 - **回退**：重试后仍是 5xx/429 时，本任务换到另一个模型一次；快速模型返回 404（模型不存在）时改用主模型。
 - 上下文压缩等后台调用使用快速模型；其他模块通过同一个入口（`background_provider`）做摘要、记忆提取等廉价调用。
-- 费用按实际应答的模型计价，`/model` 列出每个模型的调用次数、token（含缓存读写）和费用。快速模型不在价格表里时按主模型价格估算，预算仅作提醒。
+- 费用按实际应答的模型计价，`/model` 列出每个模型的调用次数、token（含缓存读写）和费用。快速模型不在价格表里时按主模型价格估算（宁可高估）。
 
 ### 供应商特性
 
-- **Anthropic**：`thinking`、`effort` 写入请求；thinking 块（含签名）原样回传，压缩后只保留当前工具循环和最后一条助手消息里的 thinking。系统提示和最后 3 条消息带 `cache_control: ephemeral` 提示缓存，并发送 prompt-caching beta 头（Bedrock 不发）。
-- **缓存计费**：解析 Anthropic 的 `cache_read_input_tokens`/`cache_creation_input_tokens`、OpenAI 的 `cached_tokens`、DeepSeek 的 `prompt_cache_hit_tokens`。缓存读取按内置价格表里各模型的缓存价（未知模型按输入价的 0.1 倍），缓存写入按输入价的 1.25 倍。
+- **Anthropic**：`thinking`、`effort` 写入请求；thinking 块（含签名）原样回传，压缩后只保留当前工具循环和最后一条助手消息里的 thinking。系统提示和最后 3 条消息带 `cache_control: ephemeral` 提示缓存，并发送 prompt-caching beta 头（Bedrock 不发）。主任务和子 Agent 的对话请求在支持的模型上（Opus 4.5、Sonnet 4.6、Haiku 4.5 及之后的所有 Claude 模型）全部使用 1 小时缓存（`ttl: "1h"`），任务之间停 5–60 分钟仍能命中；压缩、记忆提取、标题等一次性的后台调用保持默认的 5 分钟。
+- **缓存计费**：解析 Anthropic 的 `cache_read_input_tokens`/`cache_creation_input_tokens`、OpenAI 的 `cached_tokens`、DeepSeek 的 `prompt_cache_hit_tokens`。缓存读取按内置价格表里各模型的缓存价（未知模型按输入价的 0.1 倍），缓存写入按输入价的 1.25 倍；Anthropic 报告的 1 小时缓存写入（`cache_creation.ephemeral_1h_input_tokens`）按输入价的 2 倍。
 - **OpenAI 兼容**：o1/o3/o4/gpt-5 系列用 `max_completion_tokens`；`deepseek-reasoner`/`deepseek-r1` 不发送工具定义；`reasoning_content` 只在带工具调用的助手消息上回传。
 - **多 key 轮换**：`provider.api_keys`（或逗号分隔的环境变量）轮流使用。429 让该 key 休息（按 `Retry-After`，没有则 60 秒），有其他 key 时立即换用；401/403 把该 key 标为失效并立即用下一个重试。
 - **限流信息**：记录响应里的 `x-ratelimit-*` / `anthropic-ratelimit-*` 头，`/status limits` 显示剩余请求数、token 数和重置倒计时。
@@ -239,7 +237,6 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/model profile list\|switch\|save\|delete\|show <名>` | 管理 profile；`show` 中的 key 已打码 |
 | `/config model\|provider\|base_url\|system\|max_output_tokens [值]` | 不带值显示当前值，带值修改 |
 | `/config api_key [key]` | 不带值时在终端里不回显地输入；显示时只显示打码的 key |
-| `/config budget [金额\|auto\|off\|save]` | 金额、`auto`（已花费 + 10 美元）、`off` 只改本会话；`save` 把当前预算写入配置 |
 | `/config effort [low\|medium\|high\|xhigh\|max\|default]` | 立即生效并写入当前配置档；越低响应越快、输出越少，复杂任务效果可能下降；`default` 删除设置交给服务端。只对 Anthropic 协议（含 Bedrock）生效 |
 | `/config setup` | 重新运行设置向导（含验证请求） |
 | `/status limits` | 最近一次响应的限流信息 |
@@ -260,22 +257,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **安全**：项目技能文件如果是指向项目外的链接，拒绝加载并警告；技能正文始终作为不可信数据交给模型，`allowed_tools` 只是收窄工具选择的提示，不授予任何权限。配置 `disabled_skills: ["名字"]` 可整体移除技能。
 - **调用**：`/<技能名> [参数]` 把技能（编号步骤清单、工具限制说明、正文和你的参数）作为一次新任务发给模型。内置命令同名时内置命令优先；输错命令会提示“你是不是想输入 /…”。模型也可以用 `skill` 工具按需加载。
 - **按文件类型提示**：带 `paths` 的技能在 read/write/edit 触及匹配文件时，于该次工具结果后附 `<relevant_skills>`，每个会话每个技能只提示一次。
-- **自动技能候选**：交互会话满足复盘条件时（至少一个任务完成且验证未失败），后台模型的提议经筛查后存入 `<data_dir>/skill-candidates/records.json`。复盘会看到本项目和全局已有的学到的技能，优先输出 `UPDATE:` 改进已有技能；新技能分 `NEW: project`（只在本项目加载）和 `NEW: global`。名字相近的提案并入已有候选（记一次出现），与被拒绝或手动撤销的名字相近的直接丢弃；每次最多 2 条，正文不超过 2KB。只出现过一次、超过 30 天的待审候选自动清理。筛查和任务完成不等于验证通过；候选验证状态可为 `unknown`。`"skill_review": false` 关闭复盘；`-p` 单次任务不复盘。设置预算不阻止复盘。
-- **自动启用**（`skill_review_auto`，默认开）：候选在 2 个会话中出现，或来源任务验证通过，即自动启用；`UPDATE` 直接更新已批准的技能并立即生效；60 天未调用的学到的技能自动退役（可再次学到），每个项目最多 20 条、全局最多 30 条，超出时退役最久未用的。启用、更新、退役各提示一行（以 `[skills]` 开头），不需要审核。
-- **改为人工审核**：
-  1. 在用户配置 `%USERPROFILE%\.cove\config.json`（或 `<数据目录>/config.json`）顶层加一行 `"skill_review_auto": false`，例如：
-     ```json
-     {
-       "skill_review_auto": false
-     }
-     ```
-     也可以只对某个项目关闭：写在该项目的 `.cove.json` 里（设为 `false` 属于只做减法的安全字段，无需信任项目）。
-  2. 重启 cove 生效。
-  3. 之后复盘只生成待审候选，不会自动启用；`UPDATE` 不会改动已批准的技能；也不会自动退役。用下面“候选审核”的命令处理：先 `/config skills candidates list` 查看（复制 `id` 字段的完整哈希），再 `approve <哈希>` 启用或 `reject <哈希>` 拒绝，已启用的用 `revoke <哈希> <原因>` 撤销。
-  4. 想恢复自动：删掉这一行或改为 `true`，重启即可。已批准的技能两种模式下都保留。
-  - 完全不想学技能：`"skill_review": false`（关闭复盘本身）。
-- **候选审核**（人工审核模式下使用；自动模式下也可用来手动批准、拒绝或撤销）：`/skills candidates list`（待审在前，按出现次数排序，显示作用域）、`prune [天数]`（清理 N 天前只出现过一次的待审候选，默认 30，`0` 为清空待审）、`show <完整哈希>`、`approve <完整哈希>`、`reject <完整哈希>`、`revoke <完整哈希> <原因>`。批准前检查状态、内容和同名技能；撤销后不可调用。记录中存在重复候选 ID 或同名多个批准版本时拒绝读取及调用。候选存储锁被占用时审核操作会立即报忙；后台复盘写入针对锁竞争最多等待 250 毫秒，仍未取得锁则提示失败。旧自动技能保持原有启停状态并标记 `legacy-unverified`，不会自动迁移。
-- **旧技能迁移**：`/skills candidates migrate <旧名> <新名>` 将旧自动技能复制为不同名称的待审批候选，记录原文件内容摘要及当前会话；原文件与启停状态不变。目标名称必须可用；无法无损迁移的元数据、可疑指令或敏感内容会被拒绝。迁移与筛查不代表原技能已验证，仍需人工审核批准。
+- **不再自动学习技能**：早期版本会在任务结束后由后台模型复盘并学习技能，这个功能已移除（见 `docs/optimizations/0003`）。可复用的经验由自动记忆和 dream 记忆整理负责；技能只来自内置、插件、用户目录、配置和项目目录。
 - **改进建议**：`/suggestions analyze` 显式分析当前会话，`/suggestions list` 查看，`/suggestions accept <完整哈希>`、`reject <完整哈希>` 和 `revoke <完整哈希> <原因>` 记录人工决定。仅在显式分析时扫描最近 256 条消息，每条最多 32 个内容块；目前只识别白名单工具相同输入至少两次失败，重复调用 ID 或结果存在歧义时不作为证据。接受前重新核对当前会话证据，历史压缩或修改可能使证据位置失效；拒绝及撤销仍可关闭过期建议。接受仅记录决定，不执行建议、不改动提示词、技能或权限，也不发起模型请求。
 - 建议记录保存在 `<data_dir>/suggestions/<会话ID>.json`，每个会话最多 128 条，不自动清理；记录工具名、输入摘要和消息位置，不复制工具输入或输出。摘要不是匿名化手段，低熵输入可能被猜出；撤销原因由用户填写并持久保存。记录仅做一致性校验，不能防止能修改本地文件的人伪造记录。
 - **管理**：`/skills` 列出技能（名字、来源、描述），`/skill <名>` 查看正文；`/config skills [list]`、`show <名>`、`create <名>`（生成模板）、`install <名|https URL>`、`marketplace [关键词]`。新建和安装的技能写到 `<data_dir>/skills/<名字>/SKILL.md`，写入前需要授权；已存在的同名技能不会被覆盖。
@@ -332,8 +314,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 项目信任与 `.cove.json`
 
 - 启动时读取 cwd 下的 `.cove.json`（必须是不超过 1 MiB 的普通文件，不跟随链接；格式错误只警告）。它合并到用户配置的顶层，选中的 profile 仍覆盖其上。
-- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、调低的 `max_budget_usd`、只做减法的 `done_verify_auto`/`done_verify_tests`/`skill_review`/`skill_review_auto`（设为 `false`）、`done_verify_timeout_seconds`、`done_self_review`、`done_check`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`max_iterations` 等限额。
-- **需要信任**的敏感字段：`auto`/`bypass` 权限、调高预算、`system_prompt`、`mcp_servers`、`done_verify_commands`、开启校验、`web_search`、`provider`、`memory_embedding`、`skills_registry`、单价等。未信任时启动会列出被忽略的字段；不支持的字段（如 `profiles`、`extensions`）单独列出。
+- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、只做减法的 `done_verify_auto`/`done_verify_tests`（设为 `false`）、`commit_gate`/`commit_review`（设为 `off`）、`done_verify_timeout_seconds`、`done_self_review`、`done_check`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`max_iterations` 等限额。
+- **需要信任**的敏感字段：`auto`/`bypass` 权限、`system_prompt`、`mcp_servers`、`done_verify_commands`、开启校验、`web_search`、`provider`、`memory_embedding`、`skills_registry`、单价等。未信任时启动会列出被忽略的字段；不支持的字段（如 `profiles`、`extensions`）单独列出。
 - `/config trust` 把项目根目录（git 根，否则 cwd）记为可信，并按**本次启动读到的内容**记录 `.cove.json` 的 sha256，写入 `<data_dir>/trusted_projects.json`；文件之后再改动就需要重新信任。重启后生效。可信项目等同于加了 `--trust-extensions`，自动验证门禁也通过 `cove::trust::is_trusted(cwd)` 查询同一份记录。
 
 ## 会话、恢复与交互
@@ -351,12 +333,12 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/resume clear [all] [confirm]`、`/resume clean`、`/resume export [file]` | 批量清理（先预览，加 `confirm` 才执行）/ 修复历史（先备份）/ 导出 Markdown 记录 |
 | `/continue`、`/continue <n|id>` | 裸命令列出当前工作区的会话（当前会话有未完成任务时排在第一位，标“当前”），交互终端打开历史面板；指定编号或 ID 直接恢复。未完成任务会继续运行，已完成任务恢复上下文后等待新消息。结果不确定的工具调用会作为失败结果交回 Agent 检查，不会自动重放。 |
 | `/turns [编号]` | 查看当前会话每一轮的提问和结论（不含中间的工具调用），包括压缩前的轮次。交互终端打开全屏阅读器：上方是你的输入，↑↓ 或单击切换，下方显示这一轮的结论；滚轮、PageUp/PageDown 滚动；拖动鼠标选中即复制（可跨屏），`c` 复制整段 Markdown 原文，`o` 在编辑器中打开，`/` 筛选，Esc 返回。普通终端用 `/turns <编号>` 查看指定轮。 |
-| `/status usage` | 当前会话的账户与用量：认证方式（供应商及 key 来源）、估算总费用、等待模型响应的累计时间（API 耗时）、会话创建至今的时间、文件工具新增/删除的行数、模型调用次数，以及每个模型的输入/输出/缓存读写 token、调用次数和费用（含子 Agent 的花费） |
-| `/status cost [period] [export [file]]` | 按供应商/模型统计用量与估算费用，可导出 CSV |
+| `/status usage`（简写 `/usage`） | 当前会话的账户与用量：认证方式（供应商及 key 来源）、估算总费用、等待模型响应的累计时间（API 耗时）、会话创建至今的时间、文件工具新增/删除的行数、模型调用次数，以及每个模型的输入/输出/缓存读写 token、调用次数和费用（含子 Agent 的花费） |
+| `/status cost [period] [export [file]]`（简写 `/cost`） | 按供应商/模型统计用量与估算费用，可导出 CSV |
 | `/compact` | 付费摘要压缩，原始上下文先归档 |
 | `/diff` | 有 Git 快照时显示本任务首个快照以来的整树变更（含 Shell 改动）；否则显示文件工具跟踪的变更 |
-| `/undo`、`/undo confirm` | 预览 / 授权后回退当前任务的文件工具检查点（不含 Shell 改动），并列出最近的 Git 快照 |
-| `/undo list`、`/undo <#n\|hash>`、`/undo files <#n\|hash> <文件…>`、`/undo confirm <token>` | Git 快照：列表 / 预览整树或单个文件的还原，凭预览给出的 token 确认执行（含 Shell 改动，还原本身可再撤销） |
+| `/undo` | 列出回滚点（最新 15 个；每个任务开始改动前一个，会改东西的 Shell 和子代理前各一个） |
+| `/undo <#n\|hash>`、`/undo files <#n\|hash> <文件…>`、`/undo confirm` | 预览整个工作区或指定文件的恢复，再 `/undo confirm` 执行（含 Shell 改动，恢复本身可再撤销）。没有 Git 快照时，`/undo`、`/undo confirm` 退回上一个任务的文件工具回滚 |
 | `/resolve <call-id> executed` | 用户确认不确定调用已执行，禁止重放；结果标为未验证失败 |
 | `/resolve <call-id> not-run` | 检查证据确认未执行后允许重试 |
 | `/config` | Skills、MCP、Hooks、插件及记忆管理；`/mcp`、`/plugins`、`/hooks`、`/memory` 是 `/config mcp` 等的简写 |
@@ -400,7 +382,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ✓ 完成 · 2 次模型调用 · 3 个工具 · 2.6k tokens · $0.02 · 48s
 ```
 
-- **显示规则**：模型回复的 Markdown 边接收边渲染：标题加粗（一、二级加下划线），`**粗体**`，反引号里的代码名、路径和命令为浅橙色，列表符号换成 `•`，引用以 `│` 开头，分隔线画成横线，代码块保留原文（围栏行为暗色）便于复制。表格收齐后按终端宽度对齐，长单元格在列内换行并分隔多行记录；列太多时改为带列名的纵向展示。工具调用一行写明动作和关键参数（读取的文件、搜索的内容、运行的命令），下面用 `└` 给出摘要（行数、匹配数、退出码等），`#n` 可用 `/expand n` 看完整输出。同时运行的多个工具，各自的标题和结果放在一起。`-p`、管道和简单模式保持原来的机器可读行（`[tool]`、`[ok]`、`[summary]`），供脚本和 worker 解析。
+- **显示规则**：模型回复的 Markdown 边接收边渲染：标题加粗（一、二级加下划线），`**粗体**`，反引号里的代码名、路径和命令为浅橙色，列表符号换成 `•`，引用以 `│` 开头，分隔线画成横线，代码块保留原文（围栏行为暗色）便于复制。表格收齐后按终端宽度对齐，长单元格在列内换行并分隔多行记录；列太多时改为带列名的纵向展示。工具调用一行写明动作和关键参数（读取的文件、搜索的内容、运行的命令），下面用 `└` 给出摘要（行数、匹配数、退出码等），`#n` 可用 `/expand n` 看完整输出。同时运行的多个工具，各自的标题和结果放在一起。`-p`、管道和简单模式保持原来的机器可读行（`[tool]`、`[ok]`、`[summary]`），供脚本和测试解析。
 
 - **任务运行中输入**：普通文字作为插话，默认在工具结束或本轮回复完成时自动送入；以 `!` 开头则优先插话并打断生成。被中断的请求可能照常计费，但未返回的费用按零累计。插话标注为任务运行时输入的指令，最多排 16 条；任务结束时还没送达的插话成为下一条消息。斜杠命令和带附件的消息排队，等当前任务结束后依次执行。
 - **中断**：任务运行中连按两次 **Esc**（2 秒内）或按 **Ctrl+C** 中断任务，`/continue` 可以继续。空闲时在空行上按 Ctrl+C 只提示用 `/exit` 或 Ctrl+D 退出；**Ctrl+D** 在空行上保存并退出。
@@ -411,7 +393,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **多行输入**：Ctrl+J、Alt+Enter、Shift+Enter、Ctrl+Enter 插入换行；行尾输入 `\` 再回车也会换行；粘贴的多行文本保持原样，不会逐行提交。多行时上下键在行间移动。
 - **编辑键**：Ctrl+A/Ctrl+E 或 Home/End 到行首/行尾，Alt+B/Alt+F 或 Ctrl/Alt+←/→ 按词移动，Ctrl+W 或 Alt/Ctrl+Backspace 删前一个词，Ctrl+K 删到行尾，Ctrl+U 删到行首；Esc 清空输入，紧接着 Ctrl+Z 恢复；Ctrl+L 清屏。
 - **Agent 面板**：Alt+M 打开或关闭输入行下方的子 Agent / 后台 Agent 面板（Esc 也可关闭）。
-- **图片**：粘贴或拖入图片文件路径（PNG/JPEG/GIF/WebP，可多个、可带引号）会作为附件挂在下一条消息上；Windows 上 Alt+V 附加剪贴板里的图片；空行上 Alt+Backspace 移除最后一个附件。只有附件、没有文字时，按 Enter 让模型分析附件。
+- **图片**：粘贴或拖入图片文件路径（PNG/JPEG/GIF/WebP，可多个、可带引号）会作为附件挂在下一条消息上；Windows 上 Alt+V 附加剪贴板里的图片（保存为数据目录 `clipboard/` 下的 PNG，图片发送时已写进会话，这些文件在下次粘贴时清理 7 天前的）；空行上 Alt+Backspace 移除最后一个附件。只有附件、没有文字时，按 Enter 让模型分析附件。
 - **环境变量**：设置 `NO_COLOR` 去掉颜色（光标控制保留）；`COVE_PLAIN_REPL=1` 改用简单的逐行读取（无常驻输入行、补全和任务中输入，命令在任务之间执行，用 Ctrl+C 取消任务）；`COVE_ESC_INTERRUPT=0` 让单独的 Esc 不再中断任务。stdin 或 stderr 不是终端时也自动使用简单模式。
 
 ```powershell
@@ -440,9 +422,10 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | 命令 | 行为 |
 | --- | --- |
 | `/help`、`/help <命令>` | 按组列出全部命令（含各功能区的命令）/ 单个命令的用法；未知命令给出相近命令建议，参数不对时显示该命令用法，**都不发送给模型** |
-| `/init`、`/init apply`、`/init discard` | 一次有界模型调用（最多 3 分钟，计费，超出预算仍继续）阅读仓库摘要（两级目录、README 与清单文件开头、项目概要），起草 `CLAUDE.md`；仓库采用 `AGENTS.md` 约定时起草 `AGENTS.md`。模型不可用、失败或 Ctrl+C 时用模板。草稿存于 `<数据目录>/projects/<hash>/init-draft.md`，以 diff 展示；`apply` 经授权后走工作区检查点写入（`/diff`、`/undo` 可见可退），**从不覆盖已有文件**；`discard` 删除草稿 |
+| `/init`、`/init apply`、`/init discard` | 一次有界模型调用（最多 3 分钟，计费）阅读仓库摘要（两级目录、README 与清单文件开头、项目概要），起草 `CLAUDE.md`；仓库采用 `AGENTS.md` 约定时起草 `AGENTS.md`。模型不可用、失败或 Ctrl+C 时用模板。草稿存于 `<数据目录>/projects/<hash>/init-draft.md`，以 diff 展示；`apply` 经授权后走工作区检查点写入（`/diff`、`/undo` 可见可退），**从不覆盖已有文件**；`discard` 删除草稿 |
 | `/diff git`、`/diff git --stat` | 分两节显示 `git diff --cached` 与 `git diff`；`--stat` 列出已暂存、未暂存和未跟踪文件，用于提交前审阅。`/diff` 仍是当前任务的文件工具变更 |
-| `/commit [--preview] [--all \| --only <路径>... --] [消息]` | 默认只提交**已暂存**内容；`--all`/`--only` 通过从 HEAD 建立的临时 `GIT_INDEX_FILE` 选择文件，不改动你原来的暂存区（提交后只同步已提交文件）。先显示 stat、执行 `git diff --cached --check`，default 模式下请求批准，再运行验证命令（`done_verify_commands` 或自动检测）；验证前后检查暂存树哈希和工作区内容均未改变，否则不提交。默认消息 `auto-commit`；**从不推送** |
+| `/commit [--preview] [--no-review] [--all \| --only <路径>... --] [消息]` | 默认只提交**已暂存**内容；`--all`/`--only` 通过从 HEAD 建立的临时 `GIT_INDEX_FILE` 选择文件，不改动你原来的暂存区（提交后只同步已提交文件）。先显示 stat、执行 `git diff --cached --check`，default 模式下请求批准，再运行验证命令（`done_verify_commands` 或自动检测）；验证前后检查暂存树哈希和工作区内容均未改变，否则不提交。验证通过后做提交前 AI 审查（见“完成闸门”），发现问题就不提交并列出问题；`--no-review` 跳过审查。默认消息 `auto-commit`；**从不推送** |
+| `/rules [add <规则>\|remove <n>\|local]` | 项目规则（见“项目规则”）：不带参数列出；`add` 添加一条；`remove` 按编号删除；`local` 把规则文件加进 `.git/info/exclude`，只留在本机 |
 | `/cd <路径>` | 保存会话后以新目录重启本程序（工作区、租约、检查点、工具和项目上下文都绑定 cwd，重启是最安全的切换方式）；原会话留在原目录，可在那里 `--resume` |
 | `/restart` | 保存后用原参数加 `--resume <id>` 重新启动本程序（Unix 为 exec，Windows 启动子进程并等待其退出码） |
 | `/expand [n] [all]` | 工具结果在终端只显示摘要（交互控制台）或前 12 行（`-p`、管道），并带 `#n` 标记；本命令显示第 n 个（默认最近一个）的完整输出，默认最多 200 行，`all` 显示全部。内存中只保留最近 50 个 |
@@ -454,7 +437,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **错误日志** `<数据目录>/errors.log`：模型调用失败、任务中断原因、命令错误和启动失败各记一行 JSON（时间、来源、诊断码、最多 400 字节的消息，API Key 被替换为 `****`）；超过 1 MiB 轮换为 `errors.log.1`。`/doctor errors` 按诊断码和消息分组显示次数、最近时间和建议。
 - **交互轨迹** `<数据目录>/trace.jsonl`：每次模型调用、工具调用、上下文压缩和任务结束各记一行，主要记录大小、数量、耗时和结果；失败工具的首行输出及模型错误摘要也可能被记录。已知 API Key 会被替换，但无法保证日志不含其他敏感信息，**不要直接外发原始日志**。超过 4 MiB 轮换一次为 `trace.jsonl.1`；`/doctor trace [N]` 显示最近 N 条（默认 30）。错误日志同样可能包含敏感信息，大小轮转不是按时间过期，当前没有自动按时间清理。
 - **支持报告**：`/doctor report` 本地预览版本、系统类型、最近最多 2000 条错误的已知诊断码汇总及最近最多 2000 条轨迹中的压缩截断次数；只使用固定字段和内置建议，不复制原始错误、路径、会话或工具输出。报告是有限窗口的统计，不代表完整历史。`/doctor report export <文件>` 经写入授权后生成文件，不覆盖已有文件；导出时重新生成，请检查导出的内容并按需编辑。报告不会自动外发，当前没有邮件发送功能或预置邮箱。
-- **可选模型分析**：预览会显示供应商、模型、端点主机及确认摘要；核对后运行 `/doctor report analyze confirm <完整摘要>`，才会按网络权限向指定模型发送报告，产生一次可能计费的调用并按会话预算与用量记账。摘要绑定报告、供应商、完整端点和模型；变化后需重新预览。模型回答仅作未验证建议，不使用工具、不自动执行。无确认时不发请求；不要把原始日志自行拼入报告后发送，且分享前仍应人工检查。
+- **可选模型分析**：预览会显示供应商、模型、端点主机及确认摘要；核对后运行 `/doctor report analyze confirm <完整摘要>`，才会按网络权限向指定模型发送报告，产生一次可能计费的调用并记入会话用量。摘要绑定报告、供应商、完整端点和模型；变化后需重新预览。模型回答仅作未验证建议，不使用工具、不自动执行。无确认时不发请求；不要把原始日志自行拼入报告后发送，且分享前仍应人工检查。
 
 命令行：
 
@@ -477,13 +460,13 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ### 费用账本
 
-- 模型调用（任务、压缩、子 Agent、后台记忆提取、dream）在 Provider 边界记录到 `<数据目录>/usage/YYYY-MM.jsonl`；技能复盘单独记为 `skill_review`，其费用保守标为未知。账本记录时间、供应商、模型、会话、来源和供应商报告的 token；按 UTC 月份分文件，保留 13 个月。技能复盘发送前先写入 `<数据目录>/usage/intents/`；写入失败时不发送，进程中断后未完成请求按未知费用显示，不能据此认定供应商确实收费。完成记录按请求开始时间归属，写入成功后移除意图；损坏的意图会使账本读取报错，未完成意图不会自动清理，最多保留 4096 条。具体断电持久性取决于操作系统和文件系统。
+- 模型调用（任务、压缩、子 Agent、后台记忆提取、dream）在 Provider 边界记录到 `<数据目录>/usage/YYYY-MM.jsonl`。账本记录时间、供应商、**实际作答的模型**（后台调用是快速模型）、会话、来源和供应商报告的 token；费用与会话统计用同一规则：供应商报告了费用就用报告值，否则按该模型的价格分别计算普通输入、缓存读取和缓存写入（2026-11-20 之前的记录把缓存读取按全价计算、后台调用按主模型计价，费用明显偏高，未回改）；按 UTC 月份分文件，保留 13 个月。具体断电持久性取决于操作系统和文件系统。
 - `/status cost` 默认统计本月；也可用 `YYYY-MM`、`30d`、`24h`、`today`、`all`。价格未知的调用显示为 `unknown`，合计里标成 `>=`，不当作零。`export [file]` 写 CSV，默认 `<数据目录>/usage/export-<时段>.csv`。
-- 估算方法与会话预算一致（报告的 input/output token × 配置单价），不是供应商账单。
+- 是估算，不是供应商账单。
 
 ### Git 快照与 `/undo`
 
-- 每个会产生副作用的工具调用（`write`、`edit`、非只读 Shell、写模式子 Agent、`execute_plan`）执行前，把整个工作区快照到私有的 Git 仓库 `<数据目录>/checkpoints/git`：每个项目一个 ref、一个独立 index，不碰项目自己的 `.git`；工作区没变化时不新增快照。排除规则由项目本身推导，每次快照前更新（结果复用 30 秒）：
+- 每个任务第一次改动之前（标签是本次请求），以及每次非只读 Shell、写模式子 Agent、`execute_plan` 之前（标签写明命令和所属任务），把整个工作区快照到私有的 Git 仓库 `<数据目录>/checkpoints/git`；同一任务里之后的 `write`、`edit`、`draw_image` 不再快照，它们之间的回退由文件工具检查点负责。快照的位置：每个项目一个 ref、一个独立 index，不碰项目自己的 `.git`；工作区没变化时不新增快照。排除规则由项目本身推导，每次快照前更新（结果复用 30 秒）：
   - 项目自己的 Git 忽略的一切：`.gitignore`、`.git/info/exclude` 和全局 `core.excludesFile`（快照用的是独立仓库，单靠它只能看到 `.gitignore`，所以改为直接询问项目的 Git）；
   - 项目 Git 未跟踪的隐藏（`.` 开头）文件和目录，如索引、缓存、IDE 设置（`.codeatlas/`、`.vscode/`、`.env`）；项目跟踪的 `.github/` 等照常快照；
   - 项目 Git 未跟踪且大于 2 MB 的文件（数据库、数据转储、模型等；与 OpenCode 相同）；
@@ -494,33 +477,43 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
   以前快照进去、现在被排除的条目会从快照索引中移除；还原旧快照时也不会触碰这些路径。只读权限模式下不做快照。需要本机安装 `git`；没有时只剩文件工具回退。
 - 工具调用最多等快照 10 秒：超时则本次调用不做快照照常执行，结果里注明 `/undo` 无法还原这次的效果；已开始的暂存在后台继续完成（不记录快照），之后的快照就快了。后台暂存期间的调用同样跳过快照、不计为超时。同一会话两次超时后，本会话不再自动快照。大项目第一次快照可能需要几十秒（之后通常 1 秒左右）。
 - 快照按原始字节存储（`* -text`、`core.autocrlf=false`），还原时一字不差，项目的 `.gitattributes` 和换行设置不会影响它；快照用的 Git 不读用户的全局和系统配置（`core.autocrlf`、`commit.gpgSign`、钩子模板等都不会带进来）。暂存时文件内容写进一个打包文件而不是逐个小文件，大项目第一次快照约快一半。
-- 每个项目保留最新 50 个快照，超过 60 个时修剪，后台 `git gc` 只回收 1 小时前的对象（单线程、不对大文件做增量压缩，避免占满机器）。cove 退出时遗留的过期 index 锁会在下次快照前清除。
-- 两种回退：`/undo confirm` 只回退本任务文件工具的修改，**不含 Shell 改动**；Git 快照还原**包括 Shell 改动**（被忽略和排除的目录除外）。
-- 快照还原先预览：列出将要还原、重建、删除的文件，并给出一次性 token。`/undo confirm <token>` 执行前复核工作区，与预览时不一致就拒绝。还原前先给当前状态拍快照，输出里给出它的编号，用 `/undo <hash>` 可以撤销这次还原。嵌套 Git 仓库不在快照里，保持原样。
+- 每个项目保留最新 50 个、且不超过 30 天的快照：超过 60 个，或最旧的超过 33 天时修剪，后台 `git gc` 只回收 1 小时前的对象（单线程、不对大文件做增量压缩，避免占满机器）。任何项目修剪时，顺带删除最新快照也超过 30 天的其他项目（不再打开的项目不会自己修剪）；打开快照库时，若有超过 1 小时、尚未回收的 cruft pack，就在后台跑一次 `git gc`。`/init apply` 写入前也会拍一个快照。cove 退出时遗留的过期 index 锁会在下次快照前清除。
+- 快照还原**包括 Shell 改动**（被忽略和排除的目录除外）。没有 Git 快照时（未安装 Git、工作区是主目录或根目录、快照超时被关闭），`/undo` 退回文件工具回滚：只回退上一个任务文件工具的修改，**不含 Shell 改动**。
+- 快照还原先预览：`/undo #n` 列出将要还原、重建、删除的文件；`/undo confirm` 执行最近一次预览，执行前复核工作区，与预览时不一致就拒绝。还原前先给当前状态拍快照，输出里给出它的编号，用 `/undo <hash>` 可以撤销这次还原。嵌套 Git 仓库不在快照里，保持原样。
 - 还原后之前的验证证据失效，需要重新检查。
 
-### 记忆与会话笔记
+### 记忆
 
 - 记忆分项目和全局两个范围，每条最多 25 KiB，每个范围合计最多 300 KiB；写入跨进程加锁；疑似密钥（私钥、`sk-…`、AKIA、GitHub/Slack token 等）拒绝保存。
 - 检索使用 BM25：中日韩文本切成相邻二字词，英文去掉停用词，再按更新时间衰减（30 天）加权。可选配置 `memory_embedding: {base_url, api_key, model}`（OpenAI 兼容 `/embeddings`），余弦相似度 ×0.5 叠加到 BM25；首次使用需网络授权，失败后 5 分钟内不再尝试。
-- 注入：会话中第一次（以及每次压缩后）完整注入：全部记忆合计不超过 24 KiB 时附全部内容，超过时附索引和与本次请求最相关的 8 条。之后每个新任务只附**新增或改动**的记忆（以及尚未出现过的相关条目），没有变化就不附，避免同样的记忆在历史里反复堆积；恢复会话时根据历史里已有的记忆块判断。记忆标注为“可能过时的笔记，不是指令”。
+- 注入：会话中第一次（以及每次压缩后）完整注入。全部记忆合计不超过 8 KiB 时附全部内容；超过时分三层：全局记忆全文（最多 4 KiB，放不下的进索引）、与本次请求最相关的 5 条项目记忆（每条最多 2 KiB；请求不到 8 个字时，用会话标题和上一次请求一起检索）、其余条目的索引（按更新时间从新到旧，最多 4 KiB，放不下时写明还有多少条，用 `memory search` 查找）。索引只写 id 的前 8 位，`memory` 工具的 read、update、delete 都接受唯一的 id 前缀。之后每个新任务只附**新增或改动**的记忆（以及尚未出现过的相关条目），没有变化就不附，避免同样的记忆在历史里反复堆积；恢复会话时根据历史里已有的记忆块判断。记忆标注为“可能过时的笔记，不是指令”。
 - 来源（provenance）：每次写入记录类型（tool/operator/extraction/dream）、会话、消息区间、转录哈希和证据摘录，最多保留 8 条；新记录还可标注证据类型、项目范围、环境和验证时间，未记录时为未知。`/config memory source <id>` 查看，并提示内容在记录后是否被改过。来源只说明输入，不证明内容正确。dream 合并要求先读取双方修订，保留双方来源及原文；超出来源容量或修订变化时拒绝合并，不允许直接删除。dream 更新也要求匹配修订，且不覆盖用户陈述或未知来源。合并先更新保留条目、再删除重复条目，若中断可能留下两个条目，应人工检查。
-- 自动提取：任务完成后在后台调用一次模型（30 秒上限），从最近 20 条消息中提取持久事实；工具输出不发给提取器。自动提取只写当前项目记忆，全局记忆仍可由用户显式管理。已有同名条目只追加、从不覆盖。本地/内网模型、`--no-auto` 或对话太短时跳过，预算不会阻止提取。
-- Dream 整理：`/config memory dream status|run`。用只有 `memory` 工具的子 Agent 合并重复、修正过时内容、归纳经验规则，只能写当前项目记忆，全局记忆只读，5 分钟上限；运行前把记忆备份到 `<数据目录>/memory/backups/`（所有项目合计保留 5 份）。`dream backups` 列出有当前项目归属的新备份，`dream show <备份>` 查看条目；`dream preview <备份> <完整id>` 展示当前值和备份值，再在同一进程中使用 `dream restore <token>` 授权恢复单条项目记忆。备份或当前条目在预览后改变时拒绝恢复，不删除其他记忆；令牌一次有效，重启或新预览后失效。旧备份没有项目归属清单，不能通过此命令恢复；全局记忆不能通过此命令恢复。
+- 自动提取：任务完成后在后台调用一次模型（30 秒上限），从最近 20 条消息中提取持久事实，并把你对做法的纠正或明确说的长期规则写成项目规则（见“项目规则”）；工具输出不发给提取器。自动提取只写当前项目记忆，全局记忆仍可由用户显式管理。已有同名条目只追加、从不覆盖。本地/内网模型、`--no-auto` 或对话太短时跳过。
+- Dream 整理：`/config memory dream status|run`。用带 `memory` 和 `project_rules` 工具的子 Agent 合并重复、修正过时内容，并把至少在两个会话里出现过的问题写成项目规则（不在项目目录里时，仍归纳成“rules and patterns”记忆），只能写当前项目记忆，全局记忆只读，5 分钟上限；运行前把记忆备份到 `<数据目录>/memory/backups/`（所有项目合计保留 5 份）。`dream backups` 列出有当前项目归属的新备份，`dream show <备份>` 查看条目；`dream preview <备份> <完整id>` 展示当前值和备份值，再在同一进程中使用 `dream restore <token>` 授权恢复单条项目记忆。备份或当前条目在预览后改变时拒绝恢复，不删除其他记忆；令牌一次有效，重启或新预览后失效。旧备份没有项目归属清单，不能通过此命令恢复；全局记忆不能通过此命令恢复。
 - 恢复意图和结果记录在 `<数据目录>/memory/restore-audit/`：`started` 表示中断后结果未知，`unknown` 表示写入结果不确定，需先检查当前记忆；不会自动重试。这些审计文件目前不自动清理。备份记录输入来源，不保证其内容正确。
 - Dream 配置 `<数据目录>/dream.json`，默认 `enabled: true`、`trigger: session_end`、`min_turns: 2`，`threshold` 模式 12 小时且 3 个会话；本实现在会话达到 `min_turns` 后的某次任务结束时在后台运行一次，进程退出时取消。文件格式错误时关闭自动运行，避免按错误配置执行。
-- 会话笔记：`<数据目录>/projects/<hash>/session_notes.md` 按固定规则记录用户的决定（“改用…”“use …”）、Agent 的发现（“发现…”“the issue is …”）和上下文压缩事件，最多 200 行；新任务按相关度附上不超过 2 KiB 的笔记，会话第一个任务另附最近 5 条。
+
+### 项目规则
+
+- 规则文件是 `<git 根目录>/.cove/rules.md`，不在 git 里时用工作区目录；工作区是家目录或盘符根时不启用。文件跟着仓库走：提交后，换电脑、换人都能用；不想提交时用 `/rules local`。
+- 每条规则以 `- ` 开头，一句话写明不要做什么、改为怎么做，末尾带日期。可以直接编辑这个文件；cove 只认 `- ` 开头的行，保留你写的其他内容。每条最多 300 字，最多 60 条；疑似密钥拒绝保存。
+- 来源：
+  - 你对做法的纠正，或明确说的长期规则（自动提取，一次就记）；
+  - 至少在两个会话里出现过的“问题 → 尝试 → 失败 → 解决”（dream）；
+  - `/rules add`。
+  新规则写入后立即生效，不需要审批；后台记下的规则会在下一个输入提示前显示一行。
+- 生效：规则文件是项目说明文件之一，和 AGENTS.md 一起完整放进系统提示，不按相关性挑选，安全上也同等对待（是项目方的指令，不能越过安全规则）。会话中途新增的规则，在下一个任务开始时告诉模型。提交前审查和自审每次都读取最新的规则文件。
 
 ## 上下文与回退边界
 
-- 上下文按估算 token 计算（ASCII 约 3 字节 1 个 token，其他字符 1 个）。交互启动时可探测支持 `/props` 的本地服务；否则使用已学习的窗口、旧配置记录或内置模型表。服务端超限错误报告窗口时会自动学习并缓存，但并非所有服务都会提供该信息；可用 `context_window`（或 `--context-window`）显式指定。预算最多为窗口的 85%，同时为回复和安全余量留出空间；超过预算的 90% 时自动压缩（用 `model_fast`，未配置时用主模型），摘要同样收费并占模型调用额度。大窗口模型在自动压缩前，上下文超过约 400K tokens（实测此后每次响应约慢一倍）时提示一次：继续同一件事用 `/compact`，换新话题用 `/new`；回落到阈值以下后可再次提示。旧的 `--context-bytes` 仍可用。
+- 上下文按估算 token 计算（ASCII 约 3 字节 1 个 token，其他字符 1 个）。交互启动时可探测支持 `/props` 的本地服务；否则使用已学习的窗口、旧配置记录或内置模型表。服务端超限错误报告窗口时会自动学习并缓存，但并非所有服务都会提供该信息；可用 `context_window`（或 `--context-window`）显式指定。上下文预算最多为窗口的 85%，同时为回复和安全余量留出空间。估算值按服务端上一次报告的实际输入 token 数校准（比例限制在 0.5–3 倍）。超过预算的 90% 或 400K tokens（取较小者；实测超过约 400K 后每次响应明显变慢）时自动压缩（用 `model_fast`，未配置时用主模型），摘要同样收费并占模型调用额度；压缩后保留的最近消息不超过阈值的一半。离阈值还有 60K tokens（小阈值时为阈值的 1/6）时，摘要先在后台写；到达阈值时，如果被摘要的那段消息没有变化，就直接用它，不用停下来等，否则照常现场压缩。后台摘要的费用在使用或放弃时计入会话；进程在它完成前退出时，这次调用的费用无法计入。旧的 `--context-bytes` 仍可用。
 - 保留当前需求原文、近期完整消息/工具交换和相应 thinking signature；更早历史归档后摘要化。不会保留所有历史决策原文，必要时检查归档。压缩摘要的输出上限为配置的 `max_output_tokens` 与 8192 中较小者；实际输出和思考用量由供应商计费，不会自动重试。摘要失败、不完整或不能缩小时，保留原上下文并明确停止；截断时显示实际输出上限，手动压缩可用 `/compact` 重试，中断任务可用 `/continue`。
 - 最新不可拆分交换本身过大时明确失败，不静默截断需求。会话超过 `max_sessions` 时自动清理最旧的会话及其归档。
 - 单个工具结果按模型窗口限长：read/grep 约 6000 token，shell 和网络工具约 3000，其他约 4000；窗口大于 128K 时按比例放大（最多 4 倍，且不超过窗口的 1/8）。被截断的 read 结果末尾给出正确的 `[next: offset=N]`。
-- 旧工具输出外置：最近约 50K token（随窗口放大）之外的旧工具输出累计超过 30K token 时，移到数据目录的 `tool-outputs/`，历史中只留一行占位说明文件位置（可用 Shell 查看）；`question`、`todo` 等计划类结果不外置。重复出现的相同结果只保留最新一份，较早的改成指向它的说明。外置文件 7 天后自动清理。
+- 旧工具输出外置：最近约 50K token（不随窗口放大）之外的旧工具输出累计超过 30K token 时，移到数据目录的 `tool-outputs/`，历史中只留一行占位说明文件位置（可用 Shell 查看）；`question`、`todo` 等计划类结果不外置。重复出现的相同结果只保留最新一份，较早的改成指向它的说明。外置文件 7 天后自动清理。
 - 工具访问到工作区子目录时，会把该目录及其上级（最多 5 层，不超过工作区根）的 `AGENTS.md`、`CLAUDE.md`、`.cursorrules`、`.cove.md` 附在结果后，标注 `[Context from <路径>]`；每个文件只附一次（压缩后的新任务重新附），单文件 12 KB、单次 24 KB 封顶。Shell 命令中的路径也会识别。
 - 每个新任务建立一个检查点，最多跟踪 100 个文本文件；重复编辑保留本轮首次修改前的原件。回退前检查全部文件，再逐文件复核并记录进度。
-- `/undo confirm` 只还原 **文件工具**产生的变化，保留已有未提交改动和用户后续修改，**不回滚 Shell、Git、网络或外部进程副作用**；工作区内的 Shell 文件改动可用 Git 快照还原（见上文），工作区外的副作用和网络请求都无法撤销。回退后原验证证据失效，需要重新检查。
+- 文件工具回滚（没有 Git 快照时的 `/undo confirm`）只还原 **文件工具**产生的变化，保留已有未提交改动和用户后续修改，**不回滚 Shell、Git、网络或外部进程副作用**；工作区内的 Shell 文件改动可用 Git 快照还原（见上文），工作区外的副作用和网络请求都无法撤销。回退后原验证证据失效，需要重新检查。
 - 外部进程并发改文件不受锁控制；预检不能保证整批原子事务。回退过程中发生漂移或崩溃时保留明确记录，可能需要人工核对，不盲目覆盖。
 
 ## 权限与限额
@@ -534,12 +527,11 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `--max-turns 20` | 每个任务/继续窗口最多 20 次模型请求，含自动压缩，不是用户对话数 |
 | `--timeout 300` | 任务总时限，秒；达到后取消并有界清理 |
 | `--max-output-tokens 4096` | 每次模型响应的输出 token 上限 |
-| `--budget <USD>` | 会话费用提醒阈值，不限制执行；未知价格时费用可能低估 |
 | `--input-price` / `--output-price` | 每百万 token 的美元价格 |
 
 `-p` 永不读取审批输入，也不会注册提问工具；不要通过管道传入 `y` 来绕过审批。非交互运行中需要审批的操作会报错并停止，错误里写明可选的 `--permission auto`、`bypass` 或允许规则；需要无交互执行时必须显式选择。
 
-预算是会话费用提醒阈值，达到 80% 时提示、达到或超过 100% 时以红色警示，任务及子任务继续执行。OpenRouter 官方端点优先使用响应中的 `usage.cost`；自带上游密钥时，上游单独收取的费用可能不包含在内。其他情况用报告的 token 和已知单价估算。缺少费用、请求失败、中断或崩溃时，未能确定的单次费用按零计入，已知金额不丢失，因此累计可能低估，实际费用以供应商账单为准。旧会话历史费用若已未知则仍显示未知，并从零开始统计新的预算提醒金额；无法还原历史金额。`/config budget off` 可关闭提醒。
+cove 统计并显示费用，但不设花费上限，也不会因费用停止任务。OpenRouter 官方端点优先使用响应中的 `usage.cost`；自带上游密钥时，上游单独收取的费用可能不包含在内。其他情况用报告的 token 和已知单价估算。缺少费用、请求失败、中断或崩溃时，未能确定的单次费用按零计入，已知金额不丢失，因此累计可能低估，实际费用以供应商账单为准。旧会话历史费用若已未知则仍显示未知。
 
 文件工具限制在解析后的工作区内，拒绝父目录穿越、外部链接目标、直接访问 Git 元数据和 Windows ADS；这不是对恶意并发文件系统变化的沙箱。Shell 具有宿主权限，可能修改工作区外的数据、访问网络或启动程序。授权前务必检查命令。
 
@@ -561,7 +553,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ```
 
 - `tool_pattern` 是工具名 glob：`shell`（也认 `bash`、`powershell`）、`write`/`edit`、`web_fetch`/`web_search`、`mcp`/`hook`。`command_prefix` 按词匹配；`command_group` 是常规操作组（`git` 含 add/commit/push/pull/switch 等但不含 `--force`、reset、clean、checkout；另有 `cargo`、`npm`、`go`、`dotnet`）；`command_exact` 要求 Shell 命令整行完全相同；`command_directory` 将确认范围限制为指定目录下程序的 `--help` / `--version` 只读查询；`command_executable` 将确认范围限制为指定原生程序路径；`command_endpoint` / `command_output` 将确认范围限制为本地模型推理端点和同一个输出文件；`param_match` 按字段 glob（`command`、`path`、`url`）；`input_equals` 要求字段完全相等；`scope` 限定项目根目录；`enabled: false` 停用。允许规则必须覆盖整行的每一条命令才生效，拒绝规则只要命中其中一条（含 `bash -c` 内层文本）就生效。
-- **记住本项目 / 本次会话**：选 `a` 会向 policies.json 追加一条限定本项目的允许规则，选 `s` 生成同样的规则但只保存在本进程内存里（常规命令记成组或“程序 + 子命令”前缀；只读帮助/版本查询可记住同一目录；其他复合命令只记住整行；本地模型完成请求可变更 JSON 提示内容，但限制在同一 loopback 端点与同一结果文件；明确路径的原生程序可记住同一个程序路径，后续参数可变，但不覆盖管道或重定向）。含动态变量或解析不确定的命令不会生成命令族规则；无疑似密钥且长度不超过 8 KiB 时，可以选择只记住完全相同的命令行。
+- **记住本项目 / 本次会话**：选 `a` 会向 policies.json 追加一条限定本项目的允许规则，选 `s` 生成同样的规则但只保存在本进程内存里（常规命令记成组或“程序 + 子命令”前缀；只读帮助/版本查询可记住同一目录；其他复合命令只记住整行；本地模型完成请求可变更 JSON 提示内容，但限制在同一 loopback 端点与同一结果文件；明确路径的原生程序可记住同一个程序路径，后续参数可变，但不覆盖管道或重定向）。含动态变量或解析不确定的命令不会生成命令族规则；无疑似密钥且长度不超过 8 KiB 时，可以选择只记住完全相同的命令行。这种"完全相同的命令行"规则在 policies.json 里最多保留最近允许的 100 条，更早的自动删除（几乎都是一次性的命令）；再次允许已有的同一条时，它算作最新。
 - 拒绝规则和灾难命令被拦截时，模型收到拒绝说明并继续；你在审批里拒绝时同样如此（见“交互控制台”）。需要询问但没有终端时（如 `-p`），任务停止并保留状态，换模式后可 `/continue`。
 
 ### 安全拦截
@@ -585,7 +577,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **收尾催促**（临近调用次数上限时跳过）：空回复（最多 2 次）；最新 todo 清单仍有未完成项（1 次）；改过文件后的完成自检（`done_check`，1 次）。“宣布了下一步却没做”（中英文启发式）和“做了事却只回一句话”（共最多 2 次）只在交互会话启用。
 - **验证门禁补充**：自动推断的检查命令在项目受信任或 `auto`/`bypass` 模式下直接运行，否则照常审批（项目信任由项目设置提供，当前默认不信任）。模型在最后一次修改之后自己跑通过的同一条命令直接记为通过，不再重复运行。检查超时记为“未验证”，不当作失败打回。每条检查结果追加到 `<data_dir>/verify_ledger.jsonl`。
 - **提交前验证**：开启门禁时，模型通过 Shell 执行 `git commit` 前会先运行检查，并核对暂存内容与工作区一致、检查期间暂存区没变；要求先单独 `git add`，再单独 `git commit -m …`（不支持 `-a` 等改变暂存范围的参数）。不通过则不提交，结果交回模型。每份暂存内容（按 `git write-tree` 的树哈希）只检查一次：通过后，同样的内容再提交不重跑检查；失败或你拒绝了检查，同样的内容再提交时直接说明“已经检查过且未通过”，不再重跑也不再询问，并提示模型改动内容或向你说明情况，而不是反复重试。系统提示也告诉模型提交要单独一次调用，避免被门禁退回。
-- **自审**：`done_self_review` 开启时，收尾前一个只读子 Agent 阅读本轮 diff，回答 `NO_ISSUES` 或列出问题；问题交回模型处理一次。自审的调用和费用计入当前会话。
+- **提交前审查**：`commit_review`（默认 on）开启时，模型执行 `git commit` 和你执行 `/commit` 之前，一个只读子 Agent（快速模型，未配置时用主模型）阅读 `git diff --cached`（最多 40 KiB），查真实缺陷，并对照项目说明文件（AGENTS.md、CLAUDE.md、.cove.md）和最新的项目规则：违反规则就算问题，并引用那条规则；没有规则覆盖的风格不提。有问题时提交被拦下：模型的提交把问题交回模型，`/commit` 列出问题，可用 `--no-review` 跳过。同一份暂存内容只审一次。审查没跑完（模型报错、超时）时不拦截，只提示已跳过。没有配置验证命令时，门禁也会为审查生效。一次审查通常约 $0.01。
+- **自审**：`done_self_review` 开启时，收尾前一个只读子 Agent 阅读本轮 diff，按与提交前审查相同的标准（真实缺陷 + 项目规则）回答 `NO_ISSUES` 或列出问题；问题交回模型处理一次。自审的调用和费用计入当前会话。
 - **验收报告**：每个任务结束后写 `<data_dir>/acceptance/<会话>.json`：运行过的检查及证据、验证结论、Git 状态（HEAD、未提交文件数、未推送提交数、本任务里的 commit/push 是否成功）。`/status acceptance` 显示最近一次。报告只记录发生了什么，不代表模型声称完成。
 
 ## 文件、输出与失败语义
@@ -626,11 +619,11 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 用后台 Agent 分别在独立 worktree 里做这三个修复，做完告诉我
 ```
 
-子 Agent 的费用计入主会话预算提醒，不因超额停止；审批规则与主任务相同（并行时审批排队，一次只问一个）；子 Agent 看不到主对话，不能再委派，也不能向你提问。
+子 Agent 的费用计入主会话；审批规则与主任务相同（并行时审批排队，一次只问一个）；子 Agent 看不到主对话，不能再委派，也不能向你提问。
 
 ### 子 Agent 类型
 
-`agent` 工具把一个自包含的子任务交给子 Agent。子 Agent 看不到父对话，只按 `prompt` 工作，不能提问，也不能再委派（没有 `agent`、`ask_user`、`memory`、`mcp`）。系统提示里带有和父任务相同的项目说明。每个子 Agent 最多调用模型 `subagent_max_iterations` 次（默认 60）。它的模型调用、token 和费用都记入父会话，预算只提醒。
+`agent` 工具把一个自包含的子任务交给子 Agent。子 Agent 看不到父对话，只按 `prompt` 工作，不能提问，也不能再委派（没有 `agent`、`ask_user`、`memory`、`mcp`）。系统提示里带有和父任务相同的项目说明。每个子 Agent 最多调用模型 `subagent_max_iterations` 次（默认 60）。它的模型调用、token 和费用都记入父会话。
 
 | 类型 | 能做什么 |
 | --- | --- |
@@ -643,7 +636,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - 旧参数 `mode=read`/`mode=write` 仍然可用，分别等于 `explore`/`general`。
 - 自定义类型写在配置的 `agent_types` 里。只读类型只能列 read/glob/grep/repo_map、web 工具和 regression。
-- 结果第一行是 `[sub-agent <id> (<类型>): <描述>] [exit: <原因>, steps: N, truncated: yes/no]`，最后一行是费用、步数和失败工具数。`exit` 的取值：`completed`、`max_iterations`、`budget`、`interrupted`、`approval_denied`、`unverified`、`error`。
+- 结果第一行是 `[sub-agent <id> (<类型>): <描述>] [exit: <原因>, steps: N, truncated: yes/no]`，最后一行是费用、步数和失败工具数。`exit` 的取值：`completed`、`max_iterations`、`interrupted`、`approval_denied`、`unverified`、`error`。
 - 可编辑类型的写入进入父任务的检查点，`/diff` 能看到、`/undo` 能回退，也会触发验证门禁。审批规则与父任务相同；多个子 Agent 并行时，审批提示会排队，一次只问一个。
 - 子 Agent 内部的单次工具调用不进入父会话的调用日志。委派过程中崩溃时，整个 `agent` 调用标记为不确定，需要检查改动后 `/resolve`。Hooks 只对 `agent` 这一次调用触发。
 - 子 Agent 运行时的动作会实时显示为带 id 前缀的行（如 `[agent-1] -> edit`、`[todo-2] [ok] shell: ...`）。
@@ -691,7 +684,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **持久化**：每个后台 Agent 的会话（消息、待执行调用、费用）都按会话存储的规则落盘：原子快照，执行前先记日志，不确定的调用从不重放。状态记录在 `<数据目录>/agents/<项目哈希>/`。
 - **状态机**：`running → paused / interrupted / finished / failed → discarded`，所有转换都经过类型化的状态机校验。进程重启后，原来 `running` 的 Agent 显示为 `interrupted`。
 - **通知**：Agent 结束时，父 Agent 会收到带最终报告的通知：任务进行中，在下一次工具结果里送达；任务之间，在 REPL 里打印一行。没有改动的 worktree 会标为“worktree has no changes”。
-- **费用**：后台 Agent 的费用经 Ledger 记入父会话，计入预算提醒。
+- **费用**：后台 Agent 的费用经 Ledger 记入父会话。
 - **审批**：后台 Agent 使用同一权限模式。default 模式下，审批请求排队，在任务之间到终端上逐个询问（REPL 空闲时会提示按 Enter 处理）；没有终端时直接拒绝，绝不静默批准。
 - **单次模式**：`-p` 单次模式结束前会等后台 Agent 跑完，最长等 `--timeout`，超时后中断它们（可恢复）。REPL `/exit` 会中断仍在运行的后台 Agent。
 
@@ -719,59 +712,40 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - `brief` 汇总看板、子 Agent 活动和最新计划。
 - `sleep` 等待 1–300 秒，可以取消。
 
-## 外围工作流（/changes、/auto、/remote）
+## 外围工作流（/race、/changes、/remote）
 
-所有功能默认关闭，只在显式命令下运行。结果放在数据目录（`<data-dir>`），**除 `/changes apply … confirm` 外不写入项目工作区**。子进程（worker、验证命令、浏览器、git）都在同一套进程树管理下运行（Windows Job Object / Unix 进程组），取消或超时时整棵树回收。
+所有功能默认关闭，只在显式命令下运行。结果放在数据目录（`<data-dir>`），**除 `/changes apply … confirm` 外不写入项目工作区**。子进程（验证命令、浏览器、git）都在同一套进程树管理下运行（Windows Job Object / Unix 进程组），取消或超时时整棵树回收。
 
 ### 命令一览
 
 | 命令 | 作用 |
 | --- | --- |
-| `/changes` | 列出所有变更集：竞跑候选 `race:<run>:<a\|b>`、收件箱结果 `inbox:<id>`、当前任务 `turn` |
+| `/race <需求>`、`/race` | 一个需求两个方案（见下文），前台运行，Ctrl+C 取消；不带参数查看最近一次 |
+| `/changes` | 列出所有变更集：竞速方案 `race:<run>:<a\|b>`、当前任务 `turn` |
 | `/changes show\|diff <id>` | 查看元数据（基线、补丁哈希/字节、检查结果、审阅状态）或补丁 |
 | `/changes export <id> <out>` | 把补丁写到项目外的新文件，不覆盖已有文件 |
 | `/changes apply <id>` | 只做预检；加 `confirm` 才真正应用 |
 | `/changes review <id> accepted\|rejected` | 记录审阅决定，不应用 |
-| `/changes race <spec.json>` | 前台运行双方案竞跑，Ctrl+C 取消 |
 | `/changes verify-browser <workflow.json> [--allow-local]` / `results` | 浏览器实操验收 / 查看历史报告 |
-| `/auto list\|add <spec.json>\|remove <id>\|run <id>\|tick\|event <name> <key>` | 自动化任务 |
-| `/auto inbox [list\|show <id>\|patch <id> <out>\|review <id> accepted\|rejected]` | 收件箱 |
 | `/remote start [--bind 127.0.0.1:0] [--token-file <路径>] [--allow-lan --tls-cert <pem> --tls-key <pem>]`、`status`、`stop` | 远程监督 |
 
 ### 统一变更集与应用
 
-竞跑候选、收件箱结果和当前任务都用同一个模型表示：基线 `{root, commit, branch}`、补丁 SHA-256 与字节数、验证记录（只看退出码，按最后一次尝试判断）、审阅状态（pending/accepted/rejected/applied）。`apply … confirm` 依次检查：可应用、项目根/分支/提交与基线一致且工作区干净（无已跟踪改动、无未跟踪文件）、最后一次检查全部通过、补丁大小与哈希一致；再在项目级文件锁（最多等 10 秒）下执行 `git apply --check` 和 `git apply`。最后的 `git apply` 不响应取消，避免半途中断。应用后不提交、不合并、不推送，并在会话中记一条说明，之前的验证证据视为过期。当前任务的变更集 `turn` 只读，撤销用 `/undo`。
+竞速方案和当前任务都用同一个模型表示：基线 `{root, commit, branch}`、补丁 SHA-256 与字节数、验证记录（只看退出码，按最后一次尝试判断）、审阅状态（pending/accepted/rejected/applied）。`apply … confirm` 依次检查：可应用、项目根/分支/提交与基线一致且工作区干净（无已跟踪改动、无未跟踪文件）、最后一次检查全部通过、补丁大小与哈希一致；再在项目级文件锁（最多等 10 秒）下执行 `git apply --check` 和 `git apply`。最后的 `git apply` 不响应取消，避免半途中断。应用后不提交、不合并、不推送，并在会话中记一条说明，之前的验证证据视为过期。当前任务的变更集 `turn` 只读，撤销用 `/undo`。
 
 干净检查**允许被忽略的文件**（例如 `target/`、`node_modules/`）：补丁不含它们，且 `git apply` 不会覆盖已存在文件，所以不要求先清掉构建产物。
 
-### 双方案竞跑
+### 一个需求两个方案（`/race`）
 
-要求项目根是本地 Git 仓库、处于分支上且工作区干净。spec 建议放在项目外：
+要求项目根是本地 Git 仓库、处于分支上且工作区干净。`/race <需求>` 同时做两个方案：
 
-```json
-{"prompts":["用方案 A 实现","用方案 B 实现"],"verify":[["cargo","test"]],"budget":2,"timeout":900}
-```
-
-（`budget`、`timeout` 也可写作别名 `total_budget_usd`、`total_timeout_seconds`。）可选 `models` 字段恰含两个模型名（非空、互不相同），用于同题双模竞速：此时 `prompts` 允许只有 1 个，两个候选用同一道题分别跑对应模型；`prompts` 仍是两个时取对角线组合 prompt[i] × model[i]。不带 `models` 时行为不变，`prompts` 必须正好两个。两个候选各自在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行子进程 `cove -p <prompt> --permission auto --max-turns 12`（设置 `models` 时追加 `--model <模型名>`）：私有临时数据目录与最小配置（只有 provider、模型、单价、预算份额；无 profile、扩展、MCP、Hooks 和自动验证门禁），API key 只通过子进程环境变量传递，不落盘。预算提醒阈值均分；未知单价时费用可能低估。随后在各自 worktree 运行同一组验证 argv（不经 Shell），清理被忽略文件后捕获二进制补丁（符号链接、子模块、`.git` 路径会使候选失败），报告与补丁存到 `<data-dir>/race/<run>/`，worktree 随后删除；报告记录每个候选所用的模型并在输出中显示。总时限内约 2/3 留给生成。模型自评不能决定通过；只有通过验证的候选可以 `/changes apply race:<run>:a confirm`，一次运行只能应用一个候选。成本取子进程 `[summary]` 的估算，没有则为 unverified。
-
-### 自动化任务与收件箱
-
-spec 存在 `<data-dir>/automations/<项目键>/`，格式如下：
-
-```json
-{"version":1,"spec":{"id":"nightly","prompt":"修复一个失败的小测试","enabled":true,"every_seconds":3600,"event":"tests-failed","timeout_seconds":300,"budget_usd":1,"max_turns":8,"retries":1,"verify":[["cargo","test"]]}}
-```
-
-`add` 不启动任何东西。`run` 立即运行；`tick` 对到期任务各运行一次（错过的周期合并为一次），需由操作系统计划任务调用；`event <name> <key>` 运行监听该事件的任务，同一 key 只处理一次（失败或崩溃也不重放）。每次尝试使用从 HEAD 新建的分离 worktree（未提交和未跟踪文件不参与）、隔离配置、`auto` 模式、无 MCP，嵌套运行通过环境变量 `COVE_NESTED_WORKER` 拒绝。只有“已完成但失败”的尝试会重试（最多 2 次，预算按次均分）；取消和超时记为 interrupted，不重试。每个项目同时只运行一个任务（跨进程任务锁）；进程中途退出留下的 running 结果下次会标为 uncertain，审阅前阻止再次运行。结果连同基线、检查、补丁进入收件箱，**从不自动应用**；在分离 HEAD 上记录的结果只能导出。
-
-供计划任务使用的独立入口（`--automation` 必须是第一个参数，provider 等取自默认配置和 `COVE_*` 环境变量）：
-
-```text
-cove --automation tick D:\project
-cove --automation event D:\project tests-failed build-42
-cove --automation add D:\project C:\Temp\nightly.json
-cove --automation inbox D:\project list
-```
+- 方案 A 用主模型；方案 B 用快速模型（`model_fast`）。没有配置快速模型或与主模型相同时，B 也用主模型，并被要求采用与最直接的做法不同的思路。
+- 每个方案是一个可编辑的子 Agent（`general` 类型，调用上限同 `subagent_max_iterations`），在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行，和主任务在同一进程、用同样的工具（包括 MCP、Hooks）。权限是 `auto`，判定范围是自己的 worktree；仍需审批的命令排进后台审批队列，没有终端时拒绝。
+- 费用记入当前会话和费用账本。
+- 两个方案完成后，在各自 worktree 运行同一组验证命令（不经 Shell，只看退出码）：配置了 `done_verify_commands` 时用它，否则按自动验证门禁的规则推断构建和测试命令（`cargo check`/`cargo test`、`go build`/`go test`、`npm run build`/测试脚本、`dotnet build`、Python 的 `compileall`/`pytest` 等）。推断不出时结果标为"未验证"。
+- 清理被忽略文件后捕获二进制补丁（符号链接、子模块、`.git` 路径会使方案失败），报告与补丁存到 `<data-dir>/race/<run>/`，worktree 随后删除。
+- 总时限 15 分钟，约 2/3 留给生成。结果列出每个方案的模型、验证结果、改动的文件数与增删行数、费用和 Agent 的总结。
+- 模型自评不能决定通过：只有通过验证的方案可以 `/changes apply race:<run>:a confirm`；**未验证的方案不能直接应用**（可 `/changes export` 后自行检查、手动 `git apply`）。一次运行只能应用一个方案。
 
 ### draw_image 与 browser 工具
 
@@ -801,15 +775,14 @@ cove --automation inbox D:\project list
 
 ### 安全边界
 
-Git worktree 不是操作系统、网络或进程沙箱：worker 和验证命令拥有宿主权限，Git 管理数据共享，只对可信项目、提示和命令使用。补丁、输出和截图可能含敏感信息，不要同步数据目录。预算仅用于估算费用提醒，不会限制支出。宿主崩溃可能遗留 worktree（位于数据目录下）或临时配置，需要人工清理。
+Git worktree 不是操作系统、网络或进程沙箱：竞速方案的 Agent 和验证命令拥有宿主权限，Git 管理数据共享，只对可信项目、提示和命令使用。补丁、输出和截图可能含敏感信息，不要同步数据目录。费用只是估算，cove 不限制支出。宿主崩溃可能遗留 worktree（位于数据目录下），需要人工清理。
 
 ## 尚未实现与已知限制
 
-- 界面是滚动输出加常驻输入行的命令行控制台，不是全屏 TUI：输出按行追加，进度条这类原地刷新的输出会显示成多行；不支持鼠标操作。
+- 界面是滚动输出加常驻输入行的命令行控制台，不是全屏 TUI：输出按行追加，进度条这类原地刷新的输出会显示成多行；鼠标只在历史阅读器（`/resume`、`/turns`）里可用（滚动、拖选复制）。
 - 剪贴板图片（Alt+V）只支持 Windows；其他平台可以粘贴或拖入图片路径。
 - 不支持 MCP 的采样、交互 elicitation 和服务端后台任务（OAuth 登录见上文 `/mcp login`）；插件不加载原生动态库或可执行代码；`bedrock` 不支持 SigV4 签名（只支持 Bedrock API key）。
 - 写入模式的子 Agent 和后台 Agent 使用与主任务相同的权限判定，但不经过主任务的计划模式工具和提交前验证包装。
-- 后台调用中，记忆提取和自审按主模型单价估算；技能复盘费用显示为未知。
 
 自动化测试只用模拟模型协议和临时项目中的真实文件/进程操作，不调用真实供应商的付费 API，也未完成各模型的兼容认证。交互控制台的显示在 Windows 伪终端里按字符核对过颜色和排版；其他终端（特别是旧版 conhost 字体）对 `●`、`│`、`└` 等符号的显示可能不同，转圈动画在无法确认支持盲文点字符的终端里改用 `- \ | /`。
 

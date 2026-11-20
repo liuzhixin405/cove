@@ -106,7 +106,9 @@ impl RawOutput {
     }
 }
 
-async fn capture_limited(
+/// Reads a pipe to its end, keeping at most `limit` bytes (true: more were dropped);
+/// draining the rest keeps the child from blocking on a full pipe.
+pub(crate) async fn capture_limited(
     mut pipe: impl AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
@@ -144,6 +146,10 @@ pub async fn run_argv(argv: Argv, cancel: &CancellationToken) -> Result<RawOutpu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The API key cove uses never reaches a child; callers that need it set it below.
+    for key in super::secrets::protected() {
+        command.env_remove(key);
+    }
     for key in &argv.env_remove {
         command.env_remove(key);
     }

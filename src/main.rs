@@ -38,25 +38,17 @@ async fn run() -> u8 {
             // Argv callers (verifiers) record the real exit code.
             Ok(code) => u8::try_from(code).unwrap_or(1).max(1),
             Err(err) => {
-                eprintln!("{}", cove::app::ui::visible(&err.to_string()));
+                eprintln!("{}", cove::text::visible(&err.to_string()));
                 EXIT_FAILURE
             }
         };
-    }
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg == "--automation")
-    {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        let code = cove::workflows::automation::cli(args).await;
-        return u8::try_from(code).unwrap_or(1);
     }
     // Started by double-click: no arguments and a console window of its own.
     let double_clicked = std::env::args_os().len() == 1 && setup::own_console();
     match start(double_clicked).await {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("\n错误：{}", cove::app::ui::visible(&format!("{error:#}")));
+            eprintln!("\n错误：{}", cove::text::visible(&format!("{error:#}")));
             if double_clicked {
                 setup::pause();
             }
@@ -73,7 +65,7 @@ async fn run() -> u8 {
 }
 
 fn usage_error(message: &str) -> anyhow::Result<u8> {
-    eprintln!("错误：{}", cove::app::ui::visible(message));
+    eprintln!("错误：{}", cove::text::visible(message));
     Ok(EXIT_USAGE)
 }
 
@@ -92,7 +84,7 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
             "--list-sessions 只接受 all 或不带值：cove --list-sessions 列出本项目的会话，cove --list-sessions all 列出全部"
         );
         let text = cove::session::list_sessions(&data_dir(&cli)?, &cli.cwd, scope == "all")?;
-        print!("{}", cove::app::ui::visible(&text));
+        print!("{}", cove::text::visible(&text));
         return Ok(0);
     }
     if double_clicked {
@@ -129,9 +121,9 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
                 cli.cwd.join(image)
             };
             if let Err(err) = cove::model::images::attachment(&path) {
-                return usage_error(&format!("--image {}: {err}", image.display()));
+                return usage_error(&format!("--image {}: {err}", image.to_string_lossy()));
             }
-            prompt = format!("{prompt} @\"{}\"", path.display());
+            prompt = format!("{prompt} @\"{}\"", path.to_string_lossy());
         }
         prompt = match launch::attach_files(&prompt, &cli.files) {
             Ok(prompt) => prompt,
@@ -198,7 +190,7 @@ async fn start(double_clicked: bool) -> anyhow::Result<u8> {
             cove::model::models::context_budget(window, settings.max_output_tokens).min(10_000_000);
     }
     for warning in &settings.warnings {
-        eprintln!("警告：{}", cove::app::ui::visible(warning));
+        eprintln!("警告：{}", cove::text::visible(warning));
     }
     cove::app::run(settings).await?;
     match launch::take_restart() {

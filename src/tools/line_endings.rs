@@ -309,19 +309,10 @@ fn git_checkout_ending(root: &Path, path: &Path) -> Option<&'static str> {
         .to_string_lossy()
         .replace('\\', "/");
     let git = |args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        crate::process::git::Git::new(root)
+            .args(args.iter().copied())
+            .timeout(std::time::Duration::from_secs(10))
+            .query_blocking()
     };
     let attributes = git(&["check-attr", "text", "eol", "--", &relative])?;
     let attribute = |name: &str| {

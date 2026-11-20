@@ -128,6 +128,30 @@ pub fn interrupted_stream(err: &Error) -> bool {
     .any(|sign| message.starts_with(sign))
 }
 
+/// Whether `model` accepts the one-hour prompt cache (`ttl: "1h"`): Claude Opus 4.5,
+/// Sonnet 4.6, Haiku 4.5 and every later model (Bedrock's table). Older models reject
+/// the field, so they keep the default five minutes.
+pub fn long_cache_model(model: &str) -> bool {
+    static VERSION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let version = VERSION.get_or_init(|| {
+        regex::Regex::new(r"(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:[-.](\d{1,2}))?(?:\D|$)")
+            .expect("valid model pattern")
+    });
+    let model = model.to_ascii_lowercase();
+    let Some(found) = version.captures(&model) else {
+        return false;
+    };
+    let major: u32 = found[2].parse().unwrap_or(0);
+    let minor: u32 = found.get(3).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+    match (&found[1], major) {
+        ("fable" | "mythos", _) => true,
+        (_, 5..) => true,
+        ("opus" | "haiku", 4) => minor >= 5,
+        ("sonnet", 4) => minor >= 6,
+        _ => false,
+    }
+}
+
 /// The server refused the prompt as larger than its context window.
 pub fn context_overflow(err: &Error) -> bool {
     let Error::Provider(message) = err else {
@@ -891,7 +915,13 @@ fn build_body(
                 })
                 .collect();
             // Prompt cache: the system prompt and the last three messages; thinking
-            // blocks cannot carry cache_control, so the last other block does.
+            // blocks cannot carry cache_control, so the last other block does. A
+            // conversation turn keeps its cache an hour where the model supports it.
+            let cache_control = if request.long_cache && long_cache_model(model) {
+                json!({"type":"ephemeral","ttl":"1h"})
+            } else {
+                json!({"type":"ephemeral"})
+            };
             let mut marked = 0;
             for message in messages.iter_mut().rev() {
                 if marked == 3 {
@@ -905,7 +935,7 @@ fn build_body(
                         )
                     })
                 }) {
-                    block["cache_control"] = json!({"type":"ephemeral"});
+                    block["cache_control"] = cache_control.clone();
                     marked += 1;
                 }
             }
@@ -919,7 +949,7 @@ fn build_body(
                 })
                 .collect();
             let mut body = json!({"model":model,
-                "system":[{"type":"text","text":request.system,"cache_control":{"type":"ephemeral"}}],
+                "system":[{"type":"text","text":request.system,"cache_control":cache_control}],
                 "messages":messages,"stream":true,"max_tokens":request.max_output_tokens});
             if !tools.is_empty() {
                 body["tools"] = json!(tools);
@@ -1334,6 +1364,10 @@ impl Collector {
                     self.usage.cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                     self.usage.cache_write =
                         usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    self.usage.cache_write_1h =
+                        usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                            .as_u64()
+                            .unwrap_or(0);
                     self.usage.input = usage["input_tokens"]
                         .as_u64()
                         .ok_or_else(|| Error::Provider("missing input usage".into()))?
@@ -1514,6 +1548,30 @@ fn block_index(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_hour_cache_only_for_models_that_take_it() {
+        for model in [
+            "anthropic.claude-opus-5-5",
+            "us.anthropic.claude-sonnet-5-5",
+            "claude-opus-4-5-20251101",
+            "anthropic.claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-fable-5-2",
+        ] {
+            assert!(long_cache_model(model), "{model}");
+        }
+        for model in [
+            "claude-3-5-sonnet-20241022",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-1",
+            "claude-3-haiku",
+            "deepseek-v4-pro",
+            "gpt-5",
+        ] {
+            assert!(!long_cache_model(model), "{model}");
+        }
+    }
     use crate::domain::ToolDefinition;
 
     #[tokio::test]
@@ -1627,6 +1685,7 @@ mod tests {
             max_output_tokens: 100,
             estimated_tokens: None,
             model: None,
+            long_cache: false,
         }
     }
 
@@ -1767,6 +1826,51 @@ mod tests {
         );
         assert!(!interrupted_stream(&invalid));
         assert!(invalid.to_string().contains("bad tool schema"));
+    }
+
+    #[test]
+    fn conversation_turns_ask_for_the_one_hour_cache_where_supported() {
+        let options = ProviderOptions {
+            thinking: None,
+            effort: None,
+            bedrock: true,
+        };
+        let turn = |model: &str, long_cache: bool| {
+            let mut request = request(history());
+            request.long_cache = long_cache;
+            build_body(Protocol::Anthropic, &options, model, request)
+        };
+        let marks = |body: &Value| -> Vec<Value> {
+            let mut marks = vec![body["system"][0]["cache_control"].clone()];
+            for message in body["messages"].as_array().unwrap() {
+                for block in message["content"].as_array().unwrap() {
+                    if let Some(mark) = block.get("cache_control") {
+                        marks.push(mark.clone());
+                    }
+                }
+            }
+            marks
+        };
+        let hour = marks(&turn("anthropic.claude-opus-5-5", true));
+        assert!(hour.len() > 1);
+        // One TTL everywhere: no ordering of mixed lifetimes to get wrong.
+        assert!(hour.iter().all(|mark| mark["ttl"] == "1h"), "{hour:?}");
+        for body in [
+            turn("anthropic.claude-opus-5-5", false),
+            turn("claude-3-5-sonnet-20241022", true),
+        ] {
+            assert!(marks(&body).iter().all(|mark| mark.get("ttl").is_none()));
+        }
+    }
+
+    #[test]
+    fn one_hour_cache_writes_are_parsed() {
+        let mut c = Collector::new(Protocol::Anthropic);
+        c.accept(r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":80,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}}}"#).unwrap();
+        assert_eq!(
+            (c.usage.input, c.usage.cache_write, c.usage.cache_write_1h),
+            (120, 30, 20)
+        );
     }
 
     #[test]

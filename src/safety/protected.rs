@@ -10,24 +10,9 @@ use std::{
 
 static PROTECTED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// A comparable form: no `\\?\` prefix, `/` separators, lower case on Windows.
-fn key(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let text = text
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&text)
-        .replace('\\', "/");
-    let text = text.trim_end_matches('/').to_owned();
-    if cfg!(windows) {
-        text.to_lowercase()
-    } else {
-        text
-    }
-}
-
 /// Keeps every tool out of `dir` from now on.
 pub fn protect(dir: &Path) {
-    let dir = key(&dir.canonicalize().unwrap_or_else(|_| dir.to_owned()));
+    let dir = crate::paths::key(&dir.canonicalize().unwrap_or_else(|_| dir.to_owned()));
     if let Ok(mut protected) = PROTECTED.write()
         && !protected.contains(&dir)
     {
@@ -38,7 +23,7 @@ pub fn protect(dir: &Path) {
 /// Whether `path` is a protected directory or lies below one. `path` should be
 /// absolute; the walkers and the path resolver pass canonical paths.
 pub fn is_protected(path: &Path) -> bool {
-    let path = key(path);
+    let path = crate::paths::key(path);
     PROTECTED.read().is_ok_and(|protected| {
         protected
             .iter()
@@ -49,7 +34,7 @@ pub fn is_protected(path: &Path) -> bool {
 /// The protected directories below `root`, relative with `/` separators (for the
 /// exclude lists of ripgrep and the snapshot repository).
 pub fn below(root: &Path) -> Vec<String> {
-    let root = key(&root.canonicalize().unwrap_or_else(|_| root.to_owned()));
+    let root = crate::paths::key(&root.canonicalize().unwrap_or_else(|_| root.to_owned()));
     PROTECTED
         .read()
         .map(|protected| {
@@ -64,12 +49,15 @@ pub fn below(root: &Path) -> Vec<String> {
 /// Why `dir` is too wide for a workspace: the home directory or a filesystem root.
 pub fn too_wide(dir: &Path) -> Option<&'static str> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
-    if dir.parent().is_none() || key(&dir).ends_with(':') {
+    if dir.parent().is_none() || crate::paths::key(&dir).ends_with(':') {
         return Some("a filesystem root");
     }
     let home: Option<PathBuf> = crate::extensions::skills::home_dir();
-    home.filter(|home| key(&home.canonicalize().unwrap_or_else(|_| home.clone())) == key(&dir))
-        .map(|_| "your home directory")
+    home.filter(|home| {
+        crate::paths::key(&home.canonicalize().unwrap_or_else(|_| home.clone()))
+            == crate::paths::key(&dir)
+    })
+    .map(|_| "your home directory")
 }
 
 #[cfg(test)]

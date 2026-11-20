@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     domain::{Error, Result},
-    session::{atomic_json, read_json},
+    persist::{atomic_json, read_json},
 };
 
 pub const STORE: &str = "trusted_projects.json";
@@ -66,7 +66,7 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 fn key(path: &Path) -> String {
-    let text = path.display().to_string();
+    let text = path.to_string_lossy().into_owned();
     if cfg!(windows) {
         text.to_lowercase()
     } else {
@@ -91,13 +91,7 @@ pub fn read_store(data_dir: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 fn record(data_dir: &Path, entries: &[(String, String)]) -> Result<()> {
-    std::fs::create_dir_all(data_dir)?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(data_dir.join(".trust.lock"))?;
-    fs2::FileExt::lock_exclusive(&lock)?;
+    let _lock = crate::persist::lock(&data_dir.join(".trust.lock"))?;
     let mut store = read_store(data_dir)?;
     if store.len() > 4096 {
         return Err(Error::Session("trust store holds too many entries".into()));
@@ -105,9 +99,7 @@ fn record(data_dir: &Path, entries: &[(String, String)]) -> Result<()> {
     for (key, value) in entries {
         store.insert(key.clone(), value.clone());
     }
-    let result = atomic_json(&store_path(data_dir), &store);
-    let _ = fs2::FileExt::unlock(&lock);
-    result
+    atomic_json(&store_path(data_dir), &store)
 }
 
 /// Trusts the project directory, and the given `.cove.json` content when present.
@@ -212,24 +204,14 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
             }
             _ => Class::Sensitive,
         },
-        "max_budget_usd" => {
-            let base = root
-                .get("max_budget_usd")
-                .and_then(Value::as_f64)
-                .unwrap_or(10.0);
-            match value.as_f64() {
-                Some(budget) if budget > 0.0 && budget <= base => Class::Safe,
-                _ => Class::Sensitive,
-            }
-        }
-        "done_verify_auto" | "done_verify_tests" | "skill_review" | "skill_review_auto" => {
+        "done_verify_auto" | "done_verify_tests" => {
             if value == &Value::Bool(false) {
                 Class::Safe
             } else {
                 Class::Sensitive
             }
         }
-        "commit_gate" => match value {
+        "commit_gate" | "commit_review" => match value {
             Value::Bool(false) => Class::Safe,
             Value::String(text)
                 if matches!(text.trim().to_ascii_lowercase().as_str(), "off" | "false") =>
@@ -271,7 +253,10 @@ pub fn apply_project_config(
         Ok(Some(data)) => data,
         Ok(None) => return None,
         Err(reason) => {
-            warnings.push(format!("已忽略项目配置 {}：{reason}", path.display()));
+            warnings.push(format!(
+                "已忽略项目配置 {}：{reason}",
+                crate::paths::display(&path)
+            ));
             return None;
         }
     };
@@ -279,11 +264,17 @@ pub fn apply_project_config(
     let over = match serde_json::from_slice::<Value>(text) {
         Ok(Value::Object(over)) => over,
         Ok(_) => {
-            warnings.push(format!("已忽略项目配置 {}：不是 JSON 对象", path.display()));
+            warnings.push(format!(
+                "已忽略项目配置 {}：不是 JSON 对象",
+                crate::paths::display(&path)
+            ));
             return None;
         }
         Err(err) => {
-            warnings.push(format!("已忽略项目配置 {}：{err}", path.display()));
+            warnings.push(format!(
+                "已忽略项目配置 {}：{err}",
+                crate::paths::display(&path)
+            ));
             return None;
         }
     };
@@ -318,14 +309,14 @@ pub fn apply_project_config(
     if !config.ignored.is_empty() {
         warnings.push(format!(
             "项目配置 {}：已忽略未受信任的键：{}（运行 /config trust 并重启后生效）",
-            path.display(),
+            crate::paths::display(&path),
             config.ignored.join(", ")
         ));
     }
     if !config.unsupported.is_empty() {
         warnings.push(format!(
             "项目配置 {}：已忽略 .cove.json 不支持的键：{}",
-            path.display(),
+            crate::paths::display(&path),
             config.unsupported.join(", ")
         ));
     }
@@ -344,18 +335,17 @@ mod tests {
         let cwd = cwd.path().canonicalize().unwrap();
         std::fs::write(
             cwd.join(PROJECT_CONFIG),
-            json!({"model":"m","permission_mode":"auto","max_budget_usd":3,"system_prompt":"x",
+            json!({"model":"m","permission_mode":"auto","system_prompt":"x",
                 "mcp_servers":{"a":{"command":"evil"}},"done_verify_auto":false,"done_verify_tests":true,
                 "provider":{"base_url":"https://evil"},"profiles":{}})
             .to_string(),
         )
         .unwrap();
-        let mut raw = json!({"max_budget_usd": 5, "provider": {"name": "deepseek"}});
+        let mut raw = json!({"provider": {"name": "deepseek"}});
         let mut warnings = Vec::new();
         let config = apply_project_config(&mut raw, &cwd, data.path(), &mut warnings).unwrap();
         assert!(!config.trusted);
         assert_eq!(raw["model"], "m");
-        assert_eq!(raw["max_budget_usd"], 3);
         assert_eq!(raw["done_verify_auto"], false);
         assert!(raw.get("system_prompt").is_none() && raw.get("mcp_servers").is_none());
         assert_eq!(raw["provider"], json!({"name": "deepseek"}));
@@ -393,14 +383,10 @@ mod tests {
     }
 
     #[test]
-    fn budget_raise_needs_trust_and_bad_files_warn() {
+    fn bad_project_files_warn() {
         let data = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        std::fs::write(cwd.path().join(PROJECT_CONFIG), r#"{"max_budget_usd": 50}"#).unwrap();
         let mut raw = json!({});
-        let config =
-            apply_project_config(&mut raw, cwd.path(), data.path(), &mut Vec::new()).unwrap();
-        assert_eq!(config.ignored, ["max_budget_usd"]);
         std::fs::write(cwd.path().join(PROJECT_CONFIG), "{not json").unwrap();
         let mut warnings = Vec::new();
         assert!(apply_project_config(&mut raw, cwd.path(), data.path(), &mut warnings).is_none());

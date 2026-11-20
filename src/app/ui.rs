@@ -116,7 +116,7 @@ pub fn prompt_line(prompt: &str, masked: bool) -> Result<String> {
 
 fn read_answer(prompt: &str, cancel: &CancellationToken, masked: bool) -> Result<String> {
     let mut output = std::io::stderr();
-    write!(output, "\n{}", visible(prompt))?;
+    write!(output, "\n{}", crate::text::visible(prompt))?;
     output.flush()?;
     terminal::enable_raw_mode()?;
     let _guard = RawMode;
@@ -179,18 +179,6 @@ fn read_answer(prompt: &str, cancel: &CancellationToken, masked: bool) -> Result
     }
 }
 
-pub fn visible(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 static SHOW_REASONING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `show_reasoning`: print reasoning text live (to stderr) instead of hiding it.
@@ -231,7 +219,7 @@ pub async fn consume_events(
                     err(format!(
                         "  {} {}\n",
                         if error { "!" } else { "|" },
-                        visible(&line)
+                        crate::text::visible(&line)
                     ))?;
                 }
                 AgentEvent::ToolFinished {
@@ -243,25 +231,27 @@ pub async fn consume_events(
                     err(format!(
                         "[{}] {}: {}  #{id}\n",
                         if failed { "failed" } else { "ok" },
-                        visible(&name),
-                        visible(output.lines().next().unwrap_or_default())
+                        crate::text::visible(&name),
+                        crate::text::visible(output.lines().next().unwrap_or_default())
                     ))?
                 }
-                AgentEvent::Notice(text) => err(format!("\n[notice] {}\n", visible(&text)))?,
-                AgentEvent::Text(text) => console::write(true, &visible(&text))?,
+                AgentEvent::Notice(text) => {
+                    err(format!("\n[notice] {}\n", crate::text::visible(&text)))?
+                }
+                AgentEvent::Text(text) => console::write(true, &crate::text::visible(&text))?,
                 AgentEvent::Reasoning(text) => {
                     if SHOW_REASONING.load(std::sync::atomic::Ordering::Relaxed) {
                         // Dimmed on a terminal, so it reads as thinking, not the answer.
                         if std::io::stderr().is_terminal() {
-                            err(format!("\x1b[2m{}\x1b[0m", visible(&text)))?;
+                            err(format!("\x1b[2m{}\x1b[0m", crate::text::visible(&text)))?;
                         } else {
-                            err(visible(&text))?;
+                            err(crate::text::visible(&text))?;
                         }
                     }
                 }
                 AgentEvent::ToolStarted { name, .. } => {
                     streamed = false;
-                    err(format!("\n[tool] {}\n", visible(&name)))?
+                    err(format!("\n[tool] {}\n", crate::text::visible(&name)))?
                 }
                 AgentEvent::ToolFinished {
                     name,
@@ -273,8 +263,8 @@ pub async fn consume_events(
                     err(format!(
                         "[{}] {}: {}\n",
                         if failed { "failed" } else { "ok" },
-                        visible(&name),
-                        visible(&crate::app::blocks::inline(&output, id))
+                        crate::text::visible(&name),
+                        crate::text::visible(&crate::app::blocks::inline(&output, id))
                     ))?
                 }
                 AgentEvent::Usage { .. } => {}
@@ -318,6 +308,8 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
     // is a hidden helper script; the title row
     // last written, while nothing followed it except its own live output.
     let mut running: Vec<(String, String, bool, bool)> = Vec::new();
+    // The changed lines of edits still running, shown with their results.
+    let mut previews: Vec<(String, Vec<String>)> = Vec::new();
     let mut open: Option<String> = None;
     let mut streamed = false;
     // `/expand` ids of helper-script calls left out of the transcript.
@@ -366,7 +358,7 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     activity("回复中");
                     open = None;
                 }
-                buffered.push_str(&markdown.push(&visible(&text)));
+                buffered.push_str(&markdown.push(&crate::text::visible(&text)));
                 if buffered.ends_with('\n') || buffered.len() >= 4096 {
                     line_done = buffered.ends_with('\n');
                     console::write(true, &buffered)?;
@@ -384,7 +376,7 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     console::write(false, "\x1b[2m✻ 思考过程\x1b[0m\n")?;
                     open = None;
                 }
-                let text = visible(&text);
+                let text = crate::text::visible(&text);
                 line_done = text.ends_with('\n');
                 console::write(false, &format!("{REASONING}{text}\x1b[0m"))?;
             }
@@ -405,6 +397,9 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     open_block(&mut block, Block::Tool, &mut line_done, &mut markdown)?;
                 }
                 activity(&title);
+                if name == "edit" {
+                    previews.push((name.clone(), render::edit_preview(&input)));
+                }
                 running.push((name, title, false, false));
                 streamed = false;
             }
@@ -421,10 +416,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     && !*shown
                 {
                     *shown = true;
-                    out.push_str(&render::tool_started(&visible(title)));
+                    out.push_str(&render::tool_started(&crate::text::visible(title)));
                     open = Some(title.clone());
                 }
-                out.push_str(&render::output_line(&visible(&line), stderr));
+                out.push_str(&render::output_line(&crate::text::visible(&line), stderr));
                 console::write(false, &out)?;
             }
             AgentEvent::ToolFinished {
@@ -437,12 +432,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                     .iter()
                     .position(|(running, _, _, _)| *running == name)
                     .map(|at| running.remove(at));
-                let next = |running: &[(String, String, bool, bool)]| {
-                    match running.last() {
-                        Some((_, _, _, true)) => "运行辅助脚本".to_owned(),
-                        Some((_, title, _, _)) => title.clone(),
-                        None => "思考中".to_owned(),
-                    }
+                let next = |running: &[(String, String, bool, bool)]| match running.last() {
+                    Some((_, _, _, true)) => "运行辅助脚本".to_owned(),
+                    Some((_, title, _, _)) => title.clone(),
+                    None => "思考中".to_owned(),
                 };
                 if let Some((_, _, _, true)) = finished {
                     hidden.push(id);
@@ -454,18 +447,28 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 if let Some(title) = title
                     && open.as_ref() != Some(&title)
                 {
-                    out.push_str(&render::tool_started(&visible(&title)));
+                    out.push_str(&render::tool_started(&crate::text::visible(&title)));
+                }
+                // An edit shows the lines it changed above its result.
+                if let Some(at) = previews.iter().position(|(running, _)| *running == name) {
+                    let (_, rows) = previews.remove(at);
+                    if !failed {
+                        for row in rows {
+                            out.push_str(&row);
+                            out.push('\n');
+                        }
+                    }
                 }
                 // `verbose`: the whole result above its summary (output shown live is not repeated).
                 if verbose && !streamed {
                     for line in output.lines() {
-                        out.push_str(&render::output_line(&visible(line), false));
+                        out.push_str(&render::output_line(&crate::text::visible(line), false));
                     }
                 }
                 out.push_str(&render::tool_finished(
                     &name,
                     failed,
-                    &visible(&output),
+                    &crate::text::visible(&output),
                     id,
                     std::mem::take(&mut streamed),
                 ));
@@ -477,11 +480,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 if !line_done || block != Block::None {
                     open_block(&mut block, Block::None, &mut line_done, &mut markdown)?;
                 }
-                if text.starts_with("[预算超限]") {
-                    console::write(false, &format!("\x1b[31m! {}\x1b[0m\n", visible(&text)))?;
-                } else {
-                    console::write(false, &format!("\x1b[33m!\x1b[0m {}\n", visible(&text)))?;
-                }
+                console::write(
+                    false,
+                    &format!("\x1b[33m!\x1b[0m {}\n", crate::text::visible(&text)),
+                )?;
                 open = None;
             }
             AgentEvent::Usage { tokens, .. } => {
@@ -595,24 +597,11 @@ impl ReplInput {
 }
 
 pub fn print_text(text: &str, diagnostic: bool) -> std::io::Result<()> {
-    console::write(!diagnostic, &visible(text))
-}
-
-pub(crate) fn print_budget_notice(text: &str) -> std::io::Result<()> {
-    if console::rich() {
-        let color = if text.starts_with("[预算超限]") {
-            31
-        } else {
-            33
-        };
-        console::write(false, &format!("\x1b[{color}m{}\x1b[0m\n", visible(text)))
-    } else {
-        print_text(&format!("{text}\n"), true)
-    }
+    console::write(!diagnostic, &crate::text::visible(text))
 }
 
 pub fn print_error(text: &str) -> std::io::Result<()> {
-    console::write(false, &format!("错误：{}\n", visible(text)))
+    console::write(false, &format!("错误：{}\n", crate::text::visible(text)))
 }
 
 pub fn print_report(report: &TaskReport) -> std::io::Result<()> {

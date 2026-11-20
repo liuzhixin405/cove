@@ -29,10 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::{Error, Message, Result},
     extensions::hooks::HookRun,
-    session::{
-        Accounting, PendingCall, STATE_LIMIT, Session, State, TitleSource, atomic_json,
-        history::History, io_context, now,
-    },
+    persist::STATE_LIMIT,
+    persist::{atomic_json, io_context},
+    session::{Accounting, PendingCall, Session, State, TitleSource, history::History, now},
 };
 
 /// A journal past this size is folded into a new snapshot.
@@ -326,7 +325,7 @@ fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if data.len() as u64 > limit {
         return Err(Error::Session(format!(
             "{} exceeds {} MiB",
-            path.display(),
+            crate::paths::display(path),
             limit / (1024 * 1024)
         )));
     }

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::ui::prompt_line,
     config::{Protocol, default_model, normalize_base_url, provider_defaults, provider_protocol},
-    domain::{Error, Message, ModelRequest, Provider},
+    domain::{Error, Provider},
     model::provider::HttpProvider,
 };
 
@@ -65,14 +65,14 @@ fn ask(prompt: &str, default: Option<&str>) -> anyhow::Result<String> {
 pub fn ask_workspace(current: &Path) -> anyhow::Result<PathBuf> {
     eprintln!("\nCove 在一个项目目录里工作；文件工具不会改动目录之外的文件。");
     loop {
-        let answer = ask("项目目录", Some(&current.display().to_string()))?;
+        let answer = ask("项目目录", Some(&crate::paths::display(current)))?;
         let path = PathBuf::from(answer.trim_matches('"'));
         if path.is_dir() {
             return Ok(path);
         }
         eprintln!(
             "不是已存在的目录：{}；请输入项目目录的完整路径",
-            path.display()
+            crate::paths::display(&path)
         );
     }
 }
@@ -172,14 +172,8 @@ pub async fn verify(
     )?;
     let (events, mut receiver) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
-    let request = ModelRequest {
-        system: "Reply with the single word ok.".into(),
-        messages: vec![Message::user("reply ok")],
-        tools: Vec::new(),
-        max_output_tokens: 256,
-        estimated_tokens: None,
-        model: None,
-    };
+    let request =
+        crate::model::oneshot::text_request("Reply with the single word ok.", "reply ok", 256);
     let result = tokio::time::timeout(
         timeout,
         provider.stream(request, events, CancellationToken::new()),
@@ -208,7 +202,7 @@ pub async fn run(config: &Path, reason: &str) -> anyhow::Result<()> {
     eprintln!("\nCove 初始设置：{reason}");
     eprintln!(
         "设置会保存到 {}，以后每次启动都会使用。\n",
-        config.display()
+        crate::paths::display(config)
     );
     'provider: loop {
         let choice = choose()?;
@@ -242,7 +236,7 @@ pub async fn run(config: &Path, reason: &str) -> anyhow::Result<()> {
                     break;
                 }
                 Err(err) => {
-                    eprintln!("验证失败：{}", crate::app::ui::visible(&format!("{err:#}")));
+                    eprintln!("验证失败：{}", crate::text::visible(&format!("{err:#}")));
                     let answer = ask(
                         "[r] 重试  [k] 重新输入 Key  [p] 换供应商  [s] 不验证直接保存",
                         Some("r"),
@@ -267,7 +261,7 @@ pub async fn run(config: &Path, reason: &str) -> anyhow::Result<()> {
         save(config, Value::Object(provider), &choice.model)?;
         eprintln!(
             "\n已保存。以后可编辑 {} 修改设置（参考 docs/config.example.json）。\n",
-            config.display()
+            crate::paths::display(config)
         );
         return Ok(());
     }
@@ -275,6 +269,7 @@ pub async fn run(config: &Path, reason: &str) -> anyhow::Result<()> {
 
 /// Updates the active profile (or the root) and keeps every other setting in the file.
 fn save(path: &Path, provider: Value, model: &str) -> anyhow::Result<()> {
+    let _config = crate::persist::lock_for(path)?;
     let mut root = match std::fs::read(path) {
         Ok(data) => {
             let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
@@ -296,27 +291,12 @@ fn save(path: &Path, provider: Value, model: &str) -> anyhow::Result<()> {
     let object = target.as_object_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "{} 的顶层必须是 JSON 对象；请修正或删除该文件后重新运行",
-            path.display()
+            crate::paths::display(path)
         )
     })?;
     object.insert("provider".into(), provider);
     object.insert("model".into(), json!(model));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    use std::io::Write;
-    temporary.write_all(serde_json::to_string_pretty(&root)?.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    crate::session::replace_with(temporary, path)?;
-    Ok(())
+    crate::config::write_json_file(path, &root)
 }
 
 #[cfg(test)]

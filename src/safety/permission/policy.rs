@@ -82,7 +82,7 @@ fn field(effect: &Effect, name: &str) -> Option<String> {
     match (effect, name) {
         (Effect::Shell(command), "command") => Some(command.clone()),
         (Effect::Write(path), "path" | "file_path" | "filePath" | "file") => {
-            Some(path.display().to_string())
+            Some(path.to_string_lossy().into_owned())
         }
         (Effect::Network(request), "url" | "query" | "request") => Some(request.clone()),
         (Effect::Process(process), "command" | "process") => Some(process.clone()),
@@ -126,18 +126,7 @@ pub fn same_project(a: &Path, b: &Path) -> bool {
     if !cfg!(windows) {
         return a == b;
     }
-    let norm = |p: &Path| {
-        let mut text = p.to_string_lossy().replace('/', "\\");
-        // Strip the verbatim prefix canonicalize adds on Windows.
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            text = rest.to_owned();
-        }
-        while text.ends_with('\\') {
-            text.pop();
-        }
-        text.to_lowercase()
-    };
-    norm(&a) == norm(&b)
+    crate::paths::key(&a) == crate::paths::key(&b)
 }
 
 /// Simple commands of a shell line in both dialects, runner-stripped, lowercase program.
@@ -372,7 +361,7 @@ pub fn allow_or_ask(
 
 /// The rule "remember for this project" appends, when the effect has a reasonable one.
 pub fn remember_rule(effect: &Effect, project: &Path, dialect: Dialect) -> Option<PolicyRule> {
-    let scope = project.display().to_string();
+    let scope = project.to_string_lossy().into_owned();
     let mut rule = PolicyRule {
         action: Some(Action::Allow),
         enabled: true,
@@ -811,21 +800,45 @@ pub fn load(path: &Path) -> Result<Vec<PolicyRule>> {
     let data = std::fs::read(path)?;
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
     serde_json::from_slice(data)
-        .map_err(|err| Error::Session(format!("invalid {}: {err}", path.display())))
+        .map_err(|err| Error::Session(format!("invalid {}: {err}", crate::paths::display(path))))
 }
 
-/// Adds or replaces (same ID and scope) `rule` in the file.
+/// Remembered exact command lines kept in a policy file: almost all of them are
+/// one-off scripts (2% recurred in the history behind docs/optimizations/0011).
+pub const EXACT_RULES: usize = 100;
+
+/// Adds `rule`, or moves the one with the same ID and scope to the end as the
+/// newest; then drops the oldest exact command rules past [`EXACT_RULES`].
+/// Locked: several cove windows may remember rules at once.
 pub fn append(path: &Path, rule: &PolicyRule) -> Result<Vec<PolicyRule>> {
-    let mut rules = load(path)?;
-    match rules
-        .iter_mut()
-        .find(|r| r.id == rule.id && same_project(Path::new(&r.scope), Path::new(&rule.scope)))
-    {
-        Some(existing) => *existing = rule.clone(),
-        None => rules.push(rule.clone()),
-    }
-    crate::session::atomic_json(path, &rules)?;
-    Ok(rules)
+    crate::persist::with_lock(path, || {
+        let mut rules = load(path)?;
+        rules.retain(|r| {
+            r.id != rule.id || !same_project(Path::new(&r.scope), Path::new(&rule.scope))
+        });
+        rules.push(rule.clone());
+        cap_exact(&mut rules, EXACT_RULES);
+        crate::persist::atomic_json(path, &rules)?;
+        Ok(rules)
+    })
+}
+
+/// Keeps the newest `limit` exact command rules cove remembered (the file is in
+/// remembering order); rules the user wrote, whatever they match, always stay.
+fn cap_exact(rules: &mut Vec<PolicyRule>, limit: usize) {
+    let remembered = |rule: &PolicyRule| rule.id.starts_with("allow-shell-exact-");
+    let mut excess = rules
+        .iter()
+        .filter(|rule| remembered(rule))
+        .count()
+        .saturating_sub(limit);
+    rules.retain(|rule| {
+        if excess > 0 && remembered(rule) {
+            excess -= 1;
+            return false;
+        }
+        true
+    });
 }
 
 #[cfg(test)]
@@ -915,6 +928,54 @@ mod tests {
             allow_or_ask(&rules, &effect, Path::new("/q"), Dialect::Posix),
             RuleDecision::None
         );
+    }
+
+    #[test]
+    fn exact_rules_are_capped_and_a_renewed_one_becomes_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policies.json");
+        let exact = |n: usize| PolicyRule {
+            id: format!("allow-shell-exact-{n}"),
+            tool_pattern: "shell".into(),
+            command_exact: format!("echo {n}"),
+            scope: "/p".into(),
+            ..PolicyRule::default()
+        };
+        let group = PolicyRule {
+            id: "allow-shell-group-git".into(),
+            tool_pattern: "shell".into(),
+            command_group: "git".into(),
+            scope: "/p".into(),
+            ..PolicyRule::default()
+        };
+        append(&path, &group).unwrap();
+        // A rule the user wrote with an exact command is never evicted.
+        let written = PolicyRule {
+            id: "deny-deploy".into(),
+            tool_pattern: "shell".into(),
+            command_exact: "make deploy".into(),
+            action: Some(Action::Deny),
+            scope: "/p".into(),
+            ..PolicyRule::default()
+        };
+        append(&path, &written).unwrap();
+        for n in 0..EXACT_RULES {
+            append(&path, &exact(n)).unwrap();
+        }
+        // Allowing the oldest again makes it the newest.
+        append(&path, &exact(0)).unwrap();
+        let rules = append(&path, &exact(EXACT_RULES)).unwrap();
+        let ids: Vec<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
+        assert_eq!(rules.len(), EXACT_RULES + 2);
+        assert_eq!(ids[0], "allow-shell-group-git", "other rules stay");
+        assert_eq!(ids[1], "deny-deploy", "the user's own rule stays");
+        assert!(!ids.contains(&"allow-shell-exact-1"), "the oldest went");
+        assert!(ids.contains(&"allow-shell-exact-0"));
+        assert_eq!(
+            ids.last(),
+            Some(&format!("allow-shell-exact-{EXACT_RULES}").as_str())
+        );
+        assert_eq!(load(&path).unwrap().len(), EXACT_RULES + 2);
     }
 
     #[test]

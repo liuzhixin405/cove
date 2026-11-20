@@ -73,7 +73,10 @@ fn dialect_mismatch(shell: &Shell, output: &process::CommandOutput) -> Option<&'
             ("parsererror", "syntax error"),
             ("unexpected token", "syntax error"),
             ("意外的标记", "syntax error"),
-            ("is not recognized as the name of a cmdlet", "command not found"),
+            (
+                "is not recognized as the name of a cmdlet",
+                "command not found",
+            ),
             ("识别为 cmdlet", "command not found"),
         ],
         process::ShellKind::Posix => &[
@@ -82,7 +85,10 @@ fn dialect_mismatch(shell: &Shell, output: &process::CommandOutput) -> Option<&'
             ("未找到命令", "command not found"),
         ],
         process::ShellKind::Cmd => &[
-            ("is not recognized as an internal or external command", "command not found"),
+            (
+                "is not recognized as an internal or external command",
+                "command not found",
+            ),
             ("不是内部或外部命令", "command not found"),
             ("was unexpected at this time", "syntax error"),
             ("此时不应有", "syntax error"),
@@ -568,7 +574,7 @@ impl LocalTools {
             let row = format!(
                 "{}: {}\n",
                 index + 1,
-                text::clip_chars(line, READ_LINE_CHARS)
+                crate::text::clip_counted(line, READ_LINE_CHARS)
             );
             if out.len() + row.len() > READ_OUTPUT && last >= offset {
                 break;
@@ -1212,7 +1218,10 @@ mod tests {
             Some("syntax error")
         );
         assert_eq!(
-            dialect_mismatch(&ps, &output("无法将“grep”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。")),
+            dialect_mismatch(
+                &ps,
+                &output("无法将“grep”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。")
+            ),
             Some("command not found")
         );
         let bash = shell(process::ShellKind::Posix);
@@ -1222,7 +1231,10 @@ mod tests {
         );
         let cmd = shell(process::ShellKind::Cmd);
         assert_eq!(
-            dialect_mismatch(&cmd, &output("'grep' 不是内部或外部命令，也不是可运行的程序")),
+            dialect_mismatch(
+                &cmd,
+                &output("'grep' 不是内部或外部命令，也不是可运行的程序")
+            ),
             Some("command not found")
         );
         assert_eq!(dialect_mismatch(&bash, &output("error: test failed")), None);

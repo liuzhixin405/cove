@@ -10,7 +10,8 @@ use similar::TextDiff;
 
 use crate::{
     domain::{Error, Result},
-    session::{Store, atomic_json, new_id, read_json},
+    persist::{atomic_json, read_json},
+    session::{Store, new_id},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +59,7 @@ impl Image {
     }
 
     /// Text for diffs: GBK content decoded, other bytes lossily.
-    fn display(&self) -> Cow<'_, str> {
+    fn diff_text(&self) -> Cow<'_, str> {
         if self.raw.is_none() {
             return Cow::Borrowed(&self.text);
         }
@@ -595,7 +596,7 @@ impl Workspace {
                 };
                 result.push_str(&format!(
                     "Binary file {} changed: {} -> {}\n",
-                    change.path.display(),
+                    change.path.to_string_lossy(),
                     size(&change.before),
                     size(&current)
                 ));
@@ -604,16 +605,16 @@ impl Workspace {
             let before = change
                 .before
                 .as_ref()
-                .map_or(Cow::Borrowed(""), |image| image.display());
+                .map_or(Cow::Borrowed(""), |image| image.diff_text());
             let after = current
                 .as_ref()
-                .map_or(Cow::Borrowed(""), |image| image.display());
+                .map_or(Cow::Borrowed(""), |image| image.diff_text());
             result.push_str(
                 &TextDiff::from_lines(before.as_ref(), after.as_ref())
                     .unified_diff()
                     .header(
-                        &format!("before/{}", change.path.display()),
-                        &format!("current/{}", change.path.display()),
+                        &format!("before/{}", change.path.to_string_lossy()),
+                        &format!("current/{}", change.path.to_string_lossy()),
                     )
                     .to_string(),
             );
@@ -650,7 +651,7 @@ impl Workspace {
             {
                 return Err(Error::Workspace(format!(
                     "拒绝回滚：{} 在 agent 编辑后又被改动过；/undo list 可改用 Git 快照恢复",
-                    change.path.display()
+                    change.path.to_string_lossy()
                 )));
             }
         }
@@ -676,7 +677,7 @@ impl Workspace {
                     } else {
                         "删除新建的文件"
                     },
-                    change.path.display()
+                    change.path.to_string_lossy()
                 ));
             }
         }
@@ -708,7 +709,7 @@ impl Workspace {
             .ok_or_else(|| {
                 Error::Workspace(format!(
                     "{} was not changed by file tools in this task; no baseline",
-                    relative.display()
+                    relative.to_string_lossy()
                 ))
             })?;
         Ok(change.before.as_ref().map(|image| image.text.clone()))
@@ -742,7 +743,9 @@ impl Workspace {
         };
         for (path, baseline) in files {
             let current = image(&self.resolve(&path)?)?
-                .ok_or_else(|| Error::Workspace(format!("{} does not exist", path.display())))?
+                .ok_or_else(|| {
+                    Error::Workspace(format!("{} does not exist", crate::paths::display(&path)))
+                })?
                 .text;
             journal.files.push(SwapFile {
                 path,
@@ -804,14 +807,14 @@ impl Workspace {
                 replace_file(&resolved, Some(&file.baseline), Some(&file.current))?;
                 restored += 1;
             } else {
-                drifted.push(file.path.display().to_string());
+                drifted.push(file.path.to_string_lossy().into_owned());
             }
         }
         if !drifted.is_empty() {
             return Err(Error::Uncertain(format!(
                 "regression swap: {} changed while it held its baseline; restore manually (journal kept at {})",
                 drifted.join(", "),
-                path.display()
+                crate::paths::display(&path)
             )));
         }
         std::fs::remove_file(&path)?;
@@ -921,7 +924,7 @@ pub fn replace_file_bytes(path: &Path, expected: Option<&[u8]>, text: Option<&[u
         return Err(Error::Workspace("file changed during replacement".into()));
     }
     if current.is_some() {
-        crate::session::replace_with(temporary, path)?;
+        crate::persist::replace_with(temporary, path)?;
     } else {
         temporary
             .persist_noclobber(path)

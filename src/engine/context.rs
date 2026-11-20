@@ -97,10 +97,13 @@ pub fn tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// `limit` is the context budget; the kept recent messages stay within `keep` so
+/// the compacted context lands well below the compaction threshold.
 pub fn prepare(
     messages: &[Message],
     current_request: &str,
     limit: usize,
+    keep: usize,
 ) -> Result<CompactionPlan> {
     if messages.len() < 2 {
         return Err(Error::Limit("已完成的上下文太少，无需压缩".into()));
@@ -119,7 +122,7 @@ pub fn prepare(
         {
             continue;
         }
-        if tokens(&messages[index..]) <= limit / 2 {
+        if tokens(&messages[index..]) <= keep.min(limit / 2) {
             boundary = Some(index);
             break;
         }

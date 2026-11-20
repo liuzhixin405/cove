@@ -12,8 +12,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     domain::{Error, Result},
     extensions::identifier,
+    persist::atomic_json,
     safety::permission::{Authorizer, Effect},
-    session::{atomic_json, new_id},
+    session::new_id,
 };
 
 fn text(path: &Path, limit: usize) -> Result<String> {
@@ -24,7 +25,7 @@ fn text(path: &Path, limit: usize) -> Result<String> {
     if bytes.len() > limit {
         return Err(Error::Tool(format!(
             "{} exceeds {limit} bytes",
-            path.display()
+            crate::paths::display(path)
         )));
     }
     String::from_utf8(bytes).map_err(|_| Error::Tool("extension data must be UTF-8".into()))
@@ -267,7 +268,7 @@ impl Memory {
             request.source.clone(),
             ProvenanceSource {
                 kind: "dream".into(),
-                evidence: crate::memory::recall::clip(&request.source, 256),
+                evidence: crate::text::clip(&request.source, 256, crate::text::TRUNCATED),
                 ..ProvenanceSource::default()
             },
             others,
@@ -313,7 +314,7 @@ impl Memory {
         let evidence = format!(
             "merged from {}; original source: {}",
             duplicate.id,
-            crate::memory::recall::clip(&duplicate.source, 512)
+            crate::text::clip(&duplicate.source, 512, crate::text::TRUNCATED)
         );
         screen(&evidence)?;
         survivor.provenance.push(ProvenanceSource {
@@ -445,24 +446,11 @@ impl Memory {
 
     /// Cross-process write lock of one scope; waits up to five seconds.
     pub(crate) fn lock(&self, scope: Scope) -> Result<std::fs::File> {
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.directory(scope).join(".lock"))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match fs2::FileExt::try_lock_exclusive(&lock) {
-                Ok(()) => return Ok(lock),
-                Err(err) if std::time::Instant::now() >= deadline => {
-                    return Err(Error::Tool(format!(
-                        "memory scope is busy or cannot be locked: {err}"
-                    )));
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
+        crate::persist::try_lock(
+            &self.directory(scope).join(".lock"),
+            std::time::Duration::from_secs(5),
+            |err| Error::Tool(format!("memory scope is busy or cannot be locked: {err}")),
+        )
     }
 
     fn restore_snapshot_locked(&self, backup: &Path, id: &str) -> Result<RestoreSnapshot> {
@@ -652,6 +640,36 @@ impl Memory {
         }
     }
 
+    /// The full ID of the entry in `scope` that `id` names: the ID itself, or the
+    /// unique prefix the memory index shows.
+    pub(crate) fn resolve(&self, scope: Scope, id: &str) -> Result<String> {
+        if self.path(scope, id).is_ok_and(|path| path.is_file()) {
+            return Ok(id.to_owned());
+        }
+        if id.len() < 4 {
+            return Err(Error::Tool(
+                "memory ID prefix needs at least 4 characters".into(),
+            ));
+        }
+        let matches: Vec<String> = self
+            .entries(scope)?
+            .into_iter()
+            .map(|entry| entry.id)
+            .filter(|full| full.starts_with(id))
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(Error::Tool(format!(
+                "no {} memory with ID {id}",
+                scope.name()
+            ))),
+            many => Err(Error::Tool(format!(
+                "ambiguous memory ID prefix {id}: {}",
+                many.join(", ")
+            ))),
+        }
+    }
+
     fn list(&self, scope: Scope, query: Option<&str>, cancel: &CancellationToken) -> Result<Value> {
         if query.is_some_and(|q| q.trim().is_empty() || q.len() > 256) {
             return Err(Error::Tool("memory query must be 1..256 bytes".into()));
@@ -698,8 +716,11 @@ impl Memory {
         match args {
             MemoryArgs::List { scope } => self.list(scope, None, cancel),
             MemoryArgs::Search { scope, query } => self.list(scope, Some(&query), cancel),
-            MemoryArgs::Read { scope, id } => Ok(serde_json::to_value(self.read(scope, &id)?)?),
-            MemoryArgs::Delete { scope, id } => self.remove(scope, &id),
+            MemoryArgs::Read { scope, id } => {
+                let id = self.resolve(scope, &id)?;
+                Ok(serde_json::to_value(self.read(scope, &id)?)?)
+            }
+            MemoryArgs::Delete { scope, id } => self.remove(scope, &self.resolve(scope, &id)?),
             MemoryArgs::Add {
                 scope,
                 title,
@@ -717,6 +738,7 @@ impl Memory {
                 source,
             } => {
                 let provenance = tool(&source);
+                let id = self.resolve(scope, &id)?;
                 self.save(scope, Some(id), title, content, source, provenance)
             }
         }
@@ -852,7 +874,7 @@ impl Memory {
         let now = crate::session::now();
         provenance.at = now;
         provenance.content_hash = content_hash(&content);
-        provenance.evidence = crate::memory::recall::clip(&provenance.evidence, 4096);
+        provenance.evidence = crate::text::clip(&provenance.evidence, 4096, crate::text::TRUNCATED);
         if provenance.evidence_type.is_none() {
             provenance.evidence_type = match provenance.kind.as_str() {
                 "operator" => Some(EvidenceType::UserStatement),

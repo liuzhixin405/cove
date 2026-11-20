@@ -13,12 +13,15 @@ use crate::{
     domain::{Block, Message},
     engine::context::{text_tokens, tokens},
     session::History,
+    text,
 };
 
 /// The window the fixed limits were tuned for.
 const BASE_WINDOW: usize = 128_000;
 const MAX_SCALE: f64 = 4.0;
-/// Recent context never masked, scaled with the window.
+/// Recent context never masked, whatever the window: scaled with a 1M window it
+/// kept ~390K tokens of old output in every request (OpenCode keeps 40K, Gemini
+/// CLI 50K; docs/optimizations/0012).
 const PROTECTED_TOKENS: usize = 50_000;
 /// Old tool output worth a history rewrite.
 const MIN_PRUNABLE_TOKENS: usize = 30_000;
@@ -83,10 +86,10 @@ impl OutputPolicy {
         let budget = ((content.len() as u128 * limit as u128 / estimate as u128) as usize)
             .saturating_sub(200)
             .max(256);
-        let budget = content.floor_char_boundary(budget.min(content.len()));
+        let budget = text::head(&content, budget.min(content.len())).len();
         let notice = format!("[result cut to about {limit} tokens to fit the context]");
         if matches!(name, "read" | "grep" | "glob" | "repo_map") {
-            let head = &content[..budget];
+            let head = text::head(&content, budget);
             let head = &head[..head.rfind('\n').map_or(head.len(), |end| end + 1)];
             let mut out = format!("{head}... {notice}");
             if name == "read"
@@ -99,11 +102,10 @@ impl OutputPolicy {
             }
             return out;
         }
-        let head_end = content.floor_char_boundary(budget * 2 / 5);
-        let head = &content[..head_end];
+        let head_end = text::head(&content, budget * 2 / 5).len();
+        let head = text::head(&content, head_end);
         let head = &head[..head.rfind('\n').map_or(head.len(), |end| end + 1)];
-        let tail_start = content.ceil_char_boundary(content.len() - (budget - head_end));
-        let tail = &content[tail_start..];
+        let tail = text::tail(&content, budget - head_end);
         let tail = tail.find('\n').map_or(tail, |start| &tail[start + 1..]);
         let omitted = content.len() - head.len() - tail.len();
         format!("{head}[... {omitted} bytes omitted; {notice} ...]\n{tail}")
@@ -133,7 +135,7 @@ impl OutputPolicy {
                 && !content.starts_with(DEDUPED_PREFIX)
         };
         // Where the protected recent window starts (message index).
-        let threshold = (PROTECTED_TOKENS as f64 * self.scale()) as usize;
+        let threshold = PROTECTED_TOKENS;
         let mut protected = 0;
         let mut cutoff = 0;
         for (index, message) in messages.iter().enumerate().rev() {
@@ -243,7 +245,7 @@ impl OutputPolicy {
                     masked += 1;
                     *content = format!(
                         "{MASKED_PREFIX} {name} result, ~{estimate} tokens, saved to {}; view it with the shell if it is needed again]",
-                        file.display()
+                        crate::paths::display(&file)
                     );
                 }
             }
@@ -373,5 +375,25 @@ mod tests {
         assert!(content(&messages[11]).contains("g5"));
         assert_eq!(content(&messages[21]), "same ".repeat(200));
         assert!(policy.mask(&mut messages).is_none());
+    }
+
+    #[test]
+    fn a_large_window_protects_no_more_recent_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = OutputPolicy::new(1_000_000, Some(dir.path().join("tool-outputs")));
+        // About 40K tokens each: with the protected window scaled to the 1M window
+        // (~390K) none of these would ever leave the context.
+        let big = |n: usize| format!("{n}{}", "data ".repeat(25_000));
+        let mut messages = History::new();
+        for n in 0..5 {
+            messages.push(call(&format!("r{n}"), "read"));
+            messages.push(result(&format!("r{n}"), big(n)));
+        }
+        assert!(policy.mask(&mut messages).is_some());
+        assert!(content(&messages[1]).starts_with(MASKED_PREFIX));
+        assert!(
+            !content(&messages[9]).starts_with(MASKED_PREFIX),
+            "the latest stays"
+        );
     }
 }

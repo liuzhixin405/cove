@@ -3,4 +3,5 @@
 pub mod dream;
 pub mod extract;
 pub mod recall;
+pub mod rules;
 pub mod store;

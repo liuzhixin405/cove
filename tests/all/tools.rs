@@ -807,7 +807,6 @@ async fn consecutive_read_only_calls_run_concurrently_with_ordered_results() {
         Limits {
             max_turns: 3,
             max_output_tokens: 100,
-            budget: None,
             prices: None,
         },
     )

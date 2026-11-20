@@ -79,7 +79,7 @@ pub enum Effect {
 impl Effect {
     pub fn describe(&self) -> String {
         match self {
-            Effect::Write(path) => format!("写入 {}", path.display()),
+            Effect::Write(path) => format!("写入 {}", crate::paths::display(path)),
             Effect::Shell(command) => format!("运行 shell 命令（无沙箱）：{command}"),
             Effect::Network(request) => format!("访问网络：{request}"),
             Effect::Process(process) => format!("运行扩展进程（无沙箱）：{process}"),
@@ -724,7 +724,12 @@ mod tests {
             Vec::new(),
             Some(input.clone()),
         );
-        let ask = || permissions.authorize(Effect::Shell("rm -rf build".into()), CancellationToken::new());
+        let ask = || {
+            permissions.authorize(
+                Effect::Shell("rm -rf build".into()),
+                CancellationToken::new(),
+            )
+        };
         let (first, second, third) = tokio::join!(ask(), ask(), ask());
         first.unwrap();
         second.unwrap();
@@ -774,7 +779,11 @@ mod tests {
         );
         let prompts = input.1.lock().unwrap();
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].contains("原因：删除文件（rm）"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains("原因：删除文件（rm）"),
+            "{}",
+            prompts[0]
+        );
     }
 
     #[tokio::test]
@@ -794,9 +803,15 @@ mod tests {
                 "curl -s http://127.0.0.1:9931/completion -H \"Content-Type: application/json\" -d '{{\"prompt\":\"{prompt}\",\"n_predict\":64}}' > {output}; cat {output}"
             )
         };
-        for (prompt, output) in [("Hello", "/tmp/llama_timing.json"), ("Summarize", "/tmp/other.json")] {
+        for (prompt, output) in [
+            ("Hello", "/tmp/llama_timing.json"),
+            ("Summarize", "/tmp/other.json"),
+        ] {
             permissions
-                .authorize(Effect::Shell(command(prompt, output)), CancellationToken::new())
+                .authorize(
+                    Effect::Shell(command(prompt, output)),
+                    CancellationToken::new(),
+                )
                 .await
                 .unwrap();
         }

@@ -149,9 +149,7 @@ impl Hub {
     pub fn set_scope(&self, session: &str, project: &Path) {
         let mut state = self.lock();
         state.session = session.into();
-        state.project = crate::workflows::changes::plain(project)
-            .display()
-            .to_string();
+        state.project = crate::paths::plain(project).to_string_lossy().into_owned();
     }
 
     pub fn task_started(&self, cancel: &CancellationToken) {

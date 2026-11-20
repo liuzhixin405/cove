@@ -428,20 +428,23 @@ impl Console {
 
     /// A session got a new title: the open history panel shows it, and for the
     /// session in use so does the window's title bar.
-    pub fn retitle(&self, id: &str, title: &str, current: bool) {
+    pub fn retitle(&self, id: &str, title: &str) {
         let mut state = self.lock();
         if let Some(view) = state.history_view.as_mut() {
             view.retitle(id, title);
         }
-        if current {
+        if retitles_window(&state.window_session, state.window_named, id) {
             state.window_title(title);
         }
         state.redraw();
     }
 
-    /// The terminal window's title: `cove · <title>`.
-    pub fn set_window_title(&self, title: &str) {
+    /// The terminal window's title: `cove · <title>` of `session`; `named` when the
+    /// user gave it that name.
+    pub fn set_window_title(&self, session: &str, title: &str, named: bool) {
         let mut state = self.lock();
+        state.window_session = session.to_owned();
+        state.window_named = named;
         state.window_title(title);
         state.flush();
     }
@@ -843,6 +846,10 @@ struct State {
     panel: Option<Vec<String>>,
     /// The history panel or reader (`/continue`, `/resume`, `/turns`).
     history_view: Option<crate::app::history::HistoryView>,
+    /// The session the window title shows, and whether the user named it (an AI
+    /// title then never replaces the name there).
+    window_session: String,
+    window_named: bool,
     /// The reader holds the alternate screen; output waits in `deferred` meanwhile.
     alternate: bool,
     deferred: String,
@@ -884,6 +891,8 @@ impl State {
             choices: None,
             panel: None,
             history_view: None,
+            window_session: String::new(),
+            window_named: false,
             alternate: false,
             deferred: String::new(),
         }
@@ -1032,7 +1041,7 @@ impl State {
         }
         let draft = self.editor.take();
         self.ask = Some(Ask {
-            prompt: visible(tail),
+            prompt: crate::text::visible_styled(tail),
             masked,
             keys,
             options,
@@ -1460,7 +1469,10 @@ impl State {
             let echo = format!(
                 "{}{}\n",
                 ask.prompt,
-                self.style(USER_TEXT, &format!(" {} ", visible(&shown)))
+                self.style(
+                    USER_TEXT,
+                    &format!(" {} ", crate::text::visible_styled(&shown))
+                )
             );
             self.notice(&echo);
             self.end_ask(Ok(answer));
@@ -1657,7 +1669,7 @@ impl State {
             _ => USER_TEXT,
         };
         let mut out = String::from("\n");
-        for (index, row) in visible(line).lines().enumerate() {
+        for (index, row) in crate::text::visible_styled(line).lines().enumerate() {
             let lead = if index == 0 { ">" } else { " " };
             out.push_str(&format!(
                 "{} {}",
@@ -1732,7 +1744,7 @@ impl State {
         let mut column = self.out_col;
         let mut escape = false;
         let mut sequence = String::new();
-        for character in visible(text).chars() {
+        for character in crate::text::visible_styled(text).chars() {
             if escape || character == '\x1b' {
                 sequence.push(character);
                 escape = character == '\x1b' || !character.is_ascii_alphabetic();
@@ -1818,12 +1830,15 @@ impl State {
         let columns = self.columns();
         let mut screen = Screen::new(columns);
         if let Some(status) = self.status() {
-            screen.text(&self.style("2", &clip(&status, columns - 1)));
+            screen.text(&self.style("2", crate::text::fit_width(&status, columns - 1)));
             screen.newline();
         }
         let running = self.busy.then(|| self.started.elapsed().as_secs_f64());
         if let Some((meter, near)) = self.meter.row(running) {
-            screen.text(&self.style(if near { "33" } else { "2" }, &clip(&meter, columns - 1)));
+            screen.text(&self.style(
+                if near { "33" } else { "2" },
+                crate::text::fit_width(&meter, columns - 1),
+            ));
             screen.newline();
         }
         let cursor = if let Some(search) = &self.search {
@@ -1833,10 +1848,18 @@ impl State {
             } else {
                 "(搜索历史：无匹配)"
             };
-            screen.text(&self.style("36", &format!("{label} {} > ", visible(&search.query))));
+            screen.text(&self.style(
+                "36",
+                &format!("{label} {} > ", crate::text::visible_styled(&search.query)),
+            ));
             let at = screen.position();
-            let shown = found.map_or(String::new(), |line| visible(line).replace('\n', " "));
-            screen.text(&clip(&shown, columns.saturating_sub(at.1 + 1)));
+            let shown = found.map_or(String::new(), |line| {
+                crate::text::visible_styled(line).replace('\n', " ")
+            });
+            screen.text(crate::text::fit_width(
+                &shown,
+                columns.saturating_sub(at.1 + 1),
+            ));
             at
         } else {
             self.draw_input(&mut screen, columns)
@@ -1887,7 +1910,10 @@ impl State {
                     "(/ 查看命令，@路径 添加附件，Ctrl+J 换行)"
                 }
             };
-            screen.text(&self.style("2", &clip(placeholder, columns.saturating_sub(at.1 + 1))));
+            screen.text(&self.style(
+                "2",
+                crate::text::fit_width(placeholder, columns.saturating_sub(at.1 + 1)),
+            ));
             return at;
         }
         let shown: Vec<char> = if masked {
@@ -1913,7 +1939,7 @@ impl State {
                 if offset + column == self.editor.cursor {
                     at = screen.position();
                 }
-                screen.text(&visible(&c.to_string()));
+                screen.text(&crate::text::visible_styled(&c.to_string()));
             }
             if offset + line.len() == self.editor.cursor {
                 at = screen.position();
@@ -1991,7 +2017,7 @@ impl State {
         (!parts.is_empty()).then(|| {
             format!(
                 "  {}",
-                visible(&parts.join(" | ")).replace(['\n', '\t'], " ")
+                crate::text::visible_styled(&parts.join(" | ")).replace(['\n', '\t'], " ")
             )
         })
     }
@@ -2006,7 +2032,7 @@ impl State {
         if visible.is_empty() {
             return vec![self.style(
                 "2",
-                &clip(
+                crate::text::fit_width(
                     &format!(
                         "{} | 无匹配，按 Backspace 修改筛选或 Esc 关闭",
                         choices.title
@@ -2018,7 +2044,7 @@ impl State {
         let selected = choices.selected.min(visible.len() - 1);
         let mut rows = vec![self.style(
             "2",
-            &clip(
+            crate::text::fit_width(
                 &format!("{} | {}/{}", choices.title, selected + 1, visible.len()),
                 columns - 1,
             ),
@@ -2028,9 +2054,12 @@ impl State {
             .min(visible.len().saturating_sub(5));
         for (offset, index) in visible.iter().enumerate().skip(start).take(5) {
             let item = &choices.items[*index];
-            let label = clip(&visible_text(&item.label), columns - 3);
-            let room = columns.saturating_sub(3 + width(&label) + 3);
-            let description = clip(&visible_text(&item.description), room);
+            let label = crate::text::fit_width(&crate::text::visible_row(&item.label), columns - 3)
+                .to_owned();
+            let room = columns.saturating_sub(3 + crate::text::width(&label) + 3);
+            let description =
+                crate::text::fit_width(&crate::text::visible_row(&item.description), room)
+                    .to_owned();
             let entry = if offset == selected {
                 format!("> {}", self.style("7", &label))
             } else {
@@ -2050,7 +2079,10 @@ impl State {
         let Some(lines) = &self.panel else {
             return Vec::new();
         };
-        let mut rows = vec![self.style("2", &clip("子代理 | Alt+M 或 Esc 关闭", columns - 1))];
+        let mut rows = vec![self.style(
+            "2",
+            crate::text::fit_width("子代理 | Alt+M 或 Esc 关闭", columns - 1),
+        )];
         rows.push(format!(
             "主任务：{}",
             if self.busy { "运行中" } else { "空闲" }
@@ -2063,7 +2095,9 @@ impl State {
             rows.push("没有子代理".into());
         }
         for line in lines.into_iter().take(6) {
-            rows.push(clip(&visible_text(line), columns - 1));
+            rows.push(
+                crate::text::fit_width(&crate::text::visible_row(line), columns - 1).to_owned(),
+            );
         }
         rows
     }
@@ -2078,16 +2112,20 @@ impl State {
         let shown = &self.candidates[start..self.candidates.len().min(start + PANEL_ROWS)];
         let label = shown
             .iter()
-            .map(|candidate| width(&candidate.text))
+            .map(|candidate| crate::text::width(&candidate.text))
             .max()
             .unwrap_or(0)
             .min(32);
         let mut rows = Vec::new();
         for (index, candidate) in shown.iter().enumerate() {
-            let text = clip(&visible(&candidate.text), columns - 3);
-            let pad = " ".repeat(label.saturating_sub(width(&text)));
-            let room = columns.saturating_sub(3 + width(&text) + pad.len() + 2);
-            let description = clip(&visible(&candidate.description), room);
+            let text =
+                crate::text::fit_width(&crate::text::visible_styled(&candidate.text), columns - 3)
+                    .to_owned();
+            let pad = " ".repeat(label.saturating_sub(crate::text::width(&text)));
+            let room = columns.saturating_sub(3 + crate::text::width(&text) + pad.len() + 2);
+            let description =
+                crate::text::fit_width(&crate::text::visible_styled(&candidate.description), room)
+                    .to_owned();
             let entry = if start + index == self.selected {
                 format!("> {}", self.style("7", &text))
             } else {
@@ -2144,18 +2182,6 @@ fn filter(items: &[Choice], query: &str) -> Vec<usize> {
                 .contains(query)
         })
         .map(|(index, _)| index)
-        .collect()
-}
-
-/// Untrusted text for a single row: control characters (ESC included) shown as
-/// U+FFFD, tabs and newlines as spaces.
-fn visible_text(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\n' | '\t' => ' ',
-            c if c.is_control() => '\u{fffd}',
-            c => c,
-        })
         .collect()
 }
 
@@ -2542,10 +2568,8 @@ impl History {
                 .filter_map(|line| serde_json::to_string(line).ok())
                 .map(|line| line + "\n")
                 .collect();
-            let parent = path.parent().unwrap_or(std::path::Path::new("."));
-            let mut file = tempfile::NamedTempFile::new_in(parent)?;
-            file.write_all(text.as_bytes())?;
-            return crate::session::replace_with(file, path);
+            return crate::persist::write_atomic(path, text.as_bytes(), false)
+                .map_err(std::io::Error::other);
         }
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
@@ -2583,37 +2607,14 @@ fn keeps(line: &str) -> bool {
     {
         return false;
     }
-    !crate::extensions::skill_review::contains_secret(line)
+    !crate::safety::secrets::contains_secret(line)
         && crate::safety::permission::safety::secrets(line).is_empty()
 }
 
-fn width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
-}
-
-/// `text` cut to at most `room` columns.
-fn clip(text: &str, room: usize) -> String {
-    let mut used = 0;
-    text.chars()
-        .take_while(|c| {
-            used += c.width().unwrap_or(0);
-            used <= room
-        })
-        .collect()
-}
-
-/// Control characters other than newline, tab and ESC shown as U+FFFD; the
-/// callers have already neutralized ESC in untrusted text.
-fn visible(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' && c != '\x1b' {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .collect()
+/// Whether a new AI title for session `id` goes into the window title: only when the
+/// window shows that session and the user has not named it.
+fn retitles_window(window_session: &str, named: bool, id: &str) -> bool {
+    window_session == id && !named
 }
 
 /// Turns on control-sequence processing for the console; false where the
@@ -2655,6 +2656,16 @@ mod tests {
             state.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
             Action::Paste
         ));
+    }
+
+    #[test]
+    fn ai_titles_change_the_window_only_for_its_session_and_never_a_name() {
+        assert!(retitles_window("s1", false, "s1"));
+        assert!(
+            !retitles_window("s2", false, "s1"),
+            "the user switched sessions"
+        );
+        assert!(!retitles_window("s1", true, "s1"), "the user named it");
     }
 
     #[test]
@@ -2826,6 +2837,7 @@ mod tests {
             output: 5,
             cache_read: 80,
             cache_write: 10,
+            ..Default::default()
         });
         assert_eq!(meter.context, 100);
         assert_eq!(meter.session, 105);

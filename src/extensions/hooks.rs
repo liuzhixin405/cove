@@ -206,7 +206,7 @@ pub fn load_hooks_json(data_dir: &Path) -> Result<(Vec<Sourced<HookConfig>>, Vec
         hooks: std::collections::BTreeMap<String, Vec<Value>>,
     }
     let file: File = serde_json::from_str(data.trim_start_matches('\u{feff}'))
-        .map_err(|err| Error::Tool(format!("parse {}: {err}", path.display())))?;
+        .map_err(|err| Error::Tool(format!("parse {}: {err}", crate::paths::display(&path))))?;
     let (mut hooks, mut warnings) = (Vec::new(), Vec::new());
     for (event_name, entries) in file.hooks {
         let Some(event) = json_event(&event_name) else {
@@ -276,7 +276,7 @@ fn bounded_input(mut input: Value) -> String {
             if let Value::String(text) = value
                 && text.len() > 2048
             {
-                *text = format!("{}…[truncated]", &text[..text.floor_char_boundary(2048)]);
+                *text = crate::text::clip(text, 2048, "…[truncated]");
             }
         }
     }

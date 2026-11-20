@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::{Error, Result},
-    extensions::skills::{clip, read_text},
+    extensions::skills::read_text,
     extensions::{Registry, identifier},
 };
 
@@ -71,8 +71,9 @@ fn read_manifest(dir: &Path) -> Result<Manifest> {
         let path = dir.join(file);
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             let text = read_text(&path, 256 * 1024)?;
-            return serde_json::from_str(text.trim_start_matches('\u{feff}'))
-                .map_err(|err| Error::Tool(format!("parse {}: {err}", path.display())));
+            return serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|err| {
+                Error::Tool(format!("parse {}: {err}", crate::paths::display(&path)))
+            });
         }
     }
     Err(Error::Tool(
@@ -212,7 +213,10 @@ pub fn parse_command(content: &str) -> (String, String) {
             has_frontmatter: false,
         }
     });
-    (clip(&parsed.description, 60), parsed.body.trim().to_owned())
+    (
+        crate::text::clip_chars(&parsed.description, 60),
+        parsed.body.trim().to_owned(),
+    )
 }
 
 /// Substitutes `$ARGUMENTS`; without the placeholder, arguments are appended.
@@ -263,32 +267,20 @@ pub fn name_from_url(url: &str) -> String {
         .collect()
 }
 
-/// Bounded, non-interactive git: no terminal or credential-manager prompts.
+/// Bounded, non-interactive git (120 s): stdout and stderr together, or an error
+/// with them.
 pub async fn git(args: &[&str], cwd: &Path, cancel: &CancellationToken) -> Result<String> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::select! {
-        _ = cancel.cancelled() => return Err(Error::Cancelled),
-        output = tokio::time::timeout(Duration::from_secs(120), command.output()) => output
-            .map_err(|_| Error::Tool("git timed out after 120 s".into()))?
-            .map_err(|err| Error::Tool(format!("cannot run git: {err}")))?,
-    };
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
+    let output = crate::process::git::Git::new(cwd)
+        .args(args.iter().copied())
+        .timeout(Duration::from_secs(120))
+        .output(cancel)
+        .await?;
+    let text = format!("{}{}", output.stdout_text(), output.stderr_text());
+    if !output.ok {
         return Err(Error::Tool(format!(
-            "git {} failed: {}",
+            "git {} 失败：{}",
             args.first().unwrap_or(&""),
-            clip(text.trim(), 2000)
+            crate::text::clip_chars(text.trim(), 2000)
         )));
     }
     Ok(text)
@@ -567,7 +559,7 @@ mod tests {
         assert!(
             install_git(
                 &data.path().join("plugins"),
-                &source.path().display().to_string(),
+                &source.path().to_string_lossy(),
                 None,
                 None,
                 &cancel

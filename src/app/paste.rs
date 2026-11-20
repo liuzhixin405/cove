@@ -104,7 +104,7 @@ fn image(raw: &str, cwd: &Path) -> Option<PathBuf> {
 /// `name WxH 12.3 KB` for the status row.
 pub fn describe(path: &Path) -> String {
     let name = path.file_name().map_or_else(
-        || path.display().to_string(),
+        || path.to_string_lossy().into_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
     let bytes = std::fs::read(path).unwrap_or_default();
@@ -151,9 +151,41 @@ pub fn clipboard_image(dir: &Path) -> Result<PathBuf> {
     let hash = sha2::Sha256::digest(&png);
     let name: String = hash[..4].iter().map(|byte| format!("{byte:02x}")).collect();
     std::fs::create_dir_all(dir)?;
+    prune_clipboard(dir, CLIPBOARD_DAYS);
     let path = dir.join(format!("clipboard-{name}.png"));
     std::fs::write(&path, &png)?;
     Ok(path)
+}
+
+/// Clipboard images are kept this long: a sent image already sits in the session as
+/// base64, so the file is only needed until the message goes out.
+#[cfg(windows)]
+const CLIPBOARD_DAYS: u64 = 7;
+
+/// Deletes `clipboard-*.png` files in `dir` older than `days`.
+#[cfg(windows)]
+fn prune_clipboard(dir: &Path, days: u64) {
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(days * 24 * 3600))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("clipboard-")
+            && name.ends_with(".png")
+            && entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified < cutoff)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -166,6 +198,29 @@ pub fn clipboard_image(_dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn only_old_clipboard_images_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("clipboard-old.png");
+        let new = dir.path().join("clipboard-new.png");
+        let other = dir.path().join("notes.png");
+        for path in [&old, &new, &other] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        for path in [&old, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        prune_clipboard(dir.path(), 7);
+        assert!(!old.exists() && new.exists() && other.exists());
+    }
 
     fn png(path: &Path) {
         let mut bytes = Vec::new();
@@ -189,7 +244,7 @@ mod tests {
         let cwd = dir.path();
         let a = cwd.join("a.png");
         assert_eq!(image_paths("a.png", cwd), Some(vec![a.clone()]));
-        let absolute = format!("\"{}\"", cwd.join("my shot.png").display());
+        let absolute = format!("\"{}\"", cwd.join("my shot.png").to_string_lossy());
         assert_eq!(
             image_paths(&absolute, cwd),
             Some(vec![cwd.join("my shot.png")])

@@ -3,8 +3,6 @@
 pub mod hooks;
 pub mod mcp;
 pub mod plugins;
-pub mod skill_candidates;
-pub mod skill_review;
 pub mod skills;
 
 use std::{
@@ -17,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::{Error, Result},
-    session::{atomic_json, read_json},
+    persist::{atomic_json, read_json},
 };
 
 pub const TEXT_LIMIT: usize = 32 * 1024;
@@ -441,6 +439,5 @@ pub fn bounded(text: String) -> String {
     if text.len() <= TEXT_LIMIT {
         return text;
     }
-    let end = text.floor_char_boundary(TEXT_LIMIT);
-    format!("{}\n[extension output truncated]", &text[..end])
+    crate::text::clip(&text, TEXT_LIMIT, "\n[extension output truncated]")
 }

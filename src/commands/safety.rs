@@ -68,7 +68,10 @@ pub(crate) async fn handle(
             if save {
                 let path = save_config(app, key, stored).await?;
                 print_text(
-                    &format!("已将 {key}={stored} 保存到 {}\n", path.display()),
+                    &format!(
+                        "已将 {key}={stored} 保存到 {}\n",
+                        crate::paths::display(&path)
+                    ),
                     false,
                 )?;
             }
@@ -101,7 +104,7 @@ fn status(app: &Application) -> String {
         rules.len(),
         permissions
             .policy_path()
-            .map_or("-".into(), |path| path.display().to_string())
+            .map_or("-".into(), crate::paths::display)
     );
     for rule in rules.iter().take(20) {
         let target = [&rule.command_prefix, &rule.command_group]
@@ -146,6 +149,7 @@ async fn save_config(app: &Application, key: &str, value: &str) -> Result<std::p
     app.authorizer
         .authorize(Effect::Write(path.clone()), CancellationToken::new())
         .await?;
+    let _config = crate::persist::lock_for(&path)?;
     let mut config: Value = if path.is_file() {
         let data = std::fs::read(&path)?;
         serde_json::from_slice(data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data))?
@@ -177,12 +181,6 @@ async fn save_config(app: &Application, key: &str, value: &str) -> Result<std::p
         }
         target.insert(key.into(), Value::String(value.into()));
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&config)?)?;
-    crate::session::replace_with(file, &path)?;
+    crate::persist::write_atomic(&path, &serde_json::to_vec_pretty(&config)?, true)?;
     Ok(path)
 }

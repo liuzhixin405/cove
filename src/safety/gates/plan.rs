@@ -165,7 +165,7 @@ impl Workflow {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = crate::session::atomic_json(&path, plan);
+        let _ = crate::persist::atomic_json(&path, plan);
         if let Ok(mut state) = self.state.lock() {
             state.last_plan = Some(plan.clone());
         }

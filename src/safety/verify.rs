@@ -304,7 +304,9 @@ fn project_files(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .filter_entry(|entry| {
             !matches!(
                 entry.file_name().to_str(),
-                Some("bin" | "obj" | "node_modules" | "target" | "venv" | ".venv" | "build" | "dist")
+                Some(
+                    "bin" | "obj" | "node_modules" | "target" | "venv" | ".venv" | "build" | "dist"
+                )
             )
         })
         .build()
@@ -355,7 +357,10 @@ fn node_tests(root: &Path, script: &str, changed: &[PathBuf]) -> String {
     let sources = !changed.is_empty()
         && changed.iter().all(|path| {
             path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                matches!(e, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts")
+                matches!(
+                    e,
+                    "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
+                )
             })
         });
     let jest = script.trim_start().starts_with("jest")
@@ -502,7 +507,11 @@ fn java_tests(root: &Path, changed: &[PathBuf]) -> Option<String> {
     let mut whole = changed.is_empty();
     for path in changed {
         match owner(root, path, |dir| {
-            if maven { has(dir, &["pom.xml"]) } else { has(dir, GRADLE) }
+            if maven {
+                has(dir, &["pom.xml"])
+            } else {
+                has(dir, GRADLE)
+            }
         }) {
             Some(dir) if dir != root => {
                 let module = shell_path(root, &dir);
@@ -651,9 +660,8 @@ impl CommandVerifier {
 
     /// Configured limit, else 120 s and 300 s for the slower test/dotnet/npm toolchains.
     fn timeout(&self, command: &str) -> Duration {
-        self.timeout.unwrap_or_else(|| {
-            Duration::from_secs(if slow_command(command) { 300 } else { 120 })
-        })
+        self.timeout
+            .unwrap_or_else(|| Duration::from_secs(if slow_command(command) { 300 } else { 120 }))
     }
 
     fn record(&self, check: CheckRecord) {
@@ -862,16 +870,7 @@ pub fn slow_command(command: &str) -> bool {
         .any(|part| SLOW.iter().any(|tool| part.starts_with(tool)))
 }
 
-fn tail(text: &str, limit: usize) -> &str {
-    if text.len() <= limit {
-        return text;
-    }
-    let mut start = text.len() - limit;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
+use crate::process::tail_bytes as tail;
 
 impl Verifier for CommandVerifier {
     fn verify(&self, cancel: CancellationToken) -> BoxFuture<'_, Result<Option<Verification>>> {
@@ -1010,12 +1009,6 @@ mod tests {
         assert_eq!(runs.matches("run").count(), 1, "{runs}");
     }
 
-    #[test]
-    fn tail_keeps_char_boundaries() {
-        assert_eq!(tail("ab界cd", 4), "cd");
-        assert_eq!(tail("abc", 10), "abc");
-    }
-
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1035,13 +1028,26 @@ mod tests {
         );
         // Not only sources changed: the whole suite.
         assert_eq!(
-            test_commands(root, &[PathBuf::from("src/a.ts"), PathBuf::from("jest.config.js")])
-                .len(),
+            test_commands(
+                root,
+                &[PathBuf::from("src/a.ts"), PathBuf::from("jest.config.js")]
+            )
+            .len(),
             1
         );
-        assert_eq!(test_commands(root, &[PathBuf::from("README.md")]), ["pnpm test"]);
-        write(root, "package.json", r#"{"scripts":{"test":"vitest run && eslint ."}}"#);
-        assert_eq!(test_commands(root, &[PathBuf::from("src/a.ts")]), ["pnpm test"]);
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("README.md")]),
+            ["pnpm test"]
+        );
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"test":"vitest run && eslint ."}}"#,
+        );
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("src/a.ts")]),
+            ["pnpm test"]
+        );
     }
 
     #[test]
@@ -1125,7 +1131,10 @@ mod tests {
             test_commands(root, &[PathBuf::from("core/src/A.java")]),
             ["mvn test -q -pl core -am"]
         );
-        assert_eq!(test_commands(root, &[PathBuf::from("pom.xml")]), ["mvn test -q"]);
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("pom.xml")]),
+            ["mvn test -q"]
+        );
     }
 
     #[test]

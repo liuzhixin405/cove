@@ -34,16 +34,22 @@ pub(crate) async fn dispatch(app: &mut Application, line: &str) -> Result<Option
     Ok(None)
 }
 
-/// `/config` areas that also answer to their own name.
-const CONFIG_SHORTCUTS: [&str; 4] = ["mcp", "plugins", "hooks", "memory"];
+/// Short names other agents use, and the command each one stands for.
+const SHORTCUTS: [(&str, &str); 6] = [
+    ("mcp", "/config mcp"),
+    ("plugins", "/config plugins"),
+    ("hooks", "/config hooks"),
+    ("memory", "/config memory"),
+    ("usage", "/status usage"),
+    ("cost", "/status cost"),
+];
 
-/// `/mcp list` as `/config mcp list`, for the areas in `CONFIG_SHORTCUTS`.
-pub(crate) fn config_shortcut(line: &str) -> Option<String> {
+/// `/mcp list` as `/config mcp list`, `/cost 30d` as `/status cost 30d`.
+pub(crate) fn shortcut(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix('/')?;
-    let name = rest.split_whitespace().next()?;
-    CONFIG_SHORTCUTS
-        .contains(&name)
-        .then(|| format!("/config {rest}"))
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let (_, target) = SHORTCUTS.iter().find(|(short, _)| *short == name)?;
+    Some(format!("{target} {}", args.trim()).trim_end().to_owned())
 }
 
 /// Help lines of each area with its `/help` group title.

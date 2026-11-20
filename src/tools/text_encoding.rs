@@ -210,30 +210,6 @@ pub fn decode_output(bytes: &[u8]) -> (String, bool) {
     (out, lossy)
 }
 
-/// Cuts `text` to at most `max` characters, saying how many were left out.
-pub fn clip_chars(text: &str, max: usize) -> Cow<'_, str> {
-    if text.len() <= max {
-        return Cow::Borrowed(text);
-    }
-    let count = text.chars().count();
-    if count <= max {
-        return Cow::Borrowed(text);
-    }
-    let end = text.char_indices().nth(max).map_or(text.len(), |(i, _)| i);
-    Cow::Owned(format!("{}…[+{} chars]", &text[..end], count - max))
-}
-
-/// Cuts `text` to at most `max` bytes on a character boundary, appending `marker`.
-pub fn clip_bytes<'a>(text: &'a str, max: usize, marker: &str) -> Cow<'a, str> {
-    if text.len() <= max {
-        return Cow::Borrowed(text);
-    }
-    Cow::Owned(format!(
-        "{}{marker}",
-        &text[..text.floor_char_boundary(max)]
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,14 +240,6 @@ mod tests {
             "\u{feff}a\r\nb\r\n"
         );
         assert_eq!(match_existing("a\nb", "x\ny"), "a\nb");
-    }
-
-    #[test]
-    fn long_lines_are_clipped_by_characters() {
-        let line = "字".repeat(10);
-        assert_eq!(clip_chars(&line, 4), "字字字字…[+6 chars]");
-        assert_eq!(clip_chars("short", 4), "shor…[+1 chars]");
-        assert_eq!(clip_chars("four", 4), "four");
     }
 
     #[cfg(windows)]

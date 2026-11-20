@@ -100,9 +100,6 @@ pub struct Cli {
     /// [default: 4096]
     #[arg(long)]
     pub max_output_tokens: Option<u32>,
-    /// Estimated USD cap; requires both prices below (per million tokens).
-    #[arg(long)]
-    pub budget: Option<f64>,
     #[arg(long)]
     pub input_price: Option<f64>,
     #[arg(long)]
@@ -381,7 +378,6 @@ struct Profile {
     provider: Option<ProviderField>,
     #[serde(alias = "mode")]
     permission_mode: Option<String>,
-    max_budget_usd: Option<f64>,
     max_iterations: Option<u32>,
     max_turn_minutes: Option<u64>,
     subagent_max_iterations: Option<u32>,
@@ -405,7 +401,6 @@ impl Profile {
             model: self.model.or(base.model),
             provider: self.provider.or(base.provider),
             permission_mode: self.permission_mode.or(base.permission_mode),
-            max_budget_usd: self.max_budget_usd.or(base.max_budget_usd),
             max_iterations: self.max_iterations.or(base.max_iterations),
             max_turn_minutes: self.max_turn_minutes.or(base.max_turn_minutes),
             subagent_max_iterations: self
@@ -431,7 +426,6 @@ const PROFILE_KEYS: &[&str] = &[
     "provider",
     "permission_mode",
     "mode",
-    "max_budget_usd",
     "max_iterations",
     "max_turn_minutes",
     "subagent_max_iterations",
@@ -464,8 +458,6 @@ const ROOT_KEYS: &[&str] = &[
     "mcp_servers",
     "disabled_skills",
     "skills_registry",
-    "skill_review",
-    "skill_review_auto",
     "browser_path",
     "shell",
     "max_sessions",
@@ -544,7 +536,7 @@ impl FileConfig {
             warn_if_shared(path, warnings);
         }
         let parsed = serde_json::from_value(value.clone())
-            .with_context(|| format!("解析配置文件 {} 失败", path.display()))?;
+            .with_context(|| format!("解析配置文件 {} 失败", crate::paths::display(path)))?;
         Ok((parsed, value))
     }
 
@@ -572,34 +564,20 @@ impl FileConfig {
 pub fn read_json_file(path: &Path) -> anyhow::Result<Value> {
     let mut data = Vec::new();
     std::fs::File::open(path)
-        .with_context(|| format!("打开配置文件 {} 失败", path.display()))?
+        .with_context(|| format!("打开配置文件 {} 失败", crate::paths::display(path)))?
         .take(64 * 1024 + 1)
         .read_to_end(&mut data)?;
     anyhow::ensure!(data.len() <= 64 * 1024, "配置文件超过 64 KiB");
     // Windows PowerShell 5.1 writes UTF-8 with a BOM.
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
-    serde_json::from_slice(data).with_context(|| format!("解析配置文件 {} 失败", path.display()))
+    serde_json::from_slice(data)
+        .with_context(|| format!("解析配置文件 {} 失败", crate::paths::display(path)))
 }
 
 /// Writes the user config atomically (owner-only on Unix: it may hold API keys).
+/// Callers that read the file first hold `crate::persist::lock_for(path)`.
 pub fn write_json_file(path: &Path, value: &Value) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    use std::io::Write;
-    temporary.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    crate::session::replace_with(temporary, path)?;
+    crate::persist::write_atomic(path, serde_json::to_string_pretty(value)?.as_bytes(), true)?;
     Ok(())
 }
 
@@ -671,7 +649,7 @@ fn warn_if_shared(path: &Path, warnings: &mut Vec<String>) {
     if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 != 0) {
         warnings.push(format!(
             "config：{} 含有 API key，但其他用户可读；请运行 chmod 600",
-            path.display()
+            crate::paths::display(&path)
         ));
     }
 }
@@ -757,7 +735,6 @@ pub struct Settings {
     pub max_turns: u32,
     pub timeout: Duration,
     pub max_output_tokens: u32,
-    pub budget: Option<f64>,
     pub prices: Option<(f64, f64)>,
     /// Commands run when a task that changed files ends; empty disables the gate.
     pub verify_commands: Vec<String>,
@@ -1038,24 +1015,6 @@ impl Settings {
             (None, None) => crate::model::models::prices(&model),
             _ => anyhow::bail!("请同时提供两个有限的非负 token 价格（input_price、output_price）"),
         };
-        let budget = match (cli.budget, config.max_budget_usd) {
-            (Some(budget), _) => Some(budget),
-            // The default cap, when the model's price is known.
-            (None, None) if prices.is_some() => Some(10.0),
-            (None, budget) => budget,
-        };
-        if let Some(budget) = budget {
-            anyhow::ensure!(budget.is_finite() && budget > 0.0, "预算提醒金额必须为正数");
-            if prices.is_none() && !crate::model::provider::supports_reported_cost(&base_url) {
-                warnings.push(
-                    "模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用，请以供应商账单为准"
-                        .into(),
-                );
-            }
-            if crate::model::provider::supports_reported_cost(&base_url) {
-                warnings.push("OpenRouter 预算仅计入其账户报告的费用；自带上游密钥时，上游另收费用可能不包含在内".into());
-            }
-        }
         let permission = match (cli.permission, config.permission_mode) {
             (Some(mode), _) => mode,
             (None, Some(mode)) => parse_mode(&mode)?,
@@ -1140,7 +1099,6 @@ impl Settings {
             max_turns,
             timeout: Duration::from_secs(timeout),
             max_output_tokens,
-            budget,
             prices,
             verify_commands,
             verify_timeout,
@@ -1274,50 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_price_keeps_budget_and_warns() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut cli = Cli::parse_from(["cove"]);
-        cli.cwd = directory.path().to_path_buf();
-        cli.data_dir = Some(directory.path().to_path_buf());
-        cli.budget = Some(2.0);
-        let config = serde_json::json!({
-            "model": "unknown-model",
-            "provider": {"name": "openai", "base_url": "https://example.com/v1", "api_key": "test-key"}
-        });
-        let settings = Settings::load_with(cli, Some(config)).unwrap();
-        assert_eq!(settings.prices, None);
-        assert_eq!(settings.budget, Some(2.0));
-        assert!(
-            settings
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("低估"))
-        );
-    }
-
-    #[test]
-    fn reported_cost_provider_keeps_configured_budget_without_static_prices() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut cli = Cli::parse_from(["cove"]);
-        cli.cwd = directory.path().to_path_buf();
-        cli.data_dir = Some(directory.path().to_path_buf());
-        let config = serde_json::json!({
-            "model": "gpt-4o",
-            "provider": {"name": "openai", "base_url": "https://openrouter.ai/api/v1", "api_key": "test-key"},
-            "max_budget_usd": 2.0
-        });
-        let settings = Settings::load_with(cli, Some(config)).unwrap();
-        assert_eq!(settings.prices, None);
-        assert_eq!(settings.budget, Some(2.0));
-        assert!(
-            !settings
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("已忽略 max_budget_usd"))
-        );
-    }
-
-    #[test]
     fn documented_example_config_loads_without_warnings() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/config.example.json");
         let mut warnings = Vec::new();
@@ -1331,8 +1245,6 @@ mod tests {
         assert!(raw["profiles"]["deepseek"].get("context_bytes").is_none());
         assert!(raw["profiles"]["deepseek"].get("input_price").is_none());
         assert!(raw["profiles"]["deepseek"].get("output_price").is_none());
-        assert!(raw["profiles"]["deepseek"].get("max_budget_usd").is_none());
-        assert!(raw["profiles"]["gemini"].get("max_budget_usd").is_none());
         for profile in raw["profiles"].as_object().unwrap().values() {
             assert!(profile.get("system_prompt").is_none());
             assert!(profile.get("done_verify_commands").is_none());
@@ -1352,7 +1264,6 @@ mod tests {
         }
         .resolve(Some("bedrock".into()))
         .unwrap();
-        assert_eq!(bedrock.max_budget_usd, Some(500.0));
         assert!(bedrock.max_output_tokens.is_none());
         assert_eq!(bedrock.thinking.as_deref(), Some("adaptive"));
         assert_eq!(file.resolve(None).unwrap().0.as_deref(), Some("deepseek"));

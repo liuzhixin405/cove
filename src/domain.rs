@@ -160,6 +160,9 @@ pub struct ModelRequest {
     pub estimated_tokens: Option<usize>,
     /// Model for this request; `None` lets the provider (or router) choose.
     pub model: Option<String>,
+    /// A conversation turn the user may pause after: its prompt cache is kept an hour
+    /// where the provider supports that (one-off background calls keep the default).
+    pub long_cache: bool,
 }
 
 /// `input` counts every prompt token; `cache_read` and `cache_write` are the parts
@@ -172,6 +175,13 @@ pub struct Usage {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_write: u64,
+    /// The part of `cache_write` kept an hour (billed higher).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 pub struct ModelResponse {

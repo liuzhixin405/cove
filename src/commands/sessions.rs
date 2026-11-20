@@ -14,10 +14,9 @@ use crate::{
     engine::turn::TurnHook,
     memory::dream::Dreamer,
     memory::extract::{Extractor, is_local},
-    memory::recall::{Embedder, EmbeddingConfig, INLINE_LIMIT, MemoryRecall, clip},
+    memory::recall::{Embedder, EmbeddingConfig, INLINE_LIMIT, MemoryRecall},
     memory::store::{Memory, ProvenanceSource, Scope},
     safety::permission::{Authorizer, Effect, Mode},
-    session::notes::SessionNotes,
     session::snapshot::{SnapshotInfo, Snapshots, Snapshotting},
     session::usage::{UsageLedger, aggregate, csv, parse_period, render, timestamp},
     session::{
@@ -36,11 +35,14 @@ pub(crate) const HELP: &str = "\
 /suggestions [list|analyze|accept <hash>|reject <hash>|revoke <hash> <reason>]  当前会话的人工审核建议
 /status usage  本会话：账户、花费、API 与实际耗时、代码改动、各模型 token
 /status cost [month|YYYY-MM|30d|24h|today|all] [export [file]]  按服务商/模型统计用量；export 导出 CSV
-/undo [list|<#n|hash>|files <#n|hash> <file…>|confirm [token]]  文件工具回滚用 /undo confirm；快照可恢复整个工作区（含 Shell 的影响）
+/usage  同 /status usage
+/cost [month|YYYY-MM|30d|24h|today|all] [export [file]]  同 /status cost
+/undo [<#n|hash>|files <#n|hash> <file…>|confirm]  列出回滚点；/undo #n 预览恢复，/undo confirm 执行（含 Shell 的影响）
 /config memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run|backups|show <backup>|preview <backup> <id>|restore <token>]]  长期记忆：查看、添加、删除、搜索、整理";
 
-/// A previewed snapshot restore waiting for `/undo confirm <token>`; kept on disk so a
-/// later one-shot invocation can confirm it.
+/// A previewed snapshot restore waiting for `/undo confirm` (the token checks that the
+/// workspace did not change since the preview); kept on disk so a later one-shot
+/// invocation can confirm it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingRestore {
     token: String,
@@ -55,8 +57,9 @@ pub(crate) struct Services {
     pub(crate) snapshot_error: Option<String>,
     pub(crate) memory: Arc<Memory>,
     pub(crate) recall: Arc<MemoryRecall>,
-    pub(crate) notes: Arc<SessionNotes>,
     pub(crate) extractor: Arc<Extractor>,
+    /// The project's rules (`.cove/rules.md`); `None` outside a project.
+    pub(crate) rules: Option<Arc<crate::memory::rules::ProjectRules>>,
     pub(crate) titler: Arc<crate::session::titles::Titler>,
     pub(crate) dreamer: Arc<Dreamer>,
     max_sessions: i64,
@@ -84,6 +87,7 @@ impl Services {
         authorizer: Arc<dyn Authorizer>,
         background: Arc<dyn Provider>,
         ledger: Arc<UsageLedger>,
+        rules: Option<Arc<crate::memory::rules::ProjectRules>>,
     ) -> Arc<Self> {
         // Snapshotting a home directory or a drive would stage everything on it.
         let (snapshots, snapshot_error) = match crate::safety::protected::too_wide(&settings.cwd) {
@@ -115,13 +119,13 @@ impl Services {
             snapshots,
             snapshot_error,
             recall: Arc::new(MemoryRecall::new(memory.clone(), embedder)),
-            notes: Arc::new(SessionNotes::new(store.root(), &settings.cwd)),
             extractor: Arc::new(Extractor::new(
                 memory.clone(),
+                rules.clone(),
                 background.clone(),
                 auto_off.clone(),
-                settings.budget,
             )),
+            rules: rules.clone(),
             titler: {
                 let titler = Arc::new(crate::session::titles::Titler::new(
                     background.clone(),
@@ -132,24 +136,26 @@ impl Services {
                     },
                 ));
                 // New titles show at once: in an open history panel, and in the
-                // window's title bar for the session in use.
-                titler.set_listener(Arc::new(|id: &str, title: &str, current: bool| {
+                // window's title bar when it shows that session.
+                titler.set_listener(Arc::new(|id: &str, title: &str| {
                     if let Some(console) = crate::app::console::active() {
-                        console.retitle(id, title, current);
+                        console.retitle(id, title);
                     }
                 }));
                 titler
             },
-            dreamer: Arc::new(Dreamer::new(
-                memory.clone(),
-                background,
-                store.clone(),
-                store.root().to_path_buf(),
-                settings.cwd.clone(),
-                settings.prices,
-                auto_off,
-                settings.budget,
-            )),
+            dreamer: Arc::new(
+                Dreamer::new(
+                    memory.clone(),
+                    background,
+                    store.clone(),
+                    store.root().to_path_buf(),
+                    settings.cwd.clone(),
+                    settings.prices,
+                    auto_off,
+                )
+                .with_rules(rules),
+            ),
             memory,
             ledger,
             max_sessions,
@@ -181,8 +187,10 @@ impl Services {
             hooks.push(snapshots.clone());
         }
         hooks.push(self.recall.clone());
-        hooks.push(self.notes.clone());
         hooks.push(self.extractor.clone());
+        if let Some(rules) = &self.rules {
+            hooks.push(rules.clone());
+        }
         hooks.push(self.titler.clone());
         hooks.push(Arc::new(self.dreamer.clone()));
         hooks
@@ -455,13 +463,14 @@ pub(crate) async fn handle(
         ["/suggestions", rest @ ..] => suggestions(app, rest).await?,
         ["/status", "cost", rest @ ..] => cost(app, rest).await?,
         ["/status", "usage"] => say(&usage(app))?,
-        ["/undo", "list"] => undo_list(app).await?,
-        ["/undo", "confirm", token] => undo_apply(app, token).await?,
+        // Without snapshots the file-tool rollback answers `/undo` and `/undo confirm`.
+        ["/undo"] | ["/undo", "confirm"] if app.sessions.snapshots.is_none() => return Ok(None),
+        ["/undo"] => undo_overview(app).await?,
+        ["/undo", "confirm"] => undo_apply(app).await?,
         ["/undo", "files", target, files @ ..] if !files.is_empty() => {
             undo_preview(app, target, files.iter().map(|f| f.to_string()).collect()).await?
         }
-        ["/undo", target] if *target != "confirm" => undo_preview(app, target, Vec::new()).await?,
-        ["/undo"] => undo_overview(app).await?,
+        ["/undo", target] => undo_preview(app, target, Vec::new()).await?,
         ["/diff"] => {
             let Some(text) = task_diff(app).await? else {
                 return Ok(None);
@@ -497,8 +506,8 @@ fn turn_text(index: usize, turn: &crate::session::TurnRecord) -> String {
 fn turn_list(turns: &[crate::session::TurnRecord]) -> String {
     let mut text = String::from("当前对话（输入 /turns <编号> 查看这一轮的提问和结论）：\n");
     for (index, turn) in turns.iter().enumerate() {
-        let title =
-            crate::session::title_from(&turn.input).unwrap_or_else(|| clip(&turn.input, 60));
+        let title = crate::session::title_from(&turn.input)
+            .unwrap_or_else(|| crate::text::clip(&turn.input, 60, crate::text::TRUNCATED));
         text.push_str(&format!(
             "{}. {title}{}\n",
             index + 1,
@@ -619,7 +628,7 @@ fn rename(app: &mut Application, line: &str) -> Result<()> {
     app.session.title_source = TitleSource::User;
     app.store.save(&app.session)?;
     if let Some(console) = crate::app::console::active() {
-        console.set_window_title(&name);
+        console.set_window_title(&app.session.id, &name, true);
     }
     say(&format!("会话已改名为：{name}\n"))
 }
@@ -900,7 +909,7 @@ async fn resume(app: &mut Application, id: &str, show_continue_hint: bool) -> Re
 /// A session of another workspace resumes in a restart there, the way `/cd` switches:
 /// the tools, checkpoints and permissions of a workspace belong to its process.
 fn resume_elsewhere(app: &mut Application, session: &Session) -> Result<bool> {
-    let cwd = session.cwd.display().to_string();
+    let cwd = crate::paths::display(&session.cwd);
     let command = format!("cove --cwd \"{cwd}\" --resume {}", session.id);
     if app.settings.one_shot {
         return Err(Error::Session(format!(
@@ -936,7 +945,7 @@ fn resume_elsewhere(app: &mut Application, session: &Session) -> Result<bool> {
 ",
             &session.id[..session.id.len().min(8)],
             &app.session.id[..app.session.id.len().min(8)],
-            app.settings.cwd.display()
+            crate::paths::display(&app.settings.cwd)
         ),
         true,
     )?;
@@ -953,9 +962,15 @@ pub(crate) fn show_conversation(store: &Store, session: &Session) -> Result<()> 
     }
     let mut text = String::new();
     for turn in &records[records.len().saturating_sub(TURNS)..] {
-        text.push_str(&format!("\n> {}\n", clip(turn.input.trim(), 800)));
+        text.push_str(&format!(
+            "\n> {}\n",
+            crate::text::clip(turn.input.trim(), 800, crate::text::TRUNCATED)
+        ));
         if !turn.reply.is_empty() {
-            text.push_str(&format!("{}\n", clip(&turn.reply, 2000)));
+            text.push_str(&format!(
+                "{}\n",
+                crate::text::clip(&turn.reply, 2000, crate::text::TRUNCATED)
+            ));
         }
     }
     let shown = if records.len() > TURNS {
@@ -1058,7 +1073,7 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
                 app.session.title_source = TitleSource::User;
                 app.store.save(&app.session)?;
                 if let Some(console) = crate::app::console::active() {
-                    console.set_window_title(&name);
+                    console.set_window_title(&app.session.id, &name, true);
                 }
             } else {
                 let _lease = app.store.acquire(&id)?;
@@ -1153,10 +1168,13 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
                 report.in_use
             );
             for item in &report.quarantined {
-                text.push_str(&format!("  已移走：{}\n", clip(item, 300)));
+                text.push_str(&format!(
+                    "  已移走：{}\n",
+                    crate::text::clip(item, 300, crate::text::TRUNCATED)
+                ));
             }
             if let Some(backup) = report.backup {
-                text.push_str(&format!("备份：{}\n", backup.display()));
+                text.push_str(&format!("备份：{}\n", crate::paths::display(&backup)));
             }
             say(&text)?;
         }
@@ -1189,7 +1207,10 @@ async fn history(app: &mut Application, line: &str, rest: &[&str]) -> Result<boo
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, markdown(&app.session))?;
-            say(&format!("对话记录已导出到 {}\n", path.display()))?;
+            say(&format!(
+                "对话记录已导出到 {}\n",
+                crate::paths::display(&path)
+            ))?;
         }
         [reference] => {
             let id = pick(app, reference)?;
@@ -1209,7 +1230,7 @@ fn search_text(session: &Session) -> String {
     let mut text = session.display_title();
     for turn in session.turns() {
         text.push('\n');
-        text.push_str(&clip(turn.input, 1024));
+        text.push_str(&crate::text::clip(turn.input, 1024, crate::text::TRUNCATED));
         if text.len() > 8 * 1024 {
             break;
         }
@@ -1232,11 +1253,11 @@ fn detail(store: &Store, session: &Session) -> String {
         session.display_title(),
         session.id,
         session.state,
-        session.cwd.display(),
+        crate::paths::display(&session.cwd),
         session.model,
         session.protocol,
-        timestamp(session.created),
-        timestamp(session.updated),
+        crate::session::time::stamp(session.created),
+        crate::session::time::stamp(session.updated),
         session.messages.len(),
         store.history(session).len(),
         session.compactions,
@@ -1288,21 +1309,24 @@ async fn replay(app: &mut Application, reference: Option<&str>) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, replay_html(&session))?;
-    say(&format!("会话回放已生成：{}\n", path.display()))
+    say(&format!(
+        "会话回放已生成：{}\n",
+        crate::paths::display(&path)
+    ))
 }
 
 /// Markdown transcript including tool calls and (bounded) results; no secrets are
 /// stored in sessions, so none can be exported.
 pub fn markdown(session: &Session) -> String {
     let mut out = format!(
-        "# {}\n\n- 会话：`{}`\n- 工作区：`{}`\n- 模型：{}（{}）\n- 创建：{} UTC，更新：{} UTC\n- 模型调用：{} 次，token 输入/输出：{}/{}，预估花费：{}\n\n---\n\n",
+        "# {}\n\n- 会话：`{}`\n- 工作区：`{}`\n- 模型：{}（{}）\n- 创建：{}，更新：{}\n- 模型调用：{} 次，token 输入/输出：{}/{}，预估花费：{}\n\n---\n\n",
         session.display_title(),
         session.id,
-        session.cwd.display(),
+        crate::paths::display(&session.cwd),
         session.model,
         session.protocol,
-        timestamp(session.created),
-        timestamp(session.updated),
+        crate::session::time::stamp(session.created),
+        crate::session::time::stamp(session.updated),
         session.accounting.model_calls,
         session.accounting.usage.input,
         session.accounting.usage.output,
@@ -1359,7 +1383,10 @@ pub fn markdown(session: &Session) -> String {
                     } else {
                         "**工具结果**\n\n"
                     });
-                    out.push_str(&fence(&clip(content, 8 * 1024), "text"));
+                    out.push_str(&fence(
+                        &crate::text::clip(content, 8 * 1024, crate::text::TRUNCATED),
+                        "text",
+                    ));
                 }
                 Block::Image { media_type, .. } => {
                     out.push_str(&format!("*[图片附件：{media_type}]*\n\n"));
@@ -1393,10 +1420,14 @@ fn param_summary(input: &serde_json::Value) -> String {
     const KEYS: [&str; 6] = ["path", "file", "command", "query", "pattern", "url"];
     for key in KEYS {
         if let Some(value) = input.get(key).and_then(serde_json::Value::as_str) {
-            return clip(value, 120);
+            return crate::text::clip(value, 120, crate::text::TRUNCATED);
         }
     }
-    clip(&serde_json::to_string(input).unwrap_or_default(), 120)
+    crate::text::clip(
+        &serde_json::to_string(input).unwrap_or_default(),
+        120,
+        crate::text::TRUNCATED,
+    )
 }
 
 /// The marker the agent loop prefixes automatic-verification failures with.
@@ -1498,14 +1529,14 @@ pub fn replay_html(session: &Session) -> String {
                                     "<span class=\"badge ok\">成功</span>",
                                     format!(
                                         "<details><summary>结果</summary><pre>{}</pre></details>",
-                                        html_escape(&clip(content, 8 * 1024))
+                                        html_escape(&crate::text::clip(content, 8 * 1024, crate::text::TRUNCATED))
                                     ),
                                 ),
                                 Some((true, content)) => (
                                     "<span class=\"badge err\">失败</span>",
                                     format!(
                                         "<details><summary>结果（失败）</summary><pre>{}</pre></details>",
-                                        html_escape(&clip(content, 8 * 1024))
+                                        html_escape(&crate::text::clip(content, 8 * 1024, crate::text::TRUNCATED))
                                     ),
                                 ),
                                 None => (
@@ -1572,11 +1603,11 @@ pub fn replay_html(session: &Session) -> String {
 </body>\n</html>\n",
         html_escape(&session.display_title()),
         html_escape(&session.id),
-        html_escape(&session.cwd.display().to_string()),
+        html_escape(&crate::paths::display(&session.cwd)),
         html_escape(&session.model),
         html_escape(&session.protocol),
-        timestamp(session.created),
-        timestamp(session.updated),
+        crate::session::time::stamp(session.created),
+        crate::session::time::stamp(session.updated),
         html_escape(goal)
     )
 }
@@ -1640,12 +1671,12 @@ async fn cost(app: &Application, rest: &[&str]) -> Result<()> {
         text.push_str(&format!(
             "已导出 {} 次调用到 {}\n",
             entries.len(),
-            path.display()
+            crate::paths::display(&path)
         ));
     }
     text.push_str(&format!(
         "账本：{}（每次调用一行 JSON，保留 13 个月）\n",
-        app.sessions.ledger.dir().display()
+        crate::paths::display(app.sessions.ledger.dir())
     ));
     say(&text)
 }
@@ -1655,68 +1686,42 @@ async fn cost(app: &Application, rest: &[&str]) -> Result<()> {
 fn snapshots(app: &Application) -> Result<Arc<Snapshots>> {
     app.sessions.snapshots.clone().ok_or_else(|| {
         Error::Workspace(format!(
-            "Git 快照不可用（{}）；只能用 /undo 预览、/undo confirm 回滚文件工具的编辑",
+            "Git 快照不可用（{}）；/undo 只能回滚上一个任务的文件工具编辑（/undo 预览，/undo confirm 执行）",
             app.sessions.snapshot_error.as_deref().unwrap_or("未启动")
         ))
     })
 }
 
-async fn undo_overview(app: &Application) -> Result<()> {
-    let file_tools = app.workspace.undo_preview();
-    let list = match &app.sessions.snapshots {
-        Some(snapshots) => snapshots.list(5).await.unwrap_or_default(),
-        None => Vec::new(),
-    };
-    if list.is_empty()
-        && let Err(err) = &file_tools
-    {
-        return Err(Error::Workspace(format!("{err}；也没有可恢复的 Git 快照")));
-    }
-    let mut text =
-        String::from("文件工具回滚（/undo confirm；只覆盖 write/edit，不含 Shell 的影响）：\n");
-    match file_tools {
-        Ok(preview) => text.push_str(&preview),
-        Err(err) => text.push_str(&format!("  不可用：{err}\n")),
-    }
-    if !list.is_empty() {
-        text.push_str(
-            "\nGit 快照（整个工作区，包含 Shell 的影响；不含 .gitignore 忽略的文件和构建目录）：\n",
-        );
-        for (index, info) in list.iter().enumerate() {
-            text.push_str(&format!(
-                "  #{} {} {}  {}\n",
-                index + 1,
-                info.short(),
-                timestamp(info.time),
-                info.label
-            ));
-        }
-        text.push_str("/undo #1 预览恢复到最新快照；/undo list 查看全部。\n");
-    }
-    say(&text)
-}
+/// Restore points shown by `/undo`; older ones are still reachable as `#n`.
+const UNDO_SHOWN: usize = 15;
 
-async fn undo_list(app: &Application) -> Result<()> {
+async fn undo_overview(app: &Application) -> Result<()> {
     let snapshots = snapshots(app)?;
     let list = snapshots.list(crate::session::snapshot::KEEP).await?;
-    let mut text = format!(
-        "本工作区的 Git 快照（最新在前，保留 {} 个；恢复包含 Shell 的影响）：\n",
-        crate::session::snapshot::KEEP
+    let mut text = String::from(
+        "回滚点（最新在前；每个任务开始改动前一个，会改东西的 Shell 和子代理前各一个；恢复包含 Shell 的影响）：\n",
     );
-    for (index, info) in list.iter().enumerate() {
+    for (index, info) in list.iter().take(UNDO_SHOWN).enumerate() {
         text.push_str(&format!(
-            "  #{:<2} {} {}  {}\n",
+            "  #{:<2} {}  {}\n",
             index + 1,
-            info.short(),
             timestamp(info.time),
-            info.label
+            info.label.trim_start_matches("[cove] ")
+        ));
+    }
+    if list.len() > UNDO_SHOWN {
+        text.push_str(&format!(
+            "  ……还有 {} 个更早的（#{}–#{}）\n",
+            list.len() - UNDO_SHOWN,
+            UNDO_SHOWN + 1,
+            list.len()
         ));
     }
     if list.is_empty() {
-        text.push_str("  还没有快照（每次会修改文件的工具调用前自动创建）\n");
+        text.push_str("  还没有回滚点（任务第一次改动前自动创建）\n");
     }
     text.push_str(
-        "/undo <#n|hash> 预览整个工作区的恢复；/undo files <#n|hash> <file…> 只恢复指定文件。\n",
+        "/undo #n 预览恢复整个工作区；/undo files #n <文件…> 只恢复指定文件；预览后 /undo confirm 执行。\n",
     );
     say(&text)
 }
@@ -1751,10 +1756,10 @@ async fn undo_preview(app: &Application, target: &str, paths: Vec<String>) -> Re
         say(&text)?;
         return Ok(());
     }
-    text.push_str(&format!(
-        "恢复前会先为当前状态创建快照，所以这次恢复本身也能撤销。\n运行 /undo confirm {token} 执行（在此之前工作区若有变化会被拒绝）。\n"
-    ));
-    crate::session::atomic_json(
+    text.push_str(
+        "恢复前会先为当前状态创建快照，所以这次恢复本身也能撤销。\n运行 /undo confirm 执行（在此之前工作区若有变化会被拒绝）。\n",
+    );
+    crate::persist::atomic_json(
         &pending_path(app),
         &PendingRestore {
             token,
@@ -1772,15 +1777,14 @@ fn pending_path(app: &Application) -> PathBuf {
         .join(format!("undo-pending-{}.json", app.session.id))
 }
 
-async fn undo_apply(app: &mut Application, token: &str) -> Result<()> {
+async fn undo_apply(app: &mut Application) -> Result<()> {
     let snapshots = snapshots(app)?;
     let path = pending_path(app);
-    let pending = crate::session::read_json::<PendingRestore>(&path)
+    let pending = crate::persist::read_json::<PendingRestore>(&path)
         .ok()
-        .filter(|pending| pending.token == token)
         .ok_or_else(|| {
             Error::Workspace(
-                "确认码未知或已过期；请用 /undo <#n|hash> 重新预览（/undo list 查看快照），再按提示确认".into(),
+                "没有待确认的恢复；先用 /undo #n 预览（/undo 列出回滚点），再 /undo confirm".into(),
             )
         })?;
     if !app.session.pending.is_empty() {
@@ -1984,7 +1988,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                     &entry.id[..8],
                     scope.name(),
                     entry.title,
-                    clip(&entry.content.replace('\n', " "), 160)
+                    crate::text::clip(&entry.content.replace('\n', " "), 160, crate::text::TRUNCATED)
                 ));
             }
             if hits.is_empty() {
@@ -2003,12 +2007,15 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
             let total = project_bytes + global_bytes;
             let mut text = format!(
                 "项目：{project} 条，{project_bytes} 字节（{}）\n全局：{global} 条，{global_bytes} 字节（{}）\n限制：每条 25 KiB，每个范围 300 KiB\n注入方式：{}\n",
-                app.sessions.memory.directory(Scope::Project).display(),
-                app.sessions.memory.directory(Scope::Global).display(),
+                crate::paths::display(app.sessions.memory.directory(Scope::Project)),
+                crate::paths::display(app.sessions.memory.directory(Scope::Global)),
                 if total <= INLINE_LIMIT {
-                    "全部记忆直接注入（<= 24 KiB）".to_owned()
+                    "全部记忆直接注入（<= 8 KiB）".to_owned()
                 } else {
-                    format!("索引 + 每个任务最相关的 {} 条", crate::memory::recall::TOP_K)
+                    format!(
+                        "全局记忆全文 + 每个任务最相关的 {} 条 + 按时间排序的索引",
+                        crate::memory::recall::TOP_K
+                    )
                 }
             );
             text.push_str(&format!(
@@ -2021,10 +2028,6 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
             ));
             text.push_str(&app.sessions.extractor.status());
             text.push_str(&app.sessions.titler.status());
-            text.push_str(&format!(
-                "会话笔记：{}\n",
-                app.sessions.notes.path().display()
-            ));
             say(&text)
         }
         ["source", id] => {

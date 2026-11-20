@@ -8,7 +8,7 @@ use crate::{
     domain::{Error, Result, ToolDefinition},
     extensions::mcp::{Mcp, McpArgs},
     extensions::skills::{SkillArgs, Skills},
-    memory::store::{Memory, MemoryArgs},
+    memory::store::{Memory, MemoryArgs, Scope},
     safety::permission::{Authorizer, Effect},
     tools::json_output as output,
     tools::web::Web,
@@ -35,12 +35,31 @@ fn definition(name: &str, description: &str, properties: Value) -> ToolDefinitio
 fn memory_definition() -> ToolDefinition {
     let mut definition = definition(
         "memory",
-        "Project/global persistent notes with explicit sources. Every action requires scope: project or global, matching the scope shown in the memory index. Search/list first; read and delete require id; search requires query; add requires title, content and source; update requires id, title, content and source. Do not store secrets or claim notes are verified evidence.",
+        "Project/global persistent notes with explicit sources. scope is project or global as shown in the memory index; without it, read/update/delete find the id in either scope and add/list/search use project. The id may be the 8-character prefix the index shows. Search/list first; read and delete require id; search requires query; add requires title, content and source; update requires id, title, content and source. Do not store secrets or claim notes are verified evidence.",
         json!({"action":{"enum":["list","search","read","add","update","delete"]},"scope":{"enum":["project","global"]},
             "query":{"type":"string"},"id":{"type":"string"},"title":{"type":"string"},"content":{"type":"string"},"source":{"type":"string"}}),
     );
-    definition.schema["required"] = json!(["action", "scope"]);
+    definition.schema["required"] = json!(["action"]);
     definition
+}
+
+/// The scope of a memory call that names none: the one holding its `id`, else project;
+/// an id found in both scopes must be told apart by the caller.
+fn default_scope(memory: &Memory, input: &Value) -> Result<Scope> {
+    let Some(id) = input.get("id").and_then(Value::as_str) else {
+        return Ok(Scope::Project);
+    };
+    let holders: Vec<Scope> = [Scope::Project, Scope::Global]
+        .into_iter()
+        .filter(|scope| memory.resolve(*scope, id).is_ok())
+        .collect();
+    match holders.as_slice() {
+        [one] => Ok(*one),
+        [] => Ok(Scope::Project),
+        _ => Err(Error::Tool(format!(
+            "memory {id} exists in both project and global; give scope"
+        ))),
+    }
 }
 
 impl ToolExecutor for ExtensionTools {
@@ -99,6 +118,10 @@ impl ToolExecutor for ExtensionTools {
                         })
                     }
                     "memory" => {
+                        let mut input = input;
+                        if input.get("scope").is_none_or(Value::is_null) {
+                            input["scope"] = json!(default_scope(&self.memory, &input)?.name());
+                        }
                         let args: MemoryArgs = serde_json::from_value(input)?;
                         self.memory.authorize(&args, cancel.clone()).await?;
                         let memory = self.memory.clone();
@@ -146,14 +169,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_definition_requires_scope_for_every_action() {
+    fn memory_scope_is_optional_and_found_from_the_id() {
         let definition = memory_definition();
         assert_eq!(definition.name, "memory");
-        assert_eq!(definition.schema["required"], json!(["action", "scope"]));
+        assert_eq!(definition.schema["required"], json!(["action"]));
         assert_eq!(
             definition.schema["properties"]["scope"]["enum"],
             json!(["project", "global"])
         );
-        assert!(definition.description.contains("scope"));
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let memory = Memory::new(
+            data.path(),
+            root.path(),
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Auto,
+                input: None,
+            }),
+        )
+        .unwrap();
+        let saved = memory
+            .save(
+                Scope::Global,
+                None,
+                "language".into(),
+                "Reply in Chinese.".into(),
+                "test".into(),
+                crate::memory::store::ProvenanceSource::default(),
+            )
+            .unwrap();
+        let id = saved["saved"].as_str().unwrap().to_owned();
+        let scope = |input: Value| default_scope(&memory, &input).ok();
+        assert_eq!(
+            scope(json!({"action":"read","id":&id[..8]})),
+            Some(Scope::Global)
+        );
+        assert_eq!(
+            scope(json!({"action":"add","title":"x"})),
+            Some(Scope::Project)
+        );
+        assert_eq!(
+            scope(json!({"action":"read","id":"ffffffff"})),
+            Some(Scope::Project)
+        );
+        // The same id in both scopes: the caller has to say which.
+        let entry = memory.find(&id).unwrap().1;
+        std::fs::copy(
+            memory.directory(Scope::Global).join(format!("{id}.json")),
+            memory.directory(Scope::Project).join(format!("{id}.json")),
+        )
+        .unwrap();
+        assert_eq!(entry.id, id);
+        assert!(default_scope(&memory, &json!({"action":"delete","id":&id})).is_err());
     }
 }

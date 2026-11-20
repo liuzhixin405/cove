@@ -3,4 +3,5 @@
 pub mod gates;
 pub mod permission;
 pub mod protected;
+pub mod secrets;
 pub mod verify;

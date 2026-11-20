@@ -406,7 +406,7 @@ async fn resumed_diff_and_undo_preview_are_read_only_until_confirmation() {
     );
     server.await.unwrap();
     let id = saved_id(data.path());
-    for operation in ["/diff", "/undo"] {
+    for operation in ["/diff", "/undo", "/undo #1"] {
         let output = persistent_cli(root.path(), data.path(), &url)
             .args(["--resume", &id, "-p", operation])
             .launch()
@@ -739,7 +739,7 @@ async fn plugin_registration_enable_disable_uninstall_preserve_source_files() {
     )
     .unwrap();
     for command in [
-        format!("/config plugins install {}", manifest.display()),
+        format!("/config plugins install {}", manifest.to_string_lossy()),
         "/config plugins disable local".into(),
         "/config skills".into(),
         "/config plugins enable local".into(),
@@ -1158,8 +1158,6 @@ async fn sub_agent_reads_with_its_own_tools_and_reports_to_parent() {
             "1",
             "--output-price",
             "1",
-            "--budget",
-            "5",
         ])
         .launch()
         .await
@@ -1506,4 +1504,31 @@ async fn a_new_message_moves_on_from_a_task_stopped_during_a_question() {
         "{request}"
     );
     assert!(request.contains("能访问CCP-3359吗"), "{request}");
+}
+
+#[tokio::test]
+async fn shell_commands_the_model_runs_never_see_the_api_key() {
+    let root = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        tool(
+            "probe",
+            "shell",
+            json!({"command":"echo \"[$COVE_TEST_VISIBLE][$COVE_API_KEY]\""}),
+        ),
+        openai(json!({"content":"done"}), "stop"),
+    ])
+    .await;
+    let mut invocation = cli(root.path(), &url, "openai");
+    invocation.command.env("COVE_TEST_VISIBLE", "yes");
+    let output = invocation.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.await.unwrap();
+    let sent = requests[1]["messages"].to_string();
+    // An ordinary variable is visible (the shell did expand), the key is not.
+    assert!(sent.contains("[yes][]"), "{sent}");
+    assert!(!sent.contains("test-only-not-a-real-key"), "{sent}");
 }

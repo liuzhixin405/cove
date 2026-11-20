@@ -16,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 use crate::domain::{Error, Progress, Result};
 
 mod argv;
+pub mod git;
+pub mod secrets;
 mod stdio;
+pub(crate) use argv::capture_limited;
 pub use argv::{Argv, RawOutput, run_argv};
 mod shell;
 pub use shell::{Shell, ShellKind, inherited_git_config_count, noninteractive_env};
@@ -48,8 +51,12 @@ pub trait LockWait: Send + Sync {
     /// Output fragments that mean "waiting on another process's lock".
     fn patterns(&self) -> &'static [&'static str];
     /// `line` is the output line that matched.
-    fn waiting(&self, child: u32, line: String, cancel: CancellationToken)
-    -> BoxFuture<'static, ()>;
+    fn waiting(
+        &self,
+        child: u32,
+        line: String,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, ()>;
 }
 
 static LOCK_HANDLER: OnceLock<Arc<dyn LockWait>> = OnceLock::new();
@@ -268,7 +275,10 @@ async fn capture_watched(
         if count == 0 {
             break;
         }
-        if lock.as_mut().is_some_and(|watch| !watch.feed(&buffer[..count])) {
+        if lock
+            .as_mut()
+            .is_some_and(|watch| !watch.feed(&buffer[..count]))
+        {
             lock = None;
         }
         if let Some(live) = &mut live {
@@ -300,6 +310,15 @@ async fn capture_watched(
         live.finish().await;
     }
     Ok(kept.finish())
+}
+
+/// The last `limit` bytes of `text`, starting on a character boundary (output tails for
+/// reports and evidence).
+pub fn tail_bytes(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    crate::text::tail(text, limit)
 }
 
 /// Runs `script` in the legacy shell (PowerShell on Windows, sh elsewhere).
@@ -438,6 +457,11 @@ async fn run(
         command.env("COVE_HOOK_INPUT", input);
         0
     } else {
+        // Hooks get an allowlisted environment above; everything else the model runs
+        // inherits cove's, minus the API key cove itself uses.
+        for key in secrets::protected() {
+            command.env_remove(key);
+        }
         inherited_git_config_count()
     };
     command.envs(noninteractive_env(inherited));
@@ -667,6 +691,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byte_tails_start_on_a_character() {
+        assert_eq!(tail_bytes("ab界cd", 4), "cd");
+        assert_eq!(tail_bytes("ab界cd", 5), "界cd");
+        assert_eq!(tail_bytes("abc", 10), "abc");
+    }
+
+    #[test]
     fn long_output_keeps_head_and_tail_at_line_boundaries() {
         let mut kept = HeadTail::new(100);
         let text: String = (0..50).map(|n| format!("line {n:02}\n")).collect();
@@ -697,15 +728,24 @@ mod tests {
         };
         let capture = tokio::spawn(capture_watched(reader, None, 1024, Some(watch)));
         use tokio::io::AsyncWriteExt;
-        writer.write_all(b"   Compiling a\n   Blocking waiting fo").await.unwrap();
+        writer
+            .write_all(b"   Compiling a\n   Blocking waiting fo")
+            .await
+            .unwrap();
         writer.flush().await.unwrap();
         tokio::task::yield_now().await;
-        writer.write_all(b"r file lock on build directory\n").await.unwrap();
+        writer
+            .write_all(b"r file lock on build directory\n")
+            .await
+            .unwrap();
         drop(writer);
         let line = tokio::time::timeout(Duration::from_secs(5), lock.recv())
             .await
             .expect("lock wait not detected");
-        assert_eq!(line.as_deref(), Some("Blocking waiting for file lock on build directory"));
+        assert_eq!(
+            line.as_deref(),
+            Some("Blocking waiting for file lock on build directory")
+        );
         capture.await.unwrap().unwrap();
     }
 

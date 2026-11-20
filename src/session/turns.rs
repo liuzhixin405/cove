@@ -28,6 +28,7 @@ const NOTICE_PREFIXES: [&str; 10] = [
     "[automatic verification failed;",
     "[self_review;",
     "[Saved memories",
+    // Injected by versions before 0008 removed session notes; old histories hold them.
     "[Session notes",
     "[interrupted",
     "Operator ",

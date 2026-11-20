@@ -165,18 +165,22 @@ pub fn read_output(path: Option<&Path>) -> Option<ToolOutput> {
 
 /// One user attachment as message blocks: an image, or the text of a text file.
 pub fn attachment(path: &Path) -> Result<Block> {
-    let meta = std::fs::metadata(path)
-        .map_err(|err| Error::Tool(format!("cannot read attachment {}: {err}", path.display())))?;
+    let meta = std::fs::metadata(path).map_err(|err| {
+        Error::Tool(format!(
+            "cannot read attachment {}: {err}",
+            crate::paths::display(path)
+        ))
+    })?;
     if meta.is_dir() {
         return Err(Error::Tool(format!(
             "attachment is a directory: {}",
-            path.display()
+            crate::paths::display(path)
         )));
     }
     if meta.len() > ATTACH_MAX_FILE {
         return Err(Error::Tool(format!(
             "attachment {} exceeds 32 MiB; shrink it first",
-            path.display()
+            crate::paths::display(path)
         )));
     }
     let bytes = std::fs::read(path)?;
@@ -196,7 +200,7 @@ pub fn attachment(path: &Path) -> Result<Block> {
     }
     let (body, note) = if text.len() > TEXT_ATTACH_LIMIT {
         (
-            &text[..text.floor_char_boundary(TEXT_ATTACH_LIMIT)],
+            crate::text::head(&text, TEXT_ATTACH_LIMIT),
             "\n[truncated: only the first 200 KB attached]",
         )
     } else {

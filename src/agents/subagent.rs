@@ -327,14 +327,6 @@ pub struct ActivityBoard {
     entries: Mutex<Vec<Activity>>,
 }
 
-pub fn clip(text: &str, limit: usize) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.len() <= limit {
-        return text;
-    }
-    format!("{}…", &text[..text.floor_char_boundary(limit)])
-}
-
 impl ActivityBoard {
     pub fn start(&self, id: &str, kind: &'static str, agent_type: &str, model: &str, task: &str) {
         if let Ok(mut entries) = self.entries.lock() {
@@ -347,7 +339,7 @@ impl ActivityBoard {
                 model: model.into(),
                 started: Instant::now(),
                 ended: None,
-                task: clip(task, 120),
+                task: crate::text::short(task, 120),
                 last_step: "starting".into(),
             });
             // Keep the most recent finished entries only.
@@ -366,7 +358,7 @@ impl ActivityBoard {
         if let Ok(mut entries) = self.entries.lock()
             && let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
         {
-            entry.last_step = clip(step, 120);
+            entry.last_step = crate::text::short(step, 120);
         }
     }
 
@@ -728,7 +720,6 @@ impl ToolExecutor for ScopedTools {
 pub enum Exit {
     Completed,
     MaxIterations,
-    Budget,
     Interrupted,
     ApprovalDenied(String),
     /// verify finished without passing regression evidence.
@@ -741,7 +732,6 @@ impl Exit {
         match self {
             Self::Completed => "completed",
             Self::MaxIterations => "max_iterations",
-            Self::Budget => "budget",
             Self::Interrupted => "interrupted",
             Self::ApprovalDenied(_) => "approval_denied",
             Self::Unverified => "unverified",
@@ -759,9 +749,8 @@ impl Exit {
     pub fn from_result(result: &Result<crate::engine::agent::TaskReport>) -> Self {
         match result {
             Ok(_) => Self::Completed,
-            // Matches the engine's limit texts ("已用完 N 次模型调用", "已达到本会话的预算").
+            // Matches the engine's limit text ("已用完 N 次模型调用").
             Err(Error::Limit(text)) if text.contains("模型调用") => Self::MaxIterations,
-            Err(Error::Limit(text)) if text.contains("预算") => Self::Budget,
             Err(Error::Cancelled) => Self::Interrupted,
             Err(Error::Approval(text)) => Self::ApprovalDenied(text.clone()),
             Err(err) => Self::Error(err.to_string()),
@@ -772,7 +761,7 @@ impl Exit {
     pub fn lifecycle(&self) -> Lifecycle {
         match self {
             Self::Completed => Lifecycle::Finished,
-            Self::MaxIterations | Self::Budget | Self::Interrupted | Self::ApprovalDenied(_) => {
+            Self::MaxIterations | Self::Interrupted | Self::ApprovalDenied(_) => {
                 Lifecycle::Interrupted
             }
             Self::Unverified | Self::Error(_) => Lifecycle::Failed,
@@ -805,7 +794,7 @@ impl RunOutcome {
             "[sub-agent {} ({}): {}] [exit: {}, steps: {}, truncated: {}]",
             self.id,
             self.agent_type,
-            clip(&self.description, 80),
+            crate::text::short(&self.description, 80),
             self.exit.label(),
             self.steps,
             if self.truncated { "yes" } else { "no" }
@@ -856,8 +845,6 @@ pub struct SubAgentSettings {
     pub project_context: Option<String>,
     pub model: String,
     pub protocol: String,
-    /// Session budget, for background agents resumed between tasks.
-    pub budget: Option<f64>,
     pub max_background: usize,
     pub experimental: bool,
     pub regression_command: Option<String>,
@@ -911,7 +898,13 @@ pub struct RunRequest {
     pub agent_type: AgentType,
     pub description: String,
     pub prompt: String,
-    pub budget: Option<f64>,
+    /// The model of every request; `None` is the hub's default.
+    pub model: Option<String>,
+    /// Approvals for this run instead of the parent's (a race lane's own worktree).
+    pub authorizer: Option<Arc<dyn Authorizer>>,
+    /// Started outside a tool call (`/race`): the spend waits in the ledger's
+    /// background slot, which the session absorbs between tasks.
+    pub detached: bool,
     /// Worktree root and its journal, instead of the main tree.
     pub worktree: Option<(PathBuf, Arc<Workspace>)>,
     pub claims: Option<(Arc<Claims>, String)>,
@@ -1020,7 +1013,6 @@ impl AgentHub {
         &self,
         kind: &AgentType,
         tools: Arc<dyn ToolExecutor>,
-        budget: Option<f64>,
         extra: Option<String>,
         inbox_key: &str,
     ) -> Result<Agent> {
@@ -1037,7 +1029,6 @@ impl AgentHub {
             Limits {
                 max_turns: self.settings.max_turns,
                 max_output_tokens: self.settings.max_output_tokens,
-                budget,
                 prices: self.settings.prices,
             },
         )?
@@ -1082,7 +1073,8 @@ impl AgentHub {
                         failed,
                         output,
                     } => {
-                        let first = clip(output.lines().next().unwrap_or_default(), 160);
+                        let first =
+                            crate::text::short(output.lines().next().unwrap_or_default(), 160);
                         let status = if failed { "failed" } else { "ok" };
                         hub.activity.step(&id, &format!("{name} {status}: {first}"));
                         hub.progress
@@ -1090,7 +1082,8 @@ impl AgentHub {
                             .await;
                     }
                     Event::Notice(text) => {
-                        let first = clip(text.lines().next().unwrap_or_default(), 160);
+                        let first =
+                            crate::text::short(text.lines().next().unwrap_or_default(), 160);
                         hub.progress.line(format!("[{id}] {first}"), false).await;
                     }
                     Event::Text(_) | Event::Reasoning(_) if !answering => {
@@ -1131,7 +1124,7 @@ impl AgentHub {
             &request.id,
             request.kind,
             &kind.name,
-            &self.settings.model,
+            request.model.as_deref().unwrap_or(&self.settings.model),
             &request.description,
         );
         let (progress, events, forward) = self.forward_events(&request.id);
@@ -1142,7 +1135,7 @@ impl AgentHub {
                 Some(format!(
                     "You work inside the git worktree {}; every path is relative to it and it is separate from the user's main tree. \
                      Commit finished steps there with git so the work survives interruption.",
-                    root.display()
+                    crate::paths::display(root)
                 )),
             ),
             None => (self.root.clone(), self.workspace.clone(), None),
@@ -1153,13 +1146,17 @@ impl AgentHub {
                 &root,
                 workspace,
                 progress.clone(),
-                self.authorizer.clone(),
+                request
+                    .authorizer
+                    .clone()
+                    .unwrap_or_else(|| self.authorizer.clone()),
                 request.claims.clone(),
                 &request.id,
             )
             .and_then(|tools| {
-                let agent =
-                    self.build_agent(&kind, tools.clone(), request.budget, extra, &request.id)?;
+                let agent = self
+                    .build_agent(&kind, tools.clone(), extra, &request.id)?
+                    .with_model(request.model.clone());
                 Ok((tools, agent))
             });
         let (tools, agent) = match built {
@@ -1178,7 +1175,11 @@ impl AgentHub {
             .await;
         progress.attach(None);
         let _ = forward.await;
-        self.ledger.record(&spent);
+        if request.detached {
+            self.ledger.record_background(&spent);
+        } else {
+            self.ledger.record(&spent);
+        }
         outcome.exit = Exit::from_result(&result);
         if outcome.exit == Exit::Completed
             && kind.requires_regression
@@ -1286,7 +1287,6 @@ impl WithSubAgent {
             Ok(kind) => kind,
             Err(err) => return failed(err.to_string()),
         };
-        let budget = None;
         if args.background {
             if args.worktree.is_some() {
                 return failed(
@@ -1307,14 +1307,7 @@ impl WithSubAgent {
             };
             return match self
                 .hub
-                .spawn_background(
-                    kind,
-                    args.description,
-                    args.prompt,
-                    isolated,
-                    budget,
-                    &cancel,
-                )
+                .spawn_background(kind, args.description, args.prompt, isolated, &cancel)
                 .await
             {
                 Ok(text) => Ok(ToolOutput {
@@ -1357,7 +1350,9 @@ impl WithSubAgent {
                     agent_type: kind,
                     description: args.description,
                     prompt: args.prompt,
-                    budget,
+                    model: None,
+                    authorizer: None,
+                    detached: false,
                     worktree,
                     claims: None,
                 },
@@ -1380,16 +1375,10 @@ impl WithSubAgent {
             "list" => Ok(self.hub.status_text(None).await),
             "stop" => self.hub.stop_agent(id, false).await,
             "park" => self.hub.park_agent(id, &cancel).await,
-            "resume" => {
-                let remaining = self.hub.ledger.remaining_budget();
-                self.hub
-                    .resume_agent(id, args.message.clone(), false, remaining)
-                    .await
-            }
+            "resume" => self.hub.resume_agent(id, args.message.clone(), false).await,
             "send" => match args.message.as_deref() {
                 Some(message) if !message.trim().is_empty() => {
-                    let remaining = self.hub.ledger.remaining_budget();
-                    self.hub.send_agent(id, message.into(), remaining).await
+                    self.hub.send_agent(id, message.into()).await
                 }
                 _ => Err(Error::Tool("send needs a message".into())),
             },
@@ -1423,7 +1412,7 @@ impl ToolExecutor for WithSubAgent {
                  Editing types share your approvals and checkpoint; read-only types never edit. It sees nothing of this conversation: \
                  give full context in prompt. worktree=<branch> runs an editing agent inside a worktree made with the worktree tool. \
                  background=true returns an agent id at once and runs it as a durable background agent (editing types in their own fresh \
-                 git worktree; you are notified when it finishes; manage it with agent_control). Costs count toward this session's budget. \
+                 git worktree; you are notified when it finishes; manage it with agent_control). Costs count toward this session's spend. \
                  The result header reports [exit, steps, truncated].",
                 self.hub.settings.max_turns,
                 self.hub.types.summary()
@@ -1575,10 +1564,6 @@ mod tests {
         assert_eq!(
             Exit::from_result(&Err(Error::Limit("已用完 20 次模型调用".into()))),
             Exit::MaxIterations
-        );
-        assert_eq!(
-            Exit::from_result(&Err(Error::Limit("已达到本会话的预算（估算）".into()))),
-            Exit::Budget
         );
     }
 

@@ -84,3 +84,22 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 |---|---|---|
 | [0001](0001-unified-session-history.md) | 统一历史会话的数据、标题与展示 | 已完成 |
 | [0002](0002-ai-titles-visible.md) | 让 AI 标题看得见：补齐已有会话、即时应用、显示在窗口标题 | 已完成 |
+| [0003](0003-remove-skill-auto-learning.md) | 去掉技能自动学习 | 已完成 |
+| [0004](0004-unified-process-env-and-git.md) | 统一执行外部命令的环境变量与 git 调用 | 已完成 |
+| [0005](0005-unified-oneshot-model-calls-and-billing.md) | 统一一次性模型调用，修正费用账本 | 已完成 |
+| [0006](0006-remove-budget.md) | 去掉预算：只统计和显示 token 与费用 | 已完成 |
+| [0007](0007-text-paths-persist.md) | 统一底层工具：文本截断、路径前缀、文件锁与原子写入 | 已完成 |
+| [0008](0008-memory-injection-and-notes.md) | 记忆注入分层，删除会话笔记 | 已完成 |
+| [0009](0009-undo-and-storage.md) | 回滚点按任务记录，存储按时间清理 | 已完成 |
+| [0010](0010-isolated-runs.md) | 竞速改为一个需求两个方案，统一隔离执行 | 已完成 |
+| [0011](0011-cap-exact-command-rules.md) | “总是允许”的精确命令规则设上限 | 已完成 |
+| [0012](0012-main-loop-context-and-tools.md) | 主流程第一批：上下文长度和无效轮次 | 已完成 |
+| [0013](0013-cache-ttl-and-precompaction.md) | 主流程第二批：1 小时缓存和后台预压缩 | 已完成 |
+| [0014](0014-audit-fixes.md) | 收尾核对：修正 0001–0013 的改漏和改错 | 已完成 |
+| [0015](0015-readme-rewrite.md) | 重写 README | 已完成 |
+| [0016](0016-show-package-module-edits.md) | Python 包里的文件不再被当成临时脚本折叠 | 已完成 |
+| [0017](0017-show-edit-diffs.md) | 编辑结果显示改了哪几行 | 已完成 |
+| [0018](0018-demo-polish.md) | 路由提示改成人话、回复跟随用户语言、加 /usage | 已完成 |
+| [0019](0019-plain-paths-in-output.md) | 输出里的路径去掉 `\\?\` 前缀 | 已完成 |
+| [0020](0020-agents-rules.md) | 开发禁忌文档（AGENTS.md） | 已完成 |
+| [0021](0021-pre-commit-ai-review.md) | 项目规则：踩过的坑沉淀下来，写代码时遵守，提交前检查 | 已完成 |

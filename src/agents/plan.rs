@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agents::subagent::{AgentHub, AgentType, Claims, Exit, RunOutcome, RunRequest, clip},
+    agents::subagent::{AgentHub, AgentType, Claims, Exit, RunOutcome, RunRequest},
     domain::{Block, Error, Message, Result},
     tools::ToolOutput,
 };
@@ -371,7 +371,7 @@ pub async fn run_tasks(
                 if let Some(&other) = index.get(dep) {
                     prompt.push_str(&format!(
                         "\n\n[result of {dep}]\n{}",
-                        clip(&nodes[other].output, 2000)
+                        crate::text::short(&nodes[other].output, 2000)
                     ));
                 }
             }
@@ -382,7 +382,7 @@ pub async fn run_tasks(
             if node.attempts > 0 {
                 prompt.push_str(&format!(
                     "\n\n[previous attempt failed: {}]\nInspect what it left behind, fix the cause and finish the item.",
-                    clip(&node.error, 1500)
+                    crate::text::short(&node.error, 1500)
                 ));
             }
             node.attempts += 1;
@@ -392,7 +392,9 @@ pub async fn run_tasks(
                 agent_type: node.task.agent_type.clone(),
                 description: node.task.title.clone(),
                 prompt,
-                budget: None,
+                model: None,
+                authorizer: None,
+                detached: false,
                 worktree: None,
                 claims: claims
                     .as_ref()
@@ -442,10 +444,7 @@ pub async fn run_tasks(
         }
         // A capped run would redo the same work and hit the same cap; keep its result.
         let retry = node.attempts < 2
-            && !matches!(
-                outcome.exit,
-                Exit::MaxIterations | Exit::Budget | Exit::Interrupted
-            )
+            && !matches!(outcome.exit, Exit::MaxIterations | Exit::Interrupted)
             && !cancel.is_cancelled();
         node.state = if retry {
             NodeState::Pending
@@ -465,7 +464,10 @@ pub async fn run_tasks(
             }
             NodeState::Failed => {
                 counts[1] += 1;
-                ("[failed]", format!("failed: {}", clip(&node.error, 300)))
+                (
+                    "[failed]",
+                    format!("failed: {}", crate::text::short(&node.error, 300)),
+                )
             }
             NodeState::Skipped(reason) => {
                 counts[2] += 1;
@@ -482,7 +484,7 @@ pub async fn run_tasks(
         text.push_str(&format!(
             "  {mark} [{}] {} - {status} (exit: {}, attempts: {}, steps: {})\n",
             node.task.id,
-            clip(&node.task.title, 100),
+            crate::text::short(&node.task.title, 100),
             node.exit.as_ref().map_or("not run", Exit::label),
             node.attempts,
             node.steps
@@ -490,7 +492,7 @@ pub async fn run_tasks(
         if !node.output.trim().is_empty() {
             text.push_str(&format!(
                 "    result: {}\n",
-                clip(&node.output, 1500).replace('\n', "\n    ")
+                crate::text::short(&node.output, 1500).replace('\n', "\n    ")
             ));
         }
     }

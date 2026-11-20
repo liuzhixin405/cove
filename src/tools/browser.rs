@@ -342,7 +342,7 @@ impl Browser {
         .chain([
             format!(
                 "--user-data-dir={}",
-                crate::workflows::changes::plain(profile.path()).display()
+                crate::paths::plain(profile.path()).to_string_lossy()
             ),
             "about:blank".into(),
         ])

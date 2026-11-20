@@ -307,8 +307,11 @@ async fn simple_tasks_route_to_the_fast_model_and_complex_ones_to_premium() {
     .await;
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("[model] fast-model"), "{stderr}");
-    assert!(!stderr.contains("[model] premium-model"), "{stderr}");
+    assert!(
+        stderr.contains("简单任务，交给快速模型 fast-model"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("交给快速模型 premium-model"), "{stderr}");
     let seen = server.await.unwrap();
     assert_eq!(seen[0].body["model"], "fast-model");
     assert_eq!(seen[1].body["model"], "premium-model");
@@ -369,7 +372,7 @@ async fn the_key_pool_skips_rejected_and_rate_limited_keys() {
 }
 
 #[tokio::test]
-async fn failed_request_can_continue_without_resetting_budget() {
+async fn failed_request_can_continue_and_keeps_its_cost() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let (url, server) = mock_server(vec![
@@ -390,19 +393,20 @@ async fn failed_request_can_continue_without_resetting_budget() {
             "1000",
             "--output-price",
             "1000",
-            "--budget",
-            "20",
             "--no-auto",
         ])
         .env("COVE_API_KEY", "test-key");
     let output = run(
         command,
-        Some("original task\n/continue 1\n/config budget\n/exit\n"),
+        Some("original task\n/continue 1\n/status usage\n/exit\n"),
     )
     .await;
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("已花费 $0.0300"), "{stdout}");
+    assert!(
+        stdout.contains("总花费") && stdout.contains("$0.03"),
+        "{stdout}"
+    );
     assert!(stdout.contains("task continued"), "{stdout}");
     let seen = server.await.unwrap();
     assert_eq!(seen.len(), 2);
@@ -427,7 +431,7 @@ async fn live_model_and_config_changes_apply_and_are_saved() {
         .env("COVE_API_KEY", "env-key-123456789");
     let output = run(
         command,
-        Some("/model other-model\nfirst\n/config max_output_tokens 321\n/config system Prefer tabs.\n/config api_key\n/config budget\nsecond\n/model\n/exit\n"),
+        Some("/model other-model\nfirst\n/config max_output_tokens 321\n/config system Prefer tabs.\n/config api_key\nsecond\n/model\n/exit\n"),
     )
     .await;
     assert_success(&output);

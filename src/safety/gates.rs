@@ -27,6 +27,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "done_self_review",
     "workflow",
     "commit_gate",
+    "commit_review",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +63,9 @@ pub struct GateConfig {
     pub verify_tests: bool,
     /// Pre-commit verification gate (default on); `off` keeps only the end-of-task check.
     pub commit_gate: Switch,
+    /// AI review of the staged change before a commit (default on); `auto` = at least
+    /// 40 changed lines.
+    pub commit_review: Switch,
 }
 
 impl GateConfig {
@@ -74,6 +78,7 @@ impl GateConfig {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             commit_gate: Switch::parse(file.get("commit_gate"), Switch::On),
+            commit_review: Switch::parse(file.get("commit_review"), Switch::On),
         }
     }
 }
@@ -300,6 +305,8 @@ pub struct Assembly {
     pub tools: std::sync::Arc<dyn crate::tools::ToolExecutor>,
     pub workflow: std::sync::Arc<plan::Workflow>,
     pub hooks: Vec<std::sync::Arc<dyn TurnHook>>,
+    /// The review before a commit, for `/commit` too; `None` when `commit_review` is off.
+    pub commit_review: Option<std::sync::Arc<review::CommitReview>>,
 }
 
 pub struct Parts {
@@ -310,11 +317,15 @@ pub struct Parts {
     pub progress: std::sync::Arc<crate::domain::Progress>,
     pub tools: std::sync::Arc<dyn crate::tools::ToolExecutor>,
     pub provider: std::sync::Arc<dyn crate::domain::Provider>,
-    /// Read-only tools for the self-review sub-agent.
+    /// The fast model when set: the review before a commit runs on it.
+    pub background: std::sync::Arc<dyn crate::domain::Provider>,
+    /// Read-only tools for the review sub-agents.
     pub readonly: std::sync::Arc<dyn crate::tools::ToolExecutor>,
     pub ledger: std::sync::Arc<crate::engine::agent::Ledger>,
     pub project_context: Option<String>,
     pub trust: std::sync::Arc<dyn crate::safety::verify::ProjectTrust>,
+    /// The project's rules, for the reviews.
+    pub rules: Option<std::sync::Arc<crate::memory::rules::ProjectRules>>,
 }
 
 fn verification_preapproved(
@@ -365,23 +376,49 @@ impl Assembly {
                 verifier = verifier.with_detection(
                     tests,
                     Arc::new(move |command| {
-                        verification_preapproved(
-                            permissions.mode(),
-                            trust.trusted(&root),
-                            command,
-                        )
+                        verification_preapproved(permissions.mode(), trust.trusted(&root), command)
                     }),
                 );
             }
             Arc::new(verifier)
         });
-        let gated: Arc<dyn crate::tools::ToolExecutor> = match &verifier {
-            // commit_gate=off leaves the end-of-task verification but no per-commit run.
-            Some(verifier) if config.commit_gate != Switch::Off => Arc::new(
-                commit::WithCommitGate::new(parts.tools.clone(), verifier.clone(), root.clone()),
-            ),
-            _ => parts.tools.clone(),
+        let review_settings = || review::ReviewSettings {
+            max_turns: settings.subagent_max_turns,
+            max_output_tokens: settings.max_output_tokens,
+            prices: settings.prices,
+            context_tokens: settings.context_tokens,
+            project_context: parts.project_context.clone(),
         };
+        let commit_review = (config.commit_review != Switch::Off).then(|| {
+            Arc::new(review::CommitReview {
+                mode: config.commit_review,
+                reviewer: review::Reviewer {
+                    provider: parts.background.clone(),
+                    tools: parts.readonly.clone(),
+                    settings: review_settings(),
+                    ledger: parts.ledger.clone(),
+                    rules: parts.rules.clone(),
+                },
+            })
+        });
+        // commit_gate=off leaves the end-of-task verification but no per-commit run.
+        let commit_checks = verifier
+            .clone()
+            .filter(|_| config.commit_gate != Switch::Off);
+        let gated: Arc<dyn crate::tools::ToolExecutor> =
+            if commit_checks.is_some() || commit_review.is_some() {
+                Arc::new(
+                    commit::WithCommitGate::new(
+                        parts.tools.clone(),
+                        commit_checks,
+                        commit_review.clone(),
+                        root.clone(),
+                    )
+                    .with_progress(parts.progress.clone()),
+                )
+            } else {
+                parts.tools.clone()
+            };
         let workflow_mode = settings
             .file
             .get("workflow")
@@ -412,7 +449,6 @@ impl Assembly {
             Arc::new(nudge::Nudges::new(
                 nudge::NudgeLimits {
                     max_turns: settings.max_turns,
-                    budget: settings.budget,
                     done_check: nudge::NudgeLimits::done_check(
                         config.done_check,
                         anthropic,
@@ -426,17 +462,14 @@ impl Assembly {
             Arc::new(review::SelfReview::new(
                 config.self_review,
                 parts.workspace.clone(),
-                parts.provider,
-                parts.readonly,
-                review::ReviewSettings {
-                    max_turns: settings.subagent_max_turns,
-                    max_output_tokens: settings.max_output_tokens,
-                    prices: settings.prices,
-                    context_tokens: settings.context_tokens,
-                    project_context: parts.project_context,
+                review::Reviewer {
+                    provider: parts.provider.clone(),
+                    tools: parts.readonly.clone(),
+                    settings: review_settings(),
+                    ledger: parts.ledger.clone(),
+                    rules: parts.rules.clone(),
                 },
-                parts.ledger,
-                Some(parts.progress),
+                Some(parts.progress.clone()),
             )),
             Arc::new(acceptance::Acceptance::new(
                 settings.data_dir.clone(),
@@ -450,6 +483,7 @@ impl Assembly {
             tools,
             workflow,
             hooks,
+            commit_review,
         }
     }
 }
@@ -461,16 +495,7 @@ pub fn last_reply(session: &crate::session::Session) -> String {
         .iter()
         .rev()
         .find(|message| message.role == crate::domain::Role::Assistant)
-        .map(|message| {
-            message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    crate::domain::Block::Text(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>()
-        })
+        .map(crate::model::oneshot::response_text)
         .unwrap_or_default()
 }
 
@@ -489,10 +514,18 @@ mod tests {
     #[test]
     fn default_verification_preapproval_matches_shell_build_policy() {
         use crate::safety::permission::Mode;
-        assert!(verification_preapproved(Mode::Default, false, "cargo check"));
+        assert!(verification_preapproved(
+            Mode::Default,
+            false,
+            "cargo check"
+        ));
         assert!(verification_preapproved(Mode::Default, false, "cargo test"));
         assert!(!verification_preapproved(Mode::Default, false, "cargo fmt"));
-        assert!(!verification_preapproved(Mode::Default, false, "cargo install x"));
+        assert!(!verification_preapproved(
+            Mode::Default,
+            false,
+            "cargo install x"
+        ));
         assert!(!verification_preapproved(Mode::Plan, false, "cargo check"));
         assert!(verification_preapproved(Mode::Default, true, "cargo fmt"));
     }

@@ -1,5 +1,5 @@
-//! Reviewable patches from several sources (race candidates, automation inbox
-//! results, the current task) under one model, plus the Git plumbing they share:
+//! Reviewable patches from several sources (race candidates and the current task)
+//! under one model, plus the Git plumbing they share:
 //! baselines, detached worktrees, patch capture and guarded apply.
 //!
 //! Nothing here touches the user's working tree except `apply`, which first
@@ -7,13 +7,11 @@
 //! checks and the patch hash, all under a per-project lock.
 
 use std::{
-    ffi::OsString,
     fs::OpenOptions,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -25,23 +23,13 @@ use crate::{
 
 /// Patches larger than this are a failed capture, never silently truncated.
 pub const PATCH_LIMIT: usize = 4 * 1024 * 1024;
-/// Environment marker of a worker started by race or automation; workers refuse to nest.
-pub const NESTED_ENV: &str = "COVE_NESTED_WORKER";
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Drops the Windows verbatim prefix (`\\?\`) that `canonicalize` adds; Git and
-/// most tools expect ordinary drive paths.
-pub fn plain(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-        _ => path.to_path_buf(),
-    }
-}
+use crate::paths::plain;
 
 /// Stable short key for per-project state directories and locks.
 pub fn project_key(root: &Path) -> String {
@@ -52,20 +40,7 @@ pub fn project_key(root: &Path) -> String {
     sha256_hex(text.as_bytes())[..16].to_owned()
 }
 
-pub fn nested() -> bool {
-    std::env::var_os(NESTED_ENV).is_some()
-}
-
-pub fn refuse_nested() -> Result<()> {
-    if nested() {
-        return Err(Error::Tool(
-            "nested race/automation runs are refused inside a worker".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Runs git with a scrubbed `GIT_*` environment, no prompts and no hooks.
+/// Runs git with every `GIT_*` variable dropped, no prompts and no hooks.
 pub async fn git_raw(
     dir: &Path,
     args: &[&str],
@@ -73,26 +48,15 @@ pub async fn git_raw(
     limit: usize,
     cancel: &CancellationToken,
 ) -> Result<RawOutput> {
-    let mut argv = Argv::new(plain(dir), "git")
-        .args(["-c", "core.fsmonitor=false"])
+    let mut git = crate::process::git::Git::new(dir)
         .args(args.iter().copied())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .timeout(GIT_TIMEOUT)
         .limit(limit)
-        .direct();
-    argv.env_remove = std::env::vars_os()
-        .map(|(key, _)| key)
-        .filter(|key| {
-            key.to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-                && key != "GIT_TERMINAL_PROMPT"
-                && key != "GIT_OPTIONAL_LOCKS"
-        })
-        .collect::<Vec<OsString>>();
-    argv.stdin = stdin;
-    run_argv(argv, cancel).await
+        .scrub_all();
+    if let Some(stdin) = stdin {
+        git = git.stdin(stdin);
+    }
+    git.raw(cancel).await
 }
 
 /// Successful git stdout, or an error with its stderr.
@@ -200,7 +164,7 @@ impl Baseline {
     pub async fn add_worktree(&self, path: &Path, cancel: &CancellationToken) -> Result<()> {
         let hooks = path.with_extension("nohooks");
         std::fs::create_dir_all(&hooks)?;
-        let hooks_config = format!("core.hooksPath={}", plain(&hooks).display());
+        let hooks_config = format!("core.hooksPath={}", plain(&hooks).to_string_lossy());
         let target = plain(path).to_string_lossy().into_owned();
         git(
             &self.root,
@@ -245,7 +209,7 @@ impl Baseline {
         match removed {
             Ok(Ok(_)) if !path.exists() => None,
             _ if !path.exists() => None,
-            _ => Some(format!("worktree left at {}", path.display())),
+            _ => Some(format!("worktree left at {}", crate::paths::display(path))),
         }
     }
 
@@ -412,16 +376,14 @@ pub struct Check {
     pub output: String,
 }
 
-/// Keeps the last `limit` bytes of `text` on a character boundary.
+/// The end of a check's output, marked when cut.
 pub fn tail(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
+    let kept = crate::process::tail_bytes(text, limit);
+    if kept.len() == text.len() {
+        kept.to_owned()
+    } else {
+        format!("[...]{kept}")
     }
-    let mut start = text.len() - limit;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("[...]{}", &text[start..])
 }
 
 /// Runs every argv in `dir` (gated process tree, credentials removed from the
@@ -455,7 +417,6 @@ pub async fn run_checks(
         }
         let mut command = Argv::new(plain(dir), &argv[0])
             .args(argv[1..].iter())
-            .env(NESTED_ENV, "1")
             .timeout(remaining)
             .limit(256 * 1024);
         command.env_remove = ["COVE_API_KEY".into()].into();
@@ -508,7 +469,6 @@ pub fn validate_argvs(commands: &[Vec<String>]) -> Result<()> {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Race,
-    Inbox,
     Turn,
 }
 
@@ -644,26 +604,13 @@ pub async fn project_lock(
     project: &Path,
     timeout: Duration,
 ) -> Result<std::fs::File> {
-    let directory = data_dir.join("changesets");
-    std::fs::create_dir_all(&directory)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(format!("{}.lock", project_key(project))))?;
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if file.try_lock_exclusive().is_ok() {
-            return Ok(file);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(Error::Tool(
-                "另一个应用操作正占用这个项目的锁；请稍后重试".into(),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let path = data_dir
+        .join("changesets")
+        .join(format!("{}.lock", project_key(project)));
+    crate::persist::try_lock_async(&path, timeout, |_| {
+        Error::Tool("另一个应用操作正占用这个项目的锁；请稍后重试".into())
+    })
+    .await
 }
 
 /// Validates a user-supplied output path: a new file outside the project.
@@ -755,7 +702,7 @@ pub(crate) mod tests {
         };
         let mut set = Changeset {
             id: "x".into(),
-            kind: Kind::Inbox,
+            kind: Kind::Race,
             title: String::new(),
             baseline: None,
             patch_sha256: String::new(),

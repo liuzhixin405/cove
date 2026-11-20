@@ -98,11 +98,13 @@ const PRICES: &[(&str, f64, f64, f64)] = &[
     ("o4-mini", 1.1, 0.275, 4.4),
 ];
 
-/// An unknown Claude ID is billed at the most expensive tier, so a budget stays a ceiling.
+/// An unknown Claude ID is billed at the most expensive tier: overstate the cost rather than understate it.
 const UNKNOWN_CLAUDE: (f64, f64, f64) = (15.0, 1.5, 75.0);
 
 /// Anthropic bills a five-minute cache write at 1.25x the input rate.
 pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+/// Cache writes kept an hour (Anthropic `ttl: "1h"`), relative to the input rate.
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 /// Cache reads cost a tenth of the input rate unless the table says otherwise.
 pub const CACHE_READ_RATIO: f64 = 0.1;
 
@@ -126,14 +128,17 @@ impl Prices {
         }
     }
 
-    /// Estimated USD for one response; cache reads and writes are parts of `usage.input`.
+    /// Estimated USD for one response; cache reads and writes are parts of `usage.input`,
+    /// and writes kept an hour cost twice the input rate instead of `cache_write`.
     pub fn cost(&self, usage: &crate::domain::Usage) -> f64 {
         let read = usage.cache_read.min(usage.input);
         let write = usage.cache_write.min(usage.input - read);
+        let write_1h = usage.cache_write_1h.min(write);
         let plain = usage.input - read - write;
         (plain as f64 * self.input
             + read as f64 * self.cache_read
-            + write as f64 * self.cache_write
+            + (write - write_1h) as f64 * self.cache_write
+            + write_1h as f64 * self.input * CACHE_WRITE_1H_MULTIPLIER
             + usage.output as f64 * self.output)
             / 1_000_000.0
     }
@@ -166,6 +171,17 @@ pub fn context_budget(window: usize, max_output: u32) -> usize {
     let margin = (window / 8).clamp(1024, 8000);
     let room = window.saturating_sub(max_output as usize + margin);
     (window * 85 / 100).min(room).max(4096)
+}
+
+/// What a response cost: the provider's own figure when it reports one, else the usage at
+/// `prices` with cache reads and writes at their own rates; `None` when neither is known.
+/// The one rule for session accounting and the usage ledger alike.
+pub fn charge(response: &crate::domain::ModelResponse, prices: Option<Prices>) -> Option<f64> {
+    response.reported_cost.or_else(|| {
+        prices
+            .filter(|_| response.usage_reported)
+            .map(|prices| prices.cost(&response.usage))
+    })
 }
 
 /// List prices per million tokens; `None` for models the table does not know.
@@ -283,6 +299,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_input_is_charged_at_cache_rates() {
+        // A real ledger line: 100065 input, of which 98816 cache reads and 1247 cache
+        // writes, 955 output, at $4 / $20 per million. Billed as plain input it was $0.419.
+        let response =
+            |reported_cost: Option<f64>, usage_reported: bool| crate::domain::ModelResponse {
+                message: crate::domain::Message::user(""),
+                usage: crate::domain::Usage {
+                    input: 100_065,
+                    output: 955,
+                    cache_read: 98_816,
+                    cache_write: 1_247,
+                    ..Default::default()
+                },
+                complete: true,
+                usage_reported,
+                reported_cost,
+                model: None,
+            };
+        let prices = Some(Prices::from_pair((4.0, 20.0)));
+        let cost = charge(&response(None, true), prices).unwrap();
+        assert!((0.06..0.07).contains(&cost), "{cost}");
+        assert_eq!(charge(&response(Some(1.5), true), None), Some(1.5));
+        assert_eq!(charge(&response(None, false), prices), None);
+    }
+
+    #[test]
     fn windows_outputs_and_prices_follow_the_built_in_tables() {
         assert_eq!(context_window("deepseek-v4-pro"), 1_000_000);
         assert_eq!(context_window("Claude-Opus-4-1-20250805"), 200_000);
@@ -306,9 +348,16 @@ mod tests {
             output: 0,
             cache_read: 600_000,
             cache_write: 200_000,
+            ..Default::default()
         };
         // 200k plain at 3.0, 600k reads at 0.3, 200k writes at 3.75.
         assert!((card.cost(&usage) - (0.6 + 0.18 + 0.75)).abs() < 1e-9);
+        // Kept an hour, half of those writes cost twice the input rate: 100k at 6.0.
+        let hour = crate::domain::Usage {
+            cache_write_1h: 100_000,
+            ..usage
+        };
+        assert!((card.cost(&hour) - (0.6 + 0.18 + 0.375 + 0.6)).abs() < 1e-9);
         let configured = prices_for("gpt-4o", Some((5.0, 20.0))).unwrap();
         assert_eq!(configured.cache_read, 2.5);
         assert!((prices_for("local", Some((1.0, 2.0))).unwrap().cache_read - 0.1).abs() < 1e-12);

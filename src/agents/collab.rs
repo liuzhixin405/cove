@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agents::lifecycle::Kind,
     agents::plan::{PlanTask, run_tasks},
-    agents::subagent::{AgentHub, clip},
+    agents::subagent::AgentHub,
     domain::{Error, Result, ToolDefinition},
     tools::ToolOutput,
 };
@@ -243,7 +243,7 @@ async fn run(
                     task.team
                         .as_ref()
                         .map_or(String::new(), |team| format!(" team={team}")),
-                    clip(&task.title, 100)
+                    crate::text::short(&task.title, 100)
                 ));
             }
             text(out)
@@ -266,7 +266,7 @@ async fn run(
                 task.title,
                 task.status,
                 task.description,
-                clip(&task.output, 500)
+                crate::text::short(&task.output, 500)
             ))
         }
         "task_update" => {
@@ -285,7 +285,7 @@ async fn run(
                 task.status = status.into();
             }
             if let Some(output) = field(&input, "output") {
-                task.output = clip(output, 8000);
+                task.output = crate::text::short(output, 8000);
             }
             text(format!(
                 "{id} is now {} (recorded only; this does not run or verify anything)",
@@ -339,7 +339,7 @@ async fn run(
                 }
                 tasks.push(PlanTask {
                     id: format!("team-{name}-{}", index + 1),
-                    title: clip(&member.task, 100),
+                    title: crate::text::short(&member.task, 100),
                     prompt: member.task.clone(),
                     depends: Vec::new(),
                     agent_type: kind.clone(),
@@ -423,11 +423,7 @@ async fn run(
                 && let Ok(record) = hub.find_record(to)
                 && record.kind == Kind::Background
             {
-                let remaining = hub.ledger.remaining_budget();
-                return text(
-                    hub.send_agent(&record.id, message.into(), remaining)
-                        .await?,
-                );
+                return text(hub.send_agent(&record.id, message.into()).await?);
             }
             let pending_item = hub
                 .plan
@@ -492,7 +488,7 @@ async fn run(
                         "- {} [{}] {}\n",
                         item.id,
                         item.status,
-                        clip(&item.title, 100)
+                        crate::text::short(&item.title, 100)
                     ));
                 }
             }

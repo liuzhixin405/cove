@@ -103,7 +103,7 @@ fn directory(input: &Value) -> Option<String> {
     }
     let path = std::path::Path::new(value.split_whitespace().next().unwrap_or(value));
     path.parent()
-        .map(|p| p.display().to_string())
+        .map(|p| p.to_string_lossy().into_owned())
         .filter(|p| !p.is_empty())
 }
 
@@ -126,6 +126,8 @@ struct State {
     since_activity: u32,
     hits: u32,
     stopped: bool,
+    /// File-tool hints already given this task.
+    hinted: HashSet<&'static str>,
 }
 
 impl State {
@@ -249,6 +251,61 @@ impl ToolGuard {
     }
 }
 
+/// A hint when a shell command does what a file tool does better: writing or
+/// editing a workspace file, or reading a line range. Temporary files are fine.
+fn file_tool_hint(command: &str) -> Option<(&'static str, &'static str)> {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 4]> = std::sync::OnceLock::new();
+    let [in_place, redirect, tee, range] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(r"\bsed\s+(?:-[a-zA-Z]*i|--in-place)").unwrap(),
+            regex::Regex::new(r"\bcat\b[^|;&\n]*?>{1,2}\s*([^\s;&|<>]+)").unwrap(),
+            regex::Regex::new(r"\btee\s+(?:-a\s+)?([^\s;&|<>-][^\s;&|<>]*)").unwrap(),
+            regex::Regex::new(r#"\bsed\s+-n\s+['"]?\d+(?:,\d+)?p"#).unwrap(),
+        ]
+    });
+    let temporary = |target: &str| {
+        let target = target
+            .trim_matches(['"', '\''])
+            .replace('\\', "/")
+            .to_lowercase();
+        [
+            "/tmp",
+            "$tmp",
+            "${tmp",
+            "$temp",
+            "${temp",
+            "$env:temp",
+            "/dev/",
+        ]
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+            || target.contains("appdata/local/temp/")
+    };
+    if in_place.is_match(command) {
+        return Some((
+            "edit",
+            "[hint] Change workspace files with the edit tool rather than sed -i: it checks the file's current content, keeps encoding and line endings, and needs no shell approval.",
+        ));
+    }
+    let writes = redirect
+        .captures_iter(command)
+        .chain(tee.captures_iter(command))
+        .any(|captures| !temporary(&captures[1]));
+    if writes {
+        return Some((
+            "write",
+            "[hint] Create or rewrite workspace files with the write tool rather than cat >, heredocs or tee: it checks the file's current content, keeps encoding and line endings, and needs no shell approval.",
+        ));
+    }
+    if range.is_match(command) {
+        return Some((
+            "read",
+            "[hint] Read a line range with the read tool (offset and limit) rather than sed -n: it needs no shell approval and runs in parallel with other reads.",
+        ));
+    }
+    None
+}
+
 impl TurnHook for ToolGuard {
     fn task_note<'a>(&'a self, _session: &'a Session) -> BoxFuture<'a, Option<String>> {
         if let Ok(mut state) = self.state.lock() {
@@ -340,6 +397,11 @@ impl TurnHook for ToolGuard {
             for warning in safety::risky(command) {
                 notes.push(format!("[safety] warning: {warning}"));
             }
+            if let Some((kind, hint)) = file_tool_hint(command)
+                && state.hinted.insert(kind)
+            {
+                notes.push(hint.to_owned());
+            }
         }
         if !output.failed && matches!(name, "read" | "write" | "edit") {
             state.since_activity = 0;
@@ -426,6 +488,32 @@ impl TurnHook for PolicyGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_file_operations_get_a_file_tool_hint() {
+        let kind = |command: &str| file_tool_hint(command).map(|(kind, _)| kind);
+        assert_eq!(kind("sed -i 's/a/b/' src/main.rs"), Some("edit"));
+        assert_eq!(kind("sed -ri 's/a/b/' x"), Some("edit"));
+        assert_eq!(
+            kind("cat > src/Program.cs <<'EOF'\nclass A {}\nEOF"),
+            Some("write")
+        );
+        assert_eq!(kind("cat <<'EOF' >> notes.md\nx\nEOF"), Some("write"));
+        assert_eq!(kind("echo x | tee README.md"), Some("write"));
+        assert_eq!(kind("sed -n '10,40p' src/lib.rs"), Some("read"));
+        // Temporary scripts, plain reads and unrelated commands get none.
+        assert_eq!(kind("cat > /tmp/probe.py <<'EOF'\nprint(1)\nEOF"), None);
+        assert_eq!(kind("cat > \"$TEMP/x.ps1\""), None);
+        assert_eq!(kind("cat src/lib.rs 2>&1"), None);
+        assert_eq!(kind("cargo test 2>&1 | tee /dev/null"), None);
+        assert_eq!(kind("git status"), None);
+        // Workspace paths that merely contain "tmp" or "dev" are still workspace files.
+        assert_eq!(
+            kind("cat > src/tmpl/page.html <<'EOF'\nx\nEOF"),
+            Some("write")
+        );
+        assert_eq!(kind("tee web/dev/app.js"), Some("write"));
+    }
     use serde_json::json;
 
     fn output(content: &str, failed: bool) -> ToolOutput {

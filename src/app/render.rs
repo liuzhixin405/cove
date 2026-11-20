@@ -3,7 +3,7 @@
 //! (`-p`, piped) output keeps the machine-readable lines in `ui`.
 
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -17,14 +17,14 @@ const HEADING: &str = "\x1b[1;4m";
 /// Longest tool detail shown in a title, in characters.
 const DETAIL: usize = 90;
 
+/// The first line in at most `max` columns; `…` marks a cut or further lines.
 fn clip(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
-    if line.chars().count() <= max && !text.trim().contains('\n') {
-        return line.to_owned();
+    if text.trim().contains('\n') {
+        crate::text::clip_width(&format!("{line}…"), max)
+    } else {
+        crate::text::clip_width(line, max)
     }
-    let mut out: String = line.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 fn field<'a>(input: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -99,6 +99,47 @@ pub fn tool_title(name: &str, input: &Value) -> String {
     format!("{verb} {}", clip(&detail, DETAIL))
         .trim_end()
         .to_owned()
+}
+
+/// Lines of an edit's change shown under its row: removed ones red, added ones green,
+/// the lines both sides share left out.
+pub fn edit_preview(input: &Value) -> Vec<String> {
+    const SHOWN: usize = 8;
+    let (Some(old), Some(new)) = (
+        field(input, &["old", "old_string"]),
+        field(input, &["new", "new_string"]),
+    ) else {
+        return Vec::new();
+    };
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let removed = &old[head..old.len() - tail];
+    let added = &new[head..new.len() - tail];
+    let line = |sign: char, color: &str, text: &str| {
+        let text = crate::text::clip_width(&crate::text::visible_row(text), 100);
+        format!("  {DIM}│{RESET} {color}{sign} {text}{RESET}")
+    };
+    let mut rows: Vec<String> = removed
+        .iter()
+        .map(|text| line('-', RED, text))
+        .chain(added.iter().map(|text| line('+', GREEN, text)))
+        .collect();
+    if rows.len() > SHOWN {
+        rows.truncate(SHOWN - 2);
+        rows.push(format!(
+            "  {DIM}│ …… 共 +{} −{} 行{RESET}",
+            added.len(),
+            removed.len()
+        ));
+    }
+    rows
 }
 
 /// The `●` row that opens a tool call.
@@ -196,13 +237,24 @@ fn interpreter(word: &str) -> Option<&'static [&'static str]> {
 }
 
 /// A script file that is not project code: in a scratch location, or in a language the
-/// project does not use (a `.py` file in a project without Python packaging).
+/// project does not use (a `.py` file in a project without Python packaging, unless it
+/// sits in a package directory).
 fn scratch_script(path: &str, root: &Path) -> bool {
     let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
+    // A module of a Python package is project code, packaging files or not.
+    if extension == "py" && !scratch_location(path, root) {
+        let full = root.join(path);
+        if full
+            .parent()
+            .is_some_and(|dir| dir.join("__init__.py").is_file())
+        {
+            return false;
+        }
+    }
     let markers: &[&str] = match extension.as_str() {
         "py" => &[
             "pyproject.toml",
@@ -224,10 +276,7 @@ fn scratch_script(path: &str, root: &Path) -> bool {
 
 /// Outside the project, in the temp directory, or under a build/scratch directory.
 fn scratch_location(path: &str, root: &Path) -> bool {
-    let plain = |path: &Path| {
-        let text = path.to_string_lossy();
-        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
-    };
+    let plain = crate::paths::plain;
     let path = Path::new(path);
     let full = if path.is_absolute() {
         plain(path)
@@ -308,6 +357,13 @@ fn tail(text: &str, count: usize) -> Vec<String> {
     out
 }
 
+/// `N` of the edit tool's "Edited <file>: N replacement(s)".
+fn edit_count(output: &str) -> Option<usize> {
+    let first = output.lines().next()?.strip_prefix("Edited ")?;
+    let (_, rest) = first.rsplit_once(": ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
 fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String> {
     // The refusal the model is told about (engine::agent::denied), in the user's words.
     if let Some(rest) = output.strip_prefix("The user denied this call (") {
@@ -364,7 +420,11 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
             vec![format!("{} 个文件", rows.len())]
         }
         "shell" => shell_summary(failed, output, streamed),
-        "write" | "edit" | "todo" => vec![clip(output, 160)],
+        "edit" => match edit_count(output) {
+            Some(count) => vec![format!("改了 {count} 处")],
+            None => vec![clip(output, 160)],
+        },
+        "write" | "todo" => vec![clip(output, 160)],
         _ => {
             let rows = lines_of(output);
             match rows.len() {
@@ -1090,10 +1150,61 @@ mod tests {
         assert!(write("target/tmp/x.ps1"));
         assert!(!write("build.bat"));
         assert!(!write("src/main.rs"));
+        // A module of a package directory is project code even without packaging.
+        std::fs::create_dir_all(root.join("shop")).unwrap();
+        std::fs::write(root.join("shop/__init__.py"), "").unwrap();
+        assert!(!write("shop/pricing.py"));
+        assert!(!scratch_call(
+            "edit",
+            &serde_json::json!({"path": "shop/pricing.py"}),
+            &root
+        ));
         std::fs::write(root.join("pyproject.toml"), "").unwrap();
         assert!(!write("repro.py"));
         assert!(!shell("python tools/gen.py"));
         assert!(write("tmp/repro.py"));
+    }
+
+    #[test]
+    fn edits_show_the_lines_they_change() {
+        let strip = |rows: Vec<String>| -> Vec<String> {
+            rows.iter()
+                .map(|row| {
+                    regex::Regex::new(r"\x1b\[[0-9;]*m")
+                        .unwrap()
+                        .replace_all(row, "")
+                        .into_owned()
+                })
+                .collect()
+        };
+        let input = serde_json::json!({
+            "old": "def shipping(amount):\n    return 0 if amount > LIMIT else FEE\n",
+            "new": "def shipping(amount):\n    return 0 if amount >= LIMIT else FEE\n",
+        });
+        assert_eq!(
+            strip(edit_preview(&input)),
+            [
+                "  │ -     return 0 if amount > LIMIT else FEE",
+                "  │ +     return 0 if amount >= LIMIT else FEE",
+            ]
+        );
+        let long = serde_json::json!({
+            "old_string": "a",
+            "new_string": (0..12).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"),
+        });
+        let rows = strip(edit_preview(&long));
+        assert_eq!(rows.len(), 7);
+        assert!(rows[6].contains("共 +12 −1 行"), "{rows:?}");
+        assert!(edit_preview(&serde_json::json!({"path": "x"})).is_empty());
+        assert_eq!(
+            summary(
+                "edit",
+                false,
+                "Edited src/a.py: 2 replacement(s)\n3: x",
+                false
+            ),
+            ["改了 2 处"]
+        );
     }
 
     #[test]

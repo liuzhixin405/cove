@@ -156,13 +156,13 @@ impl OAuth {
         if let Some(saved) = self.cache.lock().ok()?.get(server) {
             return Some(saved.clone());
         }
-        let saved: Saved = crate::session::read_json(&self.path(server)).ok()?;
+        let saved: Saved = crate::persist::read_json(&self.path(server)).ok()?;
         (saved.server == server).then_some(saved)
     }
 
     fn store(&self, saved: Saved) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        crate::session::atomic_json(&self.path(&saved.server), &saved)?;
+        crate::persist::atomic_json(&self.path(&saved.server), &saved)?;
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(saved.server.clone(), saved);
         }
@@ -235,10 +235,7 @@ impl OAuth {
         if !status.is_success() {
             return Err(failed(
                 "token request",
-                format!(
-                    "HTTP {status}: {}",
-                    crate::extensions::skills::clip(&text, 300)
-                ),
+                format!("HTTP {status}: {}", crate::text::clip_chars(&text, 300)),
             ));
         }
         serde_json::from_str(&text).map_err(|err| failed("token response", err))

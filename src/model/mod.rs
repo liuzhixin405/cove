@@ -4,5 +4,6 @@ pub mod eventstream;
 pub mod images;
 pub mod models;
 pub mod net;
+pub mod oneshot;
 pub mod provider;
 pub mod routing;

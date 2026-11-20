@@ -241,7 +241,7 @@ async fn plan_mode_refuses_changes_with_guidance() {
 }
 
 #[tokio::test]
-async fn memory_can_be_read_after_repeated_missing_scope_errors() {
+async fn memory_reads_without_scope_using_the_short_id_of_the_index() {
     use cove::{
         memory::store::{Memory, MemoryArgs, Scope},
         safety::permission::{LocalAuthorizer, Mode},
@@ -263,7 +263,7 @@ async fn memory_can_be_read_after_repeated_missing_scope_errors() {
     let saved = memory
         .execute(
             MemoryArgs::Add {
-                scope: Scope::Project,
+                scope: Scope::Global,
                 title: "analysis".into(),
                 content: "previous analysis is available".into(),
                 source: "test".into(),
@@ -272,30 +272,19 @@ async fn memory_can_be_read_after_repeated_missing_scope_errors() {
         )
         .unwrap();
     let id = saved["saved"].as_str().unwrap();
-    let mut responses: Vec<String> = (0..5)
-        .map(|index| {
-            tool(
-                &format!("bad-{index}"),
-                "memory",
-                json!({"action":"read", "id":id}),
-            )
-        })
-        .collect();
-    responses.push(tool(
-        "corrected",
-        "memory",
-        json!({"action":"read", "id":id, "scope":"project"}),
-    ));
-    responses.push(text("Analysis recovered."));
+    let responses = vec![
+        tool("read", "memory", json!({"action":"read", "id":&id[..8]})),
+        text("Analysis recovered."),
+    ];
     let (url, server) = mock_server(responses).await;
     let output = cli(root.path(), data.path(), &url, "auto")
         .args(["--no-auto", "-p", "read the saved analysis"])
         .launch()
         .await
         .unwrap();
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 2);
     let definition = requests[0]["tools"]
         .as_array()
         .unwrap()
@@ -304,10 +293,9 @@ async fn memory_can_be_read_after_repeated_missing_scope_errors() {
         .unwrap();
     assert_eq!(
         definition["function"]["parameters"]["required"],
-        json!(["action", "scope"])
+        json!(["action"])
     );
-    assert!(tool_result(&requests[5]).contains("missing field"));
-    assert!(tool_result(&requests[6]).contains("previous analysis is available"));
+    assert!(tool_result(&requests[1]).contains("previous analysis is available"));
 }
 
 #[tokio::test]

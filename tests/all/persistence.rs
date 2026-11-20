@@ -92,7 +92,6 @@ fn agent(provider: Arc<Fake>, tools: Arc<LocalTools>, max_turns: u32) -> Agent {
         Limits {
             max_turns,
             max_output_tokens: 256,
-            budget: None,
             prices: None,
         },
     )
@@ -156,7 +155,6 @@ async fn model_dispatch_preserves_cost_before_contacting_provider() {
     struct ObservingProvider {
         store: Store,
         id: String,
-        renewed: bool,
     }
     impl Provider for ObservingProvider {
         fn stream(
@@ -167,13 +165,7 @@ async fn model_dispatch_preserves_cost_before_contacting_provider() {
         ) -> BoxFuture<'_, Result<ModelResponse>> {
             Box::pin(async move {
                 let durable = self.store.load(&self.id)?;
-                if self.renewed {
-                    assert_eq!(durable.accounting.cost, None);
-                    assert!(durable.accounting.renewed_budget.is_some());
-                    assert_eq!(durable.accounting.budget_cost(), Some(0.0));
-                } else {
-                    assert_eq!(durable.accounting.cost, Some(0.0));
-                }
+                assert_eq!(durable.accounting.cost, Some(0.0));
                 assert_eq!(durable.accounting.model_calls, 1);
                 Ok(response(vec![Block::Text("done".into())]))
             })
@@ -192,7 +184,6 @@ async fn model_dispatch_preserves_cost_before_contacting_provider() {
     let provider = Arc::new(ObservingProvider {
         store: store.clone(),
         id: session.id.clone(),
-        renewed: false,
     });
     let agent = Agent::new(
         provider,
@@ -200,7 +191,6 @@ async fn model_dispatch_preserves_cost_before_contacting_provider() {
         Limits {
             max_turns: 2,
             max_output_tokens: 256,
-            budget: Some(1.0),
             prices: Some((1.0, 1.0)),
         },
     )
@@ -221,47 +211,6 @@ async fn model_dispatch_preserves_cost_before_contacting_provider() {
         store.load(&session.id).unwrap().accounting.cost,
         Some(0.000015)
     );
-
-    let (_, tools) = setup(root.path(), &store);
-    let mut session = Session::new(
-        root.path().canonicalize().unwrap(),
-        "Openai".into(),
-        "mock".into(),
-        Some((1.0, 1.0)),
-    );
-    session.accounting.cost = None;
-    session.accounting.reset_budget_spend();
-    let provider = Arc::new(ObservingProvider {
-        store: store.clone(),
-        id: session.id.clone(),
-        renewed: true,
-    });
-    let agent = Agent::new(
-        provider,
-        tools,
-        Limits {
-            max_turns: 2,
-            max_output_tokens: 256,
-            budget: Some(1.0),
-            prices: Some((1.0, 1.0)),
-        },
-    )
-    .unwrap();
-    let (tx, drain) = events();
-    agent
-        .run_in(
-            &mut session,
-            Some("task".into()),
-            &store,
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    drain.await.unwrap();
-    let saved = store.load(&session.id).unwrap();
-    assert_eq!(saved.accounting.cost, None);
-    assert_eq!(saved.accounting.budget_cost(), Some(0.000015));
 }
 
 #[tokio::test]
@@ -606,7 +555,7 @@ async fn uncertain_file_intent_requires_matching_evidence_before_resolution() {
         checkpoint["changes"][0]["after"] = checkpoint["changes"][0]["before"].clone();
         checkpoint["changes"][0]["state"] = json!("Intent");
         checkpoint["changes"][0]["intended"] = json!("after");
-        cove::session::atomic_json(&path, &checkpoint).unwrap();
+        cove::persist::atomic_json(&path, &checkpoint).unwrap();
         if !executed {
             std::fs::write(root.path().join("file"), "before").unwrap();
         }
@@ -864,16 +813,19 @@ async fn million_window_compaction_preserves_history_on_truncation_and_persists_
 }
 
 #[tokio::test]
-async fn million_window_does_not_compact_before_new_threshold() {
+async fn million_window_does_not_compact_below_the_slow_threshold() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let (_, tools) = setup(root.path(), &store);
     let mut session = session(root.path());
-    million_window_history(&mut session, 240);
+    million_window_history(&mut session, 100);
     let budget = cove::model::models::context_budget(1_000_000, 64_000);
     let before = cove::engine::context::tokens(&session.messages);
-    assert!(before > budget * 3 / 4 && before < budget * 9 / 10);
+    assert!(
+        before > 250_000 && before < cove::engine::agent::SLOW_TOKENS,
+        "{before}"
+    );
     let provider = Fake::new(vec![
         response(vec![Block::Text("Task finished".into())]),
         response(vec![Block::Text("Unexpected extra request".into())]),
@@ -939,6 +891,178 @@ async fn million_window_automatically_compacts_before_continuing_task() {
             .flat_map(|message| &message.blocks)
             .any(|block| matches!(block, Block::Text(text) if text.contains("next task")))
     );
+}
+
+#[tokio::test]
+async fn million_window_compacts_where_calls_slow_down() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    million_window_history(&mut session, 160);
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    let before = cove::engine::context::tokens(&session.messages);
+    // Past the slow threshold, far below 90% of the 1M budget.
+    assert!(
+        before > cove::engine::agent::SLOW_TOKENS && before < budget * 6 / 10,
+        "{before}"
+    );
+    let provider = Fake::new(vec![
+        response(vec![Block::Text("Old verified context".into())]),
+        response(vec![Block::Text("Task finished".into())]),
+    ]);
+    let agent = agent(provider.clone(), tools, 3)
+        .with_context_tokens(budget)
+        .unwrap();
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some("next task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    // What was kept lands well below the threshold again.
+    assert!(
+        cove::engine::context::tokens(&session.messages) < cove::engine::agent::SLOW_TOKENS / 2
+    );
+}
+
+/// Answers compaction requests with a summary and task requests from a script;
+/// reports no usage, so the token estimate stays uncalibrated.
+struct Summarizer {
+    script: Mutex<VecDeque<Vec<Block>>>,
+    summaries: Mutex<u32>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl Provider for Summarizer {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        _: mpsc::Sender<Event>,
+        _: CancellationToken,
+    ) -> BoxFuture<'_, Result<ModelResponse>> {
+        Box::pin(async move {
+            let blocks = if request
+                .system
+                .starts_with(cove::engine::agent::COMPACT_SYSTEM_PREFIX)
+            {
+                *self.summaries.lock().unwrap() += 1;
+                vec![Block::Text("Summary written in the background".into())]
+            } else {
+                self.requests.lock().unwrap().push(request);
+                self.script.lock().unwrap().pop_front().unwrap()
+            };
+            let mut answer = response(blocks);
+            answer.usage_reported = false;
+            Ok(answer)
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let slow = cove::engine::agent::SLOW_TOKENS;
+    // Just inside the lead: the summary starts in the background on the first call.
+    let mut count = 100;
+    let mut session = loop {
+        let mut session = self::session(root.path());
+        million_window_history(&mut session, count);
+        if cove::engine::context::tokens(&session.messages) > slow - 5_000 {
+            break session;
+        }
+        count += 1;
+    };
+    let before = cove::engine::context::tokens(&session.messages);
+    assert!(before < slow, "{before}");
+    // The read result then pushes the context past the threshold.
+    std::fs::write(
+        root.path().join("big.txt"),
+        "word word word word word word word
+"
+        .repeat(20_000),
+    )
+    .unwrap();
+    let provider = Arc::new(Summarizer {
+        script: Mutex::new(VecDeque::from([
+            vec![Block::ToolUse {
+                id: "r1".into(),
+                name: "read".into(),
+                input: json!({"path":"big.txt"}),
+                extra: None,
+            }],
+            vec![Block::Text("Task finished".into())],
+        ])),
+        summaries: Mutex::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let budget = cove::model::models::context_budget(1_000_000, 64_000);
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        Limits {
+            max_turns: 5,
+            max_output_tokens: 256,
+            prices: None,
+        },
+    )
+    .unwrap()
+    .with_context_tokens(budget)
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(256);
+    let notices = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let Event::Notice(text) = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    agent
+        .run_in(
+            &mut session,
+            Some("next task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let notices = notices.await.unwrap();
+    assert_eq!(*provider.summaries.lock().unwrap(), 1, "no second summary");
+    assert_eq!(session.compactions, 1);
+    assert!(
+        notices.iter().any(|text| text.contains("提前在后台")),
+        "{notices:?}"
+    );
+    // The last request carries the summary and, verbatim, what came after it.
+    let requests = provider.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    let text: String = last
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.as_str()),
+            Block::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("Summary written in the background"));
+    assert!(text.contains("word word"));
+    assert!(cove::engine::context::tokens(&last.messages) < slow);
 }
 
 #[tokio::test]
@@ -1115,7 +1239,6 @@ async fn unknown_usage_counts_as_zero_and_preserves_known_spend() {
         Limits {
             max_turns: 3,
             max_output_tokens: 256,
-            budget: Some(1.0),
             prices: Some((1.0, 1.0)),
         },
     )
@@ -1173,7 +1296,6 @@ async fn provider_failure_counts_as_zero_and_allows_continuation() {
         Limits {
             max_turns: 3,
             max_output_tokens: 256,
-            budget: Some(1.0),
             prices: Some((1.0, 1.0)),
         },
     )
@@ -1210,186 +1332,6 @@ async fn provider_failure_counts_as_zero_and_allows_continuation() {
     drain.await.unwrap();
     assert_eq!(loaded.accounting.cost, Some(0.250015));
     assert_eq!(provider.requests.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn legacy_unknown_cost_resumes_with_a_new_budget_counter() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
-    let (_, tools) = setup(root.path(), &store);
-    let mut session = Session::new(
-        root.path().canonicalize().unwrap(),
-        "Openai".into(),
-        "mock".into(),
-        Some((1.0, 1.0)),
-    );
-    session.accounting.cost = None;
-    session.state = cove::session::State::Interrupted("old unknown cost".into());
-    let provider = Fake::new(vec![response(vec![Block::Text("done".into())])]);
-    let agent = Agent::new(
-        provider,
-        tools,
-        Limits {
-            max_turns: 3,
-            max_output_tokens: 256,
-            budget: Some(1.0),
-            prices: Some((1.0, 1.0)),
-        },
-    )
-    .unwrap();
-    let (tx, drain) = events();
-    assert!(
-        agent
-            .run_in(&mut session, None, &store, tx, CancellationToken::new())
-            .await
-            .is_ok()
-    );
-    drain.await.unwrap();
-    let loaded = store.load(&session.id).unwrap();
-    assert_eq!(loaded.accounting.cost, None);
-    assert_eq!(loaded.accounting.budget_cost(), Some(0.000015));
-}
-
-#[tokio::test]
-async fn renewed_budget_counts_future_spend_without_claiming_historical_cost() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
-    let (_, tools) = setup(root.path(), &store);
-    let mut session = Session::new(
-        root.path().canonicalize().unwrap(),
-        "Openai".into(),
-        "mock".into(),
-        Some((1.0, 1.0)),
-    );
-    let provider = Fake::new(Vec::new());
-    let agent = Agent::new(
-        provider.clone(),
-        tools,
-        Limits {
-            max_turns: 3,
-            max_output_tokens: 256,
-            budget: Some(0.000025),
-            prices: Some((1.0, 1.0)),
-        },
-    )
-    .unwrap();
-    let (tx, drain) = events();
-    assert!(
-        agent
-            .run_in(
-                &mut session,
-                Some("task".into()),
-                &store,
-                tx,
-                CancellationToken::new()
-            )
-            .await
-            .is_err()
-    );
-    drain.await.unwrap();
-    let mut loaded = store.load(&session.id).unwrap();
-    loaded.accounting.cost = None;
-    loaded.accounting.reset_budget_spend();
-    store.save(&loaded).unwrap();
-    let mut loaded = store.load(&session.id).unwrap();
-    provider.responses.lock().unwrap().extend([
-        response(vec![Block::Text("done".into())]),
-        response(vec![Block::Text("done again".into())]),
-    ]);
-    let (tx, drain) = events();
-    assert!(
-        agent
-            .run_in(&mut loaded, None, &store, tx, CancellationToken::new())
-            .await
-            .is_ok()
-    );
-    drain.await.unwrap();
-    assert_eq!(loaded.accounting.cost, None);
-    assert_eq!(loaded.accounting.budget_cost(), Some(0.000015));
-    let (tx, drain) = events();
-    assert!(
-        agent
-            .run_in(
-                &mut loaded,
-                Some("next task".into()),
-                &store,
-                tx,
-                CancellationToken::new()
-            )
-            .await
-            .is_ok()
-    );
-    drain.await.unwrap();
-    assert_eq!(loaded.accounting.cost, None);
-    assert_eq!(loaded.accounting.budget_cost(), Some(0.00003));
-    assert_eq!(provider.requests.lock().unwrap().len(), 3);
-}
-
-#[tokio::test]
-async fn renewed_budget_counts_missing_usage_as_zero() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
-    let (_, tools) = setup(root.path(), &store);
-    let mut session = Session::new(
-        root.path().canonicalize().unwrap(),
-        "Openai".into(),
-        "mock".into(),
-        Some((1.0, 1.0)),
-    );
-    session.accounting.cost = None;
-    session.accounting.reset_budget_spend();
-    let mut missing_usage = response(vec![Block::Text("done".into())]);
-    missing_usage.usage_reported = false;
-    let provider = Fake::new(vec![missing_usage]);
-    let agent = Agent::new(
-        provider.clone(),
-        tools,
-        Limits {
-            max_turns: 3,
-            max_output_tokens: 256,
-            budget: Some(1.0),
-            prices: Some((1.0, 1.0)),
-        },
-    )
-    .unwrap();
-    let (tx, drain) = events();
-    assert!(
-        agent
-            .run_in(
-                &mut session,
-                Some("task".into()),
-                &store,
-                tx,
-                CancellationToken::new()
-            )
-            .await
-            .is_ok()
-    );
-    drain.await.unwrap();
-    let loaded = store.load(&session.id).unwrap();
-    assert_eq!(loaded.accounting.cost, None);
-    assert_eq!(loaded.accounting.budget_cost(), Some(0.0));
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
-}
-
-#[test]
-fn renewed_budget_counts_unknown_subagent_spend_as_zero() {
-    let mut accounting = cove::session::Accounting::default();
-    accounting.reset_budget_spend();
-    cove::engine::agent::add_spend(
-        &mut accounting,
-        &cove::session::Accounting {
-            cost: Some(0.25),
-            ..Default::default()
-        },
-    );
-    assert_eq!(accounting.cost, None);
-    assert_eq!(accounting.budget_cost(), Some(0.25));
-    cove::engine::agent::add_spend(&mut accounting, &cove::session::Accounting::default());
-    assert_eq!(accounting.budget_cost(), Some(0.25));
 }
 
 #[tokio::test]

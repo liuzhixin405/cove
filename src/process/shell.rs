@@ -107,7 +107,8 @@ impl Shell {
 
     /// An installed interpreter of `kind`, found once per process.
     pub fn available(kind: ShellKind) -> Option<&'static Shell> {
-        static FOUND: [OnceLock<Option<Shell>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        static FOUND: [OnceLock<Option<Shell>>; 3] =
+            [OnceLock::new(), OnceLock::new(), OnceLock::new()];
         let current = Self::current();
         if current.kind == kind {
             return Some(current);
@@ -145,7 +146,9 @@ impl Shell {
         Ok(match value.to_ascii_lowercase().as_str() {
             "" | "auto" => Self::detect(),
             "powershell" | "pwsh" => Self::powershell(),
-            "cmd" => Self::cmd().ok_or_else(|| Error::Tool("shell \"cmd\" is only on Windows".into()))?,
+            "cmd" => {
+                Self::cmd().ok_or_else(|| Error::Tool("shell \"cmd\" is only on Windows".into()))?
+            }
             "bash" | "sh" => {
                 let detected = Self::detect();
                 if detected.kind == ShellKind::Posix {
@@ -211,7 +214,7 @@ impl Shell {
 
     /// Dialect plus where it lives, e.g. `bash (D:\Program Files\Git\bin\bash.exe)`.
     pub fn describe(&self) -> String {
-        let mut text = format!("{} ({})", self.dialect(), self.path.display());
+        let mut text = format!("{} ({})", self.dialect(), crate::paths::display(&self.path));
         if cfg!(windows) && self.kind == ShellKind::Posix {
             text.push_str(" on Windows; use POSIX paths like /d/dir or forward slashes");
         }

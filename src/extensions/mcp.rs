@@ -27,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::{Error, Result},
-    extensions::skills::clip,
     extensions::{McpTransport, Registry, ServerConfig, Sourced},
     process::ManagedChild,
     safety::permission::{Authorizer, Effect},
@@ -152,7 +151,7 @@ fn summary(tool: &Tool) -> ToolSummary {
     let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
     ToolSummary {
         name: tool.name.to_string(),
-        description: clip(
+        description: crate::text::clip_chars(
             tool.description.as_deref().unwrap_or_default().trim(),
             DESCRIPTION_LIMIT,
         ),
@@ -163,7 +162,7 @@ fn summary(tool: &Tool) -> ToolSummary {
                 .and_then(Value::as_object)
                 .map(|p| p.keys().cloned().collect())
                 .unwrap_or_default();
-            clip(
+            crate::text::clip_chars(
                 &format!(
                     "{{\"properties\":{properties:?},\"note\":\"schema clipped; use action=tools\"}}"
                 ),

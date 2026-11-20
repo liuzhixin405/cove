@@ -183,7 +183,7 @@ impl WorkflowTools {
                     content: format!(
                         "Saved screenshot of {url} ({width}x{height}, {} bytes){note} to {}",
                         value.len(),
-                        crate::workflows::changes::plain(&saved).display()
+                        crate::paths::plain(&saved).to_string_lossy()
                     ),
                     failed: false,
                     ..Default::default()

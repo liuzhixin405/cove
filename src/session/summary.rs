@@ -93,7 +93,7 @@ impl SessionSummary {
 
     /// The workspace's directory name, for lists that span workspaces.
     pub fn workspace_name(&self) -> String {
-        let shown = display_path(&self.cwd);
+        let shown = crate::paths::display(&self.cwd);
         shown
             .trim_end_matches(['\\', '/'])
             .rsplit(['\\', '/'])
@@ -130,15 +130,6 @@ impl Store {
     }
 }
 
-/// A path as users write it: without Windows' verbatim prefix.
-pub fn display_path(path: &Path) -> String {
-    let shown = path.display().to_string();
-    match shown.strip_prefix(r"\\?\") {
-        Some(rest) => rest.to_owned(),
-        None => shown,
-    }
-}
-
 /// One text line per session, numbered from 1 (plain output: pipes, `-p`,
 /// `--list-sessions`).
 pub fn history_lines(sessions: &[SessionSummary], current: Option<&str>, show_cwd: bool) -> String {
@@ -167,7 +158,7 @@ pub fn history_lines(sessions: &[SessionSummary], current: Option<&str>, show_cw
                 ""
             },
             if show_cwd {
-                format!("  {}", display_path(&session.cwd))
+                format!("  {}", crate::paths::display(&session.cwd))
             } else {
                 String::new()
             }

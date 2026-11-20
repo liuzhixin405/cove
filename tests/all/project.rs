@@ -539,7 +539,7 @@ async fn trace_and_error_logs_record_sizes_and_failures_but_no_text() {
 }
 
 #[tokio::test]
-async fn init_uses_model_after_budget_warning() {
+async fn init_uses_model_after_a_task() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let (url, server) = mock_server(vec![
@@ -551,15 +551,7 @@ async fn init_uses_model_after_budget_warning() {
     ])
     .await;
     let mut command = cove(root.path(), data.path(), &url);
-    command.args([
-        "--budget",
-        "0.00001",
-        "--input-price",
-        "1",
-        "--output-price",
-        "1",
-        "--no-auto",
-    ]);
+    command.args(["--input-price", "1", "--output-price", "1", "--no-auto"]);
     let (output, stdout, stderr) = repl(command, "task\n/init\n/exit\n").await;
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -580,19 +572,9 @@ async fn init_drafts_with_the_model_and_applies_without_overwriting() {
     )])
     .await;
     let mut command = cove(root.path(), data.path(), &url);
-    command.args([
-        "--budget",
-        "0.00001",
-        "--input-price",
-        "1",
-        "--output-price",
-        "1",
-        "-p",
-        "/init",
-    ]);
+    command.args(["--input-price", "1", "--output-price", "1", "-p", "/init"]);
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("[预算超限]"), "{stderr}");
     assert!(stdout.contains("+++ CLAUDE.md") && stdout.contains("+Run `make test`."));
     assert!(!root.path().join("CLAUDE.md").exists());
     let requests = server.await.unwrap();
@@ -763,7 +745,7 @@ async fn cd_and_restart_start_the_binary_again() {
     let data = tempfile::tempdir().unwrap();
     let (output, _, stderr) = repl(
         cove(root.path(), data.path(), NOWHERE),
-        &format!("/cd {}\n", other.path().display()),
+        &format!("/cd {}\n", other.path().to_string_lossy()),
     )
     .await;
     assert!(output.status.success(), "{stderr}");

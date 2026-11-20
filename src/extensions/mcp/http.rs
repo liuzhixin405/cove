@@ -312,7 +312,7 @@ impl Transport<RoleClient> for HttpTransport {
                     .unwrap_or_default();
                 return Err(err(format!(
                     "MCP POST: HTTP {status}: {}",
-                    crate::extensions::skills::clip(&text, 500)
+                    crate::text::clip_chars(&text, 500)
                 )));
             }
             if kind == McpTransport::Sse {

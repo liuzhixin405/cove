@@ -116,24 +116,30 @@ pub fn attach_files(prompt: &str, files: &[PathBuf]) -> anyhow::Result<String> {
     let mut out = prompt.to_owned();
     for path in files {
         let meta = std::fs::metadata(path).map_err(|err| {
-            anyhow::anyhow!("--file {}：{err}；请检查路径是否正确", path.display())
+            anyhow::anyhow!(
+                "--file {}：{err}；请检查路径是否正确",
+                crate::paths::display(path)
+            )
         })?;
         anyhow::ensure!(
             meta.is_file() && meta.len() <= FILE_LIMIT,
             "--file {}：只能附加不超过 256 KiB 的普通文件；更大的文件可放在工作区里，让模型自己读取",
-            path.display()
+            crate::paths::display(path)
         );
         let data = std::fs::read(path)?;
         let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
         let text = std::str::from_utf8(data).map_err(|_| {
             anyhow::anyhow!(
                 "--file {}：不是 UTF-8 文本（图片请用 --image）",
-                path.display()
+                crate::paths::display(path)
             )
         })?;
         out.push_str(&format!(
             "\n\n{}",
-            crate::tools::external::wrap(&format!("attached file {}", path.display()), text)
+            crate::tools::external::wrap(
+                &format!("attached file {}", crate::paths::display(path)),
+                text
+            )
         ));
     }
     Ok(out)
@@ -197,7 +203,7 @@ fn restart_with(exe: &Path, args: &[OsString]) -> anyhow::Result<u8> {
     let err = std::process::Command::new(exe).args(args).exec();
     Err(anyhow::anyhow!(
         "无法重新启动 {}：{err}；请手动再次运行 cove",
-        exe.display()
+        crate::paths::display(&exe)
     ))
 }
 

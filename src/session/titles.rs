@@ -14,18 +14,14 @@ use std::{
 };
 
 use futures_util::future::BoxFuture;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    domain::{Block, Message, ModelRequest, Provider},
-    engine::turn::TurnHook,
-};
+use crate::{domain::Provider, engine::turn::TurnHook};
 
 use super::{Session, SessionPersistence, Store, TITLE_CHARS, TitleSource};
 
 /// Told about each new title: (session id, title, whether it is the session in use).
-pub type Listener = Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+pub type Listener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Sessions given a title when a history list shows them, at most per list.
 const BACKFILL_LIMIT: usize = 20;
@@ -43,7 +39,7 @@ const CLIP: usize = 300;
 
 /// Whether a session with `turns` turns gets a new title.
 pub fn due(turns: usize) -> bool {
-    matches!(turns, 1..=3) || (turns > 3 && turns % 5 == 0)
+    matches!(turns, 1..=3) || (turns > 3 && turns.is_multiple_of(5))
 }
 
 pub struct Titler {
@@ -52,10 +48,9 @@ pub struct Titler {
     disabled: Option<String>,
     /// Finished titles by session id, waiting to be applied.
     ready: Arc<Mutex<HashMap<String, String>>>,
-    /// (session, turns) already titled in this process.
-    claimed: Mutex<HashSet<(String, usize)>>,
+    /// Each (session, turns) titled once per process; running work for shutdown.
+    work: crate::model::oneshot::Background,
     last: Arc<Mutex<Option<String>>>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     listener: Arc<Mutex<Option<Listener>>>,
     /// Sessions already queued for a title by a history list in this process.
     backfilled: Mutex<HashSet<String>>,
@@ -67,9 +62,8 @@ impl Titler {
             provider,
             disabled,
             ready: Arc::default(),
-            claimed: Mutex::default(),
+            work: Default::default(),
             last: Arc::default(),
-            tasks: Mutex::default(),
             listener: Arc::default(),
             backfilled: Mutex::default(),
         }
@@ -116,7 +110,7 @@ impl Titler {
             self.listener.clone(),
             self.last.clone(),
         );
-        let handle = tokio::spawn(async move {
+        self.work.spawn(async move {
             for session in sessions {
                 let id = session.id.clone();
                 let outcome = generate(provider.clone(), prompt(&session)).await;
@@ -155,15 +149,11 @@ impl Titler {
                     }
                     let listener = listener.lock().ok().and_then(|slot| slot.clone());
                     if let Some(listener) = listener {
-                        listener(&id, &title, false);
+                        listener(&id, &title);
                     }
                 }
             }
         });
-        if let Ok(mut tasks) = self.tasks.lock() {
-            tasks.retain(|task| !task.is_finished());
-            tasks.push(handle);
-        }
     }
 
     /// The title finished for `session`, if any; it is handed out once.
@@ -195,32 +185,19 @@ impl Titler {
 
     /// Lets running generations finish (bounded).
     pub async fn wait(&self, limit: Duration) {
-        let tasks: Vec<_> = self
-            .tasks
-            .lock()
-            .map(|mut tasks| tasks.drain(..).collect())
-            .unwrap_or_default();
-        let _ = tokio::time::timeout(limit, futures_util::future::join_all(tasks)).await;
+        self.work.wait(limit).await;
     }
 
     fn claim(&self, session: &Session, turns: usize) -> bool {
-        self.claimed
-            .lock()
-            .is_ok_and(|mut claimed| claimed.insert((session.id.clone(), turns)))
+        self.work.claim(format!("{}#{turns}", session.id))
     }
 }
 
 /// What the model sees: the first request and the latest turns, clipped.
 pub fn prompt(session: &Session) -> String {
     let turns = session.turns();
-    let clip = |text: &str| {
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if text.chars().count() <= CLIP {
-            text
-        } else {
-            format!("{}…", text.chars().take(CLIP).collect::<String>())
-        }
-    };
+    // CLIP characters, plus the `…` of a cut.
+    let clip = |text: &str| crate::text::clip_chars(&crate::text::one_line(text), CLIP + 1);
     let mut out = String::from("<conversation>\n");
     let skip = turns.len().saturating_sub(TURNS_SHOWN);
     for (index, turn) in turns.iter().enumerate() {
@@ -272,41 +249,17 @@ pub fn clean(reply: &str) -> Option<String> {
 }
 
 async fn generate(provider: Arc<dyn Provider>, prompt: String) -> Result<String, String> {
-    let (events, mut receiver) = mpsc::channel(64);
-    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
-    let response = provider.stream(
-        ModelRequest {
-            system: SYSTEM.into(),
-            messages: vec![Message::user(prompt)],
-            tools: Vec::new(),
-            max_output_tokens: 200,
-            estimated_tokens: None,
-            model: None,
-        },
-        events,
+    use crate::model::oneshot::{call, require_text, text_request};
+    let response = call(
+        &*provider,
+        text_request(SYSTEM, prompt, 200),
+        TIMEOUT,
         CancellationToken::new(),
-    );
-    let response = match tokio::time::timeout(TIMEOUT, response).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(err)) => {
-            drain.abort();
-            return Err(err.to_string());
-        }
-        Err(_) => {
-            drain.abort();
-            return Err("timed out".into());
-        }
-    };
-    drain.abort();
-    let text: String = response
-        .message
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    // A cut-off reply is no title.
+    let text = require_text(&response).map_err(|why| why.to_string())?;
     clean(&text).ok_or_else(|| "empty reply".into())
 }
 
@@ -330,7 +283,7 @@ impl TurnHook for Titler {
             );
             let id = session.id.clone();
             let prompt = prompt(session);
-            let handle = tokio::spawn(async move {
+            self.work.spawn(async move {
                 let outcome = generate(provider, prompt).await;
                 let note = match &outcome {
                     Ok(title) => format!("{} 第 {turns} 轮后：{title}", &id[..id.len().min(8)]),
@@ -345,14 +298,10 @@ impl TurnHook for Titler {
                     }
                     let listener = listener.lock().ok().and_then(|slot| slot.clone());
                     if let Some(listener) = listener {
-                        listener(&id, &title, true);
+                        listener(&id, &title);
                     }
                 }
             });
-            if let Ok(mut tasks) = self.tasks.lock() {
-                tasks.retain(|task| !task.is_finished());
-                tasks.push(handle);
-            }
         })
     }
 }
@@ -360,6 +309,8 @@ impl TurnHook for Titler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Message, ModelRequest};
+    use tokio::sync::mpsc;
 
     #[test]
     fn titles_are_due_early_then_every_five_turns() {

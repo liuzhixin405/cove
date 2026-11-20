@@ -3,34 +3,34 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::Mutex,
 };
 
 use sha2::{Digest, Sha256};
 
 /// Instruction file names, read in this order from every directory between the git root and cwd.
-const INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md", ".cove.md"];
+/// The rules file comes first so it is never skipped because the shared budget ran out.
+const INSTRUCTION_FILES: &[&str] = &[
+    crate::memory::rules::FILE,
+    "CLAUDE.md",
+    ".claude/CLAUDE.md",
+    "AGENTS.md",
+    ".cove.md",
+];
 const INSTRUCTIONS_LIMIT: usize = 32 * 1024;
+/// Rules get their own budget, above `MAX_RULES` × `MAX_CHARS` even for Chinese
+/// text (about 54 KiB), so they are applied in full.
+const RULES_LIMIT: usize = 64 * 1024;
 const OUTLINE_LIMIT: usize = 4 * 1024;
 const SKILLS_LIMIT: usize = 8 * 1024;
 
-/// Runs a read-only git query; `None` when git is missing or the directory is not a repository.
+/// Runs a read-only git query; `None` when git is missing, the directory is not a
+/// repository or git does not answer within 10 s (startup never hangs on it).
 pub fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    output.status.success().then(|| {
-        String::from_utf8_lossy(&output.stdout)
-            .trim_end()
-            .to_owned()
-    })
+    crate::process::git::Git::new(cwd)
+        .args(args.iter().copied())
+        .timeout(std::time::Duration::from_secs(10))
+        .query_blocking()
 }
 
 /// Current branch, also before the first commit; "HEAD (detached)" when not on a branch.
@@ -63,6 +63,7 @@ pub fn instruction_files(cwd: &Path) -> (Vec<(PathBuf, String)>, bool) {
     let mut seen_content = HashSet::new();
     let mut files = Vec::new();
     let mut total = 0;
+    let mut rules_total = 0;
     let mut clipped = false;
     for dir in dirs {
         for name in INSTRUCTION_FILES {
@@ -83,22 +84,31 @@ pub fn instruction_files(cwd: &Path) -> (Vec<(PathBuf, String)>, bool) {
             if text.is_empty() || !seen_content.insert(Sha256::digest(text.as_bytes())) {
                 continue;
             }
-            let room = INSTRUCTIONS_LIMIT.saturating_sub(total);
+            let is_rules = *name == crate::memory::rules::FILE;
+            let limit = if is_rules { RULES_LIMIT } else { INSTRUCTIONS_LIMIT };
+            let used = if is_rules { rules_total } else { total };
+            let room = limit.saturating_sub(used);
             if room == 0 {
                 clipped = true;
                 break;
             }
             let text = if text.len() > room {
                 clipped = true;
-                let mut end = room;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}\n[clipped at 32 KiB of instruction files]", &text[..end])
+                let head = crate::text::head(&text, room);
+                let note = if is_rules {
+                    "rules clipped at 64 KiB"
+                } else {
+                    "clipped at 32 KiB of instruction files"
+                };
+                format!("{head}\n[{note}]")
             } else {
                 text
             };
-            total += text.len();
+            if is_rules {
+                rules_total += text.len();
+            } else {
+                total += text.len();
+            }
             files.push((path, text));
         }
     }
@@ -113,7 +123,7 @@ fn shell_name() -> String {
 pub fn environment(cwd: &Path) -> String {
     let mut line = format!(
         "Working directory: {} | Platform: {}/{} | Shell: {}",
-        cwd.display(),
+        crate::paths::display(cwd),
         std::env::consts::OS,
         std::env::consts::ARCH,
         shell_name()
@@ -289,8 +299,8 @@ pub fn system_context(cwd: &Path, skills: &[(String, String)]) -> String {
             let shown = path
                 .strip_prefix(cwd)
                 .unwrap_or(&path)
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .into_owned();
             out.push_str(&format!(
                 "<instructions file=\"{}\">\n{text}\n</instructions>\n",
                 shown.replace('\\', "/")
@@ -430,6 +440,36 @@ mod tests {
         let texts: Vec<&str> = files.iter().map(|(_, text)| text.as_str()).collect();
         assert_eq!(texts, ["root rules", "app rules"]);
         assert!(!clipped);
+    }
+
+    #[test]
+    fn rules_are_complete_even_when_the_shared_budget_is_full() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::create_dir_all(root.path().join(".cove")).unwrap();
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            "a".repeat(INSTRUCTIONS_LIMIT + 1024),
+        )
+        .unwrap();
+        let rule = format!("- {}", "规".repeat(200));
+        std::fs::write(root.path().join(crate::memory::rules::FILE), &rule).unwrap();
+        let (files, clipped) = instruction_files(root.path());
+        assert!(clipped);
+        let rules = files
+            .iter()
+            .find(|(path, _)| path.ends_with(crate::memory::rules::FILE))
+            .expect("rules file included");
+        assert!(rules.1.contains(&rule), "rules were clipped");
+        let agents = files
+            .iter()
+            .find(|(path, _)| path.ends_with("AGENTS.md"))
+            .expect("AGENTS.md included");
+        assert!(
+            agents.1.ends_with("[clipped at 32 KiB of instruction files]"),
+            "{}",
+            agents.1
+        );
     }
 
     #[test]

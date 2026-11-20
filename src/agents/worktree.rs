@@ -9,7 +9,6 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -24,8 +23,6 @@ use crate::{
     tools::ToolOutput,
 };
 
-const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
-
 pub struct GitOutput {
     pub ok: bool,
     pub stdout: String,
@@ -38,86 +35,21 @@ impl GitOutput {
     }
 }
 
-/// Runs git without a shell. `core.fsmonitor` is disabled so a repository config cannot
-/// run a program through read-only queries; mutating calls are authorized by the caller.
+/// Runs git without a shell (`process::git`: non-interactive, fsmonitor off, bounded,
+/// tree killed on timeout); mutating calls are authorized by the caller. Output beyond
+/// the bound is an error, never cut (a cut `git show` would restore a broken file).
 pub async fn git(dir: &Path, args: &[&str], cancel: &CancellationToken) -> Result<GitOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Cancelled);
-    }
-    let mut command = tokio::process::Command::new("git");
-    command
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"])
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|err| Error::Tool(format!("cannot run git: {err}")))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Tool("git stdout not piped".into()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Tool("git stderr not piped".into()))?;
-    // Read both pipes while git runs, keeping at most GIT_OUTPUT_LIMIT + 1 bytes each:
-    // draining prevents a full-pipe deadlock, and the cap bounds memory during the run
-    // instead of clipping only after wait_with_output buffered everything.
-    let (stdout, stderr, status) = tokio::select! {
-        _ = cancel.cancelled() => return Err(Error::Cancelled),
-        _ = tokio::time::sleep(Duration::from_secs(120)) => {
-            return Err(Error::Tool(format!("git {} timed out", args.join(" "))))
-        }
-        result = async {
-            let (stdout, stderr, status) = tokio::join!(
-                read_capped(&mut stdout, GIT_OUTPUT_LIMIT),
-                read_capped(&mut stderr, GIT_OUTPUT_LIMIT),
-                child.wait()
-            );
-            Ok::<_, std::io::Error>((stdout?, stderr?, status?))
-        } => result?,
-    };
-    let clip = |bytes: &[u8]| {
-        let text = String::from_utf8_lossy(bytes);
-        let mut text = text.into_owned();
-        if text.len() > GIT_OUTPUT_LIMIT {
-            text.truncate(text.floor_char_boundary(GIT_OUTPUT_LIMIT));
-            text.push_str("\n[truncated]");
-        }
-        text
-    };
+    let output = crate::process::git::Git::new(dir)
+        .args(["-c", "core.quotepath=false"])
+        .args(args.iter().copied())
+        .timeout(Duration::from_secs(120))
+        .output(cancel)
+        .await?;
     Ok(GitOutput {
-        ok: status.success(),
-        stdout: clip(&stdout),
-        stderr: clip(&stderr),
+        ok: output.ok,
+        stdout: output.stdout_text(),
+        stderr: output.stderr_text(),
     })
-}
-
-/// Reads a pipe to EOF, keeping at most `limit + 1` bytes (the extra byte marks
-/// truncation) but draining the rest so the child never blocks on a full pipe.
-async fn read_capped(
-    pipe: &mut (impl tokio::io::AsyncRead + Unpin),
-    limit: usize,
-) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut kept = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let read = pipe.read(&mut buf).await?;
-        if read == 0 {
-            break;
-        }
-        let room = (limit + 1).saturating_sub(kept.len());
-        if room > 0 {
-            kept.extend_from_slice(&buf[..read.min(room)]);
-        }
-    }
-    Ok(kept)
 }
 
 async fn git_ok(dir: &Path, args: &[&str], cancel: &CancellationToken) -> Result<String> {
@@ -187,15 +119,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// `path` as git accepts it: without the Windows verbatim `\\?\` prefix of canonical paths.
-pub fn plain(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => rest.to_owned(),
-        _ => text.into_owned(),
-    }
-}
-
 /// Whether `path` is a worktree git has registered for `project`.
 pub async fn registered(project: &Path, path: &Path, cancel: &CancellationToken) -> Result<bool> {
     let list = git_ok(project, &["worktree", "list", "--porcelain"], cancel).await?;
@@ -241,7 +164,7 @@ pub async fn add_worktree(
     cancel: &CancellationToken,
 ) -> Result<String> {
     validate_branch(branch)?;
-    let target = plain(path);
+    let target = crate::paths::plain(path).to_string_lossy().into_owned();
     git_ok(
         project,
         &["worktree", "add", "-b", branch, &target, base],
@@ -256,7 +179,7 @@ pub async fn remove_worktree(
     force: bool,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let target = plain(path);
+    let target = crate::paths::plain(path).to_string_lossy().into_owned();
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -436,7 +359,7 @@ impl Worktrees {
     async fn enter(&self, args: EnterArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
         let path = self.path_for(&args.branch)?;
         if path.exists() {
-            return failed(format!("{} already exists", path.display()));
+            return failed(format!("{} already exists", crate::paths::display(&path)));
         }
         let base = head(&self.project, cancel).await?;
         self.authorizer
@@ -444,7 +367,7 @@ impl Worktrees {
                 Effect::Shell(format!(
                     "git worktree add -b {} {}",
                     args.branch,
-                    path.display()
+                    crate::paths::display(&path)
                 )),
                 cancel.clone(),
             )
@@ -455,7 +378,7 @@ impl Worktrees {
                 "Worktree created at {} on new branch {} (from {base:.10}). Your tools still act on the main tree; \
                  delegate work inside it with agent(worktree=\"{}\") and finish with exit_worktree. /undo does not cover it; \
                  the branch is its history.\n{output}",
-                path.display(),
+                crate::paths::display(&path),
                 args.branch,
                 args.branch
             ),
@@ -495,7 +418,7 @@ impl Worktrees {
                 Effect::Shell(format!(
                     "git worktree remove {}{}",
                     if force { "--force " } else { "" },
-                    path.display()
+                    crate::paths::display(&path)
                 )),
                 cancel.clone(),
             )
@@ -508,7 +431,10 @@ impl Worktrees {
             report.push_str(&format!("branch {} kept\n", args.branch));
         }
         Ok(ToolOutput {
-            content: format!("worktree {} removed\n{report}", path.display()),
+            content: format!(
+                "worktree {} removed\n{report}",
+                crate::paths::display(&path)
+            ),
             failed: false,
             ..Default::default()
         })

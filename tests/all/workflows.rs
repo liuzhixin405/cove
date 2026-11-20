@@ -1,5 +1,5 @@
-//! CLI-level tests for draw_image, browser, /changes (race, apply, verify-browser),
-//! automations and remote supervision.
+//! CLI-level tests for draw_image, browser, /race, /changes (apply, verify-browser)
+//! and remote supervision.
 
 use crate::common::{self, Launch};
 use std::{
@@ -178,25 +178,6 @@ fn repo() -> tempfile::TempDir {
     dir
 }
 
-/// Children answering with a write of `<name>.txt` chosen from the prompt, then stopping.
-fn writer() -> Responder {
-    Arc::new(|body: &Value| {
-        if has_tool_result(body) {
-            return openai(json!({"content":"done"}), "stop");
-        }
-        let name = if mentions(body, "alpha") {
-            "alpha"
-        } else {
-            "beta"
-        };
-        tool(
-            "w1",
-            "write",
-            json!({"path": format!("{name}.txt"), "content": format!("{name}\n")}),
-        )
-    })
-}
-
 #[tokio::test]
 async fn draw_image_writes_a_checkpointed_png_that_undo_removes() {
     let root = tempfile::tempdir().unwrap();
@@ -235,7 +216,7 @@ async fn draw_image_writes_a_checkpointed_png_that_undo_removes() {
     );
     let tools = requests.lock().unwrap()[0]["tools"].to_string();
     assert!(tools.contains("draw_image") && tools.contains("\"browser\""));
-    // The PNG went through the checkpoint: /undo removes the created file.
+    // A restore point was taken before the drawing: /undo removes the created file.
     let session = std::fs::read_dir(data.path().join("sessions"))
         .unwrap()
         .next()
@@ -243,10 +224,12 @@ async fn draw_image_writes_a_checkpointed_png_that_undo_removes() {
         .unwrap()
         .path();
     let id = session.file_stem().unwrap().to_str().unwrap().to_owned();
-    let mut undo = cli(root.path(), data.path(), &url);
-    undo.args(["--resume", &id, "-p", "/undo confirm"]);
-    let (ok, _, stderr) = run(undo).await;
-    assert!(ok, "{stderr}");
+    for step in ["/undo #1", "/undo confirm"] {
+        let mut undo = cli(root.path(), data.path(), &url);
+        undo.args(["--resume", &id, "-p", step]);
+        let (ok, _, stderr) = run(undo).await;
+        assert!(ok, "{step}: {stderr}");
+    }
     assert!(!root.path().join("out.png").exists());
 }
 
@@ -273,153 +256,126 @@ async fn browser_tool_refuses_loopback_targets() {
     assert!(results[0].contains("refusing"), "{results:?}");
 }
 
-#[tokio::test]
-async fn race_runs_two_workers_and_applies_only_on_explicit_confirm() {
-    let repo = repo();
-    let data = tempfile::tempdir().unwrap();
-    let specs = tempfile::tempdir().unwrap();
-    let (url, _) = mock_server(writer()).await;
-    let spec = specs.path().join("race.json");
+/// Lanes answering with a write: `beta.txt` for the lane asked for another
+/// approach, `alpha.txt` for the other one.
+fn racer() -> Responder {
+    Arc::new(|body: &Value| {
+        if has_tool_result(body) {
+            return openai(json!({"content":"done"}), "stop");
+        }
+        let name = if mentions(body, "different approach") {
+            "beta"
+        } else {
+            "alpha"
+        };
+        tool(
+            "w1",
+            "write",
+            json!({"path": format!("{name}.txt"), "content": format!("{name}\n")}),
+        )
+    })
+}
+
+/// A user config whose verification command every race lane passes.
+fn verifying_config(dir: &Path) -> PathBuf {
+    let path = dir.join("config.json");
     std::fs::write(
-        &spec,
-        json!({"prompts":["Write the alpha file","Write the beta file"],"verify":[["git","--version"]],"timeout":100}).to_string(),
+        &path,
+        json!({"done_verify_commands":["git --version"]}).to_string(),
     )
     .unwrap();
-    let mut command = cli(repo.path(), data.path(), &url);
-    command.args(["-p", &format!("/changes race {}", spec.display())]);
-    let (ok, stdout, stderr) = run(command).await;
-    assert!(ok, "{stdout}\n{stderr}");
-    assert!(stdout.contains("correct=true"), "{stdout}\n{stderr}");
-    // Nothing reached the user's tree yet, and the worktrees are gone.
-    assert!(!repo.path().join("alpha.txt").exists());
-    assert_eq!(git(repo.path(), &["worktree", "list"]).lines().count(), 1);
-    let run_id = std::fs::read_dir(data.path().join("race"))
+    path
+}
+
+fn race_id(data: &Path) -> String {
+    std::fs::read_dir(data.join("race"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .file_name()
         .into_string()
-        .unwrap();
-    let mut list = cli(repo.path(), data.path(), &url);
-    list.args(["-p", "/changes"]);
-    let (_, stdout, _) = run(list).await;
-    assert!(stdout.contains(&format!("race:{run_id}:a")), "{stdout}");
-    let mut preview = cli(repo.path(), data.path(), &url);
-    preview.args(["-p", &format!("/changes apply race:{run_id}:a")]);
-    let (ok, stdout, stderr) = run(preview).await;
-    assert!(ok && stdout.contains("confirm"), "{stdout}{stderr}");
+        .unwrap()
+}
+
+#[tokio::test]
+async fn race_offers_two_solutions_and_applies_one_only_on_explicit_confirm() {
+    let repo = repo();
+    let data = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let config = verifying_config(outside.path());
+    let (url, _) = mock_server(racer()).await;
+    let race = |args: &[&str]| {
+        let mut command = cli(repo.path(), data.path(), &url);
+        command.arg("--config").arg(&config).arg("-p").args(args);
+        command
+    };
+    let (ok, stdout, stderr) = run(race(&["/race Write the file"])).await;
+    assert!(ok, "{stdout}\n{stderr}");
+    // Both lanes ran on the main model (no fast model configured), B asked for
+    // another approach, and both passed the shared verification.
+    assert!(stdout.contains("主模型·换思路"), "{stdout}");
+    assert_eq!(stdout.matches("验证 ✓").count(), 2, "{stdout}");
+    assert!(stdout.contains("改动 1 个文件 +1 -0"), "{stdout}");
+    // Nothing reached the user's tree yet, and the worktrees are gone.
     assert!(!repo.path().join("alpha.txt").exists());
-    let mut apply = cli(repo.path(), data.path(), &url);
-    apply.args(["-p", &format!("/changes apply race:{run_id}:a confirm")]);
-    let (ok, _, stderr) = run(apply).await;
+    assert_eq!(git(repo.path(), &["worktree", "list"]).lines().count(), 1);
+    // The lanes' model calls are in the ledger.
+    let ledger: String = std::fs::read_dir(data.path().join("usage"))
+        .unwrap()
+        .flatten()
+        .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+        .collect();
+    assert!(ledger.lines().count() >= 4, "{ledger}");
+    let run_id = race_id(data.path());
+    let (_, stdout, _) = run(race(&["/race"])).await;
+    assert!(stdout.contains("Write the file"), "{stdout}");
+    let (_, stdout, _) = run(race(&["/changes"])).await;
+    assert!(stdout.contains(&format!("race:{run_id}:b")), "{stdout}");
+    let (ok, stdout, stderr) = run(race(&[&format!("/changes apply race:{run_id}:b")])).await;
+    assert!(ok && stdout.contains("confirm"), "{stdout}{stderr}");
+    assert!(!repo.path().join("beta.txt").exists());
+    let (ok, _, stderr) = run(race(&[&format!("/changes apply race:{run_id}:b confirm")])).await;
     assert!(ok, "{stderr}");
     assert_eq!(
-        std::fs::read_to_string(repo.path().join("alpha.txt")).unwrap(),
-        "alpha\n"
+        std::fs::read_to_string(repo.path().join("beta.txt")).unwrap(),
+        "beta\n"
     );
-    assert!(!repo.path().join("beta.txt").exists());
-    // The other candidate cannot be applied on top (dirty tree, sibling applied).
-    let mut again = cli(repo.path(), data.path(), &url);
-    again.args(["-p", &format!("/changes apply race:{run_id}:b confirm")]);
-    let (ok, _, _) = run(again).await;
+    assert!(!repo.path().join("alpha.txt").exists());
+    // The other solution cannot be applied on top (dirty tree, sibling applied).
+    let (ok, _, _) = run(race(&[&format!("/changes apply race:{run_id}:a confirm")])).await;
     assert!(!ok);
 }
 
 #[tokio::test]
-async fn race_refuses_a_dirty_tree_without_starting_workers() {
+async fn unverified_race_solutions_are_shown_but_not_applied() {
     let repo = repo();
     let data = tempfile::tempdir().unwrap();
-    let specs = tempfile::tempdir().unwrap();
-    std::fs::write(repo.path().join("README.md"), "edited\n").unwrap();
-    let (url, requests) = mock_server(writer()).await;
-    let spec = specs.path().join("race.json");
-    std::fs::write(
-        &spec,
-        json!({"prompts":["alpha","beta"],"verify":[["git","--version"]]}).to_string(),
-    )
-    .unwrap();
+    let (url, _) = mock_server(racer()).await;
     let mut command = cli(repo.path(), data.path(), &url);
-    command.args(["-p", &format!("/changes race {}", spec.display())]);
-    let (ok, _, stderr) = run(command).await;
-    assert!(!ok && stderr.contains("干净"), "{stderr}");
-    assert!(requests.lock().unwrap().is_empty());
-}
-
-fn standalone(data: &Path, url: &str, args: &[&str]) -> Command {
-    let mut command = Command::new(common::exe());
-    command.arg("--automation").args(args);
-    command.env("COVE_DATA_DIR", data);
-    command.env("COVE_PROVIDER", "openai");
-    command.env("COVE_MODEL", "mock-model");
-    command.env("COVE_BASE_URL", url);
-    command.env("COVE_API_KEY", "test-only-not-a-real-key");
-    command.env_remove("COVE_CONFIG");
-    command.kill_on_drop(true);
-    command
+    command.args(["-p", "/race Write the file"]);
+    let (ok, stdout, stderr) = run(command).await;
+    assert!(ok, "{stdout}\n{stderr}");
+    assert!(stdout.contains("未验证"), "{stdout}");
+    let run_id = race_id(data.path());
+    let mut apply = cli(repo.path(), data.path(), &url);
+    apply.args(["-p", &format!("/changes apply race:{run_id}:a confirm")]);
+    let (ok, _, _) = run(apply).await;
+    assert!(!ok);
+    assert!(!repo.path().join("alpha.txt").exists());
 }
 
 #[tokio::test]
-async fn automation_results_land_in_the_inbox_and_apply_only_on_request() {
+async fn race_refuses_a_dirty_tree_without_starting_lanes() {
     let repo = repo();
     let data = tempfile::tempdir().unwrap();
-    let specs = tempfile::tempdir().unwrap();
-    let (url, _) = mock_server(writer()).await;
-    let spec = specs.path().join("job.json");
-    std::fs::write(
-        &spec,
-        json!({"version":1,"spec":{"id":"nightly","prompt":"Write the alpha file","every_seconds":3600,
-            "event":"tests-failed","timeout_seconds":100,"max_turns":4,"verify":[["git","--version"]]}})
-        .to_string(),
-    )
-    .unwrap();
-    let project = repo.path().to_str().unwrap();
-    let (ok, stdout, stderr) = run(standalone(
-        data.path(),
-        &url,
-        &["add", project, spec.to_str().unwrap()],
-    ))
-    .await;
-    assert!(ok && stdout.contains("尚未启动"), "{stdout}{stderr}");
-    let (ok, stdout, stderr) = run(standalone(data.path(), &url, &["list", project])).await;
-    assert!(ok && stdout.contains("nightly"), "{stdout}{stderr}");
-    let (ok, stdout, stderr) = run(standalone(
-        data.path(),
-        &url,
-        &["event", project, "tests-failed", "build-1"],
-    ))
-    .await;
-    assert!(ok && stdout.contains("Succeeded"), "{stdout}{stderr}");
-    // The same occurrence never runs twice, and the schedule is not yet due again.
-    let (_, stdout, _) = run(standalone(
-        data.path(),
-        &url,
-        &["event", project, "tests-failed", "build-1"],
-    ))
-    .await;
-    assert!(stdout.contains("没有运行任何任务"), "{stdout}");
-    let (_, stdout, _) = run(standalone(data.path(), &url, &["tick", project])).await;
-    assert!(stdout.contains("没有运行任何任务"), "{stdout}");
-    assert!(!repo.path().join("alpha.txt").exists());
-    let (ok, stdout, _) = run(standalone(data.path(), &url, &["inbox", project])).await;
-    assert!(ok);
-    let id = stdout.split_whitespace().next().unwrap().to_owned();
-    let out = specs.path().join("result.patch");
-    let (ok, _, stderr) = run(standalone(
-        data.path(),
-        &url,
-        &["inbox", project, "patch", &id, out.to_str().unwrap()],
-    ))
-    .await;
-    assert!(ok, "{stderr}");
-    assert!(std::fs::read_to_string(&out).unwrap().contains("+alpha"));
-    let mut apply = cli(repo.path(), data.path(), &url);
-    apply.args(["-p", &format!("/changes apply inbox:{id} confirm")]);
-    let (ok, _, stderr) = run(apply).await;
-    assert!(ok, "{stderr}");
-    assert!(repo.path().join("alpha.txt").exists());
-    let (_, stdout, _) = run(standalone(data.path(), &url, &["inbox", project])).await;
-    assert!(stdout.contains("Applied"), "{stdout}");
+    std::fs::write(repo.path().join("README.md"), "edited\n").unwrap();
+    let (url, requests) = mock_server(racer()).await;
+    let mut command = cli(repo.path(), data.path(), &url);
+    command.args(["-p", "/race Write the file"]);
+    let (ok, _, stderr) = run(command).await;
+    assert!(!ok && stderr.contains("干净"), "{stderr}");
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -526,7 +482,7 @@ async fn browser_verification_passes_locally_only_with_explicit_permission() {
     let mut refused = cli(root.path(), data.path(), &url);
     refused.args([
         "-p",
-        &format!("/changes verify-browser {}", workflow.display()),
+        &format!("/changes verify-browser {}", workflow.to_string_lossy()),
     ]);
     let (ok, stdout, stderr) = run(refused).await;
     assert!(ok, "{stderr}");
@@ -538,7 +494,7 @@ async fn browser_verification_passes_locally_only_with_explicit_permission() {
         "-p",
         &format!(
             "/changes verify-browser {} --allow-local",
-            workflow.display()
+            workflow.to_string_lossy()
         ),
     ]);
     let (ok, stdout, stderr) = run(allowed).await;

@@ -4,7 +4,7 @@
 //! place where it really happens.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{BufRead, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Once},
@@ -175,77 +175,12 @@ impl UsageLedger {
         result.map_err(Into::into)
     }
 
-    fn review_lock(&self) -> Result<std::fs::File> {
-        std::fs::create_dir_all(&self.dir)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join("skill-review.lock"))?;
-        fs2::FileExt::lock_exclusive(&file)?;
-        Ok(file)
-    }
-
-    pub fn begin_skill_review(&self, entry: &UsageEntry) -> Result<String> {
-        if entry.source != "skill_review"
-            || entry.cost.is_some()
-            || entry.request_id.is_some()
-            || entry.input != 0
-            || entry.output != 0
-            || entry.cache_read != 0
-            || entry.cache_write != 0
-        {
-            return Err(Error::Tool("invalid skill review intent".into()));
-        }
-        let _lock = self.review_lock()?;
-        let dir = self.dir.join("intents");
-        std::fs::create_dir_all(&dir)?;
-        if std::fs::read_dir(&dir)?.take(4096).count() >= 4096 {
-            return Err(Error::Tool("too many pending skill review intents".into()));
-        }
-        let id = crate::session::new_id();
-        let path = dir.join(format!("{id}.json"));
-        if path.try_exists()? {
-            return Err(Error::Tool("skill review intent already exists".into()));
-        }
-        let mut pending = entry.clone();
-        pending.request_id = Some(id.clone());
-        crate::session::atomic_json(&path, &pending)?;
-        Ok(id)
-    }
-
-    pub fn finish_skill_review(&self, id: &str, entry: &UsageEntry) -> Result<()> {
-        if !crate::session::valid_id(id) {
-            return Err(Error::Tool("invalid skill review request ID".into()));
-        }
-        let _lock = self.review_lock()?;
-        let path = self.dir.join("intents").join(format!("{id}.json"));
-        let pending: UsageEntry = crate::session::read_json(&path)?;
-        if pending.request_id.as_deref() != Some(id)
-            || pending.source != "skill_review"
-            || entry.source != pending.source
-            || entry.session != pending.session
-            || entry.provider != pending.provider
-            || entry.t != pending.t
-            || entry.cost.is_some()
-        {
-            return Err(Error::Tool("skill review intent mismatch".into()));
-        }
-        let mut completed = entry.clone();
-        completed.request_id = Some(id.into());
-        self.append(&completed, true)?;
-        std::fs::remove_file(path)?;
-        Ok(())
-    }
-
     /// Entries with `from <= t < to`, oldest first; malformed lines are skipped.
     pub fn load(&self, from: u64, to: u64) -> Result<Vec<UsageEntry>> {
         let mut entries = Vec::new();
         if !self.dir.try_exists()? {
             return Ok(entries);
         }
-        let _lock = self.review_lock()?;
         let dir = std::fs::read_dir(&self.dir)?;
         let mut files: Vec<((i64, u32), PathBuf)> = dir
             .filter_map(|entry| entry.ok())
@@ -274,42 +209,6 @@ impl UsageLedger {
                 }
             }
         }
-        let completed: BTreeSet<String> = entries
-            .iter()
-            .filter_map(|entry| entry.request_id.clone())
-            .collect();
-        let intents = self.dir.join("intents");
-        if intents.try_exists()? {
-            for (scanned, file) in std::fs::read_dir(intents)?.enumerate() {
-                if scanned >= 4096 {
-                    return Err(Error::Tool("too many pending skill review intents".into()));
-                }
-                let file = file?;
-                let path = file.path();
-                if path.extension().is_none_or(|ext| ext != "json") {
-                    continue;
-                }
-                let id = path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .filter(|id| crate::session::valid_id(id))
-                    .ok_or_else(|| Error::Tool("invalid skill review intent name".into()))?;
-                let metadata = file.metadata()?;
-                if !file.file_type()?.is_file() || metadata.len() > LINE_LIMIT as u64 {
-                    return Err(Error::Tool("invalid skill review intent file".into()));
-                }
-                let entry: UsageEntry = crate::session::read_json(&path)?;
-                if entry.request_id.as_deref() != Some(id)
-                    || entry.source != "skill_review"
-                    || entry.cost.is_some()
-                {
-                    return Err(Error::Tool("invalid skill review intent".into()));
-                }
-                if !completed.contains(id) && entry.t >= from && entry.t < to {
-                    entries.push(entry);
-                }
-            }
-        }
         entries.sort_by_key(|entry| entry.t);
         Ok(entries)
     }
@@ -331,19 +230,19 @@ fn prune(dir: &Path, now: u64) {
     }
 }
 
-/// Estimated cost of one call in USD; prices are per million tokens.
-pub fn bill(prices: Option<(f64, f64)>, input: u64, output: u64) -> Option<f64> {
-    prices.map(|(pin, pout)| (input as f64 * pin + output as f64 * pout) / 1_000_000.0)
-}
+/// The prices of a model by name; `None` when unknown.
+pub type Pricing = Arc<dyn Fn(&str) -> Option<crate::model::models::Prices> + Send + Sync>;
 
 /// `Provider` decorator that records every reported call in the ledger.
 pub struct Metered {
     pub inner: Arc<dyn Provider>,
     pub ledger: Arc<UsageLedger>,
     pub provider: String,
+    /// The configured model, recorded when a response does not name its own.
     pub model: String,
-    pub prices: Option<(f64, f64)>,
-    /// "session", "extraction", "dream", ...
+    /// Prices of a model by name (the router's: the fast model has its own).
+    pub pricing: Pricing,
+    /// "session" for tasks, "background" for memory extraction, titles, dream and the like.
     pub source: &'static str,
 }
 
@@ -358,10 +257,17 @@ impl Provider for Metered {
             let response = self.inner.stream(request, events, cancel).await?;
             if response.usage_reported {
                 let usage = response.usage;
+                // The model that answered (the fast one for background calls), at its prices.
+                let model = response
+                    .model
+                    .clone()
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or_else(|| self.model.clone());
+                let cost = crate::model::models::charge(&response, (self.pricing)(&model));
                 let _ = self.ledger.record(&UsageEntry {
                     t: now(),
                     provider: self.provider.clone(),
-                    model: self.model.clone(),
+                    model,
                     session: self.ledger.session(),
                     source: self.source.into(),
                     request_id: None,
@@ -369,9 +275,7 @@ impl Provider for Metered {
                     output: usage.output,
                     cache_read: usage.cache_read,
                     cache_write: usage.cache_write,
-                    cost: response
-                        .reported_cost
-                        .or_else(|| bill(self.prices, usage.input, usage.output)),
+                    cost,
                 });
             }
             Ok(response)
@@ -433,7 +337,6 @@ pub fn parse_period(arg: Option<&str>, now: u64) -> Result<Period> {
 pub struct UsageRow {
     pub provider: String,
     pub model: String,
-    pub skill_review: bool,
     pub calls: u64,
     pub input: u64,
     pub output: u64,
@@ -460,18 +363,16 @@ impl UsageRow {
 
 /// Rows by provider/model, most expensive first, and the total.
 pub fn aggregate(entries: &[UsageEntry]) -> (Vec<UsageRow>, UsageRow) {
-    let mut rows: BTreeMap<(String, String, bool), UsageRow> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
     let mut total = UsageRow {
         provider: "total".into(),
         ..UsageRow::default()
     };
     for entry in entries {
-        let skill_review = entry.source == "skill_review";
-        rows.entry((entry.provider.clone(), entry.model.clone(), skill_review))
+        rows.entry((entry.provider.clone(), entry.model.clone()))
             .or_insert_with(|| UsageRow {
                 provider: entry.provider.clone(),
                 model: entry.model.clone(),
-                skill_review,
                 ..UsageRow::default()
             })
             .add(entry);
@@ -521,11 +422,6 @@ pub fn render(period: &Period, rows: &[UsageRow], total: &UsageRow) -> String {
             row.provider.clone()
         } else {
             format!("{}/{}", row.provider, row.model)
-        };
-        let name = if row.skill_review {
-            format!("[skill_review] {name}")
-        } else {
-            name
         };
         let name: String = name.chars().take(34).collect();
         out.push_str(&format!(
@@ -655,12 +551,11 @@ mod tests {
     }
 
     #[test]
-    fn skill_review_usage_is_visible_separately_and_unknown_is_not_free() {
-        let task = entry(1, "model", Some(0.5));
-        let mut review = entry(2, "model", None);
-        review.source = "skill_review".into();
-        let (rows, total) = aggregate(&[task, review]);
-        assert_eq!(rows.len(), 2);
+    fn unknown_cost_is_not_counted_as_free() {
+        let priced = entry(1, "model", Some(0.5));
+        let unpriced = entry(2, "model", None);
+        let (rows, total) = aggregate(&[priced, unpriced]);
+        assert_eq!(rows.len(), 1);
         assert_eq!(total.calls, 2);
         assert_eq!(total.unpriced, 1);
         let text = render(
@@ -672,72 +567,6 @@ mod tests {
             &rows,
             &total,
         );
-        assert!(text.contains("skill_review"), "{text}");
         assert!(text.contains("未知"), "{text}");
-    }
-
-    #[test]
-    fn skill_review_intent_survives_restart_and_completion_is_not_double_counted() {
-        let data = tempfile::tempdir().unwrap();
-        let ledger = UsageLedger::new(data.path());
-        let mut pending = entry(now(), "unknown", None);
-        pending.source = "skill_review".into();
-        pending.input = 0;
-        pending.output = 0;
-        pending.cache_read = 0;
-        let request_id = ledger.begin_skill_review(&pending).unwrap();
-        let intent = ledger
-            .dir()
-            .join("intents")
-            .join(format!("{request_id}.json"));
-        let saved_intent = std::fs::read(&intent).unwrap();
-        let reopened = UsageLedger::new(data.path());
-        let records = reopened.load(0, u64::MAX).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].cost, None);
-        assert_eq!(records[0].input, 0);
-        let mut complete = pending;
-        complete.model = "fast-model".into();
-        complete.input = 123;
-        complete.output = 45;
-        reopened
-            .finish_skill_review(&request_id, &complete)
-            .unwrap();
-        std::fs::write(&intent, saved_intent).unwrap();
-        let records = reopened.load(0, u64::MAX).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].model, "fast-model");
-        assert_eq!(records[0].input, 123);
-        assert_eq!(aggregate(&records).1.calls, 1);
-        assert_eq!(aggregate(&records).1.unpriced, 1);
-    }
-
-    #[test]
-    fn skill_review_intent_keeps_start_period_and_survives_completion_failure() {
-        let data = tempfile::tempdir().unwrap();
-        let ledger = UsageLedger::new(data.path());
-        let start = days_from_civil(2026, 10, 31) as u64 * 86_400 + 86_399;
-        let mut pending = entry(start, "unknown", None);
-        pending.source = "skill_review".into();
-        pending.input = 0;
-        pending.output = 0;
-        pending.cache_read = 0;
-        let request_id = ledger.begin_skill_review(&pending).unwrap();
-        let mut completion = pending.clone();
-        completion.t += 1;
-        assert!(
-            ledger
-                .finish_skill_review(&request_id, &completion)
-                .is_err()
-        );
-        assert_eq!(ledger.load(start, start + 1).unwrap().len(), 1);
-        assert!(ledger.load(start + 1, start + 2).unwrap().is_empty());
-        std::fs::create_dir(ledger.dir().join("2026-10.jsonl")).unwrap();
-        assert!(ledger.finish_skill_review(&request_id, &pending).is_err());
-        std::fs::remove_dir(ledger.dir().join("2026-10.jsonl")).unwrap();
-        assert_eq!(ledger.load(start, start + 1).unwrap().len(), 1);
-        ledger.finish_skill_review(&request_id, &pending).unwrap();
-        assert_eq!(ledger.load(start, start + 1).unwrap().len(), 1);
-        assert!(ledger.load(start + 1, start + 2).unwrap().is_empty());
     }
 }

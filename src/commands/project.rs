@@ -14,7 +14,7 @@ use crate::{
     app::Application,
     app::onboarding,
     app::ui::print_text,
-    domain::{Block, Error, Message, ModelRequest, Result},
+    domain::{Error, Result},
     safety::permission::Effect,
     session::{SessionPersistence, State},
     workflows::gitops::{self, Git, Scope},
@@ -23,7 +23,8 @@ use crate::{
 pub(crate) const HELP: &str = "\
 /init [apply|discard]  根据仓库起草 CLAUDE.md（或 AGENTS.md），以 diff 展示；apply 写入，从不覆盖已有文件
 /diff git [--stat]  显示 git diff --cached 和 git diff；--stat 列出已暂存、未暂存和未跟踪的文件
-/commit [--preview] [--all | --only <paths>... --] [message]  先验证再提交已暂存内容（或所选文件）；从不推送
+/commit [--preview] [--no-review] [--all | --only <paths>... --] [message]  先验证、再由 AI 按项目规则审查，然后提交已暂存内容（或所选文件）；--no-review 跳过审查；从不推送
+/rules [add <规则>|remove <n>|local]  项目规则（.cove/rules.md）：你纠正过的做法和反复出现的问题，每个任务都遵守、提交前按它审查；local 让它只留在本机（不提交）
 /cd <path>  保存会话并在另一个项目目录中重启
 /restart  保存并重启程序，继续当前会话
 /expand [n] [all]  工具结果 #n 的完整输出（默认最新一条；不加 all 时最多 200 行）
@@ -49,7 +50,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("改动", "/diff  当前任务通过文件工具做的改动"),
     (
         "改动",
-        "/undo [confirm]  预览并回滚上一个任务的文件工具编辑",
+        "/undo [#n|files #n <文件…>|confirm]  列出回滚点、预览并恢复（每个任务一个，包含 Shell 的影响）",
     ),
     (
         "改动",
@@ -207,7 +208,11 @@ pub(crate) async fn handle(
             print_text(&gitops::diff(&app.settings.cwd, true).await?, false)?
         }
         ["/commit", rest @ ..] => commit(app, rest).await?,
-        ["/cd"] => print_text(&format!("{}\n", app.settings.cwd.display()), false)?,
+        ["/rules", rest @ ..] => rules(app, line, rest).await?,
+        ["/cd"] => print_text(
+            &format!("{}\n", crate::paths::display(&app.settings.cwd)),
+            false,
+        )?,
         ["/cd", ..] => {
             let path = line.trim_start()["/cd".len()..].trim().trim_matches('"');
             return change_directory(app, path).map(Some);
@@ -263,7 +268,7 @@ async fn init(app: &mut Application) -> Result<()> {
         print_text(
             &format!(
                 "{} 已存在；/init 从不覆盖它，请直接编辑该文件。\n",
-                existing.display()
+                crate::paths::display(existing)
             ),
             false,
         )?;
@@ -306,7 +311,7 @@ async fn init(app: &mut Application) -> Result<()> {
         &format!(
             "{} 草稿，{source}：\n{diff}\n/init apply 写入；/init discard 丢弃。草稿位置：{}\n",
             target.name,
-            path.display()
+            crate::paths::display(&path)
         ),
         false,
     )?;
@@ -319,82 +324,34 @@ async fn draft_with_model(
     target: &str,
     digest: &str,
 ) -> std::result::Result<String, String> {
-    if app.settings.budget.is_some() && app.session.accounting.budget_cost().is_none() {
-        app.session.accounting.reset_budget_spend();
-    }
-    let previous = app.session.accounting.budget_cost();
-    let request = ModelRequest {
-        system: onboarding::INIT_SYSTEM.into(),
-        messages: vec![Message::user(onboarding::prompt(target, digest))],
-        tools: Vec::new(),
-        max_output_tokens: app.settings.max_output_tokens.min(4096),
-        estimated_tokens: None,
-        model: None,
-    };
-    let (events, mut receiver) = mpsc::channel(64);
-    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    let request = crate::model::oneshot::text_request(
+        onboarding::INIT_SYSTEM,
+        onboarding::prompt(target, digest),
+        app.settings.max_output_tokens.min(4096),
+    );
     let cancel = CancellationToken::new();
     let provider = app.background_provider();
     app.session.accounting.model_calls += 1;
     app.store
         .save(&app.session)
         .map_err(|err| err.to_string())?;
-    let call = provider.stream(request, events, cancel.clone());
+    let call = crate::model::oneshot::call(&*provider, request, INIT_TIMEOUT, cancel.clone());
     let result = tokio::select! {
         result = call => result.map_err(|err| err.to_string()),
         _ = crate::app::console::interrupted() => { cancel.cancel(); Err("已取消".into()) }
-        _ = tokio::time::sleep(INIT_TIMEOUT) => { cancel.cancel(); Err("模型调用超过 3 分钟".into()) }
     };
-    let _ = drain.await;
-    let accounting = &mut app.session.accounting;
     if let Ok(response) = &result {
-        accounting.usage.input = accounting.usage.input.saturating_add(response.usage.input);
-        accounting.usage.output = accounting
-            .usage
-            .output
-            .saturating_add(response.usage.output);
-        let call_cost = response
-            .reported_cost
-            .or_else(|| {
-                if response.usage_reported {
-                    crate::session::usage::bill(
-                        app.settings.prices,
-                        response.usage.input,
-                        response.usage.output,
-                    )
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0.0);
-        accounting.cost = accounting.cost.map(|cost| cost + call_cost);
-        if let Some(budget) = &mut accounting.renewed_budget {
-            budget.cost = budget.cost.map(|cost| cost + call_cost);
-        }
+        // Billed like a task: the model that answered, at its prices, cache-aware.
+        let model = response.model.clone().unwrap_or_default();
+        let prices = crate::model::routing::ModelPolicy::prices(&*app.models.router, &model);
+        let cost = crate::model::models::charge(response, prices).or(Some(0.0));
+        app.session.accounting.add_response(response, cost);
     }
     app.store
         .save(&app.session)
         .map_err(|err| err.to_string())?;
-    if let Some(text) = crate::engine::agent::budget_message(
-        app.settings.budget,
-        previous,
-        app.session.accounting.budget_cost(),
-    ) {
-        let _ = crate::app::ui::print_budget_notice(&text);
-    }
     let response = result?;
-    if !response.complete {
-        return Err("模型回答被截断".into());
-    }
-    let text: String = response
-        .message
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let text = crate::model::oneshot::require_text(&response).map_err(|why| why.to_string())?;
     onboarding::clean(&text).ok_or_else(|| "模型回答为空".into())
 }
 
@@ -413,8 +370,8 @@ async fn init_apply(app: &mut Application) -> Result<()> {
     if let Some(existing) = target.existing {
         return Err(Error::Workspace(format!(
             "{} 现在已存在，未覆盖（草稿保留在 {}）；可对照草稿手动编辑，或用 /init discard 丢弃草稿",
-            existing.display(),
-            draft_path.display()
+            crate::paths::display(&existing),
+            crate::paths::display(&draft_path)
         )));
     }
     if unfinished(app) {
@@ -426,7 +383,11 @@ async fn init_apply(app: &mut Application) -> Result<()> {
     app.authorizer
         .authorize(Effect::Write(path.clone()), CancellationToken::new())
         .await?;
-    // Through a checkpoint like a task's file edits, so /diff and /undo cover it.
+    // A restore point first, and through a checkpoint like a task's file edits, so
+    // /diff and /undo cover it.
+    if let Some(snapshots) = &app.sessions.snapshots {
+        snapshots.snapshot("/init apply").await?;
+    }
     let checkpoint = app.workspace.begin()?;
     app.session.checkpoints.push(checkpoint.clone());
     app.session.current_checkpoint = Some(checkpoint);
@@ -436,7 +397,7 @@ async fn init_apply(app: &mut Application) -> Result<()> {
     print_text(
         &format!(
             "已写入 {}（/undo 可撤销）。/restart 后或在新会话中，系统提示会读取它。\n",
-            path.display()
+            crate::paths::display(&path)
         ),
         false,
     )?;
@@ -479,7 +440,7 @@ async fn commit(app: &mut Application, args: &[&str]) -> Result<()> {
                 "git commit -m {:?} ({} files, no push) in {}",
                 options.message,
                 files.len(),
-                git.root.display()
+                crate::paths::display(&git.root)
             )),
             CancellationToken::new(),
         )
@@ -501,6 +462,11 @@ async fn commit(app: &mut Application, args: &[&str]) -> Result<()> {
                 "验证期间文件发生了变化，未提交；检查改动后重新运行 /commit：\n{differs}"
             )));
         }
+    }
+    if options.review
+        && let Some(review) = app.commit_review.clone()
+    {
+        review_staged(app, &git, &review).await?;
     }
     if git.run(&["write-tree"]).await? != tree {
         return Err(Error::Session(
@@ -528,6 +494,169 @@ async fn commit(app: &mut Application, args: &[&str]) -> Result<()> {
         false,
     )?;
     Ok(())
+}
+
+/// `/rules`: list, add, remove, or keep the rules file out of commits.
+async fn rules(app: &Application, line: &str, args: &[&str]) -> Result<()> {
+    let Some(rules) = app.sessions.rules.clone() else {
+        return Err(Error::Session(
+            "当前工作区不是一个项目目录（比如家目录或盘符根），没有项目规则；/cd 到项目里再用"
+                .into(),
+        ));
+    };
+    let shown = crate::paths::display(rules.path());
+    match args {
+        [] => {
+            let listed = rules.list()?;
+            if listed.is_empty() {
+                print_text(
+                    &format!(
+                        "还没有项目规则。cove 会从你的纠正和反复出现的问题里记下规则，写在 {shown}；也可以 /rules add <规则>。\n"
+                    ),
+                    false,
+                )?;
+            } else {
+                let mut text = format!("项目规则（{shown}，每个任务都遵守，提交前按它审查）：\n");
+                for (number, rule) in listed.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {}\n",
+                        number + 1,
+                        crate::text::visible_row(rule)
+                    ));
+                }
+                text.push_str("/rules remove <n> 删除一条；也可以直接编辑这个文件。\n");
+                print_text(&text, false)?;
+            }
+        }
+        ["add", ..] => {
+            let rule = line.trim_start()["/rules".len()..]
+                .trim_start()
+                .strip_prefix("add")
+                .unwrap_or_default()
+                .trim();
+            if rule.is_empty() {
+                return Err(Error::Session("用法：/rules add <规则>".into()));
+            }
+            let text = if rules.add_by_user(rule)? {
+                format!("已添加到 {shown}；本会话接下来的任务和提交前审查都会用上。\n")
+            } else {
+                "已有相同的规则。\n".to_owned()
+            };
+            print_text(&text, false)?;
+        }
+        ["remove", number] => {
+            let number = number
+                .trim_start_matches('#')
+                .parse()
+                .map_err(|_| Error::Session("用法：/rules remove <n>（/rules 列出编号）".into()))?;
+            let removed = rules.remove(number)?;
+            print_text(
+                &format!("已删除：{}\n", crate::text::visible_row(&removed)),
+                false,
+            )?;
+        }
+        ["local"] => print_text(&keep_rules_local(rules.path()).await?, false)?,
+        _ => {
+            return Err(Error::Session(
+                "用法：/rules [add <规则>|remove <n>|local]".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Lists the rules file in the repository's `info/exclude`, so it stays on this machine.
+async fn keep_rules_local(path: &std::path::Path) -> Result<String> {
+    let Some(root) = path.parent().and_then(std::path::Path::parent) else {
+        return Err(Error::Session("规则文件的位置不对".into()));
+    };
+    let cancel = CancellationToken::new();
+    let Some(exclude) = crate::process::git::Git::new(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .query(&cancel)
+        .await
+    else {
+        return Ok("这个目录不在 git 仓库里，规则文件本来就只在本机。\n".into());
+    };
+    let exclude = root.join(exclude.trim());
+    let entry = format!("/{}", crate::memory::rules::FILE);
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(format!(
+            "{entry} 已经在 {} 里。\n",
+            crate::paths::display(&exclude)
+        ));
+    }
+    if let Some(dir) = exclude.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    crate::persist::write_atomic(
+        &exclude,
+        format!("{existing}{separator}{entry}\n").as_bytes(),
+        false,
+    )?;
+    Ok(format!(
+        "已把 {entry} 加进 {}：规则只留在本机，不会被提交。已经提交过的，需要再 git rm --cached {}。\n",
+        crate::paths::display(&exclude),
+        crate::memory::rules::FILE
+    ))
+}
+
+/// The AI review of what is about to be committed; findings stop the commit.
+async fn review_staged(
+    app: &Application,
+    git: &Git,
+    review: &crate::safety::gates::review::CommitReview,
+) -> Result<()> {
+    use crate::safety::gates::review::Verdict;
+    let diff = match git
+        .run(&["diff", "--cached", "--no-color", "--no-ext-diff"])
+        .await
+    {
+        Ok(diff) => diff,
+        Err(err) => {
+            print_text(
+                &format!("[提交前审查] 读不到暂存的改动，已跳过：{err}\n"),
+                true,
+            )?;
+            return Ok(());
+        }
+    };
+    if !review.wanted(&diff) {
+        return Ok(());
+    }
+    print_text("[提交前审查] 正在按项目规则审查暂存的改动…\n", true)?;
+    let cancel = CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if crate::app::console::interrupted().await.is_ok() {
+                cancel.cancel();
+            }
+        })
+    };
+    let verdict = review
+        .review(&app.session.current_request, &diff, cancel)
+        .await;
+    watcher.abort();
+    match verdict {
+        Verdict::Passed => {
+            print_text("[提交前审查] 通过\n", true)?;
+            Ok(())
+        }
+        Verdict::Skipped => {
+            print_text("[提交前审查] 没有完成，已跳过\n", true)?;
+            Ok(())
+        }
+        Verdict::Issues(findings) => Err(Error::Session(format!(
+            "提交前审查发现问题，未提交：\n{findings}\n\n修改后重新运行 /commit；确认这些问题不成立时，用 /commit --no-review 跳过审查。"
+        ))),
+    }
 }
 
 /// The configured verification commands, each authorized like any shell command.
@@ -565,7 +694,7 @@ async fn verify(app: &Application, commands: &[String]) -> Result<()> {
                     } else {
                         format!("exit_code={:?}", output.code)
                     },
-                    crate::app::diagnostics::clip(text.trim(), 4000)
+                    crate::text::clip(text.trim(), 4000, "…")
                 )));
             }
             print_text(&format!("通过   {command}\n"), true)?;
@@ -609,9 +738,9 @@ fn change_directory(app: &mut Application, path: &str) -> Result<bool> {
     print_text(
         &format!(
             "[cd] 正在 {} 中重启；会话 {} 已为 {} 保存（回到那里用 --resume {}）。\n",
-            target.display(),
+            crate::paths::display(&target),
             app.session.id,
-            app.settings.cwd.display(),
+            crate::paths::display(&app.settings.cwd),
             app.session.id
         ),
         true,
@@ -706,7 +835,7 @@ async fn doctor(app: &mut Application, args: &[&str]) -> Result<()> {
             output.write_all(diagnostics::support_report(&app.diagnostics).as_bytes())?;
             format!(
                 "诊断报告已导出：{}；请检查并按需编辑后再分享。\n",
-                path.display()
+                crate::paths::display(&path)
             )
         }
         ["report", "analyze", "confirm", expected] => {
@@ -832,17 +961,21 @@ mod tests {
         let text = unknown_command("/comit now").to_string();
         assert!(text.contains("你是不是想输入 /commit"), "{text}");
         let text = unknown_command("/undo now").to_string();
-        assert!(text.contains("用法：\n  /undo [confirm]"), "{text}");
+        assert!(text.contains("用法：\n  /undo [#n"), "{text}");
         let text = unknown_command("/zzzzzz").to_string();
         assert!(text.contains("未知命令 /zzzzzz") && !text.contains("你是不是"));
         assert_eq!(distance("kitten", "sitting"), 3);
         let text = unknown_command("/mpc").to_string();
         assert!(text.contains("你是不是想输入 /mcp"), "{text}");
+        let shortcut = crate::commands::shortcut;
         assert_eq!(
-            crate::commands::config_shortcut("/mcp login atlassian").as_deref(),
+            shortcut("/mcp login atlassian").as_deref(),
             Some("/config mcp login atlassian")
         );
-        assert_eq!(crate::commands::config_shortcut("/mcpx"), None);
+        assert_eq!(shortcut("/usage").as_deref(), Some("/status usage"));
+        assert_eq!(shortcut("/cost 30d").as_deref(), Some("/status cost 30d"));
+        assert_eq!(shortcut("/mcpx"), None);
+        assert_eq!(shortcut("/usagex"), None);
     }
 
     #[test]
@@ -867,9 +1000,7 @@ mod tests {
             assert!(status.iter().any(|found| found == sub), "{status:?}");
         }
         let config = texts("/config ");
-        for sub in [
-            "skills", "mcp", "hooks", "plugins", "memory", "trust", "budget",
-        ] {
+        for sub in ["skills", "mcp", "hooks", "plugins", "memory", "trust"] {
             assert!(config.iter().any(|found| found == sub), "{config:?}");
         }
         assert!(texts("/status agents ").contains(&"merge".to_owned()));

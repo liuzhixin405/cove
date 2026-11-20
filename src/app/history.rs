@@ -9,7 +9,6 @@
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use unicode_width::UnicodeWidthChar;
 
 use crate::session::{SessionSummary, TurnRecord, time};
 
@@ -342,7 +341,10 @@ impl HistoryView {
             .extend(highlight(&summary.title, if selected { TITLE } else { "" }, query).0);
         let mut right = Line::new();
         if self.show_cwd {
-            right = right.push(DIM, pad_right(&clip(&summary.workspace_name(), 16), 18));
+            right = right.push(
+                DIM,
+                pad_right(&crate::text::clip_width(&summary.workspace_name(), 16), 18),
+            );
         }
         let state = match (entry.current, summary.interrupted, summary.unfinished) {
             (true, _, _) => "当前",
@@ -621,10 +623,10 @@ impl HistoryView {
             lines.push(String::new());
         }
         let hint = match &self.flash {
-            Some(flash) => self.paint(FLASH, &clip(&format!(" {flash}"), inner)),
+            Some(flash) => self.paint(FLASH, &crate::text::clip_width(&format!(" {flash}"), inner)),
             None => self.paint(
                 DIM,
-                &clip(
+                &crate::text::clip_width(
                     " ↑↓/单击 选择对话 · 滚轮/PgUp/PgDn 滚动 · 拖动选中即复制（可跨屏）· c 复制整段 · o 在编辑器打开 · / 筛选 · Enter 继续此会话 · Esc 返回",
                     inner,
                 ),
@@ -888,13 +890,10 @@ impl HistoryView {
         );
         let ((start, _), (end, _)) = selection.ordered();
         let mut rows = Vec::new();
-        for line in start..=end.min(lines.len().saturating_sub(1)) {
+        let last = end.min(lines.len().saturating_sub(1));
+        for (line, text) in lines.iter().enumerate().take(last + 1).skip(start) {
             if let Some((from, to)) = selection.columns(line) {
-                rows.push(
-                    slice_columns(&plain(&lines[line]), from, to)
-                        .trim_end()
-                        .to_owned(),
-                );
+                rows.push(slice_columns(&plain(text), from, to).trim_end().to_owned());
             }
         }
         let text = rows.join("\n");
@@ -913,7 +912,8 @@ impl HistoryView {
         } else {
             format!(" {right} ")
         };
-        let fill = inner.saturating_sub(3 + width(label) + 1 + width(&right) + 2);
+        let fill = inner
+            .saturating_sub(3 + crate::text::width(label) + 1 + crate::text::width(&right) + 2);
         format!(
             "{}{}{}{}",
             self.paint(BORDER, "── "),
@@ -925,10 +925,13 @@ impl HistoryView {
 
     fn frame_top(&self, frame: &Frame, title: &str, right: &str) -> String {
         let right = format!(" {right} ");
-        let title = clip(title, frame.total.saturating_sub(8 + width(&right)));
+        let title = crate::text::clip_width(
+            title,
+            frame.total.saturating_sub(8 + crate::text::width(&right)),
+        );
         let fill = frame
             .total
-            .saturating_sub(3 + width(&title) + 1 + width(&right) + 2);
+            .saturating_sub(3 + crate::text::width(&title) + 1 + crate::text::width(&right) + 2);
         format!(
             "{}{}{}{}",
             self.paint(BORDER, "┌─ "),
@@ -939,7 +942,9 @@ impl HistoryView {
     }
 
     fn frame_sep(&self, frame: &Frame, label: &str) -> String {
-        let fill = frame.total.saturating_sub(4 + width(label) + 2);
+        let fill = frame
+            .total
+            .saturating_sub(4 + crate::text::width(label) + 2);
         format!(
             "{}{}{}",
             self.paint(BORDER, "├─ "),
@@ -954,10 +959,13 @@ impl HistoryView {
         } else {
             format!(" {right} ")
         };
-        let hint = clip(hint, frame.total.saturating_sub(8 + width(&right)));
+        let hint = crate::text::clip_width(
+            hint,
+            frame.total.saturating_sub(8 + crate::text::width(&right)),
+        );
         let fill = frame
             .total
-            .saturating_sub(3 + width(&hint) + 1 + width(&right) + 2);
+            .saturating_sub(3 + crate::text::width(&hint) + 1 + crate::text::width(&right) + 2);
         format!(
             "{}{}{}{}",
             self.paint(BORDER, "└─ "),
@@ -1010,7 +1018,10 @@ impl Line {
     }
 
     fn width(&self) -> usize {
-        self.0.iter().map(|(_, text)| width(text)).sum()
+        self.0
+            .iter()
+            .map(|(_, text)| crate::text::width(text))
+            .sum()
     }
 
     /// Exactly `inner` columns; `bg` colors the whole row (the selection).
@@ -1034,8 +1045,8 @@ impl Line {
             if used >= inner {
                 break;
             }
-            let text = clip(&visible(text), inner - used);
-            used += width(&text);
+            let text = crate::text::clip_width(&visible(text), inner - used);
+            used += crate::text::width(&text);
             out.push_str(&paint(&style(code), &text));
         }
         out.push_str(&paint(&style(""), &" ".repeat(inner - used)));
@@ -1053,8 +1064,8 @@ fn spread(left: Line, right: Line, inner: usize) -> Line {
         if used >= room {
             break;
         }
-        let text = clip(&visible(&text), room - used);
-        used += width(&text);
+        let text = crate::text::clip_width(&visible(&text), room - used);
+        used += crate::text::width(&text);
         out = out.push(&code, text);
     }
     let gap = inner.saturating_sub(used + right_width);
@@ -1091,59 +1102,27 @@ fn highlight(text: &str, base: &str, query: &str) -> Line {
     line
 }
 
-fn char_width(c: char) -> usize {
-    c.width().unwrap_or(0)
-}
-
-fn width(text: &str) -> usize {
-    text.chars().map(char_width).sum()
-}
-
-/// Cut to `max` display columns, ending with `…` when cut.
-fn clip(text: &str, max: usize) -> String {
-    if width(text) <= max {
-        return text.to_owned();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        if used + char_width(c) + 1 > max {
-            break;
-        }
-        out.push(c);
-        used += char_width(c);
-    }
-    if max > 0 {
-        out.push('…');
-    }
-    out
-}
-
 fn pad_right(text: &str, columns: usize) -> String {
-    format!("{text}{}", " ".repeat(columns.saturating_sub(width(text))))
+    format!(
+        "{text}{}",
+        " ".repeat(columns.saturating_sub(crate::text::width(text)))
+    )
 }
 
 fn pad_left(text: &str, columns: usize) -> String {
-    format!("{}{text}", " ".repeat(columns.saturating_sub(width(text))))
+    format!(
+        "{}{text}",
+        " ".repeat(columns.saturating_sub(crate::text::width(text)))
+    )
 }
 
-/// Terminal controls in stored text are neutralized; tabs become spaces.
+/// Stored text made safe to print; tabs become spaces so columns add up.
 fn visible(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\t' => ' ',
-            '\n' => '\n',
-            c if c.is_control() => ' ',
-            c => c,
-        })
-        .collect()
+    crate::text::visible(text).replace('\t', " ")
 }
 
 fn one_line(text: &str) -> String {
-    visible(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::text::one_line(&visible(text))
 }
 
 /// The first line of prose in a reply: headings, tables and code are skipped.
@@ -1172,14 +1151,14 @@ fn first_sentence(reply: &str) -> Option<String> {
 fn snippet(text: &str, query: &str, max: usize) -> String {
     let lower = text.to_lowercase();
     let Some(at) = lower.find(&query.trim().to_lowercase()) else {
-        return clip(text, max);
+        return crate::text::clip_width(text, max);
     };
     let before = text[..at.min(text.len())].chars().count();
     if before <= 8 {
-        return clip(text, max);
+        return crate::text::clip_width(text, max);
     }
     let rest: String = text.chars().skip(before - 8).collect();
-    format!("…{}", clip(&rest, max))
+    format!("…{}", crate::text::clip_width(&rest, max))
 }
 
 /// Styles removed.
@@ -1209,7 +1188,7 @@ fn slice_columns(text: &str, from: usize, to: usize) -> String {
         if column >= from {
             out.push(c);
         }
-        column += char_width(c);
+        column += crate::text::char_width(c);
     }
     out
 }
@@ -1247,7 +1226,7 @@ fn reverse_columns(text: &str, from: usize, to: usize) -> String {
             inside = false;
         }
         out.push(c);
-        column += char_width(c);
+        column += crate::text::char_width(c);
     }
     // Selected past the line's end: one reversed space shows the line break is too.
     if to == usize::MAX && column >= from {
@@ -1357,7 +1336,7 @@ fn open_in_editor(summary: &SessionSummary, turn: usize) -> String {
         };
         let _ = opened;
     });
-    format!("正在用编辑器打开 {}", path.display())
+    format!("正在用编辑器打开 {}", crate::paths::display(&path))
 }
 
 #[cfg(test)]
@@ -1442,7 +1421,10 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("今天") && rows.contains("最近一问"), "{rows}");
-        assert!(rows.lines().all(|row| width(row) <= 99), "{rows}");
+        assert!(
+            rows.lines().all(|row| crate::text::width(row) <= 99),
+            "{rows}"
+        );
         assert_eq!(view.list_key(key(KeyCode::Down), ""), ListAction::None);
         assert_eq!(
             view.list_key(key(KeyCode::Enter), ""),

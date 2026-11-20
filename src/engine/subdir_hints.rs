@@ -75,11 +75,7 @@ impl SubdirHints {
                     let relative = crate::tools::display_path(&self.root, &file);
                     let hint = format!(
                         "[Context from {relative}]\n{}",
-                        crate::tools::text_encoding::clip_bytes(
-                            text,
-                            FILE_LIMIT,
-                            "\n[...truncated]"
-                        )
+                        crate::text::clip(text, FILE_LIMIT, "\n[...truncated]")
                     );
                     if hint.len() > *budget {
                         skipped = true;

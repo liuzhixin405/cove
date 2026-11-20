@@ -1,8 +1,7 @@
-//! Sessions and recovery: the versioned session store, file checkpoints, git snapshots, the cost ledger and session notes.
+//! Sessions and recovery: the versioned session store, file checkpoints, git snapshots, and the cost ledger.
 
 pub mod history;
 mod journal;
-pub mod notes;
 pub mod snapshot;
 pub mod suggestions;
 pub mod summary;
@@ -13,8 +12,7 @@ pub mod usage;
 pub mod workspace;
 
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    fs::File,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -29,10 +27,9 @@ pub use turns::{TurnRecord, is_steer};
 
 use crate::{
     domain::{Block, Error, Message, Result, Usage},
+    persist::{atomic_json, read_json},
     tools::ToolOutput,
 };
-
-const STATE_LIMIT: u64 = 32 * 1024 * 1024;
 
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -78,8 +75,6 @@ pub struct Accounting {
     pub usage: Usage,
     pub model_calls: u64,
     pub cost: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub renewed_budget: Option<BudgetSpend>,
     /// Spend per model that actually served the requests (a session may switch models).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub by_model: std::collections::BTreeMap<String, ModelSpend>,
@@ -91,11 +86,6 @@ pub struct Accounting {
     pub lines_added: u64,
     #[serde(default)]
     pub lines_removed: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct BudgetSpend {
-    pub cost: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -116,19 +106,40 @@ impl ModelSpend {
             .usage
             .cache_write
             .saturating_add(other.usage.cache_write);
+        self.usage.cache_write_1h = self
+            .usage
+            .cache_write_1h
+            .saturating_add(other.usage.cache_write_1h);
         self.cost = self.cost.zip(other.cost).map(|(a, b)| a + b);
     }
 }
 
 impl Accounting {
-    pub fn budget_cost(&self) -> Option<f64> {
-        self.renewed_budget
-            .as_ref()
-            .map_or(self.cost, |budget| budget.cost)
-    }
-
-    pub fn reset_budget_spend(&mut self) {
-        self.renewed_budget = Some(BudgetSpend { cost: Some(0.0) });
+    /// Adds one model response: its usage, its cost (`None` makes the total unknown) and
+    /// the per-model spend of the model that answered.
+    pub fn add_response(&mut self, response: &crate::domain::ModelResponse, cost: Option<f64>) {
+        let usage = &mut self.usage;
+        usage.input = usage.input.saturating_add(response.usage.input);
+        usage.output = usage.output.saturating_add(response.usage.output);
+        usage.cache_read = usage.cache_read.saturating_add(response.usage.cache_read);
+        usage.cache_write = usage.cache_write.saturating_add(response.usage.cache_write);
+        usage.cache_write_1h = usage
+            .cache_write_1h
+            .saturating_add(response.usage.cache_write_1h);
+        self.cost = self.cost.zip(cost).map(|(a, b)| a + b);
+        if let Some(model) = response.model.as_ref().filter(|model| !model.is_empty()) {
+            self.by_model
+                .entry(model.clone())
+                .or_insert_with(|| ModelSpend {
+                    cost: Some(0.0),
+                    ..ModelSpend::default()
+                })
+                .add(&ModelSpend {
+                    calls: 1,
+                    usage: response.usage,
+                    cost,
+                });
+        }
     }
 
     /// Adds the per-model records of `other` (a sub-agent's spend).
@@ -248,12 +259,6 @@ impl Session {
             .accounting
             .cost
             .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-            || self
-                .accounting
-                .renewed_budget
-                .as_ref()
-                .and_then(|budget| budget.cost)
-                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
             || self.prices.is_some_and(|(input, output)| {
                 !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0
             })
@@ -448,14 +453,7 @@ impl Store {
             return Err(Error::Session("invalid session ID".into()));
         }
         let lock = self.root.join("locks").join(format!("{id}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock)
-            .map_err(|err| io_context("open lock", &lock, err))?;
-        file.try_lock_exclusive().map_err(|err| {
+        let file = crate::persist::try_lock(&lock, std::time::Duration::ZERO, |err| {
             Error::Session(format!(
                 "这个会话正被另一个 cove 窗口使用（或无法加锁：{err}）；请关闭那个窗口，或输入 /new 开启新会话"
             ))
@@ -466,27 +464,11 @@ impl Store {
     pub fn acquire_workspace(&self, root: &Path) -> Result<Lease> {
         let root = root.canonicalize()?;
         let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(
-                self.root
-                    .join("locks")
-                    .join(format!("workspace-{key}.lock")),
-            )
-            .map_err(|err| {
-                io_context(
-                    "open lock",
-                    &self
-                        .root
-                        .join("locks")
-                        .join(format!("workspace-{key}.lock")),
-                    err,
-                )
-            })?;
-        file.try_lock_exclusive().map_err(|err| {
+        let lock = self
+            .root
+            .join("locks")
+            .join(format!("workspace-{key}.lock"));
+        let file = crate::persist::try_lock(&lock, std::time::Duration::ZERO, |err| {
             Error::Workspace(format!(
                 "另一个 cove 进程（同一数据目录）正在使用这个项目目录（{err}）；请关闭那个窗口后重试（或在那个窗口里继续工作）"
             ))
@@ -561,140 +543,6 @@ impl SessionPersistence for Store {
             session,
         )
     }
-}
-
-pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let mut data = Vec::new();
-    File::open(path)
-        .map_err(|err| io_context("open", path, err))?
-        .take(STATE_LIMIT + 1)
-        .read_to_end(&mut data)
-        .map_err(|err| io_context("read", path, err))?;
-    if data.len() as u64 > STATE_LIMIT {
-        return Err(Error::Session("state file exceeds 32 MiB".into()));
-    }
-    Ok(serde_json::from_slice(&data)?)
-}
-
-/// Processes that have `path` open, as the Windows Restart Manager reports them
-/// ("name (pid)", comma separated); empty when none or unknown.
-#[cfg(windows)]
-pub fn file_holders(path: &Path) -> String {
-    use windows_sys::Win32::System::RestartManager::{
-        RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources, RmStartSession,
-    };
-    let display = path.to_string_lossy();
-    let plain = display.strip_prefix(r"\\?\").unwrap_or(&display);
-    let wide: Vec<u16> = plain.encode_utf16().chain(Some(0)).collect();
-    let mut key = [0_u16; 64];
-    let mut session = 0_u32;
-    // All pointers refer to live local buffers of the declared sizes.
-    unsafe {
-        if RmStartSession(&mut session, 0, key.as_mut_ptr()) != 0 {
-            return String::new();
-        }
-        let files = [wide.as_ptr()];
-        let mut names = Vec::new();
-        if RmRegisterResources(
-            session,
-            1,
-            files.as_ptr(),
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-        ) == 0
-        {
-            let mut needed = 0_u32;
-            let mut count = 16_u32;
-            let mut reasons = 0_u32;
-            let mut infos: Vec<RM_PROCESS_INFO> = vec![std::mem::zeroed(); 16];
-            if RmGetList(
-                session,
-                &mut needed,
-                &mut count,
-                infos.as_mut_ptr(),
-                &mut reasons,
-            ) == 0
-            {
-                for info in &infos[..count as usize] {
-                    let end = info.strAppName.iter().position(|c| *c == 0).unwrap_or(256);
-                    names.push(format!(
-                        "{} ({})",
-                        String::from_utf16_lossy(&info.strAppName[..end]),
-                        info.Process.dwProcessId
-                    ));
-                }
-            }
-        }
-        RmEndSession(session);
-        names.join(", ")
-    }
-}
-
-#[cfg(not(windows))]
-pub fn file_holders(_: &Path) -> String {
-    String::new()
-}
-
-/// Moves a written temporary file over `path`. `NamedTempFile::persist` uses
-/// `MoveFileExW`, which on Windows fails with "access denied" while any process (a
-/// reader, an editor, a virus scanner, the search indexer) has the target open, even
-/// with delete sharing; `std::fs::rename` uses POSIX rename semantics there and
-/// replaces the file anyway, as it does on Unix.
-pub fn replace_with(file: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
-    let temporary = file.into_temp_path();
-    // A scanner or indexer that opened the target without delete sharing holds it only
-    // briefly; wait it out instead of failing the save (about 1.5s in all).
-    let mut attempt = 0;
-    while let Err(err) = std::fs::rename(&temporary, path) {
-        if attempt >= 5 || err.kind() != std::io::ErrorKind::PermissionDenied {
-            return Err(err);
-        }
-        attempt += 1;
-        std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
-    }
-    let _ = temporary.keep();
-    Ok(())
-}
-
-/// An I/O error that names the operation and the file, keeping its kind.
-pub fn io_context(op: &str, path: &Path, err: std::io::Error) -> Error {
-    Error::Io(std::io::Error::new(
-        err.kind(),
-        format!("{op} {}: {err}", path.display()),
-    ))
-}
-
-pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let data = serde_json::to_vec(value)?;
-    if data.len() as u64 > STATE_LIMIT {
-        return Err(Error::Session(
-            "state exceeds 32 MiB; no data was overwritten".into(),
-        ));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Session("state path has no parent".into()))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|err| io_context("create temporary file in", parent, err))?;
-    file.write_all(&data)
-        .map_err(|err| io_context("write", file.path(), err))?;
-    file.as_file()
-        .sync_all()
-        .map_err(|err| io_context("sync", file.path(), err))?;
-    replace_with(file, path).map_err(|err| {
-        let holders = file_holders(path);
-        let op = if holders.is_empty() {
-            "replace".to_owned()
-        } else {
-            format!("replace (in use by {holders})")
-        };
-        io_context(&op, path, err)
-    })?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    Ok(())
 }
 
 /// Characters of a session title.
@@ -776,7 +624,6 @@ impl Session {
             .or_else(|| title_from(&self.current_request))
     }
 
-    /// Real (non-synthetic) user turns.
     /// Whether a real user request was ever made in this session.
     pub fn has_conversation(&self) -> bool {
         self.user_turns() > 0
@@ -1126,34 +973,6 @@ pub fn list_sessions(
 mod tests {
     use super::*;
     use crate::domain::Message;
-
-    #[cfg(windows)]
-    #[test]
-    fn file_holders_names_the_process_that_has_a_file_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("held.json");
-        std::fs::write(&path, "{}").unwrap();
-        let held = File::open(&path).unwrap();
-        let holders = file_holders(&path.canonicalize().unwrap());
-        assert!(
-            holders.contains(&format!("({})", std::process::id())),
-            "{holders}"
-        );
-        drop(held);
-        assert!(file_holders(&path).is_empty());
-    }
-
-    #[test]
-    fn atomic_json_replaces_a_file_that_a_reader_has_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        atomic_json(&path, &1).unwrap();
-        let reader = File::open(&path).unwrap();
-        atomic_json(&path, &2).unwrap();
-        drop(reader);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "2");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
 
     fn session(store: &Store, cwd: &str, request: Option<&str>) -> Session {
         let mut session = Session::new(cwd.into(), "p".into(), "m".into(), None);

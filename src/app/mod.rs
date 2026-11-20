@@ -65,7 +65,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         print_text(
             &format!(
                 "[warning] 当前工作区是{what}（{}）：文件工具能访问其下的所有内容，自动快照已关闭。日常使用请在项目目录里启动 cove（或加 --cwd <目录>）。\n",
-                settings.cwd.display()
+                crate::paths::display(&settings.cwd)
             ),
             true,
         )?;
@@ -103,6 +103,8 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     );
     diagnostics.trace.set_echo(settings.debug);
     crate::app::blocks::VERBOSE.store(settings.verbose, std::sync::atomic::Ordering::Relaxed);
+    // The key cove uses must not reach the commands the model runs.
+    crate::process::secrets::protect_key_source(&settings.key_source);
     let router = crate::commands::model::new_router(&settings)?;
     crate::app::ui::set_show_reasoning(settings.show_reasoning);
     crate::app::ui::set_live_output(settings.live_output);
@@ -115,18 +117,23 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     };
     // Every model call is metered into the usage ledger at this one boundary.
     let usage = Arc::new(crate::session::usage::UsageLedger::new(store.root()));
+    let pricing: crate::session::usage::Pricing = {
+        let router = router.clone();
+        Arc::new(move |model: &str| crate::model::routing::ModelPolicy::prices(&*router, model))
+    };
     let metered = |inner: Arc<dyn Provider>, source| -> Arc<dyn crate::domain::Provider> {
         Arc::new(crate::session::usage::Metered {
             inner,
             ledger: usage.clone(),
             provider: settings.provider.clone(),
             model: settings.model.clone(),
-            prices: settings.prices,
+            pricing: pricing.clone(),
             source,
         })
     };
     let provider = metered(traced(router.clone()), "session");
-    // Cheap background calls (memory extraction, dream): the `model_fast` model when set.
+    // One-off background calls (memory extraction, titles, web summaries, /init,
+    // compaction): the `model_fast` model when set.
     let background = metered(traced(router.background()), "background");
     let progress = Arc::new(Progress::default());
     let local = Arc::new(
@@ -179,6 +186,9 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         ),
         authorizer: authorizer.clone(),
     });
+    // The project's rules (`.cove/rules.md`): written by extraction, dream and
+    // `/rules`, read by the reviews and announced to the model as they are added.
+    let rules = crate::memory::rules::ProjectRules::for_workspace(&settings.cwd);
     let project_context = {
         let cwd = settings.cwd.clone();
         let index = skills.index()?;
@@ -215,10 +225,12 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
             progress: progress.clone(),
             tools: tools.clone(),
             provider: provider.clone(),
+            background: background.clone(),
             readonly,
             ledger: ledger.clone(),
             project_context: Some(project_context.clone()),
             trust: Arc::new(crate::config::trust::StoreTrust),
+            rules: rules.clone(),
         },
     );
     let workflow_tools = Arc::new(crate::tools::workflow_tools::WorkflowTools {
@@ -250,8 +262,9 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         &store,
         memory,
         authorizer.clone(),
-        background,
+        background.clone(),
         usage.clone(),
+        rules,
     )
     .await;
     let agent_tools = sessions.wrap_tools(agent_tools, settings.permission);
@@ -261,7 +274,6 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         Limits {
             max_turns: settings.max_turns,
             max_output_tokens: settings.max_output_tokens,
-            budget: settings.budget,
             prices: settings.prices,
         },
     )?
@@ -304,14 +316,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     for hook in gates.hooks {
         agent = agent.with_turn_hook(hook);
     }
-    // Skill review uses the cheap background model when one is configured.
-    let agent = crate::commands::extensions::turn_hooks(
-        agent,
-        &settings,
-        &skills,
-        router.background(),
-        usage.clone(),
-    );
+    let agent = crate::commands::extensions::turn_hooks(agent, &settings, &skills);
     if settings.dump_system_prompt {
         print_text(&format!("{}\n", agent.system_prompt()), false)?;
         return Ok(());
@@ -363,6 +368,8 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
             attachments: Vec::new(),
         },
         agents,
+        background,
+        commit_review: gates.commit_review,
     };
     app.sessions.maintain(&app.store, &app.session.id);
     let outcome = app.interact().await;
@@ -470,8 +477,7 @@ impl Application {
             .map(|branch| branch.trim().to_owned())
             .filter(|branch| !branch.is_empty())
             .map_or(String::new(), |branch| format!(" ({branch})"));
-        let cwd = self.settings.cwd.display().to_string();
-        let cwd = cwd.strip_prefix(r"\\?\").unwrap_or(&cwd).to_owned();
+        let cwd = crate::paths::display(&self.settings.cwd);
         if crate::app::console::rich() {
             return format!(
                 "\x1b[1;36mcove\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m({}) · {} 模式\x1b[0m\n\x1b[2m{cwd}{branch} · 会话 {}\x1b[0m\n\x1b[2m/help 命令 · / 或 @ 补全 · 两次 Esc 中断 · ! 插话 · /exit 退出\x1b[0m\n",
@@ -585,7 +591,7 @@ pub(crate) fn validate_identity(session: &Session, settings: &Settings) -> Resul
     if session.cwd != settings.cwd {
         return Err(Error::Session(format!(
             "该会话属于另一个工作区（{}）；请在那个目录启动 cove 再恢复它，或用 /new 在当前目录开新会话",
-            session.cwd.display()
+            crate::paths::display(&session.cwd)
         )));
     }
     Ok(())
@@ -630,6 +636,10 @@ pub(crate) struct Application {
     pub(crate) sessions: Arc<crate::commands::sessions::Services>,
     pub(crate) agents: Arc<crate::agents::subagent::AgentHub>,
     pub(crate) models: crate::commands::model::ModelState,
+    /// The cheap background provider, traced and metered like every other call.
+    pub(crate) background: Arc<dyn Provider>,
+    /// The AI review before `/commit`; `None` when `commit_review` is off.
+    pub(crate) commit_review: Option<Arc<crate::safety::gates::review::CommitReview>>,
 }
 
 impl Application {
@@ -638,6 +648,23 @@ impl Application {
         if self.sessions.apply_titles(&mut self.session, &self.store) {
             let _ = self.store.save(&self.session);
             self.show_window_title();
+        }
+        self.announce_rules();
+    }
+
+    /// One line for each project rule learned in the background since the last one.
+    fn announce_rules(&self) {
+        let Some(rules) = &self.sessions.rules else {
+            return;
+        };
+        for rule in rules.take_unseen() {
+            let _ = print_text(
+                &format!(
+                    "[项目规则] 记下一条：{}（/rules 查看或删除）\n",
+                    crate::text::visible_row(&rule)
+                ),
+                true,
+            );
         }
     }
 
@@ -649,7 +676,11 @@ impl Application {
             } else {
                 String::new()
             };
-            console.set_window_title(&title);
+            console.set_window_title(
+                &self.session.id,
+                &title,
+                self.session.title_source == crate::session::TitleSource::User,
+            );
         }
     }
 
@@ -693,11 +724,10 @@ impl Application {
         );
     }
 
-    /// Provider for cheap background calls (summaries, memory extraction, reviews):
-    /// the `model_fast` model when configured, else the main model.
-    #[allow(dead_code)] // Shared contract for background callers.
+    /// Provider for cheap background calls (summaries, `/init`): the `model_fast` model
+    /// when configured, else the main model; traced and recorded in the usage ledger.
     pub(crate) fn background_provider(&self) -> Arc<dyn Provider> {
-        self.models.router.background()
+        self.background.clone()
     }
 
     /// Feeds `errors.log`. Model and task failures are logged where they happen
@@ -1177,7 +1207,7 @@ impl Application {
                         "会话 {}  状态 {:?}\n工作区 {}\n供应商 {}  协议 {:?}  模型 {}  base_url {}  profile {}  配置 {}  代理 {}\n消息 {} 条  上下文 ~{}/{} tokens（窗口 {}）  压缩 {} 次\n模型调用 {} 次  输入 {} tokens  输出 {} tokens  预估费用 {}\n待处理调用 {}\n",
                         self.session.id,
                         self.session.state,
-                        self.session.cwd.display(),
+                        crate::paths::display(&self.session.cwd),
                         self.settings.provider,
                         self.settings.protocol,
                         self.settings.model,
@@ -1186,7 +1216,7 @@ impl Application {
                         self.settings
                             .config_path
                             .as_ref()
-                            .map_or("-".into(), |path| path.display().to_string()),
+                            .map_or("-".into(), |path| crate::paths::display(path)),
                         crate::model::net::describe(),
                         self.session.messages.len(),
                         crate::engine::context::tokens(&self.session.messages),
@@ -1269,7 +1299,14 @@ impl Application {
                 result?;
             }
             ["/diff"] => print_text(&self.workspace.diff()?, false)?,
-            ["/undo"] => print_text(&self.workspace.undo_preview()?, false)?,
+            ["/undo"] => print_text(
+                &format!(
+                    "Git 快照不可用（{}），只能回滚上一个任务的文件工具编辑（write/edit，不含 Shell 的影响）；/undo confirm 执行：\n{}",
+                    self.sessions.snapshot_error.as_deref().unwrap_or("未启动"),
+                    self.workspace.undo_preview()?
+                ),
+                false,
+            )?,
             ["/undo", "confirm"] => {
                 if !self.session.pending.is_empty() {
                     return Err(Error::Session(
@@ -1345,9 +1382,9 @@ impl Application {
                 )?;
             }
             _ => {
-                // `/mcp`, `/plugins`, `/hooks`, `/memory`: the /config areas by their
-                // own names, as other agents name them (a skill of that name wins).
-                if let Some(config) = crate::commands::config_shortcut(line) {
+                // `/mcp`, `/memory`, `/usage`, `/cost` …: short names other agents use for
+                // our commands (a skill of that name wins).
+                if let Some(config) = crate::commands::shortcut(line) {
                     return Box::pin(self.command(&config)).await;
                 }
                 // Built-in suggestions first, then skills and plugin commands.

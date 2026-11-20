@@ -128,7 +128,7 @@ pub fn digest(root: &Path) -> String {
     out.push_str("\n## Directory tree (two levels)\n");
     let entries = walk(root, 2);
     for (path, dir) in entries.iter().take(TREE_ENTRIES) {
-        let shown = path.display().to_string().replace('\\', "/");
+        let shown = path.to_string_lossy().into_owned().replace('\\', "/");
         out.push_str(&format!("{shown}{}\n", if *dir { "/" } else { "" }));
     }
     if entries.len() > TREE_ENTRIES {
@@ -186,7 +186,7 @@ pub fn template(root: &Path, target: &str) -> String {
     let top: Vec<String> = walk(root, 1)
         .into_iter()
         .filter(|(_, dir)| *dir)
-        .map(|(path, _)| format!("- `{}/`", path.display()))
+        .map(|(path, _)| format!("- `{}/`", path.to_string_lossy()))
         .take(20)
         .collect();
     if !top.is_empty() {

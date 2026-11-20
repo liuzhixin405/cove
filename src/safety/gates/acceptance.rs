@@ -56,7 +56,7 @@ pub fn path(data_dir: &Path, session_id: &str) -> PathBuf {
 }
 
 pub fn load(data_dir: &Path, session_id: &str) -> Option<Report> {
-    crate::session::read_json(&path(data_dir, session_id)).ok()
+    crate::persist::read_json(&path(data_dir, session_id)).ok()
 }
 
 pub fn summary(report: &Report) -> String {
@@ -122,22 +122,14 @@ pub fn summary(report: &Report) -> String {
     out
 }
 
+/// A read-only git query for the acceptance report (10 s); `None` on any failure.
 async fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    crate::process::git::Git::new(root)
+        .args(args.iter().copied())
+        .timeout(Duration::from_secs(10))
+        .query(&tokio_util::sync::CancellationToken::new())
+        .await
+        .map(|text| text.trim().to_owned())
 }
 
 pub async fn git_state(root: &Path) -> GitState {
@@ -223,7 +215,7 @@ impl TurnHook for Acceptance {
                 let _ = std::fs::create_dir_all(parent);
             }
             // A failed report must not fail the task it describes.
-            let _ = crate::session::atomic_json(&target, &report);
+            let _ = crate::persist::atomic_json(&target, &report);
         })
     }
 }

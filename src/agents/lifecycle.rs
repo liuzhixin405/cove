@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::{Error, Result},
-    session::{Accounting, atomic_json, now, read_json, valid_id},
+    persist::{atomic_json, read_json},
+    session::{Accounting, now, valid_id},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,7 +8,6 @@
 use std::{
     collections::HashSet,
     path::{Component, Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     domain::{Error, Result, ToolDefinition},
     engine::turn::TurnHook,
+    process::git::Git,
     session::Session,
     tools::{ToolExecutor, ToolOutput},
 };
@@ -31,6 +31,10 @@ use crate::{
 /// Snapshots kept per project; trimming starts at `KEEP + SLACK`.
 pub const KEEP: usize = 50;
 const SLACK: usize = 10;
+/// Snapshots older than this are dropped; trimming starts once the oldest is
+/// `MAX_AGE + AGE_SLACK` old, so it runs about every few days, not at each snapshot.
+const MAX_AGE: u64 = 30 * 24 * 3600;
+const AGE_SLACK: u64 = 3 * 24 * 3600;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a tool call waits for the snapshot before it; a slower one is skipped for that
 /// call (the staging finishes in the background, so the next one is fast again).
@@ -73,17 +77,9 @@ const EXCLUDES: &[&str] = &[
 /// reach snapshot Git, as in Gemini CLI. Everything snapshots need is pinned in [`CONFIG`].
 const ISOLATED_CONFIG: &str = "isolated.gitconfig";
 
-/// Environment for every Git run on the snapshot store.
-fn isolate<'a>(
-    command: &'a mut tokio::process::Command,
-    git_dir: &Path,
-) -> &'a mut tokio::process::Command {
-    command
-        .env("GIT_CONFIG_GLOBAL", git_dir.join(ISOLATED_CONFIG))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
-}
+/// Most bytes kept from one snapshot git call. Snapshots need every byte (a cut listing
+/// or blob would corrupt the store), so more is an error; this only bounds memory.
+const STORE_LIMIT: usize = 1024 * 1024 * 1024;
 
 /// Byte-exact storage regardless of the project's attributes.
 const ATTRIBUTES: &str = "* -text -filter !diff -merge -ident -working-tree-encoding\n";
@@ -152,6 +148,11 @@ pub struct Planned {
 #[derive(Default)]
 struct State {
     task_first: Option<String>,
+    /// The current task's request, for the label of its snapshot.
+    task_request: String,
+    /// Whether the current task has its snapshot; later file-tool edits in the task
+    /// take none (the file-tool checkpoint covers them).
+    task_taken: bool,
     created: u32,
     /// Snapshots that missed [`SNAPSHOT_BUDGET`]; at [`SLOW_LIMIT`] they stop.
     slow: u32,
@@ -287,6 +288,23 @@ pub struct Snapshots {
     state: std::sync::Mutex<State>,
 }
 
+/// Whether `pack_dir` holds a cruft pack (unreachable objects, see `git gc`) old
+/// enough for `--prune=1.hour.ago` to delete.
+fn expired_garbage(pack_dir: &Path) -> bool {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(Duration::from_secs(3600)) else {
+        return false;
+    };
+    std::fs::read_dir(pack_dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.path().extension().is_some_and(|ext| ext == "mtimes")
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|modified| modified < cutoff)
+        })
+    })
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::Workspace(message.into())
 }
@@ -299,10 +317,10 @@ impl Snapshots {
 
     async fn open_keeping(data_dir: &Path, work: &Path, keep: usize) -> Result<Arc<Self>> {
         std::fs::create_dir_all(data_dir)?;
-        let git_dir = plain(&data_dir.canonicalize()?)
+        let git_dir = crate::paths::plain(&data_dir.canonicalize()?)
             .join("checkpoints")
             .join("git");
-        let work = plain(&work.canonicalize()?);
+        let work = crate::paths::plain(&work.canonicalize()?);
         let key = format!("{:x}", Sha256::digest(work.as_os_str().as_encoded_bytes()));
         let key = &key[..16];
         let snapshots = Self {
@@ -322,22 +340,23 @@ impl Snapshots {
             std::fs::write(&isolated, "")?;
         }
         if !snapshots.git_dir.join("HEAD").is_file() {
-            let output = isolate(&mut tokio::process::Command::new("git"), &snapshots.git_dir)
-                .arg("init")
-                .arg("--bare")
-                .arg("--quiet")
+            let output = Git::new(&snapshots.git_dir)
+                .isolated(&isolated)
+                .args(["init", "--bare", "--quiet"])
                 .arg(&snapshots.git_dir)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output()
+                .timeout(GIT_TIMEOUT)
+                .output(&CancellationToken::new())
                 .await
-                .map_err(|err| invalid(format!("找不到 git（快照需要 git）：{err}")))?;
-            if !output.status.success() {
+                .map_err(|err| {
+                    invalid(format!(
+                        "快照需要 git：{}",
+                        crate::process::git::error_text(&err)
+                    ))
+                })?;
+            if !output.ok {
                 return Err(invalid(format!(
                     "git init failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    output.stderr_text().trim()
                 )));
             }
         }
@@ -354,42 +373,38 @@ impl Snapshots {
         }
         std::fs::write(info.join("exclude"), exclude)?;
         std::fs::write(info.join("attributes"), ATTRIBUTES)?;
+        // A trim's garbage waits an hour in a cruft pack; a later gc deletes it, and
+        // the next trim may be far off.
+        if expired_garbage(&snapshots.git_dir.join("objects").join("pack")) {
+            snapshots.collect_garbage();
+        }
         Ok(Arc::new(snapshots))
     }
 
+    /// Git on the snapshot store: isolated config, pinned settings, the store's git
+    /// directory and this project's private index.
+    fn store_git(&self) -> Git {
+        Git::new(&self.work)
+            .isolated(&self.git_dir.join(ISOLATED_CONFIG))
+            .args(CONFIG.iter().copied())
+            .env("GIT_DIR", &self.git_dir)
+            .env("GIT_INDEX_FILE", &self.index)
+            .timeout(GIT_TIMEOUT)
+            .limit(STORE_LIMIT)
+    }
+
     async fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut command = tokio::process::Command::new("git");
-        isolate(&mut command, &self.git_dir)
-            .args(CONFIG)
+        self.store_git()
             .arg("-c")
             .arg(format!(
                 "core.excludesFile={}",
                 self.excludes.to_string_lossy().replace('\\', "/")
             ))
-            .args(args)
-            .current_dir(&self.work)
-            .env("GIT_DIR", &self.git_dir)
+            .args(args.iter().copied())
             .env("GIT_WORK_TREE", &self.work)
-            .env("GIT_INDEX_FILE", &self.index)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
+            .bytes(&CancellationToken::new())
             .await
-            .map_err(|_| invalid(format!("git {} timed out", args.first().unwrap_or(&""))))?
-            .map_err(|err| invalid(format!("找不到 git（快照需要 git）：{err}")))?;
-        if !output.status.success() {
-            return Err(invalid(format!(
-                "git {} failed: {}",
-                args.first().unwrap_or(&""),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(output.stdout)
+            .map_err(|err| invalid(crate::process::git::error_text(&err)))
     }
 
     async fn git(&self, args: &[&str]) -> Result<String> {
@@ -484,27 +499,14 @@ impl Snapshots {
 
     /// The project's own Git, run in the work tree; `None` when there is none or it fails.
     async fn project_git(&self, args: &[&str]) -> Option<String> {
-        let output = tokio::time::timeout(
-            GIT_TIMEOUT,
-            tokio::process::Command::new("git")
-                .args(["-c", "core.quotePath=false"])
-                .args(args)
-                .current_dir(&self.work)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        Git::new(&self.work)
+            .args(["-c", "core.quotePath=false"])
+            .args(args.iter().copied())
+            .timeout(GIT_TIMEOUT)
+            .limit(STORE_LIMIT)
+            .text(&CancellationToken::new())
+            .await
+            .ok()
     }
 
     /// See [`Exclusions`].
@@ -532,7 +534,7 @@ impl Snapshots {
         }
         if let Ok(extra) = std::fs::read_to_string(self.work.join(COVEIGNORE)) {
             patterns.push_str("# From the project's .coveignore\n");
-            patterns.push_str(&extra[..extra.floor_char_boundary(extra.len().min(64 * 1024))]);
+            patterns.push_str(crate::text::head(&extra, 64 * 1024));
             patterns.push('\n');
         }
         Exclusions::new(&self.work, patterns)
@@ -756,15 +758,45 @@ impl Snapshots {
     /// are re-created with their dates, and unreachable objects are collected in the
     /// background (only objects older than an hour, so concurrent writers are safe).
     async fn trim_locked(&self) {
-        let Ok(list) = self.git(&["rev-list", &self.reference]).await else {
+        let cutoff = crate::session::now().saturating_sub(MAX_AGE);
+        self.trim_older_than(cutoff, false).await;
+        self.drop_idle_projects(cutoff).await;
+    }
+
+    /// Drops snapshots past [`KEEP`](Self::keep) or older than `cutoff` (Unix seconds),
+    /// keeping at least the newest. Unless `now`, it waits for the slack (ten more
+    /// snapshots, or three more days) so the rewrite does not run at every snapshot.
+    async fn trim_older_than(&self, cutoff: u64, now: bool) {
+        let Ok(list) = self.git(&["log", "--format=%H %ct", &self.reference]).await else {
             return;
         };
-        let hashes: Vec<&str> = list.lines().collect();
-        if hashes.len() <= self.keep + SLACK {
+        let commits: Vec<(&str, u64)> = list
+            .lines()
+            .filter_map(|line| {
+                let (hash, time) = line.split_once(' ')?;
+                Some((hash, time.trim().parse().ok()?))
+            })
+            .collect();
+        let Some(&(_, oldest)) = commits.last() else {
+            return;
+        };
+        let over_count = commits.len() > self.keep + if now { 0 } else { SLACK };
+        let over_age = oldest < cutoff.saturating_sub(if now { 0 } else { AGE_SLACK });
+        if !over_count && !over_age {
             return;
         }
+        let kept = commits
+            .iter()
+            .take(self.keep)
+            .take_while(|(_, time)| *time >= cutoff)
+            .count()
+            .max(1);
+        if kept == commits.len() {
+            return;
+        }
+        let hashes: Vec<&str> = commits.iter().map(|(hash, _)| *hash).collect();
         let mut parent: Option<String> = None;
-        for hash in hashes[..self.keep].iter().rev() {
+        for hash in hashes[..kept].iter().rev() {
             let Ok(meta) = self.git(&["log", "-1", "--format=%ct%x1f%B", hash]).await else {
                 return;
             };
@@ -774,30 +806,21 @@ impl Snapshots {
             let Ok(tree) = self.tree_of(hash).await else {
                 return;
             };
-            let mut command = tokio::process::Command::new("git");
-            isolate(&mut command, &self.git_dir)
-                .args(CONFIG)
+            let mut git = self
+                .store_git()
                 .arg("commit-tree")
                 .arg(&tree)
                 .arg("-m")
                 .arg(message.trim())
-                .current_dir(&self.work)
-                .env("GIT_DIR", &self.git_dir)
-                .env("GIT_INDEX_FILE", &self.index)
                 .env("GIT_AUTHOR_DATE", format!("@{time} +0000"))
-                .env("GIT_COMMITTER_DATE", format!("@{time} +0000"))
-                .stdin(Stdio::null())
-                .kill_on_drop(true);
+                .env("GIT_COMMITTER_DATE", format!("@{time} +0000"));
             if let Some(parent) = &parent {
-                command.arg("-p").arg(parent);
+                git = git.arg("-p").arg(parent);
             }
-            let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await else {
+            let Ok(hash) = git.text(&CancellationToken::new()).await else {
                 return;
             };
-            if !output.status.success() {
-                return;
-            }
-            parent = Some(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            parent = Some(hash.trim().to_owned());
         }
         if let Some(head) = parent
             && self
@@ -805,32 +828,73 @@ impl Snapshots {
                 .await
                 .is_ok()
         {
+            self.collect_garbage();
+        }
+    }
+
+    /// Deletes the snapshots of other projects whose newest one is older than
+    /// `cutoff`: a project nobody opens any more never trims itself.
+    async fn drop_idle_projects(&self, cutoff: u64) {
+        let Ok(list) = self
+            .git(&[
+                "for-each-ref",
+                "--format=%(refname) %(committerdate:unix)",
+                "refs/cove/",
+            ])
+            .await
+        else {
+            return;
+        };
+        let mut dropped = false;
+        for line in list.lines() {
+            let Some((name, time)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(time) = time.trim().parse::<u64>() else {
+                continue;
+            };
+            if name == self.reference || time >= cutoff {
+                continue;
+            }
+            if self.git(&["update-ref", "-d", name]).await.is_ok() {
+                if let Some(key) = name.strip_prefix("refs/cove/") {
+                    let _ = std::fs::remove_file(self.git_dir.join(format!("index-{key}")));
+                    let _ = std::fs::remove_file(self.git_dir.join(format!("exclude-{key}")));
+                }
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.collect_garbage();
+        }
+    }
+
+    /// Collects unreachable objects in the background (only those older than an
+    /// hour, so concurrent writers are safe).
+    fn collect_garbage(&self) {
+        {
             let git_dir = self.git_dir.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(300),
-                    isolate(&mut tokio::process::Command::new("git"), &git_dir)
-                        // One thread and no delta search on large blobs: never saturate
-                        // the machine the user is working on.
-                        .args([
-                            "-c",
-                            "gc.auto=0",
-                            "-c",
-                            "pack.threads=1",
-                            "-c",
-                            "core.bigFileThreshold=1m",
-                            "gc",
-                            "--quiet",
-                            "--prune=1.hour.ago",
-                        ])
-                        .env("GIT_DIR", &git_dir)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .kill_on_drop(true)
-                        .status(),
-                )
-                .await;
+                let _ = Git::new(&git_dir)
+                    .isolated(&git_dir.join(ISOLATED_CONFIG))
+                    // One thread and no delta search on large blobs: never saturate
+                    // the machine the user is working on.
+                    .args([
+                        "-c",
+                        "gc.auto=0",
+                        "-c",
+                        "pack.threads=1",
+                        "-c",
+                        "core.bigFileThreshold=1m",
+                        "gc",
+                        "--quiet",
+                        "--prune=1.hour.ago",
+                    ])
+                    .env("GIT_DIR", &git_dir)
+                    .timeout(Duration::from_secs(300))
+                    .limit(64 * 1024)
+                    .output(&CancellationToken::new())
+                    .await;
             });
         }
     }
@@ -874,12 +938,45 @@ impl Snapshots {
     }
 
     pub fn reset_task(&self) {
+        self.begin_task("");
+    }
+
+    /// A new task: its first change takes a snapshot labelled with `request`.
+    pub fn begin_task(&self, request: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.task_first = None;
+            state.task_taken = false;
+            state.task_request = crate::text::short(request, 120);
         }
     }
 
-    /// `#n` (from `/undo list`, 1 = newest) or a hash prefix of this project's snapshots.
+    /// The label of the snapshot to take before this changing call, or `None` when
+    /// the task already has one and the call is a file-tool edit. Shell commands and
+    /// sub-agents always take one: only a snapshot covers what they change.
+    fn label_for(&self, name: &str, input: &Value) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        if state.task_taken && matches!(name, "write" | "edit" | "draw_image") {
+            return None;
+        }
+        let request = if state.task_request.is_empty() {
+            "(untitled)"
+        } else {
+            state.task_request.as_str()
+        };
+        Some(if state.task_taken {
+            format!("任务内 {}（任务：{request}）", label(name, input))
+        } else {
+            format!("任务：{request}")
+        })
+    }
+
+    fn task_taken(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.task_taken = true;
+        }
+    }
+
+    /// `#n` (as `/undo` lists them, 1 = newest) or a hash prefix of this project's snapshots.
     pub async fn resolve(&self, reference: &str) -> Result<SnapshotInfo> {
         let list = self.list(self.keep + SLACK).await?;
         if let Some(number) = reference.strip_prefix('#') {
@@ -889,10 +986,10 @@ impl Snapshots {
             return list
                 .get(index.wrapping_sub(1))
                 .cloned()
-                .ok_or_else(|| invalid("没有这个编号的快照；用 /undo list 查看"));
+                .ok_or_else(|| invalid("没有这个编号的回滚点；输入 /undo 查看"));
         }
         if reference.len() < 4 || !reference.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(invalid("未知快照；请使用 /undo list 中的 #n 或哈希前缀"));
+            return Err(invalid("未知的回滚点；请使用 /undo 列出的 #n 或哈希前缀"));
         }
         let lower = reference.to_ascii_lowercase();
         let matches: Vec<_> = list
@@ -902,7 +999,7 @@ impl Snapshots {
         match matches.as_slice() {
             [one] => Ok(one.clone()),
             [] => Err(invalid(
-                "本项目的快照中找不到它（可能已被清理）；用 /undo list 查看现有快照",
+                "本项目的回滚点中找不到它（可能已被清理）；输入 /undo 查看现有的回滚点",
             )),
             _ => Err(invalid("快照前缀有歧义；请多输入几位哈希")),
         }
@@ -1120,15 +1217,6 @@ impl Snapshots {
     }
 }
 
-/// Strips the Windows verbatim prefix (`\\?\C:\...`), which Git does not accept.
-fn plain(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-        _ => path.to_path_buf(),
-    }
-}
-
 fn safe_relative(path: &str) -> Result<PathBuf> {
     let relative = Path::new(path);
     if path.is_empty()
@@ -1170,7 +1258,7 @@ pub fn read_only_shell(command: &str) -> bool {
 /// Tools whose effects a snapshot must precede.
 pub fn mutating(name: &str, input: &Value) -> bool {
     match name {
-        "write" | "edit" | "execute_plan" => true,
+        "write" | "edit" | "draw_image" | "execute_plan" => true,
         // Sub-agents default to read mode; write mode or a writing agent type mutates.
         "agent" => {
             input.get("mode").and_then(Value::as_str) == Some("write")
@@ -1192,11 +1280,11 @@ fn label(name: &str, input: &Value) -> String {
         .iter()
         .find_map(|key| input.get(*key).and_then(Value::as_str))
         .unwrap_or_default();
-    let detail: String = detail.chars().take(80).collect();
-    format!("before {name}: {detail}")
+    format!("{name}: {}", crate::text::short(detail, 80))
 }
 
-/// Takes a snapshot before every mutating tool call (unchanged trees add nothing).
+/// Takes a snapshot before a task's first change and before each changing Shell
+/// command or sub-agent (unchanged trees add nothing).
 pub struct Snapshotting {
     pub inner: Arc<dyn ToolExecutor>,
     pub snapshots: Arc<Snapshots>,
@@ -1223,12 +1311,18 @@ impl ToolExecutor for Snapshotting {
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         Box::pin(async move {
             let mut warning = None;
-            if mutating(&name, &input) && !cancel.is_cancelled() {
-                let label = label(&name, &input);
+            let label = (mutating(&name, &input) && !cancel.is_cancelled())
+                .then(|| self.snapshots.label_for(&name, &input))
+                .flatten();
+            if let Some(label) = label {
                 let before = self.snapshots.before_call(label, SNAPSHOT_BUDGET);
                 tokio::select! {
                     before = before => warning = match before {
-                        Before::Taken | Before::Off => None,
+                        Before::Taken => {
+                            self.snapshots.task_taken();
+                            None
+                        }
+                        Before::Off => None,
                         Before::Busy => Some("[checkpoint] The first snapshot of this workspace is still being prepared in the background, so this call ran without one: /undo cannot restore its effects.".to_owned()),
                         Before::Failed(err) => Some(format!("[checkpoint] Git snapshot before this call failed ({err}); /undo cannot restore its effects.")),
                         Before::Slow { disabled: false } => Some(format!("[checkpoint] The workspace snapshot took longer than {}s, so this call ran without one: /undo cannot restore its effects.", SNAPSHOT_BUDGET.as_secs())),
@@ -1247,10 +1341,10 @@ impl ToolExecutor for Snapshotting {
     }
 }
 
-/// Starts a new "first snapshot of the task" for `/diff` at each new task.
+/// Starts a new task: its first change takes a snapshot, which `/diff` also starts from.
 impl TurnHook for Snapshots {
-    fn task_note<'a>(&'a self, _session: &'a Session) -> BoxFuture<'a, Option<String>> {
-        self.reset_task();
+    fn task_note<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Option<String>> {
+        self.begin_task(&session.current_request);
         Box::pin(async { None })
     }
 }
@@ -1380,6 +1474,141 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].label, format!("n{}", 3 + SLACK));
         assert_eq!(list[2].label, format!("n{}", 1 + SLACK));
+    }
+
+    #[tokio::test]
+    async fn old_snapshots_are_dropped_but_the_newest_is_kept() {
+        if !git_available() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let snapshots = Snapshots::open(data.path(), work.path()).await.unwrap();
+        for index in 0..3 {
+            std::fs::write(work.path().join("f"), index.to_string()).unwrap();
+            snapshots.snapshot(&format!("n{index}")).await.unwrap();
+        }
+        // Within the age and count limits nothing changes.
+        snapshots.trim_older_than(0, false).await;
+        assert_eq!(snapshots.list(10).await.unwrap().len(), 3);
+        // Everything is older than a future cutoff: only the newest stays.
+        snapshots
+            .trim_older_than(crate::session::now() + 3600, true)
+            .await;
+        let list = snapshots.list(10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label, "n2");
+    }
+
+    #[tokio::test]
+    async fn projects_idle_past_the_age_limit_are_dropped() {
+        if !git_available() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let (idle, active) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(idle.path().join("f"), "x").unwrap();
+        std::fs::write(active.path().join("f"), "y").unwrap();
+        let idle = Snapshots::open(data.path(), idle.path()).await.unwrap();
+        idle.snapshot("idle").await.unwrap();
+        let active = Snapshots::open(data.path(), active.path()).await.unwrap();
+        active.snapshot("active").await.unwrap();
+        active.drop_idle_projects(0).await;
+        assert_eq!(idle.list(10).await.unwrap().len(), 1, "recent enough");
+        active
+            .drop_idle_projects(crate::session::now() + 3600)
+            .await;
+        assert!(idle.list(10).await.unwrap().is_empty());
+        assert!(!idle.index.exists());
+        assert_eq!(active.list(10).await.unwrap().len(), 1, "never its own");
+    }
+
+    #[test]
+    fn only_an_hour_old_cruft_pack_is_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!expired_garbage(dir.path()));
+        let cruft = dir.path().join("pack-1.mtimes");
+        std::fs::write(&cruft, "").unwrap();
+        assert!(!expired_garbage(dir.path()), "too recent");
+        std::fs::File::options()
+            .write(true)
+            .open(&cruft)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        assert!(expired_garbage(dir.path()));
+    }
+
+    /// Writes a file named after the call, so every call changes the tree.
+    struct Touching(PathBuf);
+
+    impl ToolExecutor for Touching {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        fn metered(&self, _: &str) -> bool {
+            false
+        }
+        fn concurrent(&self, _: &str) -> bool {
+            false
+        }
+        fn execute(
+            &self,
+            name: String,
+            input: Value,
+            _: CancellationToken,
+        ) -> BoxFuture<'_, Result<ToolOutput>> {
+            let path = self.0.join(input["path"].as_str().unwrap_or(&name));
+            Box::pin(async move {
+                std::fs::write(path, "changed").unwrap();
+                Ok(ToolOutput::default())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_takes_one_snapshot_plus_one_per_changing_shell_command() {
+        if !git_available() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let snapshots = Snapshots::open(data.path(), work.path()).await.unwrap();
+        let tools = Snapshotting {
+            inner: Arc::new(Touching(work.path().to_path_buf())),
+            snapshots: snapshots.clone(),
+        };
+        let call =
+            |name: &str, input: Value| tools.execute(name.into(), input, CancellationToken::new());
+        snapshots.begin_task("fix the login bug");
+        call("edit", serde_json::json!({"path":"a"})).await.unwrap();
+        call("edit", serde_json::json!({"path":"b"})).await.unwrap();
+        call("draw_image", serde_json::json!({"path":"c"}))
+            .await
+            .unwrap();
+        call("shell", serde_json::json!({"command":"npm install"}))
+            .await
+            .unwrap();
+        call("read", serde_json::json!({"path":"d"})).await.unwrap();
+        snapshots.begin_task("add paging");
+        call("write", serde_json::json!({"path":"e"}))
+            .await
+            .unwrap();
+        let labels: Vec<String> = snapshots
+            .list(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|info| info.label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "任务：add paging",
+                "任务内 shell: npm install（任务：fix the login bug）",
+                "任务：fix the login bug",
+            ]
+        );
     }
 
     fn project_git(work: &Path, args: &[&str]) {

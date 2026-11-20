@@ -1,16 +1,16 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{File, OpenOptions},
+    fs::File,
     path::{Path, PathBuf},
 };
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     domain::{Block, Error, Result},
-    session::{Session, atomic_json, read_json},
+    persist::{atomic_json, read_json},
+    session::Session,
 };
 
 const MAX_MESSAGES: usize = 256;
@@ -214,15 +214,9 @@ impl SuggestionStore {
         }
         let path = self.dir.join(format!("{}.lock", self.session));
         reject_link(&path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        file.try_lock_exclusive()
-            .map_err(|error| Error::Tool(format!("suggestion store is busy: {error}")))?;
-        Ok(file)
+        crate::persist::try_lock(&path, std::time::Duration::ZERO, |error| {
+            Error::Tool(format!("suggestion store is busy: {error}"))
+        })
     }
 
     fn read(&self) -> Result<Records> {

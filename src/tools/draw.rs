@@ -461,7 +461,7 @@ pub async fn execute(
     Ok(format!(
         "Saved PNG ({width}x{height}, {shapes} shapes, {} bytes) to {}",
         bytes.len(),
-        crate::workflows::changes::plain(&saved).display()
+        crate::paths::plain(&saved).to_string_lossy()
     ))
 }
 

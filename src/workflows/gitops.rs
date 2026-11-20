@@ -4,8 +4,6 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use tokio::process::Command;
-
 use crate::domain::{Error, Result};
 
 const DIFF_LIMIT: usize = 256 * 1024;
@@ -16,38 +14,17 @@ pub struct Git {
     index: Option<PathBuf>,
 }
 
-/// Runs git in `dir`; a failure carries git's own message.
+/// Runs git in `dir`; a failure carries git's own message. Diffs are clipped for display
+/// later, so the output bound is generous.
 async fn git_in(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
-    command
+    let mut git = crate::process::git::Git::new(dir)
         .arg("--literal-pathspecs")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .args(args.iter().copied())
+        .limit(64 * 1024 * 1024);
     if let Some(index) = index {
-        command.env("GIT_INDEX_FILE", index);
+        git = git.env("GIT_INDEX_FILE", index);
     }
-    let output = command
-        .output()
-        .await
-        .map_err(|err| Error::Tool(format!("找不到 git（{err}）；请安装 git 并加入 PATH")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(Error::Tool(format!(
-            "git {} 失败：{}",
-            args.first().copied().unwrap_or_default(),
-            crate::app::diagnostics::clip(detail, 2000)
-        )));
-    }
-    Ok(stdout)
+    git.text(&tokio_util::sync::CancellationToken::new()).await
 }
 
 fn bounded(mut text: String) -> String {
@@ -95,17 +72,25 @@ pub enum Scope {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommitArgs {
     pub preview: bool,
+    /// `--no-review`: commit without the AI review.
+    pub review: bool,
     pub scope: Scope,
     pub message: String,
 }
 
-pub const COMMIT_USAGE: &str = "/commit [--preview] [--all | --only <paths>... --] [message]";
+pub const COMMIT_USAGE: &str =
+    "/commit [--preview] [--no-review] [--all | --only <paths>... --] [message]";
 
 /// Parses the words after `/commit`.
 pub fn parse_commit(args: &[&str]) -> std::result::Result<CommitArgs, String> {
     let mut rest = args;
-    let preview = rest.first() == Some(&"--preview");
-    if preview {
+    let (mut preview, mut review) = (false, true);
+    while let Some(flag) = rest.first() {
+        match *flag {
+            "--preview" => preview = true,
+            "--no-review" => review = false,
+            _ => break,
+        }
         rest = &rest[1..];
     }
     let scope = match rest.first().copied() {
@@ -137,6 +122,7 @@ pub fn parse_commit(args: &[&str]) -> std::result::Result<CommitArgs, String> {
         .to_owned();
     Ok(CommitArgs {
         preview,
+        review,
         scope,
         message: if message.is_empty() {
             "auto-commit".into()
@@ -274,6 +260,7 @@ mod tests {
             parse_commit(&[]).unwrap(),
             CommitArgs {
                 preview: false,
+                review: true,
                 scope: Scope::Staged,
                 message: "auto-commit".into()
             }
@@ -282,11 +269,14 @@ mod tests {
             parse_commit(&["--preview", "--only", "a.rs", "b.rs", "--", "\"fix", "it\""]).unwrap(),
             CommitArgs {
                 preview: true,
+                review: true,
                 scope: Scope::Only(vec!["a.rs".into(), "b.rs".into()]),
                 message: "fix it".into()
             }
         );
         assert_eq!(parse_commit(&["--all", "m"]).unwrap().scope, Scope::All);
+        let skipped = parse_commit(&["--no-review", "--preview", "--all", "m"]).unwrap();
+        assert!(!skipped.review && skipped.preview && skipped.scope == Scope::All);
         assert!(parse_commit(&["--only", "--"]).is_err());
         assert!(parse_commit(&["--push"]).is_err());
     }

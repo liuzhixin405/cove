@@ -263,7 +263,7 @@ async fn dream_restore_commands_preview_and_restore_one_project_entry() {
         backup.join("project").join(format!("{id}.json")),
     )
     .unwrap();
-    cove::session::atomic_json(&backup.join("manifest.json"), &json!({
+    cove::persist::atomic_json(&backup.join("manifest.json"), &json!({
         "version": 1, "project": memory.directory(Scope::Project).file_name().unwrap().to_str().unwrap()
     })).unwrap();
     memory.remove(Scope::Project, id).unwrap();
@@ -575,15 +575,10 @@ async fn git_snapshots_restore_shell_effects_and_the_restore_is_undoable() {
         let prompt = prompt.to_owned();
         async move { one_shot(command, &prompt).await }
     };
-    let list = resume("/undo list").await;
+    let list = resume("/undo").await;
     assert!(
-        list.contains("#1") && list.contains("before shell"),
+        list.contains("#1") && list.contains("任务：run the script"),
         "{list}"
-    );
-    let overview = resume("/undo").await;
-    assert!(
-        overview.contains("不含 Shell 的影响") && overview.contains("包含 Shell 的影响"),
-        "{overview}"
     );
     let preview = resume("/undo #1").await;
     assert!(
@@ -594,34 +589,24 @@ async fn git_snapshots_restore_shell_effects_and_the_restore_is_undoable() {
         preview.contains("restore") && preview.contains("a.txt"),
         "{preview}"
     );
-    let token = regex::Regex::new(r"/undo confirm ([0-9a-f]{8})")
-        .unwrap()
-        .captures(&preview)
-        .unwrap()[1]
-        .to_owned();
     // Still read-only until confirmed.
     assert!(root.path().join("new.txt").exists());
-    let applied = resume(&format!("/undo confirm {token}")).await;
+    let applied = resume("/undo confirm").await;
     assert!(applied.contains("恢复整个工作区"), "{applied}");
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
         "original"
     );
     assert!(!root.path().join("new.txt").exists());
-    // The token is single-use.
+    // A preview is confirmed once.
     let mut command = cli(root.path(), data.path(), &url);
-    command.args(["--resume", &id, "-p", &format!("/undo confirm {token}")]);
+    command.args(["--resume", &id, "-p", "/undo confirm"]);
     assert!(!command.launch().await.unwrap().status.success());
     // Undo the undo, restoring only one file.
-    let list = resume("/undo list").await;
+    let list = resume("/undo").await;
     assert!(list.contains("before restore"), "{list}");
-    let preview = resume("/undo files #1 new.txt").await;
-    let token = regex::Regex::new(r"/undo confirm ([0-9a-f]{8})")
-        .unwrap()
-        .captures(&preview)
-        .unwrap()[1]
-        .to_owned();
-    resume(&format!("/undo confirm {token}")).await;
+    resume("/undo files #1 new.txt").await;
+    resume("/undo confirm").await;
     assert!(root.path().join("new.txt").exists());
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.txt")).unwrap(),

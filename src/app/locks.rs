@@ -107,7 +107,7 @@ impl LockWait for ToolLocks {
                 let _ = print_text(
                     &format!(
                         "[锁等待] {tool} 在等待另一个进程释放锁，没找到占用者（{}）；继续等待，按两次 Esc 可中断\n",
-                        clip(&line, 100)
+                        crate::text::clip_width(line.trim(), 100)
                     ),
                     true,
                 );
@@ -116,7 +116,13 @@ impl LockWait for ToolLocks {
             let list: String = holders
                 .iter()
                 .take(5)
-                .map(|proc| format!("\n  PID {}  {}", proc.pid, clip(&proc.command, 100)))
+                .map(|proc| {
+                    format!(
+                        "\n  PID {}  {}",
+                        proc.pid,
+                        crate::text::clip_width(proc.command.trim(), 100)
+                    )
+                })
                 .collect();
             let more = if holders.len() > 5 {
                 format!("\n  …另有 {} 个", holders.len() - 5)
@@ -141,7 +147,10 @@ impl LockWait for ToolLocks {
             let Ok(answer) = input.answer(prompt, cancel.clone()).await else {
                 return;
             };
-            if !matches!(answer.trim().to_lowercase().as_str(), "k" | "1" | "kill" | "结束") {
+            if !matches!(
+                answer.trim().to_lowercase().as_str(),
+                "k" | "1" | "kill" | "结束"
+            ) {
                 return;
             }
             let mut ended = 0;
@@ -156,16 +165,6 @@ impl LockWait for ToolLocks {
             );
         })
     }
-}
-
-fn clip(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// The holders outside the waiting command's own process tree: the PIDs the
@@ -300,7 +299,10 @@ mod tests {
 
     fn lock(line: &str) -> &'static Lock {
         let lower = line.to_lowercase();
-        LOCKS.iter().find(|lock| lower.contains(lock.pattern)).unwrap()
+        LOCKS
+            .iter()
+            .find(|lock| lower.contains(lock.pattern))
+            .unwrap()
     }
 
     #[test]
@@ -324,10 +326,20 @@ mod tests {
 
     #[test]
     fn a_pid_named_in_the_message_is_the_holder_whatever_its_name() {
-        let all = [proc(40, 1, "node.exe"), proc(41, 1, "node.exe"), proc(50, 1, "java")];
+        let all = [
+            proc(40, 1, "node.exe"),
+            proc(41, 1, "node.exe"),
+            proc(50, 1, "java"),
+        ];
         for (line, holder) in [
-            ("warning Waiting for the other yarn instance to finish (pid 41)", 41),
-            ("Another command (pid=50) is running. Waiting for it to complete on the server", 50),
+            (
+                "warning Waiting for the other yarn instance to finish (pid 41)",
+                41,
+            ),
+            (
+                "Another command (pid=50) is running. Waiting for it to complete on the server",
+                50,
+            ),
             (
                 r#"warning MSB3026: Could not copy "a.dll". The file is locked by: "MyApp (40)""#,
                 40,
@@ -349,7 +361,10 @@ mod tests {
     #[tokio::test]
     async fn the_process_list_includes_this_process() {
         let all = processes(&CancellationToken::new()).await.unwrap();
-        let me = all.iter().find(|proc| proc.pid == std::process::id()).unwrap();
+        let me = all
+            .iter()
+            .find(|proc| proc.pid == std::process::id())
+            .unwrap();
         assert!(me.ppid > 0 && !me.name.is_empty());
     }
 }

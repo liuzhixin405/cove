@@ -502,7 +502,6 @@ async fn denied_before_tool_hook_prevents_the_actual_file_write() {
         Limits {
             max_turns: 3,
             max_output_tokens: 256,
-            budget: None,
             prices: None,
         },
     )
@@ -596,7 +595,6 @@ async fn continuing_after_tool_approval_denial_does_not_repeat_completed_before_
         Limits {
             max_turns: 3,
             max_output_tokens: 256,
-            budget: None,
             prices: None,
         },
     )
@@ -906,7 +904,6 @@ async fn after_tool_hook_failure_does_not_replay_a_durable_successful_write() {
         Limits {
             max_turns: 3,
             max_output_tokens: 256,
-            budget: None,
             prices: None,
         },
     )

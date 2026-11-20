@@ -290,7 +290,6 @@ async fn run_fake_steering_task(root: &Path) -> Observation {
         Limits {
             max_turns: 4,
             max_output_tokens: 128,
-            budget: None,
             prices: Some((1.0, 1.0)),
         },
     )
@@ -376,7 +375,6 @@ async fn run_agent(
         Limits {
             max_turns: 4,
             max_output_tokens: 128,
-            budget: None,
             prices: None,
         },
     )
@@ -669,7 +667,6 @@ async fn offline_uninterrupted_priced_request_has_known_cost() {
         Limits {
             max_turns: 4,
             max_output_tokens: 128,
-            budget: None,
             prices: Some((1.0, 1.0)),
         },
     )

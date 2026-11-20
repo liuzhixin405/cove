@@ -156,6 +156,11 @@ pub enum Origin { Unknown, Human, Steer, Injected, Summary, Notice }
 - 2026-11-18：修正"`/continue` 排除当前会话"这一条：当前会话有未完成的任务时，把它排在第一位并标"当前"；只有当前任务已经完成时才排除它。`/continue <编号>` 在没有先列出列表时，也按这份列表计数。`/resume` 仍然排除当前会话。理由：集成测试 `continue_lists_recent_sessions_and_selection_does_not_replay_uncertain_calls` 和 `failed_request_can_continue_without_resetting_budget` 表明，`/continue` 最主要的用途就是继续当前被中断的任务，原来的规则会把这个场景搞坏。（实施方，阶段 2 发现）
 - 2026-11-18：`SteerHook::tool_note` 会把插话追加在工具结果的内容里，而不是作为单独的消息写入。统一规则会识别这种插话并算作一轮；发给模型的格式不变。（实施方，阶段 0 发现）
 - 2026-11-18：`/resume` 原来计算"另有 N 个其他工作区的会话"时，把空会话也算了进去；改用统一入口计数后修正。（实施方，阶段 2 发现）
+- 2026-11-20 收尾核对（[0014](0014-audit-fixes.md)）：
+  - `Origin::Injected` 没有实现，注入的上下文作为同一条用户消息里的后续块；
+  - 标题生成的状态显示在 `/config memory stats`，不在 `/status`；
+  - "标题优先级 User > Ai > Prompt"和"跳过条件"两个计划中的测试没有写；
+  - 核对时发现 `/resume detail`、Markdown 导出和回放 HTML 仍是 UTC，dream 挑选会话没走统一入口，已在 0014 修正。
 
 ## 验证结果
 

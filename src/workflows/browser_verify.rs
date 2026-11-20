@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::{Error, Result},
-    session::{atomic_json, new_id, now, read_json},
+    persist::{atomic_json, read_json},
+    session::{new_id, now},
     tools::browser::{self, Browser, Page, Reach},
     workflows::changes::sha256_hex,
 };

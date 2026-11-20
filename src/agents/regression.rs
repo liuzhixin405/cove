@@ -9,7 +9,7 @@
 
 use std::{
     collections::BTreeMap,
-    path::{Component, Path, PathBuf},
+    path::{Component, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -131,7 +131,7 @@ fn relative(path: &str) -> Result<PathBuf> {
     {
         return Err(Error::Tool(format!(
             "{} must be a project-relative path without '..'",
-            path.display()
+            crate::paths::display(&path)
         )));
     }
     Ok(path)
@@ -148,14 +148,7 @@ fn quoted(text: &str) -> Result<String> {
 }
 
 fn tail(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut start = text.len() - limit;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_owned()
+    crate::process::tail_bytes(text, limit).to_owned()
 }
 
 /// `test <name> ... ok|FAILED` lines of the libtest harness.
@@ -347,7 +340,7 @@ impl Regression {
                     let baseline = workspace.baseline(file)?.ok_or_else(|| {
                         Error::Tool(format!(
                             "{} was created by this task; there is no earlier version to test against",
-                            file.display()
+                            crate::paths::display(file)
                         ))
                     })?;
                     out.push((file.clone(), baseline));
@@ -521,7 +514,7 @@ pub fn pending_files(workspace: &Workspace) -> Option<String> {
     workspace.pending_swap().map(|files| {
         files
             .iter()
-            .map(|file| Path::new(file).display().to_string())
+            .map(|file| crate::paths::display(file))
             .collect::<Vec<_>>()
             .join(", ")
     })
@@ -627,7 +620,7 @@ mod tests {
                 "new\n",
             )
             .unwrap();
-        let baseline = workspace.baseline(Path::new("lib.rs")).unwrap().unwrap();
+        let baseline = workspace.baseline(std::path::Path::new("lib.rs")).unwrap().unwrap();
         assert_eq!(baseline, "old\n");
         workspace
             .swap_in(vec![(PathBuf::from("lib.rs"), baseline)])

@@ -15,12 +15,11 @@ use crate::{
     domain::{Block, Error, Result},
     model::provider::{HttpProvider, ProviderOptions},
     model::routing::ModelRouter,
-    session::SessionPersistence,
 };
 
 pub(crate) const HELP: &str = "\
 /model [<name>|fast <name|off>|next <main|fast|auto>|provider <name> [model]|profile [list|switch|save|delete|show] <name>]  查看或切换模型、快速模型、服务商和配置档；next 指定下一个任务的模型（仅一次）
-/config <model|provider|api_key|base_url|system|budget|max_output_tokens> [value]  查看或修改设置   /config budget auto|off|<usd>|save  会话预算   /config effort low|medium|high|xhigh|max|default  思考强度（越低越快）   /config setup  重新运行配置向导
+/config <model|provider|api_key|base_url|system|max_output_tokens> [value]  查看或修改设置   /config effort low|medium|high|xhigh|max|default  思考强度（越低越快）   /config setup  重新运行配置向导
 /status limits  速率限制";
 
 /// Live model state owned by the application.
@@ -88,13 +87,14 @@ fn read_root(path: &Path) -> Result<Value> {
     if !root.is_object() {
         return Err(Error::Session(format!(
             "配置文件 {} 必须是 JSON 对象；请修正后重试",
-            path.display()
+            crate::paths::display(path)
         )));
     }
     Ok(root)
 }
 
 fn edit_file(path: &Path, edit: impl FnOnce(&mut Value) -> Result<()>) -> Result<()> {
+    let _config = crate::persist::lock_for(path)?;
     let mut root = read_root(path)?;
     edit(&mut root)?;
     write_json_file(path, &root).map_err(|err| Error::Session(format!("保存配置失败：{err:#}")))
@@ -261,6 +261,7 @@ impl Application {
         edit: impl FnOnce(&mut Value, &Settings) -> Result<()>,
     ) -> Result<()> {
         let path = config_target(&self.settings);
+        let config_lock = crate::persist::lock_for(&path)?;
         let mut root = read_root(&path)?;
         if reload == Reload::Seeded {
             let settings = &self.settings;
@@ -304,6 +305,7 @@ impl Application {
             .map_err(|err| Error::Session(format!("修改未生效：{err:#}")))?;
         write_json_file(&path, &root)
             .map_err(|err| Error::Session(format!("保存配置失败：{err:#}")))?;
+        drop(config_lock);
         next.config_path = Some(path);
         self.apply(next)
     }
@@ -317,24 +319,19 @@ impl Application {
         set_window_sink(&self.models.router, &next);
         let current = &mut self.settings;
         let mut notes = Vec::new();
-        let budget = self.agent.limits().budget;
-        if budget.is_some()
-            && next.prices.is_none()
-            && !crate::model::provider::supports_reported_cost(&next.base_url)
+        if next.prices.is_none() && !crate::model::provider::supports_reported_cost(&next.base_url)
         {
-            notes.push("新模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用".to_owned());
+            notes.push("新模型价格未知；费用统计可能不完整".to_owned());
         }
         {
             let limits = self.agent.limits_mut();
             limits.max_output_tokens = next.max_output_tokens;
             limits.prices = next.prices;
-            limits.budget = budget;
         }
         self.agent.set_context_tokens(next.context_tokens)?;
         self.agent.set_instructions(next.instructions.clone());
         crate::app::ui::set_show_reasoning(next.show_reasoning);
         crate::app::ui::set_live_output(next.live_output);
-        current.budget = budget;
         current.file = next.file;
         current.config_path = next.config_path;
         current.profile = next.profile;
@@ -623,132 +620,6 @@ impl Application {
         }
     }
 
-    async fn budget(&mut self, value: Option<&str>) -> Result<()> {
-        let spent = self.session.accounting.cost;
-        let budget_spent = self.session.accounting.budget_cost();
-        let current = self.agent.limits().budget;
-        let label = |budget: Option<f64>| budget.map_or("关闭".into(), |b| format!("${b:.2}"));
-        let set = |app: &mut Self, budget: Option<f64>| -> Result<bool> {
-            if budget.is_some()
-                && app.agent.limits().prices.is_none()
-                && !crate::model::provider::supports_reported_cost(&app.settings.base_url)
-            {
-                print_text(
-                    "模型价格未知；缺失费用按零计入，预算提醒可能低估实际费用，请以供应商账单为准\n",
-                    true,
-                )?;
-            }
-            let renewed = budget.is_some() && app.session.accounting.budget_cost().is_none();
-            if renewed {
-                let previous = app.session.accounting.renewed_budget.clone();
-                app.session.accounting.reset_budget_spend();
-                if let Err(err) = app.store.save(&app.session) {
-                    app.session.accounting.renewed_budget = previous;
-                    return Err(err);
-                }
-            }
-            app.agent.limits_mut().budget = budget;
-            app.settings.budget = budget;
-            if budget.is_some()
-                && crate::model::provider::supports_reported_cost(&app.settings.base_url)
-            {
-                print_text(
-                    "OpenRouter 预算仅计入其账户报告的费用；自带上游密钥时，上游另收费用可能不包含在内\n",
-                    false,
-                )?;
-            }
-            Ok(renewed)
-        };
-        match value.map(str::trim) {
-            None | Some("") => {
-                print_text(
-                    &format!(
-                        "本会话预算 {}；已花费 {}；配置值 {}\n用法：/config budget <usd>|auto|off（仅本会话）| save（写入配置）\n",
-                        label(current),
-                        spent.map_or("未知".into(), |cost| format!("${cost:.4}")),
-                        self.settings
-                            .file
-                            .get("max_budget_usd")
-                            .map_or("-".into(), Value::to_string)
-                    ),
-                    false,
-                )?;
-                if self.session.accounting.renewed_budget.is_some() {
-                    print_text(
-                        &format!(
-                            "新增预算已用 {}；历史总费用仍未知\n",
-                            budget_spent.map_or("未知".into(), |cost| format!("${cost:.4}"))
-                        ),
-                        false,
-                    )?;
-                }
-            }
-            Some("off") => {
-                set(self, None)?;
-                print_text(
-                    "本会话预算已关闭（/config budget save 写入配置的上限）\n",
-                    false,
-                )?;
-            }
-            Some("auto") => {
-                // Ten dollars beyond what is already spent, never lower than the current cap.
-                let budget = (budget_spent.unwrap_or(0.0) + 10.0).max(current.unwrap_or(0.0));
-                let renewed = set(self, Some(budget))?;
-                print_text(&format!("本会话预算 {}\n", label(Some(budget))), false)?;
-                if renewed {
-                    print_text(
-                        "历史总费用未知；该金额是从现在起的新增预算，不是会话总费用上限。\n",
-                        false,
-                    )?;
-                }
-            }
-            Some("save") => {
-                let budget = current.ok_or_else(|| {
-                    Error::Session(
-                        "不限预算只对本会话有效；请先设置金额，例如 /config budget 20，再 /config budget save".into(),
-                    )
-                })?;
-                edit_file(&config_target(&self.settings), |root| {
-                    target(root, self.settings.profile.as_deref())
-                        .insert("max_budget_usd".into(), json!(budget));
-                    Ok(())
-                })?;
-                print_text(
-                    &format!("预算 {} 已保存到配置\n", label(Some(budget))),
-                    false,
-                )?;
-            }
-            Some(amount) => {
-                let budget: f64 = amount
-                    .trim_start_matches('$')
-                    .parse()
-                    .ok()
-                    .filter(|b: &f64| b.is_finite() && *b > 0.0)
-                    .ok_or_else(|| {
-                        Error::Session(
-                            "预算必须是正的美元金额、auto、off 或 save，例如 /config budget 20"
-                                .into(),
-                        )
-                    })?;
-                let renewed = set(self, Some(budget))?;
-                print_text(
-                    &format!(
-                        "本会话预算 {}（/config budget save 写入配置）\n",
-                        label(Some(budget))
-                    ),
-                    false,
-                )?;
-                if renewed {
-                    print_text(
-                        "历史总费用未知；该金额是从现在起的新增预算，不是会话总费用上限。\n",
-                        false,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn config_key(&mut self, key: &str, value: Option<&str>) -> Result<()> {
         let show = |text: String| print_text(&format!("{text}\n"), false);
         match (key, value) {
@@ -823,7 +694,6 @@ impl Application {
                 })
                 .await?
             }
-            ("budget", value) => self.budget(value).await?,
             ("max_output_tokens", None) => show(self.settings.max_output_tokens.to_string())?,
             ("max_output_tokens", Some(value)) => {
                 let tokens: u32 = value
@@ -993,7 +863,6 @@ const CONFIG_KEYS: &[&str] = &[
     "api_key",
     "base_url",
     "system",
-    "budget",
     "max_output_tokens",
     "effort",
 ];

@@ -109,7 +109,6 @@ pub(crate) fn hub(
             project_context: Some(project_context),
             model: settings.model.clone(),
             protocol: format!("{:?}", settings.protocol),
-            budget: settings.budget,
             max_background,
             experimental,
             regression_command,
@@ -129,18 +128,10 @@ pub(crate) fn hub(
 }
 
 /// Background spend recorded since the last tool round goes into the session.
-fn absorb(app: &mut Application) -> Result<()> {
+pub(crate) fn absorb(app: &mut Application) -> Result<()> {
     if let Some(spent) = app.agents.ledger.take_background() {
-        let previous = app.session.accounting.budget_cost();
         add_spend(&mut app.session.accounting, &spent);
         app.store.save(&app.session)?;
-        if let Some(text) = crate::engine::agent::budget_message(
-            app.settings.budget,
-            previous,
-            app.session.accounting.budget_cost(),
-        ) {
-            let _ = crate::app::ui::print_budget_notice(&text);
-        }
     }
     Ok(())
 }
@@ -242,12 +233,8 @@ fn main_line(app: &Application) -> String {
             .accounting
             .cost
             .map_or("unknown".into(), |cost| format!("${cost:.4}")),
-        crate::agents::subagent::clip(&app.session.current_request, 60)
+        crate::text::short(&app.session.current_request, 60)
     )
-}
-
-fn remaining(_app: &Application) -> Option<f64> {
-    None
 }
 
 fn is_main(app: &Application, id: &str) -> bool {
@@ -380,8 +367,7 @@ pub(crate) async fn handle(
                         wake_main(app, id, message).await?;
                         return Ok(Some(false));
                     }
-                    hub.resume_agent(id, message, confirm, remaining(app))
-                        .await?
+                    hub.resume_agent(id, message, confirm).await?
                 }
                 ("send", false) => {
                     let Some(message) = rest(4) else {
@@ -393,7 +379,7 @@ pub(crate) async fn handle(
                         wake_main(app, id, Some(message)).await?;
                         return Ok(Some(false));
                     }
-                    hub.send_agent(id, message, remaining(app)).await?
+                    hub.send_agent(id, message).await?
                 }
                 ("merge", false) => hub.merge_agent(id, &cancel).await?,
                 ("discard", false) => hub.discard_agent(id, &cancel).await?,

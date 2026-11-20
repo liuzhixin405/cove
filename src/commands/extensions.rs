@@ -9,11 +9,10 @@ use crate::{
     app::Application,
     app::ui::print_text,
     config::Settings,
-    domain::{Error, Provider, Result},
+    domain::{Error, Result},
     engine::agent::Agent,
     extensions::mcp::McpArgs,
     extensions::plugins::{self, Plugins},
-    extensions::skill_candidates::CandidateState,
     extensions::skills::{self, SkillSources, Skills},
     extensions::{
         Catalog, ExtensionConfig, HookConfig, Registry, Sourced, identifier, top_level_servers,
@@ -21,7 +20,7 @@ use crate::{
     safety::permission::Effect,
 };
 
-pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config skills candidates [list|show <hash>|approve <hash>|reject <hash>|revoke <hash> <reason>|migrate <old> <new>|prune [days]]  审核技能候选（prune：清理 N 天前只出现过一次的待审候选，默认 30，0 为清空待审）\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
+pub(crate) const HELP: &str = "/skills  列出技能（名称、来源、说明）   /skill <name>  查看某个技能的指令\n/<skill> [args]  /<plugin-command> [args]  以任务方式运行技能或插件命令\n/config trust  信任此项目（目录及已加载的 .cove.json；重启后生效）\n/config skills [list|show <name>|install <name|url>|create <name>|marketplace [query]]  管理技能：查看、安装、创建、浏览市场\n/config plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  管理插件\n/config mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  管理 MCP 服务器   /config hooks [resolve <run-id>]  查看钩子\n/mcp [list|connect <name>|disconnect <name|all>|login <name>|logout <name>|read <server> <uri>]  同 /config mcp\n/plugins [list|install <name|git-url|manifest-path>|search [query]|update [name]|enable|disable|uninstall <name>]  同 /config plugins\n/hooks [resolve <run-id>]  同 /config hooks\n/memory [list|add [global] <text>|remove <id>|search <query>|stats|source <id>|dream [status|run]]  同 /config memory";
 
 /// Top-level commands of the final command set; they win over skills of the same name.
 const BUILTIN: &[&str] = &[
@@ -51,7 +50,6 @@ const BUILTIN: &[&str] = &[
     "doctor",
     "exit",
     "race",
-    "automations",
     "changes",
     "remote",
     "browser",
@@ -128,11 +126,6 @@ pub(crate) fn load(
                 .collect(),
             disabled,
             builtin: true,
-            auto_learn: settings
-                .file
-                .get("skill_review_auto")
-                .and_then(serde_json::Value::as_bool)
-                != Some(false),
         },
         registry,
     )?;
@@ -142,29 +135,12 @@ pub(crate) fn load(
     Ok((catalog, Arc::new(skills), plugins))
 }
 
-/// File-type skill hints, and learned skills in interactive sessions (`skill_review`).
-pub(crate) fn turn_hooks(
-    agent: Agent,
-    settings: &Settings,
-    skills: &Arc<Skills>,
-    background: Arc<dyn Provider>,
-    ledger: Arc<crate::session::usage::UsageLedger>,
-) -> Agent {
-    let agent = agent.with_turn_hook(Arc::new(skills::SkillNotes::new(
+/// File-type skill hints.
+pub(crate) fn turn_hooks(agent: Agent, settings: &Settings, skills: &Arc<Skills>) -> Agent {
+    agent.with_turn_hook(Arc::new(skills::SkillNotes::new(
         skills.clone(),
         settings.cwd.clone(),
-    )));
-    if settings.one_shot || !crate::extensions::skill_review::SkillReview::enabled(&settings.file) {
-        return agent;
-    }
-    agent.with_turn_hook(Arc::new(
-        crate::extensions::skill_review::SkillReview::new(
-            background,
-            skills.clone(),
-            settings.max_output_tokens,
-        )
-        .with_ledger(ledger, settings.provider.clone()),
-    ))
+    )))
 }
 
 fn distance(a: &str, b: &str) -> usize {
@@ -280,9 +256,7 @@ pub(crate) async fn handle(
                 print_skill_list(&app.tools.skills.listing()?)?;
                 Ok(Some(false))
             }
-            [sub, ..]
-                if ["show", "create", "install", "marketplace", "candidates"].contains(sub) =>
-            {
+            [sub, ..] if ["show", "create", "install", "marketplace"].contains(sub) => {
                 let mut forwarded = vec!["skills"];
                 forwarded.extend_from_slice(&args[1..]);
                 configure(app, &forwarded).await
@@ -327,7 +301,7 @@ fn print_skill_list(listing: &serde_json::Value) -> Result<()> {
     let width = skills
         .iter()
         .filter_map(|skill| skill["name"].as_str())
-        .map(|name| name.chars().count())
+        .map(crate::text::width)
         .max()
         .unwrap_or(0);
     let mut out = format!(
@@ -337,27 +311,18 @@ fn print_skill_list(listing: &serde_json::Value) -> Result<()> {
     for skill in &skills {
         let name = skill["name"].as_str().unwrap_or_default();
         let origin = skill["origin"].as_str().unwrap_or_default();
-        let legacy = if skill["verification"].as_str() == Some("legacy-unverified") {
-            "（历史技能，未验证）"
-        } else {
-            ""
-        };
         let disabled = if skill["enabled"].as_bool() == Some(false) {
             "（已禁用）"
         } else {
             ""
         };
-        let description: String = skill["description"]
-            .as_str()
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(100)
-            .collect();
+        let description = crate::text::clip_width(
+            &crate::text::one_line(skill["description"].as_str().unwrap_or_default()),
+            100,
+        );
+        let pad = " ".repeat(width.saturating_sub(crate::text::width(name)));
         out.push_str(&format!(
-            "  {name:<width$}  [{origin}]{disabled}{legacy}  {description}\n"
+            "  {name}{pad}  [{origin}]{disabled}  {description}\n"
         ));
     }
     print_text(&out, false).map_err(Into::into)
@@ -371,111 +336,6 @@ async fn configure(app: &mut Application, args: &[&str]) -> Result<Option<bool>>
         ["skills", "create", name] => create_skill(app, name).await?,
         ["skills", "install", source] => install_skill(app, source).await?,
         ["skills", "marketplace", query @ ..] => skill_marketplace(app, &query.join(" ")).await?,
-        ["skills", "candidates"] | ["skills", "candidates", "list"] => {
-            // Pending first, then the ones that keep coming back: recurrence is the signal.
-            let mut candidates = app.tools.skills.candidate_store()?.list()?;
-            candidates.sort_by_key(|candidate| {
-                (
-                    candidate.state != CandidateState::Candidate,
-                    std::cmp::Reverse(candidate.sessions.len()),
-                    std::cmp::Reverse(candidate.created_at),
-                )
-            });
-            let here = app.tools.skills.scope_key();
-            let list: Vec<Value> = candidates.iter().map(|candidate| json!({
-                "id": candidate.id, "name": candidate.name, "description": candidate.description,
-                "state": candidate.state, "validation": candidate.validation,
-                "scope": match &candidate.scope {
-                    None => "global".to_owned(),
-                    Some(scope) if Some(scope) == here.as_ref() => "project (this)".to_owned(),
-                    Some(scope) => format!("project {scope}"),
-                },
-                "created_at": candidate.created_at, "sources": candidate.sessions.len()
-            })).collect();
-            show(json!(list))?;
-        }
-        ["skills", "candidates", "prune", days @ ..] if days.len() <= 1 => {
-            let days: u64 = match days.first() {
-                Some(days) => days
-                    .parse()
-                    .map_err(|_| Error::Tool("usage: candidates prune [days]".into()))?,
-                None => crate::extensions::skill_candidates::STALE_SECS / 86_400,
-            };
-            authorize(
-                app,
-                Effect::Write(app.store.root().join("skill-candidates/records.json")),
-            )
-            .await?;
-            let removed = app
-                .tools
-                .skills
-                .candidate_store()?
-                .prune(days.saturating_mul(86_400))?;
-            show(json!({"removed": removed, "older_than_days": days}))?;
-        }
-        ["skills", "candidates", "show", id] => {
-            let candidate = app
-                .tools
-                .skills
-                .candidate_store()?
-                .list()?
-                .into_iter()
-                .find(|candidate| candidate.id == *id)
-                .ok_or_else(|| Error::Tool("candidate not found".into()))?;
-            show(json!(candidate))?;
-        }
-        ["skills", "candidates", "migrate", name, target] => {
-            authorize(
-                app,
-                Effect::Write(app.store.root().join("skill-candidates/records.json")),
-            )
-            .await?;
-            let candidate = app
-                .tools
-                .skills
-                .stage_legacy(name, target, &app.session.id)?;
-            show(
-                json!({"id": candidate.id, "name": candidate.name, "state": candidate.state,
-                "validation": candidate.validation, "legacy_sources": candidate.legacy_sources}),
-            )?;
-        }
-        ["skills", "candidates", action @ ("approve" | "reject"), id] => {
-            authorize(
-                app,
-                Effect::Write(app.store.root().join("skill-candidates/records.json")),
-            )
-            .await?;
-            let next = if *action == "approve" {
-                CandidateState::Approved
-            } else {
-                CandidateState::Rejected
-            };
-            let candidate = app.tools.skills.decide_candidate(
-                id,
-                CandidateState::Candidate,
-                next,
-                "user",
-                "",
-            )?;
-            show(
-                json!({"id":candidate.id,"name":candidate.name,"state":candidate.state,"validation":candidate.validation}),
-            )?;
-        }
-        ["skills", "candidates", "revoke", id, reason @ ..] if !reason.is_empty() => {
-            authorize(
-                app,
-                Effect::Write(app.store.root().join("skill-candidates/records.json")),
-            )
-            .await?;
-            let candidate = app.tools.skills.decide_candidate(
-                id,
-                CandidateState::Approved,
-                CandidateState::Revoked,
-                "user",
-                &reason.join(" "),
-            )?;
-            show(json!({"id":candidate.id,"name":candidate.name,"state":candidate.state}))?;
-        }
         ["plugins"] | ["plugins", "list"] => list_plugins(app)?,
         ["plugins", "search", query @ ..] => search_plugins(app, &query.join(" ")).await?,
         ["plugins", "install", source]
@@ -576,12 +436,12 @@ async fn trust(app: &mut Application) -> Result<()> {
     let root = crate::config::trust::trust(&data, &app.settings.cwd, config.as_ref())?;
     let mut text = format!(
         "已信任项目 {}：验证命令和项目扩展可以运行（每个操作仍需授权）。",
-        root.display()
+        crate::paths::display(&root)
     );
     if let Some(config) = config {
         text.push_str(&format!(
             " 已按当前内容信任 {}（sha256 {}）；以后修改它需要再次 /config trust。",
-            config.path.display(),
+            crate::paths::display(&config.path),
             &config.hash[..12]
         ));
         if !config.ignored.is_empty() {
@@ -614,7 +474,7 @@ async fn write_skill(app: &Application, name: &str, text: &str) -> Result<String
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&path, text)?;
     app.tools.skills.add(&path)?;
-    Ok(path.display().to_string())
+    Ok(crate::paths::display(&path))
 }
 
 async fn create_skill(app: &Application, name: &str) -> Result<()> {
@@ -769,7 +629,7 @@ async fn marketplace_skill(
                 .unwrap_or(std::path::Path::new("."))
                 .join(relative);
             let text = skills::read_text(&path, SKILL_LIMIT)?;
-            Ok((text, path.display().to_string()))
+            Ok((text, crate::paths::display(&path)))
         }
     }
 }
@@ -797,7 +657,7 @@ async fn skill_marketplace(app: &Application, query: &str) -> Result<()> {
                 || e.description.to_lowercase().contains(&query)
         })
         .map(|e| {
-            json!({"name":e.name,"description":skills::clip(&e.description, 80),
+            json!({"name":e.name,"description":crate::text::clip_chars(&e.description, 80),
             "installed":app.tools.skills.contains(&e.name)})
         })
         .collect();
@@ -843,14 +703,14 @@ fn list_plugins(app: &Application) -> Result<()> {
     let mut list = Vec::new();
     for plugin in &app.plugins.list {
         list.push(json!({"id":plugin.name,"version":plugin.manifest.version,
-            "description":skills::clip(&plugin.manifest.description, 80),"author":plugin.manifest.author,
-            "source":plugin.dir,"git":plugin.git,"format":"data_dir",
+            "description":crate::text::clip_chars(&plugin.manifest.description, 80),"author":plugin.manifest.author,
+            "source":crate::paths::display(&plugin.dir),"git":plugin.git,"format":"data_dir",
             "enabled":app.registry.active("plugin",&plugin.name,None)?}));
     }
     let mut manifests = app.catalog.plugins.clone();
     manifests.extend(app.registry.snapshot()?.installed);
     for (id, path) in manifests {
-        list.push(json!({"id":id,"source":path,"format":"manifest","loaded":app.catalog.plugins.contains_key(&id),
+        list.push(json!({"id":id,"source":crate::paths::display(&path),"format":"manifest","loaded":app.catalog.plugins.contains_key(&id),
             "enabled":app.registry.active("plugin",&id,None)?}));
     }
     let commands: Vec<Value> = app
@@ -889,7 +749,7 @@ async fn search_plugins(app: &Application, query: &str) -> Result<()> {
         })
         .take(50)
         .map(|e| {
-            json!({"name":e.name,"description":skills::clip(&e.description, 80),"author":e.author,
+            json!({"name":e.name,"description":crate::text::clip_chars(&e.description, 80),"author":e.author,
             "installed":app.plugins.get(&e.name).is_some()})
         })
         .collect();
@@ -917,7 +777,10 @@ async fn install_plugin(app: &mut Application, source: &str) -> Result<()> {
     let root = app.plugins.root.clone();
     authorize(
         app,
-        Effect::Shell(format!("git clone --depth=1 {url} into {}", root.display())),
+        Effect::Shell(format!(
+            "git clone --depth=1 {url} into {}",
+            root.to_string_lossy()
+        )),
     )
     .await?;
     let plugin = plugins::install_git(
@@ -955,10 +818,13 @@ async fn update_plugins(app: &Application, name: Option<&str>) -> Result<()> {
         }
         authorize(
             app,
-            Effect::Shell(format!("git pull --ff-only in {}", plugin.dir.display())),
+            Effect::Shell(format!(
+                "git pull --ff-only in {}",
+                plugin.dir.to_string_lossy()
+            )),
         )
         .await?;
-        let dir = plugin.dir.display().to_string();
+        let dir = plugin.dir.to_string_lossy().into_owned();
         let result = plugins::git(
             &["-C", &dir, "pull", "--ff-only", "--quiet"],
             &plugin.dir,

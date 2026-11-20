@@ -22,24 +22,23 @@ use crate::{
     session::Session,
 };
 
-/// Memories up to this size are injected whole; above it, an index plus the top matches.
-pub const INLINE_LIMIT: usize = 24 * 1024;
-pub const TOP_K: usize = 8;
-const INDEX_LIMIT: usize = 6 * 1024;
-const RELEVANT_ENTRY_LIMIT: usize = 3 * 1024;
+/// Memories up to this size are injected whole; above it, in three tiers: global
+/// memories, the entries relevant to the task, and an index of the rest.
+pub const INLINE_LIMIT: usize = 8 * 1024;
+/// Global memories (the user's cross-project preferences) are always injected whole,
+/// up to this size; the rest of them go to the index.
+const GLOBAL_LIMIT: usize = 4 * 1024;
+pub const TOP_K: usize = 5;
+const RELEVANT_ENTRY_LIMIT: usize = 2 * 1024;
+const INDEX_LIMIT: usize = 4 * 1024;
+/// Upper bound of one memory note.
+const NOTE_LIMIT: usize = 24 * 1024;
+/// A request shorter than this ("继续", "ok") says little about the task; the
+/// session title and the previous request stand in for it.
+const SHORT_REQUEST: usize = 8;
 const DECAY_HOURS: f64 = 30.0 * 24.0;
 const EMBED_WEIGHT: f64 = 0.5;
 const EMBED_BACKOFF: Duration = Duration::from_secs(300);
-
-/// First `limit` bytes of `text` on a character boundary, marked when cut.
-pub fn clip(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut cut = text[..text.floor_char_boundary(limit.saturating_sub(16))].to_owned();
-    cut.push_str("\n[truncated]");
-    cut
-}
 
 fn cjk(c: char) -> bool {
     matches!(c as u32,
@@ -264,7 +263,10 @@ impl Embedder {
                 .collect()
         };
         for chunk in missing.chunks(64) {
-            let input: Vec<String> = chunk.iter().map(|i| clip(&texts[*i], 8 * 1024)).collect();
+            let input: Vec<String> = chunk
+                .iter()
+                .map(|i| crate::text::clip(&texts[*i], 8 * 1024, crate::text::TRUNCATED))
+                .collect();
             let mut request = self
                 .client
                 .post(format!(
@@ -352,8 +354,9 @@ impl Shown {
             ..Shown::default()
         };
         for (_, entry) in entries {
-            let short = format!("({})", &entry.id[..entry.id.len().min(8)]);
-            let full = format!("id={}", entry.id);
+            let short = format!("({})", short_id(&entry.id));
+            // Index lines name the short ID (earlier versions the full one).
+            let full = format!("id={}", short_id(&entry.id));
             if notes.iter().any(|note| note.contains(&short)) {
                 shown.contents.insert(entry.id.clone(), entry.updated);
                 shown.titles.insert(entry.id.clone(), entry.updated);
@@ -365,13 +368,34 @@ impl Shown {
     }
 }
 
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// What to rank memories against: the request, or for a short one the session's
+/// title and previous request too.
+fn query(session: &Session) -> String {
+    let request = session.current_request.trim();
+    if request.chars().count() >= SHORT_REQUEST {
+        return request.to_owned();
+    }
+    let turns = session.turns();
+    let previous = turns
+        .iter()
+        .rev()
+        .map(|turn| turn.input.trim())
+        .find(|input| *input != request)
+        .unwrap_or_default();
+    format!("{} {previous} {request}", session.display_title())
+}
+
 fn entry_block(scope: Scope, entry: &Entry, limit: usize) -> String {
     format!(
         "## {} [{}] ({})\n{}\n",
         entry.title,
         scope.name(),
-        &entry.id[..entry.id.len().min(8)],
-        clip(entry.content.trim_end(), limit)
+        short_id(&entry.id),
+        crate::text::clip(entry.content.trim_end(), limit, crate::text::TRUNCATED)
     )
 }
 
@@ -460,12 +484,54 @@ impl MemoryRecall {
                 }
             }
         } else {
-            let relevant = self
-                .relevant(&entries, &session.current_request, TOP_K)
-                .await;
+            let fresh = |shown: &Shown, entry: &Entry| {
+                shown.contents.get(&entry.id) != Some(&entry.updated)
+            };
+            // 1. Global memories, whole, newest first.
+            let mut globals: Vec<&(Scope, Entry)> = entries
+                .iter()
+                .filter(|(scope, entry)| *scope == Scope::Global && fresh(&shown, entry))
+                .collect();
+            globals.sort_by_key(|entry| std::cmp::Reverse(entry.1.updated));
+            let mut global = String::new();
+            for (scope, entry) in globals {
+                let block = entry_block(*scope, entry, GLOBAL_LIMIT);
+                if global.len() + block.len() <= GLOBAL_LIMIT {
+                    global.push_str(&block);
+                    shown.contents.insert(entry.id.clone(), entry.updated);
+                    shown.titles.insert(entry.id.clone(), entry.updated);
+                }
+            }
+            if !global.is_empty() {
+                out.push_str("Global (always apply unless the user says otherwise):\n");
+                out.push_str(&global);
+            }
+            // 2. The entries relevant to this task.
+            let rest: Vec<(Scope, Entry)> = entries
+                .iter()
+                .filter(|(_, entry)| fresh(&shown, entry))
+                .cloned()
+                .collect();
+            let mut matches = String::new();
+            for index in self.relevant(&rest, &query(session), TOP_K).await {
+                let (scope, entry) = &rest[index];
+                matches.push_str(&entry_block(*scope, entry, RELEVANT_ENTRY_LIMIT));
+                shown.contents.insert(entry.id.clone(), entry.updated);
+                shown.titles.insert(entry.id.clone(), entry.updated);
+            }
+            if !matches.is_empty() {
+                out.push_str("Most relevant to this task:\n");
+                out.push_str(&matches);
+            }
+            // 3. An index of the rest, newest first.
+            let mut listed: Vec<&(Scope, Entry)> = entries
+                .iter()
+                .filter(|(_, entry)| shown.titles.get(&entry.id) != Some(&entry.updated))
+                .collect();
+            listed.sort_by_key(|entry| std::cmp::Reverse(entry.1.updated));
             let mut index = if full {
                 format!(
-                    "Memory index ({} entries; use memory action read with id and scope from [project] or [global]):\n",
+                    "Memory index ({} entries, newest first; read one with memory action read, scope and id):\n",
                     entries.len()
                 )
             } else {
@@ -473,33 +539,29 @@ impl MemoryRecall {
                     .to_owned()
             };
             let heading = index.len();
-            for (scope, entry) in &entries {
-                if shown.titles.get(&entry.id) == Some(&entry.updated) {
-                    continue;
-                }
-                let line = format!("- {} [{}] id={}\n", entry.title, scope.name(), entry.id);
+            for (position, (scope, entry)) in listed.iter().enumerate() {
+                let line = format!(
+                    "- {} [{}] id={}\n",
+                    entry.title,
+                    scope.name(),
+                    short_id(&entry.id)
+                );
                 if index.len() + line.len() > INDEX_LIMIT {
-                    index.push_str("- ... (use memory search)\n");
+                    index.push_str(&format!(
+                        "- ... {} older entries not listed; find them with memory action search\n",
+                        listed.len() - position
+                    ));
                     break;
                 }
                 index.push_str(&line);
+            }
+            // Those past the limit are announced by the count; later notes do not
+            // list them as additions.
+            for (_, entry) in &listed {
                 shown.titles.insert(entry.id.clone(), entry.updated);
             }
             if index.len() > heading {
                 out.push_str(&index);
-            }
-            let mut matches = String::new();
-            for index in relevant {
-                let (scope, entry) = &entries[index];
-                if shown.contents.get(&entry.id) != Some(&entry.updated) {
-                    matches.push_str(&entry_block(*scope, entry, RELEVANT_ENTRY_LIMIT));
-                    shown.contents.insert(entry.id.clone(), entry.updated);
-                    shown.titles.insert(entry.id.clone(), entry.updated);
-                }
-            }
-            if !matches.is_empty() {
-                out.push_str("Most relevant to this task:\n");
-                out.push_str(&matches);
             }
         }
         if let Ok(mut injected) = self.injected.lock() {
@@ -509,7 +571,11 @@ impl MemoryRecall {
             return None;
         }
         let header = if full { HEADER } else { UPDATE_HEADER };
-        Some(clip(&format!("{header}{out}"), INLINE_LIMIT + 2048))
+        Some(crate::text::clip(
+            &format!("{header}{out}"),
+            NOTE_LIMIT,
+            crate::text::TRUNCATED,
+        ))
     }
 }
 
@@ -617,14 +683,117 @@ mod tests {
             "{note}"
         );
         assert!(recall.note(&session).await.is_none());
-        // A new session gets the whole index and the relevant entries.
+        // A new session gets the global memories whole, then the index.
         let mut other = Session::new(root.path().into(), String::new(), String::new(), None);
         other.current_request = "请用中文回复".into();
         let note = recall.note(&other).await.unwrap();
+        let global = note.split("Global (always apply").nth(1).unwrap();
+        assert!(global.contains("回复使用中文"), "{note}");
         assert!(note.contains("Memory index (6 entries"));
+        assert!(
+            !note.contains("filler"),
+            "unrelated large entries are only listed"
+        );
+        assert!(note.len() <= NOTE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn many_memories_keep_global_ones_whole_and_list_the_newest() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let memory = memory(data.path(), root.path());
+        let save = |scope, id: Option<String>, title: String, content: String| {
+            memory
+                .save(
+                    scope,
+                    id,
+                    title,
+                    content,
+                    "test".into(),
+                    ProvenanceSource::default(),
+                )
+                .unwrap()
+        };
+        save(
+            Scope::Global,
+            None,
+            "User language preference".into(),
+            "Reply in Simplified Chinese.".into(),
+        );
+        let mut first = String::new();
+        for index in 0..120 {
+            let saved = save(
+                Scope::Project,
+                None,
+                format!("project fact number {index} about the build"),
+                format!("detail {index} ").repeat(20),
+            );
+            if index == 0 {
+                first = saved["saved"].as_str().unwrap().to_owned();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        save(
+            Scope::Project,
+            Some(first.clone()),
+            "project fact number 0, revised".into(),
+            "revised".into(),
+        );
+        let recall = MemoryRecall::new(memory.clone(), None);
+        let mut session = Session::new(root.path().into(), String::new(), String::new(), None);
+        session.current_request = "unrelated question about the weather".into();
+        let note = recall.note(&session).await.unwrap();
+        assert!(note.contains("Reply in Simplified Chinese."), "{note}");
+        let index = note.split("Memory index (121 entries").nth(1).unwrap();
+        let first_line = index.lines().nth(1).unwrap();
+        assert!(first_line.contains("revised"), "newest first: {first_line}");
+        assert!(first_line.contains(&format!("id={}", &first[..8])));
+        assert!(!first_line.contains(&first), "the index shows short IDs");
+        assert!(index.contains("older entries not listed"), "{index}");
+        // The short ID from the index reads the entry.
+        assert_eq!(memory.resolve(Scope::Project, &first[..8]).unwrap(), first);
+        assert!(memory.resolve(Scope::Global, &first[..8]).is_err());
+        // Nothing is announced again as an addition in the next task.
+        assert!(recall.note(&session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn short_requests_rank_with_the_title_and_the_previous_request() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let memory = memory(data.path(), root.path());
+        for index in 0..10 {
+            memory
+                .save(
+                    Scope::Project,
+                    None,
+                    format!("filler {index}"),
+                    format!("unrelated filler text {index} ").repeat(60),
+                    "test".into(),
+                    ProvenanceSource::default(),
+                )
+                .unwrap();
+        }
+        memory
+            .save(
+                Scope::Project,
+                None,
+                "staging deploy".into(),
+                "kubectl needs a fresh AWS login before deploying to staging".into(),
+                "test".into(),
+                ProvenanceSource::default(),
+            )
+            .unwrap();
+        let recall = MemoryRecall::new(memory.clone(), None);
+        let mut session = Session::new(root.path().into(), String::new(), String::new(), None);
+        session.messages.push(crate::domain::Message::human(
+            "deploy the release to staging",
+        ));
+        session.messages.push(crate::domain::Message::human("继续"));
+        session.current_request = "继续".into();
+        let note = recall.note(&session).await.unwrap();
         let relevant = note.split("Most relevant to this task:").nth(1).unwrap();
-        assert!(relevant.contains("回复使用中文") && !relevant.contains("filler"));
-        assert!(note.len() <= INLINE_LIMIT + 2048);
+        assert!(relevant.contains("fresh AWS login"), "{note}");
     }
 
     #[tokio::test]

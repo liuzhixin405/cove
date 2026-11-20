@@ -1,10 +1,9 @@
-//! Race, automations, changes, remote supervision and browser verification.
+//! Race, changes, remote supervision and browser verification.
 //!
 //! Three top-level commands:
-//! - `/changes` owns every reviewable patch (race candidates, inbox results, the
-//!   current task) plus the producers that are run on demand: `race` and
-//!   `verify-browser`.
-//! - `/auto` owns automation specs and their inbox.
+//! - `/race <request>` produces two candidate solutions;
+//! - `/changes` owns every reviewable patch (race candidates, the current task)
+//!   and browser verification;
 //! - `/remote` owns the supervision server.
 
 use std::{
@@ -22,15 +21,13 @@ use crate::{
     domain::{Error, Message, Result},
     safety::permission::Effect,
     session::SessionPersistence,
-    workflows::automation,
     workflows::browser_verify,
     workflows::changes::{self, Changeset, Decision, Kind},
     workflows::race,
-    workflows::worker::WorkerConfig,
 };
 
-pub(crate) const HELP: &str = "/changes [list|show <id>|diff <id>|export <id> <out>|apply <id> [confirm]|review <id> accepted|rejected|race <spec.json>|verify-browser <workflow.json> [--allow-local]|verify-browser results]  可审查的补丁：竞赛候选、自动化结果和当前任务\n\
-/auto [list|add <spec.json>|remove <id>|run <id>|tick|event <name> <key>|inbox [list|show <id>|patch <id> <out>|review <id> accepted|rejected]]  自动化任务及其收件箱\n\
+pub(crate) const HELP: &str = "/race [<需求>]  一个需求两个方案：主模型和快速模型各在独立的 worktree 里实现，用同一组命令验证，选一个应用；不带参数查看最近一次\n\
+/changes [list|show <id>|diff <id>|export <id> <out>|apply <id> [confirm]|review <id> accepted|rejected|verify-browser <workflow.json> [--allow-local]|verify-browser results]  可审查的补丁：竞速方案和当前任务\n\
 /remote start [--bind 127.0.0.1:0] [--token-file <path>] [--allow-lan --tls-cert <pem> --tls-key <pem>] | status | stop  远程监督服务";
 
 /// `browser_path` from the effective config.
@@ -92,7 +89,6 @@ fn all_changesets(app: &Application) -> Result<Vec<Changeset>> {
     let mut sets = Vec::new();
     sets.extend(turn_changeset(app)?);
     sets.extend(race::changesets(data, &app.settings.cwd)?);
-    sets.extend(automation::Store::open(data, &app.settings.cwd)?.changesets()?);
     Ok(sets)
 }
 
@@ -117,23 +113,17 @@ fn record(app: &Application, set: &Changeset, decision: Decision) -> Result<()> 
             };
             race::record(app.store.root(), run, candidate, decision)
         }
-        Kind::Inbox => automation::Store::open(app.store.root(), &app.settings.cwd)?
-            .review(&set.id["inbox:".len()..], decision),
     }
 }
 
-fn worker_config(app: &Application) -> WorkerConfig {
-    WorkerConfig::from_settings(&app.settings)
-}
-
-async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Result<()> {
+async fn changes_command(app: &mut Application, args: &[&str]) -> Result<()> {
     let data = app.store.root().to_path_buf();
     match args {
         [] | ["list"] => {
             let sets = all_changesets(app)?;
             if sets.is_empty() {
                 print_text(
-                    "没有改动集。可用 /changes race、/auto run 或执行一个任务来产生。\n",
+                    "没有改动集。可用 /race <需求> 或执行一个任务来产生。\n",
                     false,
                 )?;
             }
@@ -144,14 +134,6 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
         ["show", id] => {
             let set = find(app, id)?;
             print_text(&format!("{}\n", serde_json::to_string_pretty(&set)?), false)?;
-            if set.kind == Kind::Inbox
-                && set
-                    .checks
-                    .iter()
-                    .all(|c| c.argv.first().is_some_and(|a| a == "cove"))
-            {
-                print_text("注意：此结果没有记录独立的验证命令。\n", false)?;
-            }
         }
         ["diff", id] => {
             let set = find(app, id)?;
@@ -173,7 +155,11 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
                 changes::new_outside_file(Path::new(out.trim_matches('"')), &app.settings.cwd)?;
             changes::write_new(&target, &bytes)?;
             print_text(
-                &format!("已将 {} 字节写入 {}\n", bytes.len(), target.display()),
+                &format!(
+                    "已将 {} 字节写入 {}\n",
+                    bytes.len(),
+                    crate::paths::display(&target)
+                ),
                 false,
             )?;
         }
@@ -198,7 +184,7 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
                         "{} 通过了应用检查（基线、干净工作区、最近检查、哈希；{} 字节）。\n运行 /changes apply {id} confirm 写入 {}。\n",
                         set.id,
                         patch.len(),
-                        changes::plain(&app.settings.cwd).display()
+                        crate::paths::plain(&app.settings.cwd).to_string_lossy()
                     ),
                     false,
                 )?;
@@ -236,30 +222,6 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
                 &format!("已为 {id} 记录 {decision}；没有应用任何改动。\n"),
                 false,
             )?;
-        }
-        ["race", ..] => {
-            let path = line
-                .trim()
-                .strip_prefix("/changes")
-                .and_then(|rest| rest.trim_start().strip_prefix("race"))
-                .map(|rest| rest.trim().trim_matches('"'))
-                .filter(|rest| !rest.is_empty())
-                .ok_or_else(|| Error::Tool("用法：/changes race <spec.json>".into()))?;
-            let spec = race::Spec::read(Path::new(path))?;
-            let config = worker_config(app);
-            let cwd = app.settings.cwd.clone();
-            print_text(
-                "正在两个独立工作树中竞赛两个候选方案；Ctrl+C 取消。\n",
-                true,
-            )?;
-            let cancel = CancellationToken::new();
-            let report = foreground(
-                app,
-                cancel.clone(),
-                race::run(&data, &cwd, spec, &config, &cancel),
-            )
-            .await?;
-            print_text(&race::render(&report), false)?;
         }
         ["verify-browser", "results"] => {
             let reports = browser_verify::list(&data, &app.settings.cwd);
@@ -313,10 +275,11 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
             print_text(
                 &format!(
                     "报告：{}\n",
-                    browser_verify::directory(&data)
-                        .join(&report.id)
-                        .join("report.json")
-                        .display()
+                    crate::paths::display(
+                        &browser_verify::directory(&data)
+                            .join(&report.id)
+                            .join("report.json")
+                    )
                 ),
                 false,
             )?;
@@ -328,6 +291,87 @@ async fn changes_command(app: &mut Application, line: &str, args: &[&str]) -> Re
             )));
         }
     }
+    Ok(())
+}
+
+/// `/race <request>`: two solutions in their own worktrees, verified alike.
+async fn race_command(app: &mut Application, line: &str) -> Result<()> {
+    let request = line
+        .trim()
+        .strip_prefix("/race")
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    let data = app.store.root().to_path_buf();
+    let cwd = app.settings.cwd.clone();
+    if request.is_empty() {
+        return match race::latest(&data, &cwd)? {
+            Some(report) => print_text(&race::render(&report), false).map_err(Into::into),
+            None => {
+                print_text("本项目还没有竞速记录。用法：/race <需求>\n", false).map_err(Into::into)
+            }
+        };
+    }
+    if !app.session.pending.is_empty() {
+        return Err(Error::Session(
+            "有待处理的工具调用；请先 /continue 完成，或用 /resolve <call-id> executed|not-run 确认".into(),
+        ));
+    }
+    let lanes = race::lanes(
+        &request,
+        &app.settings.model,
+        app.settings.model_fast.as_deref(),
+    );
+    let verify = race::verification(&cwd, &app.settings.verify_commands);
+    print_text(
+        &format!(
+            "正在两个独立 worktree 里各做一个方案：A {} {}，B {} {}；{}。Ctrl+C 取消。\n",
+            lanes[0].label,
+            lanes[0].model,
+            lanes[1].label,
+            lanes[1].model,
+            if verify.is_empty() {
+                "推断不出验证命令，方案将标为未验证".to_owned()
+            } else {
+                format!(
+                    "完成后用 {} 验证",
+                    verify
+                        .iter()
+                        .map(|argv| argv.join(" "))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            }
+        ),
+        true,
+    )?;
+    let hub = app.agents.clone();
+    let cancel = CancellationToken::new();
+    let result = foreground(
+        app,
+        cancel.clone(),
+        race::run(
+            &hub,
+            &data,
+            &cwd,
+            &request,
+            &lanes,
+            verify,
+            race::TIMEOUT,
+            &cancel,
+        ),
+    )
+    .await;
+    // The lanes' spend reaches the session whether or not the race finished.
+    crate::commands::agents::absorb(app)?;
+    let report = result?;
+    app.session.messages.push(Message::notice(format!(
+        "Operator ran a race ({}) for: {}. Nothing was applied to the workspace.",
+        report.id,
+        crate::text::short(&request, 200)
+    )));
+    app.store.save(&app.session)?;
+    print_text(&race::render(&report), false)?;
     Ok(())
 }
 
@@ -351,7 +395,7 @@ async fn remote_command(app: &mut Application, args: &[&str]) -> Result<()> {
                 &format!(
                     "远程监督地址：{}\n接口：GET /v1/status、POST /v1/actions、GET /v1/actions/<id>\nBearer 令牌在 {}（仅所有者可读；不在此显示）。\n",
                     server.url,
-                    changes::plain(&server.token_file).display()
+                    crate::paths::plain(&server.token_file).to_string_lossy()
                 ),
                 false,
             )?;
@@ -388,27 +432,8 @@ pub(crate) async fn handle(
     args: &[&str],
 ) -> Result<Option<bool>> {
     match args.first().copied() {
-        Some("/changes") => changes_command(app, line, &args[1..]).await?,
-        Some("/auto") => {
-            let rest = &args[1..];
-            let starts_worker = matches!(rest.first(), Some(&"run" | &"tick" | &"event"));
-            let data = app.store.root().to_path_buf();
-            let cwd = app.settings.cwd.clone();
-            let config = worker_config(app);
-            let cancel = CancellationToken::new();
-            let output = if starts_worker {
-                print_text("正在运行自动化工作进程；Ctrl+C 取消。\n", true)?;
-                foreground(
-                    app,
-                    cancel.clone(),
-                    automation::command(&data, &cwd, rest, || Ok(config), &cancel),
-                )
-                .await?
-            } else {
-                automation::command(&data, &cwd, rest, || Ok(config), &cancel).await?
-            };
-            print_text(&output, false)?;
-        }
+        Some("/changes") => changes_command(app, &args[1..]).await?,
+        Some("/race") => race_command(app, line).await?,
         Some("/remote") => remote_command(app, &args[1..]).await?,
         _ => return Ok(None),
     }

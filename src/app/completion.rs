@@ -363,7 +363,7 @@ fn alternatives(lexemes: &[Lexeme], at: &mut usize) -> Node {
         items.extend(tail);
         return Node::Seq(items);
     }
-    // Likewise `budget auto|off|<usd>` means `budget (auto|off|<usd>)`.
+    // Likewise `effort low|high|<level>` means `effort (low|high|<level>)`.
     let (first, later) = options.split_first_mut().expect("several options");
     if later.iter().all(single)
         && let Node::Seq(items) = first
@@ -459,7 +459,7 @@ mod tests {
                 "/status cost [month|today] [export [file]]  usage",
                 "/skills  list skills   /skill <name>  show one skill",
                 "/model [<name>|fast <name|off>|provider <name> [model]|profile [list|switch] <name>]",
-                "/config budget auto|off|<usd>|save  /config setup",
+                "/config effort auto|high|<level>|low  /config setup",
             ],
             vec![
                 ("tdd".into(), "test first".into()),
@@ -515,10 +515,10 @@ mod tests {
             texts(&completer.suggest("/model profile ")),
             ["list", "switch"]
         );
-        assert_eq!(texts(&completer.suggest("/config ")), ["budget", "setup"]);
+        assert_eq!(texts(&completer.suggest("/config ")), ["effort", "setup"]);
         assert_eq!(
-            texts(&completer.suggest("/config budget ")),
-            ["auto", "off", "save"]
+            texts(&completer.suggest("/config effort ")),
+            ["auto", "high", "low"]
         );
         assert_eq!(texts(&completer.suggest("/skill ")), ["status", "tdd"]);
         assert!(completer.suggest("/tdd ").is_empty());

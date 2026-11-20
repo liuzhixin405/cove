@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agents::lifecycle::{AgentRecord, Kind, Lifecycle, Transition, project_key},
-    agents::subagent::{AgentHub, AgentType, Exit, clip},
+    agents::subagent::{AgentHub, AgentType, Exit},
     agents::worktree,
     domain::{Error, Result},
     engine::agent::last_answer,
@@ -229,6 +229,10 @@ fn delta(now: &Accounting, before: &Accounting) -> Accounting {
                 .usage
                 .cache_write
                 .saturating_sub(before.usage.cache_write),
+            cache_write_1h: now
+                .usage
+                .cache_write_1h
+                .saturating_sub(before.usage.cache_write_1h),
         },
         model_calls: now.model_calls.saturating_sub(before.model_calls),
         cost: now
@@ -314,7 +318,6 @@ impl AgentHub {
         description: String,
         prompt: String,
         isolated: bool,
-        _remaining: Option<f64>,
         cancel: &CancellationToken,
     ) -> Result<String> {
         if self.running_count() >= self.settings.max_background {
@@ -323,7 +326,6 @@ impl AgentHub {
                 self.settings.max_background
             )));
         }
-        let budget = None;
         let id = new_id();
         let short = id[..8].to_owned();
         let (worktree, branch, base) = if isolated {
@@ -344,7 +346,7 @@ impl AgentHub {
                 .authorize(
                     Effect::Shell(format!(
                         "git worktree add -b {branch} {} {base:.10} (background agent)",
-                        path.display()
+                        crate::paths::display(&path)
                     )),
                     cancel.clone(),
                 )
@@ -373,8 +375,8 @@ impl AgentHub {
             id: id.clone(),
             kind: Kind::Background,
             agent_type: kind.name.clone(),
-            description: clip(&description, 120),
-            task: clip(&prompt, 400),
+            description: crate::text::short(&description, 120),
+            task: crate::text::short(&prompt, 400),
             state: Lifecycle::Running,
             reason: "started".into(),
             session_id: id.clone(),
@@ -390,25 +392,22 @@ impl AgentHub {
             merged: false,
         };
         self.records.save(&record)?;
-        self.launch(record, Some(prompt), budget)?;
+        self.launch(record, Some(prompt))?;
         Ok(format!(
             "Background agent {short} ({}) started{}. It runs without blocking you; you will get a notice with its report when it ends. \
              Manage it with agent_control (list/stop/park/resume/send) using id {short}. The user merges or discards its work with /status agents merge|discard {short}.",
             kind.name,
             match (&worktree, &branch) {
-                (Some(path), Some(branch)) =>
-                    format!(" in worktree {} on branch {branch}", path.display()),
+                (Some(path), Some(branch)) => format!(
+                    " in worktree {} on branch {branch}",
+                    crate::paths::display(path)
+                ),
                 _ => " (read-only, main tree)".into(),
             }
         ))
     }
 
-    fn launch(
-        self: &Arc<Self>,
-        record: AgentRecord,
-        prompt: Option<String>,
-        budget: Option<f64>,
-    ) -> Result<()> {
+    fn launch(self: &Arc<Self>, record: AgentRecord, prompt: Option<String>) -> Result<()> {
         let cancel = CancellationToken::new();
         let park = Arc::new(AtomicBool::new(false));
         let (done_sender, done) = watch::channel(false);
@@ -438,7 +437,7 @@ impl AgentHub {
             // instead of leaving a ghost agent that cannot be stopped.
             let body = tokio::spawn({
                 let hub = hub.clone();
-                async move { hub.drive(record, prompt, budget, cancel, park).await }
+                async move { hub.drive(record, prompt, cancel, park).await }
             });
             if let Err(error) = body.await
                 && error.is_panic()
@@ -467,12 +466,11 @@ impl AgentHub {
         self: &Arc<Self>,
         mut record: AgentRecord,
         prompt: Option<String>,
-        budget: Option<f64>,
         cancel: CancellationToken,
         park: Arc<AtomicBool>,
     ) {
         let short = record.short().to_owned();
-        let outcome = self.drive_inner(&mut record, prompt, budget, cancel).await;
+        let outcome = self.drive_inner(&mut record, prompt, cancel).await;
         let (transition, reason, failed_tools) = match outcome {
             Ok((exit, failed)) => {
                 let transition = match exit.lifecycle() {
@@ -482,12 +480,18 @@ impl AgentHub {
                     _ => Transition::Interrupt,
                 };
                 let reason = match exit.detail() {
-                    Some(detail) => format!("{}: {}", exit.label(), clip(detail, 200)),
+                    Some(detail) => {
+                        format!("{}: {}", exit.label(), crate::text::short(detail, 200))
+                    }
                     None => exit.label().to_owned(),
                 };
                 (transition, reason, failed)
             }
-            Err(err) => (Transition::Fail, clip(&err.to_string(), 300), 0),
+            Err(err) => (
+                Transition::Fail,
+                crate::text::short(&err.to_string(), 300),
+                0,
+            ),
         };
         let _ = record.transition(transition, reason.clone());
         if let Some(activity) = self.activity.get(&short) {
@@ -515,7 +519,6 @@ impl AgentHub {
         self: &Arc<Self>,
         record: &mut AgentRecord,
         prompt: Option<String>,
-        budget: Option<f64>,
         cancel: CancellationToken,
     ) -> Result<(Exit, u32)> {
         let _lease = self.store.acquire(&record.session_id)?;
@@ -527,7 +530,7 @@ impl AgentHub {
                 if !path.is_dir() {
                     return Err(Error::Workspace(format!(
                         "worktree {} no longer exists",
-                        path.display()
+                        crate::paths::display(path)
                     )));
                 }
                 let workspace = Arc::new(Workspace::new(path.clone(), self.store.clone())?);
@@ -561,7 +564,7 @@ impl AgentHub {
             extra.push_str(&format!(
                 " You work in the git worktree {} on branch {branch}, isolated from the user's tree. Commit each finished step there \
                  (git add -A; git commit -m \"...\") so your progress survives interruption; the user decides whether to merge it.",
-                path.display()
+                crate::paths::display(path)
             ));
         }
         let tools = self.scoped_tools(
@@ -573,7 +576,7 @@ impl AgentHub {
             None,
             &short,
         )?;
-        let agent = self.build_agent(&kind, tools.clone(), budget, Some(extra), &record.id)?;
+        let agent = self.build_agent(&kind, tools.clone(), Some(extra), &record.id)?;
         let result = agent
             .run_in(&mut session, prompt, &self.store, events, cancel)
             .await;
@@ -582,7 +585,11 @@ impl AgentHub {
         let spent = delta(&session.accounting, &record.reported);
         self.ledger.record_background(&spent);
         record.reported = session.accounting.clone();
-        record.report = clip_report(&last_answer(&session));
+        record.report = crate::text::clip(
+            last_answer(&session).trim(),
+            8 * 1024,
+            "\n[report truncated]",
+        );
         let mut exit = Exit::from_result(&result);
         if exit == Exit::Completed
             && kind.requires_regression
@@ -692,7 +699,7 @@ impl AgentHub {
                 .authorize(
                     Effect::Shell(format!(
                         "git commit -A in agent worktree {} (park)",
-                        path.display()
+                        crate::paths::display(&path)
                     )),
                     cancel.clone(),
                 )
@@ -728,7 +735,6 @@ impl AgentHub {
         id: &str,
         message: Option<String>,
         confirm: bool,
-        _remaining: Option<f64>,
     ) -> Result<String> {
         let mut record = self.find_record(id)?;
         if record.kind == Kind::Main {
@@ -759,7 +765,6 @@ impl AgentHub {
                 "the agent's worktree no longer exists".into(),
             ));
         }
-        let budget = None;
         let mut session = self.store.load(&record.session_id)?;
         let uncertain: Vec<String> = session
             .pending
@@ -801,7 +806,7 @@ impl AgentHub {
         };
         record.transition(Transition::Resume, "resumed")?;
         self.records.save(&record)?;
-        self.launch(record.clone(), prompt, budget)?;
+        self.launch(record.clone(), prompt)?;
         Ok(format!(
             "agent {} resumed from its transcript ({} messages)",
             record.short(),
@@ -810,12 +815,7 @@ impl AgentHub {
     }
 
     /// Queues `message` for a running agent (next tool round) or resumes a stopped one with it.
-    pub async fn send_agent(
-        self: &Arc<Self>,
-        id: &str,
-        message: String,
-        remaining: Option<f64>,
-    ) -> Result<String> {
+    pub async fn send_agent(self: &Arc<Self>, id: &str, message: String) -> Result<String> {
         let record = self.find_record(id)?;
         if record.kind == Kind::Main {
             return Err(Error::Session(
@@ -830,8 +830,7 @@ impl AgentHub {
                 self.inbox.pending(&record.id)
             ));
         }
-        self.resume_agent(&record.id, Some(message), false, remaining)
-            .await
+        self.resume_agent(&record.id, Some(message), false).await
     }
 
     /// Applies the agent branch to the user's tree (explicit user request only).
@@ -858,7 +857,7 @@ impl AgentHub {
             .authorize(
                 Effect::Shell(format!(
                     "merge agent branch {branch} into {} (git merge)",
-                    self.root.display()
+                    crate::paths::display(&self.root)
                 )),
                 cancel.clone(),
             )
@@ -918,7 +917,7 @@ impl AgentHub {
                     Effect::Shell(format!(
                         "discard agent {}: git worktree remove --force {} and git branch -D {branch}",
                         record.short(),
-                        path.display()
+                        crate::paths::display(&path)
                     )),
                     cancel.clone(),
                 )
@@ -949,8 +948,8 @@ impl AgentHub {
             id: session.id.clone(),
             kind: Kind::Main,
             agent_type: "main".into(),
-            description: clip(&session.current_request, 120),
-            task: clip(&session.current_request, 400),
+            description: crate::text::short(&session.current_request, 120),
+            task: crate::text::short(&session.current_request, 400),
             state,
             reason: String::new(),
             session_id: session.id.clone(),
@@ -960,7 +959,11 @@ impl AgentHub {
             base: None,
             created: now(),
             updated: now(),
-            report: clip_report(&last_answer(session)),
+            report: crate::text::clip(
+                last_answer(session).trim(),
+                8 * 1024,
+                "\n[report truncated]",
+            ),
             last_step: format!("{} pending tool calls", session.pending.len()),
             reported: session.accounting.clone(),
             merged: false,
@@ -1079,14 +1082,14 @@ impl AgentHub {
                     format!("bg:{}", record.agent_type)
                 },
                 record.state.label(),
-                clip(&record.reason, 40),
+                crate::text::short(&record.reason, 40),
                 self.settings.model,
                 record
                     .reported
                     .cost
                     .map_or("unknown".into(), |cost| format!("${cost:.4}")),
-                clip(&record.description, 60),
-                clip(&last, 60),
+                crate::text::short(&record.description, 60),
+                crate::text::short(&last, 60),
                 record
                     .branch
                     .as_ref()
@@ -1136,17 +1139,6 @@ impl AgentHub {
         }
         text
     }
-}
-
-fn clip_report(text: &str) -> String {
-    let text = text.trim();
-    if text.len() <= 8 * 1024 {
-        return text.to_owned();
-    }
-    format!(
-        "{}\n[report truncated]",
-        &text[..text.floor_char_boundary(8 * 1024)]
-    )
 }
 
 /// Where background worktrees of `project` live.

@@ -140,18 +140,6 @@ fn read_lines(path: &Path) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Cuts `text` to at most `limit` bytes on a character boundary.
-pub fn clip(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
-
 /// A key for display: the first and last four characters at most.
 pub fn redact_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
@@ -338,12 +326,6 @@ pub const CODES: &[Code] = &[
         "原上下文保留；/new 开新会话或稍后再 /compact",
     ),
     code(
-        "E5004",
-        "engine",
-        "旧版预算限制",
-        "新版预算仅作费用提醒，不会因超额停止；实际费用以供应商账单为准",
-    ),
-    code(
         "E5007",
         "engine",
         "任务超过时限",
@@ -406,8 +388,6 @@ pub fn classify(message: &str) -> &'static str {
         "E5007"
     } else if has(&["model calls used", "model call window", "模型调用"]) {
         "E5001"
-    } else if has(&["budget", "预算"]) {
-        "E5004"
     } else if has(&["compact", "summary", "压缩", "摘要"]) {
         "E5003"
     } else if has(&[
@@ -469,7 +449,7 @@ impl Diagnostics {
         for secret in &self.secrets {
             text = text.replace(secret.as_str(), "****");
         }
-        clip(&text, limit)
+        crate::text::clip(&text, limit, "…")
     }
 
     /// Records a failure in `errors.log` with its diagnostic code.
@@ -742,13 +722,13 @@ pub fn trace_report(diagnostics: &Diagnostics, n: usize) -> String {
     if entries.is_empty() {
         return format!(
             "还没有跟踪记录（{}）；运行一个任务后再查看 /doctor trace。\n",
-            diagnostics.trace.path().display()
+            crate::paths::display(diagnostics.trace.path())
         );
     }
     let mut out = format!(
         "跟踪记录：最近 {} 条（{}）；失败摘要可能包含敏感内容，分享前请检查。\n",
         entries.len(),
-        diagnostics.trace.path().display()
+        crate::paths::display(diagnostics.trace.path())
     );
     for entry in &entries {
         out.push_str(&format_trace(entry));
@@ -807,7 +787,7 @@ pub fn errors_report(diagnostics: &Diagnostics) -> String {
     if entries.is_empty() {
         return format!(
             "没有记录到运行错误（{}）。\n",
-            diagnostics.errors.path().display()
+            crate::paths::display(diagnostics.errors.path())
         );
     }
     // (code, message) -> (count, last time, source)
@@ -833,7 +813,7 @@ pub fn errors_report(diagnostics: &Diagnostics) -> String {
         "运行错误：共 {} 条，{} 类，最新的在前（{}）。\n",
         entries.len(),
         groups.len(),
-        diagnostics.errors.path().display()
+        crate::paths::display(diagnostics.errors.path())
     );
     for (code, message, count, time, source) in groups.iter().take(30) {
         out.push_str(&format!(
@@ -962,12 +942,19 @@ fn config_checks(input: &DoctorInput<'_>, checks: &mut Vec<Check>) {
                 "" => "E1002",
                 code => code,
             };
-            checks.push(check(Status::Fail, "config", clip(error, MESSAGE_LIMIT)).code(code));
+            checks.push(
+                check(
+                    Status::Fail,
+                    "config",
+                    crate::text::clip(error, MESSAGE_LIMIT, "…"),
+                )
+                .code(code),
+            );
         }
         (Some(path), None) => checks.push(check(
             Status::Ok,
             "config",
-            format!("已加载 {}", path.display()),
+            format!("已加载 {}", crate::paths::display(path)),
         )),
         (None, None) => checks.push(
             check(
@@ -975,7 +962,7 @@ fn config_checks(input: &DoctorInput<'_>, checks: &mut Vec<Check>) {
                 "config",
                 format!(
                     "没有配置文件（{}）；当前使用命令行参数和环境变量",
-                    input.data_dir.join("config.json").display()
+                    crate::paths::display(&input.data_dir.join("config.json"))
                 ),
             )
             .code("E1001"),
@@ -1084,7 +1071,10 @@ fn data_dir_check(data_dir: &Path, workspace: Option<&Path>) -> Check {
         return check(
             Status::Warn,
             "data_dir",
-            format!("{} 尚不存在（首次启动时会自动创建）", data_dir.display()),
+            format!(
+                "{} 尚不存在（首次启动时会自动创建）",
+                crate::paths::display(data_dir)
+            ),
         );
     }
     let probe = tempfile::NamedTempFile::new_in(data_dir);
@@ -1092,7 +1082,7 @@ fn data_dir_check(data_dir: &Path, workspace: Option<&Path>) -> Check {
         return check(
             Status::Fail,
             "data_dir",
-            format!("{} 不可写", data_dir.display()),
+            format!("{} 不可写", crate::paths::display(data_dir)),
         )
         .code("E6003");
     }
@@ -1112,14 +1102,17 @@ fn data_dir_check(data_dir: &Path, workspace: Option<&Path>) -> Check {
             return check(
                 Status::Warn,
                 "data_dir",
-                format!("{} 其他用户可以访问；请执行 chmod 700", data_dir.display()),
+                format!(
+                    "{} 其他用户可以访问；请执行 chmod 700",
+                    crate::paths::display(&data_dir)
+                ),
             );
         }
     }
     check(
         Status::Ok,
         "data_dir",
-        format!("{} 可写", data_dir.display()),
+        format!("{} 可写", crate::paths::display(data_dir)),
     )
 }
 
@@ -1130,14 +1123,14 @@ fn policy_check(data_dir: &Path) -> Option<Check> {
         Ok(_) => check(
             Status::Ok,
             "policies",
-            format!("{} 解析正常", path.display()),
+            format!("{} 解析正常", crate::paths::display(&path)),
         ),
         Err(err) => check(
             Status::Fail,
             "policies",
             format!(
                 "{}：{err}；其中的规则未生效，修正 JSON 后重启",
-                path.display()
+                crate::paths::display(&path)
             ),
         )
         .code("E3004"),
@@ -1200,7 +1193,7 @@ pub async fn doctor(input: DoctorInput<'_>) -> Vec<Check> {
         .code("E4008"),
     });
     checks.push(match which("rg") {
-        Some(path) => check(Status::Ok, "ripgrep", path.display().to_string()),
+        Some(path) => check(Status::Ok, "ripgrep", crate::paths::display(&path)),
         None => check(
             Status::Warn,
             "ripgrep",
@@ -1213,7 +1206,11 @@ pub async fn doctor(input: DoctorInput<'_>) -> Vec<Check> {
         "sh"
     };
     checks.push(match which(shell.trim_end_matches(".exe")) {
-        Some(path) => check(Status::Ok, "shell", format!("{shell}：{}", path.display())),
+        Some(path) => check(
+            Status::Ok,
+            "shell",
+            format!("{shell}：{}", crate::paths::display(&path)),
+        ),
         None => check(Status::Fail, "shell", format!("找不到 {shell}")).code("E4005"),
     });
     checks.push(data_dir_check(
@@ -1275,7 +1272,7 @@ pub async fn cli_doctor(cli: crate::config::Cli) -> anyhow::Result<bool> {
     .await;
     print!(
         "{}",
-        crate::app::ui::visible(&format_checks(&checks, Some(&diagnostics)))
+        crate::text::visible(&format_checks(&checks, Some(&diagnostics)))
     );
     Ok(checks.iter().all(|item| item.status != Status::Fail))
 }

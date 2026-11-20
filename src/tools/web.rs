@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::{
     config::WebSearchConfig,
-    domain::{Block, Error, Message, ModelRequest, Provider, Result},
+    domain::{Error, Provider, Result},
     safety::permission::{Authorizer, Effect},
     tools::ToolOutput,
 };
@@ -294,7 +294,7 @@ impl Web {
         {
             return format!(
                 "{header} answer_for={:?}\n{answer}\n[answer extracted from the page by a fast model; call web_fetch without prompt to read the page itself]",
-                crate::extensions::skills::clip(prompt, 200)
+                crate::text::clip_chars(prompt, 200)
             );
         }
         format!("{header}\n{}", page(text, args.offset))
@@ -308,40 +308,18 @@ async fn extract(
     text: &str,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    let page = &text[..text.floor_char_boundary(EXTRACT_INPUT.min(text.len()))];
-    let request = ModelRequest {
-        system: EXTRACT_SYSTEM.into(),
-        messages: vec![Message::user(format!(
-            "Question: {prompt}\n\nPage text:\n{page}"
-        ))],
-        tools: Vec::new(),
-        max_output_tokens: 1024,
-        estimated_tokens: None,
-        model: None,
-    };
-    let (events, mut sink) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move { while sink.recv().await.is_some() {} });
-    let response = tokio::time::timeout(
-        EXTRACT_TIMEOUT,
-        provider.stream(request, events, cancel.child_token()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !response.complete {
-        return None;
-    }
-    let answer: String = response
-        .message
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    let answer = answer.trim();
-    (!answer.is_empty()).then(|| crate::extensions::skills::clip(answer, EXTRACT_ANSWER))
+    use crate::model::oneshot::{call, require_text, text_request};
+    let page = crate::text::head(text, EXTRACT_INPUT);
+    let request = text_request(
+        EXTRACT_SYSTEM,
+        format!("Question: {prompt}\n\nPage text:\n{page}"),
+        1024,
+    );
+    let response = call(&**provider, request, EXTRACT_TIMEOUT, cancel.child_token())
+        .await
+        .ok()?;
+    let answer = require_text(&response).ok()?;
+    Some(crate::text::clip_chars(answer.trim(), EXTRACT_ANSWER))
 }
 
 fn page(text: &str, offset: usize) -> String {
@@ -822,6 +800,7 @@ mod tests {
 #[cfg(test)]
 mod live {
     use super::*;
+    use crate::domain::{Block, Message, ModelRequest};
     use crate::safety::permission::{LocalAuthorizer, Mode};
 
     fn web() -> Web {

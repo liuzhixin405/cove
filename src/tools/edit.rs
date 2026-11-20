@@ -153,7 +153,7 @@ pub fn snippets(result: &str, spots: &[usize], inserted_len: usize) -> String {
             ));
         }
     }
-    crate::tools::text_encoding::clip_bytes(out.trim_end(), 4000, "\n... (truncated)").into_owned()
+    crate::text::clip(out.trim_end(), 4000, "\n... (truncated)")
 }
 
 enum Fuzzy {
@@ -295,7 +295,7 @@ fn fuzzy(content: &str, old: &str, new: &str) -> Fuzzy {
         best.1 * 100.0,
         best.0 + 1,
         best.0 + n,
-        crate::tools::text_encoding::clip_bytes(&snippet, 800, "\n... (truncated)")
+        crate::text::clip(&snippet, 800, "\n... (truncated)")
     )))
 }
 

@@ -182,21 +182,9 @@ pub async fn ripgrep_search(
         .ok_or_else(|| Error::Tool("rg stderr not piped".into()))?;
     // Drain stderr alongside, keeping a bounded tail, or rg could block on a full pipe.
     let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut stderr = stderr;
-        let mut kept: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let read = stderr.read(&mut buf).await?;
-            if read == 0 {
-                break;
-            }
-            let room = (64 * 1024usize).saturating_sub(kept.len());
-            if room > 0 {
-                kept.extend_from_slice(&buf[..read.min(room)]);
-            }
-        }
-        Ok::<_, std::io::Error>(kept)
+        crate::process::capture_limited(stderr, 64 * 1024)
+            .await
+            .map(|(kept, _)| kept)
     });
     // Stream matches instead of buffering all of rg's output: `--max-count` limits each
     // file, not the total, so a broad pattern in a large repository could otherwise
@@ -402,7 +390,7 @@ impl Collector {
 fn row(path: &str, separator: char, number: usize, line: &str) -> String {
     format!(
         "{path}{separator}{number}{separator}{}",
-        crate::tools::text_encoding::clip_bytes(line.trim_end_matches('\r'), 500, " [... omitted]")
+        crate::text::clip(line.trim_end_matches('\r'), 500, " [... omitted]")
     )
 }
 

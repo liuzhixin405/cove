@@ -29,8 +29,8 @@ pub enum Purpose {
 
 /// What the agent loop tells the router and asks of it.
 pub trait ModelPolicy: Send + Sync {
-    /// A new task starts; `budget_left` is the remaining share of the budget (0..1).
-    fn begin_task(&self, prompt: &str, budget_left: Option<f64>);
+    /// A new task starts.
+    fn begin_task(&self, prompt: &str);
     /// Model for the next request; `None` lets the provider use its default.
     fn model_for(&self, purpose: Purpose) -> Option<String>;
     /// The verification gate failed; returns a notice when the task moved models.
@@ -68,7 +68,6 @@ const WEIGHT_KEYWORD: f64 = 0.45;
 const WEIGHT_LENGTH: f64 = 0.20;
 const WEIGHT_FILES: f64 = 0.15;
 const WEIGHT_FAILURES: f64 = 0.10;
-const WEIGHT_BUDGET: f64 = 0.10;
 const THRESHOLD: f64 = 0.35;
 const HARD_LENGTH: usize = 2000;
 /// A follow-up this short stays on the premium model the previous task used.
@@ -76,24 +75,17 @@ const FOLLOW_UP_CHARS: usize = 40;
 const FAILED_BATCHES: u32 = 3;
 const OUTCOME_HISTORY: usize = 10;
 
-/// Multi-factor score of a task prompt: `(premium, reason)`.
-pub fn classify(prompt: &str, failure_rate: f64, budget_left: Option<f64>) -> (bool, String) {
+/// Multi-factor score of a task prompt: whether it needs the premium model.
+pub fn classify(prompt: &str, failure_rate: f64) -> bool {
     static FILES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let length = prompt.chars().count();
     if length >= HARD_LENGTH {
-        return (true, format!("length {length} >= {HARD_LENGTH}"));
+        return true;
     }
     let lower = prompt.to_lowercase();
-    let mut score = 0.0;
-    let mut reasons = Vec::new();
-    if let Some(keyword) = COMPLEX_KEYWORDS.iter().find(|word| lower.contains(*word)) {
+    let mut score = (length as f64 / 1000.0).min(1.0) * WEIGHT_LENGTH;
+    if COMPLEX_KEYWORDS.iter().any(|word| lower.contains(*word)) {
         score += WEIGHT_KEYWORD;
-        reasons.push(format!("keyword({keyword})+{WEIGHT_KEYWORD:.2}"));
-    }
-    if length > 0 {
-        let part = (length as f64 / 1000.0).min(1.0) * WEIGHT_LENGTH;
-        score += part;
-        reasons.push(format!("length({length})+{part:.2}"));
     }
     let files = FILES
         .get_or_init(|| {
@@ -104,25 +96,9 @@ pub fn classify(prompt: &str, failure_rate: f64, budget_left: Option<f64>) -> (b
         })
         .find_iter(prompt)
         .count();
-    if files > 0 {
-        let part = (files as f64 / 3.0).min(1.0) * WEIGHT_FILES;
-        score += part;
-        reasons.push(format!("files({files})+{part:.2}"));
-    }
-    if failure_rate > 0.0 {
-        let part = failure_rate.min(1.0) * WEIGHT_FAILURES;
-        score += part;
-        reasons.push(format!("fast_failures({failure_rate:.2})+{part:.2}"));
-    }
-    if let Some(left) = budget_left.filter(|left| *left < 1.0) {
-        let part = (1.0 - left.max(0.0)) * WEIGHT_BUDGET;
-        score -= part;
-        reasons.push(format!("budget_left({left:.2})-{part:.2}"));
-    }
-    (
-        score >= THRESHOLD,
-        format!("score {score:.2} [{}]", reasons.join(", ")),
-    )
+    score += (files as f64 / 3.0).min(1.0) * WEIGHT_FILES;
+    score += failure_rate.min(1.0) * WEIGHT_FAILURES;
+    score >= THRESHOLD
 }
 
 #[derive(Default)]
@@ -319,14 +295,14 @@ impl ModelRouter {
 }
 
 impl ModelPolicy for ModelRouter {
-    fn begin_task(&self, prompt: &str, budget_left: Option<f64>) {
+    fn begin_task(&self, prompt: &str) {
         let mut state = self.state();
         state.fell_back = false;
         state.failed_batches = 0;
         state.routed_fast = false;
         if let Some(pinned) = state.pin_next.take() {
             state.routed_fast = state.fast_distinct() == Some(pinned.as_str());
-            state.announce = Some(format!("[model] {pinned}（用户用 /model next 指定）"));
+            state.announce = Some(format!("本任务用 {pinned}（/model next 指定）"));
             state.task = Some(pinned);
             return;
         }
@@ -340,7 +316,7 @@ impl ModelPolicy for ModelRouter {
             state.fast_failures.iter().filter(|failed| **failed).count() as f64
                 / state.fast_failures.len() as f64
         };
-        let (premium, mut reason) = classify(prompt, failure_rate, budget_left);
+        let premium = classify(prompt, failure_rate);
         let mut model = if premium {
             state.main.clone()
         } else {
@@ -350,14 +326,14 @@ impl ModelPolicy for ModelRouter {
             && state.last.as_deref() == Some(state.main.as_str())
             && prompt.trim().chars().count() <= FOLLOW_UP_CHARS
         {
+            // A short follow-up stays on the premium model the previous task used.
             model = state.main.clone();
-            reason = "简短的追问沿用上一个高级模型".into();
         }
         state.routed_fast = model == fast;
         // Only a switch away from the main model is worth a line.
         state.announce = state
             .routed_fast
-            .then(|| format!("[model] {model} ({reason})"));
+            .then(|| format!("简单任务，交给快速模型 {model}"));
         state.task = Some(model);
     }
 
@@ -406,7 +382,7 @@ impl ModelPolicy for ModelRouter {
         if model == state.main {
             return main;
         }
-        // An unknown fast model is billed like the main one, so a budget stays a ceiling.
+        // An unknown fast model is billed like the main one: overstate the cost rather than understate it.
         models::price_card(model).or(main)
     }
 
@@ -553,32 +529,26 @@ mod tests {
     }
 
     #[test]
-    fn classifier_weighs_keywords_length_files_failures_and_budget() {
-        assert!(!classify("list the files", 0.0, None).0);
-        assert!(classify("refactor the parser", 0.0, None).0);
-        assert!(classify("重构解析器", 0.0, None).0);
-        assert!(classify(&"x".repeat(2000), 0.0, None).0);
+    fn classifier_weighs_keywords_length_files_and_failures() {
+        assert!(!classify("list the files", 0.0));
+        assert!(classify("refactor the parser", 0.0));
+        assert!(classify("重构解析器", 0.0));
+        assert!(classify(&"x".repeat(2000), 0.0));
         // Three files (0.15) and a 1000-char message (0.20) together cross 0.35.
         let long = format!("touch a.rs b.rs c.rs {}", "y".repeat(1000));
-        assert!(classify(&long, 0.0, None).0);
-        // A tight budget pulls a borderline task back to the fast model.
-        assert!(!classify(&long, 0.0, Some(0.0)).0);
+        assert!(classify(&long, 0.0));
         // Recent fast-model failures add to the score: 0.15 + 0.10 + 0.10 (keyword-free).
-        assert!(!classify("update a.rs b.rs c.rs", 1.0, None).0);
-        assert!(
-            classify(
-                &format!("update a.rs b.rs c.rs {}", "z".repeat(500)),
-                1.0,
-                None
-            )
-            .0
-        );
+        assert!(!classify("update a.rs b.rs c.rs", 1.0));
+        assert!(classify(
+            &format!("update a.rs b.rs c.rs {}", "z".repeat(500)),
+            1.0
+        ));
     }
 
     #[test]
     fn routing_escalation_and_follow_ups() {
         let router = router(Some("fast"));
-        router.begin_task("rename a variable", None);
+        router.begin_task("rename a variable");
         assert_eq!(router.model_for(Purpose::Task).as_deref(), Some("fast"));
         assert_eq!(
             router.model_for(Purpose::Background).as_deref(),
@@ -590,15 +560,15 @@ mod tests {
         assert_eq!(router.model_for(Purpose::Task).as_deref(), Some("premium"));
         router.end_task(false);
         // The previous task ended on premium, so a terse follow-up stays there.
-        router.begin_task("continue", None);
+        router.begin_task("continue");
         assert_eq!(router.model_for(Purpose::Task).as_deref(), Some("premium"));
         router.end_task(true);
-        router.begin_task("refactor everything", None);
+        router.begin_task("refactor everything");
         assert_eq!(router.model_for(Purpose::Task).as_deref(), Some("premium"));
         assert!(router.verification_failed().is_none());
 
         let single = self::router(None);
-        single.begin_task("anything", None);
+        single.begin_task("anything");
         assert_eq!(single.model_for(Purpose::Task).as_deref(), Some("premium"));
         assert_eq!(
             single.model_for(Purpose::Background).as_deref(),

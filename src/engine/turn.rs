@@ -43,7 +43,6 @@ pub trait TurnHook: Send + Sync {
         session: &'a Session,
         completed: bool,
         _verification: Option<crate::safety::verify::Outcome>,
-        _budget: Option<f64>,
     ) -> BoxFuture<'a, ()> {
         self.task_end(session, completed)
     }

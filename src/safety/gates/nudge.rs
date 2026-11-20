@@ -22,7 +22,6 @@ pub const DONE_CHECK: &str = "[system: Before finishing, check whether the user'
 
 pub struct NudgeLimits {
     pub max_turns: u32,
-    pub budget: Option<f64>,
     /// Whether the done check applies (config on, or auto and a non-Anthropic provider).
     pub done_check: bool,
     /// Heuristic nudges (announced step, too-short ending) need a watching user; scripted
@@ -387,7 +386,6 @@ mod tests {
         let nudges = Nudges::new(
             NudgeLimits {
                 max_turns: 50,
-                budget: None,
                 done_check: true,
                 heuristics: true,
             },
@@ -422,7 +420,6 @@ mod tests {
         let nudges = Nudges::new(
             NudgeLimits {
                 max_turns: 2,
-                budget: None,
                 done_check: true,
                 heuristics: true,
             },
