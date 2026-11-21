@@ -103,3 +103,4 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 | [0019](0019-plain-paths-in-output.md) | 输出里的路径去掉 `\\?\` 前缀 | 已完成 |
 | [0020](0020-agents-rules.md) | 开发禁忌文档（AGENTS.md） | 已完成 |
 | [0021](0021-pre-commit-ai-review.md) | 项目规则：踩过的坑沉淀下来，写代码时遵守，提交前检查 | 已完成 |
+| [0022](0022-legacy-auto-skill-names.md) | 旧式 auto 技能的非 ASCII 名字按生成名加载 | 已完成 |

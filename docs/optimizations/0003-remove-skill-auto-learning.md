@@ -38,7 +38,7 @@
 
 - 做：
   - 删除 `src/extensions/skill_review.rs`、`src/extensions/skill_candidates.rs`；
-  - `skills.rs`：删除候选内容类型（`Body::Candidate`）、候选加载、`auto_learn`、学习、审批、迁移、旧式自动技能（`Origin::Auto` 和 `auto-` 前缀）的专门处理；
+  - `skills.rs`：删除候选内容类型（`Body::Candidate`）、候选加载、`auto_learn`、学习、审批、迁移、旧式自动技能（`Origin::Auto`）的专门处理；`auto-` 前缀只在 0022 里保留一个名字校验回退，见 [0022](0022-legacy-auto-skill-names.md)；
   - `commands/extensions.rs`：删除 `/skills candidates` 及其子命令、技能复盘钩子的注册、帮助文字；
   - 配置：彻底删除 `skill_review`、`skill_review_auto` 两项（已知字段、安全分类、文档说明）；写了它们的配置会得到"未知字段"警告（见决策记录）；
   - 费用账本：删除只为技能复盘服务的意图机制（`usage/intents`）以及 `skill_review` 这个来源；
@@ -53,7 +53,7 @@
 
 1. 先移动数据，并确认 `/skills` 列表里只剩用户技能和内置技能。
 2. 删除两个模块，再按编译错误逐个清理引用：
-   - `skills.rs`：`Body` 只保留文件类型；删除候选加载那段、`automatic()`、`candidate_store()`、`learn`、`decide_candidate`、`migrate_legacy` 及相关测试；`Origin::Auto` 删除，`auto-` 前缀不再特殊处理；
+   - `skills.rs`：`Body` 只保留文件类型；删除候选加载那段、`automatic()`、`candidate_store()`、`learn`、`decide_candidate`、`migrate_legacy` 及相关测试；`Origin::Auto` 删除，`auto-` 前缀不再有自动学习/来源的特殊处理（名字校验的兼容回退后来在 0022 恢复）；
    - `commands/extensions.rs`：`turn_hooks` 只保留 `SkillNotes`；`configure` 删除 `["skills", "candidates", ..]` 各分支；子命令提示里删除 `candidates`；
    - `session/usage.rs`：删除意图的写入、读取和"未完成按未知费用显示"的逻辑；
    - `config/mod.rs` 和 `config/trust.rs`：删除这两个配置项；
@@ -95,7 +95,7 @@
 ## 验证结果
 
 - **代码**：`src/` 从 76738 行减少到 72479 行，少了 4259 行。其中删除两个模块共 3127 行，`skills.rs` 从 2185 行减到 1324 行，`/skills candidates` 命令和费用账本的意图机制各约 100 行。测试代码随之删掉 2 个集成测试和 41 个单元测试，都只检验被删除的功能。
-- `rg "skill_review|skill_candidates|Body::Candidate|Origin::Auto|AUTO_PREFIX" src`：只剩账本里按来源显示旧 `skill_review` 记录的代码（`session/usage.rs`，旁边注明了约 2027-11 可以删除）。
+- `rg "skill_review|skill_candidates|Body::Candidate|Origin::Auto|AUTO_PREFIX" src`：只剩账本里按来源显示旧 `skill_review` 记录的代码（`session/usage.rs`，旁边注明了约 2027-11 可以删除）。0022 后来在 `skills.rs` 加回一个 `starts_with("auto-")` 的名字回退，但未恢复 `Origin::Auto` 或 `AUTO_PREFIX`，此 rg 结论仍成立。
 - `contains_secret` 挪到了 `src/safety/secrets.rs`，正则表达式原样不变，并新增了一个单元测试；输入历史的敏感信息过滤照常工作。
 - `cargo test`：单元测试 366 个全部通过；集成测试 222 个。第一次全量运行时，`all_hook_events_run_with_scrubbed_environment_and_session_end_once` 偶发失败（0002 遗留里记录过），单独运行连续两次都通过；删除配置项之后再次全量运行，222 个全部通过。
 - 只对改动过的文件，通过标准输入运行了 rustfmt；`cargo build --release` 完成，程序体积从 45.91MB 减到 45.48MB。

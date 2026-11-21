@@ -640,9 +640,18 @@ impl Skills {
             Some(stem) => stem.to_owned(),
             None => String::new(),
         };
-        let name = parsed.name.clone().unwrap_or_else(|| fallback.clone());
+        // Legacy learned skills were generated under an `auto-*` name: either an
+        // `auto-*/SKILL.md` directory or a flat `auto-*.md` file. Older releases
+        // could write a non-ASCII frontmatter name for them; load those under the
+        // generated name instead of warning on every startup and dropping the
+        // skill. Strict validation stays for every other skill.
+        let mut name = parsed.name.clone().unwrap_or_else(|| fallback.clone());
         if !identifier(&name) {
-            return Err(Error::Tool(format!("invalid skill name {name:?}")));
+            if fallback.starts_with("auto-") && identifier(&fallback) {
+                name = fallback;
+            } else {
+                return Err(Error::Tool(format!("invalid skill name {name:?}")));
+            }
         }
         entries.insert(
             name.clone(),
@@ -1078,6 +1087,43 @@ mod tests {
         );
         // Ordinary Markdown still takes its first line.
         assert_eq!(parse("# Title\nbody").unwrap().description, "Title");
+    }
+
+    #[test]
+    fn legacy_auto_skills_with_unicode_names_load_under_their_generated_name() {
+        let data = tempfile::tempdir().unwrap();
+        write(
+            &data.path().join("skills/auto-compile/SKILL.md"),
+            "---\nname: 编译冲突排查\ndescription: Resolve build conflicts\n---\n1. Reproduce\n",
+        );
+        write(
+            &data.path().join("skills/auto-deploy.md"),
+            "---\nname: 部署排查\ndescription: Diagnose deploys\n---\n1. Read logs\n",
+        );
+        let skills = Skills::load(
+            SkillSources {
+                data_dir: data.path().into(),
+                builtin: true,
+                ..SkillSources::default()
+            },
+            registry(data.path()),
+        )
+        .unwrap();
+        assert!(skills.contains("auto-compile"));
+        assert!(skills.contains("auto-deploy"));
+        assert!(skills.warnings.is_empty(), "{:?}", skills.warnings);
+        assert!(
+            skills
+                .render("auto-compile", None)
+                .unwrap()
+                .contains("1. Reproduce")
+        );
+        assert!(
+            skills
+                .render("auto-deploy", None)
+                .unwrap()
+                .contains("1. Read logs")
+        );
     }
 
     #[test]
