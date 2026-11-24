@@ -96,6 +96,8 @@ pub struct BackgroundAuthorizer {
     pub root: std::path::PathBuf,
     pub queue: Arc<ApprovalQueue>,
     pub agent: String,
+    /// Something this run was refused: scripts it wrote ask too (docs/optimizations/0038).
+    pub refused: std::sync::atomic::AtomicBool,
 }
 
 impl Authorizer for BackgroundAuthorizer {
@@ -112,21 +114,28 @@ impl Authorizer for BackgroundAuthorizer {
                 }
                 _ => crate::safety::permission::shell::Dialect::host(),
             };
-            let decision = crate::safety::permission::decide(
+            let refused = &self.refused;
+            let decision = crate::safety::permission::decide_after(
                 self.mode,
                 &effect,
                 &[],
                 &self.root,
                 Some(&roots),
                 dialect,
+                refused.load(std::sync::atomic::Ordering::Relaxed),
             );
+            let refuse = || refused.store(true, std::sync::atomic::Ordering::Relaxed);
             let description = describe(&effect);
             match decision {
                 Decision::Allow => Ok(()),
                 Decision::Deny(reason) => Err(Error::Approval(format!("{description}: {reason}"))),
-                Decision::Ask if !self.queue.interactive => Err(Error::Approval(format!(
-                    "{description}；后台 agent 没有交互终端，无法询问（可用 --permission auto 或 bypass 授权）"
-                ))),
+                Decision::Ask if !self.queue.interactive => {
+                    refuse();
+                    Err(Error::Unattended(format!(
+                        "{description}（后台 agent）；{}",
+                        crate::safety::permission::SCRIPT_HINT
+                    )))
+                }
                 Decision::Ask => {
                     let (reply, answer) = oneshot::channel();
                     if let Ok(mut pending) = self.queue.pending.lock() {
@@ -141,7 +150,10 @@ impl Authorizer for BackgroundAuthorizer {
                         _ = cancel.cancelled() => Err(Error::Cancelled),
                         approved = answer => match approved {
                             Ok(true) => Ok(()),
-                            Ok(false) => Err(Error::Denied(description)),
+                            Ok(false) => {
+                                refuse();
+                                Err(Error::Denied(description))
+                            }
                             Err(_) => Err(Error::Approval(description)),
                         },
                     }
@@ -545,11 +557,14 @@ impl AgentHub {
                 (self.root.clone(), workspace)
             }
         };
+        let model = self.model_for(&kind);
         self.activity.start(
             &short,
             "background",
             &kind.name,
-            &self.settings.model,
+            &model
+                .clone()
+                .unwrap_or_else(|| self.settings.catalog.task_model()),
             &record.description,
         );
         let authorizer = Arc::new(BackgroundAuthorizer {
@@ -557,6 +572,7 @@ impl AgentHub {
             root: root.clone(),
             queue: self.approvals.clone(),
             agent: format!("agent {short}"),
+            refused: Default::default(),
         });
         let (progress, events, forward) = self.forward_events(&short);
         let mut extra = BACKGROUND_NOTE.to_owned();
@@ -576,9 +592,12 @@ impl AgentHub {
             None,
             &short,
         )?;
-        let agent = self.build_agent(&kind, tools.clone(), Some(extra), &record.id)?;
-        let result = agent
-            .run_in(&mut session, prompt, &self.store, events, cancel)
+        let agent = self.build_agent(&kind, tools.clone(), Some(extra), &record.id, model)?;
+        let result = crate::agents::subagent::CURRENT_AGENT
+            .scope(
+                short.clone(),
+                agent.run_in(&mut session, prompt, &self.store, events, cancel),
+            )
             .await;
         progress.attach(None);
         let _ = forward.await;
@@ -1158,6 +1177,7 @@ mod tests {
             root: std::env::temp_dir(),
             queue: queue.clone(),
             agent: "agent x".into(),
+            refused: Default::default(),
         };
         let cancel = CancellationToken::new();
         let pending = tokio::spawn({
@@ -1183,6 +1203,7 @@ mod tests {
             root: std::env::temp_dir(),
             queue: Arc::new(ApprovalQueue::new(false, Arc::default())),
             agent: "agent y".into(),
+            refused: Default::default(),
         };
         assert!(
             headless

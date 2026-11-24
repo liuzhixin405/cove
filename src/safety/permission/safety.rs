@@ -376,7 +376,7 @@ pub(crate) fn unwrap_shell(words: &[String]) -> Option<Nested> {
     }
 }
 
-const VALUE_FLAGS: &[&str] = &[
+pub(crate) const VALUE_FLAGS: &[&str] = &[
     "executionpolicy",
     "workingdirectory",
     "file",

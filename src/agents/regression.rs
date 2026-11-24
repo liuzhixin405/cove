@@ -93,11 +93,10 @@ pub struct Regression {
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "regression".into(),
-        description: "Regression verification (requires approval; runs project test code twice, not sandboxed). Temporarily restores the listed \
-            production files to their baseline (default: content before this task changed them; or baseline=\"git:<rev>\"), requires the \
-            selected tests to really fail there, restores the current files and requires the same tests to pass. runner=cargo runs \
-            `cargo test <filter>`, runner=go runs `go test -json -run <filter> <package>`, runner=command runs the configured \
-            regression_command. Tests must live outside the listed files. Build errors, skips and timeouts are unverified, not proof."
+        description: "Prove a fix (requires approval; runs project tests twice, not sandboxed): with the listed production files restored to \
+            their baseline (before this task changed them, or baseline=\"git:<rev>\") the selected tests must fail, and with the current files pass. \
+            runner=cargo: `cargo test <filter>`; go: `go test -json -run <filter> <package>`; command: the configured regression_command. \
+            Tests must live outside the listed files. Build errors, skips and timeouts are unverified, not proof."
             .into(),
         schema: json!({"type":"object","properties":{
             "files":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":32,"description":"Project-relative production files changed by the fix"},

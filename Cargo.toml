@@ -43,6 +43,10 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 which = "7"
 
+# build.rs hashes the source for the build identity (0033).
+[build-dependencies]
+sha2 = "0.10"
+
 [target.'cfg(windows)'.dependencies]
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_RestartManager", "Win32_System_Threading"] }

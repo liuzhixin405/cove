@@ -77,8 +77,9 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// `YYYY-MM-DD HH:MM` in UTC.
-pub fn timestamp(secs: u64) -> String {
+/// `YYYY-MM-DD HH:MM` in UTC, for the CSV export's `time_utc` column. Anything shown
+/// to people uses `session::time::stamp` (local time).
+fn timestamp(secs: u64) -> String {
     let (y, m, d) = civil((secs / 86_400) as i64);
     let rest = secs % 86_400;
     format!(
@@ -242,7 +243,8 @@ pub struct Metered {
     pub model: String,
     /// Prices of a model by name (the router's: the fast model has its own).
     pub pricing: Pricing,
-    /// "session" for tasks, "background" for memory extraction, titles, dream and the like.
+    /// "session" for tasks, "agent" for sub-agents, "background" for memory extraction,
+    /// titles, dream and the like.
     pub source: &'static str,
 }
 
@@ -381,6 +383,40 @@ pub fn aggregate(entries: &[UsageEntry]) -> (Vec<UsageRow>, UsageRow) {
     let mut rows: Vec<_> = rows.into_values().collect();
     rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then(b.calls.cmp(&a.calls)));
     (rows, total)
+}
+
+/// One line splitting the spend by source (tasks, sub-agents, background calls);
+/// `None` when every call has the same source.
+pub fn by_source(entries: &[UsageEntry]) -> Option<String> {
+    let mut sources: BTreeMap<&str, UsageRow> = BTreeMap::new();
+    for entry in entries {
+        let source = if entry.source.is_empty() {
+            "session"
+        } else {
+            entry.source.as_str()
+        };
+        sources.entry(source).or_default().add(entry);
+    }
+    if sources.len() < 2 {
+        return None;
+    }
+    let order = ["session", "agent", "background"];
+    let mut keys: Vec<&str> = sources.keys().copied().collect();
+    keys.sort_by_key(|key| order.iter().position(|o| o == key).unwrap_or(order.len()));
+    let parts: Vec<String> = keys
+        .into_iter()
+        .map(|key| {
+            let label = match key {
+                "session" => "任务",
+                "agent" => "子 Agent",
+                "background" => "后台",
+                other => other,
+            };
+            let row = &sources[key];
+            format!("{label} {} 次 {}", row.calls, cost(row))
+        })
+        .collect();
+    Some(format!("  按来源：{}\n", parts.join("；")))
 }
 
 fn tokens(n: u64) -> String {
@@ -548,6 +584,17 @@ mod tests {
         assert_eq!(csv.lines().count(), 4);
         assert!(csv.lines().nth(2).unwrap().ends_with(','));
         assert!(ledger.load(0, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn spend_is_split_by_source() {
+        let mut task = entry(1, "deepseek-v4-pro", Some(0.5));
+        task.source = "session".into();
+        let mut agent = entry(2, "deepseek-v4-flash", Some(0.25));
+        agent.source = "agent".into();
+        assert_eq!(by_source(std::slice::from_ref(&task)), None);
+        let line = by_source(&[agent, task]).unwrap();
+        assert_eq!(line, "  按来源：任务 1 次 $0.5000；子 Agent 1 次 $0.2500\n");
     }
 
     #[test]

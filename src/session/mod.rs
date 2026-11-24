@@ -188,7 +188,38 @@ pub struct Session {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "TitleSource::is_prompt")]
     pub title_source: TitleSource,
+    /// The model that answered the latest request of a task: a handoff writes on it,
+    /// where the prompt cache is (also after a restart, when the router forgot it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_model: Option<String>,
+    /// When (Unix seconds) the latest request of a task was sent: whether its prompt
+    /// cache may still be alive, so a compaction can continue on it (0035).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_request_at: Option<u64>,
+    /// The session this one was handed over from (`/handoff`); `/back` returns there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_from: Option<String>,
+    /// The session the latest `/handoff` from this one opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_to: Option<String>,
+    /// The cove builds that ran tasks in this session (0033), in the order first
+    /// seen, without repeats, the latest `MAX_BUILDS`; empty in older sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<String>,
+    /// The project context (`prompt::system_context`) this session's requests carry
+    /// (0036): recorded with the first task, kept across processes so a resumed
+    /// conversation keeps its prompt cache, renewed by compaction. Journal records
+    /// leave it out; a change is saved as a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_context: Option<String>,
+    /// `prompt::announced_mark` of the preferences and instruction files the model was
+    /// last told about after a resume, so a change is told once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_told: Option<String>,
 }
+
+/// Builds a session remembers; older ones are dropped first.
+pub const MAX_BUILDS: usize = 20;
 
 /// Where a session's title came from. A model's title is replaced as the
 /// conversation grows; a name the user gave never is.
@@ -234,7 +265,25 @@ impl Session {
             task_failures: 0,
             title: None,
             title_source: TitleSource::Prompt,
+            task_model: None,
+            task_request_at: None,
+            system_context: None,
+            system_told: None,
+            handoff_from: None,
+            handoff_to: None,
+            builds: Vec::new(),
         }
+    }
+
+    /// Records that `build` ran a task here (0033).
+    pub fn note_build(&mut self, build: &str) {
+        if self.builds.iter().any(|known| known == build) {
+            return;
+        }
+        if self.builds.len() >= MAX_BUILDS {
+            self.builds.drain(..=self.builds.len() - MAX_BUILDS);
+        }
+        self.builds.push(build.to_owned());
     }
 
     pub fn interrupted(&mut self, reason: String) {
@@ -981,6 +1030,38 @@ mod tests {
         }
         store.save(&session).unwrap();
         session
+    }
+
+    #[test]
+    fn builds_are_unique_capped_and_absent_in_old_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut session = session(&store, "/w", Some("first"));
+        session.note_build("0.7.0+aaaaaaaaaaaa");
+        session.note_build("0.7.0+bbbbbbbbbbbb");
+        session.note_build("0.7.0+aaaaaaaaaaaa");
+        assert_eq!(session.builds, ["0.7.0+aaaaaaaaaaaa", "0.7.0+bbbbbbbbbbbb"]);
+        for index in 0..MAX_BUILDS + 5 {
+            session.note_build(&format!("0.7.0+{index:012x}"));
+        }
+        assert_eq!(session.builds.len(), MAX_BUILDS);
+        assert_eq!(session.builds[0], format!("0.7.0+{:012x}", 5));
+        assert_eq!(
+            session.builds.last().unwrap(),
+            &format!("0.7.0+{:012x}", MAX_BUILDS + 4)
+        );
+        // Journal records and snapshots both carry the list.
+        store.save(&session).unwrap();
+        assert_eq!(store.load(&session.id).unwrap().builds, session.builds);
+        store.flush(&session).unwrap();
+        assert_eq!(store.load(&session.id).unwrap().builds, session.builds);
+        // A session written before the field existed still loads, with no builds.
+        let mut old = serde_json::to_value(&session).unwrap();
+        old.as_object_mut().unwrap().remove("builds");
+        let old: Session = serde_json::from_value(old).unwrap();
+        assert!(old.builds.is_empty());
+        let fresh = Session::new(PathBuf::new(), String::new(), String::new(), None);
+        assert!(!serde_json::to_string(&fresh).unwrap().contains("builds"));
     }
 
     #[test]

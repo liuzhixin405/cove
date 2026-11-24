@@ -182,6 +182,15 @@ struct SwapFile {
     baseline: String,
 }
 
+/// See [`Workspace::task_baseline`].
+#[derive(Debug, Default)]
+pub struct TaskBaseline {
+    /// Workspace-relative path and content before the task, for [`Workspace::swap_in`].
+    pub files: Vec<(PathBuf, String)>,
+    /// Files the task created that still exist.
+    pub created: Vec<PathBuf>,
+}
+
 pub struct Workspace {
     root: PathBuf,
     store: Store,
@@ -558,6 +567,35 @@ impl Workspace {
         }))
     }
 
+    /// Changed paths the current task's file tools created that are gone again, usually
+    /// scratch scripts removed in the shell. Files the project had before are not included.
+    pub fn deleted_scratch_paths(&self) -> Result<Vec<PathBuf>> {
+        let guard = self
+            .current
+            .lock()
+            .map_err(|_| Error::Workspace("checkpoint lock poisoned".into()))?;
+        Ok(guard.as_ref().map_or_else(Vec::new, |cp| {
+            cp.changes
+                .iter()
+                .filter(|change| change.before.is_none() && change.after.is_some())
+                .filter(|change| {
+                    std::fs::symlink_metadata(self.root.join(&change.path))
+                        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+                })
+                .map(|change| change.path.clone())
+                .collect()
+        }))
+    }
+
+    /// Shell commands may have changed files this task (not in the checkpoint).
+    pub fn shell_effects(&self) -> bool {
+        self.current
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|cp| cp.shell_effects))
+            .unwrap_or(false)
+    }
+
     pub fn note_shell(&self) -> Result<()> {
         let mut guard = self
             .current
@@ -713,6 +751,45 @@ impl Workspace {
                 ))
             })?;
         Ok(change.before.as_ref().map(|image| image.text.clone()))
+    }
+
+    /// What it takes to put the project back as it was before the current task's file-tool
+    /// changes: the before-text of each changed file, and the files the task created (which
+    /// a swap cannot remove). `None` when a swap cannot rebuild that state: an edit with an
+    /// uncertain result, content that is not UTF-8 (`swap_in` swaps text), or a project file
+    /// the task changed that is gone now. Created files that are gone again are skipped.
+    pub fn task_baseline(&self) -> Result<Option<TaskBaseline>> {
+        let guard = self
+            .current
+            .lock()
+            .map_err(|_| Error::Workspace("checkpoint lock poisoned".into()))?;
+        let Some(cp) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let mut baseline = TaskBaseline::default();
+        for change in cp
+            .changes
+            .iter()
+            .filter(|change| change.before != change.after)
+        {
+            if change.state == ChangeState::Intent {
+                return Ok(None);
+            }
+            let Ok(current) = self.resolve(&change.path).and_then(|path| image(&path)) else {
+                return Ok(None);
+            };
+            match (&change.before, current) {
+                (None, None) => {}
+                (None, Some(_)) => baseline.created.push(change.path.clone()),
+                (Some(before), Some(current)) if before.raw.is_none() && current.raw.is_none() => {
+                    baseline
+                        .files
+                        .push((change.path.clone(), before.text.clone()));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(baseline))
     }
 
     fn swap_path(&self) -> PathBuf {

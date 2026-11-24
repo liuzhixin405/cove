@@ -615,6 +615,7 @@ pub fn print_report(report: &TaskReport) -> std::io::Result<()> {
         Some(crate::safety::verify::Outcome::NotRun) => "验证未运行",
         None => "无自动验证",
     };
+    let stop = report.stop.map(|stop| stop.note());
     if console::rich() {
         let seconds = console::active().map_or(0.0, |console| console.elapsed());
         let verification = if report.verification.is_some() {
@@ -632,13 +633,18 @@ pub fn print_report(report: &TaskReport) -> std::io::Result<()> {
                 report.estimated_cost,
                 seconds,
                 verification,
+                stop.as_deref(),
             ),
         );
     }
+    let ending = match &stop {
+        Some(stop) => format!("{stop}，任务没有完成"),
+        None => "这是模型自行结束，不代表已独立验收".to_owned(),
+    };
     console::write(
         false,
         &format!(
-            "\n[summary] 模型调用 {} 次，工具 {} 个（失败 {}），输入 {} / 输出 {} tokens，{}；{verification}；这是模型自行结束，不代表已独立验收\n",
+            "\n[summary] 模型调用 {} 次，工具 {} 个（失败 {}），输入 {} / 输出 {} tokens，{}；{verification}；{ending}\n",
             report.model_calls,
             report.tools_run,
             report.tools_failed,

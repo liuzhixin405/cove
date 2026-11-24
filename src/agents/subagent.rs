@@ -24,6 +24,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    agents::explore::{self, ModelTier},
     agents::lifecycle::{AgentStore, Lifecycle},
     agents::regression::{Regression, RegressionEvidence},
     agents::worktree::Worktrees,
@@ -60,11 +61,16 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// Every sub-agent's final answer lands in the parent's context and stays there.
 pub const REPORT_INSTRUCTIONS: &str = "Your final answer is read by the parent agent and stays in its context for the rest of the task, so keep it short: \
     lead with the conclusion, then only the facts that support it (file:line references instead of quoted code, exact commands and results). \
-    Aim for at most about 400 words; do not restate the task, list what you looked at, or repeat yourself.";
+    Aim for at most about 400 words, whatever length the task asks for: cove cuts answers longer than 6 KB; do not restate the task, list what you looked at, or repeat yourself.";
 
 const READ_INSTRUCTIONS: &str = "You are a delegated read-only sub-agent (explore). You cannot edit files, run shell commands or ask the user. \
-    Investigate only the assigned question with read/glob/grep/repo_map (and web tools when sources outside the repository matter), then answer concisely with concrete file paths, line numbers and findings. \
-    State what you could not determine; do not guess.";
+    Investigate only the assigned question with read/glob/grep/repo_map (and web tools when sources outside the repository matter); put independent reads and searches in one response. \
+    Answer in exactly three parts, in the language of the task:\n\
+    Conclusion: one or two sentences that answer the question directly.\n\
+    Evidence: one line per fact, `path:line` or `path:start-end` (workspace-relative, `/` separators) followed by what is there, \
+    for example `- src/engine/agent.rs:619-627 prices come from limits.prices`. Cite only lines you actually read; cove checks that every cited place exists.\n\
+    Not determined: what you could not settle and why. Tell \"searched and confirmed absent\" (name the search, e.g. grep 'save(' in src/ and tests/) apart from \"not searched\"; \
+    never turn \"not found\" into \"does not exist\" without saying what you searched. Do not guess.";
 
 const PLAN_INSTRUCTIONS: &str = "You are a delegated read-only planning sub-agent. Study the relevant code and produce a concrete, ordered implementation plan: \
     files to change, the change in each, risks, and the checks that prove it works. Do not modify anything and do not ask the user.";
@@ -93,6 +99,10 @@ pub struct AgentType {
     pub tools: Vec<String>,
     /// A run without passing regression evidence fails (verify).
     pub requires_regression: bool,
+    /// The model it runs on (explore: fast; plan, review, verify: main).
+    pub model: ModelTier,
+    /// Its own cap on model calls, below `subagent_max_iterations` (explore: 30).
+    pub max_turns: Option<u32>,
 }
 
 fn names(list: &[&[&str]]) -> Vec<String> {
@@ -110,6 +120,12 @@ pub fn builtin_types() -> Vec<AgentType> {
         readonly,
         tools,
         requires_regression: name == "verify",
+        model: match name {
+            "explore" => ModelTier::Fast,
+            "plan" | "review" | "verify" => ModelTier::Main,
+            _ => ModelTier::Inherit,
+        },
+        max_turns: (name == "explore").then_some(explore::EXPLORE_MAX_TURNS),
     };
     vec![
         make(
@@ -172,6 +188,9 @@ struct CustomType {
     tools: Option<Vec<String>>,
     #[serde(default)]
     readonly: bool,
+    /// main, fast, inherit (default) or a model name.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 impl TypeRegistry {
@@ -239,6 +258,11 @@ impl TypeRegistry {
                     tools
                 }
             };
+            let model = match spec.model.as_deref() {
+                None => ModelTier::Inherit,
+                Some(text) => ModelTier::parse(text)
+                    .map_err(|err| Error::Session(format!("agent_types.{name}: {err}")))?,
+            };
             registry.types.insert(
                 name.clone(),
                 AgentType {
@@ -248,6 +272,8 @@ impl TypeRegistry {
                     readonly: spec.readonly,
                     tools,
                     requires_regression: false,
+                    model,
+                    max_turns: None,
                 },
             );
         }
@@ -573,8 +599,8 @@ impl ToolExecutor for AllowedTools {
             .collect()
     }
 
-    fn concurrent(&self, name: &str) -> bool {
-        self.allowed.contains(&name) && self.inner.concurrent(name)
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        self.allowed.contains(&name) && self.inner.concurrent(name, input)
     }
 
     fn metered(&self, name: &str) -> bool {
@@ -671,8 +697,8 @@ impl ToolExecutor for ScopedTools {
     }
 
     /// Reads claim no paths, so they keep the base tools' concurrency.
-    fn concurrent(&self, name: &str) -> bool {
-        self.allowed.contains(&name.to_owned()) && self.base.concurrent(name)
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        self.allowed.contains(&name.to_owned()) && self.base.concurrent(name, input)
     }
 
     fn execute(
@@ -720,6 +746,8 @@ impl ToolExecutor for ScopedTools {
 pub enum Exit {
     Completed,
     MaxIterations,
+    /// Stopped after rounds without new changes or information.
+    Stalled,
     Interrupted,
     ApprovalDenied(String),
     /// verify finished without passing regression evidence.
@@ -732,6 +760,7 @@ impl Exit {
         match self {
             Self::Completed => "completed",
             Self::MaxIterations => "max_iterations",
+            Self::Stalled => "stalled",
             Self::Interrupted => "interrupted",
             Self::ApprovalDenied(_) => "approval_denied",
             Self::Unverified => "unverified",
@@ -749,8 +778,10 @@ impl Exit {
     pub fn from_result(result: &Result<crate::engine::agent::TaskReport>) -> Self {
         match result {
             Ok(_) => Self::Completed,
-            // Matches the engine's limit text ("已用完 N 次模型调用").
-            Err(Error::Limit(text)) if text.contains("模型调用") => Self::MaxIterations,
+            Err(Error::Stopped(stopped)) => match stopped.stop {
+                crate::engine::agent::Stop::Limit(_) => Self::MaxIterations,
+                crate::engine::agent::Stop::Stalled(_) => Self::Stalled,
+            },
             Err(Error::Cancelled) => Self::Interrupted,
             Err(Error::Approval(text)) => Self::ApprovalDenied(text.clone()),
             Err(err) => Self::Error(err.to_string()),
@@ -761,7 +792,7 @@ impl Exit {
     pub fn lifecycle(&self) -> Lifecycle {
         match self {
             Self::Completed => Lifecycle::Finished,
-            Self::MaxIterations | Self::Interrupted | Self::ApprovalDenied(_) => {
+            Self::MaxIterations | Self::Stalled | Self::Interrupted | Self::ApprovalDenied(_) => {
                 Lifecycle::Interrupted
             }
             Self::Unverified | Self::Error(_) => Lifecycle::Failed,
@@ -780,6 +811,10 @@ pub struct RunOutcome {
     pub spent: Accounting,
     pub tools_failed: u32,
     pub readonly: bool,
+    /// The model(s) that answered.
+    pub model: String,
+    /// `citations: N ok, M invalid` of a read-only run's evidence (0029).
+    pub citations: Option<String>,
     /// Cancellation or an uncertain effect, which must reach the parent's journal.
     pub fatal: Option<Error>,
 }
@@ -803,10 +838,15 @@ impl RunOutcome {
 
     pub fn footer(&self) -> String {
         format!(
-            "[cost: {}, steps: {}, failed tools: {}]",
+            "[cost: {}, model: {}, steps: {}, failed tools: {}]",
             self.spent
                 .cost
                 .map_or("unknown".into(), |cost| format!("${cost:.4}")),
+            if self.model.is_empty() {
+                "unknown"
+            } else {
+                &self.model
+            },
             self.steps,
             self.tools_failed
         )
@@ -814,6 +854,10 @@ impl RunOutcome {
 
     pub fn render(&self) -> String {
         let mut text = self.header();
+        if let Some(citations) = &self.citations {
+            text.push('\n');
+            text.push_str(citations);
+        }
         if let Some(detail) = self.exit.detail() {
             text.push_str(&format!("\nstopped: {detail}"));
         }
@@ -837,8 +881,66 @@ impl RunOutcome {
     }
 }
 
+/// The configured models as sub-agents see them, live across `/model` switches (the
+/// router; `commands/agents.rs`). A sub-agent has no `ModelPolicy`: its runs must not
+/// change the main task's routing.
+pub trait ModelCatalog: Send + Sync {
+    fn main_model(&self) -> String;
+    /// The fast model, only when one different from the main model is configured.
+    fn fast_model(&self) -> Option<String>;
+    /// The model the current (or last) task runs on.
+    fn task_model(&self) -> String;
+    /// Prices of the model that answered; `None` when unknown.
+    fn prices(&self, model: &str) -> Option<crate::model::models::Prices>;
+    /// Context budget (estimated tokens) and output cap for `model`.
+    fn budget(&self, model: &str) -> (usize, u32);
+}
+
+/// Sub-agent spend is billed at the prices of the model that answered.
+fn pricing(catalog: &Arc<dyn ModelCatalog>) -> crate::session::usage::Pricing {
+    let catalog = catalog.clone();
+    Arc::new(move |model: &str| catalog.prices(model))
+}
+
+tokio::task_local! {
+    /// The id of the sub-agent whose model calls run in this future (trace `agent`).
+    pub static CURRENT_AGENT: String;
+}
+
+/// The models that answered a run, most calls first; `requested` when none reported.
+fn served_by(spent: &Accounting, requested: &str) -> String {
+    let mut models: Vec<_> = spent.by_model.iter().collect();
+    models.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then(a.0.cmp(b.0)));
+    if models.is_empty() {
+        return requested.to_owned();
+    }
+    models
+        .into_iter()
+        .map(|(model, _)| model.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// The tier of `kind`; `explore_model: "main"` moves explore to the main model.
+fn tier_for(kind: &AgentType, explore_fast: bool) -> ModelTier {
+    match &kind.model {
+        ModelTier::Fast if kind.name == "explore" && !explore_fast => ModelTier::Main,
+        tier => tier.clone(),
+    }
+}
+
+/// Read-only and without `regression` (which swaps files to their baseline while it runs).
+fn parallel_kind(kind: &AgentType) -> bool {
+    kind.readonly && !kind.tools.iter().any(|tool| tool == "regression")
+}
+
+/// Read-only foreground agents of one batch running at once (as `execute_plan`).
+pub const PARALLEL_READONLY: usize = 4;
+
 pub struct SubAgentSettings {
     pub max_turns: u32,
+    /// Rounds without progress that stop a sub-agent (`stall_rounds`; 0 = off).
+    pub stall_rounds: u32,
     pub max_output_tokens: u32,
     pub prices: Option<(f64, f64)>,
     pub context_tokens: usize,
@@ -848,6 +950,9 @@ pub struct SubAgentSettings {
     pub max_background: usize,
     pub experimental: bool,
     pub regression_command: Option<String>,
+    pub catalog: Arc<dyn ModelCatalog>,
+    /// `explore_model`: explore on the fast model (default) or the main one.
+    pub explore_fast: bool,
 }
 
 pub struct HubParts {
@@ -888,6 +993,8 @@ pub struct AgentHub {
     pub plan: crate::agents::plan::PlanState,
     pub board: crate::agents::collab::Board,
     pub background: crate::agents::background::BackgroundState,
+    /// Slots of read-only foreground agents running in parallel.
+    readonly_slots: tokio::sync::Semaphore,
     seq: AtomicU64,
 }
 
@@ -942,8 +1049,24 @@ impl AgentHub {
             plan: Default::default(),
             board: Default::default(),
             background,
+            readonly_slots: tokio::sync::Semaphore::new(PARALLEL_READONLY),
             seq: AtomicU64::new(0),
         }))
+    }
+
+    /// Whether explore runs on a fast model different from the main one.
+    pub fn explore_on_fast(&self) -> bool {
+        let fast = self.settings.catalog.fast_model();
+        self.types
+            .get("explore")
+            .ok()
+            .and_then(|kind| self.model_for(kind))
+            .is_some_and(|model| fast.as_deref() == Some(model.as_str()))
+    }
+
+    /// The model a run of `kind` requests; `None` keeps the current task's model.
+    pub fn model_for(&self, kind: &AgentType) -> Option<String> {
+        tier_for(kind, self.settings.explore_fast).resolve(&*self.settings.catalog)
     }
 
     pub fn next_id(&self, prefix: &str) -> String {
@@ -1009,12 +1132,15 @@ impl AgentHub {
         }))
     }
 
+    /// An agent of `kind` whose requests go to `model` (`None`: the task's model), with
+    /// that model's window, output cap and prices.
     pub fn build_agent(
         &self,
         kind: &AgentType,
         tools: Arc<dyn ToolExecutor>,
         extra: Option<String>,
         inbox_key: &str,
+        model: Option<String>,
     ) -> Result<Agent> {
         let mut instructions = kind.instructions.clone();
         instructions.push_str("\n\n");
@@ -1023,16 +1149,33 @@ impl AgentHub {
             instructions.push_str("\n\n");
             instructions.push_str(&extra);
         }
+        let catalog = &self.settings.catalog;
+        let serving = model.clone().unwrap_or_else(|| catalog.task_model());
+        let (context_tokens, max_output) = if serving == catalog.main_model() {
+            (
+                self.settings.context_tokens,
+                self.settings.max_output_tokens,
+            )
+        } else {
+            let (tokens, output) = catalog.budget(&serving);
+            (tokens, output.min(self.settings.max_output_tokens))
+        };
+        let max_turns = kind.max_turns.map_or(self.settings.max_turns, |cap| {
+            cap.min(self.settings.max_turns)
+        });
         Ok(Agent::new(
             self.provider.clone(),
             tools,
             Limits {
-                max_turns: self.settings.max_turns,
-                max_output_tokens: self.settings.max_output_tokens,
+                max_turns,
+                max_output_tokens: max_output.max(1),
                 prices: self.settings.prices,
             },
         )?
-        .with_context_tokens(self.settings.context_tokens)?
+        .with_model(model)
+        .with_pricing(pricing(catalog))
+        .with_stall_rounds(self.settings.stall_rounds)
+        .with_context_tokens(context_tokens)?
         .with_project_context(self.settings.project_context.clone())
         .with_instructions(Some(instructions))
         .with_turn_hook(Arc::new(InboxHook {
@@ -1104,6 +1247,7 @@ impl AgentHub {
         cancel: CancellationToken,
     ) -> RunOutcome {
         let kind = request.agent_type.clone();
+        let model = request.model.clone().or_else(|| self.model_for(&kind));
         let mut outcome = RunOutcome {
             id: request.id.clone(),
             agent_type: kind.name.clone(),
@@ -1118,13 +1262,18 @@ impl AgentHub {
             },
             tools_failed: 0,
             readonly: kind.readonly,
+            model: String::new(),
+            citations: None,
             fatal: None,
         };
+        let requested = model
+            .clone()
+            .unwrap_or_else(|| self.settings.catalog.task_model());
         self.activity.start(
             &request.id,
             request.kind,
             &kind.name,
-            request.model.as_deref().unwrap_or(&self.settings.model),
+            &requested,
             &request.description,
         );
         let (progress, events, forward) = self.forward_events(&request.id);
@@ -1154,9 +1303,8 @@ impl AgentHub {
                 &request.id,
             )
             .and_then(|tools| {
-                let agent = self
-                    .build_agent(&kind, tools.clone(), extra, &request.id)?
-                    .with_model(request.model.clone());
+                let agent =
+                    self.build_agent(&kind, tools.clone(), extra, &request.id, model.clone())?;
                 Ok((tools, agent))
             });
         let (tools, agent) = match built {
@@ -1170,11 +1318,26 @@ impl AgentHub {
                 return outcome;
             }
         };
-        let (result, spent, text) = agent
-            .run_detached_events(request.prompt.clone(), cancel, events)
+        let (result, spent, text) = CURRENT_AGENT
+            .scope(
+                request.id.clone(),
+                agent.run_detached_events(request.prompt.clone(), cancel, events),
+            )
             .await;
         progress.attach(None);
         let _ = forward.await;
+        outcome.model = served_by(&spent, &requested);
+        let (text, citations) = if kind.readonly && !text.trim().is_empty() {
+            let root = root.clone();
+            let required = kind.name == "explore";
+            let original = text.clone();
+            tokio::task::spawn_blocking(move || explore::annotate(&root, &text, required))
+                .await
+                .unwrap_or((original, None))
+        } else {
+            (text, None)
+        };
+        outcome.citations = citations;
         if request.detached {
             self.ledger.record_background(&spent);
         } else {
@@ -1254,6 +1417,20 @@ const OWN_TOOLS: &[&str] = &[
 ];
 
 impl WithSubAgent {
+    /// A foreground `agent` call of a read-only type: it writes nothing, so a batch of
+    /// them can run at once.
+    fn parallel_readonly(&self, input: &Value) -> bool {
+        let Ok(args) = serde_json::from_value::<AgentArgs>(input.clone()) else {
+            return false;
+        };
+        !args.background
+            && args.worktree.is_none()
+            && args.isolation.is_none()
+            && self
+                .resolve_type(&args)
+                .is_ok_and(|kind| parallel_kind(&kind))
+    }
+
     fn resolve_type(&self, args: &AgentArgs) -> Result<AgentType> {
         let from_mode = match args.mode.as_deref() {
             None => None,
@@ -1341,7 +1518,16 @@ impl WithSubAgent {
                 Some((root, workspace))
             }
         };
-        let outcome = self
+        // Read-only agents of one batch run side by side (`concurrent`), a few at a time.
+        let _slot = if parallel_kind(&kind) {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                slot = self.hub.readonly_slots.acquire() => slot.ok(),
+            }
+        } else {
+            None
+        };
+        let mut outcome = self
             .hub
             .run(
                 RunRequest {
@@ -1359,9 +1545,12 @@ impl WithSubAgent {
                 cancel,
             )
             .await;
-        if let Some(err) = outcome.fatal {
+        if let Some(err) = outcome.fatal.take() {
             return Err(err);
         }
+        // The parent's context budget is cove's, not the prompt's.
+        let dir = self.hub.store.root().join("tool-outputs");
+        outcome.output = explore::cap_conclusion(outcome.output.trim(), Some(&dir));
         Ok(ToolOutput {
             content: outcome.render(),
             failed: !outcome.succeeded(),
@@ -1408,18 +1597,24 @@ impl ToolExecutor for WithSubAgent {
         definitions.push(ToolDefinition {
             name: "agent".into(),
             description: format!(
-                "Delegate a self-contained subtask to a sub-agent with at most {} model calls. Types: {}. \
-                 Editing types share your approvals and checkpoint; read-only types never edit. It sees nothing of this conversation: \
-                 give full context in prompt. worktree=<branch> runs an editing agent inside a worktree made with the worktree tool. \
-                 background=true returns an agent id at once and runs it as a durable background agent (editing types in their own fresh \
-                 git worktree; you are notified when it finishes; manage it with agent_control). Costs count toward this session's spend. \
-                 The result header reports [exit, steps, truncated].",
+                "Delegate a self-contained subtask to a sub-agent (at most {} model calls). Types: {}. \
+                 Editing types share your approvals and checkpoint; read-only types never edit. It sees nothing of this conversation: give full context in prompt. \
+                 worktree=<branch>: an editing agent works in a worktree made with the worktree tool. background=true returns an id at once \
+                 (editing types get their own git worktree; you are notified when it ends; see agent_control). \
+                 Result header: [exit, steps, truncated]; answers over 6 KB are cut (full text saved, path given). \
+                 explore ({} model, at most {} calls) answers wide read-only questions: where X lives, how it flows, who calls Y, what a change to Z affects \
+                 (when to delegate: see the system prompt); foreground read-only agents in one response run in parallel, so split unrelated areas. \
+                 Its prompt: the question (not your guess to confirm), facts you have, directions ruled out, and thoroughness (quick, normal or thorough). \
+                 It answers with Conclusion, Evidence (path:line) and Not determined: cite the evidence without re-reading it; read only the key lines \
+                 before changing code on it or when it contradicts what you know. [未核实] or citations: none means a lead, not a fact.",
                 self.hub.settings.max_turns,
-                self.hub.types.summary()
+                self.hub.types.summary(),
+                if self.hub.explore_on_fast() { "fast" } else { "main" },
+                explore::EXPLORE_MAX_TURNS.min(self.hub.settings.max_turns)
             ),
             schema: json!({"type":"object","properties":{
                 "description":{"type":"string","description":"3-8 word label"},
-                "prompt":{"type":"string","description":"Complete task with all needed context"},
+                "prompt":{"type":"string","description":"Complete task with all needed context; for explore the question, known facts, ruled-out directions and thoroughness (quick/normal/thorough)"},
                 "type":{"type":"string","description":"Agent type (default general)"},
                 "mode":{"enum":["read","write"],"description":"Legacy alias: read=explore, write=general"},
                 "worktree":{"type":"string","description":"Branch of an existing worktree to work in"},
@@ -1429,9 +1624,9 @@ impl ToolExecutor for WithSubAgent {
         });
         definitions.push(ToolDefinition {
             name: "agent_control".into(),
-            description: "Manage background agents: list; stop <id> (interrupt, resumable); park <id> (suspend, commits its worktree, frees its slot); \
-                          resume <id> [message]; send <id> message (queued for a running agent at its next tool round, resumes a stopped one). \
-                          Merging or discarding an agent's work is only done by the user (/status agents merge|discard <id>)."
+            description: "Manage background agents: list; stop <id> (interrupt, resumable); park <id> (suspend, commit its worktree, free its slot); \
+                          resume <id> [message]; send <id> message (delivered at its next tool round; resumes a stopped one). \
+                          Only the user merges or discards an agent's work (/status agents merge|discard <id>)."
                 .into(),
             schema: json!({"type":"object","properties":{
                 "action":{"enum":["list","stop","park","resume","send"]},
@@ -1440,10 +1635,9 @@ impl ToolExecutor for WithSubAgent {
         });
         definitions.push(ToolDefinition {
             name: "execute_plan".into(),
-            description: "Run the pending items of your latest todo list as sub-agents in dependency order (todo id/depends, or a \
-                          'depends:todo-1,todo-2 ' content prefix). parallel=true runs independent items concurrently (max_agents 1-8, \
-                          default 4); two running items never write the same file at once. Each failed item is retried once. \
-                          Use only for plans of 3+ substantial items; update the todo list from the per-item report afterwards."
+            description: "Run the pending items of your latest todo list as sub-agents in dependency order (todo depends). \
+                          parallel=true runs independent items concurrently (max_agents 1-8, default 4), never two writing the same file at once. \
+                          A failed item is retried once. Afterwards update the todo list from the per-item report."
                 .into(),
             schema: json!({"type":"object","properties":{
                 "parallel":{"type":"boolean"},
@@ -1463,8 +1657,12 @@ impl ToolExecutor for WithSubAgent {
         matches!(name, "agent" | "execute_plan" | "team_create") || self.inner.metered(name)
     }
 
-    fn concurrent(&self, name: &str) -> bool {
-        name != "agent" && self.inner.concurrent(name)
+    /// Foreground agents of read-only types run side by side; editing ones stay serial.
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        if name == "agent" {
+            return self.parallel_readonly(input);
+        }
+        self.inner.concurrent(name, input)
     }
 
     fn execute(
@@ -1557,14 +1755,121 @@ mod tests {
     }
 
     #[test]
+    fn types_declare_their_model_tier() {
+        let registry = TypeRegistry::from_config(&json!({"agent_types":{
+            "scout":{"description":"x","instructions":"y","readonly":true,"model":"fast"},
+            "pinned":{"description":"x","instructions":"y","model":"claude-haiku-4-5"},
+            "plain":{"description":"x","instructions":"y"}
+        }}))
+        .unwrap();
+        let tier = |name: &str, explore_fast| tier_for(registry.get(name).unwrap(), explore_fast);
+        assert_eq!(tier("explore", true), ModelTier::Fast);
+        assert_eq!(tier("explore", false), ModelTier::Main);
+        for name in ["plan", "review", "verify"] {
+            assert_eq!(tier(name, true), ModelTier::Main, "{name}");
+        }
+        assert_eq!(tier("general", true), ModelTier::Inherit);
+        assert_eq!(tier("test", true), ModelTier::Inherit);
+        assert_eq!(tier("scout", true), ModelTier::Fast);
+        // explore_model only concerns explore.
+        assert_eq!(tier("scout", false), ModelTier::Fast);
+        assert_eq!(
+            tier("pinned", true),
+            ModelTier::Named("claude-haiku-4-5".into())
+        );
+        assert_eq!(tier("plain", true), ModelTier::Inherit);
+        assert_eq!(
+            registry.get("explore").unwrap().max_turns,
+            Some(explore::EXPLORE_MAX_TURNS)
+        );
+        assert!(
+            TypeRegistry::from_config(&json!({"agent_types":{
+                "bad":{"description":"x","instructions":"y","model":"two words"}
+            }}))
+            .is_err()
+        );
+        // Only read-only types without regression run side by side.
+        assert!(parallel_kind(registry.get("explore").unwrap()));
+        assert!(parallel_kind(registry.get("review").unwrap()));
+        assert!(!parallel_kind(registry.get("verify").unwrap()));
+        assert!(!parallel_kind(registry.get("general").unwrap()));
+    }
+
+    #[test]
+    fn the_result_names_the_model_and_the_evidence_check() {
+        let mut spent = Accounting::default();
+        assert_eq!(served_by(&spent, "fast-model"), "fast-model");
+        spent.by_model.insert(
+            "b-model".into(),
+            crate::session::ModelSpend {
+                calls: 1,
+                ..Default::default()
+            },
+        );
+        spent.by_model.insert(
+            "a-model".into(),
+            crate::session::ModelSpend {
+                calls: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(served_by(&spent, "x"), "a-model + b-model");
+        let outcome = RunOutcome {
+            id: "agent-1".into(),
+            agent_type: "explore".into(),
+            description: "find callers".into(),
+            exit: Exit::Completed,
+            steps: 4,
+            truncated: false,
+            output: "Conclusion: two callers.".into(),
+            spent: Accounting {
+                cost: Some(0.04),
+                ..Accounting::default()
+            },
+            tools_failed: 0,
+            readonly: true,
+            model: "deepseek-v4-flash".into(),
+            citations: Some("citations: 2 ok, 0 invalid".into()),
+            fatal: None,
+        };
+        let text = outcome.render();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("[sub-agent agent-1 (explore)"),
+            "{text}"
+        );
+        assert_eq!(lines[1], "citations: 2 ok, 0 invalid");
+        assert_eq!(
+            *lines.last().unwrap(),
+            "[cost: $0.0400, model: deepseek-v4-flash, steps: 4, failed tools: 0]"
+        );
+    }
+
+    #[test]
     fn exits_map_to_lifecycle_states() {
         assert_eq!(Exit::Completed.lifecycle(), Lifecycle::Finished);
         assert_eq!(Exit::MaxIterations.lifecycle(), Lifecycle::Interrupted);
         assert_eq!(Exit::Unverified.lifecycle(), Lifecycle::Failed);
+        assert_eq!(Exit::Stalled.lifecycle(), Lifecycle::Interrupted);
+        let stopped = |stop| {
+            Err(Error::Stopped(Box::new(crate::engine::agent::Stopped {
+                stop,
+                report: crate::engine::agent::TaskReport::default(),
+            })))
+        };
         assert_eq!(
-            Exit::from_result(&Err(Error::Limit("已用完 20 次模型调用".into()))),
+            Exit::from_result(&stopped(crate::engine::agent::Stop::Limit(20))),
             Exit::MaxIterations
         );
+        assert_eq!(
+            Exit::from_result(&stopped(crate::engine::agent::Stop::Stalled(12))),
+            Exit::Stalled
+        );
+        // Other limits (the task deadline) are errors, not a used-up quota.
+        assert!(matches!(
+            Exit::from_result(&Err(Error::Limit("任务超过时限".into()))),
+            Exit::Error(_)
+        ));
     }
 
     #[tokio::test]

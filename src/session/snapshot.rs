@@ -246,6 +246,45 @@ fn large_files(work: &Path) -> Vec<String> {
     out
 }
 
+/// `literal` (relative to the work tree `work`, which is canonical) as a
+/// work-tree-relative `/`-separated path, when it names a regular file (not a directory
+/// or link) inside the work tree and outside any `.git` directory.
+fn work_file(work: &Path, literal: &str) -> Option<String> {
+    // On Windows `/d/x` (Git Bash) and `C:x` name other files than `Path` reads there.
+    if cfg!(windows) {
+        let drive = literal.as_bytes().get(1) == Some(&b':')
+            && matches!(literal.as_bytes().get(2), Some(b'/' | b'\\'));
+        // Any other colon is a drive-relative path or an alternate data stream.
+        if literal.starts_with(['/', '\\']) || literal.matches(':').count() > usize::from(drive) {
+            return None;
+        }
+    }
+    let path = work.join(literal);
+    if !std::fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let real = crate::paths::plain(&path.canonicalize().ok()?);
+    let (real_key, work_key) = (crate::paths::key(&real), crate::paths::key(work));
+    let below = real_key
+        .strip_prefix(&work_key)
+        .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'));
+    if !below {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in real.strip_prefix(work).ok()?.components() {
+        let std::path::Component::Normal(part) = part else {
+            return None;
+        };
+        let part = part.to_str()?;
+        if part.eq_ignore_ascii_case(".git") {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// The path up to and including its first hidden component (`a/.cache/x` → `a/.cache/`).
 fn hidden_prefix(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
@@ -693,6 +732,27 @@ impl Snapshots {
         }
     }
 
+    /// The work tree's hash now, recording no snapshot: whether shell commands or
+    /// sub-agents changed files (docs/optimizations/0032). `None` when automatic
+    /// snapshots are off or warming up, or staging takes longer than `budget`; a slow
+    /// staging then finishes in the background (it only refreshes the private index).
+    pub async fn tree_now(self: &Arc<Self>, budget: Duration) -> Option<String> {
+        if self
+            .state
+            .lock()
+            .is_ok_and(|state| state.slow >= SLOW_LIMIT)
+            || self.warming.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let this = self.clone();
+        let task = tokio::spawn(async move {
+            let _guard = this.lock.lock().await;
+            this.stage().await.ok()
+        });
+        tokio::time::timeout(budget, task).await.ok()?.ok()?
+    }
+
     /// Records the work tree; returns the snapshot and whether a new one was needed.
     pub async fn snapshot(&self, label: &str) -> Result<(String, bool)> {
         self.snapshot_unless(label, &AtomicBool::new(false)).await
@@ -974,6 +1034,51 @@ impl Snapshots {
         if let Ok(mut state) = self.state.lock() {
             state.task_taken = true;
         }
+    }
+
+    /// Whether `command` only deletes files the latest snapshot holds, so `/undo`
+    /// brings each back (docs/optimizations/0034). Called right after the snapshot
+    /// before that command: every path must be a regular file in the work tree, outside
+    /// `.git`, not left out of snapshots, and a regular file in the snapshot itself.
+    pub async fn undoes_deletion(&self, command: &str) -> bool {
+        let dialect = crate::safety::permission::shell::Dialect::for_command(command);
+        let Some(paths) = crate::safety::permission::classify::deletes(command, dialect) else {
+            return false;
+        };
+        let excluded = self.excluded();
+        let mut relative = Vec::new();
+        for path in &paths {
+            match work_file(&self.work, path) {
+                Some(path) if !excluded.covers(&path) => relative.push(path),
+                _ => return false,
+            }
+        }
+        let Some(head) = self.head().await else {
+            return false;
+        };
+        let mut args = vec![
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            head.as_str(),
+            "--",
+        ];
+        args.extend(relative.iter().map(String::as_str));
+        let Ok(listed) = self.git_bytes(&args).await else {
+            return false;
+        };
+        // `<mode> blob <hash>\t<path>`: regular files only, not links or nested repositories.
+        let held: HashSet<String> = String::from_utf8_lossy(&listed)
+            .split('\0')
+            .filter_map(|entry| {
+                let (meta, path) = entry.split_once('\t')?;
+                let regular = meta.starts_with("100644 blob ") || meta.starts_with("100755 blob ");
+                regular.then(|| path.to_owned())
+            })
+            .collect();
+        relative.iter().all(|path| held.contains(path))
     }
 
     /// `#n` (as `/undo` lists them, 1 = newest) or a hash prefix of this project's snapshots.
@@ -1299,8 +1404,8 @@ impl ToolExecutor for Snapshotting {
         self.inner.metered(name)
     }
 
-    fn concurrent(&self, name: &str) -> bool {
-        self.inner.concurrent(name)
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        self.inner.concurrent(name, input)
     }
 
     fn execute(
@@ -1311,6 +1416,7 @@ impl ToolExecutor for Snapshotting {
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         Box::pin(async move {
             let mut warning = None;
+            let mut taken = false;
             let label = (mutating(&name, &input) && !cancel.is_cancelled())
                 .then(|| self.snapshots.label_for(&name, &input))
                 .flatten();
@@ -1320,6 +1426,7 @@ impl ToolExecutor for Snapshotting {
                     before = before => warning = match before {
                         Before::Taken => {
                             self.snapshots.task_taken();
+                            taken = true;
                             None
                         }
                         Before::Off => None,
@@ -1331,13 +1438,46 @@ impl ToolExecutor for Snapshotting {
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
                 }
             }
-            let mut output = self.inner.execute(name, input, cancel).await?;
+            // A deletion the snapshot just taken can undo runs in `auto` without asking
+            // (docs/optimizations/0034); only this call's own snapshot vouches for it.
+            let mut undoable = None;
+            if taken
+                && name == "shell"
+                && let Some(command) = input.get("command").and_then(Value::as_str)
+            {
+                tokio::select! {
+                    held = self.snapshots.undoes_deletion(command) => {
+                        undoable = held.then(|| command.to_owned());
+                    }
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                }
+            }
+            let call = self.inner.execute(name, input, cancel);
+            let mut output = match undoable {
+                Some(command) => {
+                    let output = crate::safety::permission::undoable(command, call).await?;
+                    if !output.failed {
+                        warning = Some("[checkpoint] 删除前已打回滚点，可用 /undo 恢复。".into());
+                    }
+                    output
+                }
+                None => call.await?,
+            };
             if let Some(warning) = warning {
                 output.content.push('\n');
                 output.content.push_str(&warning);
             }
             Ok(output)
         })
+    }
+}
+
+/// The work tree a stalled task is checked against (`engine::progress`).
+pub struct SnapshotTree(pub Arc<Snapshots>);
+
+impl crate::engine::progress::WorkTree for SnapshotTree {
+    fn tree(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(self.0.tree_now(SNAPSHOT_BUDGET))
     }
 }
 
@@ -1549,7 +1689,7 @@ mod tests {
         fn metered(&self, _: &str) -> bool {
             false
         }
-        fn concurrent(&self, _: &str) -> bool {
+        fn concurrent(&self, _: &str, _: &Value) -> bool {
             false
         }
         fn execute(
@@ -1609,6 +1749,130 @@ mod tests {
                 "任务：fix the login bug",
             ]
         );
+    }
+
+    /// A shell tool that asks the `auto` permission check, then deletes what `rm` names.
+    struct Deleting(PathBuf);
+
+    impl ToolExecutor for Deleting {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        fn metered(&self, _: &str) -> bool {
+            false
+        }
+        fn concurrent(&self, _: &str, _: &Value) -> bool {
+            false
+        }
+        fn execute(
+            &self,
+            _: String,
+            input: Value,
+            _: CancellationToken,
+        ) -> BoxFuture<'_, Result<ToolOutput>> {
+            use crate::safety::permission::{Decision, Effect, Mode, decide, shell::Dialect};
+            Box::pin(async move {
+                let command = input["command"].as_str().unwrap_or_default().to_owned();
+                let dialect = Dialect::for_command(&command);
+                let effect = Effect::Shell(command.clone());
+                let roots = [self.0.clone()];
+                let decision = decide(Mode::Auto, &effect, &[], &self.0, Some(&roots), dialect);
+                if decision != Decision::Allow {
+                    return Err(Error::Unattended(command));
+                }
+                for path in crate::safety::permission::classify::deletes(&command, dialect).unwrap()
+                {
+                    std::fs::remove_file(self.0.join(path)).unwrap();
+                }
+                Ok(ToolOutput::default())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_deletes_only_files_the_snapshot_before_the_call_holds() {
+        if !git_available() {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = work.path();
+        project_git(root, &["init", "-q"]);
+        for (path, text) in [
+            ("a.txt", "tracked"),
+            ("config/old.ini", "old"),
+            (".gitignore", "*.log\n"),
+            ("d/keep.txt", "keep"),
+        ] {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        project_git(root, &["add", "."]);
+        project_git(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("debug.log"), "ignored").unwrap();
+        std::fs::write(outside.path().join("x.txt"), "outside").unwrap();
+        let snapshots = Snapshots::open(data.path(), root).await.unwrap();
+        let tools = Snapshotting {
+            inner: Arc::new(Deleting(snapshots.work.clone())),
+            snapshots: snapshots.clone(),
+        };
+        let shell = |command: String| {
+            tools.execute(
+                "shell".into(),
+                serde_json::json!({ "command": command }),
+                CancellationToken::new(),
+            )
+        };
+        snapshots.begin_task("clean up");
+        let output = shell("rm a.txt && rm -f config/old.ini".into())
+            .await
+            .unwrap();
+        assert!(output.content.contains("/undo"), "{}", output.content);
+        assert!(!root.join("a.txt").exists() && !root.join("config/old.ini").exists());
+        let outside_file = crate::paths::plain(&outside.path().canonicalize().unwrap())
+            .join("x.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        for command in [
+            "rm debug.log".to_owned(),
+            "rm d".to_owned(),
+            "rm .git/config".to_owned(),
+            "rm missing.txt".to_owned(),
+            format!("rm '{outside_file}'"),
+            format!(
+                "rm ../{}/x.txt",
+                outside.path().file_name().unwrap().to_string_lossy()
+            ),
+        ] {
+            assert!(
+                matches!(shell(command.clone()).await, Err(Error::Unattended(_))),
+                "{command}"
+            );
+        }
+        assert!(root.join("debug.log").exists() && outside.path().join("x.txt").exists());
+        // `/undo` brings the deleted files back.
+        let before = snapshots.list(10).await.unwrap();
+        let target = before
+            .iter()
+            .find(|info| info.label == "任务：clean up")
+            .unwrap();
+        snapshots.restore(target, &[]).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "tracked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("config/old.ini")).unwrap(),
+            "old"
+        );
+        // With automatic snapshots off, nothing vouches for the deletion.
+        snapshots.state.lock().unwrap().slow = SLOW_LIMIT;
+        assert!(matches!(
+            shell("rm a.txt".into()).await,
+            Err(Error::Unattended(_))
+        ));
+        assert!(root.join("a.txt").exists());
     }
 
     fn project_git(work: &Path, args: &[&str]) {

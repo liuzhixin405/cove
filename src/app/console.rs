@@ -68,6 +68,8 @@ pub struct Meter {
     pub window: u64,
     /// Where the automatic compaction starts.
     pub compact_at: u64,
+    /// From where `/handoff` is suggested (0: never, docs/optimizations/0026).
+    pub handoff_at: u64,
     /// Tokens the session has used, input and output.
     pub session: u64,
     pub cost: Option<f64>,
@@ -120,6 +122,8 @@ impl Meter {
                 tenths / 10,
                 tenths % 10
             ));
+        } else if self.handoff_at > 0 && self.context >= self.handoff_at {
+            row.push_str(" · 换话题可 /handoff");
         }
         Some((row, near))
     }
@@ -333,6 +337,11 @@ impl Console {
         state.meter.cost = cost;
         state.meter.thinking = thinking;
         state.redraw();
+    }
+
+    /// From what context size the usage row suggests `/handoff` (0: never).
+    pub fn set_handoff_at(&self, handoff_at: u64) {
+        self.lock().meter.handoff_at = handoff_at;
     }
 
     /// The project directory the console resolves paths against.
@@ -2794,6 +2803,7 @@ mod tests {
             context: 52_100,
             window: 200_000,
             compact_at: 127_500,
+            handoff_at: 0,
             session: 1_250_000,
             cost: Some(3.2),
             thinking: String::new(),
@@ -2826,6 +2836,14 @@ mod tests {
         meter.compact_at = 765_000;
         meter.context = 732_600;
         assert!(meter.row(None).unwrap().0.contains("76.5%"));
+        // Below the compaction hint, a large context suggests a handoff (0026).
+        meter.handoff_at = 150_000;
+        assert!(!meter.row(None).unwrap().0.contains("/handoff"));
+        meter.context = 160_000;
+        let (row, near) = meter.row(None).unwrap();
+        assert!(!near && row.ends_with(" · 换话题可 /handoff"), "{row}");
+        meter.context = 149_999;
+        assert!(!meter.row(None).unwrap().0.contains("/handoff"));
         assert_eq!(Meter::default().row(None), None);
     }
 

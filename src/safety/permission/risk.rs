@@ -2,7 +2,9 @@
 //! deletes, remote state, installed software, system settings and processes, and
 //! code whose content cannot be read before it runs. Everything else (reading,
 //! building, running project scripts, unknown tools with ordinary arguments) runs
-//! without asking; an empty list means the line may run.
+//! without asking; an empty list means the line may run. Code written out on the line
+//! (`python -c`, a quoted here-document) is its own reason, [`INLINE_CODE`], which
+//! `auto` lets run like a script (docs/optimizations/0043).
 
 use super::{
     classify,
@@ -18,6 +20,123 @@ pub fn reasons(command: &str, dialect: Dialect) -> Vec<String> {
     collect(command, dialect, 0, &mut out);
     out.dedup();
     out
+}
+
+/// How every reason for code whose whole text is on the line starts.
+pub const INLINE_CODE: &str = "执行内联代码（";
+
+/// `command` asks only because it runs code written out on the line.
+pub fn inline_only(command: &str, dialect: Dialect) -> bool {
+    let reasons = reasons(command, dialect);
+    !reasons.is_empty() && reasons.iter().all(|reason| reason.starts_with(INLINE_CODE))
+}
+
+const SHELLS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "ash",
+    "fish",
+    "cmd",
+    "pwsh",
+    "powershell",
+];
+
+const INTERPRETERS: &[&str] = &[
+    "python", "python3", "py", "pythonw", "node", "deno", "bun", "perl", "ruby", "php", "rscript",
+    "lua",
+];
+
+/// The flags after which `name` takes its code as the next word.
+fn code_flags(name: &str) -> &'static [&'static str] {
+    match name {
+        "python" | "python3" | "py" | "pythonw" => &["-c"],
+        "node" | "bun" => &["-e", "--eval", "-p", "--print"],
+        "perl" => &["-e", "-E"],
+        "ruby" | "rscript" | "lua" => &["-e"],
+        "php" => &["-r"],
+        "deno" => &["eval"],
+        _ => &[],
+    }
+}
+
+/// Rewrites the reasons `simple` (run as `words`) added from `start` on, now that the
+/// code it reads is known: a here-document or here-string fed to an interpreter is
+/// code on the line, one fed to a shell is judged like `bash -c`, and code holding a
+/// variable expansion is not fully on the line.
+fn code_on_the_line(
+    simple: &Simple,
+    words: &[Word],
+    depth: usize,
+    start: usize,
+    out: &mut Vec<String>,
+) {
+    let Some(exe) = words.first() else {
+        return;
+    };
+    let name = shell::program_name(&exe.text);
+    let shell = SHELLS.contains(&name.as_str());
+    if !shell && !INTERPRETERS.contains(&name.as_str()) {
+        return;
+    }
+    let mut input: Vec<(&str, bool)> = simple
+        .heredocs
+        .iter()
+        .zip(&simple.heredoc_literal)
+        .map(|(body, quoted)| {
+            (
+                body.as_str(),
+                *quoted || !(body.contains('$') || body.contains('`')),
+            )
+        })
+        .collect();
+    input.extend(
+        simple
+            .here_strings
+            .iter()
+            .map(|word| (word.text.as_str(), !word.dynamic)),
+    );
+    let literal = !input.is_empty() && input.iter().all(|(_, literal)| *literal);
+    let mut index = start;
+    while index < out.len() {
+        if !input.is_empty() && out[index].starts_with("从标准输入执行代码（") {
+            if shell && literal {
+                out.remove(index);
+                let inner = match name.as_str() {
+                    "cmd" => Dialect::Cmd,
+                    "pwsh" | "powershell" => Dialect::PowerShell,
+                    _ => Dialect::Posix,
+                };
+                let mut nested = Vec::new();
+                for (body, _) in &input {
+                    collect(body, inner, depth + 1, &mut nested);
+                }
+                let count = nested.len();
+                out.splice(index..index, nested);
+                index += count;
+                continue;
+            }
+            if !shell {
+                out[index] = if literal {
+                    format!("{INLINE_CODE}{name}，here-document）")
+                } else {
+                    format!("执行含变量展开的代码（{name}）")
+                };
+            }
+        } else if out[index].starts_with(INLINE_CODE) && !shell {
+            let flags = code_flags(&name);
+            let code = words[1..]
+                .iter()
+                .position(|word| flags.contains(&word.text.as_str()))
+                .and_then(|at| words.get(at + 2));
+            if code.is_some_and(|word| word.dynamic) {
+                out[index] = format!("执行含变量展开的代码（{name}）");
+            }
+        }
+        index += 1;
+    }
 }
 
 fn collect(command: &str, dialect: Dialect, depth: usize, out: &mut Vec<String>) {
@@ -49,6 +168,15 @@ fn simple_reasons(simple: &Simple, dialect: Dialect, depth: usize, out: &mut Vec
         {
             out.push(format!("写入文件（重定向到 {}）", redirect.target));
         }
+    }
+    // An unquoted delimiter: the shell runs `$(...)` and backquotes in the body first.
+    if simple
+        .heredocs
+        .iter()
+        .zip(&simple.heredoc_literal)
+        .any(|(body, quoted)| !quoted && (body.contains("$(") || body.contains('`')))
+    {
+        out.push("包含无法静态分析的结构（here-document 里的命令替换）".into());
     }
     let Some(words) = classify::command_words(&simple.words, dialect) else {
         out.push("包含无法静态分析的结构（case/function/cmd if、for、call）".into());
@@ -91,7 +219,9 @@ fn simple_reasons(simple: &Simple, dialect: Dialect, depth: usize, out: &mut Vec
     let dynamic_args = words[offset + 1..]
         .iter()
         .any(|w| w.dynamic && (!w.quoted || w.text.starts_with('$') || w.text.starts_with('-')));
+    let start = out.len();
     argv_reasons(rest, dynamic_args, depth, out);
+    code_on_the_line(simple, &words[offset..], depth, start, out);
 }
 
 fn variable(word: &str) -> &str {
@@ -1146,17 +1276,17 @@ fn python_reasons(args: &[&str], out: &mut Vec<String>) {
 }
 
 fn interpreter_reasons(name: &str, args: &[&str], pos: &[&str], out: &mut Vec<String>) {
-    let inline = match name {
-        "node" | "bun" => &["-e", "--eval", "-p", "--print"][..],
-        "perl" => &["-e", "-E", "-i", "-pi", "-ni"][..],
-        "ruby" => &["-e"][..],
-        "php" => &["-r"][..],
-        "rscript" | "lua" | "osascript" => &["-e"][..],
-        "deno" => &[][..],
-        _ => &[][..],
-    };
-    if has_any(args, inline) || (name == "perl" && has_prefix(args, &["-i"])) {
-        out.push(format!("执行内联代码（{name}）"));
+    if name == "perl" && (has_prefix(args, &["-i"]) || has_any(args, &["-pi", "-ni"])) {
+        out.push("原地修改文件（perl -i）".into());
+        return;
+    }
+    // AppleScript drives other applications and the system, not project code.
+    if name == "osascript" && has_any(args, &["-e"]) {
+        out.push("执行 AppleScript（osascript）".into());
+        return;
+    }
+    if name != "deno" && has_any(args, code_flags(name)) {
+        out.push(format!("{INLINE_CODE}{name}）"));
         return;
     }
     if name == "deno" {
@@ -1358,8 +1488,19 @@ mod tests {
             ("git ls-files | xargs rm", "删除文件（rm）"),
             (
                 "python3 <<EOF\nprint(1)\nEOF",
-                "从标准输入执行代码（python）",
+                "执行内联代码（python3，here-document）",
             ),
+            ("cat a.py | python3", "从标准输入执行代码（python）"),
+            (
+                "python3 - <<EOF\nprint('$HOME')\nEOF",
+                "执行含变量展开的代码（python3）",
+            ),
+            (
+                "cat <<EOF\n`whoami`\nEOF",
+                "包含无法静态分析的结构（here-document 里的命令替换）",
+            ),
+            ("perl -pi -e 's/a/b/' x", "原地修改文件（perl -i）"),
+            ("bash <<'EOF'\ngit push\nEOF", "推送到远端（git push）"),
             ("tar -xzf a.tgz", "解压或打包写文件（tar）"),
             (
                 "git reset --soft HEAD~1",

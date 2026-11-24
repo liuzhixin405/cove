@@ -6,6 +6,20 @@ use serde_json::Value;
 
 use crate::{session::Session, tools::ToolOutput};
 
+/// One run of a task (a new task or a `/continue`), as the agent loop counted it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskStats {
+    /// Model calls of this run, compaction and sub-agents included.
+    pub model_calls: u32,
+    /// The longest run of rounds without progress.
+    pub idle_max: u32,
+    /// cove stopped the run for lack of progress.
+    pub stalled: bool,
+    /// The run sent the project context the session recorded in an earlier process,
+    /// not this process's different one (0036).
+    pub system_reused: bool,
+}
+
 /// Every method has a no-op default; implement only what a feature needs.
 /// Hooks run in registration order; the first `Some` wins where noted.
 pub trait TurnHook: Send + Sync {
@@ -32,6 +46,9 @@ pub trait TurnHook: Send + Sync {
     fn finish_nudge<'a>(&'a self, _session: &'a Session) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
     }
+
+    /// Just before `task_end`: what this run of the task did (the trace records it).
+    fn task_stats(&self, _stats: &TaskStats) {}
 
     /// After a task ends; `completed` is false for errors, limits and cancellation.
     fn task_end<'a>(&'a self, _session: &'a Session, _completed: bool) -> BoxFuture<'a, ()> {

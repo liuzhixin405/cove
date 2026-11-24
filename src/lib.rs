@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod app;
+pub mod build_id;
 mod commands;
 pub mod config;
 pub mod domain;

@@ -2,6 +2,7 @@
 
 pub mod dream;
 pub mod extract;
+pub mod preferences;
 pub mod recall;
 pub mod rules;
 pub mod store;

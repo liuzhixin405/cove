@@ -712,7 +712,7 @@ impl ToolExecutor for SlowReads {
         false
     }
 
-    fn concurrent(&self, name: &str) -> bool {
+    fn concurrent(&self, name: &str, _input: &Value) -> bool {
         name == "read"
     }
 
@@ -1006,10 +1006,10 @@ async fn cli_reads_in_parallel_keeps_gbk_and_adds_subdirectory_instructions() {
         std::fs::read(root.path().join("pkg/mod.c")).unwrap(),
         gbk("/* 模块 */\r\nint x = 2; /* 已改 */\r\n")
     );
-    // The system prompt names the shell the tool really runs.
+    // The environment line of the system prompt names the shell the tool really runs.
     let system = requests[0]["messages"][0]["content"].as_str().unwrap();
     assert!(
-        system.contains(&format!("Shell dialect: {}", Shell::current().dialect())),
+        system.contains(&format!("| Shell: {} (", Shell::current().dialect())),
         "{system}"
     );
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     io::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -135,7 +135,7 @@ fn dotnet(root: &Path) -> bool {
         entries.flatten().any(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.ends_with(".sln") || name.ends_with(".csproj")
+            name.ends_with(".sln") || name.ends_with(".slnx") || name.ends_with(".csproj")
         })
     })
 }
@@ -400,13 +400,14 @@ fn pytest_targets(root: &Path, changed: &[PathBuf]) -> Option<Vec<String>> {
         } else {
             let stem = path.file_stem()?.to_string_lossy();
             let wanted = [format!("test_{stem}.py"), format!("{stem}_test.py")];
-            tests
+            let found = tests
                 .iter()
                 .filter(|test| {
                     test.file_name()
                         .is_some_and(|file| wanted.iter().any(|w| file.to_string_lossy() == *w))
                 })
-                .collect()
+                .collect();
+            nearest(root, path, found)
         };
         if test_name(&name) {
             if root.join(path).is_file() {
@@ -421,6 +422,46 @@ fn pytest_targets(root: &Path, changed: &[PathBuf]) -> Option<Vec<String>> {
     targets.sort();
     targets.dedup();
     (!targets.is_empty()).then_some(targets)
+}
+
+/// The test files among `found` (all named after `module`) nearest to it: most leading
+/// directories shared, then most trailing ones once `tests`/`test` are dropped (the
+/// `src/pkg/a/mod.py` and `tests/a/test_mod.py` layout). Equally near ones all stay, so a
+/// module whose namesakes are all far still gets them rather than the whole suite.
+fn nearest<'a>(root: &Path, module: &Path, found: Vec<&'a PathBuf>) -> Vec<&'a PathBuf> {
+    let dirs = |path: &Path| -> Vec<String> {
+        path.parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .filter_map(|part| match part {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    };
+    let module = dirs(module);
+    let nearness = |test: &Path| {
+        let test = dirs(test.strip_prefix(root).unwrap_or(test));
+        let leading = module.iter().zip(&test).take_while(|(a, b)| a == b).count();
+        let stripped: Vec<&String> = test
+            .iter()
+            .filter(|name| !matches!(name.as_str(), "tests" | "test"))
+            .collect();
+        let trailing = module
+            .iter()
+            .rev()
+            .zip(stripped.iter().rev())
+            .take_while(|(a, b)| a == *b)
+            .count();
+        (leading, trailing)
+    };
+    let Some(best) = found.iter().map(|test| nearness(test)).max() else {
+        return found;
+    };
+    found
+        .into_iter()
+        .filter(|test| nearness(test) == best)
+        .collect()
 }
 
 /// `dotnet test` for the test projects that reference (directly or not) a changed
@@ -446,10 +487,16 @@ fn dotnet_tests(root: &Path, changed: &[PathBuf]) -> Vec<String> {
             .map(|captures| normalize(&dir.join(captures[1].replace('\\', "/"))))
             .collect();
         references.insert(normalize(project), refs);
-        if text.contains("Microsoft.NET.Test.Sdk") || text.contains("<IsTestProject>true") {
+        if is_test_project(root, project, &text) {
             tests.push(normalize(project));
         }
     }
+    // Microsoft.Testing.Platform's `dotnet test` takes no positional path.
+    let test = if mtp(root) {
+        "dotnet test --project"
+    } else {
+        "dotnet test"
+    };
     let project_in = |dir: &Path| {
         projects
             .iter()
@@ -479,8 +526,8 @@ fn dotnet_tests(root: &Path, changed: &[PathBuf]) -> Vec<String> {
     };
     let mut selected: Vec<String> = tests
         .iter()
-        .filter(|test| covers(test))
-        .map(|test| format!("dotnet test {}", shell_path(root, test)))
+        .filter(|project| covers(project))
+        .map(|project| format!("{test} {}", shell_path(root, project)))
         .collect();
     if selected.is_empty() {
         selected = owners
@@ -490,6 +537,56 @@ fn dotnet_tests(root: &Path, changed: &[PathBuf]) -> Vec<String> {
     }
     selected.sort();
     selected
+}
+
+/// Text marking test projects: VSTest's SDK package, the MSBuild property, and the
+/// Microsoft.Testing.Platform frameworks, which no longer reference Microsoft.NET.Test.Sdk.
+const TEST_MARKERS: &[&str] = &[
+    "Microsoft.NET.Test.Sdk",
+    "<IsTestProject>true",
+    "Microsoft.Testing.Platform",
+    "xunit.v3",
+    "MSTest.Sdk",
+    "\"MSTest\"",
+    "\"NUnit\"",
+    "\"TUnit\"",
+];
+
+/// A test project by its own text, or by the nearest `Directory.Build.props` (which MSBuild
+/// imports) naming a test framework for a project whose name ends in Test or Tests. The
+/// props usually decide by a condition on the name; this approximates it without running
+/// MSBuild, and keeps helpers such as `X.TestSupport` out.
+fn is_test_project(root: &Path, project: &Path, text: &str) -> bool {
+    let marked = |text: &str| TEST_MARKERS.iter().any(|marker| text.contains(marker));
+    if marked(text) {
+        return true;
+    }
+    let named = project.file_stem().is_some_and(|stem| {
+        let stem = stem.to_string_lossy().to_lowercase();
+        stem.ends_with("test") || stem.ends_with("tests")
+    });
+    if !named {
+        return false;
+    }
+    let relative = project.strip_prefix(root).unwrap_or(project);
+    owner(root, relative, |dir| {
+        dir.join("Directory.Build.props").is_file()
+    })
+    .and_then(|dir| std::fs::read_to_string(dir.join("Directory.Build.props")).ok())
+    .is_some_and(|props| marked(&props) || props.contains("<IsTestProject"))
+}
+
+/// `global.json` selects Microsoft.Testing.Platform for `dotnet test`.
+fn mtp(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("global.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| {
+            json.pointer("/test/runner")
+                .and_then(serde_json::Value::as_str)
+                .map(|runner| runner.eq_ignore_ascii_case("Microsoft.Testing.Platform"))
+        })
+        .unwrap_or(false)
 }
 
 /// Maven/Gradle tests of the modules the changed files belong to.
@@ -570,6 +667,9 @@ pub struct CommandVerifier {
     detected: Option<(bool, Preapproved)>,
     evidence: Option<Arc<Evidence>>,
     ledger: Option<PathBuf>,
+    /// Tests failing before the task's changes, per command and changed-file set;
+    /// `None` when the baseline run gave no answer.
+    baselines: Mutex<HashMap<String, Option<BTreeSet<String>>>>,
 }
 
 impl CommandVerifier {
@@ -591,6 +691,7 @@ impl CommandVerifier {
             detected: None,
             evidence: None,
             ledger: None,
+            baselines: Mutex::default(),
         }
     }
 
@@ -629,6 +730,15 @@ impl CommandVerifier {
                 .detected
                 .as_ref()
                 .is_some_and(|(tests, _)| *tests && !test_commands(&self.root, &[]).is_empty())
+    }
+
+    /// The task's changed files that scope the checks: scratch files it created and then
+    /// deleted have no tests and would widen the run to the whole suite.
+    fn changed(&self) -> Result<Vec<PathBuf>> {
+        let scratch = self.workspace.deleted_scratch_paths()?;
+        let mut changed = self.workspace.changed_paths()?;
+        changed.retain(|path| !scratch.contains(path));
+        Ok(changed)
     }
 
     fn turn_commands(&self, changed: &[PathBuf]) -> Vec<String> {
@@ -692,14 +802,22 @@ impl CommandVerifier {
         cancel: CancellationToken,
     ) -> Result<Verification> {
         let commands = self.turn_commands(paths);
-        let verification = self.run(&commands, cancel).await?;
+        // Staged content may hold more than this task: the task's before is no baseline.
+        let verification = self.run(&commands, false, cancel).await?;
         if let Some(evidence) = &self.evidence {
             evidence.set_outcome(verification.outcome.name());
         }
         Ok(verification)
     }
 
-    async fn run(&self, commands: &[String], cancel: CancellationToken) -> Result<Verification> {
+    /// Runs `commands` in order. With `baseline`, a test command whose failing tests all
+    /// failed before the task's changes too counts as passed (see [`Self::judge`]).
+    async fn run(
+        &self,
+        commands: &[String],
+        baseline: bool,
+        cancel: CancellationToken,
+    ) -> Result<Verification> {
         let mut summary = String::new();
         let mut detail = String::new();
         let mut outcome = Outcome::Passed;
@@ -811,10 +929,49 @@ impl CommandVerifier {
                 }
                 continue;
             }
+            let judged = if baseline {
+                self.judge(command, &output, duration_ms, timeout, &cancel)
+                    .await?
+            } else {
+                None
+            };
+            if let Some(judged) = &judged
+                && judged.new.is_empty()
+            {
+                let note = format!(
+                    "{} 个失败的用例改动前就失败，与本次改动无关",
+                    judged.old.len()
+                );
+                if let Some(progress) = &self.progress {
+                    progress
+                        .line(format!("[验证] {command} → 通过（{note}）"), false)
+                        .await;
+                }
+                summary.push_str(&format!(
+                    "passed   {command}（{note}：{}）\n",
+                    list(&judged.old, 5)
+                ));
+                self.record(CheckRecord {
+                    command: command.clone(),
+                    status: "preexisting".into(),
+                    exit_code: output.code,
+                    duration_ms,
+                    evidence,
+                });
+                continue;
+            }
             let status = format!("exit_code={:?}", output.code);
-            summary.push_str(&format!("failed   {command} ({status})\n"));
+            let judged_text = judged.as_ref().map(Judged::detail).unwrap_or_default();
+            match &judged {
+                Some(judged) if !judged.old.is_empty() => summary.push_str(&format!(
+                    "failed   {command} ({status}; 新失败 {} 个，另有 {} 个改动前就失败)\n",
+                    judged.new.len(),
+                    judged.old.len()
+                )),
+                _ => summary.push_str(&format!("failed   {command} ({status})\n")),
+            }
             detail.push_str(&format!(
-                "$ {command}\n{status}\n{}\n",
+                "$ {command}\n{status}\n{judged_text}{}\n",
                 tail(text.trim(), DETAIL_LIMIT)
             ));
             self.record(CheckRecord {
@@ -836,6 +993,328 @@ impl CommandVerifier {
 }
 
 const DETAIL_LIMIT: usize = 12 * 1024;
+
+/// A failing run slower than this gets no baseline run: it would cost as much again.
+const BASELINE_MAX: Duration = Duration::from_secs(120);
+
+impl CommandVerifier {
+    /// Splits the failing tests of a failed test command into new ones and ones that fail
+    /// on the code before the task's changes as well. `None` when that cannot be told:
+    /// not pytest or `go test`, no test-level result, or a baseline that cannot be rebuilt.
+    async fn judge(
+        &self,
+        command: &str,
+        output: &process::CommandOutput,
+        duration_ms: u128,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Judged>> {
+        let Some(runner) = Runner::of(command) else {
+            return Ok(None);
+        };
+        if duration_ms > BASELINE_MAX.as_millis() {
+            return Ok(None);
+        }
+        let Some(failing) = failing_tests(runner, output, true) else {
+            return Ok(None);
+        };
+        let Some(task) = self.workspace.task_baseline()? else {
+            return Ok(None);
+        };
+        let slash = |path: &PathBuf| path.to_string_lossy().replace('\\', "/");
+        let created: Vec<String> = task.created.iter().map(slash).collect();
+        if !runner.baseline_possible(&created) {
+            return Ok(None);
+        }
+        let mut paths: Vec<String> = task
+            .files
+            .iter()
+            .map(|(path, _)| slash(path))
+            .chain(created.iter().cloned())
+            .collect();
+        paths.sort();
+        let key = format!("{command}\n{}", paths.join("\n"));
+        let lock = || {
+            self.baselines
+                .lock()
+                .map_err(|_| Error::Tool("verification baseline lock poisoned".into()))
+        };
+        let cached = lock()?.get(&key).cloned();
+        let before = match cached {
+            Some(before) => before,
+            None => {
+                let before = self
+                    .run_baseline(runner, command, task.files, timeout, cancel)
+                    .await?;
+                lock()?.insert(key, before.clone());
+                before
+            }
+        };
+        Ok(before.map(|before| Judged::split(runner, failing, &before, &created)))
+    }
+
+    /// Runs `command` with `files` back at their content before the task; the failing tests,
+    /// or `None` when the files could not be swapped or the run timed out.
+    async fn run_baseline(
+        &self,
+        runner: Runner,
+        command: &str,
+        files: Vec<(PathBuf, String)>,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Option<BTreeSet<String>>> {
+        if let Some(progress) = &self.progress {
+            progress
+                .line(format!("[验证] 改动前基准 $ {command}"), false)
+                .await;
+        }
+        match self.workspace.swap_in(files) {
+            Ok(()) => {}
+            Err(err @ Error::Uncertain(_)) => return Err(err),
+            // An earlier swap still pending, a file that changed meanwhile: no baseline.
+            Err(_) => return Ok(None),
+        }
+        let swap = Swapped {
+            workspace: &self.workspace,
+            restored: false,
+        };
+        let started = Instant::now();
+        // Bytecode caches go by mtime and size: a swapped-in file written in the same second
+        // as a same-sized edit would run stale code. Read none and write none.
+        let env: Vec<(&str, String)> = match runner {
+            Runner::Pytest => vec![
+                ("PYTHONDONTWRITEBYTECODE", "1".into()),
+                (
+                    "PYTHONPYCACHEPREFIX",
+                    std::env::temp_dir()
+                        .join("cove-verify-baseline-nopyc")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ],
+            // Go caches by content.
+            Runner::Go => Vec::new(),
+        };
+        let output =
+            process::shell_with_env(&self.root, command, timeout, cancel.clone(), &env).await;
+        // The current content goes back first, whatever the run did (cancellation too).
+        swap.restore()?;
+        let output = output?;
+        let failing =
+            (!output.timed_out).then(|| failing_tests(runner, &output, false).unwrap_or_default());
+        if let Some(progress) = &self.progress {
+            let seconds = started.elapsed().as_secs_f64();
+            let result = match &failing {
+                Some(failing) => format!("{} 个用例失败（{seconds:.0}s）", failing.len()),
+                None => format!("超时，不作比较（{seconds:.0}s）"),
+            };
+            progress
+                .line(format!("[验证] 改动前基准 {command} → {result}"), false)
+                .await;
+        }
+        Ok(failing.map(|failing| failing.into_iter().collect()))
+    }
+}
+
+/// Puts the swapped files back when dropped, should the verification future be dropped
+/// mid-run; `restore` does it explicitly and reports failure.
+struct Swapped<'a> {
+    workspace: &'a Workspace,
+    restored: bool,
+}
+
+impl Swapped<'_> {
+    fn restore(mut self) -> Result<()> {
+        self.restored = true;
+        self.workspace.swap_restore().map(|_| ()).map_err(|err| {
+            Error::Uncertain(format!(
+                "自动验证跑完改动前基准后没能放回改动后的文件：{err}；用 /resolve 恢复"
+            ))
+        })
+    }
+}
+
+impl Drop for Swapped<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = self.workspace.swap_restore();
+        }
+    }
+}
+
+/// Test runners whose output names each failing test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Runner {
+    Pytest,
+    Go,
+}
+
+impl Runner {
+    fn of(command: &str) -> Option<Self> {
+        if command.contains(['&', ';', '|', '\n']) {
+            return None;
+        }
+        let words: Vec<&str> = command.split_whitespace().collect();
+        match words.as_slice() {
+            ["pytest", ..] => Some(Self::Pytest),
+            [python, "-m", "pytest", ..] if python.starts_with("python") || *python == "py" => {
+                Some(Self::Pytest)
+            }
+            ["go", "test", ..] => Some(Self::Go),
+            _ => None,
+        }
+    }
+
+    /// A created `conftest.py` or `_test.go` would act in the baseline run too (a swap
+    /// cannot remove it), and Go failures cannot be traced to a file.
+    fn baseline_possible(self, created: &[String]) -> bool {
+        !created.iter().any(|path| match self {
+            Self::Pytest => path.rsplit('/').next() == Some("conftest.py"),
+            Self::Go => path.ends_with("_test.go"),
+        })
+    }
+}
+
+/// Failing test ids in a run's output. `strict` (the run under judgment) demands a complete
+/// list, `None` otherwise; a baseline run gives whatever it names.
+fn failing_tests(
+    runner: Runner,
+    output: &process::CommandOutput,
+    strict: bool,
+) -> Option<Vec<String>> {
+    if output.timed_out {
+        return None;
+    }
+    let text = format!("{}\n{}", output.stdout, output.stderr);
+    match runner {
+        Runner::Pytest => pytest_failures(&text, output.code, strict),
+        Runner::Go => go_failures(&text, output.code, output.truncated, strict),
+    }
+}
+
+/// Node ids of the short test summary's `FAILED`/`ERROR` lines; strict mode needs exit code 1
+/// (tests failed, as opposed to an interrupted collection or a usage error) and as many lines
+/// as the final totals count.
+fn pytest_failures(text: &str, code: Option<i32>, strict: bool) -> Option<Vec<String>> {
+    static TOTALS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b\d+ (passed|failed|errors?|skipped|xfailed|xpassed)\b").unwrap()
+    });
+    static FAILED: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b(\d+) (failed|errors?)\b").unwrap());
+    let ids: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("FAILED ")
+                .or_else(|| line.strip_prefix("ERROR "))
+        })
+        .map(|rest| rest.split(" - ").next().unwrap_or(rest).trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if !strict {
+        return Some(ids);
+    }
+    if code != Some(1) {
+        return None;
+    }
+    let totals = text
+        .lines()
+        .rev()
+        .find(|line| line.contains(" in ") && TOTALS.is_match(line))?;
+    let expected: usize = FAILED
+        .captures_iter(totals)
+        .filter_map(|captures| captures[1].parse::<usize>().ok())
+        .sum();
+    (expected > 0 && expected == ids.len()).then_some(ids)
+}
+
+/// `<package>/<test>` for each `--- FAIL: <test>` line, assigned to the `FAIL\t<package>`
+/// line after it. Strict mode needs exit code 1, a complete output, no build failure or
+/// timeout, and every failed package traced to its tests.
+fn go_failures(
+    text: &str,
+    code: Option<i32>,
+    truncated: bool,
+    strict: bool,
+) -> Option<Vec<String>> {
+    let mut pending: Vec<String> = Vec::new();
+    let mut ids = Vec::new();
+    let mut untraced = false;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("--- FAIL: ") {
+            pending.extend(rest.split_whitespace().next().map(str::to_owned));
+        } else if let Some(rest) = line.strip_prefix("FAIL\t") {
+            let package = rest.split_whitespace().next().unwrap_or_default();
+            untraced |= pending.is_empty();
+            ids.extend(pending.drain(..).map(|test| format!("{package}/{test}")));
+        } else if line.starts_with("ok  \t") {
+            pending.clear();
+        }
+    }
+    if !strict {
+        return Some(ids);
+    }
+    let broken = ["[build failed]", "[setup failed]", "panic: test timed out"]
+        .iter()
+        .any(|marker| text.contains(marker));
+    (code == Some(1) && !truncated && !broken && !untraced && pending.is_empty() && !ids.is_empty())
+        .then_some(ids)
+}
+
+/// A failed test command's failing tests, split by whether they fail before the change too.
+#[derive(Debug, PartialEq, Eq)]
+struct Judged {
+    new: Vec<String>,
+    old: Vec<String>,
+}
+
+impl Judged {
+    /// Failures in a test file the task created are new whatever the baseline says: the
+    /// swap leaves created files in place, so the baseline ran them against the old code.
+    fn split(
+        runner: Runner,
+        failing: Vec<String>,
+        before: &BTreeSet<String>,
+        created: &[String],
+    ) -> Self {
+        let created_file = |id: &str| {
+            runner == Runner::Pytest
+                && created
+                    .iter()
+                    .any(|path| id.split("::").next() == Some(path.as_str()))
+        };
+        let failing: BTreeSet<String> = failing.into_iter().collect();
+        let (old, new) = failing
+            .into_iter()
+            .partition(|id| before.contains(id) && !created_file(id));
+        Self { new, old }
+    }
+
+    /// The lines ahead of the output in the detail handed to the model.
+    fn detail(&self) -> String {
+        if self.old.is_empty() {
+            return "Baseline: none of these failures occur on the code before this task's changes; this task caused them.\n".into();
+        }
+        format!(
+            "New failures (they pass before this task's changes; fix these): {}\nAlready failing before this task's changes (unrelated to it; do not fix them or change other code for them): {}\n",
+            list(&self.new, 20),
+            list(&self.old, 20)
+        )
+    }
+}
+
+/// Up to `limit` names, then how many more.
+fn list(names: &[String], limit: usize) -> String {
+    let mut text = names
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > limit {
+        text.push_str(&format!(" (+{})", names.len() - limit));
+    }
+    text
+}
 
 /// Builds and test suites of toolchains that often need minutes on a cold cache.
 pub fn slow_command(command: &str) -> bool {
@@ -884,11 +1363,16 @@ impl Verifier for CommandVerifier {
                     .map(|guard| *guard)
                     .map_err(|_| Error::Tool("verification lock poisoned".into()))
             };
-            let commands = self.turn_commands(&self.workspace.changed_paths()?);
+            let changed = self.changed()?;
+            // Only scratch files came and went: nothing of the project changed.
+            if changed.is_empty() {
+                return Ok(None);
+            }
+            let commands = self.turn_commands(&changed);
             if commands.is_empty() || lock(&self.verified)? == Some(fingerprint) {
                 return Ok(None);
             }
-            let verification = self.run(&commands, cancel).await?;
+            let verification = self.run(&commands, true, cancel).await?;
             if verification.outcome == Outcome::Passed {
                 *self
                     .verified
@@ -999,7 +1483,7 @@ mod tests {
         let checks = ["echo run >> runs.log".to_owned()];
         for _ in 0..2 {
             let verification = verifier
-                .run(&checks, CancellationToken::new())
+                .run(&checks, true, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(verification.outcome, Outcome::Passed);
@@ -1076,6 +1560,186 @@ mod tests {
     }
 
     #[test]
+    fn pytest_prefers_the_nearest_test_file_of_the_same_name() {
+        let Some(python) = python_program() else {
+            return;
+        };
+        let pytest = |root: &Path, changed: &str| test_commands(root, &[PathBuf::from(changed)]);
+        // sympy: core/numbers.py and polys/numberfields/tests/test_numbers.py share a name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pytest.ini", "");
+        write(root, "pkg/core/numbers.py", "");
+        write(root, "pkg/core/tests/test_numbers.py", "");
+        write(root, "pkg/polys/nf/tests/test_numbers.py", "");
+        write(root, "pkg/sets/handlers/functions.py", "");
+        write(root, "pkg/vector/tests/test_functions.py", "");
+        write(root, "pkg/tensor/tests/test_functions.py", "");
+        assert_eq!(
+            pytest(root, "pkg/core/numbers.py"),
+            [format!(
+                "{python} -m pytest -q pkg/core/tests/test_numbers.py"
+            )]
+        );
+        // Equally far namesakes all stay rather than widening to the whole suite.
+        assert_eq!(
+            pytest(root, "pkg/sets/handlers/functions.py"),
+            [format!(
+                "{python} -m pytest -q pkg/tensor/tests/test_functions.py pkg/vector/tests/test_functions.py"
+            )]
+        );
+        // A tests/ tree mirroring src/: the matching subdirectory wins.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pytest.ini", "");
+        write(root, "src/app/a/util.py", "");
+        write(root, "tests/a/test_util.py", "");
+        write(root, "tests/b/test_util.py", "");
+        assert_eq!(
+            pytest(root, "src/app/a/util.py"),
+            [format!("{python} -m pytest -q tests/a/test_util.py")]
+        );
+    }
+
+    /// A verifier over a real workspace whose task created `scratch` with the file tools and
+    /// then deleted it outside them (`rm` in the shell), after editing `edited`.
+    fn verifier_with_deleted_scratch(
+        root: &Path,
+        data: &Path,
+        edited: &[&str],
+        scratch: &[&str],
+    ) -> CommandVerifier {
+        let store = crate::session::Store::open(data).unwrap();
+        let workspace = Arc::new(Workspace::new(root.to_path_buf(), store).unwrap());
+        workspace.begin().unwrap();
+        for path in edited {
+            let path = root.join(path);
+            let before = std::fs::read_to_string(&path).unwrap();
+            workspace
+                .replace(&path, Some(&before), &format!("{before}\n# edited\n"))
+                .unwrap();
+        }
+        for path in scratch {
+            workspace
+                .replace(&root.join(path), None, "print(1)\n")
+                .unwrap();
+            std::fs::remove_file(root.join(path)).unwrap();
+        }
+        CommandVerifier::new(
+            root.to_path_buf(),
+            Vec::new(),
+            None,
+            workspace,
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Bypass,
+                input: None,
+            }),
+        )
+        .with_detection(true, Arc::new(|_| true))
+    }
+
+    #[test]
+    fn deleted_scratch_files_do_not_widen_pytest_to_the_whole_suite() {
+        let Some(python) = python_program() else {
+            return;
+        };
+        // The files of pub-swe-sympy-24562: one module and its test edited, scratch scripts
+        // created with the write tool and removed with `rm`.
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "pytest.ini", "");
+        write(&root, "pkg/numbers.py", "x = 1\n");
+        write(
+            &root,
+            "pkg/tests/test_numbers.py",
+            "def test_x():\n    pass\n",
+        );
+        let verifier = verifier_with_deleted_scratch(
+            &root,
+            data.path(),
+            &["pkg/numbers.py", "pkg/tests/test_numbers.py"],
+            &["_check_rational.py", "_env_check.py", "_install_pytest.py"],
+        );
+        assert_eq!(
+            verifier.turn_commands(&verifier.changed().unwrap()),
+            [format!("{python} -m pytest -q pkg/tests/test_numbers.py")]
+        );
+        // A project file the task deleted still scopes the run: its tests may now fail.
+        std::fs::remove_file(root.join("pkg/numbers.py")).unwrap();
+        assert_eq!(
+            verifier.changed().unwrap(),
+            [
+                PathBuf::from("pkg/numbers.py"),
+                PathBuf::from("pkg/tests/test_numbers.py")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_only_left_deleted_scratch_files_is_not_verified() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "pytest.ini", "");
+        let verifier = verifier_with_deleted_scratch(&root, data.path(), &[], &["_probe.py"]);
+        assert!(verifier.workspace.fingerprint().unwrap().is_some());
+        assert!(
+            verifier
+                .verify(CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleted_scratch_files_do_not_widen_node_dotnet_or_java_tests() {
+        let checks = |root: &Path, edited: &[&str], scratch: &[&str]| {
+            let data = tempfile::tempdir().unwrap();
+            let verifier = verifier_with_deleted_scratch(root, data.path(), edited, scratch);
+            verifier.turn_commands(&verifier.changed().unwrap())
+        };
+        // Node: a non-source scratch file would run the whole suite, a source one would be
+        // handed to jest as a missing path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "package.json", r#"{"scripts":{"test":"jest"}}"#);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        write(&root, "src/a.ts", "export const a = 1;\n");
+        assert_eq!(
+            checks(&root, &["src/a.ts"], &["_probe.py", "_probe.js"]),
+            ["npm test -- --findRelatedTests src/a.ts"]
+        );
+        // .NET: a scratch file outside every project would test the whole solution.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "app.sln", "");
+        write(&root, "src/Lib/Lib.csproj", "<Project/>");
+        write(&root, "src/Lib/A.cs", "class A {}\n");
+        write(
+            &root,
+            "tests/Lib.Tests/Lib.Tests.csproj",
+            r#"<PackageReference Include="Microsoft.NET.Test.Sdk" />
+               <ProjectReference Include="..\..\src\Lib\Lib.csproj" />"#,
+        );
+        assert_eq!(
+            checks(&root, &["src/Lib/A.cs"], &["_probe.py"]),
+            ["dotnet test tests/Lib.Tests/Lib.Tests.csproj"]
+        );
+        // Maven: a scratch file in the root module would test every module.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "pom.xml", "");
+        write(&root, "core/pom.xml", "");
+        write(&root, "core/src/A.java", "class A {}\n");
+        assert_eq!(
+            checks(&root, &["core/src/A.java"], &["Probe.java"]),
+            ["mvn test -q -pl core -am"]
+        );
+    }
+
+    #[test]
     fn dotnet_tests_only_the_test_projects_that_reach_the_change() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1106,6 +1770,69 @@ mod tests {
             test_commands(root, &[PathBuf::from("Directory.Build.props")]),
             ["dotnet test"]
         );
+    }
+
+    #[test]
+    fn slnx_and_microsoft_testing_platform_projects_are_verified() {
+        // The layout of a .NET 10 repository: a .slnx, MTP selected in global.json, and
+        // the test framework added by tests/Directory.Build.props, not by each csproj.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "App.slnx", "<Solution/>");
+        assert_eq!(detect(root), ["dotnet build"]);
+        write(
+            root,
+            "global.json",
+            r#"{"sdk":{"version":"10.0.100"},"test":{"runner":"Microsoft.Testing.Platform"}}"#,
+        );
+        write(root, "src/Lib/Lib.csproj", "<Project/>");
+        write(root, "src/Other/Other.csproj", "<Project/>");
+        write(
+            root,
+            "tests/Directory.Build.props",
+            r#"<IsTestProject Condition="$(MSBuildProjectName.EndsWith('UnitTest'))">true</IsTestProject>
+               <PackageReference Include="xunit.v3.mtp-v2" />"#,
+        );
+        write(
+            root,
+            "tests/Lib.UnitTest/Lib.UnitTest.csproj",
+            r#"<ProjectReference Include="..\..\src\Lib\Lib.csproj" />
+               <ProjectReference Include="..\Lib.TestSupport\Lib.TestSupport.csproj" />"#,
+        );
+        // A helper library under tests/ is no test project.
+        write(
+            root,
+            "tests/Lib.TestSupport/Lib.TestSupport.csproj",
+            r#"<ProjectReference Include="..\..\src\Lib\Lib.csproj" />"#,
+        );
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("src/Lib/A.cs")]),
+            ["dotnet test --project tests/Lib.UnitTest/Lib.UnitTest.csproj"]
+        );
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("src/Other/B.cs")]),
+            ["dotnet build src/Other/Other.csproj"]
+        );
+        assert_eq!(
+            test_commands(root, &[PathBuf::from("global.json")]),
+            ["dotnet test"]
+        );
+    }
+
+    /// Prints the checks chosen for a real repository: `COVE_VERIFY_ROOT=<dir>
+    /// COVE_VERIFY_CHANGED=a.cs,b.cs cargo test --release --lib print_checks -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_checks_for_a_real_repository() {
+        let root = PathBuf::from(std::env::var("COVE_VERIFY_ROOT").unwrap());
+        let changed: Vec<PathBuf> = std::env::var("COVE_VERIFY_CHANGED")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        println!("detect: {:?}", detect(&root));
+        println!("tests:  {:?}", test_commands(&root, &changed));
     }
 
     #[test]
@@ -1166,6 +1893,219 @@ mod tests {
         assert_eq!(
             verifier.turn_commands(&[PathBuf::from("src/lib.rs")]),
             ["cargo test"]
+        );
+    }
+
+    fn output(code: i32, stdout: &str) -> process::CommandOutput {
+        process::CommandOutput {
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            encoding_warning: false,
+        }
+    }
+
+    #[test]
+    fn test_level_failures_are_read_only_from_complete_runs() {
+        assert_eq!(
+            Runner::of("python -m pytest -q a/test_x.py"),
+            Some(Runner::Pytest)
+        );
+        assert_eq!(Runner::of("go test ./pkg/a"), Some(Runner::Go));
+        for other in [
+            "cargo test",
+            "npm test",
+            "python -m pytest -q && echo",
+            "dotnet test",
+        ] {
+            assert_eq!(Runner::of(other), None, "{other}");
+        }
+        // The summary of pub-swe-sympy-24562's first check.
+        let pytest = ".....F....\n=========================== short test summary info ===========================\n\
+            FAILED sympy/core/tests/test_numbers.py::test_numpy_to_float - ValueError: co...\n\
+            1 failed, 109 passed, 1 xfailed in 6.77s\n";
+        let run = output(1, pytest);
+        assert_eq!(
+            failing_tests(Runner::Pytest, &run, true).unwrap(),
+            ["sympy/core/tests/test_numbers.py::test_numpy_to_float"]
+        );
+        // Totals that do not match the lines (a summary cut off, `-rN`), an interrupted
+        // collection or a timeout: no test-level answer.
+        let short = "FAILED a.py::t - x\n2 failed, 3 passed in 1.0s\n";
+        assert_eq!(failing_tests(Runner::Pytest, &output(1, short), true), None);
+        let collection = "ERROR a/test_x.py - ImportError\n1 error in 0.2s\n";
+        assert_eq!(
+            failing_tests(Runner::Pytest, &output(2, collection), true),
+            None
+        );
+        assert_eq!(
+            failing_tests(Runner::Pytest, &output(2, collection), false).unwrap(),
+            ["a/test_x.py"]
+        );
+        let mut slow = output(1, pytest);
+        slow.timed_out = true;
+        assert_eq!(failing_tests(Runner::Pytest, &slow, true), None);
+
+        let go = "--- FAIL: TestA (0.00s)\n    a_test.go:9: boom\n    --- FAIL: TestA/sub (0.00s)\nFAIL\nFAIL\texample.com/m/a\t0.01s\nok  \texample.com/m/b\t0.01s\nFAIL\n";
+        assert_eq!(
+            failing_tests(Runner::Go, &output(1, go), true).unwrap(),
+            ["example.com/m/a/TestA", "example.com/m/a/TestA/sub"]
+        );
+        let build = "FAIL\texample.com/m/a [build failed]\n";
+        assert_eq!(failing_tests(Runner::Go, &output(1, build), true), None);
+        let untraced = "panic: boom\nFAIL\texample.com/m/a\t0.01s\n";
+        assert_eq!(failing_tests(Runner::Go, &output(1, untraced), true), None);
+    }
+
+    #[test]
+    fn failures_in_test_files_the_task_created_are_always_new() {
+        let before: BTreeSet<String> = ["t/test_a.py::test_old", "t/test_new.py::test_x"]
+            .map(String::from)
+            .into();
+        let failing = [
+            "t/test_a.py::test_old",
+            "t/test_a.py::test_broke",
+            "t/test_new.py::test_x",
+        ]
+        .map(String::from)
+        .to_vec();
+        let judged = Judged::split(
+            Runner::Pytest,
+            failing,
+            &before,
+            &["t/test_new.py".to_owned()],
+        );
+        assert_eq!(judged.old, ["t/test_a.py::test_old"]);
+        assert_eq!(
+            judged.new,
+            ["t/test_a.py::test_broke", "t/test_new.py::test_x"]
+        );
+        assert!(judged.detail().contains("do not fix"));
+        assert!(Runner::Pytest.baseline_possible(&["t/test_new.py".to_owned()]));
+        assert!(!Runner::Pytest.baseline_possible(&["t/conftest.py".to_owned()]));
+        assert!(!Runner::Go.baseline_possible(&["a/x_test.go".to_owned()]));
+    }
+
+    #[test]
+    fn the_task_baseline_holds_before_texts_and_created_files() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "a.py", "old\n");
+        write(&root, "gone.py", "x\n");
+        let store = crate::session::Store::open(data.path()).unwrap();
+        let workspace = Workspace::new(root.clone(), store).unwrap();
+        workspace.begin().unwrap();
+        workspace
+            .replace(&root.join("a.py"), Some("old\n"), "new\n")
+            .unwrap();
+        workspace.replace(&root.join("b.py"), None, "b\n").unwrap();
+        workspace
+            .replace(&root.join("_tmp.py"), None, "t\n")
+            .unwrap();
+        std::fs::remove_file(root.join("_tmp.py")).unwrap();
+        let baseline = workspace.task_baseline().unwrap().unwrap();
+        assert_eq!(
+            baseline.files,
+            [(PathBuf::from("a.py"), "old\n".to_owned())]
+        );
+        assert_eq!(baseline.created, [PathBuf::from("b.py")]);
+        // A project file the task changed and that is gone cannot be swapped back.
+        workspace
+            .replace(&root.join("gone.py"), Some("x\n"), "y\n")
+            .unwrap();
+        std::fs::remove_file(root.join("gone.py")).unwrap();
+        assert!(workspace.task_baseline().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failures_that_predate_the_task_do_not_fail_verification() {
+        let Some(python) = python_program() else {
+            return;
+        };
+        let probe = std::process::Command::new(python)
+            .args(["-m", "pytest", "--version"])
+            .output();
+        if !probe.is_ok_and(|probe| probe.status.success()) {
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "pytest.ini", "");
+        write(&root, "conftest.py", "");
+        let original = "def add(a, b):\n    return a + b\n\n\ndef legacy():\n    return 1\n";
+        write(&root, "calc.py", original);
+        write(
+            &root,
+            "tests/test_calc.py",
+            "from calc import add, legacy\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\ndef test_legacy():\n    assert legacy() == 2\n",
+        );
+        let store = crate::session::Store::open(data.path()).unwrap();
+        let workspace = Arc::new(Workspace::new(root.clone(), store).unwrap());
+        workspace.begin().unwrap();
+        let verifier = CommandVerifier::new(
+            root.clone(),
+            Vec::new(),
+            None,
+            workspace.clone(),
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Bypass,
+                input: None,
+            }),
+        )
+        .with_detection(true, Arc::new(|_| true));
+        let checks = [format!("{python} -m pytest -q tests/test_calc.py")];
+        // The change keeps add working; test_legacy failed before it.
+        let kept = format!("{original}\n\ndef unused():\n    return 0\n");
+        workspace
+            .replace(&root.join("calc.py"), Some(original), &kept)
+            .unwrap();
+        let verification = verifier
+            .run(&checks, true, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            verification.outcome,
+            Outcome::Passed,
+            "{}",
+            verification.summary
+        );
+        assert!(
+            verification.summary.contains("改动前就失败")
+                && verification.summary.contains("test_legacy"),
+            "{}",
+            verification.summary
+        );
+        assert_eq!(std::fs::read_to_string(root.join("calc.py")).unwrap(), kept);
+        assert!(workspace.pending_swap().is_none());
+        // The commit gate does not compare.
+        let commit = verifier
+            .run(&checks, false, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(commit.outcome, Outcome::Failed);
+        // Breaking add is a new failure; test_legacy is listed as unrelated.
+        let broken = kept.replace("return a + b", "return a - b - 0");
+        workspace
+            .replace(&root.join("calc.py"), Some(&kept), &broken)
+            .unwrap();
+        let verification = verifier
+            .run(&checks, true, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verification.outcome, Outcome::Failed);
+        let detail = &verification.detail;
+        assert!(
+            detail.contains("New failures (they pass before this task's changes; fix these): tests/test_calc.py::test_add\n")
+                && detail.contains("do not fix them or change other code for them): tests/test_calc.py::test_legacy\n"),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("calc.py")).unwrap(),
+            broken
         );
     }
 }

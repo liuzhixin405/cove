@@ -1134,6 +1134,86 @@ async fn verification_gate_feeds_failures_back_until_checks_pass() {
     assert!(!output.status.success());
 }
 
+/// A project review command (0028): HIGH until `a.py` says "fixed", then NO_ISSUES.
+/// It logs its round and whether cove's API key reached it.
+const REVIEW_SCRIPT: &str = "import os\nfixed = 'fixed' in open('a.py', encoding='utf-8').read()\nwith open('runs.log', 'a') as log:\n    log.write('%s %s key=%s\\n' % (os.environ.get('COVE_REVIEW_POINT'), os.environ.get('COVE_REVIEW_ROUND'), 'present' if os.environ.get('COVE_API_KEY') else 'absent'))\nif fixed:\n    print('NO_ISSUES')\nelse:\n    print('## Findings\\n\\n**[HIGH] Not fixed yet**: `a.py:1` the draft divides by zero\\n\\n## Previous review\\n\\n**[LOW] old**: done')\n";
+
+#[tokio::test]
+async fn project_review_hands_findings_back_until_the_review_passes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("review.py"), REVIEW_SCRIPT).unwrap();
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({
+            "done_verify_commands": [],
+            // Replaced by the project review: it must not ask the model as well.
+            "done_self_review": "on",
+            "review_commands": [format!("{} review.py", python())]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (url, server) = mock_server(vec![
+        tool("w1", "write", json!({"path":"a.py","content":"draft"})),
+        openai(json!({"content":"Done."}), "stop"),
+        tool(
+            "w2",
+            "write",
+            json!({"path":"a.py","content":"fixed","overwrite":true}),
+        ),
+        openai(json!({"content":"Fixed."}), "stop"),
+    ])
+    .await;
+    let output = persistent_cli(root.path(), data.path(), &url)
+        .args(["-p", "write a.py"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(requests.len(), 4);
+    let messages = requests[2]["messages"].as_array().unwrap();
+    let handed = messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(
+        handed.starts_with("[project review found issues") && handed.contains("Round 1 of 3"),
+        "{handed}"
+    );
+    assert!(
+        handed.contains("[HIGH] a.py:1 Not fixed yet — the draft divides by zero"),
+        "{handed}"
+    );
+    // The repeated LOW under Previous review is not a finding.
+    assert!(!handed.contains("[LOW]"), "{handed}");
+    assert!(stderr.contains("[审查] 第 2 轮通过"), "{stderr}");
+    let runs = std::fs::read_to_string(root.path().join("runs.log")).unwrap();
+    assert_eq!(
+        runs.lines().collect::<Vec<_>>(),
+        ["done 1 key=absent", "done 2 key=absent"]
+    );
+    let ledger = std::fs::read_to_string(data.path().join("verify_ledger.jsonl")).unwrap();
+    let reviews: Vec<Value> = ledger
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["kind"] == "review")
+        .collect();
+    assert_eq!(reviews.len(), 2, "{ledger}");
+    assert_eq!(reviews[0]["status"], "issues");
+    assert_eq!(reviews[0]["high"], 1);
+    assert_eq!(reviews[1]["status"], "passed");
+    let acceptance = std::fs::read_dir(data.path().join("acceptance"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(acceptance).unwrap()).unwrap();
+    assert_eq!(report["review"]["outcome"], "passed");
+    assert_eq!(report["review"]["rounds"], 2);
+}
+
 #[tokio::test]
 async fn sub_agent_reads_with_its_own_tools_and_reports_to_parent() {
     let root = tempfile::tempdir().unwrap();
@@ -1531,4 +1611,277 @@ async fn shell_commands_the_model_runs_never_see_the_api_key() {
     // An ordinary variable is visible (the shell did expand), the key is not.
     assert!(sent.contains("[yes][]"), "{sent}");
     assert!(!sent.contains("test-only-not-a-real-key"), "{sent}");
+}
+
+/// Runs one `-p` step; returns stdout and stderr together and whether it succeeded.
+async fn step(
+    root: &std::path::Path,
+    data: &std::path::Path,
+    url: &str,
+    args: &[&str],
+) -> (bool, String) {
+    let output = persistent_cli(root, data, url)
+        .args(args)
+        .launch()
+        .await
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+fn session_file(data: &std::path::Path, id: &str) -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(data.join("sessions").join(format!("{id}.json"))).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn handoff_writes_on_the_same_prefix_and_continues_in_a_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("billing")).unwrap();
+    let (url, server) = mock_server(vec![
+        tool(
+            "w1",
+            "write",
+            json!({"path":"billing/tax.py","content":"RATE = 0.07
+"}),
+        ),
+        openai(
+            json!({"content":"税率改好了；README 按你说的先不改。"}),
+            "stop",
+        ),
+        openai(
+            json!({"content":"做了：billing/tax.py 的税率改成 0.07。
+没做完：README 等确认后再改。"}),
+            "stop",
+        ),
+        openai(json!({"content":"新任务做完了。"}), "stop"),
+    ])
+    .await;
+    // One process, as in the console: the system prompt is the one the last turn sent.
+    let mut command = persistent_cli(root.path(), data.path(), &url);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(
+            "修税率，README 先不改
+/handoff 重点写清没做完的事
+下一个任务
+/exit
+"
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(25), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    // The startup line (stderr) names the old session, the handoff (stdout) the new one.
+    let id = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("[session] ").map(str::to_owned))
+            .unwrap()
+    };
+    let (origin, next) = (id(&output.stderr), id(&output.stdout));
+    assert_ne!(next, origin);
+    assert!(
+        text.contains("已交接到新会话") && text.contains("/back"),
+        "{text}"
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    // The handoff request is the last turn's request and its reply, plus one request:
+    // system prompt, tools and earlier messages byte for byte, so the cache serves them.
+    let last_turn = requests[1]["messages"].as_array().unwrap();
+    let handoff = requests[2]["messages"].as_array().unwrap();
+    assert_eq!(requests[2]["tools"], requests[1]["tools"]);
+    assert_eq!(requests[2]["model"], requests[1]["model"]);
+    assert_eq!(handoff.len(), last_turn.len() + 2);
+    assert_eq!(&handoff[..last_turn.len()], last_turn.as_slice());
+    assert_eq!(handoff[last_turn.len()]["role"], "assistant");
+    let note = handoff.last().unwrap().to_string();
+    assert!(
+        note.contains("[system: handoff]") && note.contains("重点写清没做完的事"),
+        "{note}"
+    );
+    // The new session starts from the handoff alone.
+    let first = requests[3]["messages"].as_array().unwrap();
+    let sent = requests[3]["messages"].to_string();
+    assert!(first.len() <= 4, "{sent}");
+    assert!(sent.contains("Previous work handoff") && sent.contains("README 等确认后再改"));
+    assert!(
+        sent.contains("Files changed with write/edit: billing/tax.py"),
+        "{sent}"
+    );
+    assert!(!sent.contains("修税率，README 先不改") && !sent.contains("RATE = 0.07"));
+    // The original session keeps its two turns' messages and points at the new one;
+    // the handoff call is billed to it.
+    let old = session_file(data.path(), &origin);
+    assert_eq!(old["messages"].as_array().unwrap().len(), last_turn.len());
+    assert_eq!(old["handoff_to"], next.as_str());
+    assert_eq!(old["accounting"]["model_calls"], 3);
+    let new = session_file(data.path(), &next);
+    assert_eq!(new["handoff_from"], origin.as_str());
+    assert_eq!(new["accounting"]["model_calls"], 1);
+    assert_eq!(new["messages"][0]["origin"], "summary");
+    // `/back` returns to the original session, also from a new process.
+    let (ok, text) = step(
+        root.path(),
+        data.path(),
+        &url,
+        &["--resume", &next, "-p", "/back"],
+    )
+    .await;
+    assert!(
+        ok && text.contains(&format!("[session] {origin}")),
+        "{text}"
+    );
+    let trace = std::fs::read_to_string(data.path().join("trace.jsonl")).unwrap();
+    assert!(trace.contains("\"kind\":\"handoff\"") && trace.contains("\"ok\":true"));
+}
+
+#[tokio::test]
+async fn a_failed_handoff_stays_in_the_session_and_back_needs_a_handoff() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        openai(json!({"content":"答完了。"}), "stop"),
+        // The handoff must be text: a tool call fails it.
+        tool("r1", "read", json!({"path":"README.md"})),
+    ])
+    .await;
+    let (ok, text) = step(root.path(), data.path(), &url, &["-p", "问个问题"]).await;
+    assert!(ok, "{text}");
+    let origin = saved_id(data.path());
+    let (ok, text) = step(
+        root.path(),
+        data.path(),
+        &url,
+        &["--resume", &origin, "-p", "/handoff"],
+    )
+    .await;
+    assert!(!ok && text.contains("没有交接"), "{text}");
+    assert_eq!(
+        std::fs::read_dir(data.path().join("sessions"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let old = session_file(data.path(), &origin);
+    assert!(old.get("handoff_to").is_none());
+    assert_eq!(old["accounting"]["model_calls"], 2);
+    server.await.unwrap();
+    let (ok, text) = step(
+        root.path(),
+        data.path(),
+        &url,
+        &["--resume", &origin, "-p", "/back"],
+    )
+    .await;
+    assert!(!ok && text.contains("不是用 /handoff 交接出来的"), "{text}");
+    // Nothing to hand over yet: no model call is made.
+    let empty = tempfile::tempdir().unwrap();
+    let (ok, text) = step(root.path(), empty.path(), &url, &["-p", "/handoff"]).await;
+    assert!(!ok && text.contains("还没有可交接的内容"), "{text}");
+}
+
+#[tokio::test]
+async fn a_resumed_session_sends_the_same_system_prompt_after_the_project_changed() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "Run cargo test.").unwrap();
+    let (url, server) = mock_server(vec![
+        openai(json!({"content":"第一个任务做完了。"}), "stop"),
+        openai(json!({"content":"第二个任务做完了。"}), "stop"),
+        openai(json!({"content":"第三个任务做完了。"}), "stop"),
+        openai(json!({"content":"第四个任务做完了。"}), "stop"),
+    ])
+    .await;
+    let (ok, text) = step(root.path(), data.path(), &url, &["-p", "第一个任务"]).await;
+    assert!(ok, "{text}");
+    let id = saved_id(data.path());
+    // A new source file changes the project outline the system prompt carries.
+    std::fs::write(root.path().join("src/lib.rs"), "").unwrap();
+    let (ok, text) = step(
+        root.path(),
+        data.path(),
+        &url,
+        &["--resume", &id, "-p", "第二个任务"],
+    )
+    .await;
+    assert!(ok, "{text}");
+    std::fs::write(root.path().join("AGENTS.md"), "Run cargo test --release.").unwrap();
+    for task in ["第三个任务", "第四个任务"] {
+        let (ok, text) = step(
+            root.path(),
+            data.path(),
+            &url,
+            &["--resume", &id, "-p", task],
+        )
+        .await;
+        assert!(ok, "{text}");
+    }
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    let system = |request: &Value| {
+        let first = &request["messages"][0];
+        assert_eq!(first["role"], "system");
+        first["content"].to_string()
+    };
+    let original = system(&requests[0]);
+    // Serialized JSON: the newline is escaped.
+    assert!(
+        original.contains("Entry points: src/main.rs\\n"),
+        "{original}"
+    );
+    for request in &requests[1..] {
+        assert_eq!(system(request), original);
+    }
+    let last_user = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .unwrap()
+            .to_string()
+    };
+    assert!(!last_user(&requests[1]).contains("[project context]"));
+    let told = last_user(&requests[2]);
+    assert!(
+        told.contains("[project context]") && told.contains("Run cargo test --release."),
+        "{told}"
+    );
+    assert!(!last_user(&requests[3]).contains("[project context]"));
+    let trace = std::fs::read_to_string(data.path().join("trace.jsonl")).unwrap();
+    let reused: Vec<bool> = trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["kind"] == "task")
+        .map(|entry| entry["system_reused"].as_bool().unwrap())
+        .collect();
+    assert_eq!(reused, [false, true, true, true]);
 }

@@ -353,15 +353,45 @@ fn parse_all(
 static IDENTIFIER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]{2,}").unwrap());
 
-/// Files are workspace-relative; `walk` yields (relative, absolute) paths already confined.
-pub fn query(
+/// Whether `path` is a source file the map reads (see [`LANGUAGES`]).
+pub(crate) fn supported(path: &Path) -> bool {
+    language(path).is_some()
+}
+
+/// The parsed source files of a workspace, shared with the change-impact list
+/// (`safety::impact`, 0031): same cache, same limits as `repo_map`.
+pub(crate) struct Index {
+    files: Vec<File>,
+    /// The scan stopped at [`MAX_FILES`] source files.
+    pub(crate) truncated: bool,
+}
+
+impl Index {
+    /// (workspace-relative path, definitions, identifiers used) of each file.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&Path, &[Symbol], &HashSet<String>)> {
+        self.files.iter().map(|file| {
+            (
+                file.path.as_path(),
+                file.parsed.symbols.as_slice(),
+                &file.parsed.identifiers,
+            )
+        })
+    }
+
+    /// Identifier -> files that use it, by position in [`Index::files`].
+    pub(crate) fn references(&self) -> HashMap<&str, Vec<usize>> {
+        references(&self.files)
+    }
+}
+
+/// Parses `files` (workspace-relative, absolute) through the cache; files of other
+/// languages or over 1 MiB are left out.
+pub(crate) fn index(
     files: impl Iterator<Item = (PathBuf, PathBuf)>,
-    terms: &[String],
-    max_bytes: usize,
     cancel: &CancellationToken,
-) -> Result<String> {
+) -> Result<Index> {
     let mut candidates = Vec::new();
-    let mut skipped = false;
+    let mut truncated = false;
     for (relative, absolute) in files {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -370,7 +400,7 @@ pub fn query(
             continue;
         }
         if candidates.len() >= MAX_FILES {
-            skipped = true;
+            truncated = true;
             break;
         }
         let Ok(meta) = std::fs::metadata(&absolute) else {
@@ -381,11 +411,25 @@ pub fn query(
         }
     }
     let parsed = parse_all(&candidates, cancel)?;
-    let scanned: Vec<File> = candidates
+    let files = candidates
         .into_iter()
         .zip(parsed)
         .filter_map(|((path, ..), parsed)| parsed.map(|parsed| File { path, parsed }))
         .collect();
+    Ok(Index { files, truncated })
+}
+
+/// Files are workspace-relative; `walk` yields (relative, absolute) paths already confined.
+pub fn query(
+    files: impl Iterator<Item = (PathBuf, PathBuf)>,
+    terms: &[String],
+    max_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let Index {
+        files: scanned,
+        truncated: skipped,
+    } = index(files, cancel)?;
     let ranks = rank(&scanned);
     let terms: Vec<String> = terms
         .iter()

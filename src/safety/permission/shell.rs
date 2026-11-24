@@ -65,6 +65,10 @@ pub struct Simple {
     pub redirects: Vec<Redirect>,
     /// Here-document bodies read by this command (POSIX).
     pub heredocs: Vec<String>,
+    /// For each of `heredocs`: its delimiter was quoted, so the shell expands nothing.
+    pub heredoc_literal: Vec<bool>,
+    /// Here-string words (`<<< word`, POSIX), as parsed.
+    pub here_strings: Vec<Word>,
 }
 
 impl Simple {
@@ -169,8 +173,9 @@ struct Parser {
     word: Option<Word>,
     /// Operator waiting for its target word.
     redirect: Option<String>,
-    /// Here-document delimiters waiting for the end of the current line.
-    heredocs: Vec<(String, bool)>,
+    /// Here-document delimiters waiting for the end of the current line: the
+    /// delimiter, whether tabs are stripped, whether it was quoted.
+    heredocs: Vec<(String, bool, bool)>,
 }
 
 fn single_quote(c: char) -> bool {
@@ -204,7 +209,10 @@ impl Parser {
         };
         if let Some(op) = self.redirect.take() {
             if op == "<<" || op == "<<-" {
-                self.heredocs.push((word.text.clone(), op == "<<-"));
+                self.heredocs
+                    .push((word.text.clone(), op == "<<-", word.quoted));
+            } else if op == "<<<" {
+                self.simple.here_strings.push(word.clone());
             }
             self.simple.redirects.push(Redirect {
                 op,
@@ -246,7 +254,9 @@ impl Parser {
         }
         let pending = std::mem::take(&mut self.heredocs);
         let mut bodies = Vec::new();
-        for (delimiter, strip_tabs) in pending {
+        let mut literal = Vec::new();
+        for (delimiter, strip_tabs, quoted) in pending {
+            literal.push(quoted);
             let mut body = String::new();
             let mut closed = false;
             while self.index < self.chars.len() {
@@ -280,6 +290,7 @@ impl Parser {
             })
         }) {
             simple.heredocs.extend(bodies);
+            simple.heredoc_literal.extend(literal);
         }
     }
 

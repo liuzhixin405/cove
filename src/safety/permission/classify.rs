@@ -1293,9 +1293,454 @@ pub fn line_group(command: &str, dialect: Dialect) -> Option<&'static Group> {
         .then_some(group)
 }
 
+/// The paths of a line that only deletes files named literally (docs/optimizations/0034):
+/// POSIX `rm`/`unlink`, PowerShell `Remove-Item`/`del`/`rm`, joined by `&&` or `;`, and
+/// possibly read-only commands around them (`rm a && ls`). `None` for anything else:
+/// recursion, other options, globs, variables, `~`, command substitution, redirects, a
+/// pipe into the deletion, a change of directory, or any command that is not read-only.
+pub fn deletes(command: &str, dialect: Dialect) -> Option<Vec<String>> {
+    if safety::catastrophic(command).is_some() {
+        return None;
+    }
+    let line = shell::parse(command, dialect);
+    if !line.opaque.is_empty() || !line.substitutions.is_empty() || line.pipelines.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for pipeline in &line.pipelines {
+        if pipeline.iter().all(|simple| inert(simple, dialect)) {
+            continue;
+        }
+        let [simple] = pipeline.as_slice() else {
+            return None;
+        };
+        if !simple.redirects.is_empty() || !simple.heredocs.is_empty() {
+            return None;
+        }
+        let (program, args) = simple.words.split_first()?;
+        if program.dynamic || program.glob || program.block {
+            return None;
+        }
+        let name = shell::program_name(&program.text);
+        let found = match dialect {
+            Dialect::Posix => posix_deletes(&name, args)?,
+            Dialect::PowerShell => powershell_deletes(&name, args)?,
+            Dialect::Cmd => return None,
+        };
+        paths.extend(found);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// A read-only command that leaves the directory alone, so the deletions next to it
+/// still resolve their paths against the work tree.
+fn inert(simple: &Simple, dialect: Dialect) -> bool {
+    let moves = simple.words.first().is_none_or(|program| {
+        matches!(
+            shell::program_name(&program.text).as_str(),
+            "cd" | "pushd"
+                | "popd"
+                | "chdir"
+                | "set-location"
+                | "sl"
+                | "push-location"
+                | "pop-location"
+        )
+    });
+    !moves && classify_simple(simple, dialect) == Category::Safe && !fetches(simple)
+}
+
+/// Whether some command of the line deletes files (`rm`, `unlink`, `Remove-Item` and its
+/// aliases, `git rm`): for the hint that a plain `rm` may run without approval.
+pub fn deletes_files(command: &str, dialect: Dialect) -> bool {
+    shell::parse(command, dialect).commands().any(|simple| {
+        let words = simple.argv();
+        let Some(program) = words.first() else {
+            return false;
+        };
+        match shell::program_name(program).as_str() {
+            "rm" | "unlink" | "remove-item" | "del" | "erase" | "ri" => true,
+            "git" => git_subcommand(&words[1..]).is_some_and(|(sub, _)| sub == "rm"),
+            _ => false,
+        }
+    })
+}
+
+/// A word naming one file as written: no expansion, wildcard, `~` or escape left.
+fn literal_path(word: &Word) -> Option<String> {
+    let text = word.text.as_str();
+    let plain = !word.dynamic
+        && !word.glob
+        && !word.block
+        && !text.is_empty()
+        && !text.contains([
+            '*', '?', '[', ']', '$', '~', '`', ',', '{', '}', '(', ')', '@',
+        ])
+        && !text.chars().any(char::is_control);
+    plain.then(|| text.to_owned())
+}
+
+fn posix_deletes(name: &str, args: &[Word]) -> Option<Vec<String>> {
+    let unlink = match name {
+        "rm" => false,
+        "unlink" => true,
+        _ => return None,
+    };
+    let mut paths = Vec::new();
+    let mut options = true;
+    for word in args {
+        if options && word.text == "--" {
+            options = false;
+            continue;
+        }
+        if options && word.text.starts_with('-') && word.text != "-" {
+            if word.text == "-f" && !unlink {
+                continue;
+            }
+            return None;
+        }
+        paths.push(literal_path(word)?);
+    }
+    if paths.is_empty() || (unlink && paths.len() != 1) {
+        return None;
+    }
+    Some(paths)
+}
+
+fn powershell_deletes(name: &str, args: &[Word]) -> Option<Vec<String>> {
+    if !matches!(name, "remove-item" | "del" | "rm") {
+        return None;
+    }
+    let mut path = None;
+    let mut iter = args.iter();
+    while let Some(word) = iter.next() {
+        // A quoted `'-x'` is an argument, not a parameter.
+        let parameter = word.text.starts_with('-') && !word.quoted;
+        let value = if parameter {
+            let flag = word.text.to_ascii_lowercase();
+            match flag.as_str() {
+                "-force" => continue,
+                "-literalpath" | "-path" => iter.next()?,
+                _ => return None,
+            }
+        } else {
+            word
+        };
+        // Remove-Item takes one positional path; a second one would bind elsewhere.
+        if path.replace(literal_path(value)?).is_some() {
+            return None;
+        }
+    }
+    path.map(|path| vec![path])
+}
+
+/// The files a line runs as code (docs/optimizations/0038), as written: the script of an
+/// interpreter (`python x.py`, `node a.js`, `bash s.sh`, `pwsh -File a.ps1`, `cmd /c
+/// x.bat`, `source s.sh`), a program named by a path (`./s.sh`, `.\x.ps1`), also inside
+/// `bash -c`/`cmd /c`/`pwsh -Command` text. A relative file follows a literal `cd`
+/// before it (`cd sub && python x.py` gives `sub/x.py`). Modules (`python -m`), inline
+/// code (`-c`, `-e`) and words with expansions or wildcards are not files.
+pub fn runs_files(command: &str, dialect: Dialect) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_runs(command, dialect, 0, &mut files);
+    files
+}
+
+fn collect_runs(command: &str, dialect: Dialect, depth: usize, files: &mut Vec<String>) {
+    if depth > 4 {
+        return;
+    }
+    let line = shell::parse(command, dialect);
+    // The directory a literal `cd` moved to; `None` is the shell's starting directory.
+    let mut dir: Option<String> = None;
+    for simple in line.commands() {
+        let Some(words) = command_words(&simple.words, dialect) else {
+            continue;
+        };
+        let argv: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+        let offset = argv.len() - shell::strip_runners(&argv).len();
+        let Some((program, args)) = words[offset..].split_first() else {
+            continue;
+        };
+        let name = shell::program_name(&program.text);
+        if matches!(
+            name.as_str(),
+            "cd" | "chdir"
+                | "pushd"
+                | "popd"
+                | "set-location"
+                | "sl"
+                | "push-location"
+                | "pop-location"
+        ) {
+            let target = args.iter().find(|word| !word.text.starts_with('-'));
+            dir = match target.and_then(literal_path) {
+                Some(target) if !matches!(name.as_str(), "popd" | "pop-location") => {
+                    Some(under(dir.as_deref(), &target))
+                }
+                _ => None,
+            };
+            continue;
+        }
+        let mut found = Vec::new();
+        interpreted(&name, program, args, dialect, depth, &mut found);
+        files.extend(found.iter().map(|file| under(dir.as_deref(), file)));
+    }
+}
+
+/// `file` seen from the directory `dir` (relative to the starting one).
+fn under(dir: Option<&str>, file: &str) -> String {
+    let absolute = file.starts_with(['/', '\\']) || file.as_bytes().get(1) == Some(&b':');
+    match dir {
+        Some(dir) if !absolute => format!("{}/{file}", dir.trim_end_matches(['/', '\\'])),
+        _ => file.to_owned(),
+    }
+}
+
+/// The files `program args` runs: an interpreter's script or the program itself.
+fn interpreted(
+    name: &str,
+    program: &Word,
+    args: &[Word],
+    dialect: Dialect,
+    depth: usize,
+    found: &mut Vec<String>,
+) {
+    let first = |inline: &[&str], values: &[&str], skip: &[&str]| {
+        script_argument(args, inline, values, skip)
+    };
+    let file = match name {
+        "python" | "python3" | "py" | "pythonw" => first(&["-c", "-m", "-"], &["-W", "-X"], &[]),
+        _ if name
+            .strip_prefix("python")
+            .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.')) =>
+        {
+            first(&["-c", "-m", "-"], &["-W", "-X"], &[])
+        }
+        "node" => first(
+            &["-e", "--eval", "-p", "--print", "-"],
+            &[
+                "-r",
+                "--require",
+                "--import",
+                "--loader",
+                "-C",
+                "--conditions",
+            ],
+            &[],
+        ),
+        "bun" => first(
+            &["-e", "--eval", "-p", "--print"],
+            &["-r", "--preload"],
+            &["run"],
+        ),
+        "deno" => first(&["eval", "repl"], &[], &["run"]),
+        "ruby" => first(&["-e"], &["-I", "-r"], &[]),
+        "perl" => first(&["-e", "-E"], &["-I", "-M"], &[]),
+        "php" => match args.iter().position(|word| word.text == "-f") {
+            Some(index) => args.get(index + 1).and_then(literal_path),
+            None => first(&["-r", "-a"], &["-c", "-d", "-t", "-S"], &[]),
+        },
+        "source" | "." => args.first().and_then(literal_path),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "fish" | "cmd" => {
+            let texts: Vec<String> = std::iter::once(&program.text)
+                .chain(args.iter().map(|word| &word.text))
+                .cloned()
+                .collect();
+            match safety::unwrap_shell(&texts) {
+                Some(safety::Nested::Text(text)) => {
+                    let inner = if name == "cmd" {
+                        Dialect::Cmd
+                    } else {
+                        Dialect::Posix
+                    };
+                    collect_runs(&text, inner, depth + 1, found);
+                    None
+                }
+                Some(safety::Nested::Encoded) => None,
+                None if name == "cmd" => None,
+                None => first(&["-s"], &["-o", "-O", "+o", "+O"], &[]),
+            }
+        }
+        "pwsh" | "powershell" => {
+            powershell_script(name, program, args, depth, found);
+            None
+        }
+        _ => {
+            let path = program.text.contains(['/', '\\'])
+                || (dialect == Dialect::Cmd && {
+                    let lower = program.text.to_ascii_lowercase();
+                    lower.ends_with(".bat") || lower.ends_with(".cmd")
+                });
+            if path { literal_path(program) } else { None }
+        }
+    };
+    found.extend(file);
+}
+
+/// The first argument that is not an option: `None` when an `inline` option (code or a
+/// module instead of a file) comes first. `values` take the next word; `skip` are
+/// subcommands before the file (`deno run`).
+fn script_argument(
+    args: &[Word],
+    inline: &[&str],
+    values: &[&str],
+    skip: &[&str],
+) -> Option<String> {
+    let mut words = args.iter();
+    let mut options = true;
+    let mut leading = true;
+    while let Some(word) = words.next() {
+        let text = word.text.as_str();
+        if options && inline.contains(&text) {
+            return None;
+        }
+        if options && text == "--" {
+            options = false;
+            continue;
+        }
+        if options && values.contains(&text) {
+            words.next();
+            continue;
+        }
+        if options && text.len() > 1 && (text.starts_with('-') || text.starts_with('+')) {
+            continue;
+        }
+        if leading && skip.contains(&text) {
+            leading = false;
+            continue;
+        }
+        return literal_path(word);
+    }
+    None
+}
+
+/// `pwsh -File a.ps1`, `pwsh a.ps1`, `powershell a.ps1`, and the files of `-Command` text.
+fn powershell_script(
+    name: &str,
+    program: &Word,
+    args: &[Word],
+    depth: usize,
+    found: &mut Vec<String>,
+) {
+    let mut index = 0;
+    while let Some(word) = args.get(index) {
+        let lower = word.text.to_ascii_lowercase();
+        let Some(flag) = lower.strip_prefix('-').or_else(|| lower.strip_prefix('/')) else {
+            // pwsh takes a script file here; Windows PowerShell a command, which may
+            // still name a script.
+            if name == "pwsh" || lower.ends_with(".ps1") {
+                found.extend(literal_path(word));
+                return;
+            }
+            break;
+        };
+        if flag == "f" || (flag.len() >= 2 && "file".starts_with(flag)) {
+            found.extend(args.get(index + 1).and_then(literal_path));
+            return;
+        }
+        if flag == "c" || (flag.len() >= 2 && "command".starts_with(flag)) {
+            break;
+        }
+        let value = safety::VALUE_FLAGS
+            .iter()
+            .any(|value| flag.len() >= 2 && value.starts_with(flag));
+        index += if value { 2 } else { 1 };
+    }
+    let texts: Vec<String> = std::iter::once(&program.text)
+        .chain(args.iter().map(|word| &word.text))
+        .cloned()
+        .collect();
+    if let Some(safety::Nested::Text(text)) = safety::unwrap_shell(&texts) {
+        collect_runs(&text, Dialect::PowerShell, depth + 1, found);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletions_of_literal_files_are_recognized() {
+        let posix = |command| deletes(command, Dialect::Posix);
+        let ps = |command| deletes(command, Dialect::PowerShell);
+        let list = |paths: &[&str]| Some(paths.iter().map(|p| (*p).to_owned()).collect());
+        assert_eq!(posix("rm a.txt"), list(&["a.txt"]));
+        assert_eq!(posix("rm -f a b"), list(&["a", "b"]));
+        assert_eq!(posix("rm -- -x"), list(&["-x"]));
+        assert_eq!(posix("unlink config/old.ini"), list(&["config/old.ini"]));
+        assert_eq!(
+            posix("rm 'my file.txt' && rm b.txt; rm -f c"),
+            list(&["my file.txt", "b.txt", "c"])
+        );
+        assert_eq!(ps("Remove-Item -LiteralPath a.txt"), list(&["a.txt"]));
+        assert_eq!(ps("Remove-Item -Path 'a b.txt' -Force"), list(&["a b.txt"]));
+        assert_eq!(ps("del a.txt"), list(&["a.txt"]));
+        assert_eq!(ps("rm a.txt; del b.txt"), list(&["a.txt", "b.txt"]));
+        // Read-only commands around the deletion change nothing.
+        assert_eq!(
+            posix("rm config/old.ini && ls config"),
+            list(&["config/old.ini"])
+        );
+        assert_eq!(posix("ls; rm a && git status --short"), list(&["a"]));
+        assert_eq!(ps("Remove-Item a.txt; Get-ChildItem"), list(&["a.txt"]));
+        assert!(deletes_files("git rm a && git status", Dialect::Posix));
+        assert!(deletes_files("ls && rm -rf x", Dialect::Posix));
+        assert!(!deletes_files("git status && ls", Dialect::Posix));
+        for command in [
+            "rm -rf build",
+            "rm -r build",
+            "rm -R build",
+            "rm --recursive build",
+            "rm -fr build",
+            "rm -i a",
+            "rm *.log",
+            "rm 'a*.log'",
+            "rm a?.log",
+            "rm $F",
+            "rm \"$F\"",
+            "rm ~/a",
+            "rm a && curl x",
+            "ls",
+            "cd sub && rm a",
+            "rm a; cd ..",
+            "rm a && echo x > log",
+            "rm a && python x.py",
+            "cat list | rm a",
+            "rm a | cat",
+            "rm a > log",
+            "rm $(cat list)",
+            "rm `cat list`",
+            "rm",
+            "rm -f",
+            "unlink a b",
+            "find . -delete",
+            "xargs rm < list",
+            "git rm a",
+            "sudo rm a",
+            "X=1 rm a",
+            "rmdir d",
+            "Remove-Item a",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+        }
+        for command in [
+            "Remove-Item -Recurse x",
+            "Remove-Item x -Recurse -Force",
+            "Remove-Item *.log",
+            "Remove-Item $f",
+            "Remove-Item a.txt, b.txt",
+            "Remove-Item a.txt b.txt",
+            "Remove-Item -Path",
+            "Remove-Item ~/a",
+            "Get-ChildItem x | Remove-Item",
+            "Set-Location sub; rm a",
+            "ri a",
+        ] {
+            assert_eq!(ps(command), None, "{command}");
+        }
+        assert_eq!(deletes("del a.txt", Dialect::Cmd), None);
+    }
 
     fn posix(command: &str) -> Category {
         classify(command, Dialect::Posix)
@@ -1570,5 +2015,72 @@ mod tests {
             Some("npm")
         );
         assert!(line_group("npm install -g x", Dialect::Posix).is_none());
+    }
+
+    #[test]
+    fn files_run_as_code_are_recognized() {
+        let posix = |command| runs_files(command, Dialect::Posix);
+        let ps = |command| runs_files(command, Dialect::PowerShell);
+        let list = |files: &[&str]| files.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>();
+        for (command, file) in [
+            ("python x.py", "x.py"),
+            ("python -u x.py arg", "x.py"),
+            ("python3 -W ignore tools/gen.py --check", "tools/gen.py"),
+            ("py -3 _install.py", "_install.py"),
+            ("/usr/bin/python3.11 x.py", "x.py"),
+            ("node a.js", "a.js"),
+            ("node -r ts-node/register a.ts", "a.ts"),
+            ("deno run -A main.ts", "main.ts"),
+            ("bun run x.ts", "x.ts"),
+            ("ruby x.rb", "x.rb"),
+            ("perl -w x.pl", "x.pl"),
+            ("php -f x.php", "x.php"),
+            ("bash s.sh", "s.sh"),
+            ("sh -x s.sh a", "s.sh"),
+            ("./s.sh", "./s.sh"),
+            ("scripts/run.sh --fast", "scripts/run.sh"),
+            ("source env.sh", "env.sh"),
+            (
+                "PYTHONIOENCODING=utf-8 timeout 60 python 'my x.py'",
+                "my x.py",
+            ),
+            ("bash -c 'python _install.py'", "_install.py"),
+            ("cd sub && python x.py", "sub/x.py"),
+            ("cd /tmp/w && python /d/x.py", "/d/x.py"),
+            (
+                "pwsh -NoProfile -ExecutionPolicy Bypass -File a.ps1",
+                "a.ps1",
+            ),
+            ("pwsh a.ps1", "a.ps1"),
+            ("powershell -File b.ps1", "b.ps1"),
+            ("cmd /c x.bat", "x.bat"),
+        ] {
+            assert_eq!(posix(command), list(&[file]), "{command}");
+        }
+        assert_eq!(ps(r".\x.ps1 -Verbose"), list(&[r".\x.ps1"]));
+        assert_eq!(ps("python x.py; node y.js"), list(&["x.py", "y.js"]));
+        assert_eq!(ps("Set-Location sub; python x.py"), list(&["sub/x.py"]));
+        assert_eq!(ps("powershell -Command python c.py"), list(&["c.py"]));
+        // Modules, inline code, stdin and unknown words are no files.
+        for command in [
+            "python -m pytest",
+            "python -m pip install pytest",
+            r#"python -c "import os""#,
+            "python - <<'EOF'\nprint(1)\nEOF",
+            "python",
+            "node -e 'x'",
+            "ruby -e 'x'",
+            "perl -e 'x'",
+            "php -r 'x'",
+            "deno eval 'x'",
+            "bash -s < s.sh",
+            "python $SCRIPT",
+            "python *.py",
+            "cargo test",
+            "ls ./src",
+            "pwsh -Command Get-ChildItem",
+        ] {
+            assert!(posix(command).is_empty(), "{command}: {:?}", posix(command));
+        }
     }
 }

@@ -1,5 +1,5 @@
-//! How history shows times: always in local time. `usage::timestamp` stays UTC for
-//! logs and other text machines read.
+//! How times are shown to people (history, `/undo`, memory, dream): always in local
+//! time. Only the usage CSV export (`usage::csv`, column `time_utc`) stays in UTC.
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
 
@@ -76,5 +76,17 @@ mod tests {
         assert_eq!(group(now - 30 * 86400), "更早");
         assert_eq!(ago(now - 7200), "2 小时前");
         assert_eq!(stamp(now).len(), "2026-11-18 13:47".len());
+    }
+
+    #[test]
+    fn stamp_is_local_time() {
+        for secs in [0, 1_700_000_000, 1_795_000_000, super::super::now()] {
+            let expected = Local
+                .timestamp_opt(secs as i64, 0)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+            assert_eq!(stamp(secs), expected);
+        }
     }
 }

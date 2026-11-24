@@ -24,7 +24,7 @@ pub(crate) const HELP: &str = "\
 /init [apply|discard]  根据仓库起草 CLAUDE.md（或 AGENTS.md），以 diff 展示；apply 写入，从不覆盖已有文件
 /diff git [--stat]  显示 git diff --cached 和 git diff；--stat 列出已暂存、未暂存和未跟踪的文件
 /commit [--preview] [--no-review] [--all | --only <paths>... --] [message]  先验证、再由 AI 按项目规则审查，然后提交已暂存内容（或所选文件）；--no-review 跳过审查；从不推送
-/rules [add <规则>|remove <n>|local]  项目规则（.cove/rules.md）：你纠正过的做法和反复出现的问题，每个任务都遵守、提交前按它审查；local 让它只留在本机（不提交）
+/rules [add [global] <文字>|remove <n>|remove g<n>|promote <n>|pending|local]  全局偏好（数据目录的 preferences.md，所有项目都遵守）和项目规则（.cove/rules.md：你纠正过的做法和反复出现的问题，提交前按它审查）；global 加全局偏好，g<n> 是全局偏好的编号，promote 把项目规则提升为全局偏好，pending 确认待定的候选，local 让项目规则只留在本机（不提交）
 /cd <path>  保存会话并在另一个项目目录中重启
 /restart  保存并重启程序，继续当前会话
 /expand [n] [all]  工具结果 #n 的完整输出（默认最新一条；不加 all 时最多 200 行）
@@ -396,7 +396,7 @@ async fn init_apply(app: &mut Application) -> Result<()> {
     std::fs::remove_file(&draft_path)?;
     print_text(
         &format!(
-            "已写入 {}（/undo 可撤销）。/restart 后或在新会话中，系统提示会读取它。\n",
+            "已写入 {}（/undo 可撤销）。新会话的系统提示会读取它；/restart 后继续当前会话时，下一个任务开始时告诉模型。\n",
             crate::paths::display(&path)
         ),
         false,
@@ -496,48 +496,54 @@ async fn commit(app: &mut Application, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// `/rules`: list, add, remove, or keep the rules file out of commits.
-async fn rules(app: &Application, line: &str, args: &[&str]) -> Result<()> {
-    let Some(rules) = app.sessions.rules.clone() else {
-        return Err(Error::Session(
-            "当前工作区不是一个项目目录（比如家目录或盘符根），没有项目规则；/cd 到项目里再用"
-                .into(),
-        ));
+/// `/rules`: the user's preferences and the project's rules: list, add, remove, promote
+/// a rule to a preference, answer waiting proposals, or keep the rules file out of commits.
+async fn rules(app: &mut Application, line: &str, args: &[&str]) -> Result<()> {
+    let preferences = app.sessions.preferences.clone();
+    let project = app.sessions.rules.clone();
+    let need_project = || {
+        project.clone().ok_or_else(|| {
+            Error::Session(
+                "当前工作区不是一个项目目录（比如家目录或盘符根），没有项目规则；/cd 到项目里再用，全局偏好用 /rules add global <文字>"
+                    .into(),
+            )
+        })
     };
-    let shown = crate::paths::display(rules.path());
+    // The text after `/rules add`.
+    let added = || -> String {
+        line.trim_start()["/rules".len()..]
+            .trim_start()
+            .strip_prefix("add")
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
     match args {
-        [] => {
-            let listed = rules.list()?;
-            if listed.is_empty() {
-                print_text(
-                    &format!(
-                        "还没有项目规则。cove 会从你的纠正和反复出现的问题里记下规则，写在 {shown}；也可以 /rules add <规则>。\n"
-                    ),
-                    false,
-                )?;
-            } else {
-                let mut text = format!("项目规则（{shown}，每个任务都遵守，提交前按它审查）：\n");
-                for (number, rule) in listed.iter().enumerate() {
-                    text.push_str(&format!(
-                        "  {}. {}\n",
-                        number + 1,
-                        crate::text::visible_row(rule)
-                    ));
-                }
-                text.push_str("/rules remove <n> 删除一条；也可以直接编辑这个文件。\n");
-                print_text(&text, false)?;
+        [] => print_text(&rules_listing(&preferences, project.as_deref())?, false)?,
+        ["add", "global", ..] => {
+            let text = added();
+            let text = text.strip_prefix("global").unwrap_or_default().trim();
+            if text.is_empty() {
+                return Err(Error::Session("用法：/rules add global <偏好>".into()));
             }
+            let shown = crate::paths::display(preferences.file.path());
+            let reply = if preferences.file.add_by_user(text)? {
+                format!("已添加到全局偏好 {shown}；所有项目都会遵守，本会话从下一个任务开始。\n")
+            } else {
+                "已有相同的全局偏好。\n".to_owned()
+            };
+            print_text(&reply, false)?;
         }
         ["add", ..] => {
-            let rule = line.trim_start()["/rules".len()..]
-                .trim_start()
-                .strip_prefix("add")
-                .unwrap_or_default()
-                .trim();
+            let rules = need_project()?;
+            let rule = added();
             if rule.is_empty() {
-                return Err(Error::Session("用法：/rules add <规则>".into()));
+                return Err(Error::Session(
+                    "用法：/rules add <规则>，或 /rules add global <偏好>".into(),
+                ));
             }
-            let text = if rules.add_by_user(rule)? {
+            let shown = crate::paths::display(rules.path());
+            let text = if rules.add_by_user(&rule)? {
                 format!("已添加到 {shown}；本会话接下来的任务和提交前审查都会用上。\n")
             } else {
                 "已有相同的规则。\n".to_owned()
@@ -545,24 +551,151 @@ async fn rules(app: &Application, line: &str, args: &[&str]) -> Result<()> {
             print_text(&text, false)?;
         }
         ["remove", number] => {
-            let number = number
-                .trim_start_matches('#')
-                .parse()
-                .map_err(|_| Error::Session("用法：/rules remove <n>（/rules 列出编号）".into()))?;
-            let removed = rules.remove(number)?;
+            let usage = || {
+                Error::Session(
+                    "用法：/rules remove <n> 或 /rules remove g<n>（/rules 列出编号）".into(),
+                )
+            };
+            let number = number.trim_start_matches('#');
+            let removed = match number.strip_prefix(['g', 'G']) {
+                Some(global) => preferences
+                    .file
+                    .remove(global.parse().map_err(|_| usage())?)?,
+                None => need_project()?.remove(number.parse().map_err(|_| usage())?)?,
+            };
             print_text(
                 &format!("已删除：{}\n", crate::text::visible_row(&removed)),
                 false,
             )?;
         }
-        ["local"] => print_text(&keep_rules_local(rules.path()).await?, false)?,
+        ["promote", number] => {
+            let rules = need_project()?;
+            let number = number.trim_start_matches('#').parse().map_err(|_| {
+                Error::Session("用法：/rules promote <n>（/rules 列出编号）".into())
+            })?;
+            let rule = crate::memory::rules::promote(&rules, &preferences.file, number)?;
+            print_text(
+                &format!(
+                    "已把“{}”提升为全局偏好（{}），并从项目规则里删掉。\n",
+                    crate::text::visible_row(crate::memory::rules::undated(&rule)),
+                    crate::paths::display(preferences.file.path())
+                ),
+                false,
+            )?;
+        }
+        ["pending"] => app.typed = pending_preferences(app).await?,
+        ["local"] => print_text(&keep_rules_local(need_project()?.path()).await?, false)?,
         _ => {
             return Err(Error::Session(
-                "用法：/rules [add <规则>|remove <n>|local]".into(),
+                "用法：/rules [add [global] <文字>|remove <n>|remove g<n>|promote <n>|pending|local]"
+                    .into(),
             ));
         }
     }
     Ok(())
+}
+
+/// `/rules` without arguments: the preferences (`g1`, `g2`…), then the project's rules.
+fn rules_listing(
+    preferences: &crate::memory::preferences::Preferences,
+    project: Option<&crate::memory::rules::RulesFile>,
+) -> Result<String> {
+    let mut text = String::new();
+    let shown = crate::paths::display(preferences.file.path());
+    let listed = preferences.file.list()?;
+    if listed.is_empty() {
+        text.push_str(&format!(
+            "还没有全局偏好（{shown}）。cove 发现你说的要求不只适用于一个项目时会问你；也可以 /rules add global <偏好>。\n"
+        ));
+    } else {
+        text.push_str(&format!(
+            "全局偏好（{shown}，所有项目都遵守，项目规则和你当前的要求优先）：\n"
+        ));
+        for (number, rule) in listed.iter().enumerate() {
+            text.push_str(&format!(
+                "  g{}. {}\n",
+                number + 1,
+                crate::text::visible_row(rule)
+            ));
+        }
+    }
+    match project {
+        None => text.push_str("当前工作区不是一个项目目录，没有项目规则。\n"),
+        Some(rules) => {
+            let shown = crate::paths::display(rules.path());
+            let listed = rules.list()?;
+            if listed.is_empty() {
+                text.push_str(&format!(
+                    "还没有项目规则。cove 会从你的纠正和反复出现的问题里记下规则，写在 {shown}；也可以 /rules add <规则>。\n"
+                ));
+            } else {
+                text.push_str(&format!(
+                    "项目规则（{shown}，每个任务都遵守，提交前按它审查）：\n"
+                ));
+                for (number, rule) in listed.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {}\n",
+                        number + 1,
+                        crate::text::visible_row(rule)
+                    ));
+                }
+            }
+        }
+    }
+    let waiting = preferences
+        .pending
+        .list()
+        .map(|list| list.len())
+        .unwrap_or(0);
+    if waiting > 0 {
+        text.push_str(&format!(
+            "有 {waiting} 条全局偏好候选等待确认：/rules pending。\n"
+        ));
+    }
+    text.push_str(
+        "/rules remove <n> 删除项目规则，remove g<n> 删除全局偏好，promote <n> 把项目规则提升为全局偏好；也可以直接编辑这两个文件。\n",
+    );
+    Ok(text)
+}
+
+/// `/rules pending`: lists the proposals waiting for an answer and, with a terminal,
+/// asks about each in turn. Returns text typed instead of an answer, to run next.
+async fn pending_preferences(app: &Application) -> Result<Option<String>> {
+    let preferences = &app.sessions.preferences;
+    let waiting = preferences.pending.list()?;
+    if waiting.is_empty() {
+        print_text("没有等待确认的全局偏好候选。\n", false)?;
+        return Ok(None);
+    }
+    let mut text = format!("等待确认的全局偏好候选（{} 条）：\n", waiting.len());
+    for (number, candidate) in waiting.iter().enumerate() {
+        let from = if candidate.project.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", crate::text::visible_row(&candidate.project))
+        };
+        text.push_str(&format!(
+            "  {}. {}{from}\n",
+            number + 1,
+            crate::text::visible_row(&candidate.text)
+        ));
+    }
+    if app.input.is_none() {
+        text.push_str("交互运行 cove 时输入 /rules pending 逐条确认。\n");
+        print_text(&text, false)?;
+        return Ok(None);
+    }
+    print_text(&text, false)?;
+    // Each once, also those put off earlier in this run; other text than an answer
+    // ends the round and runs as the next line.
+    let mut asked = Vec::new();
+    while let Some(candidate) = preferences.claim(&asked) {
+        asked.push(candidate.id.clone());
+        if let Some(text) = app.answer_preference(&candidate).await? {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
 }
 
 /// Lists the rules file in the repository's `info/exclude`, so it stays on this machine.
@@ -630,7 +763,7 @@ async fn review_staged(
     if !review.wanted(&diff) {
         return Ok(());
     }
-    print_text("[提交前审查] 正在按项目规则审查暂存的改动…\n", true)?;
+    print_text(&format!("[提交前审查] 正在{}…\n", review.describe()), true)?;
     let cancel = CancellationToken::new();
     let watcher = {
         let cancel = cancel.clone();
@@ -649,12 +782,19 @@ async fn review_staged(
             print_text("[提交前审查] 通过\n", true)?;
             Ok(())
         }
-        Verdict::Skipped => {
-            print_text("[提交前审查] 没有完成，已跳过\n", true)?;
+        Verdict::Skipped(reason) | Verdict::Unparsed(reason) => {
+            print_text(
+                &format!(
+                    "[提交前审查] 没有完成，已跳过：{}\n",
+                    crate::text::visible(&crate::text::short(&reason, 300))
+                ),
+                true,
+            )?;
             Ok(())
         }
         Verdict::Issues(findings) => Err(Error::Session(format!(
-            "提交前审查发现问题，未提交：\n{findings}\n\n修改后重新运行 /commit；确认这些问题不成立时，用 /commit --no-review 跳过审查。"
+            "提交前审查发现问题，未提交：\n{}\n\n修改后重新运行 /commit；确认这些问题不成立时，用 /commit --no-review 跳过审查。",
+            crate::text::visible(&crate::safety::gates::review::findings_text(&findings))
         ))),
     }
 }

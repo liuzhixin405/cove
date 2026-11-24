@@ -19,6 +19,7 @@ use crate::{
     app::ui::print_text,
     config::Settings,
     domain::{Error, Message, Result},
+    safety::impact,
     safety::permission::Effect,
     session::SessionPersistence,
     workflows::browser_verify,
@@ -27,8 +28,12 @@ use crate::{
 };
 
 pub(crate) const HELP: &str = "/race [<需求>]  一个需求两个方案：主模型和快速模型各在独立的 worktree 里实现，用同一组命令验证，选一个应用；不带参数查看最近一次\n\
-/changes [list|show <id>|diff <id>|export <id> <out>|apply <id> [confirm]|review <id> accepted|rejected|verify-browser <workflow.json> [--allow-local]|verify-browser results]  可审查的补丁：竞速方案和当前任务\n\
+/changes [list|show <id>|diff <id>|export <id> <out>|apply <id> [confirm]|review <id> accepted|rejected|impact [turn|<git 区间>]|verify-browser <workflow.json> [--allow-local]|verify-browser results]  可审查的补丁：竞速方案和当前任务；impact 列出改动符号在其他文件的使用和有没有测试引用\n\
 /remote start [--bind 127.0.0.1:0] [--token-file <path>] [--allow-lan --tls-cert <pem> --tls-key <pem>] | status | stop  远程监督服务";
+
+/// `/changes impact` prints at most this many lines of the list (30 with its title
+/// and timing).
+const ASKED_LINES: usize = 28;
 
 /// `browser_path` from the effective config.
 pub(crate) fn browser_path(settings: &Settings) -> Option<PathBuf> {
@@ -220,6 +225,60 @@ async fn changes_command(app: &mut Application, args: &[&str]) -> Result<()> {
             record(app, &set, Decision::parse(decision)?)?;
             print_text(
                 &format!("已为 {id} 记录 {decision}；没有应用任何改动。\n"),
+                false,
+            )?;
+        }
+        ["impact"] | ["impact", _] => {
+            let target = args.get(1).copied().unwrap_or("turn");
+            let cancel = CancellationToken::new();
+            let root = app.workspace.root().to_path_buf();
+            let (changes, shell, what) = if target == "turn" {
+                (
+                    crate::safety::gates::impact::task_changes(&app.workspace),
+                    app.workspace.shell_effects(),
+                    "当前任务通过文件工具做的改动".to_owned(),
+                )
+            } else {
+                let changes = foreground(
+                    app,
+                    cancel.clone(),
+                    impact::git_changes(&root, target, &cancel),
+                )
+                .await?;
+                (
+                    changes,
+                    false,
+                    format!("{target}（调用方按当前工作区查找）"),
+                )
+            };
+            if changes.is_empty() {
+                print_text(&format!("{what}：没有改动的文件。\n"), false)?;
+                return Ok(());
+            }
+            let started = std::time::Instant::now();
+            let mut found = foreground(
+                app,
+                cancel.clone(),
+                impact::run(
+                    root,
+                    changes,
+                    impact::Limits::ASKED,
+                    impact::ASKED_BUDGET,
+                    &cancel,
+                ),
+            )
+            .await?;
+            found.skipped.shell = shell;
+            let text = if found.symbols.is_empty() {
+                "[影响] 没有找到改动的符号（新增的符号、测试代码、不支持的语言不算）".to_owned()
+            } else {
+                found.render(ASKED_LINES)
+            };
+            print_text(
+                &format!(
+                    "{what}\n{text}\n用时 {:.1} 秒\n",
+                    started.elapsed().as_secs_f64()
+                ),
                 false,
             )?;
         }

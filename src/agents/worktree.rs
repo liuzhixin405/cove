@@ -294,9 +294,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "exit_worktree".into(),
-            description: "Remove the worktree of <branch> (requires approval). merge=true first merges its committed work into the main tree \
-                          (both trees must be clean; conflicts abort the merge and are reported). A worktree with uncommitted changes is only \
-                          removed with discard=true. The branch is kept unless it was merged."
+            description: "Remove the worktree of <branch> (requires approval). merge=true first merges its commits into the main tree \
+                          (both trees clean; a conflict aborts and is reported). Uncommitted changes need discard=true. The branch is kept unless merged."
                 .into(),
             schema: json!({"type":"object","properties":{"branch":{"type":"string"},"merge":{"type":"boolean"},"discard":{"type":"boolean"}},
                 "required":["branch"],"additionalProperties":false}),

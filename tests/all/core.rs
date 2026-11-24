@@ -138,7 +138,7 @@ async fn noninteractive_default_allows_workspace_writes_but_denies_shell() {
                 CancellationToken::new()
             )
             .await,
-        Err(Error::Approval(_))
+        Err(Error::Unattended(_))
     ));
     assert!(!dir.path().join("shell.txt").exists());
 }
@@ -751,7 +751,9 @@ async fn steering_empty_wakeup_counts_interrupted_request() {
         }
     );
     drain.await.unwrap();
-    assert!(matches!(result, Err(Error::Limit(_))));
+    assert!(
+        matches!(result, Err(Error::Stopped(stopped)) if stopped.stop == cove::engine::agent::Stop::Limit(1))
+    );
     assert_eq!(session.accounting.model_calls, 2);
     assert_eq!(session.accounting.cost, Some(0.0));
     let requests = provider.inner.requests.lock().unwrap();
@@ -1128,7 +1130,7 @@ async fn model_call_limit_stops_without_claiming_completion() {
     let (tx, _rx) = mpsc::channel(64);
     assert!(matches!(
         agent.run("task".into(), tx, CancellationToken::new()).await,
-        Err(Error::Limit(_))
+        Err(Error::Stopped(stopped)) if stopped.stop == cove::engine::agent::Stop::Limit(1)
     ));
 }
 
@@ -1203,7 +1205,7 @@ async fn reported_cost_is_recorded_in_usage_ledger() {
         max_output_tokens: 100,
         estimated_tokens: None,
         model: None,
-        long_cache: false,
+        cache: cove::domain::Cache::Short,
     };
     let (tx, _rx) = mpsc::channel(64);
     metered
@@ -1252,7 +1254,7 @@ async fn the_ledger_records_the_model_that_answered_at_its_cache_aware_prices() 
         max_output_tokens: 100,
         estimated_tokens: None,
         model: None,
-        long_cache: false,
+        cache: cove::domain::Cache::Short,
     };
     let (tx, _rx) = mpsc::channel(64);
     metered
@@ -1314,4 +1316,131 @@ async fn reported_cost_accumulates_without_static_prices() {
     assert!(result.is_ok());
     assert_eq!(accounting.cost, Some(0.05));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+/// Answers the stall questions in order and records them.
+struct StallAnswers {
+    answers: Mutex<VecDeque<&'static str>>,
+    questions: Mutex<Vec<String>>,
+}
+
+impl cove::domain::UserInput for StallAnswers {
+    fn answer(&self, question: String, _: CancellationToken) -> BoxFuture<'_, Result<String>> {
+        self.questions.lock().unwrap().push(question);
+        let answer = self.answers.lock().unwrap().pop_front().unwrap_or("");
+        Box::pin(async move { Ok(answer.into()) })
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_task_asks_and_each_choice_does_what_it_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let failing = || {
+        response(vec![Block::ToolUse {
+            id: cove::session::new_id(),
+            name: "read".into(),
+            input: json!({"path":"missing.txt"}),
+            extra: None,
+        }])
+    };
+    // stall_rounds 2: round 1 is new information, rounds 2-3 stall (asked: 3 = go on,
+    // now 4 rounds), rounds 4-7 stall (2 = another approach), 8-11 (typed text),
+    // 12-15 (Enter = stop and summarize).
+    let mut responses: VecDeque<ModelResponse> = (0..15).map(|_| failing()).collect();
+    responses.push_back(response(vec![Block::Text(
+        "missing.txt does not exist; nothing to read.".into(),
+    )]));
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(responses),
+        requests: Mutex::new(Vec::new()),
+    });
+    let input = Arc::new(StallAnswers {
+        answers: Mutex::new(VecDeque::from(["3", "2", "look elsewhere", ""])),
+        questions: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        Limits {
+            max_turns: 50,
+            ..limits()
+        },
+    )
+    .unwrap()
+    .with_stall_rounds(2)
+    .with_user_input(Some(input.clone()));
+    let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), None);
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let Event::Notice(text) = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    let result = agent
+        .run_in(
+            &mut session,
+            Some("read missing.txt".into()),
+            &Ephemeral,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    let notices = drain.await.unwrap();
+    let Err(Error::Stopped(stopped)) = result else {
+        panic!("{result:?}");
+    };
+    // Each choice says what it did: 3, 2 and Enter (0046).
+    for said in ["照原样继续", "换个思路再试", "停下并总结"] {
+        assert!(
+            notices.iter().any(|notice| notice.contains(said)),
+            "{said}: {notices:?}"
+        );
+    }
+    assert_eq!(stopped.stop, cove::engine::agent::Stop::Stalled(4));
+    assert_eq!(stopped.report.idle_max, 4);
+    assert!(matches!(session.state, State::Interrupted(_)));
+    let questions = input.questions.lock().unwrap();
+    assert_eq!(questions.len(), 4, "{questions:?}");
+    assert!(
+        questions[0].contains("[没有进展] 最近 2 轮"),
+        "{}",
+        questions[0]
+    );
+    assert!(
+        questions[0].contains("反复出现：read `missing.txt`"),
+        "{}",
+        questions[0]
+    );
+    assert!(
+        questions[1].contains("最近 4 轮"),
+        "doubled: {}",
+        questions[1]
+    );
+    // Counted in those 4 rounds, not the 7 of the whole run (0046).
+    assert!(questions[1].contains("×4"), "{}", questions[1]);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 16);
+    let last = requests.last().unwrap();
+    assert!(last.tools.is_empty());
+    let text = |request: &ModelRequest| format!("{:?}", request.messages);
+    assert!(
+        text(last).contains("cove stopped the task"),
+        "{}",
+        text(last)
+    );
+    assert!(text(last).contains("Repeated errors"));
+    // 2: the model hears what was tried; typed text reaches it as steering.
+    assert!(text(&requests[7]).contains("asked for a different approach"));
+    assert!(!text(&requests[6]).contains("asked for a different approach"));
+    assert!(
+        session
+            .messages
+            .iter()
+            .any(|message| message.origin == cove::domain::Origin::Steer
+                && format!("{:?}", message.blocks).contains("look elsewhere"))
+    );
 }

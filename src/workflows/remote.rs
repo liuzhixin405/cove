@@ -367,7 +367,10 @@ impl Authorizer for RemoteAuthorizer {
                     _ = cancel.cancelled() => Err(Error::Cancelled),
                     answer = remote_answer => match answer {
                         Some(true) => Ok(()),
-                        _ => Err(Error::Approval(format!("{summary}（远程审批被拒绝或已过期）"))),
+                        _ => {
+                            self.inner.note_refusal();
+                            Err(Error::Approval(format!("{summary}（远程审批被拒绝或已过期）")))
+                        }
                     },
                 }
             } else {
@@ -384,7 +387,12 @@ impl Authorizer for RemoteAuthorizer {
                                 &format!("\n[远程] {}：{summary}\n", if approved { "已批准" } else { "已拒绝" }),
                                 true,
                             )?;
-                            if approved { Ok(()) } else { Err(Error::Denied(summary.clone())) }
+                            if approved {
+                                Ok(())
+                            } else {
+                                self.inner.note_refusal();
+                                Err(Error::Denied(summary.clone()))
+                            }
                         }
                         // Expired or withdrawn: keep waiting for the local answer.
                         None => local.await,

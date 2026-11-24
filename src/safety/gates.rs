@@ -1,13 +1,16 @@
 //! Completion gates and task guards, implemented as `TurnHook`s and tool wrappers:
-//! guardrail and loop detection, finish nudges, self-review, plan mode and the
-//! review workflow, the pre-commit gate and the acceptance report.
+//! guardrail and loop detection, finish nudges, the end-of-task review loop, plan
+//! mode and the review workflow, the pre-commit gate and the acceptance report.
 
 pub mod acceptance;
+pub mod cite;
 pub mod commit;
 pub mod guard;
+pub mod impact;
 pub mod nudge;
 pub mod plan;
 pub mod review;
+pub mod review_command;
 
 use std::{collections::HashSet, sync::Mutex};
 
@@ -28,6 +31,14 @@ pub const CONFIG_KEYS: &[&str] = &[
     "workflow",
     "commit_gate",
     "commit_review",
+    "cite_check",
+    "change_impact",
+    "review_commands",
+    "review_when",
+    "review_block",
+    "review_max_rounds",
+    "review_timeout_seconds",
+    "review_instructions",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +77,11 @@ pub struct GateConfig {
     /// AI review of the staged change before a commit (default on); `auto` = at least
     /// 40 changed lines.
     pub commit_review: Switch,
+    /// Local check of the code references in answers that change no files (default
+    /// `auto` = on, interactive or not, for every provider).
+    pub cite_check: Switch,
+    /// The callers of the changed symbols at the end of a task (0031, default `auto`).
+    pub change_impact: Switch,
 }
 
 impl GateConfig {
@@ -79,6 +95,8 @@ impl GateConfig {
                 .unwrap_or(true),
             commit_gate: Switch::parse(file.get("commit_gate"), Switch::On),
             commit_review: Switch::parse(file.get("commit_review"), Switch::On),
+            cite_check: Switch::parse(file.get("cite_check"), Switch::Auto),
+            change_impact: Switch::parse(file.get("change_impact"), Switch::Auto),
         }
     }
 }
@@ -118,6 +136,22 @@ pub struct GitEvent {
     pub succeeded: bool,
 }
 
+/// How the end-of-task review of a task ended, for the acceptance report.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct ReviewRecord {
+    /// project (`review_commands`) or builtin (`done_self_review`)
+    pub reviewer: String,
+    /// passed, failed, not_run, unparsed; handed_back for the built-in review
+    pub outcome: String,
+    pub rounds: u32,
+    /// Findings left: the blocking ones when it failed, the others when it passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open: Vec<String>,
+    /// The line shown to the user.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
 #[derive(Default)]
 struct EvidenceState {
     /// Shell lines that succeeded after the last change that could affect them.
@@ -127,6 +161,11 @@ struct EvidenceState {
     checks: Vec<CheckRecord>,
     git: Vec<GitEvent>,
     outcome: Option<String>,
+    citations: Option<cite::CitationStats>,
+    review: Option<ReviewRecord>,
+    impact: Option<crate::safety::impact::ImpactRecord>,
+    /// The impact's caller list for the built-in reviewer.
+    callers: Option<String>,
 }
 
 /// What a task actually did, shared by the verifier, nudges and the acceptance report.
@@ -177,6 +216,41 @@ impl Evidence {
             state.checks.retain(|c| c.command != check.command);
             state.checks.push(check);
         });
+    }
+
+    pub fn set_citations(&self, stats: cite::CitationStats) {
+        self.with(|state| state.citations = Some(stats));
+    }
+
+    /// The citation check of this task, when one ran.
+    pub fn citations(&self) -> Option<cite::CitationStats> {
+        self.with(|state| state.citations.clone()).flatten()
+    }
+
+    pub fn set_review(&self, review: ReviewRecord) {
+        self.with(|state| state.review = Some(review));
+    }
+
+    /// The end-of-task review of this task, when one ran.
+    pub fn review(&self) -> Option<ReviewRecord> {
+        self.with(|state| state.review.clone()).flatten()
+    }
+
+    /// The change impact of this task (0031): the record for the acceptance report and
+    /// the caller list for the built-in reviewer.
+    pub fn set_impact(&self, record: crate::safety::impact::ImpactRecord, callers: Option<String>) {
+        self.with(|state| {
+            state.impact = Some(record);
+            state.callers = callers;
+        });
+    }
+
+    pub fn impact(&self) -> Option<crate::safety::impact::ImpactRecord> {
+        self.with(|state| state.impact.clone()).flatten()
+    }
+
+    pub fn callers(&self) -> Option<String> {
+        self.with(|state| state.callers.clone()).flatten()
     }
 
     pub fn set_outcome(&self, outcome: &str) {
@@ -305,8 +379,11 @@ pub struct Assembly {
     pub tools: std::sync::Arc<dyn crate::tools::ToolExecutor>,
     pub workflow: std::sync::Arc<plan::Workflow>,
     pub hooks: Vec<std::sync::Arc<dyn TurnHook>>,
-    /// The review before a commit, for `/commit` too; `None` when `commit_review` is off.
+    /// The review before a commit, for `/commit` too; `None` when there is none
+    /// (`commit_review` off, or a project review that does not run at commits).
     pub commit_review: Option<std::sync::Arc<review::CommitReview>>,
+    /// The end-of-task review, run by the agent loop after the verification.
+    pub review: Option<std::sync::Arc<review::DoneReview>>,
 }
 
 pub struct Parts {
@@ -325,7 +402,7 @@ pub struct Parts {
     pub project_context: Option<String>,
     pub trust: std::sync::Arc<dyn crate::safety::verify::ProjectTrust>,
     /// The project's rules, for the reviews.
-    pub rules: Option<std::sync::Arc<crate::memory::rules::ProjectRules>>,
+    pub rules: Option<std::sync::Arc<crate::memory::rules::RulesFile>>,
 }
 
 fn verification_preapproved(
@@ -389,17 +466,59 @@ impl Assembly {
             context_tokens: settings.context_tokens,
             project_context: parts.project_context.clone(),
         };
-        let commit_review = (config.commit_review != Switch::Off).then(|| {
-            Arc::new(review::CommitReview {
-                mode: config.commit_review,
-                reviewer: review::Reviewer {
-                    provider: parts.background.clone(),
-                    tools: parts.readonly.clone(),
-                    settings: review_settings(),
-                    ledger: parts.ledger.clone(),
-                    rules: parts.rules.clone(),
-                },
-            })
+        let review_config = review_command::ReviewConfig::from_json(&settings.file);
+        let instructions = review_config
+            .instructions
+            .as_ref()
+            .map(|path| root.join(path));
+        let reviewer = |provider: &Arc<dyn crate::domain::Provider>| review::Reviewer {
+            provider: provider.clone(),
+            tools: parts.readonly.clone(),
+            settings: review_settings(),
+            ledger: parts.ledger.clone(),
+            rules: parts.rules.clone(),
+            instructions: instructions.clone(),
+        };
+        // One reviewer per review point: a project review command replaces both
+        // built-in reviews (0028).
+        let project = (!review_config.commands.is_empty()).then(|| {
+            Arc::new(
+                review_command::CommandReview::new(
+                    root.clone(),
+                    review_config.clone(),
+                    parts.workspace.clone(),
+                )
+                .with_ledger(settings.data_dir.join("verify_ledger.jsonl"))
+                .with_progress(parts.progress.clone()),
+            )
+        });
+        let commit_review = match &project {
+            Some(project) => review_config
+                .at_commit
+                .then(|| Arc::new(review::CommitReview::Project(project.clone()))),
+            None => (config.commit_review != Switch::Off).then(|| {
+                Arc::new(review::CommitReview::Builtin {
+                    mode: config.commit_review,
+                    reviewer: reviewer(&parts.background),
+                })
+            }),
+        };
+        let done_reviewer = match &project {
+            Some(project) => review_config
+                .at_done
+                .then(|| review::DoneReviewer::Project(project.clone())),
+            None => (config.self_review != Switch::Off).then(|| review::DoneReviewer::Builtin {
+                mode: config.self_review,
+                reviewer: reviewer(&parts.provider),
+            }),
+        };
+        let done_review = done_reviewer.map(|reviewer| {
+            Arc::new(review::DoneReview::new(
+                reviewer,
+                parts.workspace.clone(),
+                evidence.clone(),
+                Some(parts.progress.clone()),
+            ))
         });
         // commit_gate=off leaves the end-of-task verification but no per-commit run.
         let commit_checks = verifier
@@ -438,14 +557,14 @@ impl Assembly {
         });
         let interactive = parts.input.is_some();
         let anthropic = matches!(settings.protocol, crate::config::Protocol::Anthropic);
-        let hooks: Vec<Arc<dyn TurnHook>> = vec![
+        let mut hooks: Vec<Arc<dyn TurnHook>> = vec![
             Arc::new(EvidenceHook(evidence.clone())),
             workflow.clone(),
             Arc::new(guard::PolicyGuard {
                 permissions: parts.permissions.clone(),
                 root: root.clone(),
             }),
-            Arc::new(guard::ToolGuard::new(parts.input.clone())),
+            Arc::new(guard::ToolGuard::default()),
             Arc::new(nudge::Nudges::new(
                 nudge::NudgeLimits {
                     max_turns: settings.max_turns,
@@ -459,16 +578,18 @@ impl Assembly {
                 Some(parts.workspace.clone()),
                 evidence.clone(),
             )),
-            Arc::new(review::SelfReview::new(
-                config.self_review,
+            Arc::new(impact::ChangeImpact::new(
+                config.change_impact,
+                settings.max_turns,
                 parts.workspace.clone(),
-                review::Reviewer {
-                    provider: parts.provider.clone(),
-                    tools: parts.readonly.clone(),
-                    settings: review_settings(),
-                    ledger: parts.ledger.clone(),
-                    rules: parts.rules.clone(),
-                },
+                evidence.clone(),
+                Some(parts.progress.clone()),
+            )),
+            Arc::new(cite::Citations::new(
+                config.cite_check != Switch::Off,
+                settings.max_turns,
+                parts.workspace.clone(),
+                evidence.clone(),
                 Some(parts.progress.clone()),
             )),
             Arc::new(acceptance::Acceptance::new(
@@ -477,6 +598,12 @@ impl Assembly {
                 evidence,
             )),
         ];
+        if let Some(review) = &done_review {
+            hooks.push(review.clone());
+        }
+        if let Some(project) = project {
+            hooks.push(Arc::new(review::ReviewGuard(project)));
+        }
         Self {
             verifier,
             gated,
@@ -484,6 +611,7 @@ impl Assembly {
             workflow,
             hooks,
             commit_review,
+            review: done_review,
         }
     }
 }
@@ -627,5 +755,9 @@ mod tests {
         assert_eq!(config.done_check, Switch::Auto);
         assert_eq!(config.self_review, Switch::Off);
         assert!(config.verify_tests);
+        assert_eq!(config.cite_check, Switch::Auto);
+        assert_eq!(config.change_impact, Switch::Auto);
+        let config = GateConfig::from_json(&serde_json::json!({"cite_check":"off"}));
+        assert_eq!(config.cite_check, Switch::Off);
     }
 }

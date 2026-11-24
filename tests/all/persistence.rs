@@ -356,7 +356,7 @@ async fn continue_uses_saved_results_instead_of_repeating_finished_tools() {
                 CancellationToken::new()
             )
             .await,
-        Err(Error::Limit(_))
+        Err(Error::Stopped(stopped)) if stopped.stop == cove::engine::agent::Stop::Limit(1)
     ));
     drain.await.unwrap();
     let mut loaded = store.load(&session.id).unwrap();
@@ -938,7 +938,7 @@ async fn million_window_compacts_where_calls_slow_down() {
 /// reports no usage, so the token estimate stays uncalibrated.
 struct Summarizer {
     script: Mutex<VecDeque<Vec<Block>>>,
-    summaries: Mutex<u32>,
+    summaries: Mutex<Vec<cove::engine::agent::CompactMode>>,
     requests: Mutex<Vec<ModelRequest>>,
 }
 
@@ -950,11 +950,8 @@ impl Provider for Summarizer {
         _: CancellationToken,
     ) -> BoxFuture<'_, Result<ModelResponse>> {
         Box::pin(async move {
-            let blocks = if request
-                .system
-                .starts_with(cove::engine::agent::COMPACT_SYSTEM_PREFIX)
-            {
-                *self.summaries.lock().unwrap() += 1;
+            let blocks = if let Some(mode) = cove::engine::agent::compaction_mode(&request) {
+                self.summaries.lock().unwrap().push(mode);
                 vec![Block::Text("Summary written in the background".into())]
             } else {
                 self.requests.lock().unwrap().push(request);
@@ -969,6 +966,19 @@ impl Provider for Summarizer {
 
 #[tokio::test]
 async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
+    use cove::engine::agent::CompactMode;
+    assert_eq!(
+        summary_written_ahead(false).await,
+        [CompactMode::Standalone]
+    );
+    // A task request sent just now: the summary continues on its cache.
+    assert_eq!(
+        summary_written_ahead(true).await,
+        [CompactMode::Continuation]
+    );
+}
+
+async fn summary_written_ahead(cached: bool) -> Vec<cove::engine::agent::CompactMode> {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
@@ -986,6 +996,9 @@ async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
     };
     let before = cove::engine::context::tokens(&session.messages);
     assert!(before < slow, "{before}");
+    if cached {
+        session.task_request_at = Some(cove::session::now());
+    }
     // The read result then pushes the context past the threshold.
     std::fs::write(
         root.path().join("big.txt"),
@@ -1004,7 +1017,7 @@ async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
             }],
             vec![Block::Text("Task finished".into())],
         ])),
-        summaries: Mutex::new(0),
+        summaries: Mutex::new(Vec::new()),
         requests: Mutex::new(Vec::new()),
     });
     let budget = cove::model::models::context_budget(1_000_000, 64_000);
@@ -1041,7 +1054,8 @@ async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
         .await
         .unwrap();
     let notices = notices.await.unwrap();
-    assert_eq!(*provider.summaries.lock().unwrap(), 1, "no second summary");
+    let summaries = provider.summaries.lock().unwrap().clone();
+    assert_eq!(summaries.len(), 1, "no second summary");
     assert_eq!(session.compactions, 1);
     assert!(
         notices.iter().any(|text| text.contains("提前在后台")),
@@ -1063,6 +1077,7 @@ async fn the_summary_written_ahead_is_used_when_the_threshold_is_reached() {
     assert!(text.contains("Summary written in the background"));
     assert!(text.contains("word word"));
     assert!(cove::engine::context::tokens(&last.messages) < slow);
+    summaries
 }
 
 #[tokio::test]
@@ -1196,6 +1211,243 @@ async fn automatic_compaction_uses_the_same_meter_and_then_continues() {
             .flat_map(|message| &message.blocks)
             .any(|block| matches!(block, Block::Text(text) if text.contains("new requirement")))
     );
+}
+
+/// A reply that leaves the token estimate uncalibrated, with `cache_read` tokens
+/// served from the prompt cache.
+fn cached(blocks: Vec<Block>, cache_read: u64) -> ModelResponse {
+    let mut answer = response(blocks);
+    answer.usage_reported = false;
+    answer.usage.cache_read = cache_read;
+    answer
+}
+
+fn notices() -> (mpsc::Sender<Event>, tokio::task::JoinHandle<Vec<String>>) {
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = tokio::spawn(async move {
+        let mut notices = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let Event::Notice(text) = event {
+                notices.push(text);
+            }
+        }
+        notices
+    });
+    (tx, handle)
+}
+
+fn tool_json(request: &ModelRequest) -> String {
+    let tools: Vec<_> = request
+        .tools
+        .iter()
+        .map(|tool| json!([tool.name, tool.description, tool.schema]))
+        .collect();
+    serde_json::to_string(&tools).unwrap()
+}
+
+/// A finished task right before: its request is the prefix the cache holds.
+async fn after_a_task(agent: &Agent, session: &mut Session, store: &Store) {
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            session,
+            Some("next task".into()),
+            store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert!(session.task_request_at.is_some());
+}
+
+#[tokio::test]
+async fn compaction_continues_on_the_conversation_while_its_cache_lives() {
+    use cove::engine::agent::{COMPACT_NOTE_PREFIX, CompactMode, compaction_mode};
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let provider = Fake::new(vec![
+        cached(vec![Block::Text("Task finished".into())], 0),
+        cached(
+            vec![Block::Text("Summary on the conversation".into())],
+            9_000,
+        ),
+    ]);
+    let agent = agent(provider.clone(), tools, 3);
+    after_a_task(&agent, &mut session, &store).await;
+    let (tx, notices) = notices();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let notices = notices.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("读缓存 9000 tokens")),
+        "{notices:?}"
+    );
+    let requests = provider.requests.lock().unwrap();
+    let (turn, summary) = (&requests[0], &requests[1]);
+    // The conversation's own request, unchanged, with one request appended.
+    assert_eq!(compaction_mode(turn), None);
+    assert_eq!(compaction_mode(summary), Some(CompactMode::Continuation));
+    assert_eq!(summary.system, turn.system);
+    assert_eq!(tool_json(summary), tool_json(turn));
+    assert!(!summary.tools.is_empty());
+    assert_eq!(summary.cache, turn.cache);
+    assert_eq!(summary.model, turn.model);
+    let n = turn.messages.len();
+    assert_eq!(
+        serde_json::to_string(&summary.messages[..n]).unwrap(),
+        serde_json::to_string(&turn.messages).unwrap()
+    );
+    assert_eq!(summary.messages.len(), n + 2, "the reply, then the request");
+    let note = cove::model::oneshot::response_text(summary.messages.last().unwrap());
+    assert!(note.starts_with(COMPACT_NOTE_PREFIX), "{note}");
+    assert_eq!(summary.max_output_tokens, 256);
+    // The result has the usual shape: the summary, then what is kept verbatim.
+    let text = serde_json::to_string(&session.messages).unwrap();
+    assert!(text.contains("Summary on the conversation"));
+    assert!(text.contains("Task finished"));
+    assert!(!text.contains(COMPACT_NOTE_PREFIX));
+    session.validate().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_after_the_cache_expired_is_standalone_without_cache_marks() {
+    use cove::engine::agent::{CompactMode, compaction_mode};
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let provider = Fake::new(vec![
+        cached(vec![Block::Text("Task finished".into())], 0),
+        cached(vec![Block::Text("Standalone summary".into())], 0),
+    ]);
+    let agent = agent(provider.clone(), tools, 3);
+    after_a_task(&agent, &mut session, &store).await;
+    session.task_request_at = session.task_request_at.map(|sent| sent - 301);
+    let (tx, notices) = notices();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let notices = notices.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    assert!(
+        notices.iter().any(|text| text.contains("读缓存 0 tokens")),
+        "{notices:?}"
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(compaction_mode(&requests[1]), Some(CompactMode::Standalone));
+    assert!(requests[1].tools.is_empty());
+    assert_eq!(requests[1].cache, cove::domain::Cache::Off);
+}
+
+#[tokio::test]
+async fn a_tool_call_instead_of_a_summary_leaves_the_context_as_it_was() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let provider = Fake::new(vec![
+        cached(vec![Block::Text("Task finished".into())], 0),
+        cached(
+            vec![Block::ToolUse {
+                id: "x1".into(),
+                name: "read".into(),
+                input: json!({"path":"file"}),
+                extra: None,
+            }],
+            9_000,
+        ),
+    ]);
+    let agent = agent(provider.clone(), tools, 3);
+    after_a_task(&agent, &mut session, &store).await;
+    let original = serde_json::to_string(&session.messages).unwrap();
+    let (tx, drain) = events();
+    let error = agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap_err();
+    drain.await.unwrap();
+    // `/compact` reports it and does not retry.
+    assert!(error.to_string().contains("工具调用"), "{error}");
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(serde_json::to_string(&session.messages).unwrap(), original);
+    assert_eq!(session.compactions, 0);
+    assert_eq!(store.load(&session.id).unwrap().compactions, 0);
+}
+
+#[tokio::test]
+async fn automatic_compaction_continues_and_retries_standalone_once_when_that_fails() {
+    use cove::engine::agent::{CompactMode, compaction_mode};
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (_, tools) = setup(root.path(), &store);
+    let mut session = session(root.path());
+    long_history(&mut session);
+    let provider = Fake::new(vec![
+        cached(vec![Block::Text("Task finished".into())], 0),
+        // The continuation answers with a tool call: no summary.
+        cached(
+            vec![Block::ToolUse {
+                id: "x1".into(),
+                name: "read".into(),
+                input: json!({"path":"file"}),
+                extra: None,
+            }],
+            9_000,
+        ),
+        cached(vec![Block::Text("Standalone summary".into())], 0),
+        cached(vec![Block::Text("Second task finished".into())], 0),
+    ]);
+    let agent = agent(provider.clone(), tools, 5);
+    after_a_task(&agent, &mut session, &store).await;
+    // The next task passes the threshold; the conversation still fits the budget.
+    let tokens = cove::engine::context::tokens(&session.messages) + 10;
+    agent.set_context_tokens(tokens + 400).unwrap();
+    let (tx, notices) = notices();
+    agent
+        .run_in(
+            &mut session,
+            Some("another task".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let notices = notices.await.unwrap();
+    assert_eq!(session.compactions, 1);
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("改用独立的压缩请求重试一次")),
+        "{notices:?}"
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        compaction_mode(&requests[1]),
+        Some(CompactMode::Continuation)
+    );
+    assert_eq!(compaction_mode(&requests[2]), Some(CompactMode::Standalone));
+    assert_eq!(compaction_mode(&requests[3]), None);
+    let text = serde_json::to_string(&requests[3].messages).unwrap();
+    assert!(text.contains("Standalone summary") && text.contains("another task"));
 }
 
 #[test]
@@ -1375,4 +1627,141 @@ async fn continuation_does_not_hide_a_failure_from_an_earlier_window() {
         .unwrap();
     drain.await.unwrap();
     assert_eq!(report.tools_failed, 1);
+}
+
+/// The project context of `root` as a process starting there computes it.
+fn project_context(root: &std::path::Path) -> String {
+    cove::engine::prompt::system_context(root, &[], &["中文回复".into()])
+}
+
+/// One process: an agent with the project context it computed at startup, on the
+/// session the store holds.
+async fn task_in_process(
+    root: &std::path::Path,
+    store: &Store,
+    id: &str,
+    prompt: &str,
+) -> (Session, ModelRequest) {
+    let (_, tools) = setup(root, store);
+    let provider = Fake::new(vec![response(vec![Block::Text("done".into())])]);
+    let agent = agent(provider.clone(), tools, 3).with_project_context(Some(project_context(root)));
+    let mut session = store.load(id).unwrap();
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some(prompt.into()),
+            store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(
+        agent.system_prompt_for(&session),
+        provider.requests.lock().unwrap()[0].system
+    );
+    let request = provider.requests.lock().unwrap().remove(0);
+    (session, request)
+}
+
+fn task_text(request: &ModelRequest) -> String {
+    cove::model::oneshot::response_text(request.messages.last().unwrap())
+}
+
+#[tokio::test]
+async fn a_resumed_session_keeps_its_project_context_and_hears_of_instruction_changes_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "Run cargo test.").unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let first = session(root.path());
+    store.save(&first).unwrap();
+    let (saved, request) = task_in_process(root.path(), &store, &first.id, "task one").await;
+    let original = request.system;
+    assert_eq!(
+        saved.system_context.as_deref(),
+        Some(project_context(root.path()).as_str())
+    );
+    store.flush(&saved).unwrap();
+
+    // A new file changes the outline: the next process keeps the recorded context.
+    std::fs::write(root.path().join("src/lib.rs"), "").unwrap();
+    assert!(!original.contains(&project_context(root.path())));
+    let (_, request) = task_in_process(root.path(), &store, &first.id, "task two").await;
+    assert_eq!(request.system, original);
+    assert!(!task_text(&request).contains("[project context]"));
+
+    // A changed instruction file is told once, in the task's message; the system
+    // prompt stays.
+    std::fs::write(root.path().join("AGENTS.md"), "Run cargo test --release.").unwrap();
+    let (_, request) = task_in_process(root.path(), &store, &first.id, "task three").await;
+    assert_eq!(request.system, original);
+    let text = task_text(&request);
+    assert!(
+        text.contains("[project context]") && text.contains("Run cargo test --release."),
+        "{text}"
+    );
+    let (_, request) = task_in_process(root.path(), &store, &first.id, "task four").await;
+    assert_eq!(request.system, original);
+    assert!(!task_text(&request).contains("[project context]"));
+}
+
+#[tokio::test]
+async fn compaction_and_older_sessions_use_the_current_project_context() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "Run the tests.").unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // Saved before 0036: a conversation, no recorded context.
+    let mut old = session(root.path());
+    long_history(&mut old);
+    assert!(old.system_context.is_none());
+    store.save(&old).unwrap();
+    let (resumed, request) = task_in_process(root.path(), &store, &old.id, "next task").await;
+    assert!(request.system.contains(&project_context(root.path())));
+    assert_eq!(
+        resumed.system_context.as_deref(),
+        Some(project_context(root.path()).as_str())
+    );
+    assert!(!task_text(&request).contains("[project context]"));
+
+    // Compaction renews it: the next request carries the current context.
+    std::fs::write(root.path().join("notes.txt"), "new top-level file").unwrap();
+    let current = project_context(root.path());
+    let (_, tools) = setup(root.path(), &store);
+    let provider = Fake::new(vec![
+        response(vec![Block::Text("Summary".into())]),
+        response(vec![Block::Text("done".into())]),
+    ]);
+    let agent = agent(provider.clone(), tools, 3).with_project_context(Some(current.clone()));
+    let mut session = store.load(&old.id).unwrap();
+    assert!(!agent.system_prompt_for(&session).contains(&current));
+    let (tx, drain) = events();
+    agent
+        .compact(&mut session, &store, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(session.system_context.as_deref(), Some(current.as_str()));
+    let (tx, drain) = events();
+    agent
+        .run_in(
+            &mut session,
+            Some("after compaction".into()),
+            &store,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].system.contains(&current));
+    assert!(!task_text(&requests[1]).contains("[project context]"));
+    assert_eq!(store.load(&old.id).unwrap().system_context, Some(current));
 }

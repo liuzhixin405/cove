@@ -14,11 +14,19 @@ pub enum Error {
     Cancelled,
     #[error("已达上限：{0}")]
     Limit(String),
+    /// cove ended the task itself (call quota used up, no progress) after a closing
+    /// summary; the report says what was done.
+    #[error("{}", .0.stop.message())]
+    Stopped(Box<crate::engine::agent::Stopped>),
     #[error("需要批准或已被拒绝：{0}")]
     Approval(String),
     /// The user said no to a call; the model hears it and goes on.
     #[error("用户拒绝了：{0}")]
     Denied(String),
+    /// A call needed approval with nobody to ask (`-p`, a pipe, a background agent):
+    /// it was not run; the model hears it and goes on.
+    #[error("需要批准，但没有终端可以询问，未执行：{0}")]
+    Unattended(String),
     #[error("模型服务：{0}")]
     Provider(String),
     #[error("tool: {0}")]
@@ -160,9 +168,29 @@ pub struct ModelRequest {
     pub estimated_tokens: Option<usize>,
     /// Model for this request; `None` lets the provider (or router) choose.
     pub model: Option<String>,
-    /// A conversation turn the user may pause after: its prompt cache is kept an hour
-    /// where the provider supports that (one-off background calls keep the default).
-    pub long_cache: bool,
+    /// The prompt-cache marks the request carries (providers that cache on their own,
+    /// such as OpenAI-compatible ones, ignore them).
+    pub cache: Cache,
+}
+
+/// Prompt-cache marks of a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cache {
+    /// No marks: a one-off prompt nothing reads again (a standalone compaction), so
+    /// writing it to the cache would only cost more than plain input.
+    Off,
+    /// The provider's default lifetime (five minutes).
+    #[default]
+    Short,
+    /// An hour where the model supports it: a conversation turn the user may pause after.
+    Hour,
+}
+
+impl Cache {
+    /// A conversation turn's marks: an hour when `long`, else the default.
+    pub fn turn(long: bool) -> Self {
+        if long { Self::Hour } else { Self::Short }
+    }
 }
 
 /// `input` counts every prompt token; `cache_read` and `cache_write` are the parts
@@ -261,6 +289,14 @@ impl Progress {
         if let Some(sender) = sender {
             // A closed display must not fail the command itself.
             let _ = sender.send(Event::Output { line, stderr }).await;
+        }
+    }
+
+    /// A notice for the user (shown even when live tool output is off).
+    pub async fn notice(&self, text: String) {
+        let sender = self.sender.lock().ok().and_then(|current| current.clone());
+        if let Some(sender) = sender {
+            let _ = sender.send(Event::Notice(text)).await;
         }
     }
 }

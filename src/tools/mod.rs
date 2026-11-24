@@ -31,7 +31,7 @@ use crate::{
 
 mod edit;
 mod question;
-mod search;
+pub(crate) mod search;
 mod todo;
 mod tracker;
 
@@ -143,8 +143,9 @@ pub trait ToolExecutor: Send + Sync {
     /// lost parallel reads, so every implementation now says what it does.
     fn metered(&self, name: &str) -> bool;
     /// Read-only tools without approval prompts or side effects that the kernel may run
-    /// concurrently with neighbouring calls of the same kind.
-    fn concurrent(&self, name: &str) -> bool;
+    /// concurrently with neighbouring calls of the same kind. `input` decides for tools
+    /// whose arguments matter (`agent` with a read-only type).
+    fn concurrent(&self, name: &str, input: &Value) -> bool;
     fn execute(
         &self,
         name: String,
@@ -1016,8 +1017,7 @@ impl ToolExecutor for LocalTools {
                 "read",
                 "Read a workspace file as numbered lines, or list a directory (subdirectories end with /). \
                  Shows 2000 lines from offset (1-based) unless limit is given; lines over 2000 characters are clipped. \
-                 When more remains the result ends with [next: offset=N]. GBK/GB18030 files are decoded; binary and UTF-16 files are refused. \
-                 Reading a file is required before replacing it with write.",
+                 When more remains the result ends with [next: offset=N]. GBK/GB18030 files are decoded; binary and UTF-16 files are refused.",
                 json!({
                     "path":{"type":"string"},
                     "offset":{"type":"integer","minimum":1,"description":"first line, 1-based"},
@@ -1067,9 +1067,9 @@ impl ToolExecutor for LocalTools {
             definition(
                 "repo_map",
                 &format!(
-                    "Repository map: source files with their types, functions and methods (signature and line), ranked by cross-file references (PageRank). \
-                     query: space-separated path fragments or identifiers, case-insensitive; also lists files most connected to the matches. \
-                     path: only files under this directory. Both optional; with neither, lists the most referenced files. Capped at 12 KiB. Maps {}.",
+                    "Repository map: source files with their types, functions and methods (signature and line), most referenced first. \
+                     query: space-separated path fragments or identifiers (case-insensitive), plus the files most connected to the matches; \
+                     path: only files under this directory; neither: the most referenced files. Capped at 12 KiB. Maps {}.",
                     repomap::LANGUAGES
                 ),
                 json!({"query":{"type":"string"},"path":{"type":"string"}}),
@@ -1080,7 +1080,7 @@ impl ToolExecutor for LocalTools {
                 &format!(
                     "Run a command in {} in the workspace directory; write that shell's syntax. A command plainly written for another installed shell (PowerShell cmdlets, cmd %VAR%) runs in that shell. Non-interactive: no pager, editor or credential prompt, colours off. \
                      Default timeout 120 s (300 s for builds and test suites), at most 600 (timeout_seconds). Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). No background jobs. Host access is NOT sandboxed. \
-                     Not for reading or searching files: read, grep and glob are faster, need no approval and skip ignored directories.",
+                     Not for reading, searching or editing files.",
                     self.shell.describe()
                 ),
                 json!({
@@ -1122,7 +1122,7 @@ impl ToolExecutor for LocalTools {
         definitions
     }
 
-    fn concurrent(&self, name: &str) -> bool {
+    fn concurrent(&self, name: &str, _input: &Value) -> bool {
         matches!(name, "read" | "glob" | "grep" | "repo_map")
     }
 
@@ -1154,7 +1154,21 @@ impl ToolExecutor for LocalTools {
                 Ok(effect) => effect,
                 Err(err) => return Ok(failed(err.to_string())),
             };
-            self.authorizer.authorize(effect, cancel.clone()).await?;
+            let approval = self.authorizer.authorize(effect, cancel.clone());
+            match (&call, &self.workspace) {
+                // After a refusal, a script this task's file tools wrote asks (0038).
+                (Call::Shell(_), Some(workspace)) => {
+                    let changed = workspace.changed_paths().unwrap_or_default();
+                    crate::safety::permission::with_written(
+                        &self.root,
+                        workspace.root(),
+                        &changed,
+                        approval,
+                    )
+                    .await?
+                }
+                _ => approval.await?,
+            }
             // Images (sniffed by content) go to the model as native image parts.
             // Decoding/resizing/base64 runs off the async workers.
             if let Call::Read(args) = &call {

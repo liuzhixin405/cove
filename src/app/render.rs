@@ -10,6 +10,7 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const CODE: &str = "\x1b[38;5;180m";
 const HEADING: &str = "\x1b[1;4m";
@@ -376,6 +377,10 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
             _ => "已拒绝（已告诉模型）".into(),
         }];
     }
+    // engine::agent::unattended: approval was needed and nobody could be asked.
+    if output.starts_with("This call needs approval, but nobody can be asked") {
+        return vec!["未执行：需要批准，但没有终端可以询问（已告诉模型）".into()];
+    }
     if failed && name != "shell" {
         return tail(output, 4);
     }
@@ -476,7 +481,8 @@ fn shell_summary(failed: bool, output: &str, streamed: bool) -> Vec<String> {
     rows
 }
 
-/// The closing row of a task.
+/// The closing row of a task; `stop` says why cove ended it before the model did.
+#[allow(clippy::too_many_arguments)]
 pub fn report(
     failed_tools: u32,
     tools: u32,
@@ -485,6 +491,7 @@ pub fn report(
     cost: Option<f64>,
     seconds: f64,
     verification: &str,
+    stop: Option<&str>,
 ) -> String {
     let mut parts = vec![format!("{model_calls} 次模型调用")];
     if tools > 0 {
@@ -502,10 +509,16 @@ pub fn report(
     if !verification.is_empty() {
         parts.push(verification.to_owned());
     }
-    format!(
-        "\n{GREEN}✓{RESET} {DIM}完成 · {}{RESET}\n",
-        parts.join(" · ")
-    )
+    match stop {
+        Some(stop) => format!(
+            "\n{YELLOW}■{RESET} {DIM}已停下 · {stop} · {}{RESET}\n",
+            parts.join(" · ")
+        ),
+        None => format!(
+            "\n{GREEN}✓{RESET} {DIM}完成 · {}{RESET}\n",
+            parts.join(" · ")
+        ),
+    }
 }
 
 /// `52.1k`, `200k`, `1.2M`.
@@ -1222,6 +1235,11 @@ mod tests {
         assert_eq!(
             summary("shell", true, refused, false),
             ["已拒绝：不要上传（已告诉模型）"]
+        );
+        let unattended = "This call needs approval, but nobody can be asked: cove is running without a terminal (-p, a pipe or a background agent), so it was not run (git rm a). Do not retry it.";
+        assert_eq!(
+            summary("shell", true, unattended, false),
+            ["未执行：需要批准，但没有终端可以询问（已告诉模型）"]
         );
     }
 }

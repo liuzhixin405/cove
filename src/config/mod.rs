@@ -25,7 +25,7 @@ pub enum Protocol {
 }
 
 #[derive(Clone, Parser)]
-#[command(version, about = "Cove Rust preview: a permission-aware coding agent")]
+#[command(version = crate::build_id::label(), about ="Cove Rust preview: a permission-aware coding agent")]
 pub struct Cli {
     /// One-shot prompt; piped stdin is appended (`cat log | cove -p "explain"`). Never reads approval answers from stdin.
     #[arg(short = 'p', long, conflicts_with = "prompt", num_args = 0..=1, default_missing_value = "", value_name = "PROMPT")]
@@ -83,6 +83,9 @@ pub struct Cli {
     pub provider: Option<String>,
     #[arg(long, env = "COVE_MODEL")]
     pub model: Option<String>,
+    /// Model of explore sub-agents: fast (default) or main (`explore_model`).
+    #[arg(long, value_name = "fast|main")]
+    pub explore_model: Option<String>,
     /// API root including /v1 when needed, not the final endpoint.
     #[arg(long, env = "COVE_BASE_URL")]
     pub base_url: Option<String>,
@@ -379,6 +382,7 @@ struct Profile {
     #[serde(alias = "mode")]
     permission_mode: Option<String>,
     max_iterations: Option<u32>,
+    stall_rounds: Option<u32>,
     max_turn_minutes: Option<u64>,
     subagent_max_iterations: Option<u32>,
     system_prompt: Option<String>,
@@ -388,6 +392,8 @@ struct Profile {
     input_price: Option<f64>,
     output_price: Option<f64>,
     model_fast: Option<String>,
+    /// fast (default) or main: the model explore sub-agents run on.
+    explore_model: Option<String>,
     thinking: Option<String>,
     effort: Option<String>,
     show_reasoning: Option<bool>,
@@ -402,6 +408,7 @@ impl Profile {
             provider: self.provider.or(base.provider),
             permission_mode: self.permission_mode.or(base.permission_mode),
             max_iterations: self.max_iterations.or(base.max_iterations),
+            stall_rounds: self.stall_rounds.or(base.stall_rounds),
             max_turn_minutes: self.max_turn_minutes.or(base.max_turn_minutes),
             subagent_max_iterations: self
                 .subagent_max_iterations
@@ -413,6 +420,7 @@ impl Profile {
             input_price: self.input_price.or(base.input_price),
             output_price: self.output_price.or(base.output_price),
             model_fast: self.model_fast.or(base.model_fast),
+            explore_model: self.explore_model.or(base.explore_model),
             thinking: self.thinking.or(base.thinking),
             effort: self.effort.or(base.effort),
             show_reasoning: self.show_reasoning.or(base.show_reasoning),
@@ -427,6 +435,7 @@ const PROFILE_KEYS: &[&str] = &[
     "permission_mode",
     "mode",
     "max_iterations",
+    "stall_rounds",
     "max_turn_minutes",
     "subagent_max_iterations",
     "system_prompt",
@@ -436,6 +445,7 @@ const PROFILE_KEYS: &[&str] = &[
     "input_price",
     "output_price",
     "model_fast",
+    "explore_model",
     "thinking",
     "effort",
     "show_reasoning",
@@ -466,11 +476,6 @@ const ROOT_KEYS: &[&str] = &[
     "experimental_tools",
     "regression_command",
     "max_background_agents",
-    // Read by `gates` from the effective config JSON.
-    "done_check",
-    "done_verify_tests",
-    "done_self_review",
-    "workflow",
 ];
 const PROVIDER_KEYS: &[&str] = &["name", "api_key", "api_keys", "base_url"];
 pub const MODEL_CONTEXT_WINDOWS_CACHE: &str = "model-context-windows.json";
@@ -605,7 +610,14 @@ fn unknown_keys(value: &Value) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    let root: Vec<&str> = PROFILE_KEYS.iter().chain(ROOT_KEYS).copied().collect();
+    // `gates` reads its own keys from the effective config JSON: one list, so a new
+    // gate key cannot be reported as unsupported while it is in use.
+    let root: Vec<&str> = PROFILE_KEYS
+        .iter()
+        .chain(ROOT_KEYS)
+        .chain(crate::safety::gates::CONFIG_KEYS)
+        .copied()
+        .collect();
     object_keys(value, "", &root, &mut out);
     let profile_keys: Vec<&str> = root
         .iter()
@@ -688,7 +700,8 @@ fn effective_json(raw: &Value, profile: Option<&str>) -> Value {
 
 pub struct Settings {
     /// Effective config JSON (root + selected profile) for modules that read their own keys.
-    /// Keys read this way must also be listed in `ROOT_KEYS`/`PROFILE_KEYS`.
+    /// Keys read this way must also be listed in `ROOT_KEYS`/`PROFILE_KEYS` (or
+    /// `gates::CONFIG_KEYS`).
     pub file: Value,
     pub extensions: crate::extensions::ExtensionConfig,
     pub extension_base: PathBuf,
@@ -711,6 +724,8 @@ pub struct Settings {
     pub key_source: String,
     /// Cheaper model for simple tasks and background calls (`model_fast`).
     pub model_fast: Option<String>,
+    /// `explore_model`: explore sub-agents run on the fast model (default) or the main one.
+    pub explore_fast: bool,
     pub thinking: Option<crate::model::provider::Thinking>,
     pub effort: Option<String>,
     /// Print reasoning text live instead of hiding it.
@@ -733,6 +748,8 @@ pub struct Settings {
     pub permission: Mode,
     pub interactive: bool,
     pub max_turns: u32,
+    /// Rounds without new changes or information that stop a task (0 = off).
+    pub stall_rounds: u32,
     pub timeout: Duration,
     pub max_output_tokens: u32,
     pub prices: Option<(f64, f64)>,
@@ -936,6 +953,17 @@ impl Settings {
             .map(str::trim)
             .filter(|fast| !fast.is_empty() && !fast.eq_ignore_ascii_case("off"))
             .map(str::to_owned);
+        let explore_fast = match cli
+            .explore_model
+            .as_deref()
+            .or(config.explore_model.as_deref())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("fast") => true,
+            Some("main") => false,
+            Some(other) => anyhow::bail!("explore_model 只能是 fast 或 main，而不是 {other:?}"),
+        };
 
         let interactive = cli.print.is_none() && !cli.continue_task;
         let one_shot = cli.print.is_some() || cli.prompt.is_some() || cli.continue_task;
@@ -1080,6 +1108,7 @@ impl Settings {
             api_keys,
             key_source,
             model_fast,
+            explore_fast,
             thinking,
             effort,
             show_reasoning: config.show_reasoning.unwrap_or(false),
@@ -1097,6 +1126,9 @@ impl Settings {
             permission,
             interactive,
             max_turns,
+            stall_rounds: config
+                .stall_rounds
+                .unwrap_or(crate::engine::progress::STALL_ROUNDS),
             timeout: Duration::from_secs(timeout),
             max_output_tokens,
             prices,
@@ -1283,5 +1315,35 @@ mod tests {
         assert!(provider.api_key.is_none());
         assert_eq!(profile.max_iterations, Some(7));
         assert!(file.resolve(Some("missing".into())).is_err());
+    }
+
+    #[test]
+    fn every_gate_key_is_a_supported_key() {
+        // commit_gate and commit_review were read by the gates but reported as
+        // unsupported; the gates' own list is part of the allowed keys now.
+        let value = serde_json::json!({
+            "commit_gate": "off",
+            "commit_review": "auto",
+            "review_commands": ["python tools/review.py"],
+            "review_when": "both",
+            "review_block": "medium",
+            "review_max_rounds": 2,
+            "review_timeout_seconds": 600,
+            "review_instructions": "eng/SKILL.md",
+            "profiles": {"p": {"commit_review": "off", "review_block": "low"}}
+        });
+        assert!(
+            unknown_keys(&value).is_empty(),
+            "{:?}",
+            unknown_keys(&value)
+        );
+        let all: serde_json::Map<String, Value> = crate::safety::gates::CONFIG_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), Value::Bool(true)))
+            .collect();
+        assert!(unknown_keys(&Value::Object(all)).is_empty());
+        let mut warnings = Vec::new();
+        FileConfig::parse(value, Path::new("config.json"), &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

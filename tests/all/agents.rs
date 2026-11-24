@@ -3,7 +3,7 @@
 
 use crate::common::{self, Launch};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -22,6 +22,8 @@ type Queue = VecDeque<Option<String>>;
 struct Mock {
     url: String,
     requests: Arc<Mutex<Vec<(String, Value)>>>,
+    /// When each request arrived and when its answer was sent, by role.
+    times: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -40,6 +42,20 @@ impl Mock {
             .filter(|(name, _)| name == role)
             .map(|(_, body)| body.clone())
             .collect()
+    }
+
+    /// (arrived, answered) of the requests of `role`, in arrival order.
+    fn times(&self, role: &str) -> Vec<(std::time::Instant, std::time::Instant)> {
+        let mut times: Vec<_> = self
+            .times
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _, _)| name == role)
+            .map(|(_, arrived, answered)| (*arrived, *answered))
+            .collect();
+        times.sort();
+        times
     }
 }
 
@@ -66,6 +82,12 @@ fn role(body: &Value) -> String {
     if text.contains("independent regression verifier") {
         return "verify".into();
     }
+    if text.contains("You are a delegated read-only sub-agent (explore)") {
+        return "explore".into();
+    }
+    if text.contains("delegated sub-agent with write access") {
+        return "general".into();
+    }
     "parent".into()
 }
 
@@ -80,6 +102,8 @@ async fn mock(queues: Vec<(&str, Vec<Option<String>>)>) -> Mock {
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let log = requests.clone();
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let timing = times.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -87,6 +111,7 @@ async fn mock(queues: Vec<(&str, Vec<Option<String>>)>) -> Mock {
             };
             let queues = queues.clone();
             let log = log.clone();
+            let timing = timing.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let body_start = loop {
@@ -124,6 +149,7 @@ async fn mock(queues: Vec<(&str, Vec<Option<String>>)>) -> Mock {
                 let body: Value =
                     serde_json::from_slice(&request[body_start..body_start + length]).unwrap();
                 let name = role(&body);
+                let arrived = std::time::Instant::now();
                 log.lock().unwrap().push((name.clone(), body));
                 let response = queues
                     .lock()
@@ -138,6 +164,19 @@ async fn mock(queues: Vec<(&str, Vec<Option<String>>)>) -> Mock {
                     }
                     None => text(&format!("(no scripted response for {name})")),
                 };
+                // "@delay:<ms>\n<response>" answers after a pause (a slow model call).
+                let response = match response.strip_prefix("@delay:") {
+                    Some(rest) => {
+                        let (ms, body) = rest.split_once('\n').unwrap();
+                        tokio::time::sleep(Duration::from_millis(ms.parse().unwrap())).await;
+                        body.to_owned()
+                    }
+                    None => response,
+                };
+                timing
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), arrived, std::time::Instant::now()));
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response.len()
@@ -151,6 +190,7 @@ async fn mock(queues: Vec<(&str, Vec<Option<String>>)>) -> Mock {
     Mock {
         url,
         requests,
+        times,
         task,
     }
 }
@@ -734,5 +774,274 @@ async fn experimental_tools_and_custom_agent_types_come_from_the_config() {
         requests[3]
             .to_string()
             .contains("(docs): docs] [exit: completed")
+    );
+}
+
+#[tokio::test]
+async fn a_sub_agent_without_progress_ends_stalled_and_the_parent_goes_on() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({"stall_rounds":4}).to_string(),
+    )
+    .unwrap();
+    let read = || {
+        Some(tool(
+            &cove::session::new_id(),
+            "read",
+            json!({"path":"missing.txt"}),
+        ))
+    };
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool(
+                    "look",
+                    "agent",
+                    json!({"description":"find the config","prompt":"Read missing.txt and report its settings","type":"explore"}),
+                )),
+                Some(text("The sub-agent could not read missing.txt; it does not exist.")),
+            ],
+        ),
+        (
+            "explore",
+            vec![
+                read(),
+                read(),
+                read(),
+                read(),
+                read(),
+                Some(text("missing.txt does not exist.")),
+            ],
+        ),
+    ])
+    .await;
+    let (_, _, stderr) =
+        run(cli(root.path(), data.path(), &server.url).args(["-p", "find the config"])).await;
+    let explore = server.requests("explore");
+    assert_eq!(explore.len(), 6, "{stderr}");
+    assert!(explore[5].to_string().contains("cove stopped the task"));
+    let parent = server.requests("parent");
+    assert_eq!(parent.len(), 2, "{stderr}");
+    assert!(
+        parent[1].to_string().contains("[exit: stalled"),
+        "{}",
+        parent[1]
+    );
+}
+
+/// Several tool calls in one response.
+fn calls(list: &[(&str, &str, Value)]) -> String {
+    let calls: Vec<Value> = list
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            json!({"index":index,"id":id,"type":"function",
+                "function":{"name":name,"arguments":arguments.to_string()}})
+        })
+        .collect();
+    openai(json!({ "tool_calls": calls }), "tool_calls")
+}
+
+/// A provider block in the config (a command-line provider would drop `model_fast`):
+/// DeepSeek's pro as the main model and flash as the fast one, at their list prices.
+fn fast_cli(root: &Path, data: &Path, url: &str) -> Command {
+    let config = data.join("config.json");
+    std::fs::write(
+        &config,
+        json!({"provider":{"name":"openai","base_url":url},
+            "model":"deepseek-v4-pro","model_fast":"deepseek-v4-flash"})
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(common::exe());
+    command
+        .args(["--permission", "bypass", "--timeout", "60", "--config"])
+        .arg(&config)
+        .arg("--cwd")
+        .arg(root)
+        .arg("--data-dir")
+        .arg(data);
+    command.env("COVE_API_KEY", "test-only-not-a-real-key");
+    command.kill_on_drop(true);
+    command
+}
+
+fn jsonl(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn explore_runs_on_the_fast_model_in_parallel_and_is_billed_at_its_prices() {
+    let root = repo();
+    let data = tempfile::tempdir().unwrap();
+    let explore = |area: &str| {
+        Some(format!(
+            "@delay:1500\n{}",
+            text(&format!(
+                "Conclusion: {area} has one caller.\nEvidence:\n- README.md:1 the caller\n- src/gone.rs:3 a stale reference\nNot determined: nothing"
+            ))
+        ))
+    };
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(calls(&[
+                    (
+                        "e1",
+                        "agent",
+                        json!({"description":"area one","prompt":"Who calls save in area one?","type":"explore"}),
+                    ),
+                    (
+                        "e2",
+                        "agent",
+                        json!({"description":"area two","prompt":"Who calls save in area two?","type":"explore"}),
+                    ),
+                    (
+                        "g1",
+                        "agent",
+                        json!({"description":"note it","prompt":"Write nothing; reply done","type":"general"}),
+                    ),
+                ])),
+                Some(text("Done.")),
+            ],
+        ),
+        ("explore", vec![explore("area one"), explore("area two")]),
+        ("general", vec![Some(text("general done"))]),
+    ])
+    .await;
+    // "调试" routes the task to the main model.
+    let (ok, _, stderr) =
+        run(fast_cli(root.path(), data.path(), &server.url).args(["-p", "调试：谁调用了 save"]))
+            .await;
+    assert!(ok, "{stderr}");
+    // The two explore agents overlapped; the editing agent ran after both.
+    let explores = server.times("explore");
+    assert_eq!(explores.len(), 2, "{stderr}");
+    assert!(
+        explores[1].0 < explores[0].1,
+        "explore agents ran one after the other"
+    );
+    let general = server.times("general");
+    assert_eq!(general.len(), 1, "{stderr}");
+    assert!(general[0].0 >= explores[0].1 && general[0].0 >= explores[1].1);
+    // explore asked for the fast model; general kept the task's model.
+    for body in server.requests("explore") {
+        assert_eq!(body["model"], "deepseek-v4-flash", "{body}");
+    }
+    assert_eq!(server.requests("general")[0]["model"], "deepseek-v4-pro");
+    // The parent sees the evidence check and the model of each result.
+    let result = server.requests("parent")[1].to_string();
+    assert!(result.contains("citations: 1 ok, 1 invalid"), "{result}");
+    assert!(result.contains("[未核实：文件不存在]"), "{result}");
+    assert!(result.contains("model: deepseek-v4-flash"), "{result}");
+    // Session and usage ledger bill the fast model's calls at the fast model's prices.
+    let entries: Vec<Value> = std::fs::read_dir(data.path().join("usage"))
+        .unwrap()
+        .flat_map(|entry| jsonl(&entry.unwrap().path()))
+        .collect();
+    let fast: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["source"] == "agent" && entry["model"] == "deepseek-v4-flash")
+        .collect();
+    assert_eq!(fast.len(), 2, "{entries:?}");
+    let ledger: f64 = fast
+        .iter()
+        .map(|entry| entry["cost"].as_f64().unwrap())
+        .sum();
+    let flash = 2.0 * (20.0 * 0.30 + 10.0 * 1.20) / 1e6;
+    assert!((ledger - flash).abs() < 1e-12, "{ledger} vs {flash}");
+    let session: Value = serde_json::from_slice(
+        &std::fs::read(
+            data.path()
+                .join("sessions")
+                .join(format!("{}.json", saved_id(data.path()))),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let billed = session["accounting"]["by_model"]["deepseek-v4-flash"]["cost"]
+        .as_f64()
+        .unwrap();
+    assert!((billed - ledger).abs() < 1e-12, "{billed} vs {ledger}");
+    // The trace names the model that answered and the sub-agent that asked.
+    let trace = jsonl(&data.path().join("trace.jsonl"));
+    let agents: HashSet<&str> = trace
+        .iter()
+        .filter(|line| line["kind"] == "model" && line["model"] == "deepseek-v4-flash")
+        .filter_map(|line| line["agent"].as_str())
+        .collect();
+    assert_eq!(agents.len(), 2, "{trace:?}");
+    assert!(trace.iter().any(|line| line["kind"] == "model"
+        && line["model"] == "deepseek-v4-pro"
+        && line.get("agent").is_none()));
+}
+
+#[tokio::test]
+async fn a_long_answer_is_capped_in_the_parent_and_saved_whole() {
+    let root = repo();
+    let data = tempfile::tempdir().unwrap();
+    let mut answer = String::from("Conclusion: long.\nEvidence:\n- README.md:1 base\n");
+    while answer.len() < 20 * 1024 {
+        answer.push_str("- 一行很长的补充说明，父模型在 prompt 里要了 1400 字，cove 照样截断。\n");
+    }
+    answer.push_str("TAIL-MARKER\n");
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool(
+                    "e1",
+                    "agent",
+                    json!({"description":"wide","prompt":"Investigate, answer in about 1400 words","type":"explore"}),
+                )),
+                Some(text("Done.")),
+            ],
+        ),
+        ("explore", vec![Some(text(&answer))]),
+    ])
+    .await;
+    // explore_model main: explore stays on the main model.
+    let (ok, _, stderr) = run(fast_cli(root.path(), data.path(), &server.url).args([
+        "--explore-model",
+        "main",
+        "-p",
+        "调试：调查一下",
+    ]))
+    .await;
+    assert!(ok, "{stderr}");
+    assert_eq!(server.requests("explore")[0]["model"], "deepseek-v4-pro");
+    let parent = server.requests("parent");
+    let result = parent[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(result.len() < 8 * 1024, "{}", result.len());
+    assert!(!result.contains("TAIL-MARKER"));
+    assert!(result.contains("answer cut at 6 KB"), "{result}");
+    let saved: Vec<_> = std::fs::read_dir(data.path().join("tool-outputs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with("_agent.txt"))
+        .collect();
+    assert_eq!(saved.len(), 1);
+    let full = std::fs::read_to_string(&saved[0]).unwrap();
+    assert!(full.contains("TAIL-MARKER"));
+    assert!(
+        result.contains(&cove::paths::display(&saved[0])),
+        "{result}"
     );
 }

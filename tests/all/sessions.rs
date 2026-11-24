@@ -556,7 +556,10 @@ async fn git_snapshots_restore_shell_effects_and_the_restore_is_undoable() {
     .await;
     let mut command = cli(root.path(), data.path(), &url);
     command.args(["-p", "run the script"]);
+    let minute = |time: chrono::DateTime<chrono::Local>| time.format("%Y-%m-%d %H:%M").to_string();
+    let before = minute(chrono::Local::now());
     let output = command.launch().await.unwrap();
+    let after = minute(chrono::Local::now());
     assert!(
         output.status.success(),
         "{}",
@@ -579,6 +582,21 @@ async fn git_snapshots_restore_shell_effects_and_the_restore_is_undoable() {
     assert!(
         list.contains("#1") && list.contains("任务：run the script"),
         "{list}"
+    );
+    // The checkpoint time is shown in local time, not UTC.
+    let shown = list
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("#1 "))
+        .map(|rest| {
+            rest.split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        before <= shown && shown <= after,
+        "{before}..{after}: {list}"
     );
     let preview = resume("/undo #1").await;
     assert!(

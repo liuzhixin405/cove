@@ -61,7 +61,7 @@ impl JsonLog {
         self.echo.store(echo, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Appends `{"t": <local RFC 3339>, "kind": kind, ...fields}`.
+    /// Appends `{"t": <local RFC 3339>, "kind": kind, "build": BUILD, ...fields}`.
     pub fn write(&self, kind: &str, fields: Value) {
         let mut line = match fields {
             Value::Object(map) => map,
@@ -74,6 +74,7 @@ impl JsonLog {
             ),
         );
         line.insert("kind".into(), Value::String(kind.into()));
+        line.insert("build".into(), Value::String(crate::build_id::BUILD.into()));
         let Ok(mut data) = serde_json::to_vec(&Value::Object(line)) else {
             return;
         };
@@ -285,7 +286,7 @@ pub const CODES: &[Code] = &[
         "E3002",
         "permission",
         "非交互模式无法询问授权",
-        "无人值守时显式使用 --permission auto（会执行写入与 shell）",
+        "无人值守时用 --permission bypass，或在 policies.json 加 allow 规则；auto 仍会询问改文件、执行代码等命令",
     ),
     code(
         "E3004",
@@ -330,6 +331,12 @@ pub const CODES: &[Code] = &[
         "engine",
         "任务超过时限",
         "调高 --timeout / max_turn_minutes，或把任务拆小",
+    ),
+    code(
+        "E5008",
+        "engine",
+        "没有进展，已停下",
+        "用 /continue 换个思路继续，或补上缺的外部条件（服务、权限、依赖）；stall_rounds 调整轮数",
     ),
     code(
         "E6001",
@@ -386,6 +393,8 @@ pub fn classify(message: &str) -> &'static str {
         "E2007"
     } else if has(&["task deadline exceeded", "任务超过时限"]) {
         "E5007"
+    } else if has(&["没有进展", "no progress"]) {
+        "E5008"
     } else if has(&["model calls used", "model call window", "模型调用"]) {
         "E5001"
     } else if has(&["compact", "summary", "压缩", "摘要"]) {
@@ -477,22 +486,34 @@ impl Provider for Traced {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ModelResponse>> {
         Box::pin(async move {
-            let compaction = request.tools.is_empty()
-                && request
-                    .system
-                    .starts_with(crate::engine::agent::COMPACT_SYSTEM_PREFIX);
+            let compaction = crate::engine::agent::compaction_mode(&request);
             let messages = request.messages.len();
             let est_tokens = request
                 .estimated_tokens
                 .unwrap_or_else(|| crate::engine::context::tokens(&request.messages));
             let tools = request.tools.len();
+            let requested = request.model.clone();
             let started = Instant::now();
             let result = self.inner.stream(request, events, cancel.clone()).await;
             let ms = started.elapsed().as_millis() as u64;
+            // The model that answered (the fast one, a fallback), else the one asked for.
+            let model = result
+                .as_ref()
+                .ok()
+                .and_then(|response| response.model.clone())
+                .or(requested)
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| self.model.clone());
             let mut fields = json!({
-                "model": self.model, "messages": messages, "est_tokens": est_tokens,
+                "model": model, "messages": messages, "est_tokens": est_tokens,
                 "tools": tools, "ms": ms,
             });
+            if let Ok(agent) = crate::agents::subagent::CURRENT_AGENT.try_with(Clone::clone) {
+                merge(&mut fields, json!({ "agent": agent }));
+            }
+            if let Some(mode) = compaction {
+                merge(&mut fields, json!({ "mode": mode.name() }));
+            }
             match &result {
                 Ok(response) => {
                     let (calls, text) =
@@ -507,7 +528,8 @@ impl Provider for Traced {
                             });
                     let extra = json!({
                         "complete": response.complete, "in": response.usage.input,
-                        "out": response.usage.output, "tool_calls": calls, "content_bytes": text,
+                        "cache_read": response.usage.cache_read, "out": response.usage.output,
+                        "tool_calls": calls, "content_bytes": text,
                     });
                     merge(&mut fields, extra);
                 }
@@ -524,7 +546,11 @@ impl Provider for Traced {
                     }
                 }
             }
-            let kind = if compaction { "compact" } else { "model" };
+            let kind = if compaction.is_some() {
+                "compact"
+            } else {
+                "model"
+            };
             self.diagnostics.trace.write(kind, fields);
             result
         })
@@ -542,6 +568,7 @@ pub struct TraceHook {
     diagnostics: Arc<Diagnostics>,
     tool_started: Mutex<Option<Instant>>,
     task_started: Mutex<Option<Instant>>,
+    stats: Mutex<Option<crate::engine::turn::TaskStats>>,
 }
 
 impl TraceHook {
@@ -550,6 +577,7 @@ impl TraceHook {
             diagnostics,
             tool_started: Mutex::new(None),
             task_started: Mutex::new(None),
+            stats: Mutex::new(None),
         }
     }
 
@@ -594,6 +622,12 @@ impl TurnHook for TraceHook {
         None
     }
 
+    fn task_stats(&self, stats: &crate::engine::turn::TaskStats) {
+        if let Ok(mut slot) = self.stats.lock() {
+            *slot = Some(*stats);
+        }
+    }
+
     fn task_end<'a>(&'a self, session: &'a Session, completed: bool) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let reason = match &session.state {
@@ -605,8 +639,20 @@ impl TurnHook for TraceHook {
                 "messages": session.messages.len(),
                 "est_tokens": crate::engine::context::tokens(&session.messages),
                 "failures": session.task_failures,
+                // The session's running total; `task_calls` is this run's.
                 "model_calls": session.accounting.model_calls,
             });
+            if let Some(stats) = self.stats.lock().ok().and_then(|mut slot| slot.take()) {
+                merge(
+                    &mut fields,
+                    json!({
+                        "task_calls": stats.model_calls,
+                        "idle_max": stats.idle_max,
+                        "stalled": stats.stalled,
+                        "system_reused": stats.system_reused,
+                    }),
+                );
+            }
             if let Some(ms) = Self::elapsed(&self.task_started) {
                 merge(&mut fields, json!({"ms": ms}));
             }
@@ -697,12 +743,19 @@ pub fn format_trace(entry: &Value) -> String {
             }
         }
         "task" => format!(
-            "{time} task    {}  {} 条消息 ~{} tok  {} 个工具失败{}",
+            "{time} task    {}{}  {} 条消息 ~{} tok  {} 个工具失败{}",
             if entry.get("completed") == Some(&Value::Bool(true)) {
                 "完成"
+            } else if entry.get("stalled") == Some(&Value::Bool(true)) {
+                "没有进展"
             } else {
                 "中止"
             },
+            entry
+                .get("task_calls")
+                .and_then(Value::as_u64)
+                .map(|calls| format!("  {calls} 次模型调用"))
+                .unwrap_or_default(),
             number(entry, "messages"),
             number(entry, "est_tokens"),
             number(entry, "failures"),
@@ -755,7 +808,7 @@ pub fn support_report(diagnostics: &Diagnostics) -> String {
         .count();
     let mut report = format!(
         "# Cove 诊断报告\n\n版本: {}\n系统: {} / {}\n错误样本: {}（最多最近 2000 条）\n压缩截断: {}（最近最多 2000 条轨迹）\n\n## 错误分类\n",
-        env!("CARGO_PKG_VERSION"),
+        crate::build_id::label(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         entries.len(),
@@ -1346,6 +1399,26 @@ mod tests {
         assert_eq!(tail[2]["name"], "t9");
         assert_eq!(tail[0]["name"], "t7");
         assert!(log.tail(100).len() < 10, "only one rotation is kept");
+    }
+
+    #[test]
+    fn every_line_names_its_build_and_old_lines_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        std::fs::write(
+            &path,
+            "{\"t\":\"2026-11-01T10:00:00.000+08:00\",\"kind\":\"tool\"}\n",
+        )
+        .unwrap();
+        let log = JsonLog::new(path, TRACE_LIMIT);
+        log.write("model", json!({"input": 1}));
+        log.write("tool", Value::Null);
+        let tail = log.tail(10);
+        assert_eq!(tail.len(), 3);
+        assert!(tail[0].get("build").is_none());
+        assert_eq!(tail[1]["build"], crate::build_id::BUILD);
+        assert_eq!(tail[2]["build"], crate::build_id::BUILD);
+        assert!(!format_trace(&tail[0]).is_empty());
     }
 
     #[test]

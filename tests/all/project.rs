@@ -227,23 +227,9 @@ async fn exit_codes_distinguish_usage_errors_and_dump_prints_the_system_prompt()
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
     assert!(stdout.starts_with("You are Cove") && stdout.contains("Project rule: use tabs."));
-    assert!(stdout.contains("你是 Cove，一个高效的 AI 编程助手。"));
+    // No built-in text after the project context (0044): it ends with the outline.
+    assert!(!stdout.contains("User-configured instructions"), "{stdout}");
     assert!(sessions(data.path()).is_empty());
-    std::fs::write(
-        data.path().join("config.json"),
-        json!({"system_prompt":"你是 Cove，一个高效的 AI 编程助手。先理解任务，再用工具完成它；需要时读取、搜索、修改、执行、验证并给出真实结果，遇到问题要诚实说明。"}).to_string(),
-    )
-    .unwrap();
-    let mut command = cove(root.path(), data.path(), NOWHERE);
-    command.arg("--dump-system-prompt");
-    let (output, stdout, stderr) = run(command).await;
-    assert!(output.status.success(), "{stderr}");
-    assert_eq!(
-        stdout
-            .matches("你是 Cove，一个高效的 AI 编程助手。")
-            .count(),
-        1
-    );
     std::fs::write(
         data.path().join("config.json"),
         json!({"system_prompt":"custom instruction"}).to_string(),
@@ -253,7 +239,127 @@ async fn exit_codes_distinguish_usage_errors_and_dump_prints_the_system_prompt()
     command.arg("--dump-system-prompt");
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
-    assert!(stdout.contains("custom instruction"));
+    assert!(stdout.contains("\n\nUser-configured instructions:\ncustom instruction"));
+}
+
+#[tokio::test]
+async fn preferences_reach_the_system_prompt_and_the_language_memory_moves_there_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "README is generated.").unwrap();
+    // A global memory from before 0030: the language preference, and a machine fact.
+    let global = data.path().join("memory").join("global");
+    std::fs::create_dir_all(&global).unwrap();
+    let language = "0123456789abcdef0123456789abcdef";
+    for (id, title, content) in [
+        (language, "用户语言偏好", "回复一律使用简体中文"),
+        (
+            "fedcba9876543210fedcba9876543210",
+            "TMP 环境变量",
+            "TMP 指向系统临时目录",
+        ),
+    ] {
+        std::fs::write(
+            global.join(format!("{id}.json")),
+            json!({"version":1,"id":id,"title":title,"content":content,"source":"automatic extraction","created":1,"updated":1}).to_string(),
+        )
+        .unwrap();
+    }
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.arg("--dump-system-prompt");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("已把全局记忆里的语言偏好"), "{stderr}");
+    let preferences = stdout
+        .find("# User preferences")
+        .expect("preferences section");
+    let project = stdout
+        .find("# Project instructions")
+        .expect("project section");
+    assert!(preferences < project, "{stdout}");
+    assert!(
+        stdout.contains("<preferences>\n- 回复一律使用简体中文（"),
+        "{stdout}"
+    );
+    assert!(!global.join(format!("{language}.json")).exists());
+    assert!(
+        global
+            .join("fedcba9876543210fedcba9876543210.json")
+            .exists()
+    );
+    let backup = data
+        .path()
+        .join("backups/0030-global-preferences")
+        .join(format!("{language}.json"));
+    assert!(
+        std::fs::read_to_string(backup)
+            .unwrap()
+            .contains("回复一律使用简体中文")
+    );
+    // Once: the next start moves nothing and says nothing.
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.arg("--dump-system-prompt");
+    let (output, stdout, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("语言偏好"), "{stderr}");
+    assert_eq!(stdout.matches("回复一律使用简体中文").count(), 1);
+}
+
+#[tokio::test]
+async fn rules_lists_adds_removes_and_promotes_preferences() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    let rules = |line: &str| {
+        let mut command = cove(root.path(), data.path(), NOWHERE);
+        command.args(["-p", line]);
+        command
+    };
+    let (output, stdout, stderr) = run(rules("/rules")).await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("还没有全局偏好") && stdout.contains("还没有项目规则"),
+        "{stdout}"
+    );
+    let (_, stdout, _) = run(rules("/rules add global 改动尽量小，功能要完整")).await;
+    assert!(stdout.contains("已添加到全局偏好"), "{stdout}");
+    let (_, stdout, _) = run(rules("/rules add 先审查再推送")).await;
+    assert!(stdout.contains("已添加到"), "{stdout}");
+    let (_, stdout, _) = run(rules("/rules add 只在这里用 tabs")).await;
+    assert!(stdout.contains("已添加到"), "{stdout}");
+    let (_, stdout, _) = run(rules("/rules promote 1")).await;
+    assert!(
+        stdout.contains("已把“先审查再推送”提升为全局偏好"),
+        "{stdout}"
+    );
+    let (_, stdout, _) = run(rules("/rules")).await;
+    assert!(
+        stdout.contains("  g1. 改动尽量小，功能要完整（"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  g2. 先审查再推送（"), "{stdout}");
+    assert!(stdout.contains("  1. 只在这里用 tabs（"), "{stdout}");
+    let (_, stdout, _) = run(rules("/rules remove g1")).await;
+    assert!(stdout.contains("已删除：改动尽量小"), "{stdout}");
+    let text = std::fs::read_to_string(data.path().join("preferences.md")).unwrap();
+    assert!(
+        text.starts_with("# 全局偏好") && !text.contains("改动尽量小"),
+        "{text}"
+    );
+    let (_, stdout, _) = run(rules("/rules pending")).await;
+    assert!(stdout.contains("没有等待确认的全局偏好候选"), "{stdout}");
+    let (output, _, stderr) = run(rules("/rules remove gx")).await;
+    assert!(
+        !output.status.success() && stderr.contains("remove g<n>"),
+        "{stderr}"
+    );
+    // `/help rules` names the new forms; the old usage line is gone.
+    let (_, stdout, _) = run(rules("/help rules")).await;
+    assert!(
+        stdout.contains("promote <n>") && stdout.contains("pending"),
+        "{stdout}"
+    );
 }
 
 #[tokio::test]
@@ -536,6 +642,49 @@ async fn trace_and_error_logs_record_sizes_and_failures_but_no_text() {
     command.args(["-p", "/doctor errors"]);
     let (_, stdout, _) = run(command).await;
     assert!(stdout.contains("运行错误"), "{stdout}");
+}
+
+#[tokio::test]
+async fn trace_acceptance_and_session_name_the_build() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.txt"), "body\n").unwrap();
+    let (url, server) = mock_server(vec![
+        tool("r1", "read", json!({"path":"notes.txt"})),
+        openai(json!({"content":"read it"}), "stop"),
+    ])
+    .await;
+    let mut command = cove(root.path(), data.path(), &url);
+    command.args(["-p", "read notes.txt"]);
+    let (output, _, stderr) = run(command).await;
+    assert!(output.status.success(), "{stderr}");
+    server.await.unwrap();
+    let build = cove::build_id::BUILD;
+    let mut command = cove(root.path(), data.path(), NOWHERE);
+    command.arg("--version");
+    let (_, version, _) = run(command).await;
+    assert!(
+        version.starts_with(&format!("cove {build}（构建于 ")),
+        "{version}"
+    );
+    let trace = std::fs::read_to_string(data.path().join("trace.jsonl")).unwrap();
+    let lines: Vec<Value> = trace
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(lines.iter().any(|line| line["kind"] == "model"), "{trace}");
+    assert!(lines.iter().all(|line| line["build"] == build), "{trace}");
+    let only = |dir: &str| -> Value {
+        let path = std::fs::read_dir(data.path().join(dir))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    assert_eq!(only("acceptance")["build"], build);
+    assert_eq!(only("sessions")["builds"], json!([build]));
 }
 
 #[tokio::test]

@@ -444,7 +444,10 @@ pub async fn run_tasks(
         }
         // A capped run would redo the same work and hit the same cap; keep its result.
         let retry = node.attempts < 2
-            && !matches!(outcome.exit, Exit::MaxIterations | Exit::Interrupted)
+            && !matches!(
+                outcome.exit,
+                Exit::MaxIterations | Exit::Stalled | Exit::Interrupted
+            )
             && !cancel.is_cancelled();
         node.state = if retry {
             NodeState::Pending

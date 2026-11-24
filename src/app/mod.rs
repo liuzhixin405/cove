@@ -157,6 +157,17 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         &settings.cwd,
         authorizer.clone(),
     )?);
+    // The user's preferences (`<data dir>/preferences.md`), moved there from global
+    // memory once (0030) before anything reads either.
+    let preferences = crate::memory::preferences::Preferences::open(store.root());
+    match crate::memory::preferences::migrate_language(store.root(), &memory, &preferences.file) {
+        Ok(Some(notice)) => print_text(&notice, true)?,
+        Ok(None) => {}
+        Err(err) => print_text(
+            &format!("[偏好] 没能把全局记忆里的语言偏好移到全局偏好，下次启动再试：{err}\n"),
+            true,
+        )?,
+    }
     let mcp = Arc::new(Mcp::new(
         catalog.servers.clone(),
         &settings.cwd,
@@ -188,13 +199,16 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     });
     // The project's rules (`.cove/rules.md`): written by extraction, dream and
     // `/rules`, read by the reviews and announced to the model as they are added.
-    let rules = crate::memory::rules::ProjectRules::for_workspace(&settings.cwd);
+    let rules = crate::memory::rules::RulesFile::for_workspace(&settings.cwd);
     let project_context = {
         let cwd = settings.cwd.clone();
         let index = skills.index()?;
-        tokio::task::spawn_blocking(move || crate::engine::prompt::system_context(&cwd, &index))
-            .await
-            .map_err(|err| Error::Tool(format!("project context failed: {err}")))?
+        let listed = preferences.file.list().unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            crate::engine::prompt::system_context(&cwd, &index, &listed)
+        })
+        .await
+        .map_err(|err| Error::Tool(format!("project context failed: {err}")))?
     };
     let ledger = Arc::new(Ledger::default());
     let output_policy = Arc::new(crate::engine::tool_output::OutputPolicy::new(
@@ -241,9 +255,12 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         web: tools.web.clone(),
         browser_path: crate::commands::workflows::browser_path(&settings),
     });
+    let models = crate::commands::agents::catalog(&settings, router.clone());
     let agents = crate::commands::agents::hub(
         &settings,
-        provider.clone(),
+        models.clone(),
+        // Sub-agent calls are their own source in the usage ledger.
+        metered(traced(router.clone()), "agent"),
         tools.clone(),
         authorizer.clone(),
         input.is_some(),
@@ -265,6 +282,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         background.clone(),
         usage.clone(),
         rules,
+        preferences,
     )
     .await;
     let agent_tools = sessions.wrap_tools(agent_tools, settings.permission);
@@ -277,6 +295,12 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
             prices: settings.prices,
         },
     )?
+    .with_stall_rounds(settings.stall_rounds)
+    .with_work_tree(sessions.snapshots.clone().map(
+        |snapshots| -> Arc<dyn crate::engine::progress::WorkTree> {
+            Arc::new(crate::session::snapshot::SnapshotTree(snapshots))
+        },
+    ))
     .with_context_tokens(settings.context_tokens)?
     .with_instructions(settings.instructions.clone())
     .with_verifier(
@@ -285,6 +309,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
             .clone()
             .map(|verifier| -> Arc<dyn Verifier> { verifier }),
     )
+    .with_review(gates.review.clone())
     .with_ledger(ledger)
     .with_project_context(Some(project_context))
     .with_turn_note(Some(Arc::new(crate::engine::prompt::GitNote::new(
@@ -309,7 +334,8 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     .with_turn_hook(Arc::new(crate::app::console::GoalHook))
     .with_turn_hook(Arc::new(crate::agents::background::NoticeHook {
         hub: agents.clone(),
-    }));
+    }))
+    .with_turn_hook(Arc::new(crate::agents::explore::ExploreHint::new(models)));
     for hook in sessions.hooks() {
         agent = agent.with_turn_hook(hook);
     }
@@ -370,6 +396,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         agents,
         background,
         commit_review: gates.commit_review,
+        typed: None,
     };
     app.sessions.maintain(&app.store, &app.session.id);
     let outcome = app.interact().await;
@@ -380,6 +407,13 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         server.stop().await;
     }
     app.sessions.shutdown().await;
+    // Nobody could be asked: say where the proposals wait.
+    if app.input.is_none()
+        && let Some(notice) =
+            crate::memory::preferences::unattended_notice(app.sessions.preferences.queued())
+    {
+        let _ = print_text(&notice, true);
+    }
     app.apply_titles();
     crate::commands::agents::shutdown(&mut app).await;
     let cleanup = app.close_session().await;
@@ -506,16 +540,27 @@ impl Application {
             let line = if let Some(text) = console.and_then(|console| console.take_steer()) {
                 print_text("[steer] 任务已先结束，这条内容作为新消息发送\n", true)?;
                 format!("[sent while the previous task was running]\n{text}")
+            } else if let Some(text) = self.typed.take() {
+                text
             } else {
-                let read = {
-                    let agents = self.agents.clone();
-                    let read = reader.read(crate::commands::completer(self));
-                    tokio::pin!(read);
-                    loop {
-                        tokio::select! {
-                            line = &mut read => break line,
-                            _ = agents.background.notify.notified() => {
-                                crate::commands::agents::print_idle(&agents);
+                // A broken queue file must not end the session.
+                let typed = self.ask_preference().await.unwrap_or_else(|err| {
+                    let _ = print_error(&format!("[偏好] {err}"));
+                    None
+                });
+                let read = match typed {
+                    // Typed at the question: it is the next line.
+                    Some(text) => Ok(Some(text)),
+                    None => {
+                        let agents = self.agents.clone();
+                        let read = reader.read(crate::commands::completer(self));
+                        tokio::pin!(read);
+                        loop {
+                            tokio::select! {
+                                line = &mut read => break line,
+                                _ = agents.background.notify.notified() => {
+                                    crate::commands::agents::print_idle(&agents);
+                                }
                             }
                         }
                     }
@@ -551,6 +596,10 @@ impl Application {
             } else {
                 self.execute(Some(line.into())).await.map(|_| false)
             };
+            if !line.starts_with('/') {
+                // A task ran: the next prompt may ask about a preference again.
+                self.sessions.preferences.task_done();
+            }
             if let Some(console) = console {
                 console.set_busy(false);
             }
@@ -566,6 +615,10 @@ impl Application {
             match result {
                 Ok(true) => break,
                 Ok(false) => {}
+                // cove stopped the task: the closing line said why; only how to go on.
+                Err(Error::Stopped(stopped)) => {
+                    print_text(&format!("{}\n", stopped.stop.hint()), true)?
+                }
                 Err(err) => {
                     self.record_failure("command", &err);
                     print_error(&err.to_string())?
@@ -638,8 +691,11 @@ pub(crate) struct Application {
     pub(crate) models: crate::commands::model::ModelState,
     /// The cheap background provider, traced and metered like every other call.
     pub(crate) background: Arc<dyn Provider>,
-    /// The AI review before `/commit`; `None` when `commit_review` is off.
+    /// The review before `/commit`; `None` when there is none at commits.
     pub(crate) commit_review: Option<Arc<crate::safety::gates::review::CommitReview>>,
+    /// Text typed at a question that was not its answer (`/rules pending`): the REPL
+    /// runs it as the next line.
+    pub(crate) typed: Option<String>,
 }
 
 impl Application {
@@ -650,6 +706,68 @@ impl Application {
             self.show_window_title();
         }
         self.announce_rules();
+    }
+
+    /// One question about a proposed cross-project preference (0030): before the next
+    /// line is read, at most one between two tasks and a few per run. Returns text
+    /// typed at the question that was not an answer: the next line.
+    async fn ask_preference(&self) -> Result<Option<String>> {
+        if self.input.is_none() {
+            return Ok(None);
+        }
+        match self.sessions.preferences.next_question(true, false) {
+            Some(candidate) => self.answer_preference(&candidate).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Asks about `candidate` and acts on the answer: yes writes the preference, no
+    /// keeps it a project rule for good, anything else asks again in a later run;
+    /// other text than an answer is returned, to run as a task.
+    pub(crate) async fn answer_preference(
+        &self,
+        candidate: &crate::memory::preferences::Candidate,
+    ) -> Result<Option<String>> {
+        use crate::memory::preferences::{Reply, answer, question};
+        let preferences = &self.sessions.preferences;
+        let Some(input) = &self.input else {
+            preferences.later(candidate);
+            return Ok(None);
+        };
+        let cwd = &self.settings.cwd;
+        let here =
+            crate::paths::display(&crate::engine::prompt::git_root(cwd).unwrap_or(cwd.clone()));
+        let reply = input
+            .answer(question(candidate, &here), CancellationToken::new())
+            .await;
+        let reply = reply.ok().map_or(Reply::Later, |text| answer(&text));
+        let mut typed = None;
+        let text = match reply {
+            Reply::Yes => match preferences.accept(candidate) {
+                Ok(text) => text,
+                Err(err) => format!("[偏好] 没有记成全局偏好：{err}\n"),
+            },
+            Reply::No => {
+                preferences.decline(candidate)?;
+                if candidate.rules.is_some() {
+                    "[偏好] 只留在项目规则里，以后不再问这一条。\n".to_owned()
+                } else {
+                    "[偏好] 不记成全局偏好，以后不再问这一条。\n".to_owned()
+                }
+            }
+            Reply::Later => {
+                preferences.later(candidate);
+                "[偏好] 以后再问；也可以用 /rules pending 处理。\n".to_owned()
+            }
+            Reply::Task(text) => {
+                preferences.later(candidate);
+                typed = Some(text);
+                "[偏好] 以后再问（/rules pending 可以处理）；刚才输入的内容作为任务执行。\n"
+                    .to_owned()
+            }
+        };
+        print_text(&text, true)?;
+        Ok(typed)
     }
 
     /// One line for each project rule learned in the background since the last one.
@@ -691,17 +809,7 @@ impl Application {
         let Some(console) = crate::app::console::active() else {
             return;
         };
-        let context = rebuilt.then(|| {
-            use crate::engine::context::{text_tokens, tokens};
-            let tools: usize = self
-                .tools
-                .definitions()
-                .iter()
-                .map(|tool| text_tokens(&tool.description) + text_tokens(&tool.schema.to_string()))
-                .sum();
-            (tokens(&self.session.messages) + text_tokens(&self.agent.system_prompt()) + tools)
-                as u64
-        });
+        let context = rebuilt.then(|| self.context_estimate(&self.session.messages) as u64);
         // Only the Anthropic protocol sends thinking and effort; others use the model's own.
         let thinking = if !matches!(self.settings.protocol, crate::config::Protocol::Anthropic) {
             "默认".to_owned()
@@ -714,6 +822,8 @@ impl Application {
                 .unwrap_or_else(|| "默认".into())
         };
         let usage = &self.session.accounting.usage;
+        // Set before the meter, whose update redraws the row.
+        console.set_handoff_at(self.agent.handoff_hint_at() as u64);
         console.set_meter(
             context,
             self.settings.context_window as u64,
@@ -733,8 +843,10 @@ impl Application {
     /// Feeds `errors.log`. Model and task failures are logged where they happen
     /// (trace provider and hook); a mistyped command is not a failure.
     pub(crate) fn record_failure(&self, source: &str, err: &Error) {
-        let logged = matches!(err, Error::Provider(_) | Error::Limit(_) | Error::Cancelled)
-            || matches!(err, Error::Session(text)
+        let logged = matches!(
+            err,
+            Error::Provider(_) | Error::Limit(_) | Error::Stopped(_) | Error::Cancelled
+        ) || matches!(err, Error::Session(text)
                 if text.starts_with("未知命令") || text.contains("的参数不对")
                     || text.starts_with("unknown command") || text.starts_with("invalid arguments"));
         if !logged {
@@ -968,7 +1080,8 @@ impl Application {
                 continue;
             }
             let replayable = matches!(call.name.as_str(), "question" | "todo")
-                || ToolExecutor::concurrent(self.tools.as_ref(), &call.name);
+                || (ToolExecutor::concurrent(self.tools.as_ref(), &call.name, &call.input)
+                    && !ToolExecutor::metered(self.tools.as_ref(), &call.name));
             if replayable {
                 self.session.pending[index].state = CallState::Planned;
                 changed = true;
@@ -1115,6 +1228,8 @@ impl Application {
             self.session.checkpoints.push(checkpoint.clone());
             self.session.current_checkpoint = Some(checkpoint);
             self.store.save(&self.session)?;
+            // Refusals tighten scripts only within their task (0038).
+            self.permissions.begin_task();
         }
         let cancel = CancellationToken::new();
         self.remote.set_scope(&self.session.id, &self.settings.cwd);
@@ -1147,7 +1262,16 @@ impl Application {
         accounting.lines_removed = accounting.lines_removed.saturating_add(removed);
         // The task's journal folds into the snapshot: files at rest are complete.
         let flushed = self.store.flush(&self.session);
-        let report = result?;
+        let report = match result {
+            // cove stopped the task (call quota, no progress): the summary still shows
+            // what was done, and the stop is the outcome (`-p` exits non-zero).
+            Err(Error::Stopped(stopped)) => {
+                flushed?;
+                print_report(&stopped.report)?;
+                return Err(Error::Stopped(stopped));
+            }
+            result => result?,
+        };
         flushed?;
         print_report(&report)?;
         if report.verification == Some(Outcome::Failed) {
@@ -1161,6 +1285,119 @@ impl Application {
                 report.tools_failed
             )));
         }
+        Ok(())
+    }
+
+    /// The context a request of `messages` carries, estimated: the messages, the
+    /// system prompt and the tool definitions.
+    pub(crate) fn context_estimate(&self, messages: &[Message]) -> usize {
+        use crate::engine::context::{text_tokens, tokens};
+        let tools: usize = self
+            .tools
+            .definitions()
+            .iter()
+            .map(|tool| text_tokens(&tool.description) + text_tokens(&tool.schema.to_string()))
+            .sum();
+        tokens(messages) + text_tokens(&self.agent.system_prompt_for(&self.session)) + tools
+    }
+
+    /// `/handoff [focus]` (docs/optimizations/0026): the model writes a handoff note on
+    /// this conversation's prefix, cove adds the facts it recorded, and the work goes
+    /// on in a new session that starts from them. This session stays as it is;
+    /// `/back` returns to it. Workspace, tools and MCP servers stay as they are, so
+    /// unlike `/new` no `SessionEnd` hook runs.
+    pub(crate) async fn handoff(&mut self, focus: Option<&str>) -> Result<()> {
+        let before = self.context_estimate(&self.session.messages);
+        // The model the last task ran on, where its prompt cache is; a model the
+        // configuration no longer has gives way to the router's.
+        let router = &self.models.router;
+        let model = self
+            .session
+            .task_model
+            .clone()
+            .filter(|model| {
+                *model == router.main_model() || router.fast_model().as_ref() == Some(model)
+            })
+            .unwrap_or_else(|| router.current_model());
+        let model = Some(model);
+        let cancel = CancellationToken::new();
+        let (events, receiver) = mpsc::channel(64);
+        let consumer = tokio::spawn(consume_events(receiver, cancel.clone()));
+        let result = drive(
+            self.agent.write_handoff(
+                &mut self.session,
+                model,
+                focus,
+                &self.store,
+                events,
+                cancel.clone(),
+            ),
+            cancel,
+            self.settings.timeout,
+        )
+        .await;
+        consumer
+            .await
+            .map_err(|err| Error::Session(format!("输出线程异常退出：{err}")))??;
+        let note = match result {
+            Ok(note) => note,
+            Err(err) => {
+                self.diagnostics.trace.write(
+                    "handoff",
+                    serde_json::json!({"ok": false, "before": before, "error": err.to_string()}),
+                );
+                return Err(err);
+            }
+        };
+        let facts = crate::engine::handoff::facts(&self.session.messages, &self.settings.cwd);
+        let status = {
+            let cwd = self.settings.cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::engine::prompt::git_root(&cwd)?;
+                crate::engine::prompt::git(&cwd, &["status", "--short"])
+            })
+            .await
+            .unwrap_or(None)
+        };
+        let mut next = fresh(&self.settings);
+        next.handoff_from = Some(self.session.id.clone());
+        next.messages.push(crate::engine::handoff::assemble(
+            &note,
+            &facts,
+            status.as_deref(),
+            &self.session.id,
+        ));
+        let lease = self.store.acquire(&next.id)?;
+        self.store.save(&next)?;
+        self.session.handoff_to = Some(next.id.clone());
+        self.store.flush(&self.session)?;
+        self.workspace.activate(None)?;
+        let origin = std::mem::replace(&mut self.session, next);
+        self.lease = lease;
+        self.sessions.ledger.set_session(&self.session.id);
+        let after = self.context_estimate(&self.session.messages);
+        self.diagnostics.trace.write(
+            "handoff",
+            serde_json::json!({
+                "ok": true, "before": before, "after": after,
+                "files": facts.files.len(), "commits": facts.commits.len(),
+            }),
+        );
+        // On stdout like `/new` and `/resume`: the id a script continues with.
+        print_text(&format!("[session] {}\n", self.session.id), false)?;
+        print_text(
+            &format!(
+                "已交接到新会话 {}：上下文约 {before} -> 约 {after} tokens（{}）。原会话 {} 保留，输入 /back 回到原会话。\n",
+                crate::text::head(&self.session.id, 8),
+                if facts.files.is_empty() {
+                    "本会话没有用文件工具改过文件".to_owned()
+                } else {
+                    format!("带上了改过的 {} 个文件", facts.files.len())
+                },
+                crate::text::head(&origin.id, 8),
+            ),
+            false,
+        )?;
         Ok(())
     }
 
@@ -1204,7 +1441,7 @@ impl Application {
             ["/status"] => {
                 print_text(
                     &format!(
-                        "会话 {}  状态 {:?}\n工作区 {}\n供应商 {}  协议 {:?}  模型 {}  base_url {}  profile {}  配置 {}  代理 {}\n消息 {} 条  上下文 ~{}/{} tokens（窗口 {}）  压缩 {} 次\n模型调用 {} 次  输入 {} tokens  输出 {} tokens  预估费用 {}\n待处理调用 {}\n",
+                        "会话 {}  状态 {:?}\n工作区 {}\n供应商 {}  协议 {:?}  模型 {}  base_url {}  profile {}  配置 {}  代理 {}\n消息 {} 条  上下文 ~{}/{} tokens（窗口 {}）  压缩 {} 次\n模型调用 {} 次  输入 {} tokens  输出 {} tokens  预估费用 {}\n待处理调用 {}\n构建 {}\n",
                         self.session.id,
                         self.session.state,
                         crate::paths::display(&self.session.cwd),
@@ -1239,7 +1476,8 @@ impl Application {
                                 .map(|call| format!("{}:{}:{:?}", call.id, call.name, call.state))
                                 .collect::<Vec<_>>()
                                 .join(", ")
-                        }
+                        },
+                        crate::build_id::label(),
                     ),
                     false,
                 )?;

@@ -519,3 +519,110 @@ async fn browser_verification_passes_locally_only_with_explicit_permission() {
         assert!(stdout.contains("Unverified"), "{stdout}");
     }
 }
+
+const PRICING: &str = "def price(item):\n    return item['cost']\n";
+const INVOICE: &str =
+    "from pricing import price\n\n\ndef format_invoice(x):\n    return f\"{price(x):.2f}\"\n";
+
+/// A repository where `invoice.py` calls `price()` and no test refers to it.
+fn pricing_repo() -> tempfile::TempDir {
+    let repo = repo();
+    std::fs::write(repo.path().join("pricing.py"), PRICING).unwrap();
+    std::fs::write(repo.path().join("invoice.py"), INVOICE).unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "pricing"]);
+    repo
+}
+
+#[tokio::test]
+async fn changes_impact_lists_the_untested_callers_of_a_commit() {
+    let repo = pricing_repo();
+    let data = tempfile::tempdir().unwrap();
+    git(repo.path(), &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(
+        repo.path().join("pricing.py"),
+        "def price(item, currency):\n    return item['cost'], currency\n",
+    )
+    .unwrap();
+    git(repo.path(), &["commit", "-q", "-am", "currency"]);
+    let (url, requests) =
+        mock_server(Arc::new(|_: &Value| openai(json!({"content":"x"}), "stop"))).await;
+    for range in ["main..topic", "main...HEAD", "HEAD"] {
+        let mut command = cli(repo.path(), data.path(), &url);
+        command.args(["-p", &format!("/changes impact {range}")]);
+        let (ok, stdout, stderr) = run(command).await;
+        assert!(ok, "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("[影响] 改了 1 个符号，其他文件里有 1 处使用"),
+            "{range}: {stdout}"
+        );
+        assert!(stdout.contains("签名变化 pricing.py:1 price()"), "{stdout}");
+        assert!(
+            stdout.contains("invoice.py:5  format_invoice()  没有测试引用"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains(r"\\?\"), "{stdout}");
+    }
+    let mut command = cli(repo.path(), data.path(), &url);
+    command.args(["-p", "/changes impact no-such-rev..HEAD"]);
+    let (ok, _, stderr) = run(command).await;
+    assert!(!ok && stderr.contains("找不到提交"), "{stderr}");
+    // Read-only: no model call, nothing written.
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(git(repo.path(), &["status", "--porcelain"]).is_empty());
+}
+
+#[tokio::test]
+async fn the_end_of_a_task_shows_the_impact_and_hands_untested_callers_back_once() {
+    let repo = pricing_repo();
+    let data = tempfile::tempdir().unwrap();
+    let (url, requests) = mock_server(Arc::new(|body: &Value| {
+        if mentions(body, "[change_impact;") {
+            openai(json!({"content":"checked invoice.py"}), "stop")
+        } else if tool_results(body).is_empty() {
+            tool(
+                "e1",
+                "edit",
+                json!({"path":"pricing.py","old":"def price(item):","new":"def price(item, currency='CNY'):"}),
+            )
+        } else {
+            openai(json!({"content":"price() now takes a currency"}), "stop")
+        }
+    }))
+    .await;
+    let mut command = cli(repo.path(), data.path(), &url);
+    command.args(["-p", "add a currency to price()"]);
+    let (ok, stdout, stderr) = run(command).await;
+    assert!(ok, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("[影响] 改了 1 个符号，其他文件里有 1 处使用"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("format_invoice()  没有测试引用"),
+        "{stderr}"
+    );
+    let requests = requests.lock().unwrap();
+    let handed: Vec<&Value> = requests
+        .iter()
+        .filter(|body| mentions(body, "[change_impact;"))
+        .collect();
+    assert!(!handed.is_empty(), "{requests:?}");
+    assert!(mentions(
+        handed[0],
+        "invoice.py:5 in format_invoice() uses price"
+    ));
+    // Once: the last request carries one such notice.
+    let last = requests.last().unwrap()["messages"].to_string();
+    assert_eq!(last.matches("[change_impact;").count(), 1, "{last}");
+    // The acceptance report keeps the counts and the untested caller.
+    let report: Value = std::fs::read_dir(data.path().join("acceptance"))
+        .unwrap()
+        .flatten()
+        .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+        .next()
+        .unwrap();
+    assert_eq!(report["impact"]["signature"], 1, "{report}");
+    assert_eq!(report["impact"]["untested"][0]["file"], "invoice.py");
+    assert_eq!(report["impact"]["handed_back"], true);
+}

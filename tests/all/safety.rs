@@ -137,13 +137,13 @@ async fn catastrophic_commands_are_refused_even_in_bypass_mode() {
 }
 
 #[tokio::test]
-async fn auto_mode_allows_project_edits_but_asks_for_unknown_shell() {
+async fn auto_mode_without_a_terminal_refuses_the_call_and_the_task_goes_on() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let (url, server) = mock_server(vec![
         tool("w", "write", json!({"path":"a.txt","content":"auto"})),
         tool("s", "shell", json!({"command":"echo x > b.txt"})),
-        text("unreachable"),
+        text("Wrote a.txt; creating b.txt needs your approval, run: echo x > b.txt"),
     ])
     .await;
     let output = cli(root.path(), data.path(), &url, "auto")
@@ -152,16 +152,148 @@ async fn auto_mode_allows_project_edits_but_asks_for_unknown_shell() {
         .await
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    server.abort();
+    let requests = server.await.unwrap();
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
         "auto"
     );
     assert!(!root.path().join("b.txt").exists());
-    assert!(!output.status.success());
+    // The refusal reached the model, which answered: the task was not stopped.
+    assert_eq!(requests.len(), 3, "{stderr}");
     assert!(
-        stderr.contains("--permission auto") && stderr.contains("bypass"),
+        tool_result(&requests[2]).contains("nobody can be asked"),
+        "{}",
+        tool_result(&requests[2])
+    );
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("未执行") && stderr.contains("--permission bypass"),
         "{stderr}"
+    );
+}
+
+/// docs/optimizations/0038: a refused install is not run through a script the task writes.
+#[tokio::test]
+async fn after_a_refusal_a_script_the_task_wrote_is_not_run_either() {
+    let script = "open('ran.txt', 'w').write('ran')\n";
+    let sequence = |refuse_first: bool| {
+        let mut responses = Vec::new();
+        if refuse_first {
+            responses.push(tool(
+                "pip",
+                "shell",
+                json!({"command":"python -m pip install cove-0038-no-such-package"}),
+            ));
+        }
+        responses.push(tool(
+            "w",
+            "write",
+            json!({"path":"_install.py","content":script}),
+        ));
+        responses.push(tool(
+            "run",
+            "shell",
+            json!({"command":format!("{} _install.py", python())}),
+        ));
+        responses.push(text("Done."));
+        responses
+    };
+    // Without a refusal, writing a script and running it needs no approval.
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(sequence(false)).await;
+    let output = cli(root.path(), data.path(), &url, "auto")
+        .args(["-p", "run a script"])
+        .launch()
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join("ran.txt").exists());
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(sequence(true)).await;
+    let output = cli(root.path(), data.path(), &url, "auto")
+        .args(["-p", "install pytest"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4, "{stderr}");
+    assert!(
+        tool_result(&requests[1]).contains("nobody can be asked"),
+        "{}",
+        tool_result(&requests[1])
+    );
+    // The script was written, but running it was refused like the install.
+    assert!(root.path().join("_install.py").exists());
+    assert!(!root.path().join("ran.txt").exists(), "{stderr}");
+    let refused = tool_result(&requests[3]);
+    assert!(
+        refused.contains("nobody can be asked") && refused.contains("不要用脚本绕过"),
+        "{refused}"
+    );
+    assert!(
+        stderr.contains("未执行") && stderr.contains("_install.py"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn inline_code_runs_in_auto_until_something_is_refused() {
+    // docs/optimizations/0043: `python -c` runs like a script the task wrote.
+    let inline = format!(r#"{} -c "open('ran.txt', 'w').write('ran')""#, python());
+    let sequence = |refuse_first: bool| {
+        let mut responses = Vec::new();
+        if refuse_first {
+            responses.push(tool(
+                "pip",
+                "shell",
+                json!({"command":"python -m pip install cove-0043-no-such-package"}),
+            ));
+        }
+        responses.push(tool("run", "shell", json!({"command":inline})));
+        responses.push(text("Done."));
+        responses
+    };
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(sequence(false)).await;
+    let output = cli(root.path(), data.path(), &url, "auto")
+        .args(["-p", "check a value"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "{stderr}");
+    assert!(root.path().join("ran.txt").exists(), "{stderr}");
+    assert!(!stderr.contains("未执行"), "{stderr}");
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(sequence(true)).await;
+    let output = cli(root.path(), data.path(), &url, "auto")
+        .args(["-p", "install a package"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3, "{stderr}");
+    // After the install was refused, the inline code is refused too and does not run.
+    assert!(!root.path().join("ran.txt").exists(), "{stderr}");
+    let refused = tool_result(&requests[2]);
+    assert!(
+        refused.contains("nobody can be asked") && refused.contains("内联代码绕过"),
+        "{refused}"
     );
 }
 
@@ -371,6 +503,91 @@ async fn verification_reuses_the_models_own_passing_check_and_records_acceptance
     );
 }
 
+const PAD: &str = "\n\n补充：这一段只是为了让回答足够长，不涉及任何具体的代码位置，也不提到任何文件或者符号的名字，读者可以忽略。补充：这一段只是为了让回答足够长，不涉及任何具体的代码位置，也不提到任何文件或者符号的名字，读者可以忽略。补充：这一段只是为了让回答足够长，不涉及任何具体的代码位置，也不提到任何文件或者符号的名字，读者可以忽略。";
+
+fn cited_repo() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("shop")).unwrap();
+    std::fs::write(
+        root.path().join("shop/pricing.py"),
+        "MEMBER_RATE = 0.9\n\n\ndef apply_discount(order):\n    if order.member:\n        return order.total * MEMBER_RATE\n    return order.total\n",
+    )
+    .unwrap();
+    let mut filler = String::new();
+    for n in 1..=60 {
+        filler.push_str(&if n == 50 {
+            "def checkout(order):\n".to_owned()
+        } else {
+            format!("# {n}\n")
+        });
+    }
+    std::fs::write(root.path().join("shop/checkout.py"), filler).unwrap();
+    root
+}
+
+#[tokio::test]
+async fn a_wrong_code_reference_in_an_answer_is_handed_back_once() {
+    let root = cited_repo();
+    let data = tempfile::tempdir().unwrap();
+    let wrong = format!("只有会员 9 折，见 `shop/pricing.py:40` 的 `apply_discount`。{PAD}");
+    let right = format!("只有会员 9 折，见 `shop/pricing.py:4` 的 `apply_discount`。{PAD}");
+    let (url, server) = mock_server(vec![
+        tool("r", "read", json!({"path":"shop/pricing.py"})),
+        text(&wrong),
+        text(&right),
+    ])
+    .await;
+    let output = cli(root.path(), data.path(), &url, "default")
+        .args(["-p", "折扣怎么算？只回答"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(requests.len(), 3, "{stderr}");
+    let nudge = tool_result(&requests[2]);
+    assert!(
+        nudge.contains("could not be verified") && nudge.contains("the file has 7 lines"),
+        "{nudge}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shop/pricing.py:4"));
+    let report = std::fs::read_dir(data.path().join("acceptance"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+    assert_eq!(report["citations"]["nudged"], json!(true), "{report}");
+    assert_eq!(report["citations"]["passed"], json!(1), "{report}");
+}
+
+#[tokio::test]
+async fn a_line_offset_is_only_reported_and_costs_no_model_call() {
+    let root = cited_repo();
+    let data = tempfile::tempdir().unwrap();
+    let answer = format!("结算入口是 `checkout`（`shop/checkout.py:2`）。{PAD}");
+    let (url, server) = mock_server(vec![
+        tool("r", "read", json!({"path":"shop/checkout.py"})),
+        text(&answer),
+    ])
+    .await;
+    let output = cli(root.path(), data.path(), &url, "default")
+        .args(["-p", "结算入口在哪？只回答"])
+        .launch()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.await.unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(requests.len(), 2, "{stderr}");
+    assert!(
+        stderr.contains("[引用核实] shop/checkout.py:2 → 实际在第 50 行"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn secrets_in_the_prompt_are_warned_about() {
     let root = tempfile::tempdir().unwrap();
@@ -424,4 +641,139 @@ async fn mode_command_saves_the_mode_to_the_config() {
         !output.status.success(),
         "review needs an interactive terminal"
     );
+}
+
+fn failing_shell(id: &str) -> String {
+    tool(id, "shell", json!({"command":"exit 1"}))
+}
+
+#[tokio::test]
+async fn a_task_without_progress_stops_and_summarizes_in_print_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    // Round 1 is new information; rounds 2-13 bring nothing new, so the 14th request
+    // is the tool-free closing summary.
+    let mut responses: Vec<String> = (0..13).map(|i| failing_shell(&format!("s{i}"))).collect();
+    responses.push(text(
+        "exit 1 keeps failing the same way; I need you to tell me what the command should do.",
+    ));
+    let (url, server) = mock_server(responses).await;
+    let output = cli(root.path(), data.path(), &url, "bypass")
+        .args(["-p", "run it"])
+        .launch()
+        .await
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 14, "{all}");
+    assert!(!output.status.success(), "{all}");
+    let last = &requests[13];
+    assert!(
+        last.get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+        "{last}"
+    );
+    assert!(last.to_string().contains("cove stopped the task"), "{last}");
+    // The warning came at round 7 (6 idle rounds).
+    assert!(requests[7].to_string().contains("[progress] 最近 6 轮"));
+    assert!(!requests[6].to_string().contains("[progress]"));
+    assert!(all.contains("[summary]"), "{all}");
+    assert!(all.contains("因连续 12 轮没有进展提前停止"), "{all}");
+    assert!(all.contains("没有进展，已停下"), "{all}");
+    let trace = std::fs::read_to_string(data.path().join("trace.jsonl")).unwrap();
+    let task = trace
+        .lines()
+        .rfind(|line| line.contains("\"kind\":\"task\""))
+        .unwrap();
+    assert!(
+        task.contains("\"stalled\":true") && task.contains("\"task_calls\":14"),
+        "{task}"
+    );
+    assert!(
+        task.contains("\"idle_max\":12") && task.contains("E5008"),
+        "{task}"
+    );
+}
+
+/// Same command, same (empty) output every round; `writes` decides whether it changes
+/// a file. With `stall_rounds` 4 the work tree tells the two apart.
+async fn shell_rounds(writes: bool) -> (Vec<Value>, String, bool) {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({"stall_rounds":4}).to_string(),
+    )
+    .unwrap();
+    let script = if writes {
+        "import time; open('out.txt', 'w').write(str(time.time_ns()))"
+    } else {
+        "import time; time.time_ns()"
+    };
+    let command = format!("{} -c \"{script}\"", python());
+    let rounds = if writes { 9 } else { 5 };
+    let mut responses: Vec<String> = (0..rounds)
+        .map(|i| tool(&format!("s{i}"), "shell", json!({ "command": command })))
+        .collect();
+    responses.push(text("Ran the script repeatedly."));
+    let (url, server) = mock_server(responses).await;
+    let output = cli(root.path(), data.path(), &url, "bypass")
+        .args(["-p", "run the script"])
+        .launch()
+        .await
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (server.await.unwrap(), all, output.status.success())
+}
+
+#[tokio::test]
+async fn files_changed_by_shell_are_progress_and_unchanged_ones_are_not() {
+    let (requests, all, ok) = shell_rounds(true).await;
+    assert_eq!(requests.len(), 10, "{all}");
+    assert!(ok, "{all}");
+    assert!(!all.contains("没有进展"), "{all}");
+    let (requests, all, ok) = shell_rounds(false).await;
+    assert_eq!(requests.len(), 6, "{all}");
+    assert!(!ok, "{all}");
+    assert!(all.contains("因连续 4 轮没有进展提前停止"), "{all}");
+}
+
+#[tokio::test]
+async fn the_model_call_limit_also_prints_the_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, server) = mock_server(vec![
+        tool("a", "glob", json!({"pattern":"*.a"})),
+        tool("b", "glob", json!({"pattern":"*.b"})),
+        tool("c", "glob", json!({"pattern":"*.c"})),
+        text("Looked for three kinds of files; none found yet."),
+    ])
+    .await;
+    let output = cli(root.path(), data.path(), &url, "bypass")
+        .args(["--max-turns", "3", "-p", "find files"])
+        .launch()
+        .await
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4, "{all}");
+    assert!(requests[3].to_string().contains("model call limit reached"));
+    assert!(!output.status.success(), "{all}");
+    assert!(
+        all.contains("[summary]") && all.contains("因用完 3 次模型调用停止"),
+        "{all}"
+    );
+    assert!(all.contains("已用完 3 次模型调用"), "{all}");
 }

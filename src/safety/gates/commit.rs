@@ -1,6 +1,7 @@
 //! Pre-commit gate: a shell `git commit` first runs the verification checks (when there
-//! are any) and the AI review of the staged change (`commit_review`), and requires the
-//! staged content to match the worktree, before and after the checks.
+//! are any) and the review of the staged change (`commit_review`, or the project's
+//! review command when `review_when` includes `commit`), and requires the staged
+//! content to match the worktree, before and after the checks.
 
 use std::{
     path::{Path, PathBuf},
@@ -27,7 +28,7 @@ pub struct WithCommitGate {
     pub inner: Arc<dyn ToolExecutor>,
     /// The checks; `None` when there are none or `commit_gate` is off.
     pub verifier: Option<Arc<CommandVerifier>>,
-    /// The AI review; `None` when `commit_review` is off.
+    /// The review; `None` when there is none at commits.
     pub review: Option<Arc<CommitReview>>,
     pub progress: Option<Arc<Progress>>,
     pub root: PathBuf,
@@ -73,19 +74,22 @@ impl WithCommitGate {
         )
         .await
         else {
-            self.say("[pre-commit review] could not read the staged diff; skipped")
-                .await;
-            return Verdict::Skipped;
+            self.say("[提交前审查] 读不到暂存的改动，已跳过").await;
+            return Verdict::Skipped("读不到暂存的改动".into());
         };
         if !review.wanted(&diff) {
             return Verdict::Passed;
         }
-        self.say("[pre-commit review] reviewing the staged change…")
+        self.say(&format!("[提交前审查] 正在{}…", review.describe()))
             .await;
         let verdict = review.review("", &diff, cancel).await;
-        if verdict == Verdict::Skipped {
-            self.say("[pre-commit review] did not finish; skipped")
-                .await;
+        match &verdict {
+            Verdict::Skipped(reason) => {
+                self.say(&format!("[提交前审查] 没有完成，已跳过：{reason}"))
+                    .await;
+            }
+            Verdict::Passed => self.say("[提交前审查] 通过").await,
+            _ => {}
         }
         verdict
     }
@@ -245,7 +249,8 @@ impl WithCommitGate {
             && let Verdict::Issues(findings) = self.review(review, cancel).await
         {
             verdict = Err(format!(
-                "the pre-commit review found issues; nothing was committed. Fix the real ones, stage and commit again. If a finding is wrong, do not commit around it: tell the user why and let them decide.\n{findings}"
+                "the pre-commit review found issues; nothing was committed. Fix the real ones, stage and commit again. If a finding is wrong, do not commit around it: tell the user why and let them decide.\n{}",
+                super::review::findings_text(&findings)
             ));
         }
         // Declined checks count too: asking again on a retry is what made commits drag.
@@ -277,8 +282,8 @@ impl ToolExecutor for WithCommitGate {
         self.inner.metered(name)
     }
 
-    fn concurrent(&self, name: &str) -> bool {
-        self.inner.concurrent(name)
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        self.inner.concurrent(name, input)
     }
 
     fn execute(
@@ -426,7 +431,7 @@ mod tests {
                 reply,
                 calls: Default::default(),
             });
-            let review = Arc::new(CommitReview {
+            let review = Arc::new(CommitReview::Builtin {
                 mode: crate::safety::gates::Switch::On,
                 reviewer: Reviewer {
                     provider: model.clone(),
@@ -440,6 +445,7 @@ mod tests {
                     },
                     ledger: Default::default(),
                     rules: None,
+                    instructions: None,
                 },
             });
             let gate = WithCommitGate::new(tools.clone(), None, Some(review), root.clone());

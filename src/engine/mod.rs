@@ -2,6 +2,8 @@
 
 pub mod agent;
 pub mod context;
+pub mod handoff;
+pub mod progress;
 pub mod prompt;
 pub mod subdir_hints;
 pub mod tool_output;

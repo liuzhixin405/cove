@@ -29,7 +29,7 @@
 
 ## 三、流程
 
-1. **先写优化文档，再改代码。** 写在 `docs/optimizations/NNNN-*.md`，按那里 README 的模板写，并加进索引；改完回填验证结果和状态。
+1. **先写优化文档，再改代码。** 写在 `docs/optimizations/NNNN-*.md`，按那里 README 的模板写，并加进索引；改完回填验证结果和状态。拿本机数据（`~/.cove` 下的会话、trace、账本）当证据时，先确认问题在当前版本上还存在：数据来自旧版本，之后可能已经修了（README 规则 3）。
 2. **禁止 `cargo fmt`**：它会重排 120 多个无关文件。只格式化自己改过的文件：
    `rustfmt --edition 2024 --config max_width=100 --emit stdout < 文件 > 临时文件`，确认后再拷回。
    **文件列表要用自己改过的文件，不要用 `grep -l` 搜出来的列表**：搜出来的会带上没改过的文件，曾因此误格式化 `safety/permission/risk.rs`。
@@ -45,6 +45,7 @@
 - **`grep` 搜 `\\?\` 这类带反斜杠的字面量**：用 `grep -F`。
 - **`ls | head`、`| tail` 会截断输出**：判断"文件不存在"之前，先看完整列表。
 - **`rm -rf` 删目录会被安全检查拦下**：清理演示项目时用 `git checkout` / `git clean`。
+- **分析本机数据时不要读 `~/.cove/config.json`**：`profiles.*.provider.api_key` 是嵌套字段，只过滤顶层的 key 会把它原样打印出来。要知道有哪些 profile、模型是什么，用 `cove --dump-system-prompt --profile <名>` 或 `/status`；trace、会话、账本里没有 key。（出处：2026-11-23 两次分析数据时，都因为只过滤了顶层字段，把 API key 打印到了命令输出里）
 
 ## 维护这份文档
 

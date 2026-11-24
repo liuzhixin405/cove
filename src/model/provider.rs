@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::Protocol,
     domain::{
-        Block, Error, Event, Message, ModelRequest, ModelResponse, Provider, Result, Role, Usage,
-        emit,
+        Block, Cache, Error, Event, Message, ModelRequest, ModelResponse, Provider, Result, Role,
+        Usage, emit,
     },
 };
 
@@ -916,13 +916,14 @@ fn build_body(
                 .collect();
             // Prompt cache: the system prompt and the last three messages; thinking
             // blocks cannot carry cache_control, so the last other block does. A
-            // conversation turn keeps its cache an hour where the model supports it.
-            let cache_control = if request.long_cache && long_cache_model(model) {
-                json!({"type":"ephemeral","ttl":"1h"})
-            } else {
-                json!({"type":"ephemeral"})
+            // conversation turn keeps its cache an hour where the model supports it;
+            // a one-off prompt carries no marks at all.
+            let cache_control = match request.cache {
+                Cache::Off => Value::Null,
+                Cache::Hour if long_cache_model(model) => json!({"type":"ephemeral","ttl":"1h"}),
+                Cache::Hour | Cache::Short => json!({"type":"ephemeral"}),
             };
-            let mut marked = 0;
+            let mut marked = if cache_control.is_null() { 3 } else { 0 };
             for message in messages.iter_mut().rev() {
                 if marked == 3 {
                     break;
@@ -948,8 +949,11 @@ fn build_body(
                     })
                 })
                 .collect();
-            let mut body = json!({"model":model,
-                "system":[{"type":"text","text":request.system,"cache_control":cache_control}],
+            let mut system = json!({"type":"text","text":request.system});
+            if !cache_control.is_null() {
+                system["cache_control"] = cache_control;
+            }
+            let mut body = json!({"model":model, "system":[system],
                 "messages":messages,"stream":true,"max_tokens":request.max_output_tokens});
             if !tools.is_empty() {
                 body["tools"] = json!(tools);
@@ -1685,7 +1689,7 @@ mod tests {
             max_output_tokens: 100,
             estimated_tokens: None,
             model: None,
-            long_cache: false,
+            cache: Cache::Short,
         }
     }
 
@@ -1837,7 +1841,7 @@ mod tests {
         };
         let turn = |model: &str, long_cache: bool| {
             let mut request = request(history());
-            request.long_cache = long_cache;
+            request.cache = Cache::turn(long_cache);
             build_body(Protocol::Anthropic, &options, model, request)
         };
         let marks = |body: &Value| -> Vec<Value> {
@@ -1861,6 +1865,17 @@ mod tests {
         ] {
             assert!(marks(&body).iter().all(|mark| mark.get("ttl").is_none()));
         }
+        // A one-off prompt (a standalone compaction) writes nothing to the cache.
+        let mut request = request(history());
+        request.cache = Cache::Off;
+        let body = build_body(
+            Protocol::Anthropic,
+            &options,
+            "anthropic.claude-opus-5-5",
+            request,
+        );
+        assert!(marks(&body).iter().all(Value::is_null), "{body}");
+        assert!(body["system"][0].get("cache_control").is_none());
     }
 
     #[test]

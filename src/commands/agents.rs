@@ -9,13 +9,15 @@ use crate::{
     agents::background::MAIN,
     agents::lifecycle::Kind,
     agents::subagent::{
-        AgentHub, HubParts, SerialAuthorizer, SubAgentSettings, ToolScope, TypeRegistry,
+        AgentHub, HubParts, ModelCatalog, SerialAuthorizer, SubAgentSettings, ToolScope,
+        TypeRegistry,
     },
     app::ui::print_text,
     app::{Application, fresh, validate_identity},
     config::Settings,
     domain::{Error, Progress, Provider, Result},
     engine::agent::{Ledger, add_spend},
+    model::routing::{ModelPolicy, ModelRouter},
     safety::permission::{Authorizer, LocalAuthorizer, Mode},
     session::workspace::Workspace,
     session::{SessionPersistence, State, Store},
@@ -26,10 +28,100 @@ use crate::{
 
 pub(crate) const HELP: &str = "/status agents [stop|park|resume|send|merge|discard <id|main> [confirm] [text]]  子代理和主任务：列出、中断、挂起、唤醒、发消息、合并或丢弃后台代理的分支；/status agents repair 恢复回归检查崩溃时留在基线状态的文件";
 
+/// The router's models for sub-agents: live main and fast model, prices by model, and
+/// each model's own window (learned from overflow errors, else the built-in table).
+struct RouterModels {
+    router: Arc<ModelRouter>,
+    cache: std::path::PathBuf,
+    provider: String,
+    base_url: String,
+    learned: serde_json::Value,
+}
+
+impl RouterModels {
+    /// The window of `model` as `Settings::load` finds the main model's: learned from an
+    /// overflow error (cache file, then `model_context_windows`), else the table.
+    fn window(&self, model: &str) -> usize {
+        let valid = |window: &u64| (8192..=10_000_000).contains(window);
+        crate::persist::read_json::<serde_json::Value>(&self.cache)
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(crate::config::model_context_cache_key(
+                        &self.provider,
+                        &self.base_url,
+                        model,
+                    ))?
+                    .as_u64()
+            })
+            .filter(valid)
+            .or_else(|| {
+                self.learned
+                    .get(model.to_ascii_lowercase())?
+                    .as_u64()
+                    .filter(valid)
+            })
+            .map_or_else(
+                || crate::model::models::context_window(model),
+                |window| window as usize,
+            )
+    }
+
+    fn budget_of(&self, model: &str) -> (usize, u32) {
+        let window = self.window(model);
+        let output = crate::model::models::max_output_tokens(model, window);
+        (
+            crate::model::models::context_budget(window, output).min(10_000_000),
+            output,
+        )
+    }
+}
+
+impl ModelCatalog for RouterModels {
+    fn main_model(&self) -> String {
+        self.router.main_model()
+    }
+
+    fn fast_model(&self) -> Option<String> {
+        let main = self.router.main_model();
+        self.router.fast_model().filter(|fast| *fast != main)
+    }
+
+    fn task_model(&self) -> String {
+        self.router.current_model()
+    }
+
+    fn prices(&self, model: &str) -> Option<crate::model::models::Prices> {
+        ModelPolicy::prices(&*self.router, model)
+    }
+
+    fn budget(&self, model: &str) -> (usize, u32) {
+        self.budget_of(model)
+    }
+}
+
+/// The sub-agents' view of `router`.
+pub(crate) fn catalog(settings: &Settings, router: Arc<ModelRouter>) -> Arc<dyn ModelCatalog> {
+    Arc::new(RouterModels {
+        router,
+        cache: settings
+            .data_dir
+            .join(crate::config::MODEL_CONTEXT_WINDOWS_CACHE),
+        provider: settings.provider.clone(),
+        base_url: settings.base_url.clone(),
+        learned: settings
+            .file
+            .get("model_context_windows")
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
 /// Builds the sub-agent hub; tool factories re-root the file and shell tools per scope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hub(
     settings: &Settings,
+    catalog: Arc<dyn ModelCatalog>,
     provider: Arc<dyn Provider>,
     tools: Arc<ExtensionTools>,
     authorizer: Arc<dyn Authorizer>,
@@ -103,6 +195,7 @@ pub(crate) fn hub(
         types,
         settings: SubAgentSettings {
             max_turns: settings.subagent_max_turns,
+            stall_rounds: settings.stall_rounds,
             max_output_tokens: settings.max_output_tokens,
             prices: settings.prices,
             context_tokens: settings.context_tokens,
@@ -112,6 +205,8 @@ pub(crate) fn hub(
             max_background,
             experimental,
             regression_command,
+            catalog,
+            explore_fast: settings.explore_fast,
         },
         ledger,
         progress,
@@ -395,4 +490,50 @@ pub(crate) async fn handle(
     print_text(&format!("{}\n", output.trim_end()), false)?;
 
     Ok(Some(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sub_agent_model_gets_its_own_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(
+            crate::model::provider::HttpProvider::new(
+                crate::config::Protocol::Openai,
+                "http://127.0.0.1:9/v1",
+                "claude-opus-5-5".into(),
+                "test-only-not-a-real-key",
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(ModelRouter::new(
+            provider,
+            Some("claude-haiku-4-5".into()),
+            None,
+        ));
+        let cache = dir.path().join("windows.json");
+        let models = RouterModels {
+            router,
+            cache: cache.clone(),
+            provider: "openai".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            learned: serde_json::json!({"learned-model": 50_000}),
+        };
+        assert_eq!(models.fast_model().as_deref(), Some("claude-haiku-4-5"));
+        // The fast model's window is Haiku's 200K, not the main model's 1M.
+        let (haiku, _) = models.budget("claude-haiku-4-5");
+        let (opus, _) = models.budget("claude-opus-5-5");
+        assert!(haiku <= 200_000 * 85 / 100, "{haiku}");
+        assert!(opus > 500_000, "{opus}");
+        assert_eq!(models.window("learned-model"), 50_000);
+        let key = crate::config::model_context_cache_key(
+            "openai",
+            "http://127.0.0.1:9/v1",
+            "claude-haiku-4-5",
+        );
+        std::fs::write(&cache, serde_json::json!({ key: 120_000 }).to_string()).unwrap();
+        assert_eq!(models.window("claude-haiku-4-5"), 120_000);
+    }
 }

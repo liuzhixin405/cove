@@ -348,6 +348,29 @@ pub async fn shell_live(
         cancel,
         None,
         progress,
+        &[],
+    )
+    .await
+}
+
+/// `shell_live` with extra environment variables for the command (the project review
+/// command's `COVE_REVIEW_*`), and no live output.
+pub async fn shell_with_env(
+    cwd: &Path,
+    script: &str,
+    timeout: Duration,
+    cancel: CancellationToken,
+    env: &[(&str, String)],
+) -> Result<CommandOutput> {
+    run(
+        Shell::route(script),
+        cwd,
+        script,
+        timeout,
+        cancel,
+        None,
+        None,
+        env,
     )
     .await
 }
@@ -359,7 +382,17 @@ pub async fn shell_configured(
     cancel: CancellationToken,
     input: Option<&str>,
 ) -> Result<CommandOutput> {
-    run(&Shell::legacy(), cwd, script, timeout, cancel, input, None).await
+    run(
+        &Shell::legacy(),
+        cwd,
+        script,
+        timeout,
+        cancel,
+        input,
+        None,
+        &[],
+    )
+    .await
 }
 
 /// Runs `script` in `shell`, streaming output lines to `progress`.
@@ -371,7 +404,7 @@ pub async fn run_shell(
     cancel: CancellationToken,
     progress: Option<Arc<Progress>>,
 ) -> Result<CommandOutput> {
-    run(shell, cwd, script, timeout, cancel, None, progress).await
+    run(shell, cwd, script, timeout, cancel, None, progress, &[]).await
 }
 
 /// PowerShell reads the script from stdin after the process has joined its Job Object.
@@ -434,6 +467,7 @@ fn command_for(shell: &Shell, script: &str) -> (Command, Option<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     shell: &Shell,
     cwd: &Path,
@@ -442,6 +476,7 @@ async fn run(
     cancel: CancellationToken,
     input: Option<&str>,
     progress: Option<Arc<Progress>>,
+    env: &[(&str, String)],
 ) -> Result<CommandOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Cancelled);
@@ -465,6 +500,7 @@ async fn run(
         inherited_git_config_count()
     };
     command.envs(noninteractive_env(inherited));
+    command.envs(env.iter().map(|(key, value)| (*key, value.as_str())));
     let mut child = command.spawn()?;
     let tree = match ProcessTree::attach(&child) {
         Ok(tree) => tree,

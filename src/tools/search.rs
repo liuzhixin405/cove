@@ -75,7 +75,7 @@ impl PathPattern {
 }
 
 /// Files under `base` (respecting ignore files, without `.git`), each confined by `confine`.
-fn walk(base: &Path) -> ignore::Walk {
+pub(crate) fn walk(base: &Path) -> ignore::Walk {
     let mut walk = ignore::WalkBuilder::new(base);
     walk.hidden(false).follow_links(false).require_git(false);
     walk.filter_entry(|entry| {

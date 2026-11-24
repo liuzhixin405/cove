@@ -21,6 +21,9 @@ const INSTRUCTIONS_LIMIT: usize = 32 * 1024;
 /// Rules get their own budget, above `MAX_RULES` × `MAX_CHARS` even for Chinese
 /// text (about 54 KiB), so they are applied in full.
 const RULES_LIMIT: usize = 64 * 1024;
+/// The user preferences, at most 20 × 200 characters when written by cove (about
+/// 12 KiB of Chinese at the very most, usually far less).
+const PREFERENCES_LIMIT: usize = 8 * 1024;
 const OUTLINE_LIMIT: usize = 4 * 1024;
 const SKILLS_LIMIT: usize = 8 * 1024;
 
@@ -287,9 +290,33 @@ pub fn outline(cwd: &Path) -> String {
     out
 }
 
-/// System prompt sections describing the project; stable for the whole process.
-pub fn system_context(cwd: &Path, skills: &[(String, String)]) -> String {
+/// The "User preferences" section for `preferences` (`memory::rules`, the user's own
+/// file); empty when there are none. Above [`PREFERENCES_LIMIT`] the rest is cut and
+/// marked: writes keep the file far below it, only a hand edit gets there.
+pub fn preferences_section(preferences: &[String]) -> String {
+    if preferences.is_empty() {
+        return String::new();
+    }
+    let mut body: String = preferences
+        .iter()
+        .map(|preference| format!("- {preference}\n"))
+        .collect();
+    if body.len() > PREFERENCES_LIMIT {
+        body = format!(
+            "{}\n[preferences clipped at 8 KiB]\n",
+            crate::text::head(&body, PREFERENCES_LIMIT)
+        );
+    }
+    format!(
+        "\n# User preferences\nThe user's own preferences, for every project. Follow them unless the project instructions below, or the user's current request, say otherwise; those win.\n<preferences>\n{body}</preferences>\n"
+    )
+}
+
+/// System prompt sections describing the project, after the user's `preferences`;
+/// stable for the whole process.
+pub fn system_context(cwd: &Path, skills: &[(String, String)], preferences: &[String]) -> String {
     let mut out = format!("\n\n# Environment\n{}\n", environment(cwd));
+    out.push_str(&preferences_section(preferences));
     let (files, _) = instruction_files(cwd);
     if !files.is_empty() {
         out.push_str(
@@ -329,6 +356,112 @@ pub fn system_context(cwd: &Path, skills: &[(String, String)]) -> String {
         out.push_str(&index);
     }
     out
+}
+
+/// Above this many bytes of changed instruction files, a [`context_changes`] note
+/// names them instead of quoting them.
+const CHANGE_NOTE_LIMIT: usize = 16 * 1024;
+
+/// The key of the user preferences among [`announced_parts`]; no file is named so.
+const PREFERENCES_PART: &str = "\0preferences";
+
+/// The parts of a [`system_context`] that steer what the model does (0036): the user
+/// preferences and each instruction file, as `(name, text)`. The environment line,
+/// outline and skills are left out: they only orient the model, and it can look them
+/// up again.
+fn announced_parts(context: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    if let Some(start) = context.find("\n# User preferences\n") {
+        let rest = &context[start..];
+        if let Some(open) = rest.find("<preferences>\n") {
+            let body = &rest[open + "<preferences>\n".len()..];
+            if let Some(close) = body.find("</preferences>\n") {
+                parts.push((PREFERENCES_PART.to_owned(), body[..close].to_owned()));
+            }
+        }
+    }
+    if let Some(start) = context.find("\n# Project instructions\n") {
+        let rest = &context[start..];
+        // The outline and the skill index are cove's own text after the files, so the
+        // last heading of them ends the instructions even if a file has such a line.
+        let end = rest
+            .rfind("\n# Project outline\n")
+            .or_else(|| rest.rfind("\n# Available skills\n"))
+            .unwrap_or(rest.len());
+        for block in rest[..end].split("<instructions file=\"").skip(1) {
+            let Some((name, body)) = block.split_once("\">\n") else {
+                continue;
+            };
+            let body = body.strip_suffix("\n</instructions>\n").unwrap_or(body);
+            parts.push((name.to_owned(), body.to_owned()));
+        }
+    }
+    parts
+}
+
+/// A digest of the preferences and instruction files in `context`: a resumed session
+/// records it once it told the model about them, so the same change is told once.
+pub fn announced_mark(context: &str) -> String {
+    let mut digest = Sha256::new();
+    for (name, text) in announced_parts(context) {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(text.as_bytes());
+        digest.update([0]);
+    }
+    digest.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What changed in the user preferences and instruction files from the project
+/// context a resumed session keeps (`saved`) to the current one: a note for the next
+/// task's message, as `/rules` announces added rules; `None` when neither changed (the
+/// environment, outline and skills are not compared, 0036).
+pub fn context_changes(saved: &str, current: &str) -> Option<String> {
+    let before = announced_parts(saved);
+    let after = announced_parts(current);
+    let mut changed: Vec<(&str, Option<&str>)> = after
+        .iter()
+        .filter(|part| !before.contains(part))
+        .map(|(name, text)| (name.as_str(), Some(text.as_str())))
+        .collect();
+    changed.extend(
+        before
+            .iter()
+            .filter(|(name, _)| !after.iter().any(|(other, _)| other == name))
+            .map(|(name, _)| (name.as_str(), None)),
+    );
+    if changed.is_empty() {
+        return None;
+    }
+    let files: usize = changed
+        .iter()
+        .filter(|(name, _)| *name != PREFERENCES_PART)
+        .filter_map(|(_, text)| *text)
+        .map(str::len)
+        .sum();
+    let mut note = String::from(
+        "[project context] Changed since this session started; this replaces what the system prompt says about them:\n",
+    );
+    for (name, text) in changed {
+        match (name == PREFERENCES_PART, text) {
+            (true, None) => note.push_str("- User preferences: all removed\n"),
+            // At most 8 KiB, and outside the workspace the read tool can open.
+            (true, Some(text)) => note.push_str(&format!(
+                "User preferences:\n<preferences>\n{text}</preferences>\n"
+            )),
+            (false, None) => note.push_str(&format!("- {name}: removed\n")),
+            (false, Some(_)) if files > CHANGE_NOTE_LIMIT => note.push_str(&format!(
+                "- {name}: changed; read it before relying on it\n"
+            )),
+            (false, Some(text)) => note.push_str(&format!(
+                "<instructions file=\"{name}\">\n{text}\n</instructions>\n"
+            )),
+        }
+    }
+    Some(note)
 }
 
 /// Text added to a new task's message; `None` when there is nothing new to say.
@@ -470,6 +603,89 @@ mod tests {
             "{}",
             agents.1
         );
+    }
+
+    #[test]
+    fn preferences_come_before_the_project_instructions_and_say_who_wins() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "README is generated").unwrap();
+        let context = system_context(root.path(), &[], &["改了命令就更新 README".into()]);
+        let preferences = context.find("# User preferences").expect("section");
+        let project = context.find("# Project instructions").expect("project");
+        assert!(preferences < project, "{context}");
+        assert!(context.contains("<preferences>\n- 改了命令就更新 README\n</preferences>"));
+        assert!(context.contains("project instructions below, or the user's current request"));
+        let none = system_context(root.path(), &[], &[]);
+        assert!(!none.contains("# User preferences"), "{none}");
+        assert!(preferences_section(&[]).is_empty());
+        let many: Vec<String> = (0..200)
+            .map(|n| format!("{n} {}", "偏".repeat(20)))
+            .collect();
+        let clipped = preferences_section(&many);
+        assert!(clipped.contains("[preferences clipped at 8 KiB]"));
+        assert!(clipped.len() < PREFERENCES_LIMIT + 512, "{}", clipped.len());
+    }
+
+    #[test]
+    fn only_preference_and_instruction_changes_are_told() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "Run cargo test.").unwrap();
+        let skills = [("deploy".to_owned(), "Deploy it".to_owned())];
+        let saved = system_context(root.path(), &skills, &["中文回复".into()]);
+        // A new file and a new skill change the context, but not what is compared.
+        std::fs::write(root.path().join("src/lib.rs"), "").unwrap();
+        let grown = system_context(root.path(), &[], &["中文回复".into()]);
+        assert_ne!(saved, grown);
+        assert_eq!(context_changes(&saved, &grown), None);
+        assert_eq!(announced_mark(&saved), announced_mark(&grown));
+
+        std::fs::write(root.path().join("AGENTS.md"), "Run cargo test --release.").unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "Keep CRLF.").unwrap();
+        let edited = system_context(root.path(), &[], &["中文回复".into()]);
+        let note = context_changes(&saved, &edited).expect("instructions changed");
+        assert!(note.starts_with("[project context]"), "{note}");
+        assert!(
+            note.contains(
+                "<instructions file=\"AGENTS.md\">\nRun cargo test --release.\n</instructions>"
+            ) && note.contains("<instructions file=\"CLAUDE.md\">\nKeep CRLF.\n</instructions>"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("preferences") && !note.contains("Languages"),
+            "{note}"
+        );
+        assert_ne!(announced_mark(&saved), announced_mark(&edited));
+
+        std::fs::remove_file(root.path().join("AGENTS.md")).unwrap();
+        let removed = system_context(root.path(), &[], &[]);
+        let note = context_changes(&edited, &removed).expect("removed");
+        assert!(
+            note.contains("- AGENTS.md: removed")
+                && note.contains("- User preferences: all removed"),
+            "{note}"
+        );
+        let preferred = system_context(root.path(), &[], &["先写测试".into()]);
+        let note = context_changes(&removed, &preferred).expect("preferences");
+        assert!(
+            note.contains("<preferences>\n- 先写测试\n</preferences>"),
+            "{note}"
+        );
+
+        // Too much to quote: named, to be read.
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            "x".repeat(CHANGE_NOTE_LIMIT + 1),
+        )
+        .unwrap();
+        let large = system_context(root.path(), &[], &["先写测试".into()]);
+        let note = context_changes(&preferred, &large).expect("large");
+        assert!(note.contains("- AGENTS.md: changed; read it"), "{note}");
+        assert!(note.len() < 1024, "{}", note.len());
     }
 
     #[test]

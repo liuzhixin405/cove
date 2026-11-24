@@ -180,8 +180,14 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
         | "disabled_skills"
         | "done_self_review"
         | "done_check"
+        | "cite_check"
+        | "change_impact"
         | "done_verify_timeout_seconds"
+        | "review_when"
+        | "review_timeout_seconds"
+        | "review_instructions"
         | "max_iterations"
+        | "stall_rounds"
         | "subagent_max_iterations"
         | "max_output_tokens"
         | "context_window"
@@ -220,6 +226,36 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
             }
             _ => Class::Sensitive,
         },
+        // Running repository code; turning it off is safe.
+        "review_commands" => match value {
+            Value::Array(commands) if commands.is_empty() => Class::Safe,
+            _ => Class::Sensitive,
+        },
+        // Stricter than what applies already is safe; looser is not.
+        "review_block" => {
+            use crate::safety::gates::review_command::Severity;
+            let base = root
+                .get("review_block")
+                .and_then(Value::as_str)
+                .and_then(Severity::parse_block)
+                .unwrap_or(Severity::High);
+            match value.as_str().and_then(Severity::parse_block) {
+                Some(new) if new <= base => Class::Safe,
+                _ => Class::Sensitive,
+            }
+        }
+        "review_max_rounds" => {
+            let base = root
+                .get("review_max_rounds")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::from(
+                    crate::safety::gates::review_command::DEFAULT_ROUNDS,
+                ));
+            match value.as_u64() {
+                Some(new) if new > 0 && new <= base => Class::Safe,
+                _ => Class::Sensitive,
+            }
+        }
         "max_sessions" => match (
             value.as_i64(),
             root.get("max_sessions").and_then(Value::as_i64),
@@ -380,6 +416,57 @@ mod tests {
             apply_project_config(&mut json!({}), &cwd, data.path(), &mut Vec::new()).unwrap();
         assert!(!config.trusted);
         assert_eq!(config.ignored, ["system_prompt"]);
+    }
+
+    #[test]
+    fn review_keys_need_trust_only_to_run_code_or_loosen_the_review() {
+        let root = Map::new();
+        let class = |key: &str, value: Value| match classify(key, &value, &root) {
+            Class::Safe => "safe",
+            Class::Sensitive => "sensitive",
+            Class::Unsupported => "unsupported",
+        };
+        assert_eq!(class("review_commands", json!(["bash x.sh"])), "sensitive");
+        assert_eq!(class("review_commands", json!([])), "safe");
+        assert_eq!(class("review_when", json!("both")), "safe");
+        assert_eq!(class("review_timeout_seconds", json!(1800)), "safe");
+        assert_eq!(class("review_instructions", json!("eng/SKILL.md")), "safe");
+        // Stricter than the default `high` is safe, looser is not.
+        assert_eq!(class("review_block", json!("medium")), "safe");
+        assert_eq!(class("review_block", json!("any")), "safe");
+        assert_eq!(class("review_block", json!("high")), "safe");
+        assert_eq!(class("review_block", json!("critical")), "sensitive");
+        assert_eq!(class("review_block", json!("nonsense")), "sensitive");
+        assert_eq!(class("review_max_rounds", json!(2)), "safe");
+        assert_eq!(class("review_max_rounds", json!(5)), "sensitive");
+        assert_eq!(class("review_max_rounds", json!(0)), "sensitive");
+        // Against the user's own setting, not just the default.
+        let user = json!({"review_block": "low", "review_max_rounds": 5});
+        let user = user.as_object().unwrap();
+        assert!(matches!(
+            classify("review_block", &json!("medium"), user),
+            Class::Sensitive
+        ));
+        assert!(matches!(
+            classify("review_max_rounds", &json!(4), user),
+            Class::Safe
+        ));
+
+        // Untrusted: the command is left out and listed.
+        let data = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().canonicalize().unwrap();
+        std::fs::write(
+            cwd.join(PROJECT_CONFIG),
+            json!({"review_commands": ["python tools/review.py"], "review_block": "medium"})
+                .to_string(),
+        )
+        .unwrap();
+        let mut raw = json!({});
+        let config = apply_project_config(&mut raw, &cwd, data.path(), &mut Vec::new()).unwrap();
+        assert_eq!(config.ignored, ["review_commands"]);
+        assert!(raw.get("review_commands").is_none());
+        assert_eq!(raw["review_block"], "medium");
     }
 
     #[test]

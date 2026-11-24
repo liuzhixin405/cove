@@ -333,6 +333,7 @@ async fn candidate(
                 root: tree.clone(),
                 queue: hub.approvals.clone(),
                 agent: format!("race {}", lane.id),
+                refused: Default::default(),
             })),
             detached: true,
             worktree: Some((tree.clone(), workspace)),

@@ -1,5 +1,6 @@
 //! Acceptance report per task: the checks that ran with their evidence, the verification
-//! outcome and the git work state, saved as `<data_dir>/acceptance/<session>.json`.
+//! outcome, the end-of-task review and the git work state, saved as
+//! `<data_dir>/acceptance/<session>.json`.
 //! It records what happened; it is not the model's claim of completion.
 
 use std::{
@@ -11,7 +12,7 @@ use std::{
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use super::{CheckRecord, Evidence, GitEvent};
+use super::{CheckRecord, Evidence, GitEvent, ReviewRecord};
 use crate::{engine::turn::TurnHook, session::Session};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -47,6 +48,19 @@ pub struct Report {
     pub verification: Option<String>,
     pub checks: Vec<CheckRecord>,
     pub git: GitState,
+    /// The citation check of an answer that changed no files; absent when none ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<super::cite::CitationStats>,
+    /// The end-of-task review (0028); absent when none ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewRecord>,
+    /// The change impact (0031): counts and the callers no test refers to; absent
+    /// when it was not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<crate::safety::impact::ImpactRecord>,
+    /// The cove build that wrote the report (0033); absent in older reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 pub fn path(data_dir: &Path, session_id: &str) -> PathBuf {
@@ -80,6 +94,24 @@ pub fn summary(report: &Report) -> String {
     );
     if report.checks.is_empty() {
         out.push_str("checks: none ran\n");
+    }
+    if let Some(citations) = &report.citations {
+        out.push_str(&citations.summary());
+        out.push('\n');
+    }
+    if let Some(review) = &report.review {
+        out.push_str(&review_summary(review));
+        out.push('\n');
+    }
+    if let Some(impact) = &report.impact {
+        out.push_str(&impact.summary());
+        out.push('\n');
+        for caller in impact.untested.iter().take(5) {
+            out.push_str(&format!(
+                "  没有测试引用：{}:{} 使用 {}\n",
+                caller.file, caller.line, caller.symbol
+            ));
+        }
     }
     for check in &report.checks {
         out.push_str(&format!(
@@ -120,6 +152,36 @@ pub fn summary(report: &Report) -> String {
         ));
     }
     out
+}
+
+/// One line on the end-of-task review: `审查（项目审查命令）：通过，2 轮`.
+pub fn review_summary(review: &ReviewRecord) -> String {
+    let who = if review.reviewer == "project" {
+        "项目审查命令"
+    } else {
+        "自审"
+    };
+    let outcome = match review.outcome.as_str() {
+        "passed" => "通过",
+        "failed" => "未通过",
+        "not_run" => "未运行",
+        "unparsed" => "无法判定",
+        "handed_back" => "发现问题，已交回模型一次",
+        other => other,
+    };
+    let mut text = format!("审查（{who}）：{outcome}，{} 轮", review.rounds);
+    if !review.open.is_empty() {
+        let label = if review.outcome == "passed" {
+            "未要求处理"
+        } else {
+            "未处理"
+        };
+        text.push_str(&format!(
+            "；{label}：{}",
+            crate::text::short(&review.open.join("；"), 300)
+        ));
+    }
+    text
 }
 
 /// A read-only git query for the acceptance report (10 s); `None` on any failure.
@@ -209,6 +271,10 @@ impl TurnHook for Acceptance {
                 verification,
                 checks,
                 git,
+                citations: self.evidence.citations(),
+                review: self.evidence.review(),
+                impact: self.evidence.impact(),
+                build: Some(crate::build_id::BUILD.into()),
             };
             let target = path(&self.data_dir, &session.id);
             if let Some(parent) = target.parent() {
@@ -237,6 +303,30 @@ mod tests {
             evidence: String::new(),
         });
         evidence.set_outcome("passed");
+        evidence.set_review(ReviewRecord {
+            reviewer: "project".into(),
+            outcome: "passed".into(),
+            rounds: 2,
+            open: vec!["[LOW] a.py:3 命名".into()],
+            note: String::new(),
+        });
+        evidence.set_impact(
+            crate::safety::impact::ImpactRecord {
+                symbols: 2,
+                removed: 0,
+                signature: 1,
+                body: 1,
+                callers: 3,
+                untested: vec![crate::safety::impact::UntestedCaller {
+                    file: "invoice.py".into(),
+                    line: 30,
+                    symbol: "price".into(),
+                }],
+                partial: false,
+                handed_back: true,
+            },
+            None,
+        );
         let hook = Acceptance::new(data.path().into(), root.path().into(), evidence);
         let mut session = Session::new(root.path().into(), String::new(), String::new(), None);
         session.current_request = "fix the bug".into();
@@ -244,10 +334,30 @@ mod tests {
         hook.task_end(&session, true).await;
         let report = load(data.path(), &session.id).unwrap();
         assert_eq!(report.verification.as_deref(), Some("passed"));
+        assert_eq!(report.build.as_deref(), Some(crate::build_id::BUILD));
         let text = summary(&report);
         assert!(
             text.contains("cargo test") && text.contains("fix the bug"),
             "{text}"
         );
+        assert!(
+            text.contains("审查（项目审查命令）：通过，2 轮；未要求处理：[LOW] a.py:3 命名"),
+            "{text}"
+        );
+        assert!(
+            text.contains("其他文件 3 处使用，1 处没有测试引用（已交给模型核对）"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  没有测试引用：invoice.py:30 使用 price"),
+            "{text}"
+        );
+        // A report written before the field existed still loads.
+        let mut old = serde_json::to_value(&report).unwrap();
+        old.as_object_mut().unwrap().remove("impact");
+        old.as_object_mut().unwrap().remove("build");
+        let old: Report = serde_json::from_value(old).unwrap();
+        assert!(old.impact.is_none());
+        assert!(old.build.is_none());
     }
 }

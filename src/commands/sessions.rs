@@ -18,7 +18,7 @@ use crate::{
     memory::store::{Memory, ProvenanceSource, Scope},
     safety::permission::{Authorizer, Effect, Mode},
     session::snapshot::{SnapshotInfo, Snapshots, Snapshotting},
-    session::usage::{UsageLedger, aggregate, csv, parse_period, render, timestamp},
+    session::usage::{UsageLedger, aggregate, csv, parse_period, render},
     session::{
         MAX_SESSIONS, Session, SessionPersistence, SessionScope, State, Store, TitleSource,
         history_lines,
@@ -30,6 +30,8 @@ pub(crate) const HELP: &str = "\
 /resume [list|all|search <words>|<n|id>|detail <n|id>|rename <n|id> <名字>|delete <n|id>|clear [all] [confirm]|clean|export [file]]  会话历史（列表后直接输入编号即可恢复；新会话中输入 继续 回到上一个任务）
 /continue [<n|id>]  列出当前工作区的会话供选择，或直接恢复指定会话；未完成任务会继续运行
 /rename <名字>  给当前会话改名（AI 生成的标题不会再覆盖它）
+/handoff [重点]  换话题时交接：模型在原上下文上写一份交接摘要（做了什么、定了什么、没做完什么），cove 附上改过的文件、提交和未提交的改动，在新会话里从这份摘要接着做；原会话原样保留
+/back  回到交接前的原会话（交接出来的会话里可用）
 /turns [<n>]  查看当前会话每一轮的提问和结论；交互终端打开阅读器
 /replay [<n|id>]  会话回放：把会话渲染成零依赖的单文件 HTML 时间线报告（缺省为当前会话），写入数据目录 replay/ 并打印路径
 /suggestions [list|analyze|accept <hash>|reject <hash>|revoke <hash> <reason>]  当前会话的人工审核建议
@@ -59,7 +61,10 @@ pub(crate) struct Services {
     pub(crate) recall: Arc<MemoryRecall>,
     pub(crate) extractor: Arc<Extractor>,
     /// The project's rules (`.cove/rules.md`); `None` outside a project.
-    pub(crate) rules: Option<Arc<crate::memory::rules::ProjectRules>>,
+    pub(crate) rules: Option<Arc<crate::memory::rules::RulesFile>>,
+    /// The user's preferences (`<data dir>/preferences.md`) and the proposals waiting
+    /// for an answer.
+    pub(crate) preferences: Arc<crate::memory::preferences::Preferences>,
     pub(crate) titler: Arc<crate::session::titles::Titler>,
     pub(crate) dreamer: Arc<Dreamer>,
     max_sessions: i64,
@@ -80,6 +85,7 @@ impl TurnHook for LedgerSession {
 }
 
 impl Services {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         settings: &Settings,
         store: &Store,
@@ -87,7 +93,8 @@ impl Services {
         authorizer: Arc<dyn Authorizer>,
         background: Arc<dyn Provider>,
         ledger: Arc<UsageLedger>,
-        rules: Option<Arc<crate::memory::rules::ProjectRules>>,
+        rules: Option<Arc<crate::memory::rules::RulesFile>>,
+        preferences: Arc<crate::memory::preferences::Preferences>,
     ) -> Arc<Self> {
         // Snapshotting a home directory or a drive would stage everything on it.
         let (snapshots, snapshot_error) = match crate::safety::protected::too_wide(&settings.cwd) {
@@ -119,12 +126,16 @@ impl Services {
             snapshots,
             snapshot_error,
             recall: Arc::new(MemoryRecall::new(memory.clone(), embedder)),
-            extractor: Arc::new(Extractor::new(
-                memory.clone(),
-                rules.clone(),
-                background.clone(),
-                auto_off.clone(),
-            )),
+            extractor: Arc::new(
+                Extractor::new(
+                    memory.clone(),
+                    rules.clone(),
+                    background.clone(),
+                    auto_off.clone(),
+                )
+                .with_preferences(preferences.clone(), settings.cwd.clone()),
+            ),
+            preferences,
             rules: rules.clone(),
             titler: {
                 let titler = Arc::new(crate::session::titles::Titler::new(
@@ -191,6 +202,7 @@ impl Services {
         if let Some(rules) = &self.rules {
             hooks.push(rules.clone());
         }
+        hooks.push(self.preferences.file.clone());
         hooks.push(self.titler.clone());
         hooks.push(Arc::new(self.dreamer.clone()));
         hooks
@@ -217,6 +229,7 @@ impl Services {
         self.extractor.wait(Duration::from_secs(10)).await;
         self.titler.wait(Duration::from_secs(10)).await;
         self.dreamer.shutdown(Duration::from_secs(5)).await;
+        self.preferences.shutdown();
     }
 
     /// Puts titles the model finished in the background into their sessions: the
@@ -451,6 +464,20 @@ pub(crate) async fn handle(
         ["/continue"] => continue_sessions(app, None).await?,
         ["/continue", reference] => continue_sessions(app, Some(*reference)).await?,
         ["/rename", ..] => rename(app, line)?,
+        ["/handoff", ..] => {
+            let focus = line
+                .trim()
+                .strip_prefix("/handoff")
+                .unwrap_or_default()
+                .trim();
+            app.handoff(Some(focus).filter(|focus| !focus.is_empty()))
+                .await?
+        }
+        ["/back"] => {
+            if back(app).await? {
+                return Ok(Some(true));
+            }
+        }
         ["/turns"] => browse_turns(app, None)?,
         ["/turns", number] => browse_turns(app, Some(number))?,
         ["/resume", rest @ ..] => {
@@ -906,6 +933,17 @@ async fn resume(app: &mut Application, id: &str, show_continue_hint: bool) -> Re
     Ok(false)
 }
 
+/// `/back`: the session this one was handed over from (`/handoff`).
+async fn back(app: &mut Application) -> Result<bool> {
+    let Some(origin) = app.session.handoff_from.clone() else {
+        return Err(Error::Session(
+            "当前会话不是用 /handoff 交接出来的，没有可回去的原会话；/resume 列出本目录的会话"
+                .into(),
+        ));
+    };
+    resume(app, &origin, true).await
+}
+
 /// A session of another workspace resumes in a restart there, the way `/cd` switches:
 /// the tools, checkpoints and permissions of a workspace belong to its process.
 fn resume_elsewhere(app: &mut Application, session: &Session) -> Result<bool> {
@@ -1350,6 +1388,11 @@ pub fn markdown(session: &Session) -> String {
         };
         out.push_str(match (message.role, &mark) {
             (Role::User, crate::session::turns::Mark::Start { .. }) => "## 用户\n\n",
+            (Role::User, crate::session::turns::Mark::Summary { .. })
+                if crate::engine::handoff::is_handoff(message) =>
+            {
+                "## 交接摘要\n\n"
+            }
             (Role::User, crate::session::turns::Mark::Summary { .. }) => "## 压缩摘要\n\n",
             (Role::User, _) if matches!(message.blocks.first(), Some(Block::Text(_))) => {
                 "## 系统提示\n\n"
@@ -1652,6 +1695,9 @@ async fn cost(app: &Application, rest: &[&str]) -> Result<()> {
     let entries = app.sessions.ledger.load(period.from, period.to)?;
     let (rows, total) = aggregate(&entries);
     let mut text = render(&period, &rows, &total);
+    if let Some(line) = crate::session::usage::by_source(&entries) {
+        text.push_str(&line);
+    }
     if let Some(file) = export {
         let path = match file {
             Some(file) if PathBuf::from(file).is_absolute() => PathBuf::from(file),
@@ -1705,7 +1751,7 @@ async fn undo_overview(app: &Application) -> Result<()> {
         text.push_str(&format!(
             "  #{:<2} {}  {}\n",
             index + 1,
-            timestamp(info.time),
+            crate::session::time::stamp(info.time),
             info.label.trim_start_matches("[cove] ")
         ));
     }
@@ -1742,7 +1788,7 @@ async fn undo_preview(app: &Application, target: &str, paths: Vec<String>) -> Re
         } else {
             "所选文件"
         },
-        timestamp(target.time),
+        crate::session::time::stamp(target.time),
         target.label
     );
     for item in planned.iter().take(200) {
@@ -1910,7 +1956,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                     scope.name(),
                     entry.title,
                     entry.content.len(),
-                    timestamp(entry.updated)
+                    crate::session::time::stamp(entry.updated)
                 ));
             }
             if entries.is_empty() {
@@ -2039,8 +2085,8 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                 scope.name(),
                 entry.title,
                 entry.source,
-                timestamp(entry.created),
-                timestamp(entry.updated)
+                crate::session::time::stamp(entry.created),
+                crate::session::time::stamp(entry.updated)
             );
             if entry.provenance.is_empty() {
                 text.push_str("没有出处记录（旧条目或外部写入的条目）\n");
@@ -2050,7 +2096,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                 text.push_str(&format!(
                     "- {} 于 {}{}{}{}{}\n",
                     source.kind,
-                    timestamp(source.at),
+                    crate::session::time::stamp(source.at),
                     if source.session.is_empty() {
                         String::new()
                     } else {
@@ -2079,7 +2125,7 @@ async fn memory(app: &mut Application, line: &str, args: &[&str]) -> Result<()> 
                     },
                     source.scope.map_or("未知", Scope::name),
                     source.environment.as_deref().unwrap_or("未知"),
-                    source.verified_at.map_or("未知".into(), timestamp),
+                    source.verified_at.map_or("未知".into(), crate::session::time::stamp),
                 ));
                 if !source.evidence.is_empty() {
                     for line in source.evidence.lines().take(12) {

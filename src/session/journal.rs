@@ -64,12 +64,28 @@ struct Head<'a> {
     title: Option<&'a str>,
     #[serde(skip_serializing_if = "TitleSource::is_prompt")]
     title_source: TitleSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_request_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_to: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    builds: &'a [String],
+    /// Only in snapshots: up to 100 KiB that rarely changes (`Session::system_context`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_context: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_told: Option<&'a str>,
 }
 
 impl<'a> Head<'a> {
     /// The destructuring names every field: a field added to `Session` and not
-    /// journaled here does not compile.
-    fn of(session: &'a Session, updated: u64) -> Self {
+    /// journaled here does not compile. A record (`snapshot` false) leaves out the
+    /// project context: replay keeps the snapshot's, and a changed one is snapshotted.
+    fn of(session: &'a Session, updated: u64, snapshot: bool) -> Self {
         let Session {
             hook_runs,
             version,
@@ -92,6 +108,13 @@ impl<'a> Head<'a> {
             task_failures,
             title,
             title_source,
+            task_model,
+            task_request_at,
+            handoff_from,
+            handoff_to,
+            builds,
+            system_context,
+            system_told,
         } = session;
         Self {
             hook_runs,
@@ -114,6 +137,13 @@ impl<'a> Head<'a> {
             task_failures: *task_failures,
             title: title.as_deref(),
             title_source: *title_source,
+            task_model: task_model.as_deref(),
+            task_request_at: *task_request_at,
+            handoff_from: handoff_from.as_deref(),
+            handoff_to: handoff_to.as_deref(),
+            builds,
+            system_context: system_context.as_deref().filter(|_| snapshot),
+            system_told: system_told.as_deref(),
         }
     }
 }
@@ -156,6 +186,8 @@ struct Journal {
     epoch: u64,
     /// Messages the snapshot and the journal hold.
     saved: usize,
+    /// The project context of the snapshot; records do not repeat it.
+    context: Option<String>,
     seq: u64,
     bytes: u64,
     /// Last `sync_data`; appends between syncs are in the OS cache, which a process
@@ -201,6 +233,7 @@ pub fn save(snapshot: &Path, log: &Path, session: &Session) -> Result<()> {
     if let Some(journal) = journals.get_mut(log)
         && journal.epoch == session.messages.epoch()
         && journal.saved <= session.messages.len()
+        && journal.context == session.system_context
         && journal.bytes < JOURNAL_LIMIT
     {
         let seq = next_seq();
@@ -208,7 +241,7 @@ pub fn save(snapshot: &Path, log: &Path, session: &Session) -> Result<()> {
             seq,
             at: journal.saved,
             append: &session.messages[journal.saved..],
-            head: Head::of(session, updated),
+            head: Head::of(session, updated, false),
         };
         let mut line = serde_json::to_vec(&record)?;
         line.push(b'\n');
@@ -248,7 +281,7 @@ fn write_snapshot(
     atomic_json(
         snapshot,
         &SnapshotRef {
-            head: Head::of(session, updated),
+            head: Head::of(session, updated, true),
             messages: &session.messages,
             journal_seq: seq,
         },
@@ -271,6 +304,7 @@ fn write_snapshot(
             file,
             epoch: session.messages.epoch(),
             saved: session.messages.len(),
+            context: session.system_context.clone(),
             seq,
             bytes: 0,
             synced: std::time::Instant::now(),
@@ -308,8 +342,13 @@ pub fn load(snapshot: &Path, log: &Path) -> Result<(Session, u64)> {
         let mut messages = std::mem::take(&mut session.messages).into_vec();
         messages.truncate(record.at);
         messages.extend(record.append);
+        let context = session.system_context.take();
         session = record.head;
         session.messages = History::from(messages);
+        // Records leave it out (`Head::of`).
+        if session.system_context.is_none() {
+            session.system_context = context;
+        }
         seq = record.seq;
     }
     Ok((session, seq))
@@ -380,6 +419,34 @@ mod tests {
         // The snapshot alone is still the session as it was first saved.
         let plain: Session = serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
         assert!(plain.messages.is_empty());
+    }
+
+    #[test]
+    fn the_project_context_is_snapshotted_once_and_kept_by_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snapshot, log) = paths(dir.path());
+        let mut session = session();
+        save(&snapshot, &log, &session).unwrap();
+        // A changed context is a snapshot, not a record.
+        session.system_context = Some("\n\n# Environment\nlarge".into());
+        session.messages.push(Message::user("one"));
+        save(&snapshot, &log, &session).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        session.messages.push(Message::user("two"));
+        session.system_told = Some("mark".into());
+        save(&snapshot, &log, &session).unwrap();
+        let journal = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(journal.lines().count(), 1);
+        assert!(!journal.contains("# Environment"), "{journal}");
+        let (loaded, _) = load(&snapshot, &log).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.system_context, session.system_context);
+        assert_eq!(loaded.system_told.as_deref(), Some("mark"));
+        session.system_context = Some("renewed".into());
+        save(&snapshot, &log, &session).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        let (loaded, _) = load(&snapshot, &log).unwrap();
+        assert_eq!(loaded.system_context.as_deref(), Some("renewed"));
     }
 
     #[test]

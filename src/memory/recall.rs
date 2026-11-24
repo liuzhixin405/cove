@@ -25,8 +25,9 @@ use crate::{
 /// Memories up to this size are injected whole; above it, in three tiers: global
 /// memories, the entries relevant to the task, and an index of the rest.
 pub const INLINE_LIMIT: usize = 8 * 1024;
-/// Global memories (the user's cross-project preferences) are always injected whole,
-/// up to this size; the rest of them go to the index.
+/// Global memories (notes about this machine; the user's preferences are in the
+/// preferences file, `memory::rules`) are always injected whole, up to this size; the
+/// rest of them go to the index.
 const GLOBAL_LIMIT: usize = 4 * 1024;
 pub const TOP_K: usize = 5;
 const RELEVANT_ENTRY_LIMIT: usize = 2 * 1024;
@@ -503,7 +504,7 @@ impl MemoryRecall {
                 }
             }
             if !global.is_empty() {
-                out.push_str("Global (always apply unless the user says otherwise):\n");
+                out.push_str("Global notes (this machine):\n");
                 out.push_str(&global);
             }
             // 2. The entries relevant to this task.
@@ -687,8 +688,10 @@ mod tests {
         let mut other = Session::new(root.path().into(), String::new(), String::new(), None);
         other.current_request = "请用中文回复".into();
         let note = recall.note(&other).await.unwrap();
-        let global = note.split("Global (always apply").nth(1).unwrap();
+        // Labelled as notes: preferences that apply are in the system prompt instead.
+        let global = note.split("Global notes (this machine)").nth(1).unwrap();
         assert!(global.contains("回复使用中文"), "{note}");
+        assert!(!note.contains("always apply"), "{note}");
         assert!(note.contains("Memory index (6 entries"));
         assert!(
             !note.contains("filler"),

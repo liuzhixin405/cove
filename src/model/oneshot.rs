@@ -22,7 +22,7 @@ pub fn text_request(
         max_output_tokens,
         estimated_tokens: None,
         model: None,
-        long_cache: false,
+        cache: crate::domain::Cache::Short,
     }
 }
 

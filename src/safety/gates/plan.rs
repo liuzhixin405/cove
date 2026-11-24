@@ -414,8 +414,8 @@ impl ToolExecutor for WithPlanTools {
         self.inner.metered(name)
     }
 
-    fn concurrent(&self, name: &str) -> bool {
-        self.inner.concurrent(name)
+    fn concurrent(&self, name: &str, input: &Value) -> bool {
+        self.inner.concurrent(name, input)
     }
 
     fn execute(
