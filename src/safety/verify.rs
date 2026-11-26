@@ -270,6 +270,17 @@ fn scope_compile(root: &Path, command: String, changed: &[PathBuf]) -> Option<St
     (!files.is_empty()).then(|| format!("{python} -m py_compile {}", files.join(" ")))
 }
 
+/// Prose no build or test reads. `.txt` and data formats are left out: tests read them.
+fn documentation(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["md", "markdown", "rst", "adoc"]
+                .iter()
+                .any(|doc| extension.eq_ignore_ascii_case(doc))
+        })
+}
+
 /// A path for a command line: relative to `root`, `/`-separated, quoted when it has spaces.
 fn shell_path(root: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -659,6 +670,8 @@ pub struct CommandVerifier {
     root: PathBuf,
     commands: Vec<String>,
     timeout: Option<Duration>,
+    /// Idle limit of the checks; `None` is [`process::IDLE_LIMIT`].
+    idle: Option<Duration>,
     workspace: Arc<Workspace>,
     authorizer: Arc<dyn Authorizer>,
     verified: Mutex<Option<u64>>,
@@ -684,6 +697,7 @@ impl CommandVerifier {
             root,
             commands,
             timeout,
+            idle: None,
             workspace,
             authorizer,
             verified: Mutex::new(None),
@@ -693,6 +707,12 @@ impl CommandVerifier {
             ledger: None,
             baselines: Mutex::default(),
         }
+    }
+
+    /// Stops a check after this long without any sign of work (default 180 s).
+    pub fn with_idle(mut self, idle: Option<Duration>) -> Self {
+        self.idle = idle;
+        self
     }
 
     pub fn with_progress(mut self, progress: Arc<Progress>) -> Self {
@@ -741,6 +761,47 @@ impl CommandVerifier {
         Ok(changed)
     }
 
+    /// The changed paths detected checks are chosen by: git-ignored files (scratch notes,
+    /// build output) and documentation are left out, so they neither start a run nor
+    /// widen it to the whole suite. Configured commands see every change.
+    async fn affecting(&self, paths: Vec<PathBuf>, cancel: &CancellationToken) -> Vec<PathBuf> {
+        if self.detected.is_none() {
+            return paths;
+        }
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !documentation(path))
+            .collect();
+        if paths.is_empty() {
+            return paths;
+        }
+        let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        let mut input = Vec::new();
+        for path in &paths {
+            input.extend_from_slice(slash(path).as_bytes());
+            input.push(0);
+        }
+        // Exit 1 (nothing ignored) and 128 (not a repository) both leave stdout empty.
+        let ignored: HashSet<String> = match process::git::Git::new(&self.root)
+            .args(["check-ignore", "-z", "--stdin"])
+            .stdin(input)
+            .output(cancel)
+            .await
+        {
+            Ok(output) => output
+                .stdout_text()
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+        paths
+            .into_iter()
+            .filter(|path| !ignored.contains(&slash(path)))
+            .collect()
+    }
+
     fn turn_commands(&self, changed: &[PathBuf]) -> Vec<String> {
         let mut commands = self.commands.clone();
         if let Some((true, _)) = &self.detected {
@@ -768,10 +829,13 @@ impl CommandVerifier {
         commands
     }
 
-    /// Configured limit, else 120 s and 300 s for the slower test/dotnet/npm toolchains.
-    fn timeout(&self, command: &str) -> Duration {
-        self.timeout
-            .unwrap_or_else(|| Duration::from_secs(if slow_command(command) { 300 } else { 120 }))
+    /// Checks run as long as they keep working: stopped after the idle limit without any
+    /// sign of work, or at the total limit (configured, else an hour).
+    fn limit(&self) -> process::Limit {
+        process::Limit::watched(
+            self.timeout.unwrap_or(process::WATCHED_TOTAL),
+            self.idle.unwrap_or(process::IDLE_LIMIT),
+        )
     }
 
     fn record(&self, check: CheckRecord) {
@@ -801,9 +865,18 @@ impl CommandVerifier {
         paths: &[PathBuf],
         cancel: CancellationToken,
     ) -> Result<Verification> {
-        let commands = self.turn_commands(paths);
+        let paths = self.affecting(paths.to_vec(), &cancel).await;
+        // Only documentation or ignored files staged: nothing for the checks to judge.
+        if paths.is_empty() && self.detected.is_some() {
+            return Ok(Verification {
+                outcome: Outcome::Passed,
+                summary: String::new(),
+                detail: String::new(),
+            });
+        }
+        let commands = self.turn_commands(&paths);
         // Staged content may hold more than this task: the task's before is no baseline.
-        let verification = self.run(&commands, false, cancel).await?;
+        let verification = self.run(&commands, false, false, cancel).await?;
         if let Some(evidence) = &self.evidence {
             evidence.set_outcome(verification.outcome.name());
         }
@@ -812,12 +885,21 @@ impl CommandVerifier {
 
     /// Runs `commands` in order. With `baseline`, a test command whose failing tests all
     /// failed before the task's changes too counts as passed (see [`Self::judge`]).
+    /// `after_reply`: the checks run once the reply is written, so the screen says the
+    /// task is still busy and needs nothing from the user, not that it waits for an answer.
     async fn run(
         &self,
         commands: &[String],
         baseline: bool,
+        after_reply: bool,
         cancel: CancellationToken,
     ) -> Result<Verification> {
+        let stage = if after_reply {
+            "回复已结束，自动验证中（无需操作）"
+        } else {
+            "提交前验证中"
+        };
+        let mut announced = false;
         let mut summary = String::new();
         let mut detail = String::new();
         let mut outcome = Outcome::Passed;
@@ -840,6 +922,15 @@ impl CommandVerifier {
                 continue;
             }
             if let Some(progress) = &self.progress {
+                if after_reply && !std::mem::replace(&mut announced, true) {
+                    progress
+                        .line(
+                            "[验证] 回复已结束，正在自动运行检查，不需要你操作".into(),
+                            false,
+                        )
+                        .await;
+                }
+                progress.activity(format!("{stage} · {command}")).await;
                 progress.line(format!("[验证] $ {command}"), false).await;
             }
             let preapproved = self
@@ -870,15 +961,25 @@ impl CommandVerifier {
                 }
             }
             let _ = self.workspace.note_shell();
-            let timeout = self.timeout(command);
+            let limit = self.limit();
+            let timeout = limit.total;
             let started = Instant::now();
             // No per-line streaming: the terminal stays quiet during checks; the finish
-            // line and, on failure, the detail tail carry the information.
+            // line and, on failure, the detail tail carry the information. The status row
+            // says how long it has run and whether it still works.
+            let watched = match &self.progress {
+                Some(progress) => limit
+                    .clone()
+                    .with_status(progress.clone(), format!("{stage} · {command}")),
+                None => limit.clone(),
+            };
             let output =
-                process::shell_live(&self.root, command, timeout, cancel.clone(), None).await?;
+                process::shell_live(&self.root, command, watched, cancel.clone(), None).await?;
             let duration_ms = started.elapsed().as_millis();
             if let Some(progress) = &self.progress {
-                let state = if output.timed_out {
+                let state = if output.stalled.is_some() {
+                    "卡住，已中止"
+                } else if output.timed_out {
                     "超时"
                 } else if output.code == Some(0) {
                     "通过"
@@ -911,6 +1012,24 @@ impl CommandVerifier {
             }
             let text = format!("{}\n{}", output.stdout, output.stderr);
             let evidence = tail(text.trim(), 2048).to_owned();
+            if let Some(reason) = &output.stalled {
+                // Stuck says nothing certain about the change either: not verified, and
+                // the reason names what was still running and since when nothing moved.
+                summary.push_str(&format!(
+                    "not run  {command}（卡住，已中止；not verified）\n{reason}\n"
+                ));
+                self.record(CheckRecord {
+                    command: command.clone(),
+                    status: "stalled".into(),
+                    exit_code: None,
+                    duration_ms,
+                    evidence: format!("{reason}\n{evidence}"),
+                });
+                if outcome == Outcome::Passed {
+                    outcome = Outcome::NotRun;
+                }
+                continue;
+            }
             if output.timed_out {
                 // A slow check says nothing about the change: not verified, not failed.
                 summary.push_str(&format!(
@@ -930,7 +1049,7 @@ impl CommandVerifier {
                 continue;
             }
             let judged = if baseline {
-                self.judge(command, &output, duration_ms, timeout, &cancel)
+                self.judge(command, &output, duration_ms, &limit, &cancel)
                     .await?
             } else {
                 None
@@ -984,6 +1103,9 @@ impl CommandVerifier {
             outcome = Outcome::Failed;
             break;
         }
+        if let Some(progress) = &self.progress {
+            progress.activity("思考中".into()).await;
+        }
         Ok(Verification {
             outcome,
             summary,
@@ -1006,7 +1128,7 @@ impl CommandVerifier {
         command: &str,
         output: &process::CommandOutput,
         duration_ms: u128,
-        timeout: Duration,
+        limit: &process::Limit,
         cancel: &CancellationToken,
     ) -> Result<Option<Judged>> {
         let Some(runner) = Runner::of(command) else {
@@ -1044,7 +1166,7 @@ impl CommandVerifier {
             Some(before) => before,
             None => {
                 let before = self
-                    .run_baseline(runner, command, task.files, timeout, cancel)
+                    .run_baseline(runner, command, task.files, limit.clone(), cancel)
                     .await?;
                 lock()?.insert(key, before.clone());
                 before
@@ -1060,7 +1182,7 @@ impl CommandVerifier {
         runner: Runner,
         command: &str,
         files: Vec<(PathBuf, String)>,
-        timeout: Duration,
+        limit: process::Limit,
         cancel: &CancellationToken,
     ) -> Result<Option<BTreeSet<String>>> {
         if let Some(progress) = &self.progress {
@@ -1096,7 +1218,7 @@ impl CommandVerifier {
             Runner::Go => Vec::new(),
         };
         let output =
-            process::shell_with_env(&self.root, command, timeout, cancel.clone(), &env).await;
+            process::shell_with_env(&self.root, command, limit, cancel.clone(), &env).await;
         // The current content goes back first, whatever the run did (cancellation too).
         swap.restore()?;
         let output = output?;
@@ -1182,7 +1304,8 @@ fn failing_tests(
     output: &process::CommandOutput,
     strict: bool,
 ) -> Option<Vec<String>> {
-    if output.timed_out {
+    // A run stopped early, stuck or at the limit, lists only part of its failures.
+    if output.timed_out || output.stalled.is_some() {
         return None;
     }
     let text = format!("{}\n{}", output.stdout, output.stderr);
@@ -1316,39 +1439,6 @@ fn list(names: &[String], limit: usize) -> String {
     text
 }
 
-/// Builds and test suites of toolchains that often need minutes on a cold cache.
-pub fn slow_command(command: &str) -> bool {
-    const SLOW: &[&str] = &[
-        "dotnet",
-        "npm",
-        "npx",
-        "pnpm",
-        "yarn",
-        "cargo build",
-        "cargo test",
-        "cargo check",
-        "cargo clippy",
-        "cargo run",
-        "cargo nextest",
-        "go build",
-        "go test",
-        "mvn",
-        "gradle",
-        "./gradlew",
-        "./mvnw",
-        ".\\gradlew",
-        ".\\mvnw",
-        "bun",
-        "pytest",
-        "python -m pytest",
-        "python3 -m pytest",
-    ];
-    command
-        .split(['&', ';', '|', '\n'])
-        .map(str::trim_start)
-        .any(|part| SLOW.iter().any(|tool| part.starts_with(tool)))
-}
-
 use crate::process::tail_bytes as tail;
 
 impl Verifier for CommandVerifier {
@@ -1363,8 +1453,8 @@ impl Verifier for CommandVerifier {
                     .map(|guard| *guard)
                     .map_err(|_| Error::Tool("verification lock poisoned".into()))
             };
-            let changed = self.changed()?;
-            // Only scratch files came and went: nothing of the project changed.
+            let changed = self.affecting(self.changed()?, &cancel).await;
+            // Only scratch, ignored or documentation files changed: nothing to check.
             if changed.is_empty() {
                 return Ok(None);
             }
@@ -1372,7 +1462,7 @@ impl Verifier for CommandVerifier {
             if commands.is_empty() || lock(&self.verified)? == Some(fingerprint) {
                 return Ok(None);
             }
-            let verification = self.run(&commands, true, cancel).await?;
+            let verification = self.run(&commands, true, true, cancel).await?;
             if verification.outcome == Outcome::Passed {
                 *self
                     .verified
@@ -1483,7 +1573,7 @@ mod tests {
         let checks = ["echo run >> runs.log".to_owned()];
         for _ in 0..2 {
             let verification = verifier
-                .run(&checks, true, CancellationToken::new())
+                .run(&checks, true, false, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(verification.outcome, Outcome::Passed);
@@ -1739,6 +1829,130 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ignored_and_documentation_files_neither_start_nor_widen_detected_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !initialized {
+            return;
+        }
+        write(&root, ".gitignore", ".local/\n");
+        write(&root, "app.sln", "");
+        write(&root, "src/Lib/Lib.csproj", "<Project/>");
+        write(&root, "src/Lib/A.cs", "class A {}\n");
+        write(
+            &root,
+            "tests/Lib.Tests/Lib.Tests.csproj",
+            r#"<PackageReference Include="Microsoft.NET.Test.Sdk" />
+               <ProjectReference Include="..\..\src\Lib\Lib.csproj" />"#,
+        );
+        write(&root, ".local/commit-msg.txt", "draft\n");
+        write(&root, "docs/notes.md", "# notes\n");
+        let cancel = CancellationToken::new();
+        // An ignored scratch note or a document alone: nothing to verify, where both used
+        // to run the whole solution's tests.
+        for edited in [".local/commit-msg.txt", "docs/notes.md"] {
+            let data = tempfile::tempdir().unwrap();
+            let verifier = verifier_with_deleted_scratch(&root, data.path(), &[edited], &[]);
+            assert_eq!(
+                verifier.turn_commands(&verifier.changed().unwrap()),
+                ["dotnet test"]
+            );
+            assert!(
+                verifier.verify(cancel.clone()).await.unwrap().is_none(),
+                "{edited}"
+            );
+        }
+        // Next to a code change they do not widen the run to the whole suite.
+        let data = tempfile::tempdir().unwrap();
+        let verifier = verifier_with_deleted_scratch(
+            &root,
+            data.path(),
+            &["src/Lib/A.cs", "docs/notes.md", ".local/commit-msg.txt"],
+            &[],
+        );
+        let changed = verifier
+            .affecting(verifier.changed().unwrap(), &cancel)
+            .await;
+        assert_eq!(changed, [PathBuf::from("src/Lib/A.cs")]);
+        assert_eq!(
+            verifier.turn_commands(&changed),
+            ["dotnet test tests/Lib.Tests/Lib.Tests.csproj"]
+        );
+        // A commit of documentation only runs no checks.
+        let verification = verifier
+            .verify_commit(&[PathBuf::from("docs/notes.md")], cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(verification.outcome, Outcome::Passed);
+        assert!(verification.summary.is_empty());
+        // Configured commands are the user's: they see every change.
+        let configured = CommandVerifier::new(
+            root.clone(),
+            vec!["markdownlint docs".into()],
+            None,
+            verifier.workspace.clone(),
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Bypass,
+                input: None,
+            }),
+        );
+        let paths = vec![
+            PathBuf::from("docs/notes.md"),
+            PathBuf::from(".local/commit-msg.txt"),
+        ];
+        assert_eq!(configured.affecting(paths.clone(), &cancel).await, paths);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn a_stuck_check_is_stopped_and_says_why() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = crate::session::Store::open(data.path()).unwrap();
+        let workspace = Arc::new(Workspace::new(root.clone(), store).unwrap());
+        let ledger = data.path().join("ledger.jsonl");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 60"
+        } else {
+            "sleep 60"
+        };
+        let verifier = CommandVerifier::new(
+            root.clone(),
+            vec![command.into()],
+            None,
+            workspace,
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Bypass,
+                input: None,
+            }),
+        )
+        .with_idle(Some(Duration::from_secs(2)))
+        .with_ledger(ledger.clone());
+        let started = Instant::now();
+        let verification = verifier
+            .verify_commit(&[PathBuf::from("a.txt")], CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(verification.outcome, Outcome::NotRun);
+        assert!(
+            verification.summary.contains("卡住，已中止")
+                && verification.summary.contains("没有任何活动"),
+            "{}",
+            verification.summary
+        );
+        let line = std::fs::read_to_string(&ledger).unwrap();
+        assert!(line.contains("\"status\":\"stalled\""), "{line}");
+    }
+
     #[test]
     fn dotnet_tests_only_the_test_projects_that_reach_the_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -1903,6 +2117,7 @@ mod tests {
             stderr: String::new(),
             truncated: false,
             timed_out: false,
+            stalled: None,
             encoding_warning: false,
         }
     }
@@ -2064,7 +2279,7 @@ mod tests {
             .replace(&root.join("calc.py"), Some(original), &kept)
             .unwrap();
         let verification = verifier
-            .run(&checks, true, CancellationToken::new())
+            .run(&checks, true, false, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(
@@ -2083,7 +2298,7 @@ mod tests {
         assert!(workspace.pending_swap().is_none());
         // The commit gate does not compare.
         let commit = verifier
-            .run(&checks, false, CancellationToken::new())
+            .run(&checks, false, false, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(commit.outcome, Outcome::Failed);
@@ -2093,7 +2308,7 @@ mod tests {
             .replace(&root.join("calc.py"), Some(&kept), &broken)
             .unwrap();
         let verification = verifier
-            .run(&checks, true, CancellationToken::new())
+            .run(&checks, true, false, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(verification.outcome, Outcome::Failed);

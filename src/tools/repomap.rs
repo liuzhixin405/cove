@@ -271,13 +271,17 @@ const CACHE_FILES: usize = 50_000;
 
 fn parse(relative: &Path, absolute: &Path) -> Option<Parsed> {
     let text = std::fs::read_to_string(absolute).ok()?;
-    Some(Parsed {
-        symbols: symbols(relative, &text),
+    Some(parse_text(relative, &text))
+}
+
+fn parse_text(relative: &Path, text: &str) -> Parsed {
+    Parsed {
+        symbols: symbols(relative, text),
         identifiers: IDENTIFIER
-            .find_iter(&text)
+            .find_iter(text)
             .map(|found| found.as_str().to_owned())
             .collect(),
-    })
+    }
 }
 
 /// Parses the files the cache cannot answer on scoped threads: reading is
@@ -390,7 +394,18 @@ pub(crate) fn index(
     files: impl Iterator<Item = (PathBuf, PathBuf)>,
     cancel: &CancellationToken,
 ) -> Result<Index> {
+    index_with(files, &HashMap::new(), cancel)
+}
+
+/// `index`, parsing the files in `contents` (by workspace-relative path) from that content
+/// instead of the disk: an overlay's changed files (docs/optimizations/0053).
+fn index_with(
+    files: impl Iterator<Item = (PathBuf, PathBuf)>,
+    contents: &HashMap<PathBuf, Arc<Vec<u8>>>,
+    cancel: &CancellationToken,
+) -> Result<Index> {
     let mut candidates = Vec::new();
+    let mut held = Vec::new();
     let mut truncated = false;
     for (relative, absolute) in files {
         if cancel.is_cancelled() {
@@ -399,9 +414,21 @@ pub(crate) fn index(
         if language(&relative).is_none() {
             continue;
         }
-        if candidates.len() >= MAX_FILES {
+        if candidates.len() + held.len() >= MAX_FILES {
             truncated = true;
             break;
+        }
+        if let Some(bytes) = contents.get(&relative) {
+            if bytes.len() as u64 <= FILE_LIMIT
+                && let Ok(text) = std::str::from_utf8(bytes)
+            {
+                let parsed = Arc::new(parse_text(&relative, text));
+                held.push(File {
+                    path: relative,
+                    parsed,
+                });
+            }
+            continue;
         }
         let Ok(meta) = std::fs::metadata(&absolute) else {
             continue;
@@ -415,6 +442,7 @@ pub(crate) fn index(
         .into_iter()
         .zip(parsed)
         .filter_map(|((path, ..), parsed)| parsed.map(|parsed| File { path, parsed }))
+        .chain(held)
         .collect();
     Ok(Index { files, truncated })
 }
@@ -426,10 +454,21 @@ pub fn query(
     max_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<String> {
+    query_with(files, &HashMap::new(), terms, max_bytes, cancel)
+}
+
+/// `query` with the files in `contents` (workspace-relative) parsed from that content.
+pub fn query_with(
+    files: impl Iterator<Item = (PathBuf, PathBuf)>,
+    contents: &HashMap<PathBuf, Arc<Vec<u8>>>,
+    terms: &[String],
+    max_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<String> {
     let Index {
         files: scanned,
         truncated: skipped,
-    } = index(files, cancel)?;
+    } = index_with(files, contents, cancel)?;
     let ranks = rank(&scanned);
     let terms: Vec<String> = terms
         .iter()

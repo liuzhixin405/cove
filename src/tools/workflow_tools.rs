@@ -205,6 +205,10 @@ impl ToolExecutor for WorkflowTools {
         self.inner.metered(name)
     }
 
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.inner.jobs()
+    }
+
     fn concurrent(&self, name: &str, input: &Value) -> bool {
         self.inner.concurrent(name, input)
     }

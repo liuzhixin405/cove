@@ -162,6 +162,60 @@ async fn slash_skill_runs_as_a_task_with_steps_and_builtin_index() {
 }
 
 #[tokio::test]
+async fn the_builtin_task_split_skill_is_listed_and_runs_unless_the_user_has_one() {
+    let (root, data, home) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let output = cli(
+        root.path(),
+        data.path(),
+        home.path(),
+        "http://127.0.0.1:9/v1",
+    )
+    .args(["-p", "/skills"])
+    .launch()
+    .await
+    .unwrap();
+    let listed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(listed.contains("task-split"), "{listed}");
+    let (url, server) = mock_server(vec![done("Plan shown.")]).await;
+    let output = cli(root.path(), data.path(), home.path(), &url)
+        .args(["-p", "/task-split rename the config loader"])
+        .launch()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = server.await.unwrap()[0].to_string();
+    assert!(request.contains("[Skill: task-split]"), "{request}");
+    assert!(request.contains("execute_plan"), "{request}");
+    assert!(request.contains("estimate_minutes"), "{request}");
+    // A user skill of the same name wins over the built-in one.
+    write(
+        &home.path().join(".claude/skills/task-split/SKILL.md"),
+        "---\nname: task-split\ndescription: Mine\n---\nUSER-TASK-SPLIT-MARKER\n",
+    );
+    let (url, server) = mock_server(vec![done("Mine.")]).await;
+    let output = cli(root.path(), data.path(), home.path(), &url)
+        .args(["-p", "/task-split x"])
+        .launch()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let request = server.await.unwrap()[0].to_string();
+    assert!(request.contains("USER-TASK-SPLIT-MARKER"), "{request}");
+}
+
+#[tokio::test]
 async fn unknown_commands_suggest_and_plugin_commands_expand_arguments() {
     let (root, data, home) = (
         tempfile::tempdir().unwrap(),

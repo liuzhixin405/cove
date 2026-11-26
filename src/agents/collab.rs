@@ -343,6 +343,9 @@ async fn run(
                     prompt: member.task.clone(),
                     depends: Vec::new(),
                     agent_type: kind.clone(),
+                    writes: None,
+                    overlay: None,
+                    before_start: None,
                 });
             }
             {

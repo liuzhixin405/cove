@@ -2,6 +2,8 @@
 
 pub mod history;
 mod journal;
+pub mod merge;
+pub mod overlay;
 pub mod snapshot;
 pub mod suggestions;
 pub mod summary;

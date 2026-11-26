@@ -761,6 +761,8 @@ const NEGATIONS: &[&str] = &[
     "并非",
     "不是",
     "不叫",
+    "不在",
+    "未",
     "not ",
     "no ",
     "n't",
@@ -768,6 +770,31 @@ const NEGATIONS: &[&str] = &[
     "none",
     "without",
 ];
+
+/// `range` of the prose says something is not there: a negation outside the code spans
+/// (`NoneType` in backticks does not count as "none").
+fn negated(prose: &str, range: &Range<usize>, spans: &[Range<usize>]) -> bool {
+    let end = range.end.min(prose.len());
+    let mut said = String::new();
+    let mut at = range.start;
+    let mut inside: Vec<&Range<usize>> = spans
+        .iter()
+        .filter(|span| span.start < end && span.end > range.start)
+        .collect();
+    inside.sort_by_key(|span| span.start);
+    for span in inside {
+        if span.start > at {
+            said.push_str(&prose[at..span.start]);
+        }
+        said.push(' ');
+        at = at.max(span.end);
+    }
+    if at < end {
+        said.push_str(&prose[at..end]);
+    }
+    let said = said.to_lowercase();
+    NEGATIONS.iter().any(|negation| said.contains(negation))
+}
 
 /// What the check is given besides the workspace.
 pub struct Input<'a> {
@@ -894,12 +921,19 @@ pub fn analyze(files: &Files, input: &Input) -> Analysis {
         .iter()
         .map(|citation| {
             let clause = enclosing(&clauses, &citation.span);
+            // "`a.cs:3` does not set `X`": only the file and its lines are checked.
+            if negated(&prose, &clause, &ranges) {
+                let verdict = verify(files, citation, &[], input.tools);
+                return (citation.clone(), verdict);
+            }
             let mut near: Vec<&(Range<usize>, String)> = spans
                 .iter()
                 .filter(|(range, text)| {
                     range.start >= clause.start
                         && range.end <= clause.end
-                        && !overlaps(range, &citation.span)
+                        // Another line reference (`:117`) or a number is not a symbol.
+                        && !citations.iter().any(|other| overlaps(range, &other.span))
+                        && text.chars().any(char::is_alphabetic)
                         && !path_like(text, &files.exts)
                 })
                 .collect();
@@ -946,8 +980,7 @@ pub fn analyze(files: &Files, input: &Input) -> Analysis {
         }
         let sentence = enclosing(&sentences, range);
         let end = sentence.end.min(prose.len());
-        let said = prose[sentence.start..end].to_lowercase();
-        if NEGATIONS.iter().any(|negation| said.contains(negation)) {
+        if negated(&prose, &sentence, &ranges) {
             continue;
         }
         if mentions
@@ -1682,6 +1715,59 @@ mod tests {
             "{:?}",
             found.missing_symbols
         );
+    }
+
+    /// A reference said NOT to contain a symbol is not checked for that symbol (0055 P1);
+    /// the same reference stated positively still is.
+    #[test]
+    fn negated_references_are_not_checked_for_their_symbols() {
+        let (_dir, root) = fixture();
+        for reply in [
+            "`src/AdminApi.cs:16` 也没开 `RespectNullableAnnotations`。",
+            "`src/AdminApi.cs:16` 未设置 `RespectNullableAnnotations`。",
+            "`src/AdminApi.cs:16` does not set `RespectNullableAnnotations`.",
+        ] {
+            let found = analysis(&root, reply, true);
+            assert!(found.applies, "{reply}");
+            assert!(!found.needs_fix(), "{reply}: {:?}", found.results);
+        }
+        let found = analysis(
+            &root,
+            "`src/AdminApi.cs:16` 开了 `RespectNullableAnnotations`。",
+            true,
+        );
+        assert!(
+            found
+                .results
+                .iter()
+                .any(|(_, v)| matches!(v, Verdict::Mismatch { .. })),
+            "{:?}",
+            found.results
+        );
+        // A negation word inside code does not make the sentence negated.
+        let found = analysis(
+            &root,
+            "`src/QuoteHub.Wire` 里的 `NoneDecoder` 先 `Wrap` 到缓冲区，`Codec` 负责整数。",
+            true,
+        );
+        assert_eq!(found.missing_symbols, ["NoneDecoder", "Wrap"]);
+        // Line ranges are still checked in a negated clause.
+        let found = analysis(&root, "`src/AdminApi.cs:99` 没有 `MapGet`。", true);
+        assert!(found.needs_fix(), "{:?}", found.results);
+    }
+
+    /// Another line reference next to a citation is not a symbol to look for (0057).
+    #[test]
+    fn line_references_are_not_anchors() {
+        let (_dir, root) = fixture();
+        for reply in [
+            "路由在 `src/AdminApi.cs:16` 和 `:18`。",
+            "路由在 `src/AdminApi.cs:16`，参数是 `42`。",
+        ] {
+            let found = analysis(&root, reply, true);
+            assert!(found.applies, "{reply}");
+            assert!(!found.needs_fix(), "{reply}: {:?}", found.results);
+        }
     }
 
     /// Replaying the real sessions panicked here: a clause or sentence starting right

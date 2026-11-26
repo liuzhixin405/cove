@@ -476,7 +476,7 @@ async fn background_agent_interrupt_restart_resume_notify_and_merge() {
     let spawned = server.requests("parent")[1].to_string();
     let start = spawned.find("Background agent ").unwrap() + "Background agent ".len();
     let id = spawned[start..start + 8].to_owned();
-    assert!(stderr.contains("interrupted"), "{stderr}");
+    assert!(stderr.contains("已中断"), "{stderr}");
     let session = saved_id(data.path());
 
     // A new process lists it as interrupted, with its worktree branch.
@@ -508,7 +508,7 @@ async fn background_agent_interrupt_restart_resume_notify_and_merge() {
     .await;
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains(&format!("[background agent {id} (general) finished")),
+        stderr.contains(&format!("后台代理 {id}（general）已完成")),
         "{stderr}"
     );
     assert!(stderr.contains("Created feature.txt."), "{stderr}");
@@ -1043,5 +1043,1020 @@ async fn a_long_answer_is_capped_in_the_parent_and_saved_whole() {
     assert!(
         result.contains(&cove::paths::display(&saved[0])),
         "{result}"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_item_with_writes_is_kept_to_them_and_reports_what_it_changed() {
+    let root = repo();
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"write a","status":"pending","writes":["a.txt::intro"],"estimate_minutes":2},
+        {"content":"writes:b.txt write b","status":"pending"}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool("run", "execute_plan", json!({"parallel":true}))),
+                Some(text("Reported.")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(tool(
+                    "w1",
+                    "write",
+                    json!({"path":"c.txt","content":"no\n"}),
+                )),
+                Some(tool("w2", "write", json!({"path":"a.txt","content":"a\n"}))),
+                Some(tool("s1", "shell", json!({"command":"echo x > gen.txt"}))),
+                Some(tool(
+                    "s2",
+                    "shell",
+                    json!({"command":"npm install left-pad"}),
+                )),
+                Some(text("a written")),
+            ],
+        ),
+        ("todo-2", vec![Some(text("b not needed"))]),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "split it"])).await;
+    let item = server.requests("todo-1");
+    let prompt = item[0].to_string();
+    assert!(
+        prompt.contains("This item may change only: a.txt::intro"),
+        "{prompt}"
+    );
+    let refused = item[1].to_string();
+    assert!(
+        refused.contains("c.txt is outside this plan item's writes (a.txt::intro)"),
+        "{refused}"
+    );
+    let shell = item[3].to_string();
+    assert!(
+        shell.contains("changed files outside this plan item's writes: gen.txt"),
+        "{shell}"
+    );
+    let npm = item[4].to_string();
+    assert!(
+        npm.contains("such steps run after all items finish"),
+        "{npm}"
+    );
+    assert!(!root.path().join("c.txt").exists());
+    assert!(root.path().join("a.txt").exists() && root.path().join("gen.txt").exists());
+    let report = server.requests("parent")[2].to_string();
+    assert!(report.contains("written: a.txt"), "{report}");
+    assert!(report.contains("c.txt (write refused)"), "{report}");
+    assert!(report.contains("gen.txt (changed by shell)"), "{report}");
+    assert!(
+        report.contains("npm install left-pad (command refused)"),
+        "{report}"
+    );
+    assert!(report.contains("Outside writes (check them"), "{report}");
+    assert!(report.contains("todo-1: c.txt (write refused)"), "{report}");
+    // The second item declared writes through the content prefix and stayed inside.
+    assert!(report.contains("[done] [todo-2] write b"), "{report}");
+    // The failed item is not retried: its refusals would repeat.
+    assert_eq!(server.requests("todo-1").len(), 5);
+}
+
+#[tokio::test]
+async fn overlapping_writes_of_parallel_items_reject_the_plan_until_they_depend() {
+    for (depends, rejected) in [(json!([]), true), (json!(["todo-1"]), false)] {
+        let root = repo();
+        let data = tempfile::tempdir().unwrap();
+        let todos = json!({"todos":[
+            {"content":"part one","status":"pending","writes":["src/x.rs::one"]},
+            {"content":"part two","status":"pending","writes":["src/*.rs"],"depends":depends}
+        ]});
+        let server = mock(vec![
+            (
+                "parent",
+                vec![
+                    Some(tool("plan", "todo", todos)),
+                    Some(tool("run", "execute_plan", json!({"parallel":true}))),
+                    Some(text("ok")),
+                ],
+            ),
+            ("todo-1", vec![Some(text("one"))]),
+            ("todo-2", vec![Some(text("two"))]),
+        ])
+        .await;
+        let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "go"])).await;
+        let report = server.requests("parent")[2].to_string();
+        if rejected {
+            assert!(
+                report.contains("plan rejected before any item ran"),
+                "{report}"
+            );
+            assert!(
+                report.contains("todo-1 and todo-2 both write src/x.rs"),
+                "{report}"
+            );
+            assert!(server.requests("todo-1").is_empty());
+        } else {
+            assert!(report.contains("2 done, 0 failed"), "{report}");
+            assert!(report.contains("Outside writes: none."), "{report}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_long_parallel_plan_suggests_task_split_once_and_records_its_estimate() {
+    // (config, minutes per item, hinted, executed)
+    let cases = [
+        (json!({}), 4, true, true),
+        (json!({}), 2, false, false),
+        (json!({"split_suggest_minutes": 0}), 4, false, false),
+    ];
+    for (config, minutes, hinted, executed) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("config.json"), config.to_string()).unwrap();
+        let todos = json!({"todos":[
+            {"content":"a","status":"pending","estimate_minutes":minutes},
+            {"content":"b","status":"pending","estimate_minutes":minutes}
+        ]});
+        let mut replies = vec![
+            Some(tool("plan", "todo", todos.clone())),
+            Some(tool("again", "todo", todos)),
+        ];
+        if executed {
+            replies.push(Some(tool("run", "execute_plan", json!({"parallel":true}))));
+        }
+        replies.push(Some(text("planned")));
+        let server = mock(vec![
+            ("parent", replies),
+            ("todo-1", vec![Some(text("a done"))]),
+            ("todo-2", vec![Some(text("b done"))]),
+        ])
+        .await;
+        let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "plan"])).await;
+        let parent = server.requests("parent");
+        let first = parent[1].to_string();
+        assert_eq!(first.contains("[task-split]"), hinted, "{first}");
+        if hinted {
+            assert!(first.contains("about 8 min"), "{first}");
+            assert!(first.contains("no estimate history yet"), "{first}");
+            let messages = parent[2]["messages"].as_array().unwrap();
+            let last = messages.last().unwrap().to_string();
+            assert!(!last.contains("[task-split]"), "only once: {last}");
+        }
+        // Only an executed plan is recorded; planning alone records nothing.
+        let records = std::fs::read_to_string(data.path().join("estimates.jsonl"));
+        if executed {
+            let records = records.unwrap();
+            assert!(
+                records.contains(&format!("\"estimate_minutes\":{}", minutes * 2)),
+                "{records}"
+            );
+            assert!(records.contains("\"executed\":true"), "{records}");
+            assert!(records.contains("\"parallel\":true"), "{records}");
+        } else {
+            assert!(records.is_err(), "{records:?}");
+        }
+    }
+}
+
+const LIB: &str = "fn one() {\n    1\n}\n\nfn two() {\n    2\n}\n";
+
+/// A git repository whose `src/lib.rs` holds two functions, plus `files`.
+fn lib_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = repo();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), LIB).unwrap();
+    for (path, content) in files {
+        std::fs::write(root.path().join(path), content).unwrap();
+    }
+    git(root.path(), &["add", "-A"]);
+    git(root.path(), &["commit", "-q", "-m", "lib"]);
+    root
+}
+
+fn edit(id: &str, old: &str, new: &str) -> String {
+    tool(id, "edit", json!({"path":"src/lib.rs","old":old,"new":new}))
+}
+
+/// The content of the last tool result in `body`.
+fn last_result(body: &Value) -> String {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].to_string())
+        .unwrap_or_default()
+}
+
+/// Files left under `<data>/overlays`.
+fn overlay_files(data: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![data.join("overlays")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            } else {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn an_overlay_plan_runs_items_on_one_file_in_parallel_and_merges_them_at_the_end() {
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"change one","status":"pending","writes":["src/lib.rs::one"],"estimate_minutes":3},
+        {"content":"change two","status":"pending","writes":["src/lib.rs::two"],"estimate_minutes":3},
+        {"content":"depends:todo-1 notes","status":"pending","writes":["notes.md"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(tool(
+                    "verify",
+                    "shell",
+                    json!({"command":"git diff --stat"}),
+                )),
+                Some(text("Merged and verified.")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(format!(
+                    "@delay:600\n{}",
+                    edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")
+                )),
+                Some(tool("b1", "shell", json!({"command":"cargo build"}))),
+                Some(tool("b2", "shell", json!({"command":"echo x > gen.txt"}))),
+                Some(text("one changed")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(format!(
+                    "@delay:600\n{}",
+                    edit("e2", "fn two() {\n    2\n}", "fn two() {\n    20\n}")
+                )),
+                Some(text("two changed")),
+            ],
+        ),
+        (
+            "todo-3",
+            vec![
+                Some(tool(
+                    "s3",
+                    "shell",
+                    json!({"command":"git status --porcelain --untracked-files=all"}),
+                )),
+                Some(tool("r3", "read", json!({"path":"src/lib.rs"}))),
+                Some(tool(
+                    "w3",
+                    "write",
+                    json!({"path":"notes.md","content":"notes\n"}),
+                )),
+                Some(text("notes written")),
+            ],
+        ),
+    ])
+    .await;
+    let (_, _, stderr) =
+        run(cli(root.path(), data.path(), &server.url).args(["-p", "split it"])).await;
+    // Both items on src/lib.rs ran at the same time.
+    let one = server.times("todo-1");
+    let two = server.times("todo-2");
+    assert!(two[0].0 < one[0].1 && one[0].0 < two[0].1, "not parallel");
+    let first = server.requests("todo-1")[0].to_string();
+    assert!(
+        first.contains("[overlay] Your file changes go into a private layer"),
+        "{first}"
+    );
+    // Builds and file-writing commands are refused inside the items.
+    let item = server.requests("todo-1");
+    let build = last_result(&item[2]);
+    assert!(
+        build.contains("overlay sub-tasks cannot change files on disk"),
+        "{build}"
+    );
+    let redirect = last_result(&item[3]);
+    assert!(
+        redirect.contains("overlay sub-tasks cannot change files on disk"),
+        "{redirect}"
+    );
+    assert!(!root.path().join("gen.txt").exists());
+    // While the items ran, the main workspace was untouched; todo-3 read through todo-1's layer.
+    let third = server.requests("todo-3");
+    let status = last_result(&third[1]);
+    assert!(!status.contains("lib.rs"), "{status}");
+    assert!(
+        status.contains("does not have this sub-task's overlay changes"),
+        "{status}"
+    );
+    let read = last_result(&third[2]);
+    assert!(read.contains("10") && !read.contains("20"), "{read}");
+    // Merged at the end: one direct write, one line merge (the line merge goes first; the
+    // anchor replay only settles what it conflicts on), the new file.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
+        "fn one() {\n    10\n}\n\nfn two() {\n    20\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes.md"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "notes\n"
+    );
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(report.contains("3 done, 0 failed"), "{report}");
+    assert!(
+        report.contains("src/lib.rs [todo-1]: direct write"),
+        "{report}"
+    );
+    assert!(
+        report.contains("src/lib.rs [todo-2]: line merge"),
+        "{report}"
+    );
+    assert!(
+        report.contains("notes.md [todo-3]: direct write"),
+        "{report}"
+    );
+    assert!(report.contains("Implicit dependencies: none."), "{report}");
+    assert!(
+        report.contains("Overlay layers: merged and removed."),
+        "{report}"
+    );
+    // The build runs once, after the merge, on the merged workspace.
+    let verified = last_result(&server.requests("parent")[3]);
+    assert!(verified.contains("lib.rs"), "{verified}");
+    assert!(
+        stderr.contains("[合并] 覆盖层合并进工作区：写入 3 个文件"),
+        "{stderr}"
+    );
+    assert!(overlay_files(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn an_overlay_conflict_is_redone_once_and_what_still_conflicts_is_left_out() {
+    for redone in [true, false] {
+        let root = lib_repo(&[]);
+        let data = tempfile::tempdir().unwrap();
+        // Distinct symbols let them run side by side, but both change the same line.
+        let todos = json!({"todos":[
+            {"content":"one is ten","status":"pending","writes":["src/lib.rs::one"]},
+            {"content":"one is eleven","status":"pending","writes":["src/lib.rs::one_again"]}
+        ]});
+        let redo = if redone {
+            vec![
+                Some(edit("r1", "    10\n", "    10 + 1\n")),
+                Some(text("redone on top of todo-1")),
+            ]
+        } else {
+            vec![Some(text("cannot redo it"))]
+        };
+        let server = mock(vec![
+            (
+                "parent",
+                vec![
+                    Some(tool("plan", "todo", todos)),
+                    Some(tool(
+                        "run",
+                        "execute_plan",
+                        json!({"parallel":true,"isolation":"overlay"}),
+                    )),
+                    Some(text("done")),
+                ],
+            ),
+            (
+                "todo-1",
+                vec![
+                    Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                    Some(text("ten")),
+                ],
+            ),
+            (
+                "todo-2",
+                vec![
+                    Some(edit("e2", "fn one() {\n    1\n}", "fn one() {\n    11\n}")),
+                    Some(text("eleven")),
+                ],
+            ),
+            ("todo-2-redo", redo),
+        ])
+        .await;
+        let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "conflict"])).await;
+        let prompt = server.requests("todo-2-redo")[0].to_string();
+        assert!(prompt.contains("[conflict] src/lib.rs"), "{prompt}");
+        assert!(prompt.contains("Original goal: one is eleven"), "{prompt}");
+        assert!(
+            prompt.contains("This item may change only: src/lib.rs"),
+            "{prompt}"
+        );
+        let report = last_result(&server.requests("parent")[2]);
+        assert!(
+            report.contains("src/lib.rs [todo-1]: direct write"),
+            "{report}"
+        );
+        let content = std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap();
+        if redone {
+            assert!(
+                report.contains("src/lib.rs [todo-2]: merged after redo"),
+                "{report}"
+            );
+            assert!(content.contains("    10 + 1\n"), "{content}");
+            assert!(
+                report.contains("Overlay layers: merged and removed."),
+                "{report}"
+            );
+        } else {
+            // Not written: the workspace keeps todo-1's merge, the report points at a copy.
+            assert_eq!(content, LIB.replace("    1\n", "    10\n"));
+            assert!(
+                report.contains("src/lib.rs [todo-2]: conflict unresolved"),
+                "{report}"
+            );
+            assert!(
+                report.contains("the redo did not change this file"),
+                "{report}"
+            );
+            assert!(report.contains("copy for you:"), "{report}");
+            assert!(report.contains("conflicts"), "{report}");
+            assert!(report.contains("stay pending: todo-2"), "{report}");
+            assert!(report.contains("kept until this task ends"), "{report}");
+        }
+        // Kept layers and conflict copies go when the task ends.
+        assert!(overlay_files(data.path()).is_empty(), "{redone}");
+    }
+}
+
+#[tokio::test]
+async fn overlapping_overlay_items_are_stacked_instead_of_rejected() {
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"change one","status":"pending","writes":["src/lib.rs::one"]},
+        {"content":"change the file","status":"pending","writes":["src/lib.rs"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                Some(text("ten")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(tool("r2", "read", json!({"path":"src/lib.rs"}))),
+                Some(edit(
+                    "e2",
+                    "    10\n}\n\nfn two() {\n    2\n",
+                    "    10\n}\n\nfn two() {\n    20\n",
+                )),
+                Some(text("built on todo-1")),
+            ],
+        ),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "stack"])).await;
+    // todo-2 started after todo-1 ended and saw its change through the stacked layer.
+    let one = server.times("todo-1");
+    let two = server.times("todo-2");
+    assert!(
+        two[0].0 >= one.last().unwrap().1,
+        "stacked items ran at once"
+    );
+    let read = last_result(&server.requests("todo-2")[1]);
+    assert!(read.contains("10"), "{read}");
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(
+        report.contains("Implicit dependencies (added instead of rejecting the plan)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("todo-2 after todo-1: both write src/lib.rs"),
+        "{report}"
+    );
+    assert!(report.contains("2 done, 0 failed"), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
+        "fn one() {\n    10\n}\n\nfn two() {\n    20\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn an_overlay_plan_needs_writes_and_falls_back_to_main_without_a_confirmation() {
+    // Every item must declare writes.
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool(
+                    "plan",
+                    "todo",
+                    json!({"todos":[
+                        {"content":"one","status":"pending","writes":["src/lib.rs::one"]},
+                        {"content":"two","status":"pending"}
+                    ]}),
+                )),
+                Some(tool("run", "execute_plan", json!({"isolation":"overlay"}))),
+                Some(text("ok")),
+            ],
+        ),
+        ("todo-1", vec![Some(text("one"))]),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "go"])).await;
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(report.contains("needs writes on every item"), "{report}");
+    assert!(report.contains("missing on: todo-2"), "{report}");
+    assert!(server.requests("todo-1").is_empty());
+
+    // -p in the default permission mode cannot confirm: the plan runs as isolation=main.
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool(
+                    "plan",
+                    "todo",
+                    json!({"todos":[
+                        {"content":"one","status":"pending","writes":["src/lib.rs::one"]}
+                    ]}),
+                )),
+                Some(tool("run", "execute_plan", json!({"isolation":"overlay"}))),
+                Some(text("ok")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                Some(text("one")),
+            ],
+        ),
+    ])
+    .await;
+    let mut command = Command::new(common::exe());
+    command.args([
+        "--provider",
+        "openai",
+        "--model",
+        "mock-model",
+        "--base-url",
+        &server.url,
+        "--permission",
+        "default",
+        "--timeout",
+        "30",
+    ]);
+    command
+        .arg("--cwd")
+        .arg(root.path())
+        .arg("--data-dir")
+        .arg(data.path())
+        .env("COVE_API_KEY", "test-only-not-a-real-key")
+        .kill_on_drop(true)
+        .args(["-p", "go"]);
+    let _ = run(&mut command).await;
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(
+        report.contains("needs the user's confirmation") && report.contains("(this run: default)"),
+        "{report}"
+    );
+    assert!(report.contains("the plan ran with isolation="), "{report}");
+    assert!(
+        !report.contains("Merge into the main workspace"),
+        "{report}"
+    );
+    assert!(
+        std::fs::read_to_string(root.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("    10\n")
+    );
+}
+
+fn edit_in(id: &str, path: &str, old: &str, new: &str) -> String {
+    tool(id, "edit", json!({"path":path,"old":old,"new":new}))
+}
+
+#[tokio::test]
+async fn overlay_items_writing_shared_files_run_in_parallel_without_claims() {
+    let root = lib_repo(&[("src/a.rs", LIB), ("src/b.rs", LIB)]);
+    let data = tempfile::tempdir().unwrap();
+    // Each item writes both files, in opposite orders: claims would serialize them and
+    // call the crossing a deadlock.
+    let todos = json!({"todos":[
+        {"content":"ones","status":"pending","writes":["src/a.rs::one","src/b.rs::one"]},
+        {"content":"twos","status":"pending","writes":["src/a.rs::two","src/b.rs::two"]}
+    ]});
+    let one = "fn one() {\n    1\n}";
+    let two = "fn two() {\n    2\n}";
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit_in("a1", "src/a.rs", one, "fn one() {\n    10\n}")),
+                Some(format!(
+                    "@delay:800\n{}",
+                    edit_in("b1", "src/b.rs", one, "fn one() {\n    10\n}")
+                )),
+                Some(text("ones changed")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(edit_in("b2", "src/b.rs", two, "fn two() {\n    20\n}")),
+                Some(format!(
+                    "@delay:800\n{}",
+                    edit_in("a2", "src/a.rs", two, "fn two() {\n    20\n}")
+                )),
+                Some(text("twos changed")),
+            ],
+        ),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "cross"])).await;
+    // The slow second edits of both items overlapped.
+    let one_times = server.times("todo-1");
+    let two_times = server.times("todo-2");
+    assert!(
+        two_times[1].0 < one_times[1].1 && one_times[1].0 < two_times[1].1,
+        "not parallel"
+    );
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(report.contains("2 done, 0 failed"), "{report}");
+    assert!(!report.contains("write conflict"), "{report}");
+    for file in ["src/a.rs", "src/b.rs"] {
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(file)).unwrap(),
+            "fn one() {\n    10\n}\n\nfn two() {\n    20\n}\n",
+            "{file}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_item_on_two_parallel_layers_of_one_file_sees_both_changes() {
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"change one","status":"pending","writes":["src/lib.rs::one"]},
+        {"content":"change two","status":"pending","writes":["src/lib.rs::two"]},
+        {"content":"depends:todo-1,todo-2 notes","status":"pending","writes":["notes.md"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                Some(text("ten")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(edit("e2", "fn two() {\n    2\n}", "fn two() {\n    20\n}")),
+                Some(text("twenty")),
+            ],
+        ),
+        (
+            "todo-3",
+            vec![
+                Some(tool("r3", "read", json!({"path":"src/lib.rs"}))),
+                Some(tool("g3", "grep", json!({"pattern":"10|20","path":"src"}))),
+                Some(tool(
+                    "w3",
+                    "write",
+                    json!({"path":"notes.md","content":"notes\n"}),
+                )),
+                Some(text("notes written")),
+            ],
+        ),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "diamond"])).await;
+    let third = server.requests("todo-3");
+    let read = last_result(&third[1]);
+    assert!(read.contains("10") && read.contains("20"), "{read}");
+    let grep = last_result(&third[2]);
+    assert!(
+        grep.contains("src/lib.rs:2:    10") && grep.contains("src/lib.rs:6:    20"),
+        "{grep}"
+    );
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(report.contains("3 done, 0 failed"), "{report}");
+    assert!(
+        report.contains("Overlay layers: merged and removed."),
+        "{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
+        "fn one() {\n    10\n}\n\nfn two() {\n    20\n}\n"
+    );
+    assert!(root.path().join("notes.md").is_file());
+    assert!(overlay_files(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn an_item_on_two_conflicting_layers_is_deferred_with_its_dependents() {
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"one is ten","status":"pending","writes":["src/lib.rs::one"]},
+        {"content":"one is eleven","status":"pending","writes":["src/lib.rs::one_again"]},
+        {"content":"depends:todo-1,todo-2 notes","status":"pending","writes":["notes.md"]},
+        {"content":"depends:todo-3 docs","status":"pending","writes":["docs.md"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                Some(text("ten")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(edit("e2", "fn one() {\n    1\n}", "fn one() {\n    11\n}")),
+                Some(text("eleven")),
+            ],
+        ),
+        ("todo-2-redo", vec![Some(text("cannot redo it"))]),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "deferred"])).await;
+    assert!(server.requests("todo-3").is_empty());
+    assert!(server.requests("todo-4").is_empty());
+    let report = last_result(&server.requests("parent")[2]);
+    assert!(
+        report
+            .contains("deferred: the items it builds on (todo-1, todo-2) both changed src/lib.rs"),
+        "{report}"
+    );
+    assert!(
+        report.contains("dependency todo-3 did not succeed"),
+        "{report}"
+    );
+    assert!(report.contains("2 done, 0 failed, 2 skipped"), "{report}");
+    assert!(
+        report.contains("src/lib.rs [todo-1]: direct write"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn an_overlay_merge_cancelled_during_a_redo_reports_what_reached_the_workspace() {
+    let root = lib_repo(&[]);
+    let data = tempfile::tempdir().unwrap();
+    let todos = json!({"todos":[
+        {"content":"one is ten","status":"pending","writes":["src/lib.rs::one"]},
+        {"content":"one is eleven","status":"pending","writes":["src/lib.rs::one_again"]},
+        {"content":"notes","status":"pending","writes":["notes.md"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit("e1", "fn one() {\n    1\n}", "fn one() {\n    10\n}")),
+                Some(text("ten")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(edit("e2", "fn one() {\n    1\n}", "fn one() {\n    11\n}")),
+                Some(text("eleven")),
+            ],
+        ),
+        (
+            "todo-3",
+            vec![
+                Some(tool(
+                    "w3",
+                    "write",
+                    json!({"path":"notes.md","content":"notes\n"}),
+                )),
+                Some(text("notes written")),
+            ],
+        ),
+        // The redo hangs until the task deadline cancels it.
+        ("todo-2-redo", vec![None]),
+    ])
+    .await;
+    let _ = run(cli_with(root.path(), data.path(), &server.url, "15").args(["-p", "cancel"])).await;
+    assert_eq!(server.requests("todo-2-redo").len(), 1);
+    // todo-1 reached the workspace; todo-3 (after todo-2 in the merge order) did not.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
+        LIB.replace("    1\n", "    10\n")
+    );
+    assert!(!root.path().join("notes.md").exists());
+    // The partial report is the recorded result of the call.
+    let sessions: String = std::fs::read_dir(data.path().join("sessions"))
+        .unwrap()
+        .flatten()
+        .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+        .collect();
+    for wanted in [
+        "src/lib.rs [todo-1]: direct write",
+        "src/lib.rs [todo-2]: conflict unresolved",
+        "the redo stopped",
+        "Merging stopped",
+        "/undo reverts it",
+        "todo-2 was being merged",
+        "Not merged, still pending",
+    ] {
+        assert!(sessions.contains(wanted), "{wanted}: {sessions}");
+    }
+    // The layers of the unmerged items survive the end of the task.
+    let kept: Vec<String> = overlay_files(data.path())
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert!(
+        kept.iter()
+            .any(|path| path.contains("/todo-3/overlay.json")),
+        "{kept:?}"
+    );
+    assert!(
+        kept.iter()
+            .any(|path| path.contains("/todo-2/overlay.json")),
+        "{kept:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlay_items_share_one_check_slot_in_turn_and_see_their_own_layer() {
+    let script = "import sys, time\nlog = sys.argv[1]\nwith open(log, 'a') as f:\n    f.write('start' + chr(10))\nprint(open('src/lib.rs').read())\ntime.sleep(0.8)\nwith open(log, 'a') as f:\n    f.write('end' + chr(10))\n";
+    let root = lib_repo(&[("check.py", script)]);
+    let data = tempfile::tempdir().unwrap();
+    let log = data.path().join("check.log");
+    let command = format!(
+        "{} check.py {}",
+        python(),
+        log.to_string_lossy().replace('\\', "/")
+    );
+    std::fs::write(
+        data.path().join("config.json"),
+        json!({ "overlay_check": command }).to_string(),
+    )
+    .unwrap();
+    let todos = json!({"todos":[
+        {"content":"one","status":"pending","writes":["src/lib.rs::one"]},
+        {"content":"two","status":"pending","writes":["src/lib.rs::two"]}
+    ]});
+    let server = mock(vec![
+        (
+            "parent",
+            vec![
+                Some(tool("plan", "todo", todos)),
+                Some(tool(
+                    "run",
+                    "execute_plan",
+                    json!({"parallel":true,"isolation":"overlay"}),
+                )),
+                Some(text("done")),
+            ],
+        ),
+        (
+            "todo-1",
+            vec![
+                Some(edit(
+                    "e1",
+                    "fn one() {\n    1\n}",
+                    "fn one() {\n    1111\n}",
+                )),
+                Some(tool("c1", "check", json!({}))),
+                Some(text("checked")),
+            ],
+        ),
+        (
+            "todo-2",
+            vec![
+                Some(edit(
+                    "e2",
+                    "fn two() {\n    2\n}",
+                    "fn two() {\n    2222\n}",
+                )),
+                Some(tool("c2", "check", json!({}))),
+                Some(text("checked")),
+            ],
+        ),
+    ])
+    .await;
+    let _ = run(cli(root.path(), data.path(), &server.url).args(["-p", "check"])).await;
+    let tools = server.requests("todo-1")[0]["tools"].to_string();
+    assert!(tools.contains("\"check\""), "{tools}");
+    let one = last_result(&server.requests("todo-1")[2]);
+    let two = last_result(&server.requests("todo-2")[2]);
+    for (result, mine, theirs) in [(&one, "1111", "2222"), (&two, "2222", "1111")] {
+        assert!(result.contains("exit 0 (passed)"), "{result}");
+        assert!(
+            result.contains(mine) && !result.contains(theirs),
+            "{result}"
+        );
+    }
+    // One check at a time: the runs never overlapped.
+    let lines = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(lines.replace("\r\n", "\n"), "start\nend\nstart\nend\n");
+    // The slot keeps its copy for the next check.
+    assert!(
+        data.path()
+            .join("check-slots")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
+        "fn one() {\n    1111\n}\n\nfn two() {\n    2222\n}\n"
     );
 }

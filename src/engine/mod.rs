@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod context;
+pub mod estimate;
 pub mod handoff;
 pub mod progress;
 pub mod prompt;

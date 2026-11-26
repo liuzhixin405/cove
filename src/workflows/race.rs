@@ -338,6 +338,8 @@ async fn candidate(
             detached: true,
             worktree: Some((tree.clone(), workspace)),
             claims: None,
+            scope: None,
+            overlay: None,
         };
         // Leave at least a third of the remaining time for verification.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

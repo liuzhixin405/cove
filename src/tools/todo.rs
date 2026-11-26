@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agents::{plan::strip_writes_prefix, writes::WriteSet},
     domain::{Block, Error, Result},
     session::Session,
 };
@@ -49,6 +50,17 @@ pub struct Todo {
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends: Vec<String>,
+    /// Files (paths or globs, maybe `file::symbol`) the item may write; execute_plan
+    /// enforces them per file (docs/optimizations/0054).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// Whole minutes; a decimal is rounded.
+    #[serde(
+        default,
+        deserialize_with = "crate::engine::estimate::deserialize_minutes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub estimate_minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -57,12 +69,14 @@ pub(super) struct TodoArgs {
     todos: Vec<Todo>,
 }
 
-/// Fills default IDs and moves a `depends:todo-1,todo-2 ` content prefix into `depends`.
+/// Fills default IDs and moves `depends:todo-1,todo-2 ` and `writes:a.rs,b.rs ` content
+/// prefixes (in either order) into `depends` and `writes`.
 pub fn normalize(mut todos: Vec<Todo>) -> Vec<Todo> {
     for (index, todo) in todos.iter_mut().enumerate() {
         if todo.id.as_deref().is_none_or(|id| id.trim().is_empty()) {
             todo.id = Some(format!("todo-{}", index + 1));
         }
+        todo.content = strip_writes_prefix(&todo.content, &mut todo.writes).to_owned();
         let trimmed = todo.content.trim_start();
         if let Some(rest) = trimmed.strip_prefix("depends:") {
             let (list, content) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
@@ -73,6 +87,7 @@ pub fn normalize(mut todos: Vec<Todo>) -> Vec<Todo> {
             }
             todo.content = content.trim().to_owned();
         }
+        todo.content = strip_writes_prefix(&todo.content, &mut todo.writes).to_owned();
     }
     todos
 }
@@ -105,6 +120,12 @@ fn validate(todos: &[Todo]) -> Result<()> {
         }
     }
     for todo in todos {
+        WriteSet::parse(&todo.writes).map_err(|err| {
+            Error::Tool(format!(
+                "todo {}: {err}",
+                todo.id.as_deref().unwrap_or_default()
+            ))
+        })?;
         if let Some(missing) = todo.depends.iter().find(|id| !ids.contains(id.as_str())) {
             return Err(Error::Tool(format!(
                 "todo {} depends on unknown id {missing:?}",
@@ -142,6 +163,12 @@ pub fn render(todos: &[Todo]) -> String {
         }
         if !todo.depends.is_empty() {
             out.push_str(&format!(" (after {})", todo.depends.join(", ")));
+        }
+        match (todo.writes.len(), todo.estimate_minutes) {
+            (0, None) => {}
+            (0, Some(minutes)) => out.push_str(&format!(" [~{minutes} min]")),
+            (files, None) => out.push_str(&format!(" [writes {files}]")),
+            (files, Some(minutes)) => out.push_str(&format!(" [writes {files}, ~{minutes} min]")),
         }
         out.push('\n');
     }
@@ -224,6 +251,45 @@ mod tests {
         assert!(
             parse(json!({"todos":[{"content":"a","status":"pending","depends":["nope"]}]}))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn writes_and_estimates_come_from_fields_or_the_content_prefix() {
+        let out = parse(json!({"todos":[
+            {"content":"writes:src/a.rs,src/b.rs::f build","status":"pending","estimate_minutes":6},
+            {"content":"depends:todo-1 writes:docs/*.md docs","status":"pending","writes":["README.md"]},
+            {"content":"plain","status":"pending","estimate_minutes":3}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            out,
+            "[ ] todo-1. build [writes 2, ~6 min]\n[ ] todo-2. docs (after todo-1) [writes 2]\n[ ] todo-3. plain [~3 min]\n3 open of 3\n"
+        );
+        let todos = normalize(
+            serde_json::from_value::<TodoArgs>(json!({"todos":[
+                {"content":"depends:todo-1 writes:docs/*.md docs","status":"pending","writes":["README.md"]}
+            ]}))
+            .unwrap()
+            .todos,
+        );
+        assert_eq!(todos[0].writes, ["README.md", "docs/*.md"]);
+        assert_eq!(todos[0].depends, ["todo-1"]);
+        assert!(
+            parse(json!({"todos":[{"content":"a","status":"pending","writes":["../x"]}]}))
+                .unwrap_err()
+                .to_string()
+                .contains("workspace-relative")
+        );
+        assert!(
+            parse(json!({"todos":[{"content":"a","status":"pending","estimate_minutes":-1}]}))
+                .is_err()
+        );
+        // A decimal estimate is rounded, not a reason to refuse the whole list.
+        assert!(
+            parse(json!({"todos":[{"content":"a","status":"pending","estimate_minutes":2.5}]}))
+                .unwrap()
+                .contains("~3 min")
         );
     }
 

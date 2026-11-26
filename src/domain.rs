@@ -254,6 +254,9 @@ pub enum Event {
         name: String,
         input: serde_json::Value,
     },
+    /// What the task does now, for the status row, while neither a reply nor a tool
+    /// call shows it (the checks after a reply).
+    Activity(String),
     /// One line of live command output; the final result still arrives in `ToolFinished`.
     Output {
         line: String,
@@ -289,6 +292,14 @@ impl Progress {
         if let Some(sender) = sender {
             // A closed display must not fail the command itself.
             let _ = sender.send(Event::Output { line, stderr }).await;
+        }
+    }
+
+    /// The status-row text (shown even when live tool output is off).
+    pub async fn activity(&self, text: String) {
+        let sender = self.sender.lock().ok().and_then(|current| current.clone());
+        if let Some(sender) = sender {
+            let _ = sender.send(Event::Activity(text)).await;
         }
     }
 

@@ -99,6 +99,530 @@ pub fn may_rewrite_sources(command: &str, dialect: Dialect) -> bool {
     })
 }
 
+/// The first command of `command` that installs packages, generates code, migrates a
+/// database or formats/autofixes files, as written: a step that changes files no single
+/// plan item owns (docs/optimizations/0054). `None` when there is none; commands it does
+/// not know are not judged (their changes are caught after the fact).
+pub fn generates_files(command: &str, dialect: Dialect) -> Option<String> {
+    let line = shell::parse(&shell::normalize_dashes(command), dialect);
+    line.commands().find_map(|simple| {
+        let words = command_words(&simple.words, dialect)?;
+        let argv: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+        let rest = shell::strip_runners(&argv);
+        generating(rest).then(|| argv.join(" "))
+    })
+}
+
+/// Words of script, target and task names that usually generate, migrate, install or
+/// format. Matched as whole words of the name (see [`name_words`]), or as compounds of
+/// [`STEMS`]: `gen` is not in `agent` or `legend`, `fix` not in `prefix`, `proto` not in
+/// `prototype`.
+const GENERATING_WORDS: &[&str] = &[
+    "gen",
+    "regen",
+    "codegen",
+    "typegen",
+    "protogen",
+    "generate",
+    "regenerate",
+    "generated",
+    "generator",
+    "scaffold",
+    "format",
+    "fmt",
+    "fix",
+    "autofix",
+    "prettier",
+    "prettify",
+    "migrate",
+    "migration",
+    "migrations",
+    "makemigrations",
+    "install",
+    "prisma",
+    "proto",
+    "protos",
+    "protoc",
+    "protobuf",
+    "bootstrap",
+    "restore",
+];
+
+/// The words of a script/target name: split at every character that is not a letter or
+/// digit (`:`, `-`, `_`, `.`, `/`) and at lower-to-upper case changes (`generateProto`),
+/// lowercased.
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut lower = false;
+    for c in name.chars() {
+        let boundary = !c.is_alphanumeric() || (c.is_uppercase() && lower);
+        if boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+            lower = c.is_lowercase() || c.is_numeric();
+        } else {
+            lower = false;
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Stems that make a word generating when the word is longer than the stem and
+/// starts (`prefix`) or ends (`suffix`) with it: `reformat`, `autoformat`, `lintfix`,
+/// `dbmigrate`, `gentypes`, `mockgen`, `genproto`, `htmlgen`. `except` lists ordinary
+/// words of that shape.
+struct Stem {
+    stem: &'static str,
+    prefix: bool,
+    suffix: bool,
+    except: &'static [&'static str],
+}
+
+const STEMS: &[Stem] = &[
+    Stem {
+        stem: "format",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "fmt",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "fix",
+        prefix: false,
+        suffix: true,
+        except: &["prefix", "suffix", "affix", "infix", "postfix", "crucifix"],
+    },
+    Stem {
+        stem: "gen",
+        prefix: true,
+        suffix: true,
+        except: &[
+            "general", "generic", "generics", "genre", "genres", "genius", "genome", "gentle",
+            "genuine", "genesis", "gender", "genetic", "genetics", "oxygen", "halogen", "collagen",
+            "antigen", "nitrogen", "hydrogen",
+        ],
+    },
+    Stem {
+        stem: "generate",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "migrate",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "migration",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "install",
+        prefix: true,
+        suffix: true,
+        except: &[],
+    },
+    Stem {
+        stem: "proto",
+        prefix: true,
+        suffix: true,
+        except: &[
+            "prototype",
+            "prototypes",
+            "prototyping",
+            "protocol",
+            "protocols",
+            "proton",
+            "protons",
+        ],
+    },
+];
+
+/// A word of a name that generates, migrates, installs or formats: one of
+/// [`GENERATING_WORDS`], or a compound of one of the [`STEMS`].
+fn generating_word(word: &str) -> bool {
+    GENERATING_WORDS.contains(&word)
+        || STEMS.iter().any(|stem| {
+            word.len() > stem.stem.len()
+                && ((stem.prefix && word.starts_with(stem.stem))
+                    || (stem.suffix && word.ends_with(stem.stem)))
+                && !stem.except.contains(&word)
+        })
+}
+
+/// Formatting words, which also name a check-only mode next to `check`/`verify`.
+fn formatting_word(word: &str) -> bool {
+    ["format", "fmt", "prettier", "prettify"]
+        .iter()
+        .any(|stem| word.contains(stem))
+}
+
+/// A script or target name that generates, migrates, installs or formats. A formatting
+/// word only checks when `check`/`verify` stands right next to it or inside it
+/// (`format:check`, `check-fmt`, `fmtcheck`), or when `checking` (the script runs with
+/// `--check`); other generating words always count (`generate-and-check`), and so does a
+/// formatting word with something in between (`format-and-check`).
+fn generating_name(name: &str, checking: bool) -> bool {
+    let words = name_words(name);
+    let checks = |word: &str| matches!(word, "check" | "verify");
+    words.iter().enumerate().any(|(at, word)| {
+        if !generating_word(word) {
+            return false;
+        }
+        if !formatting_word(word) {
+            return true;
+        }
+        let only_checks = checking
+            || word.contains("check")
+            || word.contains("verify")
+            || (at > 0 && checks(&words[at - 1]))
+            || words.get(at + 1).is_some_and(|next| checks(next));
+        !only_checks
+    })
+}
+
+/// Arguments after a script name that make it only check (`npm run format -- --check`).
+fn checking_only(args: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| matches!(*arg, "--check" | "--dry-run" | "--list-different"))
+}
+
+/// The targets, tasks or goals of a build tool's arguments: not options, not the value of
+/// an option that takes one (`-C dir`, `--tests '*X*'`, `-pl module`), not `NAME=value`.
+fn build_targets<'a>(tool: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let valued: &[&str] = match tool {
+        "make" => &[
+            "-C",
+            "--directory",
+            "-f",
+            "--file",
+            "--makefile",
+            "-I",
+            "--include-dir",
+            "-o",
+            "--old-file",
+            "--assume-old",
+            "-W",
+            "--what-if",
+            "--new-file",
+            "--assume-new",
+        ],
+        "gradle" | "gradlew" => &[
+            "--tests",
+            "-p",
+            "--project-dir",
+            "-b",
+            "--build-file",
+            "-c",
+            "--settings-file",
+            "-x",
+            "--exclude-task",
+            "-I",
+            "--init-script",
+            "-g",
+            "--gradle-user-home",
+            "--console",
+            "--warning-mode",
+            "--include-build",
+            "--project-cache-dir",
+            "--priority",
+            "-D",
+            "-P",
+            "-M",
+        ],
+        "mvn" | "mvnw" => &[
+            "-pl",
+            "--projects",
+            "-f",
+            "--file",
+            "-s",
+            "--settings",
+            "-gs",
+            "--global-settings",
+            "-t",
+            "--toolchains",
+            "-gt",
+            "--global-toolchains",
+            "-P",
+            "--activate-profiles",
+            "-D",
+            "--define",
+            "-rf",
+            "--resume-from",
+            "-T",
+            "--threads",
+            "-l",
+            "--log-file",
+            "-b",
+            "--builder",
+        ],
+        "just" => &[
+            "-f",
+            "--justfile",
+            "-d",
+            "--working-directory",
+            "--set",
+            "--shell",
+            "--shell-arg",
+            "--dotenv-filename",
+            "--dotenv-path",
+            "--color",
+        ],
+        "task" => &[
+            "-d",
+            "--dir",
+            "-t",
+            "--taskfile",
+            "-o",
+            "--output",
+            "-c",
+            "--concurrency",
+            "--sort",
+            "--interval",
+        ],
+        _ => &[],
+    };
+    // Options whose value is optional: skipped only when a number follows.
+    let counted = tool == "make";
+    let mut targets = Vec::new();
+    let mut words = args.iter().copied();
+    while let Some(word) = words.next() {
+        if valued.contains(&word) {
+            words.next();
+        } else if counted && matches!(word, "-j" | "--jobs" | "-l" | "--load-average") {
+            if words
+                .clone()
+                .next()
+                .is_some_and(|next| next.parse::<f64>().is_ok())
+            {
+                words.next();
+            }
+        } else if word == "--" {
+            continue;
+        } else if !word.starts_with('-') && !word.contains('=') {
+            targets.push(word);
+        }
+    }
+    targets
+}
+
+fn generating(words: &[String]) -> bool {
+    let Some(program) = words.first() else {
+        return false;
+    };
+    let name = shell::program_name(program);
+    let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+    let sub = args.first().copied().unwrap_or_default();
+    let has = |flags: &[&str]| {
+        args.iter().any(|arg| {
+            flags
+                .iter()
+                .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        })
+    };
+    // Runners of a package's tool: judge the tool.
+    let runner = match name.as_str() {
+        "npx" | "pnpx" | "bunx" => Some(&words[1..]),
+        "npm" | "pnpm" | "yarn" | "bun" if matches!(sub, "exec" | "dlx" | "x") => Some(&words[2..]),
+        "bundle" | "bundler" | "poetry" | "pipenv" | "uv" if sub == "run" || sub == "exec" => {
+            Some(&words[2..])
+        }
+        "dotnet" if sub == "tool" && args.get(1) == Some(&"run") => words.get(3..),
+        _ => None,
+    };
+    if let Some(rest) = runner {
+        let start = rest
+            .iter()
+            .position(|word| !word.starts_with('-'))
+            .unwrap_or(rest.len());
+        return generating(&rest[start..]);
+    }
+    match name.as_str() {
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            matches!(
+                sub,
+                "install"
+                    | "i"
+                    | "ci"
+                    | "add"
+                    | "update"
+                    | "up"
+                    | "upgrade"
+                    | "remove"
+                    | "rm"
+                    | "uninstall"
+                    | "un"
+                    | "dedupe"
+                    | "prune"
+                    | "link"
+                    | "rebuild"
+                    | "import"
+            ) || (name == "yarn" && args.is_empty())
+                || (matches!(sub, "run" | "run-script")
+                    && args[1..]
+                        .iter()
+                        .position(|word| !word.starts_with('-'))
+                        .is_some_and(|at| {
+                            generating_name(args[1 + at], checking_only(&args[2 + at..]))
+                        }))
+                || (name != "npm"
+                    && !sub.starts_with('-')
+                    && generating_name(sub, checking_only(&args[1..])))
+        }
+        "pip" | "pip3" | "pipx" => matches!(sub, "install" | "uninstall" | "download"),
+        "python" | "python3" | "py" => {
+            let module = args
+                .iter()
+                .position(|arg| *arg == "-m")
+                .and_then(|at| args.get(at + 1..));
+            match module {
+                Some([tool, rest @ ..]) => match *tool {
+                    "pip" => rest
+                        .first()
+                        .is_some_and(|sub| matches!(*sub, "install" | "uninstall" | "download")),
+                    "black" | "isort" => !rest
+                        .iter()
+                        .any(|arg| matches!(*arg, "--check" | "--diff" | "--check-only")),
+                    "autopep8" | "autoflake" => {
+                        rest.iter().any(|arg| *arg == "-i" || *arg == "--in-place")
+                    }
+                    "ruff" => rest.first() == Some(&"format") || rest.contains(&"--fix"),
+                    "grpc_tools.protoc" | "alembic" | "django" => true,
+                    _ => false,
+                },
+                _ => args
+                    .iter()
+                    .position(|arg| arg.ends_with("manage.py"))
+                    .is_some_and(|at| {
+                        args.get(at + 1).is_some_and(|command| {
+                            matches!(*command, "migrate" | "makemigrations" | "collectstatic")
+                        })
+                    }),
+            }
+        }
+        "uv" => {
+            matches!(sub, "add" | "remove" | "sync" | "lock")
+                || (sub == "pip" && args.get(1).is_some_and(|sub| *sub == "install"))
+        }
+        "poetry" | "pipenv" | "pdm" => {
+            matches!(
+                sub,
+                "install" | "add" | "remove" | "update" | "lock" | "sync"
+            )
+        }
+        "conda" | "mamba" | "gem" | "brew" | "choco" | "winget" | "scoop" | "apt" | "apt-get"
+        | "yum" | "dnf" | "zypper" | "snap" | "flatpak" => matches!(
+            sub,
+            "install" | "uninstall" | "remove" | "update" | "upgrade" | "add" | "create"
+        ),
+        "pacman" => sub.starts_with("-S") || sub.starts_with("-R") || sub.starts_with("-U"),
+        "bundle" | "bundler" => matches!(sub, "install" | "update" | "add" | "lock" | "remove"),
+        "composer" => matches!(
+            sub,
+            "install" | "require" | "update" | "remove" | "dump-autoload" | "dumpautoload"
+        ),
+        "dotnet" => {
+            matches!(sub, "restore" | "format" | "new" | "add" | "remove" | "ef")
+                || (sub == "tool"
+                    && args
+                        .get(1)
+                        .is_some_and(|sub| matches!(*sub, "restore" | "install" | "update")))
+        }
+        "dotnet-ef" | "dotnet-format" => true,
+        "nuget" => matches!(sub, "restore" | "install" | "update"),
+        "cargo" => {
+            matches!(
+                sub,
+                "fmt" | "fix" | "add" | "remove" | "rm" | "update" | "install" | "generate"
+            ) || (sub == "clippy" && args.iter().any(|arg| arg.starts_with("--fix")))
+        }
+        "rustfmt" => !args
+            .iter()
+            .any(|arg| *arg == "--check" || arg.starts_with("--emit")),
+        "go" => {
+            matches!(sub, "generate" | "get" | "fmt" | "fix" | "install")
+                || (sub == "mod"
+                    && args.get(1).is_some_and(|sub| {
+                        matches!(*sub, "tidy" | "download" | "vendor" | "init" | "edit")
+                    }))
+        }
+        "gofmt" | "goimports" | "gofumpt" | "shfmt" => has(&["-w"]),
+        "protoc"
+        | "flatc"
+        | "thrift"
+        | "mockgen"
+        | "wire"
+        | "openapi-generator"
+        | "openapi-generator-cli"
+        | "swagger-codegen"
+        | "graphql-codegen"
+        | "quicktype" => true,
+        "buf" => matches!(sub, "generate" | "format"),
+        "sqlc" => sub == "generate",
+        "prisma" => matches!(sub, "generate" | "migrate" | "db" | "format"),
+        "drizzle-kit" => matches!(sub, "generate" | "migrate" | "push"),
+        "sequelize" | "sequelize-cli" | "knex" | "typeorm" | "mikro-orm" => args
+            .iter()
+            .any(|arg| arg.contains("migrat") || arg.contains("seed")),
+        "alembic" => matches!(sub, "upgrade" | "downgrade" | "revision" | "stamp"),
+        "flyway" | "liquibase" => matches!(sub, "migrate" | "update" | "repair" | "baseline"),
+        "rails" | "rake" => {
+            matches!(sub, "generate" | "g" | "destroy" | "d") || sub.starts_with("db:")
+        }
+        "prettier" => has(&["--write", "-w"]),
+        "eslint" | "stylelint" | "tslint" | "standard" | "xo" => {
+            args.iter().any(|arg| arg.starts_with("--fix"))
+        }
+        "biome" => {
+            sub == "format" && has(&["--write"])
+                || args
+                    .iter()
+                    .any(|arg| matches!(*arg, "--write" | "--apply" | "--apply-unsafe" | "--fix"))
+        }
+        "rubocop" => args
+            .iter()
+            .any(|arg| matches!(*arg, "-a" | "-A") || arg.starts_with("--auto")),
+        "ruff" => sub == "format" && !has(&["--check", "--diff"]) || has(&["--fix"]),
+        "black" | "isort" => !args
+            .iter()
+            .any(|arg| matches!(*arg, "--check" | "--diff" | "--check-only")),
+        "autopep8" | "autoflake" => has(&["-i", "--in-place"]),
+        "clang-format" => has(&["-i"]),
+        "swiftformat" | "dartfmt" => true,
+        "ktlint" => has(&["-F", "--format"]),
+        "terraform" | "tofu" => sub == "fmt" && !has(&["-check"]),
+        "deno" => sub == "fmt" && !has(&["--check"]) || sub == "install",
+        "mix" => matches!(
+            sub,
+            "format" | "deps.get" | "ecto.migrate" | "ecto.gen.migration"
+        ),
+        "dart" => sub == "format" || (sub == "fix" && has(&["--apply"])) || sub == "pub",
+        "flutter" => matches!(sub, "pub" | "create" | "format"),
+        "make" | "just" | "task" | "gradle" | "gradlew" | "mvn" | "mvnw" => {
+            build_targets(&name, &args)
+                .iter()
+                .any(|target| generating_name(target, false))
+        }
+        "install-module" | "install-package" | "update-module" | "install-script" => true,
+        _ => false,
+    }
+}
+
 /// Git steps that stay in the local repository and can be undone (`add`, `commit`,
 /// `tag`), alone or with read-only commands: no approval in default or auto mode.
 /// Push and anything forced, deleting or rewriting still asks.
@@ -1776,6 +2300,141 @@ mod tests {
             "env",
         ] {
             assert_ne!(posix(command), Category::Safe, "{command}");
+        }
+    }
+
+    #[test]
+    fn generating_commands_are_found_in_every_dialect() {
+        let posix = |command| generates_files(command, Dialect::Posix);
+        for command in [
+            "npm install",
+            "npm ci --silent",
+            "pnpm add zod",
+            "yarn",
+            "npm run codegen",
+            "npx prisma generate",
+            "pnpm exec prettier --write .",
+            "dotnet restore",
+            "dotnet ef migrations add Init",
+            "dotnet tool restore",
+            "dotnet format",
+            "cargo fmt",
+            "cargo clippy --fix",
+            "go generate ./...",
+            "go mod tidy",
+            "gofmt -w main.go",
+            "protoc --go_out=. api.proto",
+            "buf generate",
+            "python -m pip install -r requirements.txt",
+            "python manage.py migrate",
+            "alembic upgrade head",
+            "eslint --fix src",
+            "black src",
+            "ruff check --fix .",
+            "rustfmt src/main.rs",
+            "make generate",
+            "cd web && npm install > /dev/null",
+            "timeout 60 npm install",
+        ] {
+            assert!(posix(command).is_some(), "{command}");
+        }
+        for command in [
+            "cargo test",
+            "cargo build --release",
+            "npm test",
+            "npm run build",
+            "npm run dev",
+            "dotnet build --no-restore",
+            "dotnet test",
+            "go test ./...",
+            "gofmt -l .",
+            "black --check src",
+            "rustfmt --check src/main.rs",
+            "prettier --check .",
+            "git status",
+            "python -m pytest",
+            "make test",
+            "ls -la",
+        ] {
+            assert!(posix(command).is_none(), "{command}");
+        }
+        assert_eq!(
+            posix("ls && npm install left-pad").as_deref(),
+            Some("npm install left-pad")
+        );
+        // Script and target names match by whole words, and only the real target counts.
+        for command in [
+            "npm run generate",
+            "npm run gen:types",
+            "npm run --silent db:migrate",
+            "pnpm format",
+            "yarn lint:fix",
+            "make gen",
+            "make -C web fmt",
+            "make -j 4 proto",
+            "gradle :app:generateProto",
+            "./gradlew spotless flywayMigrate",
+            "mvn -pl core spotless:apply install",
+            "just codegen",
+            "npm install",
+            "go generate ./...",
+            "dotnet ef migrations add X",
+            "cargo fmt",
+            "prettier --write .",
+            // Compound names.
+            "npm run reformat",
+            "npm run autoformat",
+            "yarn lintfix",
+            "npm run dbmigrate",
+            "npm run gentypes",
+            "make mockgen",
+            "make genproto",
+            "./gradlew HTMLGen",
+            "npm run preinstall",
+            // A generating word is not cancelled by a check elsewhere in the name.
+            "npm run format-and-check",
+            "npm run generate-and-check",
+            "npm run gen:check",
+        ] {
+            assert!(posix(command).is_some(), "{command}");
+        }
+        for command in [
+            "mvn -pl agent-core test",
+            "mvn -Dtest=AgentTest -pl agents test",
+            "gradle test --tests '*AgentTest*'",
+            "./gradlew :legend:test",
+            "make -C agents test",
+            "make -f gen.mk test",
+            "make test PREFIX=/tmp",
+            "npm run test:agents",
+            "npm run prototype",
+            "npm run prefix-check",
+            "npm run format:check",
+            "npm run fmt -- --check",
+            "pnpm check-format",
+            "yarn legend",
+            "just test agents",
+            "npm run fmtcheck",
+            "npm run check:prettier",
+            "npm run prefix",
+            "npm run general",
+            "npm run protocol-test",
+            "npm run test:AgentTest",
+        ] {
+            assert!(posix(command).is_none(), "{command}");
+        }
+        assert_eq!(
+            name_words("generateProto:gen-types_v2.fix"),
+            ["generate", "proto", "gen", "types", "v2", "fix"]
+        );
+        let ps = |command| generates_files(command, Dialect::PowerShell);
+        assert!(ps("Install-Module PSReadLine").is_some());
+        assert!(ps("dotnet restore; dotnet build").is_some());
+        assert!(generates_files("npm.cmd install", Dialect::Cmd).is_some());
+        // Every source rewrite the evidence check knows is a generating step too.
+        for command in ["cargo fmt", "go fix ./...", "shfmt -w a.sh", "rustfmt a.rs"] {
+            assert!(may_rewrite_sources(command, Dialect::Posix));
+            assert!(posix(command).is_some(), "{command}");
         }
     }
 

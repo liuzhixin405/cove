@@ -1,7 +1,7 @@
 # 0044 精简系统提示词
 
-- 状态：实施中
-- 日期：2026-11-24（创建）
+- 状态：已完成
+- 日期：2026-11-24（创建）；2026-11-25（完成）
 - 关联：0012（文件工具规则和 shell 提示）、0018（回复语言）、0027（问答引用）、0029（explore 委派）、0032（止损）、0036（恢复会话时系统提示不变）、0038（拒绝说明）；评测基线 `evals/results/20261124-190241-bedrock.json`
 
 ## 背景
@@ -184,7 +184,7 @@
 - [x] 阶段 2：改基础规则、删 `DEFAULT_SYSTEM_GUIDANCE`、精简工具描述。
 - [x] 阶段 3：场景提示（guard.rs）和测试。
 - [x] 阶段 4：同步测试断言、`docs/reference.md`；测量改动后的数据；`cargo test`、`cargo clippy`。
-- [ ] 阶段 5：Bedrock Opus 全量评测，对比基线，回填“验证结果”。
+- [x] 阶段 5：Bedrock Opus 全量评测，对比基线，回填“验证结果”。
 
 ## 待决策
 
@@ -226,12 +226,26 @@
   - 本次新增和修改的测试都通过：`safety::gates::guard::tests::rare_shell_work_gets_its_rules_once_per_task`、`shell_file_operations_get_a_file_tool_hint`、`project::exit_codes_distinguish_usage_errors_and_dump_prints_the_system_prompt`、`tools::cli_reads_in_parallel_keeps_gbk_and_adds_subdirectory_instructions`。
 - `cargo clippy --release --all-targets`：5 条警告，与原有的 5 条相同（`app/console.rs` 两条、`process.rs`、`safety/permission/policy.rs`、`tests/all/cli.rs`），没有新增。
 
-**评测**：未跑，待回填（命令见“验证”）。
+**评测**（2026-11-25，`python -X utf8 evals/run.py --profile bedrock --set model_fast=off --baseline evals/results/20261124-190241-bedrock.json --keep`，结果 `evals/results/20261125-164807-bedrock.json`）：
+
+- 被测构建 `0.8.0+250359b4ace5`，基线构建 `0.7.0+27947ada177d`。被测构建同时包含 0041、0042、0043、0047 的改动，所以下面的差别不全是本文带来的：`pub-swe-sympy-24562` 调用数 16 → 4、峰值 −72%，主要来自 0041/0042（验证不再带上无关测试、改动前就失败的用例不再判失败）。
+- 通过：29/29（基线 29/29）。第一次判定是 28/29：`impact-review-commits` 的回复正确指出 `feed_b.py` 少传 `venue` 会抛 TypeError，但其中一句"所以只有空批次……不会报错"被判定当成"没有风险"的结论。已修正判定（`check.py` 新增 `EXCEPTION`：同一分句里"只有/仅有/除非/仅当……不会"是在限定例外范围，跳过；`selftest.py` 加了这次的原文作 good、"只有一处改动，不会挂"作 bad，自检全过），`--rejudge` 后 29/29。
+- 合计（29 个用例各 1 次）：
+
+| 项 | 基线 | 本次 | 变化 |
+|---|---|---|---|
+| 模型调用 | 138 | 120 | −13.0% |
+| 输入 tokens | 1,568,439 | 1,093,190 | −30.3% |
+| 输出 tokens | 33,900 | 27,612 | −18.5% |
+| 耗时 | 909s | 855s | −5.9% |
+| 费用 | $2.439 | $1.825 | −25.2% |
+| 主上下文峰值之和 | 355,176 | 297,084 | −16.4% |
+
+- 单个用例的峰值：28 个下降（多数 −7% 到 −20%），`outdated-readme-tool` +5%。调用数变多的 4 个（`cleanup-unused-config` 5 → 6、`doc-port-mismatch` 2 → 3、`feature-with-docs` 4 → 5、`handoff-back` 9 → 10）都只多 1 次，并且都通过。
+- “验证”一节点名要重点看的用例（`unverifiable-tests`、`unreachable-service`、`scope-discipline`、`git-merge-request`、`doc-port-mismatch`、`uncalled-twin` 等）全部通过。
 
 ## 遗留
 
-（评测后补全）目前已知：
-
 - 按项目裁剪工具集合：Python 测试仓库里 `regression`（只支持 cargo、go 和配置的命令）的 JSON 有 1234 字节，没有配置 MCP 服务时 `mcp` 工具什么也做不了（621 字节）。需要另开文档评估。
 - 技能索引在本机占系统提示的 47%（改动后），是现在最大的一段。
-- 上面列出的 4 个超时类集成测试失败，需要在本机空闲时重跑确认。
+- 上面列出的 4 个超时类集成测试：2026-11-25 全量 `cargo test --release` 里 3 个通过，`safety::files_changed_by_shell_are_progress_and_unchanged_ones_are_not` 失败 1 次、单独重跑通过；`engine::progress` 那个单测也已通过。是并行负载下的偶发失败，不是本文引起的。

@@ -307,6 +307,15 @@ impl Console {
         }
     }
 
+    /// How many background shell commands still run.
+    pub fn set_background(&self, running: usize) {
+        let mut state = self.lock();
+        if state.background != running {
+            state.background = running;
+            state.redraw();
+        }
+    }
+
     /// Tokens a model call used; input already includes cache reads and writes.
     pub fn add_tokens(&self, usage: Usage) {
         let mut state = self.lock();
@@ -833,6 +842,8 @@ struct State {
     started: Instant,
     activity: String,
     tokens: (u64, u64),
+    /// Background shell commands still running (0050), shown while idle too.
+    background: usize,
     /// The spinner frame last drawn.
     frame: u64,
     /// Context and session usage, shown on a row of its own.
@@ -886,6 +897,7 @@ impl State {
             started: Instant::now(),
             activity: String::new(),
             tokens: (0, 0),
+            background: 0,
             frame: 0,
             meter: Meter::default(),
             hint: None,
@@ -1913,8 +1925,10 @@ impl State {
             } else if self.busy {
                 "(! 插话；文字引导任务；/命令排队)"
             } else {
+                // Without the keyboard enhancement protocol most Unix terminals send the
+                // same byte for Ctrl+Enter and Enter; Ctrl+J is what works there.
                 if cfg!(windows) {
-                    "(/ 查看命令，@路径 或 Alt+V 添加附件，Ctrl+J 换行)"
+                    "(/ 查看命令，@路径 或 Alt+V 添加附件，Ctrl+Enter 换行)"
                 } else {
                     "(/ 查看命令，@路径 添加附件，Ctrl+J 换行)"
                 }
@@ -1994,6 +2008,9 @@ impl State {
                 text.push_str(&format!("；{} 条排队", self.queued));
             }
             parts.push(text);
+        }
+        if self.background > 0 && self.esc_armed.is_none() && self.ask.is_none() {
+            parts.push(format!("后台命令 {} 个", self.background));
         }
         if self.search.is_some() {
             parts.push("Ctrl+R 更早的匹配，Enter 选用，Esc 取消".to_owned());
@@ -2945,7 +2962,10 @@ mod tests {
         state.editor.restore("a⚠\u{fe0f}".chars().collect());
         press(&mut state, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(line(&state), "a");
-        // Multi-line: Ctrl+J, a trailing backslash, Up within the input.
+        // Multi-line: Ctrl+Enter, Ctrl+J, a trailing backslash, Up within the input.
+        state.editor.restore("zero".chars().collect());
+        press(&mut state, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(line(&state), "zero\n");
         state.editor.restore("one".chars().collect());
         press(&mut state, KeyCode::Char('j'), KeyModifiers::CONTROL);
         typed(&mut state, "two\\");

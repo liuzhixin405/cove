@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -15,7 +16,7 @@ use crate::{
     app::ui::print_text,
     app::{Application, fresh, validate_identity},
     config::Settings,
-    domain::{Error, Progress, Provider, Result},
+    domain::{Error, Progress, Provider, Result, UserInput},
     engine::agent::{Ledger, add_spend},
     model::routing::{ModelPolicy, ModelRouter},
     safety::permission::{Authorizer, LocalAuthorizer, Mode},
@@ -26,7 +27,7 @@ use crate::{
     tools::{LocalTools, ToolExecutor},
 };
 
-pub(crate) const HELP: &str = "/status agents [stop|park|resume|send|merge|discard <id|main> [confirm] [text]]  子代理和主任务：列出、中断、挂起、唤醒、发消息、合并或丢弃后台代理的分支；/status agents repair 恢复回归检查崩溃时留在基线状态的文件";
+pub(crate) const HELP: &str = "/status agents [show|stop|park|resume|send|merge|discard <id|main> [confirm] [text]]  子代理和主任务：列出、查看完整报告、中断、挂起、唤醒、发消息、合并或丢弃后台代理的分支；/status agents repair 恢复回归检查崩溃时留在基线状态的文件";
 
 /// The router's models for sub-agents: live main and fast model, prices by model, and
 /// each model's own window (learned from overflow errors, else the built-in table).
@@ -125,7 +126,7 @@ pub(crate) fn hub(
     provider: Arc<dyn Provider>,
     tools: Arc<ExtensionTools>,
     authorizer: Arc<dyn Authorizer>,
-    interactive: bool,
+    input: Option<Arc<dyn UserInput>>,
     ledger: Arc<Ledger>,
     progress: Arc<Progress>,
     workspace: Arc<Workspace>,
@@ -164,8 +165,36 @@ pub(crate) fn hub(
                 .to_owned(),
         ),
     };
+    let overlay_check = match file.get("overlay_check") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().map(str::trim) {
+            Some("") => None,
+            Some(command) if command.len() < 4096 => Some(command.to_owned()),
+            _ => {
+                return Err(Error::Session(
+                    "overlay_check 必须是命令字符串（例如 \"cargo check\"）；请修改配置文件".into(),
+                ));
+            }
+        },
+    };
+    let mergiraf = match file.get("mergiraf_path") {
+        None | Some(Value::Null) => which::which("mergiraf").ok(),
+        Some(value) => {
+            let path = value
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| {
+                    Error::Session(
+                        "mergiraf_path 必须是 mergiraf 程序的绝对路径；请修改配置文件".into(),
+                    )
+                })?;
+            Some(path)
+        }
+    };
     let web_search = settings.web_search.clone();
     let factory_tools = tools.clone();
+    let job_dir = store.root().join("tool-outputs").join("shell");
     let factory = Arc::new(move |scope: ToolScope| -> Result<Arc<dyn ToolExecutor>> {
         let local_authorizer: Arc<dyn Authorizer> = if scope.readonly {
             Arc::new(LocalAuthorizer {
@@ -175,10 +204,14 @@ pub(crate) fn hub(
         } else {
             scope.authorizer.clone()
         };
-        let mut local =
-            LocalTools::new(scope.root.clone(), local_authorizer)?.with_progress(scope.progress);
+        let mut local = LocalTools::new(scope.root.clone(), local_authorizer)?
+            .with_progress(scope.progress)
+            .with_job_dir(job_dir.clone());
         if let Some(workspace) = scope.workspace {
             local = local.with_workspace(workspace);
+        }
+        if let Some(stack) = scope.overlay {
+            local = local.with_overlay(stack)?;
         }
         Ok(Arc::new(ExtensionTools {
             local: Arc::new(local),
@@ -207,6 +240,8 @@ pub(crate) fn hub(
             regression_command,
             catalog,
             explore_fast: settings.explore_fast,
+            overlay_check,
+            mergiraf,
         },
         ledger,
         progress,
@@ -218,7 +253,8 @@ pub(crate) fn hub(
             lock: tokio::sync::Mutex::new(()),
         }),
         permission: settings.permission,
-        interactive,
+        interactive: input.is_some(),
+        input,
     })
 }
 
@@ -442,6 +478,12 @@ pub(crate) async fn handle(
         [verb, id, ..] => {
             let main = is_main(app, id);
             match (*verb, main) {
+                ("show", true) => {
+                    return Err(Error::Session(
+                        "主任务没有后台报告；它的过程在当前会话里".into(),
+                    ));
+                }
+                ("show", false) => hub.report_text(id)?,
                 ("stop", true) => "前台任务用 Ctrl+C 停止；任务之间它不会运行".into(),
                 ("park", true) => park_main(app).await?,
                 ("resume" | "send", true) => {

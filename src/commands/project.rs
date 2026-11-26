@@ -819,12 +819,21 @@ async fn verify(app: &Application, commands: &[String]) -> Result<()> {
                 )
                 .await?;
             print_text(&format!("[verification] $ {command}\n"), true)?;
-            let timeout = app
-                .settings
-                .verify_timeout
-                .unwrap_or(Duration::from_secs(300));
+            let limit = crate::process::Limit::watched(
+                app.settings
+                    .verify_timeout
+                    .unwrap_or(crate::process::WATCHED_TOTAL),
+                app.settings
+                    .verify_idle
+                    .unwrap_or(crate::process::IDLE_LIMIT),
+            );
             let output =
-                crate::process::shell(&app.settings.cwd, command, timeout, cancel.clone()).await?;
+                crate::process::shell(&app.settings.cwd, command, limit, cancel.clone()).await?;
+            if let Some(reason) = &output.stalled {
+                return Err(Error::Tool(format!(
+                    "verification command stalled and was stopped: {command}\n{reason}"
+                )));
+            }
             if output.code != Some(0) || output.timed_out {
                 let text = format!("{}\n{}", output.stdout, output.stderr);
                 return Err(Error::Tool(format!(

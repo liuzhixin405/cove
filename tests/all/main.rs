@@ -12,6 +12,7 @@ mod evaluation;
 mod extensions;
 mod integrations;
 mod model;
+mod overlay;
 mod persistence;
 mod project;
 mod safety;

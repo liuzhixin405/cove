@@ -124,9 +124,20 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 | [0038](0038-no-script-bypass-after-refusal.md) | 操作被拒后，运行模型本任务里写的脚本也要批准 | 已完成 |
 | [0039](0039-verify-scope-ignores-deleted-scratch.md) | 自动验证不因删掉的临时脚本退回全量测试 | 已完成 |
 | [0040](0040-local-time-in-listings.md) | /undo、/memory、dream 显示的时间改成本地时间 | 已完成 |
-| [0041](0041-verify-baseline-preexisting-failures.md) | 自动验证区分改动前就失败的测试 | 实施中 |
-| [0042](0042-verify-same-name-tests.md) | 自动验证按目录就近选测试，不带上同名的无关测试 | 实施中 |
-| [0043](0043-python-c-in-print-mode.md) | `-p` 下 `python -c` 等内联代码的审批 | 实施中 |
-| [0044](0044-slim-system-prompt.md) | 精简系统提示词 | 实施中 |
-| [0045](0045-expand-public-benchmarks.md) | 公开评测题扩充到 20–30 题 | 草稿 |
+| [0041](0041-verify-baseline-preexisting-failures.md) | 自动验证区分改动前就失败的测试 | 已完成 |
+| [0042](0042-verify-same-name-tests.md) | 自动验证按目录就近选测试，不带上同名的无关测试 | 已完成 |
+| [0043](0043-python-c-in-print-mode.md) | `-p` 下 `python -c` 等内联代码的审批 | 已完成 |
+| [0044](0044-slim-system-prompt.md) | 精简系统提示词 | 已完成 |
+| [0045](0045-expand-public-benchmarks.md) | 公开评测题扩充到 20–30 题 | 已完成 |
 | [0046](0046-preference-and-stall-prompt-fixes.md) | 全局偏好提问和"没有进展"询问的界面问题 | 已完成 |
+| [0047](0047-verify-skip-ignored-and-docs.md) | 自动验证不因被忽略的文件和文档跑全量测试；验证期间状态栏写"验证中" | 已完成 |
+| [0048](0048-verify-idle-timeout.md) | 测试和构建命令按"是否还在干活"判断卡住，不按固定时长砍掉 | 已完成 |
+| [0049](0049-ctrl-enter-newline-hint.md) | 换行提示改为 Ctrl+Enter | 已完成 |
+| [0050](0050-shell-timeout-to-background.md) | 前台命令到时长转到后台继续，不再杀掉 | 已完成 |
+| [0051](0051-shell-run-in-background.md) | shell 增加 `run_in_background`：直接在后台启动一直运行的命令 | 已完成 |
+| [0052](0052-search-include-ignored.md) | glob/grep 可以包含被忽略的文件 | 已完成 |
+| [0053](0053-overlay-split.md) | 第四种隔离方式：覆盖层拆分（拆细并行，最后合并、一次验证） | 已完成 |
+| [0054](0054-task-split-skill.md) | 内置 task-split 技能，计划执行按写集合约束单元 | 已完成 |
+| [0055](0055-cite-negation-and-table-wrap.md) | 引用核对不误报否定句；表格单元格不在单词中间折行 | 已完成 |
+| [0056](0056-background-notice-once.md) | 后台代理结束通知不重复打印报告、改为中文；`/status agents show` 查看完整报告 | 已完成 |
+| [0057](0057-cite-line-refs-not-anchors.md) | 引用核对不把另一条行号引用当成锚点 | 已完成 |

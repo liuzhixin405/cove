@@ -164,6 +164,10 @@ impl ToolExecutor for DreamTools {
         false
     }
 
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        None
+    }
+
     fn concurrent(&self, _name: &str, _input: &Value) -> bool {
         false
     }
@@ -233,6 +237,10 @@ impl ToolExecutor for MemoryTools {
 
     fn metered(&self, _name: &str) -> bool {
         false
+    }
+
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        None
     }
 
     fn concurrent(&self, _name: &str, _input: &Value) -> bool {

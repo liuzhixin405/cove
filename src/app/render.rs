@@ -48,14 +48,20 @@ pub fn tool_title(name: &str, input: &Value) -> String {
         }
         "write" => ("写入", path().unwrap_or_default().to_owned()),
         "edit" => ("编辑", path().unwrap_or_default().to_owned()),
-        "glob" => (
-            "查找文件",
-            field(input, &["pattern"]).unwrap_or_default().to_owned(),
-        ),
+        "glob" => {
+            let mut detail = field(input, &["pattern"]).unwrap_or_default().to_owned();
+            if input["include_ignored"] == true {
+                detail.push_str(" · 含被忽略的文件");
+            }
+            ("查找文件", detail)
+        }
         "grep" => {
             let mut detail = format!("\"{}\"", field(input, &["pattern"]).unwrap_or_default());
             if let Some(scope) = field(input, &["path", "include"]) {
                 detail.push_str(&format!(" · {scope}"));
+            }
+            if input["include_ignored"] == true {
+                detail.push_str(" · 含被忽略的文件");
             }
             ("搜索", detail)
         }
@@ -68,6 +74,19 @@ pub fn tool_title(name: &str, input: &Value) -> String {
         "shell" => (
             "运行",
             field(input, &["command"]).unwrap_or_default().to_owned(),
+        ),
+        "shell_task" => (
+            "后台命令",
+            format!(
+                "{} {}",
+                field(input, &["action"]).unwrap_or_default(),
+                input
+                    .get("id")
+                    .map(|id| format!("#{id}"))
+                    .unwrap_or_default()
+            )
+            .trim()
+            .to_owned(),
         ),
         "question" | "ask_user" => ("提问", String::new()),
         "todo" => ("更新待办", String::new()),
@@ -397,7 +416,7 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
             vec![format!("{} 行", output.lines().count())]
         }
         "grep" => {
-            if output.trim() == "No matches found" {
+            if output.starts_with("No matches found") {
                 return vec!["没有匹配".into()];
             }
             let rows: Vec<&str> = output
@@ -419,10 +438,13 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
         }
         "glob" => {
             let rows = lines_of(output);
-            if rows.is_empty() || output.trim() == "No files found" {
+            if rows.is_empty() || output.starts_with("No files found") {
                 return vec!["没有文件".into()];
             }
-            vec![format!("{} 个文件", rows.len())]
+            // `... and N more` and `... search stopped` are notes, not files.
+            let files = rows.iter().filter(|row| !row.starts_with("... ")).count();
+            let more = if files < rows.len() { "+" } else { "" };
+            vec![format!("{files}{more} 个文件")]
         }
         "shell" => shell_summary(failed, output, streamed),
         "edit" => match edit_count(output) {
@@ -445,6 +467,21 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
 /// row, with the last lines when they were not streamed or the command failed.
 fn shell_summary(failed: bool, output: &str, streamed: bool) -> Vec<String> {
     let header = output.lines().next().unwrap_or_default();
+    // Still running in the background (0050, 0051): the output so far, then where it went.
+    if let Some(rest) = header.strip_prefix("[background #") {
+        let id = rest.split(']').next().unwrap_or_default();
+        let stdout = output
+            .split_once("\nstdout:\n")
+            .map(|(_, body)| body.split_once("\nstderr:\n").map_or(body, |(out, _)| out))
+            .unwrap_or_default();
+        let mut rows = if streamed {
+            Vec::new()
+        } else {
+            tail(stdout, 3)
+        };
+        rows.push(format!("↻ 后台运行中（#{id}），结束后自动交给模型"));
+        return rows;
+    }
     let Some(code) = header.strip_prefix("exit_code=") else {
         return tail(output, 4);
     };
@@ -904,6 +941,9 @@ fn table_with_width(rows: &[String], terminal_width: usize) -> String {
     out
 }
 
+/// Lines of at most `max_width` columns, broken after a space or around wide (CJK)
+/// characters; a word longer than the line is cut where it overflows. Styles open at a
+/// break are closed on that line and reopened on the next.
 pub(crate) fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
@@ -911,6 +951,8 @@ pub(crate) fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
     let mut line = String::new();
     let mut active = String::new();
     let mut width = 0;
+    // The last place on this line to break at: byte offset, width so far, open styles.
+    let mut last_break: Option<(usize, usize, String)> = None;
     let mut remaining = text;
     while !remaining.is_empty() {
         if remaining.starts_with('\x1b') {
@@ -930,15 +972,32 @@ pub(crate) fn wrap_cell(text: &str, max_width: usize) -> Vec<(String, usize)> {
         let grapheme = if grapheme == "\t" { " " } else { grapheme };
         let cell_width = grapheme.width();
         if width > 0 && width + cell_width > max_width {
-            if !active.is_empty() {
-                line.push_str(RESET);
+            if let Some((at, before, open)) = last_break.take().filter(|(_, w, _)| *w > 0) {
+                let tail = line.split_off(at);
+                if !open.is_empty() {
+                    line.push_str(RESET);
+                }
+                lines.push((std::mem::take(&mut line), before));
+                line = open + &tail;
+                width -= before;
             }
-            lines.push((line, width));
-            line = active.clone();
-            width = 0;
+            if width > 0 && width + cell_width > max_width {
+                if !active.is_empty() {
+                    line.push_str(RESET);
+                }
+                lines.push((std::mem::replace(&mut line, active.clone()), width));
+                width = 0;
+            }
+        }
+        let wide = cell_width > 1;
+        if wide && width > 0 {
+            last_break = Some((line.len(), width, active.clone()));
         }
         line.push_str(grapheme);
         width += cell_width;
+        if wide || grapheme == " " {
+            last_break = Some((line.len(), width, active.clone()));
+        }
     }
     lines.push((line, width));
     lines
@@ -1103,6 +1162,37 @@ mod tests {
         assert_eq!(lines[1].0, format!("{CODE}efgh{RESET}"));
     }
 
+    /// Cells break at spaces and around CJK, not inside a word (0055 P2).
+    #[test]
+    fn cells_wrap_between_words() {
+        let texts = |lines: Vec<(String, usize)>| -> Vec<String> {
+            lines.into_iter().map(|(text, _)| plain(&text)).collect()
+        };
+        assert_eq!(
+            texts(wrap_cell("is a positional record", 12)),
+            ["is a ", "positional ", "record"]
+        );
+        assert_eq!(
+            texts(wrap_cell("会抛ObjectDisposed", 12)),
+            ["会抛", "ObjectDispos", "ed"]
+        );
+        assert_eq!(
+            texts(wrap_cell("这是很长的说明内容", 8)),
+            ["这是很长", "的说明内", "容"]
+        );
+        for (text, width) in wrap_cell("is a positional record", 12) {
+            assert!(width <= 12);
+            assert_eq!(
+                width,
+                unicode_width::UnicodeWidthStr::width(plain(&text).as_str())
+            );
+        }
+        // A style open at the break carries over to the next line.
+        let lines = wrap_cell(&inline("see `foo bar baz`").0, 9);
+        assert_eq!(lines[0].0, format!("see {CODE}foo {RESET}"));
+        assert_eq!(lines[1].0, format!("{CODE}bar baz{RESET}"));
+    }
+
     #[test]
     fn narrow_tables_without_headers_number_the_columns() {
         let rows = ["| first | second | third |"].map(str::to_owned);
@@ -1136,6 +1226,11 @@ mod tests {
         let input = serde_json::json!({"command": "cargo test\ncargo build"});
         assert_eq!(tool_title("shell", &input), "运行 cargo test…");
         assert_eq!(tool_title("todo", &serde_json::json!({})), "更新待办");
+        let input = serde_json::json!({"pattern": "*.dll", "include_ignored": true});
+        assert_eq!(
+            tool_title("glob", &input),
+            "查找文件 *.dll · 含被忽略的文件"
+        );
     }
 
     #[test]
@@ -1224,6 +1319,12 @@ mod tests {
     fn results_are_summarized() {
         let grep = "src/a.rs:1:fn main\nsrc/a.rs:9:fn main2\nsrc/b.rs:3:fn main";
         assert_eq!(summary("grep", false, grep, false), ["3 处匹配，2 个文件"]);
+        let hinted = "No matches found (files excluded by .gitignore were skipped; include_ignored=true searches them)";
+        assert_eq!(summary("grep", false, hinted, false), ["没有匹配"]);
+        let hinted = hinted.replace("No matches found", "No files found");
+        assert_eq!(summary("glob", false, &hinted, false), ["没有文件"]);
+        let glob = "a.rs\nb.rs\n... search stopped after 20 s; results are incomplete, narrow path or pattern";
+        assert_eq!(summary("glob", false, glob, false), ["2+ 个文件"]);
         let shell = "exit_code=Some(1) timed_out=false truncated=false encoding_warning=false\nstdout:\nok\nstderr:\nerror: boom\n";
         let rows = summary("shell", true, shell, false);
         assert_eq!(rows, ["error: boom", "✗ 退出码 1"]);

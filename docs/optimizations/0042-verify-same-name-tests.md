@@ -1,7 +1,7 @@
 # 0042 自动验证按目录就近选测试，不带上同名的无关测试
 
-- 状态：实施中
-- 日期：2026-11-24（创建）
+- 状态：已完成
+- 日期：2026-11-24（创建）；2026-11-25（完成）
 - 关联：0039（遗留第 1 条）、0041（同一题里暴露的另一个验证问题）
 
 ## 背景
@@ -74,7 +74,7 @@ Python 项目常见的测试布局，以及"近"应该怎么算：
 
 - [x] 阶段 1：筛选和单元测试
 - [x] 阶段 2：对 sympy 跑 `print_checks`，文档
-- [ ] 阶段 3：真实模型评测确认
+- [x] 阶段 3：真实模型评测确认
 
 ## 待决策
 
@@ -98,7 +98,7 @@ Python 项目常见的测试布局，以及"近"应该怎么算：
   - `COVE_VERIFY_CHANGED=sympy/core/numbers.py` → `python -m pytest -q sympy/core/tests/test_numbers.py`（修改前两个文件）；
   - `COVE_VERIFY_CHANGED=sympy/sets/handlers/functions.py` → 4 个 `test_functions.py`（都只和它共享 `sympy`，保持现状）。
 - `cargo test --release`、`cargo clippy --release --all-targets`：见 0041 的验证结果（同一次运行）。
-- 真实模型评测（待做）：`pub-swe-sympy-24562` 的 stderr 里 `[验证]` 行不再出现 `sympy/polys/numberfields/tests/test_numbers.py`。
+- 真实模型评测：`evals/results/20261125-164807-bedrock.json`（全量 29 题，含 sympy 1 次，`--keep`）和 `evals/results/20261125-165758-bedrock.json`（sympy 3 次，`--keep`），构建 `0.8.0+250359b4ace5`，Bedrock Opus（`model_fast=off`）。`pub-swe-sympy-24562` 共 4 次，4/4 通过；4 次的 `[验证]` 行都只有 `python -m py_compile sympy/core/numbers.py` 和 `python -m pytest -q sympy/core/tests/test_numbers.py`，没有再出现 `sympy/polys/numberfields/tests/test_numbers.py`。
 
 ## 遗留
 

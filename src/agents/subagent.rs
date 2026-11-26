@@ -24,14 +24,17 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    agents::check_slot::{CheckRun, CheckSlot},
     agents::explore::{self, ModelTier},
     agents::lifecycle::{AgentStore, Lifecycle},
     agents::regression::{Regression, RegressionEvidence},
     agents::worktree::Worktrees,
-    domain::{Error, Event, Progress, Provider, Result, ToolDefinition},
+    agents::writes::ItemScope,
+    domain::{Error, Event, Progress, Provider, Result, ToolDefinition, UserInput},
     engine::agent::{Agent, Ledger, Limits},
     engine::turn::TurnHook,
     safety::permission::{Authorizer, Effect},
+    session::overlay::OverlayStack,
     session::workspace::Workspace,
     session::{Accounting, Session, Store},
     tools::{ToolExecutor, ToolOutput},
@@ -51,6 +54,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "write",
     "edit",
     "shell",
+    "shell_task",
     "todo",
     "skill",
     "web_fetch",
@@ -308,6 +312,9 @@ pub struct ToolScope {
     pub progress: Arc<Progress>,
     pub authorizer: Arc<dyn Authorizer>,
     pub readonly: bool,
+    /// An overlay item's layers (0053): its file tools read through them and write only
+    /// into the top one; nothing reaches the disk or the checkpoint.
+    pub overlay: Option<Arc<OverlayStack>>,
 }
 
 /// Builds the file/shell/web/skill tools for a scope (assembled in `app.rs`).
@@ -580,6 +587,13 @@ pub struct ScopedTools {
     pub allowed: Vec<String>,
     pub regression: Option<Arc<Regression>>,
     pub claims: Option<(Arc<Claims>, String)>,
+    /// The declared writes of a plan item (0054): writes outside them and file-generating
+    /// commands are refused, files its shell commands change outside them recorded.
+    pub scope: Option<Arc<ItemScope>>,
+    /// The `check` tool of an overlay item while `overlay_check` is configured (0053).
+    pub check: Option<CheckRun>,
+    /// An overlay item: its shell commands only read, so they are not compared around.
+    pub overlay: bool,
     pub activity: Option<(Arc<ActivityBoard>, String)>,
     pub regression_passed: AtomicBool,
 }
@@ -605,6 +619,10 @@ impl ToolExecutor for AllowedTools {
 
     fn metered(&self, name: &str) -> bool {
         self.allowed.contains(&name) && self.inner.metered(name)
+    }
+
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.inner.jobs()
     }
 
     fn execute(
@@ -678,6 +696,51 @@ impl ScopedTools {
     }
 }
 
+impl ScopedTools {
+    /// Runs a call of a write-scoped plan item: records the file a file tool wrote, and
+    /// what a shell command changed (outside the item's writes: kept, but reported).
+    async fn scoped(
+        &self,
+        scope: &ItemScope,
+        name: String,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput> {
+        let before = if name == "shell" && !self.overlay {
+            // The run ends when it is dropped, on every way out of this call.
+            let tree = scope.tree(&cancel).await;
+            tree.map(|tree| (tree, scope.shell_run()))
+        } else {
+            None
+        };
+        let mut output = self
+            .base
+            .execute(name.clone(), input.clone(), cancel.clone())
+            .await?;
+        if !output.failed {
+            scope.wrote(&name, &input);
+        }
+        if output.refused
+            && let Some((_, run)) = &before
+        {
+            run.void();
+        }
+        if let Some((before, run)) = before
+            && !output.refused
+            && let Some(after) = scope.tree(&cancel).await
+        {
+            let outside = scope.shell_changed(&before, &after, &run);
+            if !outside.is_empty() {
+                output.content.push_str(&format!(
+                    "\n[writes] This command changed files outside this plan item's writes: {}. They were kept and are reported to the parent; do not change more files outside your writes.",
+                    outside.join(", ")
+                ));
+            }
+        }
+        Ok(output)
+    }
+}
+
 impl ToolExecutor for ScopedTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions: Vec<_> = self
@@ -689,11 +752,18 @@ impl ToolExecutor for ScopedTools {
         if self.regression.is_some() && self.allowed.iter().any(|tool| tool == "regression") {
             definitions.push(crate::agents::regression::definition());
         }
+        if let Some(check) = &self.check {
+            definitions.push(crate::agents::check_slot::definition(check.slot.command()));
+        }
         definitions
     }
 
     fn metered(&self, name: &str) -> bool {
         self.allowed.contains(&name.to_owned()) && self.base.metered(name)
+    }
+
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.base.jobs()
     }
 
     /// Reads claim no paths, so they keep the base tools' concurrency.
@@ -708,9 +778,25 @@ impl ToolExecutor for ScopedTools {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         Box::pin(async move {
+            if name == "check"
+                && let Some(check) = &self.check
+            {
+                return check.execute(cancel).await;
+            }
             if !self.allowed.contains(&name) {
                 return Ok(ToolOutput {
                     content: format!("{name} is not available to this sub-agent"),
+                    failed: true,
+                    ..Default::default()
+                });
+            }
+            if let Some(refusal) = self
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.refuse(&name, &input))
+            {
+                return Ok(ToolOutput {
+                    content: refusal,
                     failed: true,
                     ..Default::default()
                 });
@@ -736,7 +822,10 @@ impl ToolExecutor for ScopedTools {
                 }
                 return Ok(output);
             }
-            self.base.execute(name, input, cancel).await
+            match &self.scope {
+                Some(scope) => self.scoped(scope, name, input, cancel).await,
+                None => self.base.execute(name, input, cancel).await,
+            }
         })
     }
 }
@@ -953,6 +1042,11 @@ pub struct SubAgentSettings {
     pub catalog: Arc<dyn ModelCatalog>,
     /// `explore_model`: explore on the fast model (default) or the main one.
     pub explore_fast: bool,
+    /// `overlay_check`: the compile check of overlay items' shared check slot (0053).
+    pub overlay_check: Option<String>,
+    /// `mergiraf_path` (trusted config only), else `mergiraf` on PATH; `None`: no
+    /// structural merge.
+    pub mergiraf: Option<PathBuf>,
 }
 
 pub struct HubParts {
@@ -970,6 +1064,8 @@ pub struct HubParts {
     pub permission: crate::safety::permission::Mode,
     /// Whether a terminal can answer queued background approvals.
     pub interactive: bool,
+    /// The terminal, for questions such as the overlay plan confirmation (0053).
+    pub input: Option<Arc<dyn UserInput>>,
 }
 
 pub struct AgentHub {
@@ -993,6 +1089,13 @@ pub struct AgentHub {
     pub plan: crate::agents::plan::PlanState,
     pub board: crate::agents::collab::Board,
     pub background: crate::agents::background::BackgroundState,
+    /// The terminal; `None` without one (`-p`).
+    pub input: Option<Arc<dyn UserInput>>,
+    /// The shared check slot of overlay plans, when `overlay_check` is set.
+    pub check_slot: Option<Arc<CheckSlot>>,
+    /// Overlay directories kept for the current task (failed or conflicting items);
+    /// removed when it ends.
+    pub overlay_dirs: Mutex<Vec<PathBuf>>,
     /// Slots of read-only foreground agents running in parallel.
     readonly_slots: tokio::sync::Semaphore,
     seq: AtomicU64,
@@ -1015,12 +1118,21 @@ pub struct RunRequest {
     /// Worktree root and its journal, instead of the main tree.
     pub worktree: Option<(PathBuf, Arc<Workspace>)>,
     pub claims: Option<(Arc<Claims>, String)>,
+    /// The write constraint of a plan item that declared writes.
+    pub scope: Option<Arc<ItemScope>>,
+    /// The layers of an overlay plan item (0053).
+    pub overlay: Option<Arc<OverlayStack>>,
 }
 
 impl AgentHub {
     pub fn new(parts: HubParts) -> Result<Arc<Self>> {
         let records = AgentStore::open(parts.store.root(), &parts.root)?;
         let background = crate::agents::background::BackgroundState::default();
+        let check_slot = parts
+            .settings
+            .overlay_check
+            .clone()
+            .map(|command| Arc::new(CheckSlot::new(parts.store.root(), &parts.root, command)));
         let approvals = Arc::new(crate::agents::background::ApprovalQueue::new(
             parts.interactive,
             background.notify.clone(),
@@ -1049,6 +1161,9 @@ impl AgentHub {
             plan: Default::default(),
             board: Default::default(),
             background,
+            input: parts.input,
+            check_slot,
+            overlay_dirs: Mutex::default(),
             readonly_slots: tokio::sync::Semaphore::new(PARALLEL_READONLY),
             seq: AtomicU64::new(0),
         }))
@@ -1103,6 +1218,8 @@ impl AgentHub {
         progress: Arc<Progress>,
         authorizer: Arc<dyn Authorizer>,
         claims: Option<(Arc<Claims>, String)>,
+        scope: Option<Arc<ItemScope>>,
+        overlay: Option<Arc<OverlayStack>>,
         activity_id: &str,
     ) -> Result<Arc<ScopedTools>> {
         let base = (self.factory)(ToolScope {
@@ -1111,7 +1228,17 @@ impl AgentHub {
             progress: progress.clone(),
             authorizer: authorizer.clone(),
             readonly: kind.readonly,
+            overlay: overlay.clone(),
         })?;
+        let check = match (&self.check_slot, &overlay) {
+            (Some(slot), Some(stack)) if !kind.readonly => Some(CheckRun {
+                slot: slot.clone(),
+                stack: stack.clone(),
+                authorizer: authorizer.clone(),
+                progress: progress.clone(),
+            }),
+            _ => None,
+        };
         let regression = kind.tools.iter().any(|tool| tool == "regression").then(|| {
             Arc::new(Regression {
                 root: root.to_path_buf(),
@@ -1122,11 +1249,21 @@ impl AgentHub {
                 evidence: self.evidence.clone(),
             })
         });
+        // A type that may run commands may also check and stop its background ones.
+        let mut allowed = kind.tools.clone();
+        if allowed.iter().any(|tool| tool == "shell")
+            && !allowed.iter().any(|tool| tool == "shell_task")
+        {
+            allowed.push("shell_task".into());
+        }
         Ok(Arc::new(ScopedTools {
             base,
-            allowed: kind.tools.clone(),
+            allowed,
             regression,
             claims,
+            scope,
+            check,
+            overlay: overlay.is_some(),
             activity: Some((self.activity.clone(), activity_id.into())),
             regression_passed: AtomicBool::new(false),
         }))
@@ -1300,6 +1437,8 @@ impl AgentHub {
                     .clone()
                     .unwrap_or_else(|| self.authorizer.clone()),
                 request.claims.clone(),
+                request.scope.clone(),
+                request.overlay.clone(),
                 &request.id,
             )
             .and_then(|tools| {
@@ -1324,6 +1463,11 @@ impl AgentHub {
                 agent.run_detached_events(request.prompt.clone(), cancel, events),
             )
             .await;
+        // Its background shell commands end with it; the parent hears which (0050, 0051).
+        let stopped = match tools.jobs() {
+            Some(jobs) => jobs.close("stopped: the sub-agent ended").await,
+            None => Vec::new(),
+        };
         progress.attach(None);
         let _ = forward.await;
         outcome.model = served_by(&spent, &requested);
@@ -1354,6 +1498,12 @@ impl AgentHub {
         outcome.steps = spent.model_calls;
         outcome.spent = spent;
         outcome.output = text;
+        if !stopped.is_empty() {
+            outcome.output.push_str(&format!(
+                "\n[background commands stopped when this sub-agent ended: {}]",
+                stopped.join(", ")
+            ));
+        }
         if let Ok(report) = &result {
             outcome.tools_failed = report.tools_failed;
         }
@@ -1541,6 +1691,8 @@ impl WithSubAgent {
                     detached: false,
                     worktree,
                     claims: None,
+                    scope: None,
+                    overlay: None,
                 },
                 cancel,
             )
@@ -1637,10 +1789,18 @@ impl ToolExecutor for WithSubAgent {
             name: "execute_plan".into(),
             description: "Run the pending items of your latest todo list as sub-agents in dependency order (todo depends). \
                           parallel=true runs independent items concurrently (max_agents 1-8, default 4), never two writing the same file at once. \
-                          A failed item is retried once. Afterwards update the todo list from the per-item report."
+                          A failed item is retried once. Afterwards update the todo list from the per-item report. \
+                          Items with todo writes may change only those files: a parallel plan whose independent items share files is rejected before it starts, \
+                          writes outside them and installing/generating/formatting commands are refused, and each result lists the files written and anything outside. \
+                          isolation=\"overlay\" (every item must declare writes): each item works in a private layer and nothing reaches the main workspace until all items end; \
+                          items sharing a file run side by side when they name distinct `file::symbol`s, otherwise the later one is stacked on the earlier one (reported). \
+                          The layers are then merged into the workspace as one checkpoint (direct, line merge, verified anchor replay, structural merge); a conflicting item redoes \
+                          its part once on the merged content, and what still conflicts is left out and listed. Items cannot run builds, tests or file-writing commands \
+                          (a `check` tool compiles in a shared slot when configured): build, test and review once after the merge. The user confirms an overlay plan first."
                 .into(),
             schema: json!({"type":"object","properties":{
                 "parallel":{"type":"boolean"},
+                "isolation":{"enum":["main","overlay"],"description":"main (default): items change the main workspace directly; overlay: private layers merged at the end"},
                 "max_agents":{"type":"integer","minimum":1,"maximum":8},
                 "type":{"type":"string","description":"Agent type for every item (default general)"}
             },"additionalProperties":false}),
@@ -1655,6 +1815,10 @@ impl ToolExecutor for WithSubAgent {
 
     fn metered(&self, name: &str) -> bool {
         matches!(name, "agent" | "execute_plan" | "team_create") || self.inner.metered(name)
+    }
+
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.inner.jobs()
     }
 
     /// Foreground agents of read-only types run side by side; editing ones stay serial.

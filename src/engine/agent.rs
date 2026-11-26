@@ -1537,6 +1537,12 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<TaskReport> {
         session.validate()?;
+        // Output files of background shell commands go under the session (0050).
+        if let Some(jobs) = self.tools.jobs()
+            && !session.id.is_empty()
+        {
+            jobs.set_scope(&session.id);
+        }
         if session
             .hook_runs
             .iter()
@@ -1637,6 +1643,12 @@ impl Agent {
                 .await
         }
         .await;
+        // A task that ended without waiting for its commands moved to the background
+        // (cancelled, failed, stopped) leaves none running; their results come next task.
+        if let Some(jobs) = self.tools.jobs() {
+            jobs.stop_moved("stopped: the task ended before the command did")
+                .await;
+        }
         report.model_calls = u32::try_from(session.accounting.model_calls - before_calls)
             .map_err(|_| Error::Limit("模型调用计数溢出".into()))?;
         {
@@ -2101,6 +2113,9 @@ impl Agent {
                 report.stop = Some(stop);
                 return Ok(());
             }
+            // Background shell commands that ended report before the next call (0050).
+            self.deliver_jobs(session, persistence, &events, &cancel)
+                .await?;
             if self.output.mask(&mut session.messages).is_some() {
                 persistence.save(session)?;
             }
@@ -2298,6 +2313,19 @@ impl Agent {
             session.pending = pending;
             if session.pending.is_empty() {
                 persistence.save(session)?;
+                // Commands moved to the background at their timeout are part of this
+                // round: wait for them, then let the model go on with their results;
+                // the checks below must see what they changed (0050).
+                if let Some(jobs) = self.tools.jobs()
+                    && jobs.awaited()
+                {
+                    if let Some(text) = self.await_jobs(&jobs, &events, &cancel).await? {
+                        progress.user_input();
+                        session.messages.push(Message::steer(text));
+                        persistence.save(session)?;
+                    }
+                    continue;
+                }
                 // Hooks may spend through the ledger (sub-agents); drain it after.
                 if let Some(ledger) = &self.ledger {
                     ledger.start();
@@ -2522,6 +2550,93 @@ impl Agent {
                     .await;
             }
         }
+    }
+
+    /// Puts the results of background shell commands that ended into the history.
+    async fn deliver_jobs(
+        &self,
+        session: &mut Session,
+        persistence: &dyn SessionPersistence,
+        events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let Some(finished) = self.tools.jobs().and_then(|jobs| jobs.take_finished()) else {
+            return Ok(());
+        };
+        // Checks read a background result as they read a foreground one (evidence).
+        for (command, output) in &finished.results {
+            for hook in &self.turn_hooks {
+                hook.background_finished(command, output);
+            }
+        }
+        if let Some(text) = finished.notice {
+            session.messages.push(Message::notice(text));
+            persistence.save(session)?;
+        }
+        for line in finished.lines {
+            emit(events, cancel, Event::Notice(line)).await?;
+        }
+        Ok(())
+    }
+
+    /// Waits until no command moved to the background at its timeout runs any more;
+    /// `Some(text)` when the user typed something meanwhile (the commands go on).
+    /// Cancelling stops them.
+    async fn await_jobs(
+        &self,
+        jobs: &crate::tools::jobs::Jobs,
+        events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
+        let mut changed = jobs.watch();
+        let mut announced = false;
+        let result = loop {
+            let Some(status) = jobs.waiting_status() else {
+                break None;
+            };
+            if !announced {
+                announced = true;
+                emit(
+                    events,
+                    cancel,
+                    Event::Notice(format!(
+                        "[后台] 等待转到后台的命令结束后再收尾（{} 个）；连按两次 Esc 停止等待并取消任务，输入文字可以打断等待",
+                        jobs.running()
+                    )),
+                )
+                .await?;
+            }
+            emit(events, cancel, Event::Activity(status)).await?;
+            let steer = async {
+                if self.steer.is_empty() {
+                    std::future::pending::<()>().await;
+                } else {
+                    steer_waiting(&self.steer).await;
+                }
+            };
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    jobs.stop_moved("stopped: the task was cancelled while waiting for it")
+                        .await;
+                    return Err(Error::Cancelled);
+                }
+                () = steer => {}
+                _ = changed.changed() => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            // Text typed meanwhile is due now: the reply is done (`!` wakes at once).
+            let texts: Vec<String> = self
+                .steer
+                .iter()
+                .filter_map(|source| source.take())
+                .collect();
+            if !texts.is_empty() {
+                break Some(texts.join("\n"));
+            }
+        };
+        emit(events, cancel, Event::Activity("思考中".into())).await?;
+        Ok(result)
     }
 
     /// Ends a stalled run: the closing summary, then the stop in the report.

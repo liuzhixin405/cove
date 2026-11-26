@@ -186,6 +186,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "todo",
     "ask_user",
     "plan_mode",
+    // Lists, reads or stops cove's own background commands; changes no file.
+    "shell_task",
 ];
 
 impl Evidence {
@@ -368,6 +370,11 @@ impl TurnHook for EvidenceHook {
         self.0.observe(name, input, output);
         None
     }
+
+    fn background_finished(&self, command: &str, output: &ToolOutput) {
+        self.0
+            .observe("shell", &serde_json::json!({ "command": command }), output);
+    }
 }
 
 /// What `app` needs from this area, built from the settings in one place.
@@ -444,6 +451,7 @@ impl Assembly {
                 parts.workspace.clone(),
                 parts.authorizer.clone(),
             )
+            .with_idle(settings.verify_idle)
             .with_progress(parts.progress.clone())
             .with_evidence(evidence.clone())
             .with_ledger(settings.data_dir.join("verify_ledger.jsonl"));
@@ -656,6 +664,36 @@ mod tests {
         ));
         assert!(!verification_preapproved(Mode::Plan, false, "cargo check"));
         assert!(verification_preapproved(Mode::Default, true, "cargo fmt"));
+    }
+
+    #[test]
+    fn a_background_end_is_evidence_and_shell_task_changes_nothing() {
+        let evidence = std::sync::Arc::new(Evidence::default());
+        let hook = EvidenceHook(evidence.clone());
+        let ok = "exit_code=Some(0) timed_out=false truncated=false encoding_warning=false";
+        // Moved to the background: the call itself proves nothing yet.
+        hook.tool_note(
+            "shell",
+            &serde_json::json!({"command":"cargo test"}),
+            &out("[background #1] Still running after 120s", false),
+        );
+        assert!(!evidence.passed("cargo test"));
+        hook.background_finished("cargo test", &out(ok, false));
+        assert!(evidence.passed("cargo test"));
+        // Looking at it or stopping another one neither invalidates nor counts as work.
+        let fresh = Evidence::default();
+        for action in ["list", "output", "stop"] {
+            let input = serde_json::json!({"action": action, "id": 2});
+            hook.tool_note("shell_task", &input, &out("#2 stopped", false));
+            fresh.observe("shell_task", &input, &out("#2 stopped", false));
+        }
+        assert!(evidence.passed("cargo test"));
+        assert!(!fresh.did_work());
+        hook.background_finished(
+            "cargo test",
+            &out("exit_code=Some(101) timed_out=false", true),
+        );
+        assert!(!evidence.passed("cargo test"));
     }
 
     #[test]

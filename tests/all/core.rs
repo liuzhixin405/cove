@@ -186,6 +186,93 @@ async fn search_respects_ignore_and_rejects_invalid_arguments() {
     );
 }
 
+#[tokio::test]
+async fn search_can_include_ignored_files_but_never_git_or_protected_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join(".gitignore"),
+        "ignored.txt\nnode_modules/\n*.log\n",
+    )
+    .unwrap();
+    for (path, text) in [
+        ("visible.txt", "needle\n"),
+        ("ignored.txt", "needle\n"),
+        ("node_modules/pkg/index.js", "needle\n"),
+        ("node_modules/pkg/debug.log", "needle\n"),
+        (".git/info/notes", "needle\n"),
+        (".cove/config.json", "needle\n"),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    cove::safety::protected::protect(&root.join(".cove"));
+    let mut backends = vec![false];
+    if which::which("rg").is_ok() {
+        backends.push(true);
+    }
+    for ripgrep in backends {
+        let tools = tools(root, Mode::Readonly).with_ripgrep(ripgrep);
+        let run = |name: &str, input: serde_json::Value| {
+            let call = tools.execute(name.into(), input, CancellationToken::new());
+            async move {
+                let out = call.await.unwrap();
+                assert!(!out.failed, "{}", out.content);
+                out.content
+            }
+        };
+        let never = |out: &str| {
+            assert!(!out.contains(".git/"), "ripgrep={ripgrep}: {out}");
+            assert!(!out.contains(".cove/"), "ripgrep={ripgrep}: {out}");
+        };
+        for (name, input) in [
+            ("glob", json!({"pattern":"*","include_ignored":true})),
+            ("grep", json!({"pattern":"needle","include_ignored":true})),
+        ] {
+            let out = run(name, input).await;
+            for path in [
+                "visible.txt",
+                "ignored.txt",
+                "node_modules/pkg/index.js",
+                "node_modules/pkg/debug.log",
+            ] {
+                assert!(out.contains(path), "ripgrep={ripgrep} {name}: {out}");
+            }
+            never(&out);
+        }
+        // By default ignored files stay out, and an empty result names the parameter.
+        let out = run("grep", json!({"pattern":"needle"})).await;
+        assert!(
+            !out.contains("node_modules") && !out.contains("ignored.txt"),
+            "{out}"
+        );
+        never(&out);
+        let hint =
+            "(files excluded by .gitignore were skipped; include_ignored=true searches them)";
+        let out = run("glob", json!({"pattern":"*.js"})).await;
+        assert_eq!(out, format!("No files found {hint}"));
+        let out = run("grep", json!({"pattern":"needle","include":"*.js"})).await;
+        assert_eq!(out, format!("No matches found {hint}"), "ripgrep={ripgrep}");
+        // An explicit path below an ignored directory is searched; rules matching files
+        // inside it (*.log) still apply unless include_ignored is set.
+        let out = run(
+            "grep",
+            json!({"pattern":"needle","path":"node_modules/pkg"}),
+        )
+        .await;
+        assert_eq!(
+            out, "node_modules/pkg/index.js:1:needle",
+            "ripgrep={ripgrep}"
+        );
+        let out = run("glob", json!({"pattern":"*","path":"node_modules/pkg"})).await;
+        assert_eq!(out, "node_modules/pkg/index.js");
+        let input = json!({"pattern":"needle","path":"node_modules/pkg","include_ignored":true});
+        let out = run("grep", input).await;
+        assert!(out.contains("node_modules/pkg/debug.log:1:needle"), "{out}");
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn alternate_data_streams_are_rejected() {
@@ -1443,4 +1530,257 @@ async fn a_stalled_task_asks_and_each_choice_does_what_it_says() {
             .any(|message| message.origin == cove::domain::Origin::Steer
                 && format!("{:?}", message.blocks).contains("look elsewhere"))
     );
+}
+
+/// A shell command for the platform's routed shell: PowerShell syntax on Windows.
+fn platform(windows: &str, unix: &str) -> String {
+    if cfg!(windows) { windows } else { unix }.to_owned()
+}
+
+fn shell_call(id: &str, input: serde_json::Value) -> ModelResponse {
+    response(vec![Block::ToolUse {
+        id: id.into(),
+        name: "shell".into(),
+        input,
+        extra: None,
+    }])
+}
+
+fn request_text(request: &ModelRequest) -> String {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.clone()),
+            Block::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Background ends the turn hooks heard: command and whether it failed.
+#[derive(Default)]
+struct Heard(Mutex<Vec<(String, bool)>>);
+
+impl cove::engine::turn::TurnHook for Heard {
+    fn background_finished(&self, command: &str, output: &cove::tools::ToolOutput) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((command.to_owned(), output.failed));
+    }
+}
+
+/// Records whether the command's last write had happened when the checks ran.
+struct SeesFile(std::path::PathBuf, Mutex<Vec<bool>>);
+
+impl cove::safety::verify::Verifier for SeesFile {
+    fn verify(
+        &self,
+        _: CancellationToken,
+    ) -> BoxFuture<'_, Result<Option<cove::safety::verify::Verification>>> {
+        self.1.lock().unwrap().push(self.0.exists());
+        Box::pin(async { Ok(None) })
+    }
+}
+
+#[tokio::test]
+async fn a_command_moved_to_the_background_is_awaited_and_its_result_goes_to_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = platform(
+        "Write-Output first; Start-Sleep -Seconds 3; Write-Output second; Set-Content -LiteralPath done.txt -Value x",
+        "echo first; sleep 3; echo second; echo x > done.txt",
+    );
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            shell_call("call-1", json!({"command": command, "timeout_seconds": 1})),
+            // Ends the reply while the command still runs: the task waits for it.
+            response(vec![Block::Text("waiting for it".into())]),
+            response(vec![Block::Text("it printed second".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let progress = Arc::new(cove::domain::Progress::default());
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Bypass).with_progress(progress.clone())),
+        limits(),
+    )
+    .unwrap();
+    let checks = Arc::new(SeesFile(
+        dir.path().join("done.txt"),
+        Mutex::new(Vec::new()),
+    ));
+    let heard = Arc::new(Heard::default());
+    let agent = agent
+        .with_verifier(Some(checks.clone()))
+        .with_turn_hook(heard.clone());
+    let (tx, mut rx) = mpsc::channel(64);
+    progress.attach(Some(tx.clone()));
+    let drain = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                Event::Notice(text) | Event::Activity(text) => seen.push(text),
+                _ => {}
+            }
+        }
+        seen
+    });
+    let report = agent
+        .run("count it".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    progress.attach(None);
+    let seen = drain.await.unwrap();
+    assert_eq!(report.model_calls, 3);
+    // The checks ran once, at the end, after the command had finished.
+    assert_eq!(*checks.1.lock().unwrap(), vec![true]);
+    // The checks' evidence hears the end as it hears a foreground result.
+    assert_eq!(*heard.0.lock().unwrap(), vec![(command.clone(), false)]);
+    let requests = provider.requests.lock().unwrap();
+    let moved = request_text(&requests[1]);
+    assert!(
+        moved.contains("[background #1] Still running after 1s"),
+        "{moved}"
+    );
+    let delivered = request_text(&requests[2]);
+    assert!(
+        delivered.contains("[background command #1 finished"),
+        "{delivered}"
+    );
+    assert!(delivered.contains("result: exit code 0"), "{delivered}");
+    assert!(delivered.contains("second"), "{delivered}");
+    assert!(
+        seen.iter()
+            .any(|text| text.starts_with("命令运行超过 1s，已转到后台继续（#1）")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|text| text.starts_with("等待后台命令 · ")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|text| text.starts_with("[后台] #1 已结束：退出码 0")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_the_wait_for_a_background_command_kills_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = platform(
+        "Start-Sleep -Seconds 5; Set-Content -LiteralPath late.txt -Value x",
+        "sleep 5; echo x > late.txt",
+    );
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            shell_call("call-1", json!({"command": command, "timeout_seconds": 1})),
+            response(vec![Block::Text("waiting".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(
+        provider,
+        Arc::new(tools(dir.path(), Mode::Bypass)),
+        limits(),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::channel(64);
+    let stop = cancel.clone();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(&event, Event::Activity(text) if text.starts_with("等待后台命令")) {
+                stop.cancel();
+            }
+        }
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        agent.run("wait".into(), tx, cancel),
+    )
+    .await
+    .expect("the wait was not cancelled");
+    let _ = drain.await;
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        !dir.path().join("late.txt").exists(),
+        "the background command survived the cancel"
+    );
+}
+
+#[tokio::test]
+async fn a_background_start_is_not_awaited_and_shell_task_stops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = platform(
+        "Write-Output listening; Start-Sleep -Seconds 30",
+        "echo listening; sleep 30",
+    );
+    let jobs = Arc::new(cove::tools::jobs::Jobs::new(Some(dir.path().join("logs"))));
+    let tools = tools(dir.path(), Mode::Bypass).with_jobs(jobs.clone());
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            shell_call(
+                "call-1",
+                json!({"command": command, "run_in_background": true}),
+            ),
+            response(vec![Block::Text("server started".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(provider.clone(), Arc::new(tools.clone()), limits()).unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let started = std::time::Instant::now();
+    let report = agent
+        .run("start the server".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(report.model_calls, 2);
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let result = request_text(&provider.requests.lock().unwrap()[1]);
+    assert!(
+        result.contains("[background #1] Started in the background"),
+        "{result}"
+    );
+    // Still running after the task; `shell_task` sees and stops it.
+    assert_eq!(jobs.running(), 1);
+    let list = tools
+        .execute(
+            "shell_task".into(),
+            json!({"action":"list"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        list.content.contains("#1 [run_in_background] running for"),
+        "{}",
+        list.content
+    );
+    let stopped = tools
+        .execute(
+            "shell_task".into(),
+            json!({"action":"stop","id":1}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!stopped.failed && stopped.content.contains("stopped with shell_task stop"));
+    assert_eq!(jobs.running(), 0);
+    let missing = tools
+        .execute(
+            "shell_task".into(),
+            json!({"action":"output","id":7}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(missing.failed);
 }

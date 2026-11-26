@@ -40,6 +40,10 @@ pub trait TurnHook: Send + Sync {
         None
     }
 
+    /// A shell command that went on in the background has ended (docs/optimizations/0050);
+    /// `output` reads like the result of a `shell` call that ran it to the end.
+    fn background_finished(&self, _command: &str, _output: &ToolOutput) {}
+
     /// Called when the model ends without tool calls. `Some(message)` sends `message`
     /// back as a user notice and continues the task (empty reply, unfinished todo,
     /// done check). First `Some` wins. Hooks bound their own repeats.

@@ -1404,6 +1404,10 @@ impl ToolExecutor for Snapshotting {
         self.inner.metered(name)
     }
 
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.inner.jobs()
+    }
+
     fn concurrent(&self, name: &str, input: &Value) -> bool {
         self.inner.concurrent(name, input)
     }
@@ -1689,6 +1693,9 @@ mod tests {
         fn metered(&self, _: &str) -> bool {
             false
         }
+        fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+            None
+        }
         fn concurrent(&self, _: &str, _: &Value) -> bool {
             false
         }
@@ -1760,6 +1767,9 @@ mod tests {
         }
         fn metered(&self, _: &str) -> bool {
             false
+        }
+        fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+            None
         }
         fn concurrent(&self, _: &str, _: &Value) -> bool {
             false

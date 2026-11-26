@@ -5,7 +5,16 @@
 //! dependencies with `id`/`depends` or the `depends:todo-1,todo-2 ` content
 //! prefix. Ready items run as soon as their dependencies are done (a DAG schedule, not BFS
 //! levels), up to `max_agents` at once; a failed item is retried once and its dependents
-//! are skipped. Concurrent items never write the same file at once (`Claims`).
+//! are skipped. Concurrent items never write the same file at once (`Claims`), except in
+//! overlay plans: there each item writes its own layer and the merge settles overlaps.
+//!
+//! An item may declare `writes` (and `estimate_minutes`; 0054). A parallel plan whose
+//! independent items declare overlapping writes is rejected before anything runs, and a
+//! declaring item's tools keep it to its writes (`agents::writes::ItemScope`); its result
+//! lists the files it wrote and anything outside its writes.
+//!
+//! `isolation: "overlay"` (0053, `agents::overlay_plan`) runs every item in a private
+//! overlay layer and merges the layers into the workspace after all items end.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -18,8 +27,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agents::subagent::{AgentHub, AgentType, Claims, Exit, RunOutcome, RunRequest},
+    agents::{
+        subagent::{AgentHub, AgentType, Claims, Exit, RunOutcome, RunRequest},
+        writes::{ItemScope, PlanScopes, Record, Unit, WriteSet},
+    },
     domain::{Block, Error, Message, Result},
+    session::overlay::OverlayStack,
     tools::ToolOutput,
 };
 
@@ -77,6 +90,51 @@ pub struct PlanItem {
     pub title: String,
     pub status: String,
     pub depends: Vec<String>,
+    /// Declared write set (`writes` or the `writes:` content prefix), as written; empty
+    /// when none was declared. [`PlanItem::write_set`] compiles it (0054).
+    pub writes: Vec<String>,
+    /// The model's estimate for the item (`estimate_minutes`).
+    pub estimate_minutes: Option<u32>,
+}
+
+impl PlanItem {
+    /// The compiled write set; `None` when the item declared none.
+    pub fn write_set(&self) -> Result<Option<WriteSet>> {
+        if self.writes.is_empty() {
+            return Ok(None);
+        }
+        WriteSet::parse(&self.writes)
+            .map(Some)
+            .map_err(|err| Error::Tool(format!("{}: {err}", self.id)))
+    }
+
+    /// Pending or in progress.
+    pub fn open(&self) -> bool {
+        matches!(self.status.as_str(), "pending" | "in_progress")
+    }
+}
+
+/// Moves a leading `writes:a.rs,b.rs ` content prefix (no space after the colon) into
+/// `writes`; returns the rest of the content.
+pub fn strip_writes_prefix<'a>(content: &'a str, writes: &mut Vec<String>) -> &'a str {
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("writes:")
+        .filter(|rest| rest.chars().next().is_some_and(|c| !c.is_whitespace()))
+    else {
+        return content;
+    };
+    let (list, remainder) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    for entry in list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if !writes.iter().any(|known| known == entry) {
+            writes.push(entry.to_owned());
+        }
+    }
+    remainder.trim_start()
 }
 
 fn valid_id(id: &str) -> bool {
@@ -135,6 +193,19 @@ pub fn parse(input: &Value) -> Result<Vec<PlanItem>> {
                     .collect()
             })
             .unwrap_or_default();
+        let mut writes: Vec<String> = todo
+            .get("writes")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(|entry| entry.trim().to_owned())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `writes:` may come before or after the `depends:` prefix.
+        let content = strip_writes_prefix(&content, &mut writes).to_owned();
         let mut title = content.clone();
         if let Some(found) = prefix.captures(&content) {
             let whole = found.get(0).map_or(0, |m| m.end());
@@ -151,6 +222,7 @@ pub fn parse(input: &Value) -> Result<Vec<PlanItem>> {
                 title = content[whole..].trim().to_owned();
             }
         }
+        title = strip_writes_prefix(&title, &mut writes).to_owned();
         if title.is_empty() {
             title = content.clone();
         }
@@ -165,6 +237,10 @@ pub fn parse(input: &Value) -> Result<Vec<PlanItem>> {
                 .unwrap_or("pending")
                 .to_owned(),
             depends,
+            writes,
+            estimate_minutes: todo
+                .get("estimate_minutes")
+                .and_then(crate::engine::estimate::minutes),
         });
     }
     Ok(items)
@@ -178,7 +254,32 @@ pub struct PlanTask {
     pub prompt: String,
     pub depends: Vec<String>,
     pub agent_type: AgentType,
+    /// The only files the item may write; `None` leaves it unconstrained (0054).
+    pub writes: Option<WriteSet>,
+    /// The layers the item works in (overlay plans, 0053); `None`: the main workspace.
+    pub overlay: Option<Arc<OverlayStack>>,
+    /// Runs just before the item starts (its dependencies done); an `Err` keeps it from
+    /// running.
+    pub before_start: Option<BeforeStart>,
 }
+
+/// Why a [`PlanTask::before_start`] hook kept its item from running.
+#[derive(Debug)]
+pub enum NotStarted {
+    /// The plan is being cancelled: the item counts as cancelled.
+    Cancelled,
+    /// The item is skipped for this reason.
+    Skipped(String),
+}
+
+/// See [`PlanTask::before_start`].
+pub type BeforeStart = Arc<
+    dyn Fn(
+            CancellationToken,
+        ) -> futures_util::future::BoxFuture<'static, std::result::Result<(), NotStarted>>
+        + Send
+        + Sync,
+>;
 
 /// Checks dependencies (inside the plan, or already completed) and cycles.
 pub fn validate(items: &[PlanItem], done: &dyn Fn(&PlanItem) -> bool) -> Result<Vec<PlanItem>> {
@@ -273,6 +374,8 @@ enum NodeState {
 
 struct Node {
     task: PlanTask,
+    /// The write constraint of an item that declared writes.
+    scope: Option<Arc<ItemScope>>,
     state: NodeState,
     attempts: u32,
     output: String,
@@ -286,6 +389,11 @@ pub struct PlanReport {
     pub all_done: bool,
     pub done: Vec<String>,
     pub fatal: Option<Error>,
+    /// What each write-scoped item did, by id.
+    pub records: HashMap<String, Record>,
+    /// `fatal` stopped an overlay plan after its items ran (before or while merging):
+    /// `text` says what reached the workspace, so it must reach the model even then.
+    pub partial: bool,
 }
 
 /// Runs `tasks` in dependency order with at most `concurrency` at once.
@@ -298,9 +406,17 @@ pub async fn run_tasks(
 ) -> PlanReport {
     let concurrency = concurrency.clamp(1, 8);
     let claims = (concurrency > 1).then(|| Arc::new(Claims::default()));
+    let scopes = tasks.iter().any(|task| task.writes.is_some()).then(|| {
+        let unscoped = concurrency > 1 && tasks.iter().any(|task| task.writes.is_none());
+        PlanScopes::new(&hub.root).with_unscoped_parallel(unscoped)
+    });
     let mut nodes: Vec<Node> = tasks
         .into_iter()
         .map(|task| Node {
+            scope: match (&scopes, &task.writes) {
+                (Some(scopes), Some(writes)) => Some(scopes.item(&task.id, writes.clone())),
+                _ => None,
+            },
             task,
             state: NodeState::Pending,
             attempts: 0,
@@ -351,6 +467,8 @@ pub async fn run_tasks(
                 node.state = NodeState::Cancelled;
             }
         }
+        // A hook skipping an item can leave its dependents to skip on the next round.
+        let mut hook_skipped = false;
         while running.len() < concurrency && !cancel.is_cancelled() && fatal.is_none() {
             let ready = nodes.iter().position(|node| {
                 node.state == NodeState::Pending
@@ -361,6 +479,16 @@ pub async fn run_tasks(
                     })
             });
             let Some(position) = ready else { break };
+            if let Some(hook) = nodes[position].task.before_start.clone()
+                && let Err(why) = hook(cancel.clone()).await
+            {
+                nodes[position].state = match why {
+                    NotStarted::Cancelled => NodeState::Cancelled,
+                    NotStarted::Skipped(reason) => NodeState::Skipped(reason),
+                };
+                hook_skipped = true;
+                continue;
+            }
             nodes[position].state = NodeState::Running;
             let task = nodes[position].task.clone();
             let mut prompt = format!(
@@ -374,6 +502,29 @@ pub async fn run_tasks(
                         crate::text::short(&nodes[other].output, 2000)
                     ));
                 }
+            }
+            if task.overlay.is_some() {
+                prompt.push_str(
+                    "\n\n[overlay] Your file changes go into a private layer: read, grep, glob and repo_map show them, \
+                     but the main workspace stays unchanged until every item has finished and cove merges the layers. \
+                     shell runs only read-only commands, in the main workspace, without your changes: no builds, tests, \
+                     generators, formatters or redirects into files (the whole build, tests and review run once after the merge). \
+                     Prefer edit over rewriting whole files, so your changes can be replayed onto the others'. \
+                     End your report with the files you changed.",
+                );
+                if hub.check_slot.is_some() {
+                    prompt.push_str(
+                        " The check tool compiles the project with your changes in a shared slot (one check at a time); use it once your part is in place.",
+                    );
+                }
+            }
+            if let Some(writes) = &task.writes {
+                prompt.push_str(&format!(
+                    "\n\n[writes] This item may change only: {}. A `::symbol` names the part of the file to change. \
+                     cove refuses write/edit outside these files, and commands that install packages, generate code, migrate a database or format/autofix files \
+                     (those run after all items finish). If something outside them needs changing, stop and say why in your report.",
+                    writes.summary(32)
+                ));
             }
             let node = &mut nodes[position];
             for message in hub.inbox.take(&node.task.id) {
@@ -396,13 +547,20 @@ pub async fn run_tasks(
                 authorizer: None,
                 detached: false,
                 worktree: None,
+                // Overlay items write private layers: no claims, the merge handles overlaps.
                 claims: claims
                     .as_ref()
+                    .filter(|_| node.task.overlay.is_none())
                     .map(|claims| (claims.clone(), node.task.id.clone())),
+                scope: node.scope.clone(),
+                overlay: node.task.overlay.clone(),
             };
             let hub = hub.clone();
             let cancel = cancel.clone();
             running.spawn(async move { (position, hub.run(request, cancel).await) });
+        }
+        if running.is_empty() && hook_skipped {
+            continue;
         }
         let Some(joined) = running.join_next().await else {
             break;
@@ -418,6 +576,15 @@ pub async fn run_tasks(
             claims.release(&outcome.id);
         }
         let node = &mut nodes[position];
+        if let Some(stack) = &node.task.overlay {
+            hub.activity.step(
+                &node.task.id,
+                &format!(
+                    "overlay layer: {} files changed",
+                    stack.changed_paths().len()
+                ),
+            );
+        }
         node.steps += outcome.steps;
         node.exit = Some(outcome.exit.clone());
         node.output = outcome.output.clone();
@@ -442,8 +609,22 @@ pub async fn run_tasks(
         if outcome.tools_failed > 0 && outcome.exit == Exit::Completed {
             node.error = format!("{} tool calls failed", outcome.tools_failed);
         }
+        // Refused out-of-scope steps would be refused again: the plan needs changing.
+        let refused = node
+            .scope
+            .as_ref()
+            .map(|scope| scope.record())
+            .filter(|record| !record.refused.is_empty() || !record.commands.is_empty());
+        if let Some(record) = &refused {
+            node.error = format!(
+                "{}; refused outside its writes: {}",
+                node.error,
+                record.outside_text()
+            );
+        }
         // A capped run would redo the same work and hit the same cap; keep its result.
         let retry = node.attempts < 2
+            && refused.is_none()
             && !matches!(
                 outcome.exit,
                 Exit::MaxIterations | Exit::Stalled | Exit::Interrupted
@@ -458,6 +639,7 @@ pub async fn run_tasks(
     let mut text = format!("{label} executed (up to {concurrency} at once):\n");
     let mut counts: [usize; 4] = [0; 4];
     let mut done = Vec::new();
+    let mut outside = Vec::new();
     for node in &nodes {
         let (mark, status) = match &node.state {
             NodeState::Done => {
@@ -498,16 +680,55 @@ pub async fn run_tasks(
                 crate::text::short(&node.output, 1500).replace('\n', "\n    ")
             ));
         }
+        if let Some(scope) = &node.scope {
+            let record = scope.record();
+            let written = if record.written.is_empty() {
+                "none".to_owned()
+            } else {
+                record
+                    .written
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let beyond = if record.outside() {
+                record.outside_text()
+            } else {
+                "none".to_owned()
+            };
+            text.push_str(&format!(
+                "    written: {written}\n    outside writes: {beyond}\n"
+            ));
+            if record.outside() {
+                outside.push(format!("{}: {beyond}", node.task.id));
+            }
+        }
     }
     text.push_str(&format!(
         "Summary: {} done, {} failed, {} skipped, {} cancelled.",
         counts[0], counts[1], counts[2], counts[3]
     ));
+    if scopes.is_some() {
+        if outside.is_empty() {
+            text.push_str("\nOutside writes: none.");
+        } else {
+            text.push_str(&format!(
+                "\nOutside writes (check them before going on; files changed by shell were kept):\n  {}",
+                outside.join("\n  ")
+            ));
+        }
+    }
     PlanReport {
         all_done: counts[0] == nodes.len(),
         text,
         done,
         fatal,
+        records: nodes
+            .iter()
+            .filter_map(|node| Some((node.task.id.clone(), node.scope.as_ref()?.record())))
+            .collect(),
+        partial: false,
     }
 }
 
@@ -520,6 +741,59 @@ struct ExecuteArgs {
     max_agents: Option<u64>,
     #[serde(default, alias = "agent_type")]
     r#type: Option<String>,
+    /// `main` (default) or `overlay` (0053).
+    #[serde(default)]
+    isolation: Option<String>,
+}
+
+/// Why the plan cannot run in parallel: independent items whose declared writes share
+/// files (globs are compared against the existing files of the workspace).
+async fn overlap_rejection(
+    hub: &Arc<AgentHub>,
+    pending: &[PlanItem],
+    writes: &[Option<WriteSet>],
+) -> Option<String> {
+    if writes.iter().all(Option::is_none) {
+        return None;
+    }
+    let root = hub.root.clone();
+    let owned: Vec<(String, Vec<String>, Option<WriteSet>)> = pending
+        .iter()
+        .zip(writes)
+        .map(|(item, writes)| (item.id.clone(), item.depends.clone(), writes.clone()))
+        .collect();
+    let found = tokio::task::spawn_blocking(move || {
+        let units: Vec<Unit> = owned
+            .iter()
+            .map(|(id, depends, writes)| Unit {
+                id,
+                depends,
+                writes: writes.as_ref(),
+            })
+            .collect();
+        crate::agents::writes::overlaps(&units, &root)
+    })
+    .await
+    .unwrap_or_default();
+    if found.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = found
+        .iter()
+        .map(|overlap| {
+            format!(
+                "  {} and {} both write {}",
+                overlap.a,
+                overlap.b,
+                overlap.files.join(", ")
+            )
+        })
+        .collect();
+    Some(format!(
+        "plan rejected before any item ran: items that may run at the same time declare overlapping writes:\n{}\n\
+         Add depends between them (the later one builds on the earlier) or merge them into one item, then call todo and execute_plan again.",
+        lines.join("\n")
+    ))
 }
 
 pub async fn execute(
@@ -578,23 +852,108 @@ pub async fn execute(
         .iter()
         .map(|item| (item.id.clone(), item.title.clone()))
         .collect();
+    let mut writes = Vec::with_capacity(pending.len());
+    for item in &pending {
+        match item.write_set() {
+            Ok(set) => writes.push(set),
+            Err(err) => return failed(err.to_string()),
+        }
+    }
+    let concurrency = if args.parallel {
+        args.max_agents.unwrap_or(4) as usize
+    } else {
+        1
+    };
+    let overlay = match args.isolation.as_deref().map(str::trim) {
+        None | Some("main") => false,
+        Some("overlay") => true,
+        Some(other) => {
+            return failed(format!(
+                "isolation must be \"main\" or \"overlay\", not {other:?}"
+            ));
+        }
+    };
+    // Why an overlay plan ran in the main workspace instead.
+    let mut note = None;
+    if overlay {
+        let missing: Vec<&str> = pending
+            .iter()
+            .zip(&writes)
+            .filter(|(_, writes)| writes.is_none())
+            .map(|(item, _)| item.id.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return failed(format!(
+                "isolation=\"overlay\" needs writes on every item (the files, or file::symbol, it changes); missing on: {}. \
+                 Declare them with todo (writes, or the writes: content prefix) and call execute_plan again, or use isolation=\"main\".",
+                missing.join(", ")
+            ));
+        }
+        let declared: Vec<WriteSet> = writes.iter().flatten().cloned().collect();
+        let prepared =
+            crate::agents::overlay_plan::prepare(&hub.root, pending.clone(), declared).await;
+        match crate::agents::overlay_plan::decide(hub, &prepared, concurrency, cancel.clone())
+            .await?
+        {
+            crate::agents::overlay_plan::Decision::Run => {
+                let report = crate::agents::overlay_plan::execute(
+                    hub,
+                    prepared,
+                    kind,
+                    concurrency,
+                    &format!("plan {run}"),
+                    cancel,
+                )
+                .await;
+                crate::engine::estimate::record_plan(hub, &items, &report.done, concurrency > 1)
+                    .await;
+                return finish(hub, &titles, report, None);
+            }
+            crate::agents::overlay_plan::Decision::Main(why) => note = Some(why),
+            crate::agents::overlay_plan::Decision::Cancel => {
+                return failed(
+                    "the user cancelled the overlay plan; nothing ran. Ask what to change, or continue without execute_plan."
+                        .into(),
+                );
+            }
+        }
+    }
+    // Items that may run at the same time must not share files (one at a time never do).
+    if concurrency > 1
+        && let Some(rejection) = overlap_rejection(hub, &pending, &writes).await
+    {
+        return failed(match &note {
+            Some(note) => format!("{rejection}\n({note})"),
+            None => rejection,
+        });
+    }
     let tasks = pending
         .into_iter()
-        .map(|item| PlanTask {
+        .zip(writes)
+        .map(|(item, writes)| PlanTask {
             prompt: "Complete this item fully within the plan's scope; other items may run at the same time, so touch only what this item needs."
                 .into(),
             id: item.id,
             title: item.title,
             depends: item.depends,
             agent_type: kind.clone(),
+            writes,
+            overlay: None,
+            before_start: None,
         })
         .collect();
-    let concurrency = if args.parallel {
-        args.max_agents.unwrap_or(4) as usize
-    } else {
-        1
-    };
     let report = run_tasks(hub, &format!("plan {run}"), tasks, concurrency, cancel).await;
+    crate::engine::estimate::record_plan(hub, &items, &report.done, concurrency > 1).await;
+    finish(hub, &titles, report, note)
+}
+
+/// Records the done items and turns the report into the tool result.
+fn finish(
+    hub: &Arc<AgentHub>,
+    titles: &HashMap<String, String>,
+    report: PlanReport,
+    note: Option<String>,
+) -> Result<ToolOutput> {
     if let Ok(mut inner) = hub.plan.inner.lock() {
         for id in &report.done {
             if let Some(title) = titles.get(id) {
@@ -603,11 +962,25 @@ pub async fn execute(
         }
     }
     if let Some(err) = report.fatal {
-        return Err(err);
+        if !report.partial {
+            return Err(err);
+        }
+        // The report says what reached the workspace and what did not. Cancelled: the
+        // result is recorded and the task still ends as cancelled.
+        let text = report.text;
+        return match err {
+            Error::Uncertain(why) => Err(Error::Uncertain(format!("{why}\n{text}"))),
+            _ => Ok(ToolOutput {
+                content: text,
+                failed: true,
+                ..Default::default()
+            }),
+        };
     }
+    let note = note.map_or(String::new(), |note| format!("Note: {note}.\n"));
     Ok(ToolOutput {
         content: format!(
-            "{}\nUpdate the todo list: mark done items completed; failed or skipped items stay pending.",
+            "{note}{}\nUpdate the todo list: mark done items completed; failed or skipped items stay pending.",
             report.text
         ),
         failed: !report.all_done,
@@ -640,6 +1013,36 @@ mod tests {
         assert_eq!(items[4].title, "docs");
         let pending = validate(&items, &|_| false).unwrap();
         assert_eq!(pending.len(), 4);
+    }
+
+    #[test]
+    fn parses_writes_and_estimates_from_fields_and_the_content_prefix() {
+        let items = parse(&json!({"todos":[
+            {"content":"writes:src/a.rs,src/b.rs::f depends:todo-2 build","status":"pending","estimate_minutes":6},
+            {"content":"depends:todo-1 writes:docs/ docs","status":"pending","writes":["README.md"]},
+            {"content":"writes: is not a prefix with a space","status":"pending"}
+        ]}))
+        .unwrap();
+        assert_eq!(items[0].writes, ["src/a.rs", "src/b.rs::f"]);
+        assert_eq!(items[0].depends, ["todo-2"]);
+        assert_eq!(items[0].title, "build");
+        assert_eq!(items[0].estimate_minutes, Some(6));
+        assert_eq!(items[1].writes, ["README.md", "docs/"]);
+        assert_eq!(items[1].title, "docs");
+        assert!(items[1].write_set().unwrap().unwrap().covers("docs/a/b.md"));
+        assert!(items[2].writes.is_empty() && items[2].write_set().unwrap().is_none());
+        assert_eq!(items[2].estimate_minutes, None);
+        let bad = parse(&json!({"todos":[
+            {"content":"x","status":"pending","writes":["/abs"]}
+        ]}))
+        .unwrap();
+        assert!(
+            bad[0]
+                .write_set()
+                .unwrap_err()
+                .to_string()
+                .contains("todo-1")
+        );
     }
 
     #[test]

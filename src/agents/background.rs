@@ -170,9 +170,110 @@ struct Running {
 }
 
 struct Notice {
+    /// What the model gets.
     text: String,
+    /// What the user gets while the model has not had it.
+    user: String,
+    /// One line for the user once the model has the report (0056).
+    brief: String,
     user_seen: bool,
     model_seen: bool,
+}
+
+impl Notice {
+    fn new(text: String, user: String, brief: String) -> Self {
+        Self {
+            text,
+            user,
+            brief,
+            user_seen: false,
+            model_seen: false,
+        }
+    }
+}
+
+/// What a finished agent left in its worktree.
+enum Changes {
+    NoWorktree,
+    Removed,
+    Clean,
+    Branch {
+        branch: String,
+        commits: u64,
+        dirty: usize,
+    },
+    Unknown(String),
+}
+
+impl Changes {
+    fn english(&self) -> String {
+        match self {
+            Self::NoWorktree => "no worktree".into(),
+            Self::Removed => "worktree removed".into(),
+            Self::Clean => "worktree has no changes".into(),
+            Self::Branch {
+                branch,
+                commits,
+                dirty,
+            } => format!(
+                "branch {branch}: {commits} commit(s), {}",
+                if *dirty == 0 {
+                    "clean".to_owned()
+                } else {
+                    format!("{dirty} uncommitted change(s)")
+                }
+            ),
+            Self::Unknown(err) => format!("worktree state unknown: {err}"),
+        }
+    }
+
+    /// Nothing for an agent that ran read-only in the main tree.
+    fn chinese(&self) -> Option<String> {
+        match self {
+            Self::NoWorktree => None,
+            Self::Removed => Some("工作区已被删除".into()),
+            Self::Clean => Some("工作区没有改动".into()),
+            Self::Branch {
+                branch,
+                commits,
+                dirty,
+            } => Some(format!(
+                "分支 {branch}：{commits} 个提交，{}",
+                if *dirty == 0 {
+                    "没有未提交的改动".to_owned()
+                } else {
+                    format!("{dirty} 个文件有未提交的改动")
+                }
+            )),
+            Self::Unknown(err) => Some(format!("工作区状态未知：{err}")),
+        }
+    }
+}
+
+fn state_zh(state: Lifecycle) -> &'static str {
+    match state {
+        Lifecycle::Running => "运行中",
+        Lifecycle::Paused => "已挂起",
+        Lifecycle::Interrupted => "已中断",
+        Lifecycle::Finished => "已完成",
+        Lifecycle::Failed => "失败",
+        Lifecycle::Discarded => "已丢弃",
+    }
+}
+
+/// The exit reason (`Exit::label`, `label: detail`, or an error) for the user; nothing
+/// when the state already says it.
+fn reason_zh(reason: &str) -> Option<String> {
+    let (label, detail) = reason.split_once(": ").unwrap_or((reason, ""));
+    match label {
+        "completed" | "interrupted" => None,
+        "max_iterations" => Some("达到步数上限".into()),
+        "stalled" => Some("没有进展，已停止".into()),
+        "unverified" => Some("改动没有通过验证".into()),
+        "approval_denied" => Some(format!("审批被拒：{detail}")),
+        "error" => Some(format!("出错：{detail}")),
+        _ => Some(format!("出错：{reason}")),
+    }
 }
 
 #[derive(Default)]
@@ -181,6 +282,49 @@ pub struct BackgroundState {
     notices: Mutex<Vec<Notice>>,
     /// Wakes the REPL for notices and approval requests.
     pub notify: Arc<Notify>,
+}
+
+impl BackgroundState {
+    fn push(&self, notice: Notice) {
+        if let Ok(mut notices) = self.notices.lock() {
+            notices.push(notice);
+            notices.retain(|notice| !(notice.user_seen && notice.model_seen));
+            let excess = notices.len().saturating_sub(32);
+            notices.drain(..excess);
+        }
+        self.notify.notify_one();
+    }
+
+    fn for_model(&self) -> Option<String> {
+        let mut notices = self.notices.lock().ok()?;
+        let text: Vec<String> = notices
+            .iter_mut()
+            .filter(|notice| !notice.model_seen)
+            .map(|notice| {
+                notice.model_seen = true;
+                notice.text.clone()
+            })
+            .collect();
+        (!text.is_empty()).then(|| text.join("\n\n"))
+    }
+
+    /// The model already has the report: one line, not the report again (0056).
+    fn for_user(&self) -> Vec<String> {
+        self.notices.lock().map_or(Vec::new(), |mut notices| {
+            notices
+                .iter_mut()
+                .filter(|notice| !notice.user_seen)
+                .map(|notice| {
+                    notice.user_seen = true;
+                    if notice.model_seen {
+                        notice.brief.clone()
+                    } else {
+                        notice.user.clone()
+                    }
+                })
+                .collect()
+        })
+    }
 }
 
 /// Parent-side delivery: finished-agent notices and messages for the main task reach the
@@ -281,47 +425,16 @@ impl AgentHub {
         self.records.find(id, &|id| self.is_live(id))
     }
 
-    fn push_notice(&self, text: String) {
-        if let Ok(mut notices) = self.background.notices.lock() {
-            notices.push(Notice {
-                text,
-                user_seen: false,
-                model_seen: false,
-            });
-            notices.retain(|notice| !(notice.user_seen && notice.model_seen));
-            let excess = notices.len().saturating_sub(32);
-            notices.drain(..excess);
-        }
-        self.background.notify.notify_one();
+    fn push_notice(&self, notice: Notice) {
+        self.background.push(notice);
     }
 
     pub fn notices_for_model(&self) -> Option<String> {
-        let mut notices = self.background.notices.lock().ok()?;
-        let text: Vec<String> = notices
-            .iter_mut()
-            .filter(|notice| !notice.model_seen)
-            .map(|notice| {
-                notice.model_seen = true;
-                notice.text.clone()
-            })
-            .collect();
-        (!text.is_empty()).then(|| text.join("\n\n"))
+        self.background.for_model()
     }
 
     pub fn notices_for_user(&self) -> Vec<String> {
-        self.background
-            .notices
-            .lock()
-            .map_or(Vec::new(), |mut notices| {
-                notices
-                    .iter_mut()
-                    .filter(|notice| !notice.user_seen)
-                    .map(|notice| {
-                        notice.user_seen = true;
-                        notice.text.clone()
-                    })
-                    .collect()
-            })
+        self.background.for_user()
     }
 
     pub async fn spawn_background(
@@ -509,20 +622,50 @@ impl AgentHub {
         if let Some(activity) = self.activity.get(&short) {
             record.last_step = activity.last_step;
         }
-        let changes = self.change_summary(&record).await;
+        let changes = self.changes(&record).await;
         let _ = self.records.save(&record);
         self.activity.finish(&short, record.state);
         if record.state != Lifecycle::Paused {
-            self.push_notice(format!(
-                "[background agent {short} ({}) {}: {reason}; failed tools: {failed_tools}; {changes}]\n{}",
+            let report = record.report.trim();
+            let text = format!(
+                "[background agent {short} ({}) {}: {reason}; failed tools: {failed_tools}; {}]\n{}",
                 record.agent_type,
                 record.state.label(),
-                if record.report.trim().is_empty() {
+                changes.english(),
+                if report.is_empty() {
                     "(no report)"
                 } else {
-                    record.report.trim()
+                    report
                 }
-            ));
+            );
+            let head = format!(
+                "后台代理 {short}（{}）{}",
+                record.agent_type,
+                state_zh(record.state)
+            );
+            let notes: Vec<String> = [
+                reason_zh(&reason),
+                (failed_tools > 0).then(|| format!("{failed_tools} 次工具调用失败")),
+                changes.chinese(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let user = format!(
+                "{head}{}\n{}",
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{}", notes.join("；"))
+                },
+                if report.is_empty() {
+                    "（没有报告）"
+                } else {
+                    report
+                }
+            );
+            let brief = format!("{head}，报告已交给主任务；查看全文：/status agents show {short}");
+            self.push_notice(Notice::new(text, user, brief));
         }
     }
 
@@ -590,6 +733,8 @@ impl AgentHub {
             progress.clone(),
             authorizer,
             None,
+            None,
+            None,
             &short,
         )?;
         let agent = self.build_agent(&kind, tools.clone(), Some(extra), &record.id, model)?;
@@ -599,6 +744,11 @@ impl AgentHub {
                 agent.run_in(&mut session, prompt, &self.store, events, cancel),
             )
             .await;
+        // Its background shell commands end with it, as a sub-agent's do (0050, 0051).
+        let stopped = match crate::tools::ToolExecutor::jobs(tools.as_ref()) {
+            Some(jobs) => jobs.close("stopped: the background agent ended").await,
+            None => Vec::new(),
+        };
         progress.attach(None);
         let _ = forward.await;
         let spent = delta(&session.accounting, &record.reported);
@@ -609,6 +759,12 @@ impl AgentHub {
             8 * 1024,
             "\n[report truncated]",
         );
+        if !stopped.is_empty() {
+            record.report.push_str(&format!(
+                "\n[background commands stopped when this agent ended: {}]",
+                stopped.join(", ")
+            ));
+        }
         let mut exit = Exit::from_result(&result);
         if exit == Exit::Completed
             && kind.requires_regression
@@ -621,29 +777,57 @@ impl AgentHub {
 
     /// "no changes", or the dirty state and commit count of an agent's worktree.
     pub async fn change_summary(&self, record: &AgentRecord) -> String {
+        self.changes(record).await.english()
+    }
+
+    async fn changes(&self, record: &AgentRecord) -> Changes {
         let (Some(path), Some(branch), Some(base)) =
             (&record.worktree, &record.branch, &record.base)
         else {
-            return "no worktree".into();
+            return Changes::NoWorktree;
         };
         if !path.is_dir() {
-            return "worktree removed".into();
+            return Changes::Removed;
         }
         let cancel = CancellationToken::new();
         let dirty = worktree::status(path, &cancel).await;
         let commits = worktree::commits_since(path, base, branch, &cancel).await;
         match (dirty, commits) {
-            (Ok(dirty), Ok(0)) if dirty.is_empty() => "worktree has no changes".into(),
-            (Ok(dirty), Ok(commits)) => format!(
-                "branch {branch}: {commits} commit(s), {}",
-                if dirty.is_empty() {
-                    "clean".to_owned()
+            (Ok(dirty), Ok(0)) if dirty.is_empty() => Changes::Clean,
+            (Ok(dirty), Ok(commits)) => Changes::Branch {
+                branch: branch.clone(),
+                commits,
+                dirty: if dirty.is_empty() {
+                    0
                 } else {
-                    format!("{} uncommitted change(s)", dirty.lines().count())
-                }
-            ),
-            (Err(err), _) | (_, Err(err)) => format!("worktree state unknown: {err}"),
+                    dirty.lines().count()
+                },
+            },
+            (Err(err), _) | (_, Err(err)) => Changes::Unknown(err.to_string()),
         }
+    }
+
+    /// `/status agents show <id>`: the agent's state line and its whole report.
+    pub fn report_text(&self, id: &str) -> Result<String> {
+        let record = self.find_record(id)?;
+        if record.kind == Kind::Main {
+            return Err(Error::Session(
+                "这是挂起的主任务，没有后台报告；继续它用 /status agents resume".into(),
+            ));
+        }
+        let report = record.report.trim();
+        Ok(format!(
+            "后台代理 {}（{}）{}：{}\n{}",
+            record.short(),
+            record.agent_type,
+            state_zh(record.state),
+            record.description,
+            if report.is_empty() {
+                "（没有报告）"
+            } else {
+                report
+            }
+        ))
     }
 
     async fn wait_stopped(&self, id: &str) -> Result<()> {
@@ -1212,6 +1396,46 @@ mod tests {
                 .is_err()
         );
         assert!(headless.authorize(Effect::Read, cancel).await.is_ok());
+    }
+
+    /// A report the model already has is one line for the user (0056).
+    #[test]
+    fn notices_show_the_user_one_line_once_the_model_has_the_report() {
+        let notice = || Notice::new("model text".into(), "用户全文".into(), "一行".into());
+        let state = BackgroundState::default();
+        state.push(notice());
+        assert_eq!(state.for_model().as_deref(), Some("model text"));
+        assert_eq!(state.for_user(), ["一行"]);
+        assert!(state.for_user().is_empty());
+        assert!(state.for_model().is_none());
+
+        let state = BackgroundState::default();
+        state.push(notice());
+        assert_eq!(state.for_user(), ["用户全文"]);
+        assert_eq!(state.for_model().as_deref(), Some("model text"));
+    }
+
+    #[test]
+    fn finish_reasons_read_in_chinese() {
+        assert_eq!(reason_zh("completed"), None);
+        assert_eq!(reason_zh("interrupted"), None);
+        assert_eq!(reason_zh("max_iterations").as_deref(), Some("达到步数上限"));
+        assert_eq!(reason_zh("error: boom").as_deref(), Some("出错：boom"));
+        assert_eq!(
+            reason_zh("session lost").as_deref(),
+            Some("出错：session lost")
+        );
+        assert_eq!(Changes::NoWorktree.chinese(), None);
+        let branch = Changes::Branch {
+            branch: "agent/x".into(),
+            commits: 2,
+            dirty: 0,
+        };
+        assert_eq!(
+            branch.chinese().as_deref(),
+            Some("分支 agent/x：2 个提交，没有未提交的改动")
+        );
+        assert_eq!(branch.english(), "branch agent/x: 2 commit(s), clean");
     }
 
     #[test]

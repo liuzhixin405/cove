@@ -140,8 +140,15 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         LocalTools::new(settings.cwd.clone(), authorizer.clone())?
             .with_user_input(input.clone())
             .with_workspace(workspace.clone())
-            .with_progress(progress.clone()),
+            .with_progress(progress.clone())
+            .with_job_dir(store.root().join("tool-outputs").join("shell")),
     );
+    // The status row counts the session's background shell commands (0050).
+    local.background_jobs().on_count(Arc::new(|running: usize| {
+        if let Some(console) = crate::app::console::active() {
+            console.set_background(running);
+        }
+    }));
     let registry = Arc::new(Registry::open(store.root())?);
     let extensions = crate::commands::extensions::assemble(&settings, store.root())?;
     let catalog = Catalog::load(extensions.config, &settings.extension_base, &registry)?;
@@ -217,7 +224,11 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     ));
     {
         let policy = output_policy.clone();
-        tokio::task::spawn_blocking(move || policy.prune());
+        let data_dir = store.root().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            policy.prune();
+            crate::agents::overlay_plan::prune_kept(&data_dir);
+        });
     }
     let readonly: Arc<dyn ToolExecutor> = Arc::new(AllowedTools {
         inner: Arc::new(LocalTools::new(
@@ -263,7 +274,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         metered(traced(router.clone()), "agent"),
         tools.clone(),
         authorizer.clone(),
-        input.is_some(),
+        input.clone(),
         ledger.clone(),
         progress.clone(),
         workspace.clone(),
@@ -335,7 +346,21 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     .with_turn_hook(Arc::new(crate::agents::background::NoticeHook {
         hub: agents.clone(),
     }))
-    .with_turn_hook(Arc::new(crate::agents::explore::ExploreHint::new(models)));
+    .with_turn_hook(Arc::new(crate::agents::overlay_plan::OverlayCleanup {
+        hub: agents.clone(),
+    }))
+    .with_turn_hook(Arc::new(crate::agents::explore::ExploreHint::new(models)))
+    .with_turn_hook(Arc::new(crate::engine::estimate::Estimates::new(
+        settings.data_dir.clone(),
+        settings.cwd.clone(),
+        settings
+            .file
+            .get("split_suggest_minutes")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(crate::engine::estimate::SPLIT_SUGGEST_MINUTES, |minutes| {
+                u32::try_from(minutes).unwrap_or(u32::MAX)
+            }),
+    )));
     for hook in sessions.hooks() {
         agent = agent.with_turn_hook(hook);
     }
@@ -854,6 +879,24 @@ impl Application {
         }
     }
 
+    /// Stops the session's background shell commands, saying so when there were any.
+    async fn stop_background(&self, why: &'static str, reason: &str) {
+        let stopped = match self.tools.local.jobs() {
+            Some(jobs) => jobs.close(why).await,
+            None => Vec::new(),
+        };
+        if !stopped.is_empty() {
+            let _ = print_text(
+                &format!(
+                    "[后台] {reason}，已停止 {} 个后台命令：{}\n",
+                    stopped.len(),
+                    stopped.join("、")
+                ),
+                true,
+            );
+        }
+    }
+
     pub(crate) async fn close_session(&mut self) -> Result<()> {
         let hook = tokio::time::timeout(
             Duration::from_secs(10),
@@ -873,6 +916,9 @@ impl Application {
         })
         .and_then(|r| r);
         let mcp = self.tools.mcp.close(None, None).await;
+        // Background shell commands belong to the session (0050, 0051).
+        self.stop_background("stopped: the session ended", "会话结束")
+            .await;
         let save = self.store.flush(&self.session);
         let errors = [hook, mcp, save]
             .into_iter()
@@ -1371,6 +1417,10 @@ impl Application {
         self.store.save(&next)?;
         self.session.handoff_to = Some(next.id.clone());
         self.store.flush(&self.session)?;
+        // The old session's background commands are not handed over: the new session
+        // would never hear of their ends (0050, 0051).
+        self.stop_background("stopped: the session was handed off", "交接到新会话")
+            .await;
         self.workspace.activate(None)?;
         let origin = std::mem::replace(&mut self.session, next);
         self.lease = lease;

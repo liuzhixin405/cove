@@ -578,10 +578,10 @@ async fn shell_runs_noninteractive_with_long_timeouts() {
     let out = run(
         &tools,
         "shell",
-        json!({"command":"echo x","timeout_seconds":601}),
+        json!({"command":"echo x","timeout_seconds":3601}),
     )
     .await;
-    assert!(out.failed && out.content.contains("1..600"));
+    assert!(out.failed && out.content.contains("1..3600"));
     let description = tools
         .definitions()
         .into_iter()
@@ -710,6 +710,10 @@ impl ToolExecutor for SlowReads {
 
     fn metered(&self, _: &str) -> bool {
         false
+    }
+
+    fn jobs(&self) -> Option<Arc<cove::tools::jobs::Jobs>> {
+        None
     }
 
     fn concurrent(&self, name: &str, _input: &Value) -> bool {
@@ -1052,4 +1056,35 @@ async fn cli_writes_need_a_read_and_create_missing_directories() {
     );
     // The refused first write counts as a failed tool call.
     assert!(!output.status.success());
+}
+
+#[test]
+fn directories_created_for_a_checkpoint_are_removed_by_undo_when_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let workspace = Workspace::new(root.path().into(), store).unwrap();
+    std::fs::create_dir(root.path().join("old")).unwrap();
+    workspace.begin().unwrap();
+    let base = workspace.root().to_path_buf();
+    workspace
+        .create_dirs(&base.join("new").join("deep"))
+        .unwrap();
+    workspace
+        .create_dirs(&base.join("old").join("inner"))
+        .unwrap();
+    workspace.create_dirs(&base.join("keep")).unwrap();
+    workspace
+        .replace_bytes(&base.join("new").join("deep").join("f.txt"), None, b"x")
+        .unwrap();
+    workspace
+        .replace_bytes(&base.join("old").join("inner").join("g.txt"), None, b"y")
+        .unwrap();
+    // Something outside the checkpoint now uses `keep`: it stays.
+    std::fs::write(base.join("keep").join("user.txt"), "mine").unwrap();
+    workspace.undo().unwrap();
+    assert!(!base.join("new").exists());
+    assert!(base.join("old").is_dir());
+    assert!(!base.join("old").join("inner").exists());
+    assert!(base.join("keep").join("user.txt").is_file());
 }

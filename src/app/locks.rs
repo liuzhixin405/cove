@@ -99,9 +99,23 @@ impl LockWait for ToolLocks {
             };
             let tool = lock.tool;
             let all = processes(&cancel).await.unwrap_or_default();
-            let holders = holders(&all, child, lock, &line);
+            let (ours, holders) = split_background(&all, holders(&all, child, lock, &line));
             if cancel.is_cancelled() {
                 return;
+            }
+            // Our own background command holds it: it ends by itself, or the model or
+            // the user stops it; ending it from here would lose its result (0050).
+            if !ours.is_empty() {
+                let _ = print_text(
+                    &format!(
+                        "[锁等待] {tool} 在等待锁，占用者是本会话的后台命令 {}；等它结束后会继续，不需要结束它\n",
+                        ours.join("、")
+                    ),
+                    true,
+                );
+                if holders.is_empty() {
+                    return;
+                }
             }
             if holders.is_empty() {
                 let _ = print_text(
@@ -165,6 +179,37 @@ impl LockWait for ToolLocks {
             );
         })
     }
+}
+
+/// Holders that belong to a background command of this process (it, or an ancestor,
+/// is one), named by that command's label; and the others.
+fn split_background<'a>(all: &[Proc], holders: Vec<&'a Proc>) -> (Vec<String>, Vec<&'a Proc>) {
+    let mut ours: Vec<String> = Vec::new();
+    let mut others = Vec::new();
+    for holder in holders {
+        match background_owner(all, holder.pid) {
+            Some(label) => {
+                if !ours.contains(&label) {
+                    ours.push(label);
+                }
+            }
+            None => others.push(holder),
+        }
+    }
+    (ours, others)
+}
+
+/// The label of the background command `pid` runs under, following parents.
+fn background_owner(all: &[Proc], pid: u32) -> Option<String> {
+    let mut current = pid;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        if let Some(label) = crate::process::background_label(current) {
+            return Some(label);
+        }
+        current = all.iter().find(|proc| proc.pid == current)?.ppid;
+    }
+    None
 }
 
 /// The holders outside the waiting command's own process tree: the PIDs the
@@ -303,6 +348,26 @@ mod tests {
             .iter()
             .find(|lock| lower.contains(lock.pattern))
             .unwrap()
+    }
+
+    #[test]
+    fn a_lock_held_by_our_background_command_is_not_offered_for_ending() {
+        let all = vec![
+            proc(9000, 1, "bash"),
+            proc(9001, 9000, "cargo"),
+            proc(9100, 1, "cargo"),
+            proc(9200, 1, "bash"),
+            proc(9201, 9200, "cargo"),
+        ];
+        crate::process::note_background(9000, "#2 cargo test".into());
+        let holders = holders(&all, 9201, lock("Blocking waiting for file lock"), "");
+        let (ours, others) = split_background(&all, holders);
+        crate::process::forget_background(9000);
+        assert_eq!(ours, vec!["#2 cargo test".to_owned()]);
+        assert_eq!(
+            others.iter().map(|proc| proc.pid).collect::<Vec<_>>(),
+            vec![9100]
+        );
     }
 
     #[test]

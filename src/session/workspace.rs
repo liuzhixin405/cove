@@ -75,7 +75,7 @@ impl Image {
 const TEXT_LIMIT: usize = 1024 * 1024;
 const BINARY_LIMIT: usize = 4 * 1024 * 1024;
 
-fn within_limit(bytes: &[u8]) -> bool {
+pub(crate) fn within_limit(bytes: &[u8]) -> bool {
     bytes.len() <= TEXT_LIMIT
         || (bytes.len() <= BINARY_LIMIT && std::str::from_utf8(bytes).is_err())
 }
@@ -166,6 +166,10 @@ struct Checkpoint {
     changes: Vec<Change>,
     shell_effects: bool,
     undone: bool,
+    /// Directories [`Workspace::create_dirs`] created (workspace-relative, parents first):
+    /// `undo` removes those left empty.
+    #[serde(default)]
+    created_dirs: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -228,6 +232,7 @@ impl Workspace {
             changes: Vec::new(),
             shell_effects: false,
             undone: false,
+            created_dirs: Vec::new(),
         };
         let id = checkpoint.id.clone();
         self.persist(&checkpoint)?;
@@ -317,6 +322,48 @@ impl Workspace {
             ));
         }
         Ok(path)
+    }
+
+    /// Creates the missing directories of `dir` (inside the workspace) and records them in
+    /// the active checkpoint first, so `undo` removes them again when they are left empty.
+    pub fn create_dirs(&self, dir: &Path) -> Result<()> {
+        let relative = dir
+            .strip_prefix(&self.root)
+            .map_err(|_| Error::Workspace("directory outside workspace".into()))?;
+        if relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(Error::Workspace("invalid directory path".into()));
+        }
+        let mut missing = Vec::new();
+        let mut path = PathBuf::new();
+        for part in relative.components() {
+            path.push(part);
+            if !self.root.join(&path).exists() {
+                missing.push(path.clone());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut guard = self
+                .current
+                .lock()
+                .map_err(|_| Error::Workspace("checkpoint lock poisoned".into()))?;
+            let cp = guard
+                .as_mut()
+                .ok_or_else(|| Error::Workspace("no active checkpoint".into()))?;
+            for path in missing {
+                if !cp.created_dirs.contains(&path) {
+                    cp.created_dirs.push(path);
+                }
+            }
+            self.persist(cp)?;
+        }
+        std::fs::create_dir_all(dir)?;
+        Ok(())
     }
 
     pub fn replace(&self, path: &Path, expected: Option<&str>, text: &str) -> Result<()> {
@@ -945,6 +992,15 @@ impl Workspace {
             }
             cp.changes[index].state = ChangeState::Reverted;
             self.persist(cp)?;
+        }
+        // Deepest first; a directory something else now uses is not empty and stays.
+        for dir in cp.created_dirs.iter().rev() {
+            if dir
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            {
+                let _ = std::fs::remove_dir(self.root.join(dir));
+            }
         }
         cp.undone = true;
         self.persist(cp)

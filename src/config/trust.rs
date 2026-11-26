@@ -183,6 +183,7 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
         | "cite_check"
         | "change_impact"
         | "done_verify_timeout_seconds"
+        | "done_verify_idle_seconds"
         | "review_when"
         | "review_timeout_seconds"
         | "review_instructions"
@@ -191,7 +192,8 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
         | "subagent_max_iterations"
         | "max_output_tokens"
         | "context_window"
-        | "experimental_tools" => Class::Safe,
+        | "experimental_tools"
+        | "split_suggest_minutes" => Class::Safe,
         "max_turn_minutes" => {
             // Default is 60 minutes (config/mod.rs); only tightening is safe, since a
             // huge value would saturate into a nearly unlimited task timeout.
@@ -226,6 +228,13 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
             }
             _ => Class::Sensitive,
         },
+        // A command or program cove runs (0053); turning the check off is safe.
+        "overlay_check" => match value {
+            Value::Null => Class::Safe,
+            Value::String(text) if text.trim().is_empty() => Class::Safe,
+            _ => Class::Sensitive,
+        },
+        "mergiraf_path" => Class::Sensitive,
         // Running repository code; turning it off is safe.
         "review_commands" => match value {
             Value::Array(commands) if commands.is_empty() => Class::Safe,
@@ -428,6 +437,13 @@ mod tests {
         };
         assert_eq!(class("review_commands", json!(["bash x.sh"])), "sensitive");
         assert_eq!(class("review_commands", json!([])), "safe");
+        // Overlay plans (0053): a check command or a merge program runs only when trusted.
+        assert_eq!(class("overlay_check", json!("cargo check")), "sensitive");
+        assert_eq!(class("overlay_check", json!("")), "safe");
+        assert_eq!(
+            class("mergiraf_path", json!("C:/tools/mergiraf.exe")),
+            "sensitive"
+        );
         assert_eq!(class("review_when", json!("both")), "safe");
         assert_eq!(class("review_timeout_seconds", json!(1800)), "safe");
         assert_eq!(class("review_instructions", json!("eng/SKILL.md")), "safe");

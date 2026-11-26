@@ -463,6 +463,7 @@ const ROOT_KEYS: &[&str] = &[
     "done_verify_commands",
     "done_verify_auto",
     "done_verify_timeout_seconds",
+    "done_verify_idle_seconds",
     "web_search",
     "proxy",
     "mcp_servers",
@@ -476,6 +477,9 @@ const ROOT_KEYS: &[&str] = &[
     "experimental_tools",
     "regression_command",
     "max_background_agents",
+    "split_suggest_minutes",
+    "overlay_check",
+    "mergiraf_path",
 ];
 const PROVIDER_KEYS: &[&str] = &["name", "api_key", "api_keys", "base_url"];
 pub const MODEL_CONTEXT_WINDOWS_CACHE: &str = "model-context-windows.json";
@@ -502,6 +506,7 @@ struct FileConfig {
     done_verify_commands: Option<Vec<String>>,
     done_verify_auto: Option<bool>,
     done_verify_timeout_seconds: Option<u64>,
+    done_verify_idle_seconds: Option<u64>,
     web_search: Option<WebSearchConfig>,
     /// Windows learned from servers' overflow errors (lower-case model -> tokens).
     #[serde(default)]
@@ -755,7 +760,10 @@ pub struct Settings {
     pub prices: Option<(f64, f64)>,
     /// Commands run when a task that changed files ends; empty disables the gate.
     pub verify_commands: Vec<String>,
+    /// Total limit of a check; `None` is an hour (`process::WATCHED_TOTAL`).
     pub verify_timeout: Option<Duration>,
+    /// A check without any sign of work for this long is stopped; `None` is 180 s.
+    pub verify_idle: Option<Duration>,
     pub web_search: WebSearchConfig,
     pub subagent_max_turns: u32,
     /// `--dump-system-prompt`: print the assembled system prompt and exit.
@@ -1068,8 +1076,18 @@ impl Settings {
         let verify_timeout = match file.done_verify_timeout_seconds {
             Some(seconds) => {
                 anyhow::ensure!(
-                    (1..=3600).contains(&seconds),
-                    "done_verify_timeout_seconds must be 1..3600"
+                    (1..=86400).contains(&seconds),
+                    "done_verify_timeout_seconds must be 1..86400"
+                );
+                Some(Duration::from_secs(seconds))
+            }
+            None => None,
+        };
+        let verify_idle = match file.done_verify_idle_seconds {
+            Some(seconds) => {
+                anyhow::ensure!(
+                    (10..=3600).contains(&seconds),
+                    "done_verify_idle_seconds must be 10..3600"
                 );
                 Some(Duration::from_secs(seconds))
             }
@@ -1134,6 +1152,7 @@ impl Settings {
             prices,
             verify_commands,
             verify_timeout,
+            verify_idle,
             web_search: file.web_search.take().unwrap_or_default(),
             subagent_max_turns,
             dump_system_prompt: cli.dump_system_prompt,

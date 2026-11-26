@@ -776,10 +776,11 @@ impl CommandReview {
         for command in &self.config.commands {
             self.say(format!("[审查] 第 {round} 轮：$ {command}")).await;
             let started = Instant::now();
+            // Review commands are often test suites: they run while they keep working.
             let result = crate::process::shell_with_env(
                 &self.root,
                 command,
-                self.config.timeout,
+                crate::process::Limit::watched(self.config.timeout, crate::process::IDLE_LIMIT),
                 cancel.clone(),
                 &env,
             )
@@ -797,6 +798,13 @@ impl CommandReview {
                     });
                 }
             };
+            if let Some(reason) = &ran.stalled {
+                self.record(command, point, round, "stalled", &[], None, duration_ms);
+                return Ok(Run {
+                    verdict: Verdict::Skipped(format!("{command} 卡住，已中止：{reason}")),
+                    output,
+                });
+            }
             if ran.timed_out {
                 self.record(command, point, round, "timed_out", &[], None, duration_ms);
                 return Ok(Run {

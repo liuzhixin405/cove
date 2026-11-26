@@ -275,6 +275,28 @@ impl OutputPolicy {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+        // Full output of background shell commands: `shell/<session>/<id>.log` (0050).
+        let Ok(scopes) = std::fs::read_dir(dir.join("shell")) else {
+            return;
+        };
+        for scope in scopes.flatten() {
+            let Ok(logs) = std::fs::read_dir(scope.path()) else {
+                continue;
+            };
+            for log in logs.flatten() {
+                let old = log
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age > RETENTION);
+                if old && log.path().extension().is_some_and(|ext| ext == "log") {
+                    let _ = std::fs::remove_file(log.path());
+                }
+            }
+            // Only once it is empty.
+            let _ = std::fs::remove_dir(scope.path());
+        }
     }
 }
 

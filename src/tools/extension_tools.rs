@@ -85,6 +85,10 @@ impl ToolExecutor for ExtensionTools {
         self.local.metered(name)
     }
 
+    fn jobs(&self) -> Option<std::sync::Arc<crate::tools::jobs::Jobs>> {
+        self.local.jobs()
+    }
+
     fn execute(
         &self,
         name: String,

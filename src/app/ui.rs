@@ -267,7 +267,7 @@ pub async fn consume_events(
                         crate::text::visible(&crate::app::blocks::inline(&output, id))
                     ))?
                 }
-                AgentEvent::Usage { .. } => {}
+                AgentEvent::Usage { .. } | AgentEvent::Activity(_) => {}
             }
         }
         console::write(true, "\n")
@@ -344,8 +344,10 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
             console::write(true, &buffered)?;
             buffered.clear();
         }
-        if !matches!(event, AgentEvent::Reasoning(_) | AgentEvent::Usage { .. })
-            && let Some(since) = thinking.take()
+        if !matches!(
+            event,
+            AgentEvent::Reasoning(_) | AgentEvent::Usage { .. } | AgentEvent::Activity(_)
+        ) && let Some(since) = thinking.take()
         {
             open_block(&mut block, Block::Reasoning, &mut line_done, &mut markdown)?;
             console::write(false, &thought(since.elapsed().as_secs_f64()))?;
@@ -486,6 +488,7 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 )?;
                 open = None;
             }
+            AgentEvent::Activity(text) => activity(&crate::text::visible(&text)),
             AgentEvent::Usage { tokens, .. } => {
                 if let Some(console) = console {
                     console.add_tokens(tokens);

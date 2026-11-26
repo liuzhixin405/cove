@@ -4,9 +4,11 @@ pub mod browser;
 pub mod draw;
 pub mod extension_tools;
 pub mod external;
+pub mod jobs;
 pub mod line_endings;
 pub mod repomap;
 pub mod text_encoding;
+pub mod view;
 pub mod web;
 pub mod workflow_tools;
 
@@ -25,11 +27,14 @@ use crate::{
     domain::{Error, Progress, Result, ToolDefinition, UserInput},
     process::{self, Shell},
     safety::permission::{Authorizer, Effect},
-    session::workspace::{Workspace, replace_file_bytes},
+    session::{
+        overlay::{EditSpec, Kind, OverlayStack},
+        workspace::{Workspace, replace_file_bytes},
+    },
     tools::text_encoding::{self as text, TextKind},
 };
 
-mod edit;
+pub(crate) mod edit;
 mod question;
 pub(crate) mod search;
 mod todo;
@@ -51,8 +56,16 @@ const SHELL_TIMEOUT: u64 = 120;
 /// Edit results show the changed lines up to this size; past it, only their line numbers
 /// (unless a whitespace-tolerant match applied the edit, which the model should see).
 const SHORT_SNIPPET: usize = 400;
-const SHELL_SLOW_TIMEOUT: u64 = 300;
-const SHELL_MAX_TIMEOUT: u64 = 600;
+/// Longest foreground wait a call may ask for; the command runs on in the background
+/// after it either way (docs/optimizations/0050).
+const SHELL_MAX_TIMEOUT: u64 = 3600;
+/// Most overlay paths grep hands ripgrep as exclusions; more fall back to the built-in search.
+const RG_EXCLUDES: usize = 200;
+/// Why an overlay sub-task's shell refused a command (docs/optimizations/0053).
+pub const OVERLAY_SHELL_REFUSED: &str =
+    "overlay sub-tasks cannot change files on disk; put steps that generate files after the merge";
+/// Appended to an overlay sub-task's shell results.
+const OVERLAY_SHELL_NOTE: &str = "[note: this ran in the main workspace, which does not have this sub-task's overlay changes; use read, grep or glob to see your own changes]";
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 /// A JSON value as tool-result text, pretty-printed and bounded.
@@ -100,6 +113,18 @@ fn dialect_mismatch(shell: &Shell, output: &process::CommandOutput) -> Option<&'
         .map(|(_, why)| *why)
 }
 
+/// Whether an overlay sub-task may run `command` (docs/optimizations/0053): auto-approvable
+/// and read-only, so no redirect into a file, file-changing or build command, network
+/// fetch, formatter or deletion; the overlay's changes would never see its effects.
+fn overlay_shell_allowed(command: &str) -> bool {
+    use crate::safety::permission::{classify, shell::Dialect};
+    let dialect = Dialect::for_command(command);
+    classify::auto_approvable(command, dialect)
+        && classify::classify(command, dialect) == classify::Category::Safe
+        && !classify::may_rewrite_sources(command, dialect)
+        && !classify::deletes_files(command, dialect)
+}
+
 /// Another installed shell that reads `command` as read-only, so it may run again there
 /// without a new approval: the shell its syntax names first, then the others.
 fn retry_shell(shell: &Shell, command: &str, _why: &str) -> Option<&'static Shell> {
@@ -138,6 +163,10 @@ pub struct ToolOutput {
 
 pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
+    /// The shell commands these tools run in the background, if any (docs/optimizations/0050):
+    /// the task loop delivers their results and waits for them. Required, so a wrapper
+    /// cannot hide them.
+    fn jobs(&self) -> Option<Arc<jobs::Jobs>>;
     /// Tools that make model requests themselves and report spend through a `Ledger`.
     /// Required, like `concurrent`: a wrapper that forgot to forward these silently
     /// lost parallel reads, so every implementation now says what it does.
@@ -164,6 +193,9 @@ pub struct LocalTools {
     files: Arc<FileTracker>,
     shell: Shell,
     ripgrep: bool,
+    jobs: Arc<jobs::Jobs>,
+    /// Where file tools read and write: the disk, or an overlay sub-task's layers (0053).
+    view: view::FileView,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +242,8 @@ struct GlobArgs {
     pattern: String,
     #[serde(default)]
     path: Option<PathBuf>,
+    #[serde(default)]
+    include_ignored: bool,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +260,8 @@ struct GrepArgs {
     context: Option<usize>,
     #[serde(default)]
     files_only: bool,
+    #[serde(default)]
+    include_ignored: bool,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +290,28 @@ struct ShellArgs {
     #[serde(default)]
     #[allow(dead_code)]
     description: Option<String>,
+    /// Start in the background and return after a few seconds (0051).
+    #[serde(default)]
+    run_in_background: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellTaskArgs {
+    action: String,
+    #[serde(default)]
+    id: Option<Value>,
+}
+
+impl ShellTaskArgs {
+    /// `3`, `"3"` or `"#3"`.
+    fn id(&self) -> Option<u32> {
+        match self.id.as_ref()? {
+            Value::Number(number) => number.as_u64().and_then(|id| u32::try_from(id).ok()),
+            Value::String(text) => text.trim().trim_start_matches('#').parse().ok(),
+            _ => None,
+        }
+    }
 }
 
 enum Call {
@@ -264,6 +322,7 @@ enum Call {
     Grep(GrepArgs),
     RepoMap(RepoMapArgs),
     Shell(ShellArgs),
+    ShellTask(ShellTaskArgs),
     Ask(AskArgs),
     Question(question::QuestionArgs),
     Todo(todo::TodoArgs),
@@ -279,6 +338,7 @@ impl Call {
             "grep" => Self::Grep(serde_json::from_value(input)?),
             "repo_map" => Self::RepoMap(serde_json::from_value(input)?),
             "shell" => Self::Shell(serde_json::from_value(input)?),
+            "shell_task" => Self::ShellTask(serde_json::from_value(input)?),
             // Older sessions may still call the single-question tool.
             "ask_user" => Self::Ask(serde_json::from_value(input)?),
             "question" => Self::Question(serde_json::from_value(input)?),
@@ -291,6 +351,76 @@ impl Call {
 /// `path` relative to `root` with forward slashes, as tool results show paths.
 pub fn display_path(root: &Path, path: &Path) -> String {
     search::display(root, path)
+}
+
+/// What `edit` makes of a file's bytes (`shown` names it in errors): the new bytes and
+/// how `old` matched. Line endings, BOM and GBK encoding are kept as `edit` keeps them.
+fn edited(
+    existing: &[u8],
+    shown: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(Vec<u8>, edit::Applied)> {
+    let decoded = text::decode_editable(existing, shown).map_err(Error::Tool)?;
+    // read shows lines without `\r`, so the model works in LF: match the file's LF view
+    // and give every line back its own ending (see `line_endings`).
+    let (lf_old, lf_new) = (line_endings::to_lf(old), line_endings::to_lf(new));
+    let (applied, written) = if lf_old != lf_new {
+        let applied = edit::apply(
+            &line_endings::to_lf(&decoded.text),
+            &lf_old,
+            &lf_new,
+            replace_all,
+        )
+        .map_err(Error::Tool)?;
+        let written = line_endings::restore(&decoded.text, &applied.result);
+        (applied, written)
+    } else if old != new {
+        // Only `\r` differs: the model changes line endings on purpose, byte for byte.
+        let mut applied = edit::apply(&decoded.text, old, new, replace_all)
+            .map_err(|err| {
+                Error::Tool(format!(
+                    "{err} (old and new differ only in line endings, so old must match the file's bytes, \\r included)"
+                ))
+            })?;
+        applied.note.push_str(" (line endings changed as written)");
+        let written = applied.result.clone();
+        (applied, written)
+    } else {
+        return Err(Error::Tool("old and new must differ".into()));
+    };
+    let data = match decoded.legacy {
+        Some(legacy) => legacy.encode(&written).map_err(|err| {
+            Error::Tool(format!(
+                "{shown} is {0}-encoded, and {err} in new. The file was left unchanged.",
+                legacy.name()
+            ))
+        })?,
+        None => written.into_bytes(),
+    };
+    Ok((data, applied))
+}
+
+/// Applies an overlay `Edit` intent to `existing` exactly as the `edit` tool would (the
+/// merge replays intents with it, docs/optimizations/0053); the error says why it does
+/// not apply (no match, several matches, encoding).
+pub fn replay_edit(
+    existing: &[u8],
+    shown: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> std::result::Result<Vec<u8>, String> {
+    if old.is_empty() {
+        return Err("old must not be empty".into());
+    }
+    edited(existing, shown, old, new, replace_all)
+        .map(|(data, _)| data)
+        .map_err(|err| match err {
+            Error::Tool(text) => text,
+            other => other.to_string(),
+        })
 }
 
 fn failed(content: String) -> ToolOutput {
@@ -316,7 +446,53 @@ impl LocalTools {
             files: Arc::new(FileTracker::default()),
             shell: Shell::current().clone(),
             ripgrep: true,
+            jobs: Arc::new(jobs::Jobs::new(None)),
+            view: view::FileView::Disk,
         })
+    }
+
+    /// The tools of an overlay sub-task (docs/optimizations/0053): `read`, `glob`, `grep`
+    /// and `repo_map` see `stack` (its layers above the main workspace), `write` and `edit`
+    /// go only into its top layer and record intents there. Nothing reaches the disk or a
+    /// checkpoint: the workspace is dropped, `stack.changed_paths()` lists the writes.
+    /// Boundaries, protected paths, ignore rules and approvals stay as they are; `shell`
+    /// runs read-only commands only, in the main workspace, and background commands
+    /// (`run_in_background`, `shell_task`) are off. The read tracker and the job registry
+    /// are new, so the sub-task shares neither with the tools it was made from.
+    /// `stack.root()` must be this workspace.
+    pub fn with_overlay(mut self, stack: Arc<OverlayStack>) -> Result<Self> {
+        if !view::same_root(stack.root(), &self.root) {
+            return Err(Error::Tool(
+                "the overlay belongs to another workspace".into(),
+            ));
+        }
+        self.workspace = None;
+        self.files = Arc::new(FileTracker::default());
+        self.jobs = Arc::new(jobs::Jobs::new(Some(self.jobs.dir())));
+        self.view = view::FileView::Overlay(stack);
+        Ok(self)
+    }
+
+    /// The overlay stack these tools write into, if they belong to an overlay sub-task.
+    pub fn overlay(&self) -> Option<&Arc<OverlayStack>> {
+        self.view.overlay()
+    }
+
+    /// Output files of background shell commands go under `dir` (`<data dir>/tool-outputs/shell`).
+    pub fn with_job_dir(mut self, dir: PathBuf) -> Self {
+        self.jobs = Arc::new(jobs::Jobs::new(Some(dir)));
+        self
+    }
+
+    /// Another registry for background shell commands (tests use shorter limits).
+    pub fn with_jobs(mut self, jobs: Arc<jobs::Jobs>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
+    /// The background shell commands of these tools.
+    pub fn background_jobs(&self) -> Arc<jobs::Jobs> {
+        self.jobs.clone()
     }
 
     /// Shell output is forwarded here line by line while the command runs.
@@ -355,6 +531,7 @@ impl LocalTools {
             user_input: None,
             workspace: None,
             progress: None,
+            jobs: Arc::new(jobs::Jobs::new(Some(self.jobs.dir()))),
             ..self.clone()
         }
     }
@@ -369,7 +546,24 @@ impl LocalTools {
 
     /// Canonical path inside the workspace. With `new`, missing parent directories are
     /// allowed; the deepest existing ancestor must still lie inside the workspace.
+    /// In an overlay, a file only its layers hold resolves like a new one.
     fn resolve(&self, path: &Path, new: bool) -> Result<PathBuf> {
+        match self.resolve_on_disk(path, new) {
+            Err(Error::Io(err))
+                if !new
+                    && err.kind() == std::io::ErrorKind::NotFound
+                    && self.overlay().is_some() =>
+            {
+                match self.resolve_on_disk(path, true) {
+                    Ok(resolved) if self.view.stat(&resolved).is_ok() => Ok(resolved),
+                    _ => Err(Error::Io(err)),
+                }
+            }
+            resolved => resolved,
+        }
+    }
+
+    fn resolve_on_disk(&self, path: &Path, new: bool) -> Result<PathBuf> {
         if path.as_os_str().is_empty()
             || path.components().any(|c| matches!(c, Component::ParentDir))
         {
@@ -445,16 +639,35 @@ impl LocalTools {
 
     /// Current bytes of a file a tool is about to change, bounded by the snapshot limit.
     fn read_bounded(&self, path: &Path) -> Result<Vec<u8>> {
-        if std::fs::metadata(path)?.len() > FILE_LIMIT {
+        let len = match self.view.stat(path)? {
+            Kind::File(len) => len,
+            // As reading a directory fails on disk.
+            Kind::Dir => return Ok(self.view.read(path)?),
+        };
+        if len > FILE_LIMIT {
             return Err(Error::Tool(format!(
                 "{} exceeds 1 MiB; file tools change files up to 1 MiB",
                 self.shown(path)
             )));
         }
-        Ok(std::fs::read(path)?)
+        Ok(self.view.read(path)?)
     }
 
-    fn replace(&self, path: &Path, expected: Option<&[u8]>, data: &[u8]) -> Result<()> {
+    /// Replaces `path` when it still holds `expected`: on disk through the checkpoint, or
+    /// in the overlay's top layer, where `edit` becomes the recorded intent.
+    fn replace(
+        &self,
+        path: &Path,
+        expected: Option<&[u8]>,
+        data: &[u8],
+        edit: Option<EditSpec>,
+    ) -> Result<()> {
+        if let Some(stack) = self.overlay() {
+            let relative = path
+                .strip_prefix(stack.root())
+                .map_err(|_| Error::Tool("path is outside the workspace".into()))?;
+            return stack.write(relative, expected, data, edit);
+        }
         if let Some(workspace) = &self.workspace {
             workspace.replace_bytes(path, expected, data)
         } else {
@@ -472,17 +685,12 @@ impl LocalTools {
     }
 
     fn list_directory(&self, path: &Path) -> Result<String> {
-        let mut entries: Vec<String> = std::fs::read_dir(path)?
-            .flatten()
-            .filter(|entry| !entry.file_name().eq_ignore_ascii_case(".git"))
-            .map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    format!("{name}/")
-                } else {
-                    name
-                }
-            })
+        let mut entries: Vec<String> = self
+            .view
+            .list(path)?
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(".git"))
+            .map(|(name, dir)| if dir { format!("{name}/") } else { name })
             .collect();
         entries.sort();
         let total = entries.len();
@@ -506,10 +714,10 @@ impl LocalTools {
         }
         let path = self.resolve(&args.path, false)?;
         let shown = self.shown(&path);
-        let metadata = std::fs::metadata(&path)?;
-        if metadata.is_dir() {
-            return self.list_directory(&path);
-        }
+        let len = match self.view.stat(&path)? {
+            Kind::Dir => return self.list_directory(&path),
+            Kind::File(len) => len,
+        };
         if path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -522,12 +730,12 @@ impl LocalTools {
                 "{shown} has an image extension but is not a readable PNG/JPEG/GIF/WebP within the size limits"
             )));
         }
-        if metadata.len() > READ_LIMIT {
+        if len > READ_LIMIT {
             return Err(Error::Tool(format!(
                 "{shown} exceeds 32 MiB; search it with grep or inspect parts with the shell"
             )));
         }
-        let bytes = std::fs::read(&path)?;
+        let bytes = self.view.read(&path)?;
         let mut note = None;
         let content = match text::sniff(&bytes) {
             TextKind::Binary => {
@@ -597,7 +805,9 @@ impl LocalTools {
     fn write(&self, args: WriteArgs) -> Result<String> {
         let path = self.resolve(&args.path, true)?;
         let shown = self.shown(&path);
+        // An overlay holds new directories implicitly; nothing is created on disk.
         if let Some(parent) = path.parent()
+            && self.overlay().is_none()
             && !parent.exists()
         {
             std::fs::create_dir_all(parent)?;
@@ -617,7 +827,7 @@ impl LocalTools {
         let Some(existing) = existing else {
             let content = line_endings::for_new_file(&self.root, &path, &args.content);
             let data = content.as_bytes();
-            self.replace(&path, None, data)?;
+            self.replace(&path, None, data, None)?;
             self.files.record(&path, data);
             return Ok(format!(
                 "Created {shown} ({} bytes, {lines} lines)",
@@ -638,7 +848,7 @@ impl LocalTools {
             })?,
             None => content.into_bytes(),
         };
-        self.replace(&path, Some(&existing), &data)?;
+        self.replace(&path, Some(&existing), &data, None)?;
         self.files.record(&path, &data);
         Ok(format!(
             "Overwrote {shown} ({} bytes, {lines} lines{})",
@@ -656,47 +866,13 @@ impl LocalTools {
         let path = self.resolve(&args.path, false)?;
         let shown = self.shown(&path);
         let existing = self.read_bounded(&path)?;
-        let decoded = text::decode_editable(&existing, &shown).map_err(Error::Tool)?;
-        // read shows lines without `\r`, so the model works in LF: match the file's LF view
-        // and give every line back its own ending (see `line_endings`).
-        let (old, new) = (
-            line_endings::to_lf(&args.old),
-            line_endings::to_lf(&args.new),
-        );
-        let (applied, written) = if old != new {
-            let applied = edit::apply(
-                &line_endings::to_lf(&decoded.text),
-                &old,
-                &new,
-                args.replace_all,
-            )
-            .map_err(Error::Tool)?;
-            let written = line_endings::restore(&decoded.text, &applied.result);
-            (applied, written)
-        } else if args.old != args.new {
-            // Only `\r` differs: the model changes line endings on purpose, byte for byte.
-            let mut applied = edit::apply(&decoded.text, &args.old, &args.new, args.replace_all)
-                .map_err(|err| {
-                    Error::Tool(format!(
-                        "{err} (old and new differ only in line endings, so old must match the file's bytes, \\r included)"
-                    ))
-                })?;
-            applied.note.push_str(" (line endings changed as written)");
-            let written = applied.result.clone();
-            (applied, written)
-        } else {
-            return Err(Error::Tool("old and new must differ".into()));
+        let (data, applied) = edited(&existing, &shown, &args.old, &args.new, args.replace_all)?;
+        let edit = EditSpec {
+            old: args.old,
+            new: args.new,
+            replace_all: args.replace_all,
         };
-        let data = match decoded.legacy {
-            Some(legacy) => legacy.encode(&written).map_err(|err| {
-                Error::Tool(format!(
-                    "{shown} is {0}-encoded, and {err} in new. The file was left unchanged.",
-                    legacy.name()
-                ))
-            })?,
-            None => written.into_bytes(),
-        };
-        self.replace(&path, Some(&existing), &data)?;
+        self.replace(&path, Some(&existing), &data, Some(edit))?;
         self.files.record(&path, &data);
         let mut out = format!(
             "Edited {shown}: {} replacement(s){}",
@@ -745,6 +921,7 @@ impl LocalTools {
             ignore_case: args.ignore_case,
             context: args.context.unwrap_or(0).min(search::GREP_MAX_CONTEXT),
             files_only: args.files_only,
+            include_ignored: args.include_ignored,
         }
     }
 
@@ -758,40 +935,76 @@ impl LocalTools {
             Call::Edit(args) => self.edit(args),
             Call::Glob(args) => {
                 let base = self.search_base(args.path.as_deref())?;
-                if !base.is_dir() {
+                if !matches!(self.view.stat(&base), Ok(Kind::Dir)) {
                     return Err(Error::Tool("glob path must be a directory".into()));
                 }
-                search::glob(&self.root, &base, &args.pattern, cancel, &|path| {
-                    self.resolve(path, false).ok()
-                })
+                let shadow = self.view.shadow();
+                search::glob(
+                    &self.root,
+                    &base,
+                    &args.pattern,
+                    args.include_ignored,
+                    shadow.as_ref(),
+                    cancel,
+                    &|path| self.resolve(path, false).ok(),
+                )
             }
             Call::Grep(args) => {
                 let base = self.search_base(args.path.as_deref())?;
                 let options = Self::grep_options(&args);
-                let lines = search::builtin_grep(&self.root, &base, &options, cancel, &|path| {
-                    self.resolve(path, false).ok()
-                })?;
-                Ok(search::grep_result(lines, false, &options))
+                let shadow = self.view.shadow();
+                let found = search::builtin_grep(
+                    &self.root,
+                    &base,
+                    &options,
+                    shadow.as_ref(),
+                    cancel,
+                    &|path| self.resolve(path, false).ok(),
+                )?;
+                Ok(search::grep_result(
+                    found, false, &options, &self.root, &base,
+                ))
             }
             Call::Todo(args) => todo::execute(args),
             Call::RepoMap(args) => {
                 let prefix = match &args.path {
                     Some(path) if !path.as_os_str().is_empty() && path != Path::new(".") => {
                         let resolved = self.resolve(path, false)?;
-                        if !resolved.is_dir() {
+                        if !matches!(self.view.stat(&resolved), Ok(Kind::Dir)) {
                             return Err(Error::Tool("path must be a directory".into()));
                         }
                         resolved
                     }
                     _ => self.root.clone(),
                 };
+                let shadow = self.view.shadow();
                 let mut files = Vec::new();
+                // An overlay's files are mapped from their layered content, and come first:
+                // past the scan's file limit they are what the sub-task is working on.
+                let mut contents = std::collections::HashMap::new();
+                let prefix_key = crate::paths::key(&prefix);
+                for (path, bytes) in shadow.iter().flat_map(|shadow| &shadow.files) {
+                    if !search::under(&prefix_key, path) || search::ignored(&self.root, path) {
+                        continue;
+                    }
+                    let Ok(full) = self.resolve(path, false) else {
+                        continue;
+                    };
+                    if let Ok(relative) = full.strip_prefix(&self.root) {
+                        contents.insert(relative.to_path_buf(), bytes.clone());
+                        files.push((relative.to_path_buf(), full.clone()));
+                    }
+                }
                 for entry in self.files() {
                     if cancel.is_cancelled() {
                         return Err(Error::Cancelled);
                     }
                     let Ok(entry) = entry else { continue };
-                    if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    if !entry.file_type().is_some_and(|kind| kind.is_file())
+                        || shadow
+                            .as_ref()
+                            .is_some_and(|shadow| shadow.hides(&self.root, entry.path()))
+                    {
                         continue;
                     }
                     let Ok(full) = self.resolve(entry.path(), false) else {
@@ -812,7 +1025,8 @@ impl LocalTools {
                     .split(|c: char| c.is_whitespace() || c == ',' || c == '|')
                     .map(str::to_owned)
                     .collect();
-                let map = repomap::query(files.into_iter(), &terms, 12 * 1024, cancel)?;
+                let map =
+                    repomap::query_with(files.into_iter(), &contents, &terms, 12 * 1024, cancel)?;
                 Ok(if map.is_empty() {
                     format!(
                         "No files match (only {} source files are mapped); try other terms, grep or glob.",
@@ -822,7 +1036,9 @@ impl LocalTools {
                     map
                 })
             }
-            Call::Shell(_) | Call::Ask(_) | Call::Question(_) => unreachable!(),
+            Call::Shell(_) | Call::ShellTask(_) | Call::Ask(_) | Call::Question(_) => {
+                unreachable!()
+            }
         }
     }
 
@@ -905,9 +1121,6 @@ impl LocalTools {
         let seconds = match (args.timeout_seconds, args.timeout) {
             (Some(seconds), _) => seconds,
             (None, Some(millis)) => millis.div_ceil(1000),
-            (None, None) if crate::safety::verify::slow_command(&args.command) => {
-                SHELL_SLOW_TIMEOUT
-            }
             (None, None) => SHELL_TIMEOUT,
         };
         if args.command.trim().is_empty()
@@ -927,48 +1140,69 @@ impl LocalTools {
         } else {
             &self.shell
         };
-        let mut output = process::run_shell(
-            shell,
-            &self.root,
-            &args.command,
-            Duration::from_secs(seconds),
-            cancel.clone(),
-            self.progress.clone(),
-        )
-        .await?;
+        // Every command runs while it keeps working (output, CPU or I/O); `seconds` is
+        // how long this call waits before it goes on in the background (0050).
+        let (kind, wait) = if args.run_in_background {
+            (jobs::Kind::Detached, jobs::DETACHED_WAIT)
+        } else {
+            (jobs::Kind::Moved, Duration::from_secs(seconds))
+        };
+        let (id, ran) = self
+            .shell_job(shell, &args.command, kind, wait, &cancel)
+            .await?;
+        let mut output = match ran {
+            jobs::Foreground::Done(output) => output,
+            jobs::Foreground::Moved => {
+                return Ok(self.backgrounded(id, kind, wait, &args.command, "").await);
+            }
+        };
         let mut note = String::new();
-        if (output.code != Some(0) && !output.timed_out)
+        if args.run_in_background {
+            note.push_str(&format!(
+                "[note: the command ended within {}s, so it is not running in the background]\n",
+                wait.as_secs()
+            ));
+        }
+        if (output.code != Some(0) && !output.timed_out && output.stalled.is_none())
             && let Some(mismatch) = dialect_mismatch(shell, &output)
         {
             match retry_shell(shell, &args.command, mismatch) {
                 Some(other) => {
-                    output = process::run_shell(
-                        other,
-                        &self.root,
-                        &args.command,
-                        Duration::from_secs(seconds),
-                        cancel,
-                        self.progress.clone(),
-                    )
-                    .await?;
-                    note = format!(
+                    let retried = format!(
                         "[note: {} could not run this ({mismatch}); it was run read-only in {} instead. Write {} syntax next time.]\n",
                         shell.dialect(),
                         other.dialect(),
                         other.dialect()
                     );
+                    let (id, ran) = self
+                        .shell_job(other, &args.command, kind, wait, &cancel)
+                        .await?;
+                    output = match ran {
+                        jobs::Foreground::Done(output) => output,
+                        jobs::Foreground::Moved => {
+                            return Ok(self
+                                .backgrounded(id, kind, wait, &args.command, &retried)
+                                .await);
+                        }
+                    };
+                    note.push_str(&retried);
                 }
                 None => {
-                    note = format!(
+                    note.push_str(&format!(
                         "[hint: {} could not run this ({mismatch}). The shell tool runs {}; rewrite the command in that syntax.]\n",
                         shell.dialect(),
                         shell.describe()
-                    );
+                    ));
                 }
             }
         }
+        if let Some(reason) = &output.stalled {
+            note.push_str(&format!(
+                "[stalled: stopped for lack of any activity] {reason}\n"
+            ));
+        }
         Ok(ToolOutput {
-            failed: output.code != Some(0) || output.timed_out,
+            failed: output.code != Some(0) || output.timed_out || output.stalled.is_some(),
             content: format!(
                 "{note}exit_code={:?} timed_out={} truncated={} encoding_warning={}\nstdout:\n{}\nstderr:\n{}",
                 output.code,
@@ -982,8 +1216,115 @@ impl LocalTools {
         })
     }
 
+    /// Starts `command` in the job registry and waits for it in the foreground.
+    async fn shell_job(
+        &self,
+        shell: &Shell,
+        command: &str,
+        kind: jobs::Kind,
+        wait: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<(u32, jobs::Foreground)> {
+        let id = self.jobs.start(
+            shell.clone(),
+            self.root.clone(),
+            command.to_owned(),
+            kind,
+            // A longer wait than the idle limit says the command may stay quiet that long.
+            (kind == jobs::Kind::Moved).then_some(wait),
+            self.progress.clone(),
+            self.workspace.clone(),
+        );
+        let ran = self
+            .jobs
+            .wait_foreground(id, wait, kind == jobs::Kind::Detached, cancel)
+            .await?;
+        Ok((id, ran))
+    }
+
+    /// The result of a call whose command runs on in the background: what it printed
+    /// so far, and how its result reaches the model.
+    async fn backgrounded(
+        &self,
+        id: u32,
+        kind: jobs::Kind,
+        wait: Duration,
+        command: &str,
+        note: &str,
+    ) -> ToolOutput {
+        let (stdout, stderr, truncated, file) = self.jobs.snapshot(id).unwrap_or_default();
+        let (total, idle) = self.jobs.limits();
+        let idle = idle.max(wait);
+        let (head, user) = match kind {
+            jobs::Kind::Moved => (
+                format!(
+                    "[background #{id}] Still running after {}s, so it was moved to the background (not stopped). Full output: {file}\n\
+                     It runs on until it exits, shows no activity for {}s, or reaches {}s in total; its result is delivered to you automatically when it ends. \
+                     Do not poll or sleep: continue with other work, or end your reply and the task waits for it. Check or stop it with shell_task (id {id}).",
+                    wait.as_secs(),
+                    idle.as_secs(),
+                    total.as_secs()
+                ),
+                format!(
+                    "命令运行超过 {}，已转到后台继续（#{id}）；完成后会自动交给模型",
+                    process::clock(wait)
+                ),
+            ),
+            jobs::Kind::Detached => (
+                format!(
+                    "[background #{id}] Started in the background. Full output: {file}\n\
+                     It runs until stopped (shell_task stop, id {id}) or the session ends; it is not waited for when your turn ends, and if it exits on its own its result is delivered to you. Do not poll or sleep."
+                ),
+                format!(
+                    "已在后台启动（#{id}）：{}；停止前一直运行，会话结束时自动停止",
+                    crate::text::short(command, 60)
+                ),
+            ),
+        };
+        if let Some(progress) = &self.progress {
+            progress.notice(user).await;
+        }
+        ToolOutput {
+            content: format!(
+                "{head}\n{note}exit_code=None timed_out=false truncated={truncated} encoding_warning=false\nstdout:\n{}\nstderr:\n{}",
+                Self::quiet(&stdout),
+                Self::quiet(&stderr)
+            ),
+            failed: false,
+            ..Default::default()
+        }
+    }
+
+    async fn shell_task(&self, args: ShellTaskArgs) -> ToolOutput {
+        let missing = |id: u32| {
+            failed(format!(
+                "no background shell command #{id}; shell_task list shows them"
+            ))
+        };
+        let reply = |content: String| ToolOutput {
+            content,
+            ..Default::default()
+        };
+        match (args.action.as_str(), args.id()) {
+            ("list", _) => reply(self.jobs.list()),
+            ("output", Some(id)) => self.jobs.output(id).map_or_else(|| missing(id), reply),
+            ("stop", Some(id)) => self.jobs.stop(id).await.map_or_else(|| missing(id), reply),
+            ("output" | "stop", None) => failed(format!("shell_task {} needs id", args.action)),
+            (action, _) => failed(format!(
+                "unknown shell_task action {action}; use output, stop or list"
+            )),
+        }
+    }
+
     async fn grep(&self, args: GrepArgs, cancel: CancellationToken) -> Result<String> {
-        let rg = search::ripgrep().filter(|_| self.ripgrep);
+        let shadow = self.view.shadow();
+        // Past this many changed paths the exclusions would not fit a command line.
+        let rg = search::ripgrep().filter(|_| {
+            self.ripgrep
+                && shadow
+                    .as_ref()
+                    .is_none_or(|shadow| shadow.hidden.len() <= RG_EXCLUDES)
+        });
         let Some(rg) = rg else {
             let tools = self.clone();
             return tokio::task::spawn_blocking(move || tools.local(Call::Grep(args), &cancel))
@@ -993,8 +1334,36 @@ impl LocalTools {
         let base = self.search_base(args.path.as_deref())?;
         let options = Self::grep_options(&args);
         let target = self.shown(&base);
-        let lines = search::ripgrep_search(rg, &self.root, &target, &options, &cancel).await?;
-        Ok(search::grep_result(lines, true, &options))
+        let Some(shadow) = shadow else {
+            let found =
+                search::ripgrep_search(rg, &self.root, &target, &options, &[], &cancel).await?;
+            return Ok(search::grep_result(
+                found, true, &options, &self.root, &base,
+            ));
+        };
+        // rg searches the disk without what the layers changed; those are searched here.
+        // A base only the layers hold (a new directory) has nothing on disk for rg.
+        let mut found = if shadow.hides(&self.root, &base) || !base.exists() {
+            search::Found::default()
+        } else {
+            search::ripgrep_search(rg, &self.root, &target, &options, &shadow.hidden, &cancel)
+                .await?
+        };
+        let printed = !found.lines.is_empty();
+        let tools = self.clone();
+        let (root, layered_base) = (self.root.clone(), base.clone());
+        let layered = tokio::task::spawn_blocking(move || {
+            let options = Self::grep_options(&args);
+            search::grep_layers(&root, &layered_base, &options, &shadow, printed, &|path| {
+                tools.resolve(path, false).ok()
+            })
+        })
+        .await
+        .map_err(|err| Error::Tool(format!("grep task failed: {err}")))??;
+        found.lines.extend(layered);
+        Ok(search::grep_result(
+            found, true, &options, &self.root, &base,
+        ))
     }
 }
 
@@ -1012,6 +1381,7 @@ impl ToolExecutor for LocalTools {
                 schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
             }
         }
+        const IGNORED_PARAM: &str = "also search files .gitignore excludes (node_modules, build output; stops after 20 s); use only when needed";
         let mut definitions = vec![
             definition(
                 "read",
@@ -1047,8 +1417,13 @@ impl ToolExecutor for LocalTools {
             ),
             definition(
                 "glob",
-                "Find workspace files by glob; respects ignore files. A pattern without / matches file names anywhere (*.rs); with / it matches the path relative to path, and ** crosses directories (src/**/*.ts). At most 200 results.",
-                json!({"pattern":{"type":"string"},"path":{"type":"string","description":"directory to search (default: workspace)"}}),
+                "Find workspace files by glob; respects ignore files. A pattern without / matches file names anywhere (*.rs); with / it matches the path relative to path, and ** crosses directories (src/**/*.ts). At most 200 results. \
+                 To list what .gitignore excludes (e.g. build output to clean up), run git status --short --ignored or git clean -ndX first.",
+                json!({
+                    "pattern":{"type":"string"},
+                    "path":{"type":"string","description":"directory to search (default: workspace)"},
+                    "include_ignored":{"type":"boolean","description":IGNORED_PARAM}
+                }),
                 &["pattern"],
             ),
             definition(
@@ -1060,7 +1435,8 @@ impl ToolExecutor for LocalTools {
                     "path":{"type":"string","description":"file or directory to search"},
                     "ignore_case":{"type":"boolean"},
                     "context":{"type":"integer","minimum":0,"maximum":10},
-                    "files_only":{"type":"boolean","description":"list matching files only"}
+                    "files_only":{"type":"boolean","description":"list matching files only"},
+                    "include_ignored":{"type":"boolean","description":IGNORED_PARAM}
                 }),
                 &["pattern"],
             ),
@@ -1079,31 +1455,61 @@ impl ToolExecutor for LocalTools {
                 "shell",
                 &format!(
                     "Run a command in {} in the workspace directory; write that shell's syntax. A command plainly written for another installed shell (PowerShell cmdlets, cmd %VAR%) runs in that shell. Non-interactive: no pager, editor or credential prompt, colours off. \
-                     Default timeout 120 s (300 s for builds and test suites), at most 600 (timeout_seconds). Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). No background jobs. Host access is NOT sandboxed. \
+                     Waits up to timeout_seconds (default 120); a command still running then moves to the background, is not stopped, and its result is delivered to you when it ends. \
+                     Any command is stopped after 180 s without activity (output, CPU or I/O), or after timeout_seconds when that is longer (give ssh, sleep and other long-silent commands a long timeout_seconds), and at 3600 s in total. \
+                     run_in_background: true starts a command that keeps running (dev server, watcher) and returns after a few seconds with its id and first output; it runs until stopped or the session ends. \
+                     Long output keeps its head and tail (stdout ~30 KB, stderr ~10 KB). Host access is NOT sandboxed. \
                      Not for reading, searching or editing files.",
                     self.shell.describe()
                 ),
                 json!({
                     "command":{"type":"string"},
                     "description":{"type":"string","description":"what the command does, in a few words"},
-                    "timeout_seconds":{"type":"integer","minimum":1,"maximum":SHELL_MAX_TIMEOUT}
+                    "timeout_seconds":{"type":"integer","minimum":1,"maximum":SHELL_MAX_TIMEOUT},
+                    "run_in_background":{"type":"boolean"}
                 }),
                 &["command"],
             ),
             definition(
+                "shell_task",
+                "Check or stop shell commands running in the background (moved there at timeout_seconds, or started with run_in_background). \
+                 Each one's result is delivered to you automatically when it ends: do not poll, sleep or wait for it. \
+                 output: its state and latest output; stop: end it and its child processes; list: all of them.",
+                json!({
+                    "action":{"enum":["output","stop","list"]},
+                    "id":{"type":"integer","minimum":1}
+                }),
+                &["action"],
+            ),
+            definition(
                 "todo",
                 "Replace the task plan for multi-step work. Send the full list each time; at most one item in_progress. Mark items completed only after doing them, cancelled when dropped. \
-                 Items get ids todo-1, todo-2, ... unless given; depends lists ids that must finish first.",
+                 Items get ids todo-1, todo-2, ... unless given; depends lists ids that must finish first. \
+                 For a plan you will run with execute_plan: writes lists the only files the item may change (workspace-relative files, directories or globs, optionally file::symbol), \
+                 which execute_plan enforces per file; estimate_minutes is your estimate for the item.",
                 json!({"todos":{"type":"array","maxItems":50,"items":{"type":"object","properties":{
                     "content":{"type":"string"},
                     "status":{"enum":["pending","in_progress","completed","cancelled"]},
                     "priority":{"enum":["high","medium","low"]},
                     "id":{"type":"string"},
-                    "depends":{"type":"array","items":{"type":"string"}}
+                    "depends":{"type":"array","items":{"type":"string"}},
+                    "writes":{"type":"array","maxItems":64,"items":{"type":"string"}},
+                    "estimate_minutes":{"type":"number","minimum":0}
                 },"required":["content","status"],"additionalProperties":false}}}),
                 &["todos"],
             ),
         ];
+        if self.overlay().is_some() {
+            definitions.retain(|definition| definition.name != "shell_task");
+            if let Some(shell) = definitions.iter_mut().find(|d| d.name == "shell") {
+                if let Some(properties) = shell.schema["properties"].as_object_mut() {
+                    properties.remove("run_in_background");
+                }
+                shell.description.push_str(
+                    " In this overlay sub-task only read-only commands run (no redirects into files, file-changing commands, builds, generators or formatters), in the main workspace without your overlay changes, and nothing runs in the background.",
+                );
+            }
+        }
         if self.user_input.is_some() {
             definitions.push(definition(
                 "question",
@@ -1126,6 +1532,10 @@ impl ToolExecutor for LocalTools {
         matches!(name, "read" | "glob" | "grep" | "repo_map")
     }
 
+    fn jobs(&self) -> Option<Arc<jobs::Jobs>> {
+        Some(self.jobs.clone())
+    }
+
     fn metered(&self, _name: &str) -> bool {
         false
     }
@@ -1143,6 +1553,26 @@ impl ToolExecutor for LocalTools {
             };
             if matches!(call, Call::Ask(_) | Call::Question(_)) {
                 return self.ask(call, cancel).await;
+            }
+            if self.overlay().is_some() {
+                match &call {
+                    Call::Shell(args) if args.run_in_background => {
+                        return Ok(failed(format!(
+                            "{OVERLAY_SHELL_REFUSED} (run_in_background is off in overlay sub-tasks)"
+                        )));
+                    }
+                    Call::Shell(args) if !overlay_shell_allowed(&args.command) => {
+                        return Ok(failed(format!(
+                            "{OVERLAY_SHELL_REFUSED} (only read-only commands run here: no redirects into files, file-changing commands, builds, generators or formatters)"
+                        )));
+                    }
+                    Call::ShellTask(_) => {
+                        return Ok(failed(
+                            "shell_task is off in overlay sub-tasks: they run no background commands".into(),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             let effect = match &call {
                 Call::Write(args) => self.resolve(&args.path, true).map(Effect::Write),
@@ -1172,7 +1602,11 @@ impl ToolExecutor for LocalTools {
             // Images (sniffed by content) go to the model as native image parts.
             // Decoding/resizing/base64 runs off the async workers.
             if let Call::Read(args) = &call {
-                let path = self.resolve(&args.path, false).ok();
+                // A file an overlay changed is read from its layer, never as a disk image.
+                let path = self
+                    .resolve(&args.path, false)
+                    .ok()
+                    .filter(|path| !self.view.shadows(path));
                 let image = tokio::task::spawn_blocking(move || {
                     crate::model::images::read_output(path.as_deref())
                 })
@@ -1183,7 +1617,15 @@ impl ToolExecutor for LocalTools {
                 }
             }
             let result = match call {
-                Call::Shell(args) => return self.run_shell(args, cancel).await,
+                Call::Shell(args) => {
+                    let mut output = self.run_shell(args, cancel).await?;
+                    if self.overlay().is_some() {
+                        output.content.push('\n');
+                        output.content.push_str(OVERLAY_SHELL_NOTE);
+                    }
+                    return Ok(output);
+                }
+                Call::ShellTask(args) => return Ok(self.shell_task(args).await),
                 Call::Grep(args) => self.grep(args, cancel).await,
                 call => {
                     let tools = self.clone();
@@ -1216,6 +1658,7 @@ mod tests {
             stderr: stderr.into(),
             truncated: false,
             timed_out: false,
+            stalled: None,
             encoding_warning: false,
         }
     }

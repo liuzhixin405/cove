@@ -12,13 +12,13 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - 文件工具：`read` 读文件（默认 2000 行，可用 `offset`/`limit` 续读）或列目录，支持 GBK/GB18030；`write` 自动建父目录，覆盖前必须读过当前版本；`edit` 支持 `replace_all`、空白容错匹配和缩进映射；`grep`（有 ripgrep 时优先用 rg）和 `glob`（支持 `**`）。详见下文“文件、输出与失败语义”。
 - Shell 自动选择解释器：Windows 上优先 Git Bash，没有时用 PowerShell；工具描述和系统提示的环境行会写明实际方言。命令明显是给另一种已安装的 Shell 写的（PowerShell cmdlet、cmd 的 `%VAR%`、bash 循环）时改用那个 Shell 运行，审批也按同一方言判断。
 - `question` 交互式提问：一次可问多个问题，每个问题可带编号选项，按编号或自由文本回答（仅交互模式）；对带选项的问题用自己的话回答时，问卷就此结束，剩下的问题不会拿这段话去作答。
-- `todo` 任务计划清单：多步任务中维护待办项，支持 `priority`、`cancelled`、`id` 和 `depends` 依赖；同一时间至多一项进行中。
+- `todo` 任务计划清单：多步任务中维护待办项，支持 `priority`、`cancelled`、`id` 和 `depends` 依赖，以及给 `execute_plan` 用的 `writes`（写集合）和 `estimate_minutes`（预估分钟数），见“计划执行”；同一时间至多一项进行中。
 - 连续的只读工具调用（read/glob/grep/repo_map/web_fetch/web_search）并发执行（最多 8 个），结果顺序和日志顺序保持确定；写入和 Shell 仍逐个执行。
 - `repo_map` 仓库结构索引：列出源文件中的类型、函数和方法（签名和行号），按跨文件引用做 PageRank 排序；可按路径片段或标识符查询，并带出调用方和被调用方所在的文件。支持 Rust、Go、Python、TS/JS、C#、Java。解析结果按文件的修改时间和大小缓存，再次查询只解析变化的文件，未命中缓存的文件在多个线程上并行解析。
 - Shell 实时输出：命令运行时逐行显示 stdout 和 stderr（交互控制台里是 `│` 开头的暗色行，stderr 为红色；`-p` 和管道输出里分别以 `|`、`!` 开头），验证命令同样实时显示；结束后只再打印一行状态，不重复正文。
 - 完成前验证门禁：本轮通过文件工具改过文件时，模型宣布完成后自动运行检查命令；失败输出回给模型继续修，最多 3 轮。
 - `web_fetch` / `web_search`：抓取公网 https 页面（拒绝内网和本机地址），以及通过 Tavily、Brave 或 DuckDuckGo 搜索网页。
-- 子 Agent：六种内置类型（general/explore/plan/review/test/verify）加配置里的自定义类型（所有子 Agent 都被要求最终答复先给结论、控制在约 400 词内，因为答复会留在主 Agent 的上下文里；超过 6 KB 的部分存到磁盘；`explore` 默认用快速模型，同一次回复里的多个只读子 Agent 并行）；`execute_plan` 按 todo 依赖图并行执行计划；worktree 工具；回归验证工具；可持久化、可中断/暂存/唤醒的后台 Agent（各自独立的 git worktree）。详见下文“子 Agent、计划、Worktree 与回归验证”。
+- 子 Agent：六种内置类型（general/explore/plan/review/test/verify）加配置里的自定义类型（所有子 Agent 都被要求最终答复先给结论、控制在约 400 词内，因为答复会留在主 Agent 的上下文里；超过 6 KB 的部分存到磁盘；`explore` 默认用快速模型，同一次回复里的多个只读子 Agent 并行）；`execute_plan` 按 todo 依赖图并行执行计划（`isolation: "overlay"` 时各条目在私有覆盖层里改，最后统一合并）；worktree 工具；回归验证工具；可持久化、可中断/暂存/唤醒的后台 Agent（各自独立的 git worktree）。详见下文“子 Agent、计划、Worktree 与回归验证”。
 - 集中权限检查：`default`、`plan`、`auto`、`bypass` 四种模式（`ask`/`readonly` 仍可用作别名），交互中用 `/mode` 即时切换；按命令实际运行的 Shell 语法切分、给出“会改动什么”原因的风险判断；任何模式都拦截的灾难命令；`policies.json` 允许/拒绝/询问规则，审批时可“本项目总是允许”。
 - 任务守卫与完成闸门：重复失败熔断、循环检测、按有没有进展止损、收尾催促（空回复、只说不做、todo 未完成、完成自检）、读代码问答的引用核实、改动影响说明（改动符号的调用方和没有测试引用的调用方）、计划模式与 review/once 审阅流程、提交前验证、自审子 Agent、项目审查命令（审查有问题交回模型修，最多 3 轮）、每个任务的验收报告。
 - 有界模型调用次数、输出、上下文、请求空闲时间、任务与命令超时。
@@ -33,7 +33,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - 文件工具变更的 unified diff、检查点预览与确认回退；发现用户后续修改时拒绝覆盖。
 - 会话历史（标题、列表、详情、删除、清理、修复、Markdown 导出、`max_sessions` 自动清理）；按月费用账本与 `/status cost`；覆盖 Shell 改动、可再撤销的 Git 快照 `/undo`；BM25 记忆检索与注入、自动提取和 dream 整理。
 - MCP 客户端：stdio、Streamable HTTP 与旧版 HTTP+SSE 三种传输，支持 `extensions.mcp` 和顶层 `mcp_servers` 两种写法；连接后工具清单写进 `mcp` 工具描述，处理 `tools/list_changed`，断线自动重连一次，从不重试失败调用。
-- Skills：内置 12 个技能，多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；项目/全局带来源记忆的检索和增删改。
+- Skills：内置 13 个技能（`commit-messages`、`executing-plans`、`github-code-review`、`github-pr-workflow`、`karpathy-guidelines`、`performance-optimization`、`plan`、`requesting-code-review`、`safe-refactoring`、`spike`、`systematic-debugging`、`task-split`、`test-driven-development`；用户目录里的同名技能会覆盖内置版本，见“发现顺序”），多目录分层发现（项目覆盖用户、用户覆盖插件和内置），运行中新增或修改的技能无需重启即可使用，`paths` 按文件类型提示，`/<技能名>` 直接调用；自带技能市场（内置于程序、可离线使用，也可指向自建市场）；项目/全局带来源记忆的检索和增删改。
 - 同步生命周期 Hooks 与兼容 Claude Code 格式的 `hooks.json`（`PreToolUse` 可阻止工具调用）；插件（`manifest.json` 或 `.claude-plugin/plugin.json`，`commands/*.md` 斜杠命令、git 安装、市场搜索）和本地插件清单。
 - 项目信任：`.cove.json` 未信任时只应用安全字段，`/config trust` 后才应用 MCP、系统提示、校验命令等敏感字段。
 - `draw_image` 画 PNG、`browser` 用无头 Chrome/Edge 渲染网页或截图；浏览器实操验收、一个需求两个方案（`/race`）、统一变更集（`/changes`）和远程监督（`/remote`），见[外围工作流](#外围工作流racechangesremote)。
@@ -152,9 +152,12 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `max_background_agents` | 同时运行的后台 Agent 上限，1–16，默认 4 | 无 |
 | `regression_command` | `regression` 工具 `runner=command` 使用的命令，必须含 `{filter}` 占位符 | 无 |
 | `experimental_tools` | 默认 `false`；为 `true` 时启用 task/team/send_message/brief/sleep 等实验工具 | 无 |
+| `split_suggest_minutes` | 默认 5：`todo` 计划有 2 条以上未完成的条目、校准后的预估总时长超过这个分钟数、并且至少两条可以并行时，`todo` 的结果末尾提示模型按 `task-split` 技能先把拆分计划交给你确认，再 `execute_plan parallel=true isolation="overlay"`；同一个任务只提示一次，同一个会话里同一份计划只提示一次，条目都申报了 `writes` 的计划不提示，`execute_plan` 里的子 Agent 不提示；`0` 关闭。见“计划执行” | 无 |
+| `overlay_check` | 覆盖层计划的共享检查槽命令（只编译不测试），例如 `"cargo check"`、`"dotnet build --no-restore"`；不配（或写空字符串）则关闭。开启后 `isolation="overlay"` 的条目多一个 `check` 工具，见“覆盖层拆分”。项目配置里的需要信任 | 无 |
+| `mergiraf_path` | 合并时结构化合并用的 `mergiraf` 程序的绝对路径；不配时用 PATH 里的 `mergiraf`，都没有就跳过这一级。只在用户配置或已信任的项目配置里生效 | 无 |
 | `done_verify_commands` | 完成前检查命令列表；配置后替代自动推断，写空数组 `[]` 表示关闭门禁 | 无 |
 | `done_verify_auto` | 默认 `true`：按项目文件自动推断检查命令。`Cargo.toml` → `cargo check --all-targets`，`go.mod` → `go build ./...`，`tsconfig.json` 且已安装 typescript → `npx tsc --noEmit`，`package.json` 有 build 脚本且已安装依赖 → `npm run build --if-present`，`pyproject.toml`/`setup.py` → `python -m compileall -q .`，`*.sln`/`*.slnx`/`*.csproj` → `dotnet build` | 无 |
-| `done_verify_tests` | 默认 `true`：自动推断时再加上项目测试，并按本轮改动收窄范围：Cargo workspace 只测改动所在的包（`cargo test -p a -p b`），Go 项目（`go test`）只测改动的包目录，另有 `dotnet test`（只测引用了改动项目的测试项目，没有测试覆盖时改为构建改动的项目；此时不再单独运行推断出的 `dotnet build`，测试会先构建。测试项目按 csproj 里的测试包或 `IsTestProject` 认定，也认最近一级 `Directory.Build.props` 统一加测试框架、项目名以 Test/Tests 结尾的写法；`global.json` 选了 `Microsoft.Testing.Platform` 时写成 `dotnet test --project <路径>`）、Maven/Gradle（`mvn test -pl <模块> -am`、`gradle :<模块>:test`，有 wrapper 时用 wrapper）、`npm test`（有真实 test 脚本时）、`python -m pytest -q`（有 pytest 配置或 tests 目录时；只跑和改动模块同名的 `test_<名字>.py`/`<名字>_test.py`，同名的有多个时只取目录最近的：和改动文件共同的上级目录最深的优先，再比去掉 `tests`/`test` 后末尾相同的目录层数，一样近的都跑）。pytest 和 `go test` 失败时，用同一条命令在本任务改动前的代码上再跑一次（把本任务用文件工具改过的文件临时换回改前内容，跑完立刻换回；崩溃时 `/resolve` 恢复），只有改动后新出现的失败用例才算验证未通过；全是改动前就失败的用例时算通过，进度行写明“N 个失败的用例改动前就失败，与本次改动无关”，账本状态记 `preexisting`；有新失败时交给模型的详情里分开列出两类。拿不到完整的用例级结果（输出被截断、合计对不上、收集中断、编译失败）、失败的那次运行超过 120 秒、本任务新建了 `conftest.py`/`_test.go`、改过的文件不是 UTF-8 或已被删除时，不做这一步，只看退出码；本任务新建的测试文件里的失败一律算新失败。`cargo test`（默认遇到第一个失败的测试程序就停）、dotnet、npm、Maven/Gradle 只看退出码；提交门禁也只看退出码。本任务用文件工具新建、之后又删掉的文件（比如用 `rm` 删掉的临时脚本）不参与范围选择，项目原有、被删掉的文件仍然参与；改动只剩这类文件时不验证。同一任务中已通过的检查（模型自己运行的或提交门禁运行的）在之后没有文件改动时直接复用；`git add/commit/tag/push/fetch` 不使其失效 | 无 |
+| `done_verify_tests` | 默认 `true`：自动推断时再加上项目测试，并按本轮改动收窄范围：Cargo workspace 只测改动所在的包（`cargo test -p a -p b`），Go 项目（`go test`）只测改动的包目录，另有 `dotnet test`（只测引用了改动项目的测试项目，没有测试覆盖时改为构建改动的项目；此时不再单独运行推断出的 `dotnet build`，测试会先构建。测试项目按 csproj 里的测试包或 `IsTestProject` 认定，也认最近一级 `Directory.Build.props` 统一加测试框架、项目名以 Test/Tests 结尾的写法；`global.json` 选了 `Microsoft.Testing.Platform` 时写成 `dotnet test --project <路径>`）、Maven/Gradle（`mvn test -pl <模块> -am`、`gradle :<模块>:test`，有 wrapper 时用 wrapper）、`npm test`（有真实 test 脚本时）、`python -m pytest -q`（有 pytest 配置或 tests 目录时；只跑和改动模块同名的 `test_<名字>.py`/`<名字>_test.py`，同名的有多个时只取目录最近的：和改动文件共同的上级目录最深的优先，再比去掉 `tests`/`test` 后末尾相同的目录层数，一样近的都跑）。pytest 和 `go test` 失败时，用同一条命令在本任务改动前的代码上再跑一次（把本任务用文件工具改过的文件临时换回改前内容，跑完立刻换回；崩溃时 `/resolve` 恢复），只有改动后新出现的失败用例才算验证未通过；全是改动前就失败的用例时算通过，进度行写明“N 个失败的用例改动前就失败，与本次改动无关”，账本状态记 `preexisting`；有新失败时交给模型的详情里分开列出两类。拿不到完整的用例级结果（输出被截断、合计对不上、收集中断、编译失败）、失败的那次运行超过 120 秒、本任务新建了 `conftest.py`/`_test.go`、改过的文件不是 UTF-8 或已被删除时，不做这一步，只看退出码；本任务新建的测试文件里的失败一律算新失败。`cargo test`（默认遇到第一个失败的测试程序就停）、dotnet、npm、Maven/Gradle 只看退出码；提交门禁也只看退出码。本任务用文件工具新建、之后又删掉的文件（比如用 `rm` 删掉的临时脚本）不参与范围选择，项目原有、被删掉的文件仍然参与；改动只剩这类文件时不验证。同样不参与的还有被 git 忽略的文件（如 `.local/` 下的草稿）和文档（`.md`、`.markdown`、`.rst`、`.adoc`），任务收尾验证和提交门禁都一样：只改了这些文件时不运行检查，和代码一起改时也不会把范围扩大到全量测试；这条只针对自动推断的检查，`done_verify_commands` 配置的命令照常运行。回复结束后的自动验证会先打印一行“[验证] 回复已结束，正在自动运行检查，不需要你操作”，运行期间状态栏显示“回复已结束，自动验证中（无需操作） · <命令>”（提交门禁里是“提交前验证中 · <命令>”），不再停在“回复中”，和等待你回复的状态区分开。同一任务中已通过的检查（模型自己运行的或提交门禁运行的）在之后没有文件改动时直接复用；`git add/commit/tag/push/fetch` 不使其失效 | 无 |
 | `done_check` | `on`/`off`/`auto`（默认）：改过文件后，模型收尾前追问一次“需求是否全部完成”。`auto` 只在交互会话且非 Anthropic 供应商时开启 | 无 |
 | `cite_check` | `on`/`off`/`auto`（默认，等于 on）：没改文件的回答结束前，在本地核实回复里的 `path:line` 引用（文件在、行号不越界、旁边提到的符号在那一行附近），对不上时催模型更正一次，见“完成闸门” | 无 |
 | `done_self_review` | `off`（默认）/`on`/`auto`：自动验证通过后，让只读子 Agent 审阅本轮 diff（最多 40 KB），`auto` 只在改动不少于 40 行时启用。配置了 `review_commands` 时不运行 | 无 |
@@ -163,10 +166,11 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `review_when` | 项目审查在哪里运行：`done`（默认，任务收尾）、`commit`（提交前）、`both` | 无 |
 | `review_block` | 达到这个级别的问题才交回模型：`critical`、`high`（默认）、`medium`、`low`、`any`（等于 `low`）；更低的级别只列给你看 | 无 |
 | `review_max_rounds` | 收尾审查最多跑几轮（含第一轮），默认 3，范围 1–10 | 无 |
-| `review_timeout_seconds` | 每条审查命令的时限，默认 900 秒，最多 1800 | 无 |
+| `review_timeout_seconds` | 每条审查命令的总时限，默认 900 秒，最多 1800；运行中 180 秒没有任何活动（见 `done_verify_idle_seconds`）也会中止，审查记为跳过并写明原因 | 无 |
 | `review_instructions` | 项目审查说明文件（相对工作区，如 `eng/ai-review/SKILL.md`）：内置审查（`done_self_review`、`commit_review`）把它当作额外的审查标准，最多读 16 KB；输出格式仍按 cove 的要求 | 无 |
 | `workflow` | `direct`（默认）/`review`/`once`，含义见下文“计划模式与审阅流程” | 无 |
-| `done_verify_timeout_seconds` | 每条检查命令的时限；默认 120 秒，dotnet/npm/npx 为 300 秒 | 无 |
+| `done_verify_timeout_seconds` | 每条检查命令的总时限，默认 3600 秒，范围 1–86400。检查只要还在干活就不会因为时长被砍，这个值只用来兜住一直耗 CPU 的死循环 | 无 |
+| `done_verify_idle_seconds` | 检查命令完全没有活动多久就判定卡住并中止，默认 180 秒，范围 10–3600。活动指：有新输出、整个进程树的 CPU 时间在增加（每 5 秒超过 0.05 秒）、有读写、有进程启动或退出。Windows（Job 对象）和 Linux（`/proc`）支持；其他平台只按总时限。中止时写明运行了多久、多久没有活动、最后一次输出在多久前、仍在运行的进程（名称、pid、CPU 时间）和按工具给出的排查建议（如 `dotnet test` 的 `--blame-hang-timeout`），账本状态记 `stalled`，结果算“未验证”。验证期间状态栏显示已运行时长和“活跃”/“已 N 秒无活动” | 无 |
 | `shell` | Shell 工具的解释器：`auto`（默认；Windows 上 Git Bash 优先，否则 PowerShell；其他平台 bash 或 sh）、`bash`、`powershell`、`cmd`（仅 Windows），或解释器的完整路径。也可用环境变量 `COVE_SHELL` | `auto` |
 | `web_search` | `{"provider": "tavily"\|"brave"\|"duckduckgo", "api_key": "..."}`。未配置时依次看 `TAVILY_API_KEY`、`BRAVE_API_KEY`/`BRAVE_SEARCH_API_KEY`，都没有就用 DuckDuckGo | 无 |
 | `skills_registry` | 技能市场来源：`registry.json` 的 https 地址，或本地路径（`registry.json` 文件或包含它的目录）；不写时用程序内置的市场。见下文“技能市场” | 无 |
@@ -262,6 +266,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### Skills
 
 - **发现顺序**（后者覆盖同名前者）：内置技能（编译进二进制，随版本更新）→ 插件的 `skills/` → `~/.claude/skills` → `<data_dir>/skills` → 配置的 `extensions.skills` → 项目内从仓库根到 cwd 每一级的 `.claude/skills`、`.cove/skills`（越内层越优先）。cwd 以下的子目录不扫描，避免依赖包里的技能混进来。
+- **内置技能**（13 个）：`commit-messages`、`executing-plans`、`github-code-review`、`github-pr-workflow`、`karpathy-guidelines`、`performance-optimization`、`plan`、`requesting-code-review`、`safe-refactoring`、`spike`、`systematic-debugging`、`task-split`（预计超过 5 分钟、能拆出并行部分的任务：先分析影响范围，拆成写集合互不重叠的单元交给你确认，再用 `todo` 的 `writes`/`depends`/`estimate_minutes` 和 `execute_plan parallel=true isolation="overlay"` 并行执行、统一合并，最后统一构建、测试和审查一次）、`test-driven-development`。按上面的发现顺序，用户目录（如 `~/.claude/skills/task-split`）或项目里的同名技能会覆盖内置版本，这是预期行为；想用内置版本就删掉或改名同名的技能。
 - **运行中生效**：交互模式下每次读取输入前（至多每秒一次）检查这些目录和技能文件的修改时间，有新增、修改或删除就重新加载，补全列表和 `/<技能名>` 立即可用，不需要重启。重新加载失败时保留原来的技能并给出警告。
 - **文件格式**：`<目录>/<名字>/SKILL.md` 或 `<目录>/*.md`，可选 YAML frontmatter：`name`、`description`（展示时截到 120 字符）、`paths`（如 `"*.rs, src/**/*.ts"`）、`allowed_tools`（也接受 `allowed-tools`）、`steps`。没有 frontmatter 时名字取目录/文件名，描述取正文第一行。
 - **安全**：项目技能文件如果是指向项目外的链接，拒绝加载并警告；技能正文始终作为不可信数据交给模型，`allowed_tools` 只是收窄工具选择的提示，不授予任何权限。配置 `disabled_skills: ["名字"]` 可整体移除技能。
@@ -324,8 +329,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 项目信任与 `.cove.json`
 
 - 启动时读取 cwd 下的 `.cove.json`（必须是不超过 1 MiB 的普通文件，不跟随链接；格式错误只警告）。它合并到用户配置的顶层，选中的 profile 仍覆盖其上。
-- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、只做减法的 `done_verify_auto`/`done_verify_tests`（设为 `false`）、`commit_gate`/`commit_review`（设为 `off`）、`review_commands` 设为 `[]`、不比已生效值更松的 `review_block`（级别相同或更低）和 `review_max_rounds`（不多于已生效值，默认 3）、`review_when`、`review_timeout_seconds`、`review_instructions`、`done_verify_timeout_seconds`、`done_self_review`、`done_check`、`cite_check`、`change_impact`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`max_iterations`、`stall_rounds` 等限额。
-- **需要信任**的敏感字段：`auto`/`bypass` 权限、`system_prompt`、`mcp_servers`、`done_verify_commands`、`review_commands`（会运行仓库里的代码）、放松的 `review_block`/`review_max_rounds`、开启校验、`web_search`、`provider`、`memory_embedding`、`skills_registry`、单价等。未信任时启动会列出被忽略的字段；不支持的字段（如 `profiles`、`extensions`）单独列出。
+- **无需信任**即生效的安全字段：`model`、`model_fast`、`permission_mode` 为 `default`/`plan`、只做减法的 `done_verify_auto`/`done_verify_tests`（设为 `false`）、`commit_gate`/`commit_review`（设为 `off`）、`review_commands` 设为 `[]`、`overlay_check` 设为 `""`、不比已生效值更松的 `review_block`（级别相同或更低）和 `review_max_rounds`（不多于已生效值，默认 3）、`review_when`、`review_timeout_seconds`、`review_instructions`、`done_verify_timeout_seconds`、`done_verify_idle_seconds`、`done_self_review`、`done_check`、`cite_check`、`change_impact`、`thinking`、`effort`、`show_reasoning`、`disabled_skills`、`split_suggest_minutes`、`max_iterations`、`stall_rounds` 等限额。
+- **需要信任**的敏感字段：`auto`/`bypass` 权限、`system_prompt`、`mcp_servers`、`done_verify_commands`、`review_commands`（会运行仓库里的代码）、`overlay_check`（设为空字符串关闭时无需信任）、`mergiraf_path`、放松的 `review_block`/`review_max_rounds`、开启校验、`web_search`、`provider`、`memory_embedding`、`skills_registry`、单价等。未信任时启动会列出被忽略的字段；不支持的字段（如 `profiles`、`extensions`）单独列出。
 - `/config trust` 把项目根目录（git 根，否则 cwd）记为可信，并按**本次启动读到的内容**记录 `.cove.json` 的 sha256，写入 `<data_dir>/trusted_projects.json`；文件之后再改动就需要重新信任。重启后生效。可信项目等同于加了 `--trust-extensions`，自动验证门禁也通过 `cove::trust::is_trusted(cwd)` 查询同一份记录。按内容信任过的 `.cove.json` 里的 `review_commands` 运行时不再逐次审批（等于你批准了这条命令；否则 `-p`、`auto` 模式下 `bash x.sh` 这类命令会因为没人可问而不运行），用户配置里写的同样不审批。
 
 ## 会话、恢复与交互
@@ -355,7 +360,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/resolve <call-id> not-run` | 检查证据确认未执行后允许重试 |
 | `/config` | Skills、MCP、Hooks、插件及记忆管理；`/mcp`、`/plugins`、`/hooks`、`/memory` 是 `/config mcp` 等的简写 |
 | `/memory`（同 `/config memory`）`[list\|add [global] <文本>\|remove <id>\|search <查询>\|stats\|source <id>\|dream [status\|run\|backups\|show <备份>\|preview <备份> <id>\|restore <token>]]` | 记忆管理；`/config memory <JSON>` 仍按 memory 工具参数执行 |
-| `/status agents [stop\|park\|resume\|send\|merge\|discard <id\|main> …]` | 子 Agent 与主任务的生命周期：列表、中断、暂存、唤醒、发消息、合并/丢弃后台 Agent 的分支；`/status agents repair` 修复中断后遗留的回归验证临时还原 |
+| `/status agents [show\|stop\|park\|resume\|send\|merge\|discard <id\|main> …]` | 子 Agent 与主任务的生命周期：列表、查看完整报告、中断、暂存、唤醒、发消息、合并/丢弃后台 Agent 的分支；`/status agents repair` 修复中断后遗留的回归验证临时还原 |
 | `/exit` | 保存并退出；EOF（Ctrl+D）同样保存 |
 
 未知斜杠命令报错，不发送给模型。
@@ -363,6 +368,8 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 ### 交互控制台
 
 终端支持控制序列时，REPL 由一个常驻控制台接管键盘：输出显示在上方，输入行始终留在下方，任务运行时也一样。任务运行时，输入行上方的状态行显示转圈动画、当前在做什么、已用时间和 token 数，例如 `⠹ 运行 cargo test… 12s · ↑18.2k ↓1.1k tokens · 按两次 Esc 中断`。
+
+有转到后台或 `run_in_background` 启动的命令在跑时，状态行多一段 `后台命令 N 个`，空闲时也显示；本轮结束前等待后台命令时，状态行显示 `等待后台命令 · <命令> · <已运行时长> · 活跃`。
 
 状态行下面常驻一行用量，空闲和运行时都显示：`上下文 52.1k/200k（26%）· 本会话 1.2M tokens · $3.20`。
 - **上下文**：模型调用后取服务商报告的本次输入 token（含缓存读写），即模型实际读到的对话长度；启动、压缩、`/new`、`/resume` 之后历史变了，改用估算值（消息、系统提示和工具定义之和）。
@@ -402,7 +409,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **拒绝后任务继续**：拒绝一次调用不会结束任务。模型收到“用户拒绝了”和你的理由，被要求不要重试、也不要换个等价命令绕过，而是换别的办法或询问你；屏幕上这一步显示为 `└ 已拒绝：<理由>（已告诉模型）`。拒绝不算工具失败。后台 Agent 和远程审批的拒绝同样处理。
 - **补全**：Tab 补全斜杠命令、子命令（由 `/help` 的用法行自动生成，新增子命令无需另外登记）、技能名、插件命令和 `@路径`；候选列在输入行下方，上下键选择。
 - **历史**：提交的输入保存在 `<data_dir>/input_history.jsonl`（最多 1000 条），上下键翻阅，**Ctrl+R** 反向搜索（再按 Ctrl+R 找更早的匹配，Enter 采用，Esc 取消）。含 API key、token、密码等疑似密钥的输入（包括 `/config api_key …`、带账号的 base_url）不写入历史。
-- **多行输入**：Ctrl+J、Alt+Enter、Shift+Enter、Ctrl+Enter 插入换行；行尾输入 `\` 再回车也会换行；粘贴的多行文本保持原样，不会逐行提交。多行时上下键在行间移动。
+- **多行输入**：Ctrl+Enter、Shift+Enter、Alt+Enter 插入换行（Windows 上输入框提示 Ctrl+Enter）；macOS/Linux 的多数终端分不出 Ctrl+Enter 和 Enter，那里用 Ctrl+J（提示也写 Ctrl+J），Ctrl+J 在所有平台都可用；行尾输入 `\` 再回车也会换行；粘贴的多行文本保持原样，不会逐行提交。多行时上下键在行间移动。
 - **编辑键**：Ctrl+A/Ctrl+E 或 Home/End 到行首/行尾，Alt+B/Alt+F 或 Ctrl/Alt+←/→ 按词移动，Ctrl+W 或 Alt/Ctrl+Backspace 删前一个词，Ctrl+K 删到行尾，Ctrl+U 删到行首；Esc 清空输入，紧接着 Ctrl+Z 恢复；Ctrl+L 清屏。
 - **Agent 面板**：Alt+M 打开或关闭输入行下方的子 Agent / 后台 Agent 面板（Esc 也可关闭）。
 - **图片**：粘贴或拖入图片文件路径（PNG/JPEG/GIF/WebP，可多个、可带引号）会作为附件挂在下一条消息上；Windows 上 Alt+V 附加剪贴板里的图片（保存为数据目录 `clipboard/` 下的 PNG，图片发送时已写进会话，这些文件在下次粘贴时清理 7 天前的）；空行上 Alt+Backspace 移除最后一个附件。只有附件、没有文字时，按 Enter 让模型分析附件。
@@ -493,6 +500,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - 快照按原始字节存储（`* -text`、`core.autocrlf=false`），还原时一字不差，项目的 `.gitattributes` 和换行设置不会影响它；快照用的 Git 不读用户的全局和系统配置（`core.autocrlf`、`commit.gpgSign`、钩子模板等都不会带进来）。暂存时文件内容写进一个打包文件而不是逐个小文件，大项目第一次快照约快一半。
 - 每个项目保留最新 50 个、且不超过 30 天的快照：超过 60 个，或最旧的超过 33 天时修剪，后台 `git gc` 只回收 1 小时前的对象（单线程、不对大文件做增量压缩，避免占满机器）。任何项目修剪时，顺带删除最新快照也超过 30 天的其他项目（不再打开的项目不会自己修剪）；打开快照库时，若有超过 1 小时、尚未回收的 cruft pack，就在后台跑一次 `git gc`。`/init apply` 写入前也会拍一个快照。cove 退出时遗留的过期 index 锁会在下次快照前清除。
 - 快照还原**包括 Shell 改动**（被忽略和排除的目录除外）。没有 Git 快照时（未安装 Git、工作区是主目录或根目录、快照超时被关闭），`/undo` 退回文件工具回滚：只回退上一个任务文件工具的修改，**不含 Shell 改动**。
+- 转到后台的 Shell 命令（`timeout_seconds` 到点或 `run_in_background`）：命令之前的快照照常拍，`/undo` 到它会连同命令之后做的改动一起还原；但命令还在后台跑时，下一条命令之前的快照会包含它做了一半的改动，命令还在跑时 `/undo`，它可能继续改文件。命令结束时再把检查点标记一次"有 Shell 改动"。
 - 快照还原先预览：`/undo #n` 列出将要还原、重建、删除的文件；`/undo confirm` 执行最近一次预览，执行前复核工作区，与预览时不一致就拒绝。还原前先给当前状态拍快照，输出里给出它的编号，用 `/undo <hash>` 可以撤销这次还原。嵌套 Git 仓库不在快照里，保持原样。
 - 还原后之前的验证证据失效，需要重新检查。
 
@@ -607,7 +615,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 - **Shell 结果后的提示**：Shell 命令在做文件工具该做的事（`sed -i`、`cat >`/`tee` 写工作区文件、`sed -n` 读行区间）时，结果后附一条改用 edit/write/read 的提示；下载模型（`huggingface-cli`/`hf download`、`modelscope download`、`ollama pull`、`git lfs pull`，或 `curl`/`wget`/`aria2c` 下载 `.gguf`、`.safetensors` 等模型文件）时附下载规则（确认文件和大小、单个可续传传输、校验后改名、网络反复失败就停）；构建或测试命令的输出接到 `| tail`、`| head` 时提示不要截断实时输出。每类每个任务只提示一次。这些场景很少出现，所以不写在每次请求都发的系统提示里（见 [0044](optimizations/0044-slim-system-prompt.md)）。
 - **按有没有进展止损**（`stall_rounds`，默认 12；见 [0032](optimizations/0032-stuck-detection.md)）：一轮是一次模型回复加它的全部工具调用；只回文字、被收尾催促送回的回复，自动验证失败后交回模型的那次，和审查问题交回模型的那次，也各算一轮。一轮里只要有一项就算有进展：`edit`/`write` 写出了本任务没写过的内容（来回改成以前的样子不算）；成功的调用拿到了没见过的结果（按工具、主参数和结果判断，结果里的数字、时间、7 位以上的十六进制串忽略不计，所以只差耗时或端口的输出算同一个）；失败的调用出现了没见过的错误（按工具、错误的首末行和退出码判断，同一个错误换着命令出现不算）；自动验证的失败详情变了；交回的审查问题（按级别和文件）和上一次交回的不同；用户插话、回答了 `ask_user`、在止损询问里输入了指示。被熔断、循环检测、计划模式、拒绝规则拦下的调用，用户拒绝或无人值守时没执行的调用，以及只调 `todo`、`memory`、`skill` 的轮次，都不算进展。连续 6 轮（`stall_rounds` 的一半）没有进展时在下一次请求里提醒模型说明阻碍、换做法，缺外部条件就直接说明并结束；连续 12 轮时先对照工作区快照确认（shell 或子 Agent 改了文件就算有进展，重新计数；快照不可用时跳过确认）。确认后：交互会话显示反复出现的错误（次数只数标题所说的最近这几轮；被熔断、循环检测拦下的调用按机制归为一类，显示为“被拦下（guardrail）”“被拦下（loop detection）”）和改过的文件，询问 `1` 停下并总结（默认，直接回车）、`2` 换个思路再试（把试过的做法告诉模型，重新计数）、`3` 照原样继续（这个任务的阈值翻倍）或直接输入新的指示，三个选项各显示一行确认；`-p`、没有终端时和子 Agent 直接停下。停下时和用完调用次数一样，做一次不带工具的总结（附上 cove 本地记下的调用次数、反复出现的错误和改过的文件），任务记为中断，`/continue` 可以接着做、计数从零开始；交互会话在结束行 `■ 已停下 · 因连续 12 轮没有进展提前停止 · …` 之后只再打印一行怎么继续（不显示为错误，用完调用次数时也一样）；`-p` 照样打印 `[summary]`，末尾写“因连续 12 轮没有进展提前停止，任务没有完成”，退出码非零，诊断码 E5008。切换模型（快速模型升级到主模型）时重新计数。
 - **收尾催促**（临近调用次数上限时跳过）：空回复（最多 2 次）；最新 todo 清单仍有未完成项（1 次）；改过文件后的完成自检（`done_check`，1 次）。“宣布了下一步却没做”（中英文启发式）和“做了事却只回一句话”（共最多 2 次）只在交互会话启用。
-- **引用核实**（`cite_check`，默认开，交互会话和 `-p` 都生效）：本任务没改文件、回复去掉代码块后不少于 200 字符、而且讲的是本仓库的代码（至少一条引用能对上工作区文件，或反引号里至少 2 个词在工作区搜得到）时，结束前不调模型地核实回复里的引用。认识 `path:line`、`path:12-30`、`path#L12`、markdown 链接、`` `a.rs` 第 12 行 ``、`a.rs（第 12 行）`、`a.rs line 12`，以及跟在文件后面的“第 30 行”（同一段落、有小标题时同一小标题下）；代码块里的、URL 和 `host:port` 不算。路径可以是简写（`Distributor/Program.cs`）或工作区内的绝对路径，按忽略规则列出的文件查找。每条引用核对文件在不在、行号是否越界、同一分句里反引号中的符号是否在那一行前后 30 行内（忽略大小写、驼峰和下划线写法）。另外：回复说某个仓库路径里有某符号、但整个工作区都搜不到（说明“没有”的不算）。回复提到了仓库文件、本任务却一个读类工具都没调用、上下文的工具结果和你的消息里也没出现过这些文件时，记为“没读就讲代码”，只写进验收报告，不催模型。只是行号偏了时不调模型，显示 `[引用核实] a.rs:12 → 实际在第 19 行`（最多 3 条）；文件不存在、行号越界、符号对不上、仓库里搜不到时催模型一次，要求重新回答、不比原来长、只改错的地方；第二次仍对不上就显示 `[引用核实] 以下引用没能核实：…` 并正常结束。系统提示也要求问答的关键结论带 `path:line` 引用，行为和配置值以实际运行的代码为准。
+- **引用核实**（`cite_check`，默认开，交互会话和 `-p` 都生效）：本任务没改文件、回复去掉代码块后不少于 200 字符、而且讲的是本仓库的代码（至少一条引用能对上工作区文件，或反引号里至少 2 个词在工作区搜得到）时，结束前不调模型地核实回复里的引用。认识 `path:line`、`path:12-30`、`path#L12`、markdown 链接、`` `a.rs` 第 12 行 ``、`a.rs（第 12 行）`、`a.rs line 12`，以及跟在文件后面的“第 30 行”（同一段落、有小标题时同一小标题下）；代码块里的、URL 和 `host:port` 不算。路径可以是简写（`Distributor/Program.cs`）或工作区内的绝对路径，按忽略规则列出的文件查找。每条引用核对文件在不在、行号是否越界、同一分句里反引号中的符号是否在那一行前后 30 行内（忽略大小写、驼峰和下划线写法；分句说“没有”“未”“不在”“not”等否定时不查符号；另一条行号引用如 `:117`、不含字母的片段不当符号）。另外：回复说某个仓库路径里有某符号、但整个工作区都搜不到（说明“没有”的不算）。回复提到了仓库文件、本任务却一个读类工具都没调用、上下文的工具结果和你的消息里也没出现过这些文件时，记为“没读就讲代码”，只写进验收报告，不催模型。只是行号偏了时不调模型，显示 `[引用核实] a.rs:12 → 实际在第 19 行`（最多 3 条）；文件不存在、行号越界、符号对不上、仓库里搜不到时催模型一次，要求重新回答、不比原来长、只改错的地方；第二次仍对不上就显示 `[引用核实] 以下引用没能核实：…` 并正常结束。系统提示也要求问答的关键结论带 `path:line` 引用，行为和配置值以实际运行的代码为准。
 - **验证门禁补充**：自动推断的检查命令在项目受信任或 `auto`/`bypass` 模式下直接运行，否则照常审批（项目信任由项目设置提供，当前默认不信任）。模型在最后一次修改之后自己跑通过的同一条命令直接记为通过，不再重复运行。检查超时记为“未验证”，不当作失败打回。每条检查结果追加到 `<data_dir>/verify_ledger.jsonl`。
 - **提交前验证**：开启门禁时，模型通过 Shell 执行 `git commit` 前会先运行检查，并核对暂存内容与工作区一致、检查期间暂存区没变；要求先单独 `git add`，再单独 `git commit -m …`（不支持 `-a` 等改变暂存范围的参数）。不通过则不提交，结果交回模型。每份暂存内容（按 `git write-tree` 的树哈希）只检查一次：通过后，同样的内容再提交不重跑检查；失败或你拒绝了检查，同样的内容再提交时直接说明“已经检查过且未通过”，不再重跑也不再询问，并提示模型改动内容或向你说明情况，而不是反复重试。系统提示也告诉模型提交要单独一次调用，避免被门禁退回。
 - **每个审查点只有一个审查者**：收尾和提交前各有一个审查点。配置了 `review_commands` 时由项目审查命令审（`review_when` 决定在哪个点运行），内置的 `done_self_review` 和 `commit_review` 都不再运行；`review_when` 为 `done` 时提交前不再审查（收尾已经审过）。没有配置时按原来的开关用内置审查。
@@ -630,9 +638,14 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 - 文件改动上限 1 MiB（非 UTF-8 内容 4 MiB，例如 `draw_image`/`browser` 截图写出的 PNG）；`write`/`edit` 都经过检查点日志和漂移检查。
 - 临时文件原子替换不是与外部编辑器的原子 CAS；检查点也不是宿主沙箱，建议先在干净分支或临时副本上试用。
 - **搜索**遵守 ignore 文件（没有 Git 仓库时也遵守 `.gitignore`），不跟随目录链接，不检索 Git 元数据。`grep` 有 ripgrep 时调用 `rg`，否则用内置搜索，结果格式相同（`路径:行号:内容`，上下文行用 `-`，组之间用 `--`）；参数 `include`（文件名 glob）、`path`（文件或目录）、`ignore_case`、`context`（0–10）、`files_only`；最多 100 行，超出时提示“at least N more”。`glob` 的模式不含 `/` 时匹配文件名，含 `/` 时匹配相对 `path` 的路径，`**` 可跨目录；最多 200 条，超出时提示 `... and N more`。路径一律相对工作区、用 `/` 分隔。
+  - **被忽略的文件**：`glob` 和 `grep` 都有参数 `include_ignored`（默认 `false`）。设为 `true` 时不再应用 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 excludes，可以搜 `node_modules`、`bin`、`obj` 这类构建输出；`.git` 和 cove 数据目录照样跳过，范围仍限于工作区。这时搜索最多运行 20 秒。`glob` 和内置搜索的 `grep`（没装 ripgrep 时）每次最多遍历 50,000 个条目（默认模式也是）；用 ripgrep 的 `grep` 不数条目，只有 `include_ignored` 时的 20 秒和匹配行数上限。提前停止时结果末尾写明 `... search stopped after …; results are incomplete, narrow path or pattern`。`path` 直接指向被忽略的目录（如 `node_modules/foo`）时不需要这个参数，目录照搜，但其中再匹配别的 ignore 规则的文件（如 `*.log`）仍被跳过。默认模式结果为空、且搜索路径或它的上级目录里有 `.gitignore`/`.ignore`（或 `.git/info/exclude` 有规则）时，结果写成 `No files found (files excluded by .gitignore were skipped; include_ignored=true searches them)`，grep 同理；不会为此再遍历一次被忽略的目录。要列出被 `.gitignore` 排除了哪些内容（比如找可以清理的构建输出），`glob` 的说明建议先用 `git status --short --ignored` 或 `git clean -ndX`。界面上带这个参数的调用标题后面写“含被忽略的文件”。
 - **Shell 解释器**：Windows 上优先使用 Git for Windows 的 bash（按 git 所在目录和 Program Files 查找，跳过 WSL 的 bash 启动器），没有时用 PowerShell；其他平台用 bash，没有时用 sh。可用配置 `shell` 或环境变量 `COVE_SHELL` 指定（`auto`、`bash`、`powershell`、`cmd` 或解释器路径）。命令明显是给另一种已安装的 Shell 写的就改用那个 Shell 运行，审批按同一方言判断；在原 Shell 里失败且错误表明方言不对时，用能只读解释它的另一种 Shell 重跑一次，并在结果开头注明。工具描述和系统提示中的环境行都写明实际解释器。Hooks 和验证门禁命令仍按原方言运行（Windows 上为 PowerShell）。bash 和 PowerShell 在进程加入 Job Object 之后才从 stdin 收到脚本；cmd 用 `/d /s /c` 传入单行脚本（多行以 `&` 连接，`NoDefaultCurrentDirectoryInExePath` 避免先运行工作区里的同名 `.bat`）。
 - **非交互环境**：命令运行时设置 `GIT_TERMINAL_PROMPT=0`、`GIT_EDITOR=true`、`GIT_PAGER=cat`、`PAGER=cat`、`NO_COLOR=1`、`TERM=dumb` 等，不会等待编辑器、分页器或凭据输入；通过 `GIT_CONFIG_*` 关闭仓库配置的 `core.fsmonitor` 并设 `safe.bareRepository=explicit`（保留用户已有的 `GIT_CONFIG_COUNT` 条目）。
-- **Shell 时限**：`timeout_seconds` 默认 120 秒，最多 600 秒（也接受毫秒单位的 `timeout`）；可选 `description` 说明命令用途。
+- **Shell 时限**：`timeout_seconds` 是前台最多等多久，默认 120 秒，最多 3600 秒（也接受毫秒单位的 `timeout`）；可选 `description` 说明命令用途。到点时命令**不会被杀**，而是转到后台继续跑：工具立刻返回到目前为止的输出（同样按头尾截取），开头一行 `[background #N] Still running after 120s, …` 写明任务编号和完整输出文件；屏幕上打印 `命令运行超过 2m00s，已转到后台继续（#N）；完成后会自动交给模型`。所有命令（不只是构建和测试）只要还在干活就继续跑：180 秒没有任何活动（判断方式同 `done_verify_idle_seconds`）才中止，结果开头写明 `[stalled: …]` 和原因；`timeout_seconds` 大于 180 时，空闲上限取 `timeout_seconds`（`ssh` 远程任务、`sleep` 这类长时间没有动静的命令，给一个足够长的 `timeout_seconds`）；输出里出现"在等另一个进程的锁"（cargo、yarn、bazel 等，见锁等待）之后不再按空闲判卡住，只受总时限；总时长最多 3600 秒。
+- **后台命令**：转到后台的命令结束（正常退出、失败、卡住被中止、到总时限、被停止）后，结果在下一次模型调用前作为一条通知交给模型（命令、结果、耗时、完整输出文件、输出最后约 3 KB），屏幕上显示 `[后台] #N 已结束：退出码 0，用时 3m12s · <命令>`。模型准备结束本轮时，如果还有转到后台的命令在跑，任务先等它们结束再把结果交给模型继续（`-p` 也一样），收尾验证在这之后才运行；后台命令的结果和前台命令一样算作验证证据（成功结束的检查命令记为通过，收尾验证不再重跑；失败或被停止就不算；可能改文件的命令照样作废之前的通过记录），`shell_task` 既不作废证据也不算"做了改动"；等待时状态栏显示 `等待后台命令 · <命令> · <已运行时长> · 活跃`（或 `· 已 N 无活动`），输入文字会打断等待（命令继续跑，模型先回应插话，再次结束时再等），连按两次 Esc 停止等待、取消任务并结束这些命令的整个进程树。任务被取消、出错或因上限、没有进展停下时，仍在跑的转后台命令被结束，结果在下一个任务开头交付。完整输出边跑边写到 `<数据目录>/tool-outputs/shell/<会话 id>/<N>.log`（前台跑完的命令不写文件），每个文件最多 64 MiB，超出部分不再写入，文件末尾写明 `[cove: output past 64 MiB is not written here; …]`，结果里的文件路径后注明 `(cut at 64 MiB)`，最新输出仍可用 `shell_task output` 看；7 天后清理，会话结束时不删（之后还可能要看）；内存里只保留头尾和最近 16 KiB。编号在会话内跨 cove 进程连续：恢复会话时从目录里已有的最大编号往后排，已有的日志不会被覆盖。cove 重启后不会恢复后台命令。后台命令占着锁（例如后台的 `cargo test` 占着构建目录锁）、新命令在等它时，锁等待提示写明 `占用者是本会话的后台命令 #N`，不提议结束它。
+- **`run_in_background`**：`shell` 传 `run_in_background: true` 时直接在后台启动，最多等 5 秒（出现首批输出后再等 0.5 秒；提前结束则按普通结果返回），返回 `[background #N] Started in the background` 和初始输出，用于开发服务器、watch 这类一直运行的命令。这类命令不受空闲上限和总时限限制，本轮结束前不等它们，任务被取消时也不停止；它们自己结束时结果在下一次模型调用前交给模型。审批和普通 shell 命令相同。
+- **`shell_task`**：查看或停止后台命令。`action` 为 `output`（状态、完整输出文件和最后约 4 KB 输出）、`stop`（结束命令和它的子进程，等它退出）或 `list`（全部后台命令），`output`/`stop` 需要 `id`。模型看过已结束命令的 `output`/`stop` 结果后不再重复通知。不需要审批，只作用于本会话启动的命令。
+- **后台命令的生命周期**：后台命令属于启动它的会话或子 Agent。会话结束（`/new`、`/resume`、挂起主任务、退出 cove）时全部结束，并打印 `[后台] 会话结束，已停止 N 个后台命令`；子 Agent 和后台 Agent 结束时它启动的后台命令全部结束，结果末尾写 `[background commands stopped when this sub-agent ended: …]`（后台 Agent 写 `…when this agent ended: …`）。`/handoff` 不把后台命令交给新会话：交接时结束它们，打印 `[后台] 交接到新会话，已停止 N 个后台命令`。cove 正常退出（包括 Ctrl+C）时逐个结束整棵进程树。Windows 上即使 cove 被强制结束，Job 对象随句柄关闭也会结束整棵进程树；Unix 上 cove 被 `kill -9` 或收到 SIGHUP 后来不及清理时，后台命令的进程组不会被结束，可能留下运行中的服务。有后台命令在跑时，状态栏多一段 `后台命令 N 个`（空闲时也显示）。
 - **输出截取**：stdout 最多保留约 30 KB，stderr 约 10 KB，超出时保留开头 40% 和结尾 60%（在行边界切开），中间注明省略的字节数；管道始终排空，避免堵塞。Windows 上非 UTF-8 的输出行（控制台代码页 GBK）按 GBK 解码；仍无法解码时标记 `encoding_warning`，不假装无损。
 - Shell 结果包含退出码、stdout、stderr、超时和截断标记。运行中逐行实时显示，每个流最多实时显示 256 KiB，超出部分只保留在结果里。这是按行刷新的输出，不是 TUI 面板，进度条这类原地刷新的输出会显示成多行。
 - 写入或命令已经产生的副作用不会因取消或网络错误自动撤销。
@@ -651,6 +664,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 | `execute_plan`（见下文“计划执行”） | 一个需求拆成几块，有先后依赖 | 按依赖图并行，最多 `max_agents` 个（1–8，默认 4） | 主工作区，进入当前任务的检查点（`/diff`、`/undo`） |
 | 后台 Agent `agent {background: true}`（见下文“后台 Agent 与生命周期”） | 彼此独立、耗时长、想各自出一个分支的任务 | 同时最多 `max_background_agents` 个（1–16，默认 4），不阻塞主任务 | 各自的 git worktree 和分支，由你 `/status agents merge` 合并 |
 | `team_create`（实验工具，需 `experimental_tools: true`） | 一次建一组成员 | 复用计划执行器 | 同 `execute_plan` |
+| `execute_plan {isolation: "overlay"}`（见下文“覆盖层拆分”） | 预计超过 5 分钟、能拆成几块的改动，几块可能改同一个文件；子任务里不需要构建、测试或跑生成文件的命令 | 写集合不重叠的、同一文件不同 `::符号` 的并行，其余自动排成先后；最多 `max_agents` 个 | 每个条目先进自己的覆盖层，全部结束后统一合并进主工作区，作为当前任务的一个检查点（`/diff`、`/undo`） |
 
 模型在同一次回复里直接调用多个前台 `agent` 时，只读类型（`explore`、`plan`、`review` 和只读的自定义类型；带 `regression` 的 `verify` 除外）**同时**运行，最多 4 个；可编辑类型（`general`、`test`）依次运行。要并行改代码，用上面的方式。不需要记工具名，直接说明意图即可，例如：
 
@@ -695,6 +709,31 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 - **重试**：失败的条目带着失败原因重试一次。到达调用上限或被取消的不重试，保留部分结果。依赖失败的条目会跳过，并逐级传递。
 - **文件冲突**：并行条目通过文件写入认领表协调。同一个文件不会被两个正在运行的条目同时写：后来者等先认领的条目结束后再写；如果出现互相等待，后来者的写入直接失败，并说明冲突。Shell 命令改的文件不在认领范围内。
 - **结果**：返回每个条目的结果、exit、尝试次数和步数。已由 execute_plan 完成的条目不会重复执行；模型应据此更新 todo。
+- **写集合 `writes`**（[0054](optimizations/0054-task-split-skill.md)）：条目可以申报 `writes`（字符串数组：工作区相对路径或 glob；目录（结尾带不带 `/` 都行，比如 `src/agents`）表示它下面的所有文件；可以写成 `文件::符号`，强制时只看文件，符号只用来说明），也可以在内容前写前缀 `writes:a.cs,b.cs 标题`（逗号后不留空格，可以和 `depends:` 前缀前后连用）。只对申报了 `writes` 的条目生效，没申报的条目行为不变：
+  - **开始前的重叠检查**：`parallel=true` 时，两个互相没有依赖路径的条目都申报了写集合、而且有交集（同一个文件；glob 匹配到对方的文件或同一个已存在的文件；两个 glob 字面相同），整个计划在任何条目运行前被拒绝，结果写明是哪两个条目、哪些文件，提示加 `depends` 或合并成一个条目。两个不同的 glob 只能按已存在的文件判断，将来才新建的同一个文件看不出来。串行执行不做这项检查。
+  - **写入约束**：条目的子 Agent 用 `write`、`edit`（以及 `draw_image`）写写集合以外的文件时直接拒绝，结果是 `<path> is outside this plan item's writes (...); stop and report why it needs changing instead of editing it`。
+  - **命令约束**：条目里的 shell 命令是包安装、代码生成、数据库迁移、格式化或自动修复（`npm/pnpm/yarn install|ci|add`、`pip install`、`dotnet restore|ef|format|tool restore`、`cargo fmt|fix|add`、`go generate|get|mod tidy`、`protoc`、`buf generate`、`prisma generate|migrate`、`alembic upgrade`、`prettier --write`、`eslint --fix`、`black`、`ruff format`、npm 脚本名和 make/gradle/mvn/just/task 目标名里含 gen、generate、codegen、format、fmt、fix、migrate、install、proto、restore 等整词的（名字按 `:`、`-`、`_`、`.`、`/` 和大小写边界切成词后整词比较，连写的也认，比如 `reformat`、`lintfix`、`dbmigrate`、`mockgen`、`genproto`；`test:agents`、`prefix`、`prototype` 不算。格式化类的词紧挨着 check/verify（`format:check`、`check-fmt`、`fmtcheck`），或者参数带 `--check`/`--dry-run` 时，只算检查；其他生成类词带了 check 也照样拒绝，比如 `generate-and-check`；只看真正的脚本名和目标名，`-C dir`、`-pl module`、`--tests pattern` 这类选项值不看）等，按 shell 方言解析，`npx`/`pnpm exec` 等按它们运行的工具判断）时直接拒绝，说明这类步骤放到所有条目完成之后。列表外的生成命令靠下面的事后报告兜底。`run_in_background` 的 shell 和 `regression` 工具也直接拒绝：前者在这次调用返回之后还在改文件，查不到；后者会把文件换回基线再跑测试，同时运行的条目会看到。
+  - **shell 越界改动**：条目的 shell 命令前后各取一次工作区的 `git status`（只看未提交的改动和未跟踪的文件，按大小和修改时间比较），命令改了写集合以外的文件时不回滚，在这次 shell 的结果里提醒子 Agent，并记进条目的结果。同一时间别的条目用文件工具写的文件不算在这个条目上。命令运行期间没有别的条目在跑 shell、也没有没申报写集合的条目在并行时，改动都记在这个条目上，改到别的条目申报的文件时写明是谁的（`(changed by shell; in the writes of todo-2)`）；否则归属说不准，记为“不确定”（`(changed during its shell command; maybe by another item running then)`），不提醒子 Agent。不是 git 仓库时不做这项检查；`timeout_seconds` 到点转入后台的 shell 命令只检查到转入后台为止。
+  - **结果**：每个条目多两行 `written:`（实际写入的文件，含 shell 改的写集合内文件）和 `outside writes:`（被拒绝的写入和命令、shell 改的越界文件）；汇总后面列出所有越界。因越界写入或命令被拒绝而失败的条目不再重试（重试会被同样拒绝），需要改计划。
+- **预估和校准**：条目可以带 `estimate_minutes`（非负数，小数四舍五入到整分钟）。每次 `execute_plan` 结束时，取这次完成的、带预估的条目，把“预估之和、这些条目各自最后一次运行的耗时之和（并行时也按串行工作量相加）、条目数、是否并行”追加到 `<数据目录>/estimates.jsonl`（保留最近 500 条）；只做了规划、没有执行计划的任务不记录。校准系数是最近 20 条这类记录的“实际/预估”中位数，限制在 0.5–4，没有记录时为 1；旧版本按“从 todo 到任务结束”记下的记录不参与校准。校准后的预估超过 `split_suggest_minutes`（默认 5）、并且至少两条可以并行（互相没有依赖；都申报了写集合的，写集合不重叠）时，`todo` 结果末尾提示模型按 `task-split` 技能先把拆分计划交给用户确认，再执行；同一个任务只提示一次，同一个会话里同一份计划（按未完成条目的内容判断，不管顺序）只提示一次，所有未完成条目都申报了 `writes` 的计划（已经按技能拆好）不提示，`execute_plan` 里的子 Agent 不提示。提示推荐的执行方式是 `execute_plan parallel=true isolation="overlay"`。
+
+### 覆盖层拆分 `isolation: "overlay"`
+
+`execute_plan` 的 `isolation` 参数：`"main"`（默认，上面描述的行为，完全不变）或 `"overlay"`（[0053](optimizations/0053-overlay-split.md)）。
+
+- **前提**：每个条目都要申报 `writes`，否则直接拒绝，结果列出缺的条目。
+- **确认**：开始前在终端里列出条目、各自的写集合、依赖和自动加的依赖，串行和并行的校准预估（按 `estimates.jsonl` 校准），预计额外的 token 和费用（每个子 Agent 约 1 万 token），然后问：`1 确认`、`2 改为普通方式（isolation=main）`、`3 取消`。没有终端时（`-p`）：`auto` 和 `bypass` 权限模式直接执行，其他模式改按 `isolation="main"` 执行，结果开头注明原因。
+- **调度**：写集合在文件级不重叠的条目并行；同一个文件、双方都写了 `文件::符号` 而且符号不同的，也并行，最后合并；其他重叠（同一个符号、没写符号、glob）不拒绝，而是自动让后一个条目（按计划顺序）依赖前一个，后一个在前一个的层上改，结果的 `Implicit dependencies` 一段写明。显式 `depends` 同样叠层。并发上限沿用 `max_agents`。
+- **覆盖层**：每个条目一个私有层 `<数据目录>/overlays/<计划>/<条目>/`；它的读取依次看自己的层、依赖条目的层（按依赖顺序）、主工作区，写入只进自己的层，第一次写某个文件时保存这个文件当时的内容作为合并基线（只保存改过的文件）。条目运行期间主工作区不变。两个并行条目都改了同一个文件、第三个条目同时依赖它们时，第三个条目开始前先用合并引擎把两者的版本合成一个只读的组合层（`<条目>-combined/`），放在依赖层之上、自己的层之下，它和它的 `check` 都看到两边的改动；合不成时第三个条目不运行（`skipped: deferred: ...`，依赖它的条目一并跳过），留在待办里，等这次计划合并完再调用一次 `execute_plan`，它就在合并后的主工作区上运行。覆盖层条目之间不用文件认领：同一个文件的条目真正并行，冲突交给合并。
+- **条目里的限制**：`write`/`edit` 只能改写集合里的文件（0054 的约束照样生效）；shell 只放行只读命令，在主工作区运行，看不到层里的改动；构建、测试、重定向写文件、格式化、包安装、删除一律拒绝；`run_in_background` 和 `shell_task` 关闭。
+- **共享检查槽**：配置了 `overlay_check` 时，条目多一个 `check` 工具：排队（同一时刻只跑一个，几个 cove 窗口之间也排队），把“主工作区 + 依赖条目的层 + 自己的层”同步进 `<数据目录>/check-slots/<项目哈希>/tree/`，在那里运行配置的命令（按 0048 的规则判断卡住，总时限 1 小时），返回退出码和输出。同步的文件是 `git ls-files --cached --others --exclude-standard` 列出的（不是 git 仓库时按忽略规则遍历），之后每次只重写变化的文件、删掉不再存在的文件；命令留在槽里的构建产物不动，下一次检查是热缓存。编译失败不算失败的工具调用，条目可以改完再检查。
+- **合并**：所有条目结束后，按依赖顺序把完成的条目逐层合进主工作区；每个改过的文件调用一次三方合并（基线 = 这一层开始改它时看到的内容，当前 = 主工作区现在的内容，可能已有前面合进来的层和你中途的改动，本方 = 层里的结果），依次尝试直接写入、`git merge-file` 行级合并、锚点重放（`edit` 意图；只在行级合并有冲突时用，并且重放结果对当前内容的改动必须正好是这一层对基线的改动，改到当前内容里别人改过的行、或在别人插入的同一处再插一遍时不采用）、`mergiraf` 结构化合并（`mergiraf_path` 或 PATH 里有时）。写入都经过检查点，整体是当前任务的一个检查点，`/diff`、`/undo` 可用。合并结果是删除文件的，不执行，按冲突处理。
+- **冲突重做**：一个条目有冲突的文件时，它以主工作区的当前内容为基线**重做一次**：新的层，写集合只限冲突的文件，提示词里带原目标、冲突说明、当前内容里冲突附近的行和它原来的编辑；重做完再合并（`merged after redo`）。仍冲突、重做失败或重做没改这个文件的，**不写入**，带冲突标记的内容（没有标记时是条目的版本）存到 `<数据目录>/overlays/<计划>/conflicts/<条目>/<路径>`，结果里列出，交给主任务处理；这个条目不算完成，依赖它、也改了同一文件的后续条目的这个文件一并不写入。
+- **合并报告**：工具结果在条目报告之后列出每个文件一行：`direct write`（直接写入）、`anchor replay`（锚点重放）、`line merge`（行级合并）、`structural merge`（结构化合并）、`merged after redo`（重做后合并）、`conflict unresolved`（冲突未解决，附原因和副本位置）；`Outside declared writes`（层里超出申报的改动，以及被拒绝的写入和命令）；`Implicit dependencies`；没完成的条目。界面上同时显示一行摘要，例如 `[合并] 覆盖层合并进工作区：写入 3 个文件（直接写入 2，锚点重放 1，…）`；Agent 面板里每个条目的最后一步写着层里改过的文件数。
+- **中途停止**：只有层完整合并进去的条目才算完成，后续 `execute_plan` 只把这些当作已完成的依赖。条目运行中、重做中或 mergiraf 运行中按 Esc（或出错、到时限）时，工具结果仍然记录下来：已经写入的文件（同一个检查点，`/undo` 可撤销）、正在合并的条目、没合并的条目及其层的位置；没合并的条目留在待办里。合并时为新文件新建的目录也记在检查点里，`/undo` 后为空的会删掉。
+- **清理**：全部合并成功时删除这个计划的覆盖层目录；有失败或冲突的条目时目录保留到当前任务结束，结果里写明位置；计划中途停止、有已完成但没合并的条目时目录**不随任务结束删除**，供恢复：每个条目目录里的 `overlay.json` 列出改过的路径和内容对应的 `blobs/` 文件，编辑记录在 `intents.jsonl`；cove 启动时删除 7 天没动过的计划目录（和 `tool-outputs/` 同一时机、同一期限）。条目开始前合成组合层时按 Esc，条目记为取消，不是 deferred。
+- **之后**：合并完成后，主任务在主工作区跑一次生成类步骤（如果有）、构建、测试和审查（收尾验证照常进行），不自动提交。
+- mergiraf 每次结构化合并会在它的缓存目录（`merges/`）里留一份供 `mergiraf review` 用的记录；cove 从输出里读出记录 id，合并后删掉这份记录（Linux 上还把它的缓存目录指到临时目录）。
 
 ### Worktree
 
@@ -717,7 +756,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 - `runner=cargo` 运行 `cargo test <filter>`，按 libtest 的 `test … ok/FAILED` 行判断。
 - `runner=go` 运行 `go test -json -run <filter> <package>`。
 - `runner=command` 运行配置里的 `regression_command`。这种方式只看退出码，无法区分编译失败，结果里会写明。
-- 编译错误、跳过或不存在的测试、超时都记为 `unverified`，不算证据。测试本身必须写在没列出的文件里（如 `tests/`）。
+- 编译错误、跳过或不存在的测试、超时、卡住（180 秒没有任何活动）都记为 `unverified`，不算证据。`timeout_seconds` 是每次运行的总时限，默认 3600 秒，范围 10–3600。测试本身必须写在没列出的文件里（如 `tests/`）。
 - 临时还原前，先通过 Workspace 记下当前内容。还原期间，文件工具拒绝修改这些文件。进程崩溃后，`/resolve` 或 `/status agents repair` 会把仍是基线内容的文件恢复成当前内容；被别人改过的文件不覆盖，标记为不确定。
 - 证据是 `RegressionEvidence` 结构（status/reason/runner/selector/files/baseline/tests/before/after），可以通过 `AgentHub::evidence()` 提供给验收报告。
 
@@ -728,7 +767,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 - **隔离**：可编辑类型必须隔离（`isolation="worktree"`，默认）。每个 Agent 在 `<数据目录>/worktrees/<项目哈希>/<id>` 有自己的 worktree，分支为 `cove/agent-<id8>`，从当前 HEAD 创建。只读类型可以 `isolation="none"`，在主工作区只读运行，此时不提供 regression。
 - **持久化**：每个后台 Agent 的会话（消息、待执行调用、费用）都按会话存储的规则落盘：原子快照，执行前先记日志，不确定的调用从不重放。状态记录在 `<数据目录>/agents/<项目哈希>/`。
 - **状态机**：`running → paused / interrupted / finished / failed → discarded`，所有转换都经过类型化的状态机校验。进程重启后，原来 `running` 的 Agent 显示为 `interrupted`。
-- **通知**：Agent 结束时，父 Agent 会收到带最终报告的通知：任务进行中，在下一次工具结果里送达；任务之间，在 REPL 里打印一行。没有改动的 worktree 会标为“worktree has no changes”。
+- **通知**：Agent 结束时，父 Agent 会收到带最终报告的通知：任务进行中，在下一次工具结果里送达；任务之间，在下一个任务开头送达。没有改动的 worktree 会标为“worktree has no changes”。屏幕上：报告已经交给模型的，只打印一行 `后台代理 <id>（<类型>）已完成，报告已交给主任务；查看全文：/status agents show <id>`；还没交给模型的（任务之间结束），打印状态（原因、失败的工具调用、分支和提交）和完整报告。
 - **费用**：后台 Agent 的费用经 Ledger 记入父会话。
 - **审批**：后台 Agent 使用同一权限模式。default 模式下，审批请求排队，在任务之间到终端上逐个询问（REPL 空闲时会提示按 Enter 处理）；没有终端时直接拒绝，绝不静默批准。
 - **单次模式**：`-p` 单次模式结束前会等后台 Agent 跑完，最长等 `--timeout`，超时后中断它们（可恢复）。REPL `/exit` 会中断仍在运行的后台 Agent。
@@ -738,6 +777,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 | 命令 | 行为 |
 | --- | --- |
 | `/status agents` | 列出 id、类型、状态、原因、模型、时长、费用、任务、最后一步、分支及其是否有未提交改动 |
+| `show <id>` | 显示后台 Agent 的状态和完整报告 |
 | `stop <id>` | 中断：取消当前模型请求；进行中的工具调用按日志规则结束或标为不确定 |
 | `park <id>` | 暂存：先中断，再把 worktree 里未提交的改动提交到其分支，并释放名额 |
 | `park main` | 暂存前台会话（会话和检查点都保留，文件不回退），然后新建会话，可以开始别的任务 |
@@ -829,6 +869,7 @@ Git worktree 不是操作系统、网络或进程沙箱：竞速方案的 Agent 
 - 剪贴板图片（Alt+V）只支持 Windows；其他平台可以粘贴或拖入图片路径。
 - 不支持 MCP 的采样、交互 elicitation 和服务端后台任务（OAuth 登录见上文 `/mcp login`）；插件不加载原生动态库或可执行代码；`bedrock` 不支持 SigV4 签名（只支持 Bedrock API key）。
 - 写入模式的子 Agent 和后台 Agent 使用与主任务相同的权限判定，但不经过主任务的计划模式工具和提交前验证包装。
+- 后台 Shell 命令不能接收输入（没有 `write`），也不跨 cove 重启保留：cove 退出时随进程树结束；重启后，此前转到后台的命令的结果不会再交给模型。
 
 自动化测试只用模拟模型协议和临时项目中的真实文件/进程操作，不调用真实供应商的付费 API，也未完成各模型的兼容认证。交互控制台的显示在 Windows 伪终端里按字符核对过颜色和排版；其他终端（特别是旧版 conhost 字体）对 `●`、`│`、`└` 等符号的显示可能不同，转圈动画在无法确认支持盲文点字符的终端里改用 `- \ | /`。
 
@@ -840,7 +881,7 @@ Git worktree 不是操作系统、网络或进程沙箱：竞速方案的 Agent 
 
 [扩展集成测试](../tests/all/integrations.rs)覆盖官方 MCP SDK 对真实本地 stdio 服务的握手、分页、调用、资源、断线和进程树取消；Skills、隔离记忆、插件组合，以及 Hook 拒绝、中断和防重放。MCP 测试夹具需要 Python 3（Windows 为 `python`，其他平台为 `python3`）；运行时使用 MCP 本身不依赖 Python，只有所选服务需要其自身运行时。CI 显式准备 Python。
 
-[Agent 测试](../tests/all/agents.rs)在临时 git 仓库中用模拟模型覆盖以下场景：并行 `execute_plan` 的依赖顺序和结果传递；没有回归证据的 verify 记为失败；`regression` 先在基线上失败、再在当前代码上通过，并恢复文件；worktree 内的子 Agent 及合并回主工作区；实验工具开关和自定义类型；后台 Agent 的完整流程（启动 → 进程退出被中断 → 新进程中显示 interrupted → 带上下文恢复 → 通知 → 合并）；父任务在下一轮工具调用时收到完成通知；主任务暂存（park）后在新进程中带消息唤醒；同一批两个 explore 并行、general 在它们之后执行，explore 走快速模型并按快速模型的价格记账（会话和用量账本一致），trace 记实际模型和 agent id；超过 6 KB 的答复在父会话里被截断、全文存盘，`--explore-model main` 让 explore 改用主模型。
+[Agent 测试](../tests/all/agents.rs)在临时 git 仓库中用模拟模型覆盖以下场景：并行 `execute_plan` 的依赖顺序和结果传递；没有回归证据的 verify 记为失败；`regression` 先在基线上失败、再在当前代码上通过，并恢复文件；worktree 内的子 Agent 及合并回主工作区；实验工具开关和自定义类型；后台 Agent 的完整流程（启动 → 进程退出被中断 → 新进程中显示 interrupted → 带上下文恢复 → 通知 → 合并）；父任务在下一轮工具调用时收到完成通知；主任务暂存（park）后在新进程中带消息唤醒；同一批两个 explore 并行、general 在它们之后执行，explore 走快速模型并按快速模型的价格记账（会话和用量账本一致），trace 记实际模型和 agent id；超过 6 KB 的答复在父会话里被截断、全文存盘，`--explore-model main` 让 explore 改用主模型。覆盖层计划（`isolation: "overlay"`）：两个条目并行改同一个文件的不同函数、合并前主工作区不变、合并结果正确，验证在合并之后才跑；改到同一处时重做后合并，重做没解决时不写入并列出副本；同一处的条目自动叠层；条目里的构建和写盘 shell 被拒；没申报 `writes` 时拒绝；`-p` 下非 auto 模式退回 `main`；共享检查槽排队运行并看到各自的层。
 
 ```powershell
 cargo fmt --check

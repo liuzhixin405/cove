@@ -1,7 +1,7 @@
 # 0041 自动验证区分改动前就失败的测试
 
-- 状态：实施中
-- 日期：2026-11-24（创建）
+- 状态：已完成
+- 日期：2026-11-24（创建）；2026-11-25（完成）
 - 关联：0039（遗留第 2 条）、0037（发现这个问题的评测题 `pub-swe-sympy-24562`）、`regression` 工具（`src/agents/regression.rs`，同一套换回改前内容的机制）
 
 ## 背景
@@ -92,7 +92,7 @@
 - [x] 阶段 1：`task_baseline()` 和解析、比较函数，带单元测试
 - [x] 阶段 2：接入 `CommandVerifier::verify`，端到端测试
 - [x] 阶段 3：文档
-- [ ] 阶段 4：真实模型评测确认
+- [x] 阶段 4：真实模型评测确认
 
 ## 待决策
 
@@ -123,7 +123,10 @@
   - `failures_that_predate_the_task_do_not_fail_verification`（本机有 pytest 时运行）：临时 pytest 项目里 `test_legacy` 改动前就失败，任务改了 `calc.py` 但没弄坏 `add`：判"通过"，汇总写明改动前就失败的 `test_legacy`，`calc.py` 是改动后的内容，没有遗留换回日志；同一命令走提交门禁（不做基准）判"失败"；再把 `add` 改坏：判"失败"，详情分开列出新失败 `tests/test_calc.py::test_add` 和改动前就失败的 `tests/test_calc.py::test_legacy`，文件仍是改动后的内容。
 - `cargo test --release --no-fail-fast`：库 524 通过、2 失败、6 忽略；集成测试 240 通过、2 失败。4 个失败是 `session::snapshot::tests::a_task_takes_one_snapshot_plus_one_per_changing_shell_command`、`session::snapshot::tests::auto_deletes_only_files_the_snapshot_before_the_call_holds`、`integrations::cancelled_and_timed_out_mcp_operations_kill_owned_descendants`、`safety::files_changed_by_shell_are_progress_and_unchanged_ones_are_not`，都和快照、进程计时有关，不经过本文改动的代码；单独重跑 4 个全部通过（本机同时有其他编译在跑，负载高时这几项超时）。前一次全量运行里另有 `engine::progress::tests::the_same_error_from_different_commands_is_one_error` 失败，当时 `src/engine/progress.rs` 正被另一项改动修改，之后单独运行通过。
 - `cargo clippy --release --all-targets`：5 条警告，都是原有的（`app/console.rs` 2 条、`process.rs`、`safety/permission/policy.rs`、`tests/all/cli.rs`），没有新增。
-- 真实模型评测（待做）：见"验证"一节。
+- 真实模型评测：`evals/results/20261125-164807-bedrock.json`（全量 29 题，含 sympy 1 次，`--keep`）和 `evals/results/20261125-165758-bedrock.json`（sympy 3 次，`--keep`），构建 `0.8.0+250359b4ace5`，Bedrock Opus（`model_fast=off`）。`pub-swe-sympy-24562` 共 4 次，4/4 通过：
+  - 4 次的 stderr 都是同样的顺序：`pytest -q sympy/core/tests/test_numbers.py → 失败`，接着 `改动前基准 … → 1 个用例失败`，最后 `→ 通过（1 个失败的用例改动前就失败，与本次改动无关）`；验收报告里改动前就失败的用例是 `sympy/core/tests/test_numbers.py::test_numpy_to_float`。
+  - 4 次的工作区改动都只有 `sympy/core/numbers.py` 和 `sympy/core/tests/test_numbers.py`，没有再去改 `sympify.py` 等无关文件。
+  - 每次平均 4 次模型调用、约 $0.06；基线（`20261124-190241`，构建 `0.7.0+27947ada177d`）这题是 16 次调用。
 
 ## 遗留
 

@@ -63,6 +63,10 @@ const BUILTIN: &[(&str, &str)] = &[
         include_str!("../../assets/skills/systematic-debugging/SKILL.md"),
     ),
     (
+        "task-split",
+        include_str!("../../assets/skills/task-split/SKILL.md"),
+    ),
+    (
         "test-driven-development",
         include_str!("../../assets/skills/test-driven-development/SKILL.md"),
     ),

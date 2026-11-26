@@ -1,7 +1,7 @@
 # 0043 `-p` 下 `python -c` 等内联代码的审批
 
-- 状态：实施中
-- 日期：2026-11-24（创建）
+- 状态：已完成
+- 日期：2026-11-24（创建）；2026-11-25（完成）
 - 关联：0024（没有终端时拒绝并交回模型）、0034（auto 下可撤销的删除）、0038（被拒后运行本任务写的脚本也要批准）
 
 ## 背景
@@ -108,7 +108,7 @@
 - [x] 阶段 2：`shell.rs` 记录定界符引号；`risk.rs` 原因调整和 `inline_only`
 - [x] 阶段 3：`permission.rs` 放行与收紧、说明文字；集成测试
 - [x] 阶段 4：文档
-- [ ] 阶段 5：真实模型评测
+- [x] 阶段 5：真实模型评测
 
 ## 待决策
 
@@ -150,11 +150,16 @@
 
 ### 评测
 
-未跑（需要真实模型）。要确认的：Bedrock（Opus）`many-small-failures`、`review-loop-wrong-finding` 各 `--repeat 3`：stderr 里没有 `python -c`/`python - <<` 的"未执行"，模型没有为了验证去改测试文件，判定通过率不低于之前；再全量跑 1 次确认没有退步，并看有没有被拒之后出现内联代码的"未执行"（这是预期的收紧）。
+2026-11-25，构建 `0.8.0+250359b4ace5`，Bedrock Opus（`model_fast=off`）：
+
+- `many-small-failures`、`review-loop-wrong-finding` 各 `--repeat 3 --keep`（`evals/results/20261125-165758-bedrock.json`）：6/6 通过。
+  - `many-small-failures` 3 次 stderr 里都没有"未执行"；工作区只改了 `report.py`，没有改测试文件。
+  - `review-loop-wrong-finding` 3 次各有 1 条"未执行"，都是同一条：`printf '…def count_items…' >> pricing.py && python -c "import pricing; …"`（任务里第一次 shell 调用，之前只有一次 `read`）。它用 shell 重定向往项目源码追加内容，按本文规则带重定向的命令本来就要批准，拦下的原因是 `>> pricing.py`，不是 `python -c`，属于预期行为。模型随后改用 `edit` 完成任务，工作区只改了 `pricing.py`，没有改测试文件。
+  - 没有出现 `python -c` / `python - <<` 单独被拦的"未执行"。
+- 全量 29 题（`evals/results/20261125-164807-bedrock.json`，对比 `20261124-190241`）：29/29 通过（`impact-review-commits` 首次判定失败是判定误判，修正判定后重新判定通过，见 0044），没有退步。
 
 ## 遗留
 
 - PowerShell here-string（`@'…'@ | python -`）和管道喂给解释器的字面代码（`cat <<'PY' | python -`）仍要批准，理由见"范围"。
 - 内联代码的内容不扫描，`python -c "import shutil; shutil.rmtree(…)"` 在 `auto`、没被拒的任务里会直接运行，这和 `auto` 下运行模型写的脚本一致；有终端时想审查可以用 `default`。
 - 0038 的遗留（拒绝规则和灾难命令的 `Deny` 不置位"被拒"标记）同样适用于内联代码。
-- 评测结果回填后把状态改为"已完成"，并把索引里 0043 的状态从"草稿"更新。

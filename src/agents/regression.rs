@@ -104,7 +104,7 @@ pub fn definition() -> ToolDefinition {
             "filter":{"type":"string","description":"Test name filter (cargo) or -run regex (go)"},
             "package":{"type":"string","description":"Go package, e.g. ./internal/foo (default ./...)"},
             "baseline":{"type":"string","description":"checkpoint (default) or git:<rev>"},
-            "timeout_seconds":{"type":"integer","minimum":10,"maximum":1800}
+            "timeout_seconds":{"type":"integer","minimum":10,"maximum":3600}
         },"required":["files","runner","filter"],"additionalProperties":false}),
     }
 }
@@ -215,7 +215,7 @@ fn summary(run: &Run) -> RunSummary {
     };
     RunSummary {
         exit_code: run.output.code,
-        timed_out: run.output.timed_out,
+        timed_out: run.output.timed_out || run.output.stalled.is_some(),
         failed: names(false),
         passed: names(true),
         output_tail: tail(
@@ -231,6 +231,13 @@ fn compare(runner: Runner, before: &Run, after: &Run) -> (EvidenceStatus, String
     for (label, run) in [("baseline", before), ("current", after)] {
         if run.output.timed_out {
             return (Unverified, format!("{label} run timed out"), Vec::new());
+        }
+        if let Some(reason) = &run.output.stalled {
+            return (
+                Unverified,
+                format!("{label} run stalled and was stopped: {reason}"),
+                Vec::new(),
+            );
         }
         if build_failed(runner, &run.output) {
             return (
@@ -387,10 +394,11 @@ impl Regression {
                 .line(format!("[regression:{label}] $ {command}"), false)
                 .await;
         }
+        // Tests run while they keep working; `timeout` only bounds the total.
         let output = process::shell_live(
             &self.root,
             command,
-            timeout,
+            process::Limit::watched(timeout, process::IDLE_LIMIT),
             cancel.clone(),
             self.progress.clone(),
         )
@@ -451,7 +459,7 @@ impl Regression {
             return failed("regression verification needs a workspace journal here".into());
         };
         let _ = workspace.note_shell();
-        let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(300).clamp(10, 1800));
+        let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(3600).clamp(10, 3600));
         if let Err(err) = workspace.swap_in(baselines) {
             return match err {
                 Error::Uncertain(_) => Err(err),
@@ -530,6 +538,7 @@ mod tests {
             stderr: stderr.into(),
             truncated: false,
             timed_out: false,
+            stalled: None,
             encoding_warning: false,
         }
     }

@@ -15,6 +15,40 @@ use serde::Serialize;
 
 use crate::domain::{Error, Result};
 
+/// Appends `bytes` to `path` at `offset`, its valid length: anything after it (an append
+/// nobody confirmed) is cut off first. Syncs and returns the new length. For logs whose
+/// valid length an atomically written file records.
+pub fn append_at(path: &Path, offset: u64, bytes: &[u8]) -> Result<u64> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| io_context("open", path, err))?;
+    let length = file
+        .metadata()
+        .map_err(|err| io_context("inspect", path, err))?
+        .len();
+    if length < offset {
+        return Err(Error::Workspace(format!(
+            "{} is shorter than recorded",
+            crate::paths::display(path)
+        )));
+    }
+    if length > offset {
+        file.set_len(offset)
+            .map_err(|err| io_context("truncate", path, err))?;
+    }
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|err| io_context("seek", path, err))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_data())
+        .map_err(|err| io_context("append", path, err))?;
+    Ok(offset + bytes.len() as u64)
+}
+
 /// Largest JSON state file read or written.
 pub const STATE_LIMIT: u64 = 32 * 1024 * 1024;
 
