@@ -291,7 +291,7 @@
 - 同一批两个 explore 和一个 general：两个 explore 并行（用模拟模型的时间戳确认重叠），general 在它们之后执行。
 - 模拟子 Agent 返回 20 KB 结论：父会话里的工具结果不超过上限，全文文件能读到。
 
-**真实模型评测**（`evals/cases/`，格式同 [evals/README.md](../../evals/README.md)）
+**真实模型评测**（`evals/cases/`，格式同本机 `evals/README.md`，不在仓库里）
 
 新增三个用例。每个都要先写 `selftest.py`，`--self-test` 通过后才用。
 

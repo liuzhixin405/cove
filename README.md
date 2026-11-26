@@ -190,7 +190,7 @@ Get-Content error.log | cove -p "这个报错是什么原因"   # 把管道内�
 - [架构设计](docs/design.md)：模块划分与实现原理
 - [性能说明](docs/performance.md)：提速机制与测量口径
 - [优化记录](docs/optimizations/README.md)：每次改动要解决什么、怎么验证的
-- [真实模型评测](evals/README.md)：用真实模型跑一组任务，衡量改提示词、换模型前后的效果
+- 真实模型评测（本机 `evals/`，不进仓库）：用真实模型跑一组任务，衡量改提示词、换模型前后的效果
 - [开发须知](AGENTS.md)：改代码前必读，禁止的写法和踩过的坑
 
 MIT License

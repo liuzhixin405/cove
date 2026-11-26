@@ -141,3 +141,4 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 | [0055](0055-cite-negation-and-table-wrap.md) | 引用核对不误报否定句；表格单元格不在单词中间折行 | 已完成 |
 | [0056](0056-background-notice-once.md) | 后台代理结束通知不重复打印报告、改为中文；`/status agents show` 查看完整报告 | 已完成 |
 | [0057](0057-cite-line-refs-not-anchors.md) | 引用核对不把另一条行号引用当成锚点 | 已完成 |
+| [0058](0058-evals-local-only.md) | 评测工具留在本机，`evals/` 不进仓库 | 已完成 |

@@ -2,5 +2,4 @@
 *.log
 .cove/
 .claude/
-__pycache__/
-/evals/results/
+/evals/
