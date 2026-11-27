@@ -24,18 +24,20 @@ use shell::Dialect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
-    /// Allows reads, read-only shell, local git and writes inside the project (the
-    /// Copilot-style default); asks for writes outside it, network, extension
-    /// processes and shell lines that are not read-only.
+    /// Allows reads, read-only and build/test shell lines, local git and writes inside the
+    /// project; asks for writes outside it, extension processes, network beyond web reads
+    /// and shell lines that write, delete, push, install, change system settings, end
+    /// processes or run unreadable code.
     #[value(alias = "ask")]
     Default,
     /// Read-only: file reading/search and read-only shell lines; everything else denied.
     #[value(alias = "readonly")]
     Plan,
-    /// Also allows build/test shell lines, network tools, edits inside the project and
+    /// Also allows the rest of the network, trusted extension processes, inline code and
     /// deleting project files the snapshot before the call holds (`/undo` restores them).
     Auto,
-    /// Allows everything except deny rules and catastrophic commands.
+    /// Allows everything except deny rules and catastrophic commands; the default when
+    /// neither `--permission` nor `permission_mode` is set.
     Bypass,
 }
 

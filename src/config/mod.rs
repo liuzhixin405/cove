@@ -91,7 +91,7 @@ pub struct Cli {
     pub base_url: Option<String>,
     #[arg(long, default_value = ".", value_name = "DIRECTORY")]
     pub cwd: PathBuf,
-    /// default asks; plan is read-only; auto also allows build/test and in-project edits; bypass allows all but deny rules [default: default].
+    /// bypass (default) allows all but deny rules and catastrophic commands; default asks for writes outside the project, extension processes, network beyond web reads and shell lines that write, delete, push, install, change system settings, end processes or run unreadable code; auto also allows the rest of the network, trusted extensions, inline code and undoable deletions; plan is read-only [default: bypass].
     #[arg(long, value_enum)]
     pub permission: Option<Mode>,
     /// Model requests per task [default: 20].

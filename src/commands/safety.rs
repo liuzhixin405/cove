@@ -135,7 +135,7 @@ fn status(app: &Application) -> String {
             plan.decision
         ));
     }
-    text.push_str("模式：default（逐项询问）、plan（只读）、auto（构建/测试、项目内编辑、联网）、bypass（除 deny 规则外全部放行）\n工作流：direct、review（每个任务先做计划）、once（下一个任务先做计划）\n切换：/mode <模式> [save]\n");
+    text.push_str("模式：bypass（默认，除 deny 规则和灾难命令外全部放行）、default（读文件、只读命令、构建测试、项目内编辑、网页读取直接做；会改文件或删除的 Shell 命令、写项目外的文件、扩展进程、写操作的联网、推远端、装软件、改系统设置、结束进程、执行读不到内容的代码才问你）、auto（default 之外再放行其余联网、已信任的扩展进程、内联代码和能用 /undo 恢复的删除）、plan（只读）\n工作流：direct、review（每个任务先做计划）、once（下一个任务先做计划）\n切换：/mode <模式> [save]\n");
     text
 }
 
