@@ -65,20 +65,28 @@ pub struct Command {
     pub prompt: String,
 }
 
+const MANIFESTS: [&str; 2] = ["manifest.json", ".claude-plugin/plugin.json"];
+
 /// Reads `manifest.json`, else `.claude-plugin/plugin.json`.
 fn read_manifest(dir: &Path) -> Result<Manifest> {
-    for file in ["manifest.json", ".claude-plugin/plugin.json"] {
+    for file in MANIFESTS {
         let path = dir.join(file);
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             let text = read_text(&path, 256 * 1024)?;
             return serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|err| {
-                Error::Tool(format!("parse {}: {err}", crate::paths::display(&path)))
+                Error::Tool(format!("解析 {} 失败：{err}", crate::paths::display(&path)))
             });
         }
     }
     Err(Error::Tool(
-        "no manifest.json or .claude-plugin/plugin.json".into(),
+        "没有 manifest.json 或 .claude-plugin/plugin.json，不是 cove 插件".into(),
     ))
+}
+
+fn has_manifest(dir: &Path) -> bool {
+    MANIFESTS
+        .iter()
+        .any(|file| std::fs::symlink_metadata(dir.join(file)).is_ok_and(|m| m.is_file()))
 }
 
 #[derive(Default)]
@@ -114,6 +122,13 @@ impl Plugins {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // A tool directory parked here is not broken: say how to silence it (0063).
+            if !has_manifest(&dir) {
+                plugins.warnings.push(format!(
+                    "{dir_name} 不是 cove 插件（没有 manifest.json 或 .claude-plugin/plugin.json），已跳过；不想看到这条提示，就把它移出 plugins 目录，或把目录名改成以 .disabled 结尾"
+                ));
+                continue;
+            }
             match read_manifest(&dir) {
                 Ok(mut manifest) => {
                     if manifest.name.trim().is_empty() {
@@ -137,6 +152,9 @@ impl Plugins {
                         dir,
                         manifest,
                     });
+                }
+                Err(Error::Tool(message)) => {
+                    plugins.warnings.push(format!("插件 {dir_name}：{message}"))
                 }
                 Err(err) => plugins.warnings.push(format!("插件 {dir_name}：{err}")),
             }
@@ -462,6 +480,26 @@ mod tests {
         assert_eq!(expand(&prompt, " src/a.rs "), "Review src/a.rs now");
         assert_eq!(expand("Plain", "x"), "Plain\n\nArguments: x");
         assert_eq!(parse_command("# Title\nbody").0, "Title");
+    }
+
+    #[test]
+    fn a_directory_without_a_manifest_is_skipped_with_a_hint() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("plugins");
+        std::fs::create_dir_all(root.join("docref/bin")).unwrap();
+        std::fs::create_dir_all(root.join("broken")).unwrap();
+        std::fs::write(root.join("broken/manifest.json"), "{").unwrap();
+        let plugins = Plugins::scan(data.path());
+        assert!(plugins.list.is_empty());
+        let [broken, docref] = plugins.warnings.as_slice() else {
+            panic!("{:?}", plugins.warnings);
+        };
+        assert!(
+            docref.starts_with("docref 不是 cove 插件") && docref.contains(".disabled"),
+            "{docref}"
+        );
+        assert!(broken.starts_with("插件 broken：解析 "), "{broken}");
+        assert!(!docref.contains("tool: ") && !broken.contains("tool: "));
     }
 
     #[test]

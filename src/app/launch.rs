@@ -159,6 +159,11 @@ pub fn take_restart() -> Option<Vec<OsString>> {
     RESTART.lock().ok().and_then(|mut slot| slot.take())
 }
 
+/// Whether `/restart` is about to start this session again.
+pub fn restart_requested() -> bool {
+    RESTART.lock().is_ok_and(|slot| slot.is_some())
+}
+
 /// Options whose value only applied to the first start.
 const ONE_TIME_VALUES: &[&str] = &["-r", "--resume", "--file", "--image", "-p", "--print"];
 const ONE_TIME_FLAGS: &[&str] = &["--continue", "--dump-system-prompt", "--doctor"];

@@ -430,6 +430,14 @@ async fn rich_events(mut receiver: tokio::sync::mpsc::Receiver<AgentEvent>) -> s
                 output,
             } => {
                 let id = crate::app::blocks::BLOCKS.add(&name, failed, &output);
+                // The main agent's plan for the Alt+M panel (subagent tools arrive as
+                // output rows, not here).
+                if name == "todo"
+                    && !failed
+                    && let Some(console) = console
+                {
+                    console.set_plan(&output);
+                }
                 let finished = running
                     .iter()
                     .position(|(running, _, _, _)| *running == name)

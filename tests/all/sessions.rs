@@ -749,6 +749,43 @@ async fn continue_in_a_new_session_goes_back_to_the_last_task_and_shows_it() {
         stderr.contains("会话已保存。下次在这里输入“继续”"),
         "{stderr}"
     );
+    assert!(!stderr.contains("这一轮没做完"), "{stderr}");
+}
+
+/// A resumed session says which turn "继续" picks up (0063).
+#[tokio::test]
+async fn resuming_an_unfinished_session_marks_the_unfinished_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, _server) = mock_server(vec![openai(
+        json!({"content":"Rust ownership haiku."}),
+        "stop",
+    )])
+    .await;
+    repl(
+        cli(root.path(), data.path(), &url),
+        "write a haiku about rust\n/exit\n",
+    )
+    .await;
+    let id = std::fs::read_dir(data.path().join("sessions"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .and_then(|path| Some(path.file_stem()?.to_string_lossy().into_owned()))
+        .unwrap();
+    let store = cove::session::Store::open(data.path()).unwrap();
+    let mut session = store.load(&id).unwrap();
+    session.state = cove::session::State::Interrupted("test".into());
+    store.flush(&session).unwrap();
+    let (url, _server) = mock_server(Vec::new()).await;
+    let mut command = cli(root.path(), data.path(), &url);
+    command.args(["--resume", &id]);
+    let (_, stderr) = repl(command, "/exit\n").await;
+    assert!(
+        stderr.contains("> write a haiku about rust") && stderr.contains("这一轮没做完"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]

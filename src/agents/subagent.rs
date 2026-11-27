@@ -373,7 +373,7 @@ impl ActivityBoard {
                 started: Instant::now(),
                 ended: None,
                 task: crate::text::short(task, 120),
-                last_step: "starting".into(),
+                last_step: "启动中".into(),
             });
             // Keep the most recent finished entries only.
             while entries.len() > 64 {
@@ -1345,7 +1345,7 @@ impl AgentHub {
                     }
                     Event::ToolStarted { name, .. } => {
                         answering = false;
-                        hub.activity.step(&id, &format!("running {name}"));
+                        hub.activity.step(&id, &format!("运行 {name}"));
                         hub.progress.line(format!("[{id}] -> {name}"), false).await;
                     }
                     Event::ToolFinished {
@@ -1356,7 +1356,10 @@ impl AgentHub {
                         let first =
                             crate::text::short(output.lines().next().unwrap_or_default(), 160);
                         let status = if failed { "failed" } else { "ok" };
-                        hub.activity.step(&id, &format!("{name} {status}: {first}"));
+                        hub.activity.step(
+                            &id,
+                            &format!("{name} {}：{first}", if failed { "失败" } else { "成功" }),
+                        );
                         hub.progress
                             .line(format!("[{id}] [{status}] {name}: {first}"), failed)
                             .await;
@@ -1368,7 +1371,7 @@ impl AgentHub {
                     }
                     Event::Text(_) | Event::Reasoning(_) if !answering => {
                         answering = true;
-                        hub.activity.step(&id, "model responding");
+                        hub.activity.step(&id, "模型回答中");
                     }
                     _ => {}
                 }

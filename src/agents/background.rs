@@ -335,6 +335,9 @@ pub struct NoticeHook {
 
 pub const MAIN: &str = "main";
 
+/// `status_text` without any agent or waiting approval.
+pub const NO_ACTIVITY: &str = "No sub-agent activity.";
+
 impl NoticeHook {
     fn note(&self) -> Option<String> {
         let mut parts = Vec::new();
@@ -512,7 +515,7 @@ impl AgentHub {
             created: now(),
             updated: now(),
             report: String::new(),
-            last_step: "starting".into(),
+            last_step: "启动中".into(),
             reported: session.accounting.clone(),
             merged: false,
         };
@@ -1167,7 +1170,7 @@ impl AgentHub {
                 8 * 1024,
                 "\n[report truncated]",
             ),
-            last_step: format!("{} pending tool calls", session.pending.len()),
+            last_step: format!("{} 个工具调用待确认", session.pending.len()),
             reported: session.accounting.clone(),
             merged: false,
         };
@@ -1338,10 +1341,81 @@ impl AgentHub {
             ));
         }
         if text.is_empty() {
-            text.push_str("No sub-agent activity.\n");
+            text.push_str(NO_ACTIVITY);
+            text.push('\n');
         }
         text
     }
+
+    /// The Alt+M panel's sub-agent rows: what is still going on, one Chinese row each;
+    /// finished ones fold into one count (`/status agents` keeps the full list) (0064).
+    pub fn panel_lines(&self) -> Vec<String> {
+        let records = self.records().unwrap_or_default();
+        let mut items = Vec::new();
+        for record in &records {
+            let live = self.activity.get(record.short());
+            items.push(PanelItem {
+                id: record.short().to_owned(),
+                kind: record.agent_type.clone(),
+                state: record.state,
+                secs: live.as_ref().map_or(0, |e| e.started.elapsed().as_secs()),
+                task: record.description.clone(),
+                step: live.map_or(record.last_step.clone(), |e| e.last_step),
+            });
+        }
+        let known: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+        for entry in self.activity.snapshot() {
+            if !known.contains(&entry.id) {
+                items.push(PanelItem {
+                    state: entry.state,
+                    secs: entry.started.elapsed().as_secs(),
+                    id: entry.id,
+                    kind: entry.agent_type,
+                    task: entry.task,
+                    step: entry.last_step,
+                });
+            }
+        }
+        panel_rows(&items, &self.approvals.descriptions())
+    }
+}
+
+struct PanelItem {
+    id: String,
+    kind: String,
+    state: Lifecycle,
+    secs: u64,
+    task: String,
+    step: String,
+}
+
+/// One Chinese row per agent still going on, then waiting approvals, then one count of
+/// the finished ones. Discarded agents are not shown.
+fn panel_rows(items: &[PanelItem], approvals: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut ended = 0;
+    for item in items {
+        match item.state {
+            Lifecycle::Discarded => {}
+            Lifecycle::Finished | Lifecycle::Failed => ended += 1,
+            state => lines.push(format!(
+                "{} {} {} {}秒 · {} · {}",
+                item.id,
+                item.kind,
+                state.zh(),
+                item.secs,
+                crate::text::clip_width(&item.task, 36),
+                crate::text::clip_width(&item.step, 36)
+            )),
+        }
+    }
+    for approval in approvals {
+        lines.push(format!("待确认：{approval}"));
+    }
+    if ended > 0 {
+        lines.push(format!("已结束 {ended} 个（/status agents 查看）"));
+    }
+    lines
 }
 
 /// Where background worktrees of `project` live.
@@ -1436,6 +1510,38 @@ mod tests {
             Some("分支 agent/x：2 个提交，没有未提交的改动")
         );
         assert_eq!(branch.english(), "branch agent/x: 2 commit(s), clean");
+    }
+
+    #[test]
+    fn the_panel_lists_running_agents_and_folds_the_finished_ones() {
+        let item = |id: &str, state| PanelItem {
+            id: id.into(),
+            kind: "explore".into(),
+            state,
+            secs: 7,
+            task: "排查 Grafana".into(),
+            step: "模型回答中".into(),
+        };
+        assert!(panel_rows(&[], &[]).is_empty());
+        let rows = panel_rows(
+            &[
+                item("agent-1", Lifecycle::Finished),
+                item("agent-2", Lifecycle::Running),
+                item("agent-3", Lifecycle::Failed),
+                item("agent-4", Lifecycle::Discarded),
+            ],
+            &["写 a.txt".into()],
+        );
+        assert_eq!(
+            rows,
+            [
+                "agent-2 explore 运行中 7秒 · 排查 Grafana · 模型回答中",
+                "待确认：写 a.txt",
+                "已结束 2 个（/status agents 查看）",
+            ]
+        );
+        let only_ended = panel_rows(&[item("agent-1", Lifecycle::Finished)], &[]);
+        assert_eq!(only_ended, ["已结束 1 个（/status agents 查看）"]);
     }
 
     #[test]

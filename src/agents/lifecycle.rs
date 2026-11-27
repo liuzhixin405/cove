@@ -82,6 +82,17 @@ impl Lifecycle {
         }
     }
 
+    pub fn zh(self) -> &'static str {
+        match self {
+            Self::Running => "运行中",
+            Self::Paused => "已暂停",
+            Self::Interrupted => "已中断",
+            Self::Finished => "已完成",
+            Self::Failed => "失败",
+            Self::Discarded => "已丢弃",
+        }
+    }
+
     pub fn resumable(self) -> bool {
         matches!(
             self,

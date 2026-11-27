@@ -294,7 +294,27 @@ impl Console {
             state.queued = 0;
             state.steered = 0;
             state.goal = None;
+            state.task.clear();
         }
+        state.redraw();
+    }
+
+    /// The running task's input line, for the Alt+M panel.
+    pub fn set_task(&self, line: &str) {
+        let mut state = self.lock();
+        state.task = line.to_owned();
+        state.redraw();
+    }
+
+    /// The main agent's plan, as `todo` renders it (rows other than items are
+    /// ignored); empty for none.
+    pub fn set_plan(&self, rendered: &str) {
+        let mut state = self.lock();
+        state.plan = rendered
+            .lines()
+            .filter(|line| plan_mark(line).is_some())
+            .map(str::to_owned)
+            .collect();
         state.redraw();
     }
 
@@ -842,6 +862,10 @@ struct State {
     started: Instant,
     activity: String,
     tokens: (u64, u64),
+    /// The running task's input line and the main agent's latest `todo` plan
+    /// (rendered rows), for the Alt+M panel (0060).
+    task: String,
+    plan: Vec<String>,
     /// Background shell commands still running (0050), shown while idle too.
     background: usize,
     /// The spinner frame last drawn.
@@ -853,6 +877,11 @@ struct State {
     cleared: Option<Vec<char>>,
     /// The cursor's row within the drawn input block, when it is on screen.
     drawn: Option<usize>,
+    /// The width the block was drawn at, and the display widths of its lines from
+    /// its top down to the cursor (the last one up to the cursor): a terminal that
+    /// rewraps on resize moves the block's top, so `erase` counts again (0060).
+    drawn_columns: usize,
+    drawn_lines: Vec<usize>,
     /// Column after the last output character; output resumes there.
     out_col: usize,
     dirty: bool,
@@ -897,12 +926,16 @@ impl State {
             started: Instant::now(),
             activity: String::new(),
             tokens: (0, 0),
+            task: String::new(),
+            plan: Vec::new(),
             background: 0,
             frame: 0,
             meter: Meter::default(),
             hint: None,
             cleared: None,
             drawn: None,
+            drawn_columns: 0,
+            drawn_lines: Vec::new(),
             out_col: 0,
             dirty: false,
             pending: String::new(),
@@ -1812,6 +1845,14 @@ impl State {
     /// Takes the input block off the screen; the cursor is left where it began.
     fn erase(&mut self) {
         if let Some(row) = self.drawn.take() {
+            let columns = self.columns();
+            // A resized terminal may have rewrapped the block: its top is then as many
+            // rows up as its lines take at the new width.
+            let row = if columns == self.drawn_columns {
+                row
+            } else {
+                rows_above_cursor(&self.drawn_lines, columns)
+            };
             if row > 0 {
                 self.pending.push_str(&format!("\x1b[{row}A"));
             }
@@ -1907,6 +1948,8 @@ impl State {
         }
         self.pending.push_str(&format!("\r\x1b[{}G", column + 1));
         self.drawn = Some(row);
+        self.drawn_columns = columns;
+        self.drawn_lines = line_widths(&text, row, column, columns);
     }
 
     /// The prompt and the input lines; returns where the cursor goes.
@@ -2001,6 +2044,9 @@ impl State {
                 ));
             }
             text.push_str(" · 按两次 Esc 中断");
+            if self.panel.is_none() {
+                text.push_str(" · Alt+M 查看任务");
+            }
             if self.steered > 0 {
                 text.push_str(&format!("；{} 条引导待送达", self.steered));
             }
@@ -2100,30 +2146,52 @@ impl State {
         rows
     }
 
-    /// The agent panel (Alt+M), at most eight rows.
+    /// The task panel (Alt+M), at most eight rows: the main task (state, time and
+    /// action, the request, plan progress), then subagents and background agents.
     fn agent_rows(&self, columns: usize) -> Vec<String> {
+        const ROWS: usize = 8;
         let Some(lines) = &self.panel else {
             return Vec::new();
         };
+        let fit = |text: &str| {
+            crate::text::fit_width(&crate::text::visible_row(text), columns - 1).to_owned()
+        };
         let mut rows = vec![self.style(
             "2",
-            crate::text::fit_width("子代理 | Alt+M 或 Esc 关闭", columns - 1),
+            crate::text::fit_width("任务 | Alt+M 或 Esc 关闭", columns - 1),
         )];
-        rows.push(format!(
-            "主任务：{}",
-            if self.busy { "运行中" } else { "空闲" }
-        ));
+        if self.busy {
+            let activity = if self.activity.is_empty() {
+                "运行中"
+            } else {
+                &self.activity
+            };
+            rows.push(fit(&format!(
+                "主任务：运行中 {} · {activity}",
+                crate::app::render::duration(self.started.elapsed().as_secs_f64())
+            )));
+            let task = self.task.trim();
+            if !task.is_empty() {
+                rows.push(fit(&format!("  请求：{}", task.replace('\n', " "))));
+            }
+        } else {
+            rows.push("主任务：空闲".into());
+        }
+        if let Some(plan) = plan_summary(&self.plan) {
+            rows.push(fit(&format!("  计划：{plan}")));
+        }
         let lines: Vec<&String> = lines
             .iter()
             .filter(|line| !line.trim().is_empty())
             .collect();
         if lines.is_empty() {
-            rows.push("没有子代理".into());
-        }
-        for line in lines.into_iter().take(6) {
-            rows.push(
-                crate::text::fit_width(&crate::text::visible_row(line), columns - 1).to_owned(),
-            );
+            rows.push("子代理：无".into());
+        } else {
+            rows.push("子代理：".into());
+            let room = ROWS.saturating_sub(rows.len()).max(1);
+            for line in lines.into_iter().take(room) {
+                rows.push(fit(line));
+            }
         }
         rows
     }
@@ -2214,6 +2282,94 @@ fn filter(items: &[Choice], query: &str) -> Vec<usize> {
 /// `COVE_ESC_INTERRUPT=0` keeps a bare Esc from interrupting tasks.
 fn esc_interrupts() -> bool {
     !std::env::var("COVE_ESC_INTERRUPT").is_ok_and(|value| value.trim() == "0")
+}
+
+/// The status mark of a `todo` row (`[ ]`, `[>]`, `[✓]`, `[x]`) and the item text
+/// after `id. `; `None` for other rows.
+fn plan_mark(row: &str) -> Option<(&str, &str)> {
+    let (mark, rest) = ["[ ]", "[>]", "[✓]", "[x]"]
+        .into_iter()
+        .find_map(|mark| Some((mark, row.strip_prefix(mark)?)))?;
+    let rest = rest.trim_start();
+    let text = rest
+        .split_once(". ")
+        .filter(|(id, _)| !id.contains(' '))
+        .map_or(rest, |(_, text)| text);
+    Some((mark, text.trim()))
+}
+
+/// `完成 3/5 · 当前：…` (or `下一项：…`) for the panel, cancelled items left out;
+/// `None` without a plan.
+fn plan_summary(plan: &[String]) -> Option<String> {
+    let items: Vec<(&str, &str)> = plan
+        .iter()
+        .filter_map(|row| plan_mark(row))
+        .filter(|(mark, _)| *mark != "[x]")
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let done = items.iter().filter(|(mark, _)| *mark == "[✓]").count();
+    let mut text = format!("完成 {done}/{}", items.len());
+    if let Some((_, current)) = items.iter().find(|(mark, _)| *mark == "[>]") {
+        text.push_str(&format!(" · 当前：{current}"));
+    } else if let Some((_, next)) = items.iter().find(|(mark, _)| *mark == "[ ]") {
+        text.push_str(&format!(" · 下一项：{next}"));
+    } else {
+        text.push_str(" · 全部完成");
+    }
+    Some(text)
+}
+
+/// Display widths of the lines (split at `\r\n`) of a block drawn at `columns`,
+/// from its top down to the cursor at `row`, `column`; the last entry is how far
+/// the cursor is into its line.
+fn line_widths(text: &str, row: usize, column: usize, columns: usize) -> Vec<usize> {
+    let mut widths = Vec::new();
+    let mut top = 0;
+    for line in text.split("\r\n") {
+        let mut screen = Screen::new(columns);
+        screen.text(line);
+        let rows = screen.row + 1;
+        if row < top + rows {
+            widths.push((row - top) * columns + column);
+            return widths;
+        }
+        widths.push(display_width(line));
+        top += rows;
+    }
+    widths.push(column);
+    widths
+}
+
+/// Columns `line` takes; control sequences take none, as in [`Screen::text`].
+fn display_width(line: &str) -> usize {
+    let mut width = 0;
+    let mut escape = false;
+    for c in line.chars() {
+        if escape {
+            escape = !c.is_ascii_alphabetic();
+        } else if c == '\x1b' {
+            escape = true;
+        } else {
+            width += c.width().unwrap_or(0);
+        }
+    }
+    width
+}
+
+/// Rows from the cursor up to the block's top once a terminal rewrapped the lines
+/// of [`line_widths`] at `columns`.
+fn rows_above_cursor(widths: &[usize], columns: usize) -> usize {
+    let Some((cursor, above)) = widths.split_last() else {
+        return 0;
+    };
+    let columns = columns.max(1);
+    above
+        .iter()
+        .map(|width| width.div_ceil(columns).max(1))
+        .sum::<usize>()
+        + cursor / columns
 }
 
 /// One-key answers from a prompt's trailing `[y/N/a=always ...]`. The default
@@ -3116,6 +3272,99 @@ mod tests {
                 assert!(output.contains("! 插话") && output.contains("/命令排队"));
             }
         }
+    }
+
+    #[test]
+    fn busy_status_mentions_the_task_panel_until_it_is_open() {
+        let (mut state, _) = state();
+        state.busy = true;
+        assert!(state.status().unwrap().contains("Alt+M 查看任务"));
+        state.panel = Some(Vec::new());
+        assert!(!state.status().unwrap().contains("Alt+M"));
+    }
+
+    #[test]
+    fn the_task_panel_sums_up_the_main_task_without_subagents() {
+        let (mut state, _) = state();
+        state.panel = Some(Vec::new());
+        assert_eq!(state.agent_rows(80)[1], "主任务：空闲");
+        state.busy = true;
+        state.activity = "运行 cargo test".into();
+        state.task = "给面板加上主任务简介".into();
+        state.plan = crate::tools::render_todos(&[
+            todo(1, "写优化文档", crate::tools::TodoStatus::Completed),
+            todo(2, "改 console.rs", crate::tools::TodoStatus::InProgress),
+            todo(3, "跑测试", crate::tools::TodoStatus::Pending),
+            todo(4, "不做了", crate::tools::TodoStatus::Cancelled),
+        ])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        let rows = state.agent_rows(80).join("\n");
+        assert!(
+            rows.contains("主任务：运行中") && rows.contains("运行 cargo test"),
+            "{rows}"
+        );
+        assert!(rows.contains("请求：给面板加上主任务简介"), "{rows}");
+        assert!(
+            rows.contains("计划：完成 1/3 · 当前：改 console.rs"),
+            "{rows}"
+        );
+        assert!(rows.contains("子代理：无"), "{rows}");
+        state.panel = Some(vec!["a1b2 bg:general running".into()]);
+        let rows = state.agent_rows(80);
+        assert!(
+            rows.len() <= 8 && rows.join("\n").contains("a1b2"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn plan_summary_names_the_next_item_or_says_all_done() {
+        let plan = |rows: &[&str]| {
+            plan_summary(&rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(plan(&[]), None);
+        assert_eq!(
+            plan(&["[✓] todo-1. 甲", "[ ] todo-2. 乙 [high]", "2 open of 2"]).as_deref(),
+            Some("完成 1/2 · 下一项：乙 [high]")
+        );
+        assert_eq!(
+            plan(&["[✓] todo-1. 甲"]).as_deref(),
+            Some("完成 1/1 · 全部完成")
+        );
+    }
+
+    fn todo(index: usize, content: &str, status: crate::tools::TodoStatus) -> crate::tools::Todo {
+        crate::tools::Todo {
+            content: content.into(),
+            status,
+            priority: None,
+            id: Some(format!("todo-{index}")),
+            depends: Vec::new(),
+            writes: Vec::new(),
+            estimate_minutes: None,
+        }
+    }
+
+    #[test]
+    fn erase_after_a_narrowing_resize_reaches_the_rewrapped_top() {
+        // Status (30 columns), meter (30), then the input with the cursor at 2:
+        // drawn at 40 columns, the cursor is two rows down.
+        let text = format!(
+            "{}\r\n{}\r\n> ",
+            "s".repeat(30),
+            "\x1b[2mm\x1b[0m".repeat(30)
+        );
+        let widths = line_widths(&text, 2, 2, 40);
+        assert_eq!(widths, [30, 30, 2]);
+        assert_eq!(rows_above_cursor(&widths, 40), 2);
+        // At 20 columns both rows wrap in two: the top is four rows up.
+        assert_eq!(rows_above_cursor(&widths, 20), 4);
+        // An input that wrapped at the old width: the cursor's offset counts.
+        let widths = line_widths("> 12345678\r\n", 0, 5, 10);
+        assert_eq!(widths, [5]);
+        assert_eq!(rows_above_cursor(&widths, 4), 1);
     }
 
     #[test]

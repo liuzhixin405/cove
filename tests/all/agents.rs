@@ -1041,7 +1041,7 @@ async fn a_long_answer_is_capped_in_the_parent_and_saved_whole() {
     let full = std::fs::read_to_string(&saved[0]).unwrap();
     assert!(full.contains("TAIL-MARKER"));
     assert!(
-        result.contains(&cove::paths::display(&saved[0])),
+        result.contains(&cove::paths::display(&saved[0].canonicalize().unwrap())),
         "{result}"
     );
 }

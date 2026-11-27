@@ -494,8 +494,7 @@ impl Application {
                         () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                     }
                     if console.panel_open() {
-                        let text = hub.status_text(None).await;
-                        console.set_panel(text.lines().map(str::to_owned).collect());
+                        console.set_panel(hub.panel_lines());
                     }
                 }
             })
@@ -518,7 +517,8 @@ impl Application {
             print_text(&notice, true)?;
         }
         let result = self.repl_lines(reader).await;
-        if self.session.has_conversation() {
+        // `/restart` resumes the session by itself; "next time" would mislead (0063).
+        if self.session.has_conversation() && !crate::app::launch::restart_requested() {
             print_text(
                 &format!(
                     "会话已保存。下次在这里输入“继续”，或用 cove --resume {} 启动。\n",
@@ -605,6 +605,12 @@ impl Application {
             self.models.attachments.append(&mut reader.attachments);
             if let Some(console) = console {
                 console.set_busy(true);
+                console.set_task(line);
+                console.set_plan(
+                    &crate::tools::latest_todos(&self.session)
+                        .map(|todos| crate::tools::render_todos(&todos))
+                        .unwrap_or_default(),
+                );
             }
             let before = (
                 self.session.id.clone(),

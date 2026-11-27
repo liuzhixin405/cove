@@ -456,9 +456,11 @@ impl Mcp {
         {
             return Err(Error::Tool("MCP server is disabled".into()));
         }
+        // Not something the user can approve on the spot, so a plain tool failure: the
+        // model reads it and tells the user, and the turn finishes (0063).
         if !self.trusted {
-            return Err(Error::Approval(
-                "MCP 服务器需要 --trust-extensions（或先用 /config trust 信任此项目并重启），并且需要授权".into(),
+            return Err(Error::Tool(
+                "项目未信任，MCP 服务器不会启动：先执行 /config trust，再 /restart（或启动时加 --trust-extensions）".into(),
             ));
         }
         Ok(server)
@@ -533,9 +535,9 @@ impl Mcp {
         } = &args
         {
             if !Self::allowed(&server.config.value, tool) {
-                return Err(Error::Approval(
-                    "这个 MCP 工具不在显式允许列表中（只开放服务器声明的工具）".into(),
-                ));
+                return Err(Error::Tool(format!(
+                    "MCP 工具 {tool} 不在允许列表中（只开放服务器声明的工具），这次调用没有执行"
+                )));
             }
             if serde_json::to_vec(arguments)?.len() > 64 * 1024 {
                 return Err(Error::Tool("MCP arguments exceed 64 KiB".into()));

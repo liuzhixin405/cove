@@ -142,3 +142,9 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 | [0056](0056-background-notice-once.md) | 后台代理结束通知不重复打印报告、改为中文；`/status agents show` 查看完整报告 | 已完成 |
 | [0057](0057-cite-line-refs-not-anchors.md) | 引用核对不把另一条行号引用当成锚点 | 已完成 |
 | [0058](0058-evals-local-only.md) | 评测工具留在本机，`evals/` 不进仓库 | 已完成 |
+| [0059](0059-agent-panel-hint.md) | 任务运行时提示 Alt+M 查看子代理 | 已完成 |
+| [0060](0060-main-task-panel.md) | Alt+M 面板显示主任务简介（请求、动作、计划进度）；窗口改宽度后状态行不再残留 | 已完成 |
+| [0061](0061-default-bypass.md) | 默认权限模式改为 bypass，要审批的用户自己开启 | 已完成 |
+| [0062](0062-debug-tests-reused-by-verify.md) | 测试统一用 debug 构建，收尾验证复用模型跑过的结果 | 已完成 |
+| [0063](0063-resume-after-restart.md) | MCP 未信任时不再中断整轮；重启恢复后说清"继续"接的是哪一轮 | 已完成 |
+| [0064](0064-agent-panel-running-only.md) | 任务面板只列正在运行的子代理，已结束的合并成一行，状态和步骤改中文 | 已完成 |

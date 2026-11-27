@@ -579,10 +579,7 @@ pub async fn run_tasks(
         if let Some(stack) = &node.task.overlay {
             hub.activity.step(
                 &node.task.id,
-                &format!(
-                    "overlay layer: {} files changed",
-                    stack.changed_paths().len()
-                ),
+                &format!("覆盖层：改了 {} 个文件", stack.changed_paths().len()),
             );
         }
         node.steps += outcome.steps;

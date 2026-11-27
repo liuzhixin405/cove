@@ -1054,7 +1054,7 @@ impl Settings {
         let permission = match (cli.permission, config.permission_mode) {
             (Some(mode), _) => mode,
             (None, Some(mode)) => parse_mode(&mode)?,
-            (None, None) => Mode::Default,
+            (None, None) => Mode::Bypass,
         };
         let instructions = config
             .system_prompt

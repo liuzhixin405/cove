@@ -1016,6 +1016,10 @@ pub(crate) fn show_conversation(store: &Store, session: &Session) -> Result<()> 
     } else {
         turns(records.len())
     };
+    // Which turn "继续" picks up must be visible, not inferred (0063).
+    if session.unfinished() {
+        text.push_str("（这一轮没做完：输入“继续”接着做；要做别的事，先用 /new 开新会话）\n");
+    }
     print_text(
         &format!(
             "── 之前的对话（{shown}；/turns 查看全部）──{text}── 之前的对话到此结束；模型保有完整上下文 ──\n"

@@ -83,6 +83,11 @@ fn text(content: &str) -> String {
 }
 
 fn cli(root: &Path, data: &Path, url: &str, mode: &str) -> Command {
+    cli_with(root, data, url, mode, "30")
+}
+
+/// [`cli`] with the task time limit in seconds.
+fn cli_with(root: &Path, data: &Path, url: &str, mode: &str, timeout: &str) -> Command {
     let mut command = Command::new(common::exe());
     command.args([
         "--provider",
@@ -92,7 +97,7 @@ fn cli(root: &Path, data: &Path, url: &str, mode: &str) -> Command {
         "--base-url",
         url,
         "--timeout",
-        "30",
+        timeout,
         "--permission",
         mode,
     ]);
@@ -721,7 +726,8 @@ async fn shell_rounds(writes: bool) -> (Vec<Value>, String, bool) {
         .collect();
     responses.push(text("Ran the script repeatedly."));
     let (url, server) = mock_server(responses).await;
-    let output = cli(root.path(), data.path(), &url, "bypass")
+    // Nine Python starts can take over 30 s while the whole suite runs in parallel.
+    let output = cli_with(root.path(), data.path(), &url, "bypass", "120")
         .args(["-p", "run the script"])
         .launch()
         .await

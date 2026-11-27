@@ -924,3 +924,23 @@ async fn cd_and_restart_start_the_binary_again() {
     let (output, stdout, _) = run(command).await;
     assert!(output.status.success() && stdout.contains(ids[0]));
 }
+
+/// `/restart` resumes by itself: only the restarted run says "下次在这里输入“继续”" (0063).
+#[tokio::test]
+async fn restart_does_not_tell_the_user_to_continue_next_time() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (url, _server) = mock_server(vec![openai(json!({"content":"Haiku."}), "stop")]).await;
+    let (output, _, stderr) = repl(
+        cove(root.path(), data.path(), &url),
+        "write a haiku\n/restart\n",
+    )
+    .await;
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("[restart] 正在继续会话"), "{stderr}");
+    assert_eq!(
+        stderr.matches("下次在这里输入“继续”").count(),
+        1,
+        "{stderr}"
+    );
+}

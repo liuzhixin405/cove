@@ -527,6 +527,46 @@ async fn go_mcp_servers_over_streamable_http_list_tools_in_description() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("--trust-extensions"));
 }
 
+/// Untrusted MCP is a failed tool result the model can explain, not the end of the turn (0063).
+#[tokio::test]
+async fn untrusted_mcp_call_fails_the_call_and_the_turn_finishes() {
+    let (root, data, home) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let config = data.path().join("config.json");
+    write(
+        &config,
+        &json!({"mcp_servers":{"remote":{"type":"http","url":"http://127.0.0.1:9/mcp"}}})
+            .to_string(),
+    );
+    let (url, server) = mock_server(vec![
+        tool(
+            "m1",
+            "mcp",
+            json!({"action":"call","server":"remote","tool":"echo","arguments":{"text":"hi"}}),
+        ),
+        done("Trust the project first."),
+    ])
+    .await;
+    let output = cli(root.path(), data.path(), home.path(), &url)
+        .arg("--config")
+        .arg(&config)
+        .args(["-p", "use the echo tool"])
+        .launch()
+        .await
+        .unwrap();
+    // `-p` still exits non-zero because a tool failed; what matters is that the model
+    // got the failure and answered instead of the turn ending on an approval error.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("需要批准"), "{stderr}");
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "{stderr}");
+    let second = requests[1].to_string();
+    assert!(second.contains("/config trust"), "{second}");
+}
+
 #[tokio::test]
 async fn config_skills_create_show_and_list() {
     let (root, data, home) = (
