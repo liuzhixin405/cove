@@ -2,9 +2,9 @@
 
 本文是完整的功能与实现细节参考；日常使用请先看 [使用说明](../README.md)。
 
-cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执行文件名为 **cove**。当前版本 **0.8.1**：单个可执行文件，常驻交互控制台加单次任务模式，用户命令集中在少量入口下。架构与设计原则见 [架构设计](design.md)，扩展配置见 [扩展使用说明](extensions.md)。
+cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执行文件名为 **cove**。当前版本 **0.8.2**：单个可执行文件，常驻交互控制台加单次任务模式，用户命令集中在少量入口下。架构与设计原则见 [架构设计](design.md)，扩展配置见 [扩展使用说明](extensions.md)。
 
-0.8.1 让长任务跑得稳、拆得开：验证和审查命令不再按固定时长砍，而是按“是否还在干活”判断卡住（`done_verify_idle_seconds`，默认 180 秒无活动才中止，总时限放宽到 3600 秒），中止时给出仍在运行的进程和排查建议；只改了被 git 忽略的文件或文档时不跑全量检查。前台命令到时长转到后台继续而不是被杀，`shell` 新增 `run_in_background`，状态栏显示后台命令数和等待进度。计划执行多了覆盖层拆分（`execute_plan isolation="overlay"`）：各条目在私有层里并行改，最后统一合并，`overlay_check` 提供共享编译槽，`mergiraf_path` 用于结构化合并；内置 `task-split` 技能在预估超过 `split_suggest_minutes`（默认 5 分钟）时先给拆分计划。`glob`/`grep` 新增 `include_ignored` 搜索被忽略的文件，引用核对不再误报否定句和另一条行号引用，表格单元格按宽度折行，换行提示改为 Ctrl+Enter，`/status agents show` 查看子 Agent 的完整报告。
+0.8.2 让界面说清楚当下在做什么，并减少了不必要的打扰：Alt+M 面板改名为任务面板，显示主任务的状态、用时和当前动作、本次请求、`todo` 计划进度，子代理只逐行列出还在进行的，已结束的合并成一行，状态和步骤改为中文，任务运行时状态行提示“Alt+M 查看任务”；改窗口宽度后状态行不再残留。默认权限模式改为 `bypass`（除拒绝规则和灾难命令外不询问），要审批就用 `--permission default`、`/mode default` 或配置 `permission_mode`。项目未信任、MCP 工具不在允许列表里时，这次调用作为失败结果交给模型，任务不再中断；`plugins/` 下没有清单的目录跳过并提示怎么消除提示。恢复会话时标出“这一轮没做完”，`/restart` 自动恢复后不再提示下次输入“继续”。测试统一用 `cargo test`（debug），收尾自动验证复用模型跑过的同一条命令。README 重写为更短的上手路径。
 
 ## 已实现
 
@@ -298,7 +298,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 ### 插件
 
-- 插件放在 `<data_dir>/plugins/<名字>/`，清单为 `manifest.json`（`name`、`version`、`description`、`author`、`commands`、`skills`），也接受 Claude Code 插件的 `.claude-plugin/plugin.json`。`skills/` 下的技能参与发现；`commands/*.md`（frontmatter `description` + 正文，`$ARGUMENTS` 替换为参数，没有占位符时参数附在末尾）成为 `/<命令名>`。多个插件同名命令时，按插件名排序靠前的生效。
+- 插件放在 `<data_dir>/plugins/<名字>/`，清单为 `manifest.json`（`name`、`version`、`description`、`author`、`commands`、`skills`），也接受 Claude Code 插件的 `.claude-plugin/plugin.json`。没有清单的子目录（例如只放了一个命令行工具）不当插件加载，启动时提示"不是 cove 插件，已跳过"；不想看到提示，就把它移出 `plugins/`，或把目录名改成以 `.disabled` 结尾。`skills/` 下的技能参与发现；`commands/*.md`（frontmatter `description` + 正文，`$ARGUMENTS` 替换为参数，没有占位符时参数附在末尾）成为 `/<命令名>`。多个插件同名命令时，按插件名排序靠前的生效。
 - `/config plugins [list]`、`search [关键词]`（Claude 官方插件市场索引）、`install <名字|git URL>`、`update [名字]`（`git pull --ff-only`）、`enable|disable|uninstall <名字>`。git 安装只接受 `https://`、`ssh://`、`git@host:path`，以 `git clone --depth=1 --config core.symlinks=false` 克隆到暂存目录，校验名字后再改名就位，失败不留残余；git 运行时禁用终端和凭据管理器弹窗。另有组合 Skills、MCP 和 Hooks 的本地清单插件（`/config plugins install <清单路径>`），格式见[扩展使用说明](extensions.md#6-本地清单插件)。
 - cove 不执行插件里的任何代码：命令是提示文本，技能是数据。
 
@@ -324,6 +324,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - 传输：stdio 经内置进程宿主启动；HTTP 与 SSE 用项目自带的 reqwest 实现（不引入第二个 reqwest），支持 `Mcp-Session-Id`、JSON 与 SSE 响应，关闭时发送 DELETE。
 - 连接后，服务的工具清单（描述截到 2 KB、参数 schema 压缩到 4 KB 内）会出现在 `mcp` 工具描述中，下一次模型请求即可见；收到 `tools/list_changed` 后下次操作前刷新。连接断开时自动重连一次，之后需要 `/mcp connect`。
 - `/mcp`（同 `/config mcp`）`[list]`、`connect <名字>`、`disconnect <名字|all>`、`login <名字>`、`logout <名字>`、`read <服务> <uri>`。`/mcp` 列出每个服务器的传输方式、地址、是否已连接、是否已登录，没有配置时说明怎么添加，需要登录时给出要运行的命令。
+- 项目未信任时，模型调用 `mcp`（列工具、调用、读资源）不会启动服务器，这次调用作为失败结果交给模型，结果里写明先 `/config trust` 再 `/restart`；工具不在 `extensions.mcp` 的 `tools` 白名单里时同样作为失败结果。任务不会因此中断，模型可以继续做别的事，或在回答里告诉你怎么放行。只列配置的 `servers` 不需要信任。
 - **需要登录的 HTTP 服务（OAuth）**：例如 Atlassian（Jira/Confluence），配置 `"mcp_servers": {"atlassian": {"type": "http", "url": "https://mcp.atlassian.com/v2/mcp"}}`，然后运行 `/mcp login atlassian`：按 MCP 授权流程自动发现授权服务器、动态注册客户端，在浏览器里登录授权（PKCE，回调到本机 `127.0.0.1` 临时端口，5 分钟内完成）。令牌保存在 `<数据目录>/mcp-oauth/`（工具无法访问），过期前自动刷新；服务拒绝令牌时先刷新一次，仍失败则提示重新 `login`。`logout` 删除保存的令牌。
 
 ### 项目信任与 `.cove.json`
@@ -343,7 +344,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 | `/new` | 保存当前会话并新建；不回退文件 |
 | `/handoff [重点]` | 换话题时交接到新会话。模型在原会话的上下文上写一份交接摘要（之前做了什么、用户定下的要求、没做完和待确认的事、下一步可能用到的命令和路径），请求的系统提示、工具定义和消息与上一轮完全相同，只在最后多一条要求，所以前缀命中提示缓存；用的是上一个任务的模型。cove 再附上自己收集的事实：本会话用 write/edit 改过的文件、执行过的 `git commit`/`git push` 命令、工作区未提交的改动（`git status --short`），这部分不经过模型。新会话的第一条消息就是这份交接，之后输入的第一个任务算第一轮。原会话的消息、状态原样保留，记下 `handoff_to`；新会话记下 `handoff_from`，`/resume` 列表里两个都能看到（新会话要有了第一个任务才列出）。摘要和交接调用的费用计入原会话。`重点` 会作为写摘要时的要求。摘要超过 8000 tokens 时截断并标注；摘要为空、被截断或模型要调用工具时不交接，留在原会话。不运行 `SessionEnd` 钩子、不断开 MCP。交接后打印 `[session] <新 ID>` 和交接前后的上下文估算 |
 | `/back` | 在 `/handoff` 交接出来的会话里，回到原会话（同 `/resume <原会话 ID>`），原会话的完整上下文都在；1 小时内提示缓存通常还在 |
-| `/resume [list\|all]`、`/resume <n\|id>` | 列出当前工作区（`all`：所有工作区）的其他会话，显示标题、对话轮数（包括压缩前的轮次）和本地时间（从未提问的空会话和当前会话不列出）；按编号或 ID（前缀）切换。列表后直接输入数字即可恢复该条。交互控制台里只打开历史面板（不再另外打印文本列表）：输入文字筛选标题和提问，↑↓ 选择，数字键 1–9 直接选，Enter 恢复，Tab 打开阅读器，Ctrl+A 切换本工作区 / 全部工作区，Ctrl+R 改名，Esc 关闭。选中其他工作区的会话时，保存当前会话后在那个目录重启并恢复（同 `/cd`） |
+| `/resume [list\|all]`、`/resume <n\|id>` | 列出当前工作区（`all`：所有工作区）的其他会话，显示标题、对话轮数（包括压缩前的轮次）和本地时间（从未提问的空会话和当前会话不列出）；按编号或 ID（前缀）切换。列表后直接输入数字即可恢复该条。交互控制台里只打开历史面板（不再另外打印文本列表），会话按更新时间分组为“今天”“昨天”“最近 7 天”“更早”：输入文字筛选标题和提问，↑↓ 选择，数字键 1–9 直接选，Enter 恢复，Tab 打开阅读器，Ctrl+A 切换本工作区 / 全部工作区，Ctrl+R 改名，Esc 关闭。选中其他工作区的会话时，保存当前会话后在那个目录重启并恢复（同 `/cd`） |
 | `/resume search <关键词>` | 按标题和用户请求检索所有工作区的会话（BM25，支持中文） |
 | `/resume detail\|delete <n\|id>` | 查看详情 / 删除会话（含归档和文件检查点）；不能删除当前会话 |
 | `/resume rename <n\|id> <名字>`、`/rename <名字>` | 给会话改名；改过名的会话不再被 AI 生成的标题覆盖。会话标题默认由模型在第 1、2、3 轮完成后各生成一次，之后每 5 轮更新一次（本地模型、`--no-auto`、`-p` 时不生成） |
@@ -411,7 +412,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 - **历史**：提交的输入保存在 `<data_dir>/input_history.jsonl`（最多 1000 条），上下键翻阅，**Ctrl+R** 反向搜索（再按 Ctrl+R 找更早的匹配，Enter 采用，Esc 取消）。含 API key、token、密码等疑似密钥的输入（包括 `/config api_key …`、带账号的 base_url）不写入历史。
 - **多行输入**：Ctrl+Enter、Shift+Enter、Alt+Enter 插入换行（Windows 上输入框提示 Ctrl+Enter）；macOS/Linux 的多数终端分不出 Ctrl+Enter 和 Enter，那里用 Ctrl+J（提示也写 Ctrl+J），Ctrl+J 在所有平台都可用；行尾输入 `\` 再回车也会换行；粘贴的多行文本保持原样，不会逐行提交。多行时上下键在行间移动。
 - **编辑键**：Ctrl+A/Ctrl+E 或 Home/End 到行首/行尾，Alt+B/Alt+F 或 Ctrl/Alt+←/→ 按词移动，Ctrl+W 或 Alt/Ctrl+Backspace 删前一个词，Ctrl+K 删到行尾，Ctrl+U 删到行首；Esc 清空输入，紧接着 Ctrl+Z 恢复；Ctrl+L 清屏。
-- **Agent 面板**：Alt+M 打开或关闭输入行下方的子 Agent / 后台 Agent 面板（Esc 也可关闭）。
+- **任务面板**：Alt+M 打开或关闭输入行下方的任务面板（Esc 也可关闭），最多 8 行：主任务的状态、用时和当前动作，本次请求，`todo` 计划的进度和当前项（"完成 1/3 · 当前：…"），然后是子 Agent / 后台 Agent（没有时显示"子代理：无"）。子代理只逐行列出还在进行的（运行中、暂停、被中断），一行一个，用中文写状态和当前一步；已完成、失败的合并成一行"已结束 N 个（/status agents 查看）"，`/status agents` 仍列全部。后台 Agent 需要你确认时，面板里还会出现"待确认：…"行。任务运行时状态行提示"Alt+M 查看任务"，面板打开后不再提示。
 - **图片**：粘贴或拖入图片文件路径（PNG/JPEG/GIF/WebP，可多个、可带引号）会作为附件挂在下一条消息上；Windows 上 Alt+V 附加剪贴板里的图片（保存为数据目录 `clipboard/` 下的 PNG，图片发送时已写进会话，这些文件在下次粘贴时清理 7 天前的）；空行上 Alt+Backspace 移除最后一个附件。只有附件、没有文字时，按 Enter 让模型分析附件。
 - **环境变量**：设置 `NO_COLOR` 去掉颜色（光标控制保留）；`COVE_PLAIN_REPL=1` 改用简单的逐行读取（无常驻输入行、补全和任务中输入，命令在任务之间执行，用 Ctrl+C 取消任务）；`COVE_ESC_INTERRUPT=0` 让单独的 Esc 不再中断任务。stdin 或 stderr 不是终端时也自动使用简单模式。
 
@@ -470,7 +471,7 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 - 标题取第一条真实用户请求（跳过系统通知和“继续”这类短输入），最多 60 个字符，保存在会话文件里，压缩后也不丢失。
 - **接着上次做**：启动时会提示当前工作区最近有实际对话的会话及其最近任务；在新会话输入“继续”会恢复同一会话。`/continue` 列出当前工作区的会话并允许选择其他会话（包括较早的未完成任务）；`/continue <编号或 ID>` 直接选择。未完成任务会续跑，已完成任务恢复完整上下文后等待新消息。结果不确定的工具调用会作为失败结果交回 Agent 检查，不会自动重放。新会话的第一条消息与某个**未完成**任务的原始请求相同时，也会续跑那个任务，而不是重新开始。
-- **恢复后能看到之前的对话**：`/resume`、`--resume`、列表选择、`继续` 恢复会话时，在终端输出最近 3 轮对话；模型仍保有完整上下文。已压缩的早期内容不在当前上下文中。
+- **恢复后能看到之前的对话**：`/resume`、`--resume`、列表选择、`继续` 恢复会话时，在终端输出最近 3 轮对话；模型仍保有完整上下文。已压缩的早期内容不在当前上下文中。最后一轮没做完（被中断，或有未确认的工具调用）时，回显末尾注明"这一轮没做完"：输入 `继续` 接着做它，要做别的事先 `/new`。`/restart` 会自动恢复会话，所以退出时不再提示"下次在这里输入'继续'"。
 - **恢复后沿用原来的系统提示**：会话在第一个任务开始时记下系统提示里的项目上下文（环境行、用户偏好、项目说明文件、项目概要、技能列表）。之后在新进程里恢复它（`--resume`、`/resume`、`/restart`、`继续`）时，请求沿用记下的那一份，系统提示和上一个进程逐字节相同，对话历史的提示缓存还能读到；期间新增了文件、切换了分支，项目概要和分支信息不更新（模型可以用 `repo_map`、`git` 查到最新情况）。用户偏好或项目说明文件（AGENTS.md、CLAUDE.md、`.cove/rules.md` 等）变了时，下一个任务的消息里附一段 `[project context]` 说明，写出变化后的内容（项目说明合计超过 16 KiB 时只列文件名，让模型自己读），同样的变化只说一次。压缩之后、`/new` 和 `/handoff` 开出的新会话改用当前算出的项目上下文。`/trace` 的任务记录带 `system_reused`：这次运行是否沿用了与本进程不同的旧上下文。
 - 交互终端使用普通屏幕和终端自身的滚动、选择与复制功能，不再接管鼠标或折叠对话。选择和粘贴的快捷键取决于所用终端的设置。管道和重定向仍使用普通文本输出。
 - 启动信息显示版本、模型与供应商、权限模式、工作目录、git 分支和会话 ID 前 8 位；退出时提示下次如何继续（输入 `继续`，或 `cove --resume <id>`）。
@@ -554,10 +555,10 @@ Remove-Item Env:COVE_API_KEY -ErrorAction SilentlyContinue
 
 | 参数 | 行为 |
 | --- | --- |
-| `--permission default` | 默认（旧名 `ask`，对齐 Copilot 默认姿态）；`read`/`grep`/`glob`/`repo_map` 不需要审批；Shell 命令按“会改动什么”判断，什么都改不了的直接运行（读取、构建、测试、项目脚本、本地 git 操作、参数普通的陌生工具，可与只读命令串联），会改文件或删除、推远端、装软件、改系统设置和服务、结束进程、执行读不到内容的代码（`eval`、`python -c`、`bash -c '...'`、`find -exec`、程序名来自变量等）才审批，并写明原因；项目内的文件修改直接放行；`web_fetch`/`web_search` 只读取，不需要审批；项目外写入和扩展进程逐次审批，没有终端则明确失败 |
+| `--permission default` | 需要审批时手动选用（旧名 `ask`，对齐 Copilot 默认姿态）；`read`/`grep`/`glob`/`repo_map` 不需要审批；Shell 命令按“会改动什么”判断，什么都改不了的直接运行（读取、构建、测试、项目脚本、本地 git 操作、参数普通的陌生工具，可与只读命令串联），会改文件或删除、推远端、装软件、改系统设置和服务、结束进程、执行读不到内容的代码（`eval`、`python -c`、`bash -c '...'`、`find -exec`、程序名来自变量等）才审批，并写明原因；项目内的文件修改直接放行；`web_fetch`/`web_search` 只读取，不需要审批；项目外写入和扩展进程逐次审批，没有终端则明确失败 |
 | `--permission plan` | 只读（旧名 `readonly`）；允许阅读、搜索和只读 Shell 命令，其他操作拒绝，模型收到拒绝说明后可以继续 |
 | `--permission auto` | 在 default 的 Shell 判断之外，另外自动放行网络工具和已信任的扩展进程，以及能用 `/undo` 恢复的删除：整行只有 `rm`/`unlink`（PowerShell 为 `Remove-Item`/`del`/`rm`）删除字面量写出的文件路径（可用 `&&`、`;` 连接，也可以带上 `ls`、`git status` 这类只读命令，但不能有 `cd` 等换目录的命令；只允许 `-f`、`--`、`-Force`、`-Path`/`-LiteralPath`），每个文件都是工作区内、`.git` 之外的普通文件（不是目录或链接），并且都在这次调用之前刚打成的 Git 快照里，结果末尾注明“可用 /undo 恢复”。递归删除目录、通配符、变量、`~`、命令替换、被快照排除的文件（Git 忽略的、未跟踪的隐藏文件、大文件、`.coveignore` 里的）、快照没打成或已关闭时，照常询问。其他仍然需要审批的 Shell 命令（改文件、推远端、装软件等）照常询问；无终端时不执行这次调用，并告诉模型 |
-| `--permission bypass` | 除拒绝规则和灾难命令外全部允许；只用于可信任务 |
+| `--permission bypass` | **默认**（没有命令行参数、配置里也没写 `permission_mode` 时）；除拒绝规则和灾难命令外全部允许，不询问 |
 | `--max-turns 20` | 每个任务/继续窗口最多 20 次模型请求，含自动压缩，不是用户对话数 |
 | `--timeout 300` | 任务总时限，秒；达到后取消并有界清理 |
 | `--max-output-tokens 4096` | 每次模型响应的输出 token 上限 |

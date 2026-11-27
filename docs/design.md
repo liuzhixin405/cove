@@ -1,6 +1,6 @@
 # cove 架构设计
 
-版本：0.8.1。本文说明 cove 的目标、模块划分、设计原则和关键机制；使用方式、命令和实际限制见 [使用说明](../README.md)、[技术参考](reference.md)，扩展配置见 [扩展使用说明](extensions.md)。
+版本：0.8.2。本文说明 cove 的目标、模块划分、设计原则和关键机制；使用方式、命令和实际限制见 [使用说明](../README.md)、[技术参考](reference.md)，扩展配置见 [扩展使用说明](extensions.md)。
 
 ## 1. 目标与非目标
 
@@ -59,7 +59,7 @@ cove\
     domain.rs     跨模块共享的核心类型（消息、事件、Provider/UserInput 接口、错误）
     process.rs    子进程与进程树管理（Job Object / 进程组）
     process\      argv 拼装、Shell 选择与方言、门控 stdio 宿主
-    app\          组装根与终端：Application、启动/重启、设置向导、交互控制台（输入行、补全、历史、插话/排队/中断、行内问答、选择器、Agent 面板、图片粘贴）、诊断、/init
+    app\          组装根与终端：Application、启动/重启、设置向导、交互控制台（输入行、补全、历史、插话/排队/中断、行内问答、选择器、任务面板、图片粘贴）、诊断、/init
     config\       配置加载与合并（用户配置、profile、.cove.json）、项目信任
     engine\       执行内核：Agent 循环、上下文估算与压缩、TurnHook、系统提示、子目录指令提示、工具输出管理
     model\        模型访问：两类协议与 Bedrock Runtime、事件流解析、模型路由、模型表、图片、网络代理
