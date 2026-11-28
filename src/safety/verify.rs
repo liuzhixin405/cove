@@ -663,6 +663,51 @@ fn java_tests(root: &Path, changed: &[PathBuf]) -> Option<String> {
     })
 }
 
+/// The tree `git add --all` would stage now, built in a throwaway copy of the index: the
+/// project's own staging rules (ignores, `autocrlf`, attributes) and the contents of
+/// untracked files, so it equals the staged tree exactly when a commit holds the content
+/// the checks ran on (0068). `None` outside a Git work tree or when Git fails.
+pub async fn work_tree_hash(root: &Path, cancel: &CancellationToken) -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // A hash that takes longer only costs a reuse; it must not hold up the checks.
+    let git = || process::git::Git::new(root).timeout(Duration::from_secs(20));
+    let index = git()
+        .args(["rev-parse", "--git-path", "index"])
+        .query(cancel)
+        .await?;
+    let copy = std::env::temp_dir().join(format!(
+        "cove-index-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let index = root.join(index);
+    // A repository without commits or staging has no index yet: start from an empty one.
+    if index.is_file() && std::fs::copy(&index, &copy).is_err() {
+        return None;
+    }
+    let staged = git()
+        .env("GIT_INDEX_FILE", copy.as_os_str())
+        .args(["add", "--all"])
+        .output(cancel)
+        .await
+        .is_ok_and(|output| output.ok);
+    let tree = if staged {
+        git()
+            .env("GIT_INDEX_FILE", copy.as_os_str())
+            .args(["write-tree"])
+            .query(cancel)
+            .await
+    } else {
+        None
+    };
+    // A Git stopped at its timeout leaves the copy's lock behind.
+    let mut lock = copy.clone().into_os_string();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(&copy);
+    let _ = std::fs::remove_file(lock);
+    tree.filter(|tree| !tree.is_empty())
+}
+
 /// Whether a check may run without asking (trusted project or mode policy).
 pub type Preapproved = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -860,9 +905,12 @@ impl CommandVerifier {
     }
 
     /// Runs the checks for a `git commit`, whatever the file-tool fingerprint says.
+    /// `staged`: the staged tree; checks that passed on exactly that content, in this
+    /// task or an earlier one, are reused (0068).
     pub async fn verify_commit(
         &self,
         paths: &[PathBuf],
+        staged: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Verification> {
         let paths = self.affecting(paths.to_vec(), &cancel).await;
@@ -876,7 +924,9 @@ impl CommandVerifier {
         }
         let commands = self.turn_commands(&paths);
         // Staged content may hold more than this task: the task's before is no baseline.
-        let verification = self.run(&commands, false, false, cancel).await?;
+        let verification = self
+            .run(&commands, false, false, staged.map(str::to_owned), cancel)
+            .await?;
         if let Some(evidence) = &self.evidence {
             evidence.set_outcome(verification.outcome.name());
         }
@@ -887,11 +937,14 @@ impl CommandVerifier {
     /// failed before the task's changes too counts as passed (see [`Self::judge`]).
     /// `after_reply`: the checks run once the reply is written, so the screen says the
     /// task is still busy and needs nothing from the user, not that it waits for an answer.
+    /// `judged`: the tree whose content the checks judge (the staged one for a commit);
+    /// `None` is the work tree now.
     async fn run(
         &self,
         commands: &[String],
         baseline: bool,
         after_reply: bool,
+        judged: Option<String>,
         cancel: CancellationToken,
     ) -> Result<Verification> {
         let stage = if after_reply {
@@ -903,14 +956,34 @@ impl CommandVerifier {
         let mut summary = String::new();
         let mut detail = String::new();
         let mut outcome = Outcome::Passed;
+        // What the checks run on, and what they judge (0068).
+        let before = match &self.evidence {
+            Some(_) => work_tree_hash(&self.root, &cancel).await,
+            None => None,
+        };
+        let judged = judged.or_else(|| before.clone());
         for command in commands {
-            if self
+            let this_task = self
                 .evidence
                 .as_ref()
-                .is_some_and(|evidence| evidence.passed(command))
-            {
+                .is_some_and(|evidence| evidence.passed(command));
+            let same_content = judged.as_deref().is_some_and(|tree| {
+                self.evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.passed_at(tree, command))
+            });
+            if this_task || same_content {
+                // A pass of this task holds for the work tree now: keep it by content too.
+                if this_task && let (Some(evidence), Some(tree)) = (&self.evidence, &before) {
+                    evidence.record_tree_pass(tree, command);
+                }
                 summary.push_str(&format!(
-                    "passed   {command} (already run successfully after the last edit)\n"
+                    "passed   {command} ({})\n",
+                    if this_task {
+                        "already run successfully after the last edit"
+                    } else {
+                        "already passed on this exact content"
+                    }
                 ));
                 self.record(CheckRecord {
                     command: command.clone(),
@@ -1000,6 +1073,12 @@ impl CommandVerifier {
                 summary.push_str(&format!("passed   {command}\n"));
                 if let Some(evidence) = &self.evidence {
                     evidence.record_pass(command);
+                    // Only when nothing changed while it ran: then it tested that content.
+                    if let Some(tree) = &before
+                        && work_tree_hash(&self.root, &cancel).await.as_ref() == Some(tree)
+                    {
+                        evidence.record_tree_pass(tree, command);
+                    }
                 }
                 self.record(CheckRecord {
                     command: command.clone(),
@@ -1462,7 +1541,7 @@ impl Verifier for CommandVerifier {
             if commands.is_empty() || lock(&self.verified)? == Some(fingerprint) {
                 return Ok(None);
             }
-            let verification = self.run(&commands, true, true, cancel).await?;
+            let verification = self.run(&commands, true, true, None, cancel).await?;
             if verification.outcome == Outcome::Passed {
                 *self
                     .verified
@@ -1573,7 +1652,7 @@ mod tests {
         let checks = ["echo run >> runs.log".to_owned()];
         for _ in 0..2 {
             let verification = verifier
-                .run(&checks, true, false, CancellationToken::new())
+                .run(&checks, true, false, None, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(verification.outcome, Outcome::Passed);
@@ -1581,6 +1660,118 @@ mod tests {
         let runs = std::fs::read(root.join("runs.log")).unwrap();
         let runs = String::from_utf8_lossy(&runs).replace('\0', "");
         assert_eq!(runs.matches("run").count(), 1, "{runs}");
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_work_tree_hash_is_what_staging_everything_would_give() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        write(&root, "a.txt", "one\n");
+        write(&root, ".gitignore", "ignored/\n");
+        write(&root, "ignored/x.txt", "anything\n");
+        let cancel = CancellationToken::new();
+        let hash = work_tree_hash(&root, &cancel).await.unwrap();
+        // The real index is left alone.
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+        write(&root, "ignored/x.txt", "changed\n");
+        assert_eq!(work_tree_hash(&root, &cancel).await.unwrap(), hash);
+        git(&root, &["add", "--all"]);
+        assert_eq!(git(&root, &["write-tree"]), hash);
+        // An untracked file's content counts, not only its name.
+        write(&root, "b.txt", "two\n");
+        let with_b = work_tree_hash(&root, &cancel).await.unwrap();
+        assert_ne!(with_b, hash);
+        write(&root, "b.txt", "three\n");
+        assert_ne!(work_tree_hash(&root, &cancel).await.unwrap(), with_b);
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(work_tree_hash(outside.path(), &cancel).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_commit_of_content_tested_in_an_earlier_task_reuses_the_pass() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        write(&root, "a.txt", "one\n");
+        // Outside the work tree, so counting runs changes nothing the check tested.
+        let log = data.path().join("runs.log");
+        let command = if cfg!(windows) {
+            format!("Add-Content -Path '{}' -Value run", log.to_string_lossy())
+        } else {
+            format!("echo run >> '{}'", log.to_string_lossy())
+        };
+        let store = crate::session::Store::open(data.path()).unwrap();
+        let workspace = Arc::new(Workspace::new(root.clone(), store).unwrap());
+        let evidence = Arc::new(Evidence::default());
+        let verifier = CommandVerifier::new(
+            root.clone(),
+            vec![command],
+            None,
+            workspace,
+            Arc::new(crate::safety::permission::LocalAuthorizer {
+                mode: crate::safety::permission::Mode::Bypass,
+                input: None,
+            }),
+        )
+        .with_evidence(evidence.clone());
+        let runs = || {
+            let text = std::fs::read(&log).unwrap_or_default();
+            String::from_utf8_lossy(&text)
+                .replace('\0', "")
+                .matches("run")
+                .count()
+        };
+        let commit = |staged: String| {
+            let verifier = &verifier;
+            async move {
+                verifier
+                    .verify_commit(
+                        &[PathBuf::from("a.txt")],
+                        Some(&staged),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        git(&root, &["add", "--all"]);
+        let staged = git(&root, &["write-tree"]);
+        assert_eq!(commit(staged.clone()).await.outcome, Outcome::Passed);
+        assert_eq!(runs(), 1);
+        // The next task: its own passes start empty, the content's stay.
+        evidence.reset();
+        let again = commit(staged).await;
+        assert_eq!(again.outcome, Outcome::Passed);
+        assert!(
+            again
+                .summary
+                .contains("already passed on this exact content"),
+            "{}",
+            again.summary
+        );
+        assert_eq!(runs(), 1);
+        // Changed content is tested again.
+        write(&root, "a.txt", "two\n");
+        git(&root, &["add", "--all"]);
+        evidence.reset();
+        assert_eq!(
+            commit(git(&root, &["write-tree"])).await.outcome,
+            Outcome::Passed
+        );
+        assert_eq!(runs(), 2);
     }
 
     fn write(root: &Path, path: &str, text: &str) {
@@ -1887,7 +2078,7 @@ mod tests {
         );
         // A commit of documentation only runs no checks.
         let verification = verifier
-            .verify_commit(&[PathBuf::from("docs/notes.md")], cancel.clone())
+            .verify_commit(&[PathBuf::from("docs/notes.md")], None, cancel.clone())
             .await
             .unwrap();
         assert_eq!(verification.outcome, Outcome::Passed);
@@ -1938,7 +2129,7 @@ mod tests {
         .with_ledger(ledger.clone());
         let started = Instant::now();
         let verification = verifier
-            .verify_commit(&[PathBuf::from("a.txt")], CancellationToken::new())
+            .verify_commit(&[PathBuf::from("a.txt")], None, CancellationToken::new())
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
@@ -2279,7 +2470,7 @@ mod tests {
             .replace(&root.join("calc.py"), Some(original), &kept)
             .unwrap();
         let verification = verifier
-            .run(&checks, true, false, CancellationToken::new())
+            .run(&checks, true, false, None, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(
@@ -2298,7 +2489,7 @@ mod tests {
         assert!(workspace.pending_swap().is_none());
         // The commit gate does not compare.
         let commit = verifier
-            .run(&checks, false, false, CancellationToken::new())
+            .run(&checks, false, false, None, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(commit.outcome, Outcome::Failed);
@@ -2308,7 +2499,7 @@ mod tests {
             .replace(&root.join("calc.py"), Some(&kept), &broken)
             .unwrap();
         let verification = verifier
-            .run(&checks, true, false, CancellationToken::new())
+            .run(&checks, true, false, None, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(verification.outcome, Outcome::Failed);

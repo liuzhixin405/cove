@@ -236,7 +236,9 @@ impl WithCommitGate {
         let mut verdict = Ok(());
         if let Some(verifier) = &self.verifier {
             let changed: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-            let verification = verifier.verify_commit(&changed, cancel.clone()).await?;
+            let verification = verifier
+                .verify_commit(&changed, Some(&tree), cancel.clone())
+                .await?;
             if verification.outcome != Outcome::Passed {
                 verdict = Err(format!(
                     "pre-commit verification did not pass; nothing was committed.\n{}{}",

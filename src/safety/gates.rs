@@ -12,7 +12,10 @@ pub mod plan;
 pub mod review;
 pub mod review_command;
 
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Mutex,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -172,7 +175,13 @@ struct EvidenceState {
 #[derive(Default)]
 pub struct Evidence {
     state: Mutex<EvidenceState>,
+    /// Checks that passed on a work tree's exact content, by Git tree hash; kept across
+    /// tasks, so content tested once is not tested again before a commit (0068).
+    by_tree: Mutex<VecDeque<(String, HashSet<String>)>>,
 }
+
+/// Trees whose passed checks are kept; the oldest goes first.
+const TREES_KEPT: usize = 16;
 
 /// Tools that never change anything.
 pub const READ_ONLY_TOOLS: &[&str] = &[
@@ -207,6 +216,32 @@ impl Evidence {
     /// A gate check passed; it stays valid until a later change, like a model-run check.
     pub fn record_pass(&self, command: &str) {
         self.with(|state| state.passed.insert(normalize_command(command)));
+    }
+
+    /// `command` passed on the work tree whose content hashes to `tree`.
+    pub fn record_tree_pass(&self, tree: &str, command: &str) {
+        let Ok(mut trees) = self.by_tree.lock() else {
+            return;
+        };
+        let command = normalize_command(command);
+        if let Some((_, passed)) = trees.iter_mut().find(|(known, _)| known == tree) {
+            passed.insert(command);
+            return;
+        }
+        if trees.len() >= TREES_KEPT {
+            trees.pop_front();
+        }
+        trees.push_back((tree.to_owned(), HashSet::from([command])));
+    }
+
+    /// Whether `command` passed on content that hashes to `tree`, in any task.
+    pub fn passed_at(&self, tree: &str, command: &str) -> bool {
+        let command = normalize_command(command);
+        self.by_tree.lock().is_ok_and(|trees| {
+            trees
+                .iter()
+                .any(|(known, passed)| known == tree && passed.contains(&command))
+        })
     }
 
     pub fn did_work(&self) -> bool {
