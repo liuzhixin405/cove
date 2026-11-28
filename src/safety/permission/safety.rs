@@ -932,7 +932,7 @@ pub fn secrets(text: &str) -> Vec<String> {
             if s.len() <= 8 {
                 "***".to_owned()
             } else {
-                format!("{}***{}", &s[..4], &s[s.len() - 4..])
+                format!("{}***{}", crate::text::head(s, 4), crate::text::tail(s, 4))
             }
         })
         .collect()
@@ -1025,5 +1025,22 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found[0].starts_with("sk-a***"));
         assert!(secrets("no secret here").is_empty());
+    }
+
+    /// `(?i)` folds `k` to the Kelvin sign and `s` to the long s, both wider than one
+    /// byte: the mask must not cut them.
+    #[test]
+    fn masks_secrets_whose_keyword_has_wide_case_variants() {
+        for text in [
+            "to\u{212A}en=abcdefghijklmnopqrstuvwxyz",
+            "\u{17F}ecret: abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let found = secrets(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert!(
+                found[0].contains("***") && found[0].ends_with("wxyz"),
+                "{found:?}"
+            );
+        }
     }
 }

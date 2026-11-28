@@ -472,7 +472,7 @@ async fn write_skill(app: &Application, name: &str, text: &str) -> Result<String
     }
     authorize(app, Effect::Write(path.clone())).await?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&path, text)?;
+    crate::persist::write_atomic(&path, text.as_bytes(), false)?;
     app.tools.skills.add(&path)?;
     Ok(crate::paths::display(&path))
 }

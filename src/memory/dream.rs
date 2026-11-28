@@ -840,13 +840,19 @@ Finish with a brief summary of what you merged, updated or pruned (or that nothi
         .with_long_cache(false);
         let cancel = self.cancel.child_token();
         let run = agent.run_detached(self.prompt(&sessions), cancel.clone());
-        let (ok, summary) = match tokio::time::timeout(TIMEOUT, run).await {
-            Ok((Ok(_), _, text)) => (true, text),
-            Ok((Err(err), _, text)) => (false, format!("{err}\n{text}")),
-            Err(_) => {
+        tokio::pin!(run);
+        // Stopped, not dropped: the request in flight ends and is accounted for.
+        let (outcome, timed_out) = tokio::select! {
+            outcome = &mut run => (outcome, false),
+            () = tokio::time::sleep(TIMEOUT) => {
                 cancel.cancel();
-                (false, "5 分钟后超时".into())
+                (run.await, true)
             }
+        };
+        let (ok, summary) = match outcome {
+            _ if timed_out => (false, "5 分钟后超时".into()),
+            (Ok(_), _, text) => (true, text),
+            (Err(err), _, text) => (false, format!("{err}\n{text}")),
         };
         let record = LastDream {
             at: now(),

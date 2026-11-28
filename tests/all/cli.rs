@@ -118,6 +118,17 @@ fn cli(root: &std::path::Path, url: &str, protocol: &str) -> Invocation {
 }
 
 fn persistent_cli(root: &std::path::Path, data: &std::path::Path, url: &str) -> Command {
+    persistent_cli_within(root, data, url, 20)
+}
+
+/// `persistent_cli` with another task time limit, for runs that start many processes.
+fn persistent_cli_within(
+    root: &std::path::Path,
+    data: &std::path::Path,
+    url: &str,
+    seconds: u64,
+) -> Command {
+    let seconds = seconds.to_string();
     let mut command = Command::new(common::exe());
     command.args([
         "--provider",
@@ -129,7 +140,7 @@ fn persistent_cli(root: &std::path::Path, data: &std::path::Path, url: &str) -> 
         "--permission",
         "bypass",
         "--timeout",
-        "20",
+        &seconds,
     ]);
     command.arg("--cwd").arg(root).arg("--data-dir").arg(data);
     command.env("COVE_API_KEY", "test-only-not-a-real-key");
@@ -665,7 +676,9 @@ async fn all_hook_events_run_with_scrubbed_environment_and_session_end_once() {
         } else {
             format!("test -z \"$COVE_API_KEY\" || exit 8; printf '%s\\n' '{event}' >> hook-events.txt; printf '%s' '{{\"decision\":\"allow\"}}'")
         };
-        json!({"name":event,"event":event,"command":command,"timeout_seconds":5})
+        // Six PowerShell starts: under a full parallel test run each can take seconds,
+        // so the limits leave room; what is checked is which events ran, not how fast.
+        json!({"name":event,"event":event,"command":command,"timeout_seconds":30})
     }).collect::<Vec<_>>();
     let config = root.path().join("hooks.json");
     std::fs::write(&config, json!({"extensions":{"hooks":hooks}}).to_string()).unwrap();
@@ -681,7 +694,7 @@ async fn all_hook_events_run_with_scrubbed_environment_and_session_end_once() {
         ),
     ])
     .await;
-    let output = persistent_cli(root.path(), data.path(), &url)
+    let output = persistent_cli_within(root.path(), data.path(), &url, 120)
         .arg("--config")
         .arg(config)
         .args(["--trust-extensions", "-p", "write file"])

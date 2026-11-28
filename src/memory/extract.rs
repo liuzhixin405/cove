@@ -372,6 +372,7 @@ async fn extract(
         &preferences,
         &session.id,
     );
+    let cancel = CancellationToken::new();
     let run = run(
         memory,
         targets,
@@ -380,14 +381,21 @@ async fn extract(
         provenance,
         max_output_tokens,
         session.id.clone(),
+        cancel.clone(),
     );
-    let outcome = match tokio::time::timeout(TIMEOUT, run).await {
-        Ok(outcome) => outcome,
-        Err(_) => Outcome {
-            at: now(),
-            saved: 0,
-            error: Some("timed out after 30 s".into()),
-        },
+    tokio::pin!(run);
+    // Stopped, not dropped: the request in flight ends and is accounted for.
+    let outcome = tokio::select! {
+        outcome = &mut run => outcome,
+        () = tokio::time::sleep(TIMEOUT) => {
+            cancel.cancel();
+            run.await;
+            Outcome {
+                at: now(),
+                saved: 0,
+                error: Some("timed out after 30 s".into()),
+            }
+        }
     };
     if let Ok(mut state) = state.lock() {
         state.in_flight = false;
@@ -396,6 +404,7 @@ async fn extract(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     memory: Arc<Memory>,
     targets: Targets,
@@ -404,12 +413,13 @@ async fn run(
     provenance: ProvenanceSource,
     max_output_tokens: u32,
     session: String,
+    cancel: CancellationToken,
 ) -> Outcome {
     let response = crate::model::oneshot::call(
         &*provider,
         crate::model::oneshot::text_request(SYSTEM, prompt, max_output_tokens),
         TIMEOUT,
-        CancellationToken::new(),
+        cancel,
     )
     .await;
     let response = match response {
@@ -600,6 +610,7 @@ mod tests {
             ProvenanceSource::default(),
             1000,
             "session".into(),
+            CancellationToken::new(),
         )
         .await;
         assert_eq!(result.saved, 2);
@@ -655,6 +666,7 @@ mod tests {
             ProvenanceSource::default(),
             1000,
             "s".into(),
+            CancellationToken::new(),
         )
         .await;
         assert!(preferences.pending.list().unwrap().is_empty());

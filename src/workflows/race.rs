@@ -413,7 +413,7 @@ async fn candidate(
         match capture_patch(&tree, &baseline.commit, cancel).await {
             Ok(patch) if !patch.is_empty() => {
                 let path = run_dir.join(format!("{}.patch", lane.id));
-                match std::fs::write(&path, &patch) {
+                match crate::persist::write_atomic(&path, &patch, false) {
                     Ok(()) => {
                         result.patch_sha256 = sha256_hex(&patch);
                         result.patch_bytes = patch.len();
