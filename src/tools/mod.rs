@@ -1513,7 +1513,7 @@ impl ToolExecutor for LocalTools {
         if self.user_input.is_some() {
             definitions.push(definition(
                 "question",
-                "Ask the user one or more questions when requirements need clarification or a choice. Options are shown numbered; the user answers by number(s) or with free text.",
+                "Ask the user one or more questions when requirements need clarification or a choice. The task waits for the answer and continues. Options are shown numbered; the user answers by number(s) or with free text.",
                 json!({"questions":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{
                     "question":{"type":"string"},
                     "header":{"type":"string","description":"short topic label"},

@@ -148,3 +148,4 @@ cove 的每一次改动（功能、修复、重构、性能），**先写文档�
 | [0062](0062-debug-tests-reused-by-verify.md) | 测试统一用 debug 构建，收尾验证复用模型跑过的结果 | 已完成 |
 | [0063](0063-resume-after-restart.md) | MCP 未信任时不再中断整轮；重启恢复后说清"继续"接的是哪一轮 | 已完成 |
 | [0064](0064-agent-panel-running-only.md) | 任务面板只列正在运行的子代理，已结束的合并成一行，状态和步骤改中文 | 已完成 |
+| [0065](0065-ask-with-question-tool.md) | 需要用户回答时用 question 工具提问，回答后接着做，不再以结束一轮来提问 | 已完成 |

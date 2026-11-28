@@ -2871,6 +2871,8 @@ impl Agent {
              Work only on the user's task and preserve existing changes. Use tools to implement and run relevant checks; never claim a check passed \
              without its actual successful result, and report failed or unrun checks explicitly. \
              If something outside your control is missing (a service that is not running, a permission, a dependency), say so and finish instead of retrying variations. \
+             When you need an answer, a choice or information the user can give to continue and the question tool is available, call it instead of ending your reply with a question; \
+             say so and finish only when the user must act outside cove (start a service, grant access). \
              Read and search with read, grep, glob and repo_map, and create or change files with write and edit, not with shell (cat, sed, head, grep, find, \
              heredocs, tee, sed -i): file tools need no approval, skip ignored files and keep encoding and line endings. \
              Put independent reads and searches in one response, focused with line ranges and path/include filters. \
