@@ -827,7 +827,7 @@ cove 统计并显示费用，但不设花费上限，也不会因费用停止任
 要求项目根是本地 Git 仓库、处于分支上且工作区干净。`/race <需求>` 同时做两个方案：
 
 - 方案 A 用主模型；方案 B 用快速模型（`model_fast`）。没有配置快速模型或与主模型相同时，B 也用主模型，并被要求采用与最直接的做法不同的思路。
-- 每个方案是一个可编辑的子 Agent（`general` 类型，调用上限同 `subagent_max_iterations`），在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行，和主任务在同一进程、用同样的工具（包括 MCP、Hooks）。权限是 `auto`，判定范围是自己的 worktree；仍需审批的命令排进后台审批队列，没有终端时拒绝。
+- 每个方案是一个可编辑的子 Agent（`general` 类型，调用上限同 `subagent_max_iterations`），在 `<data-dir>/race/<run>/wt-a|wt-b` 的分离 worktree（从 HEAD 创建，禁用 Git hooks）里运行，和主任务在同一进程、用同样的工具（包括 MCP、Hooks）。权限跟随会话当前的权限模式（`/mode` 改过的也算；`plan` 下按 `default`，因为方案只写自己的 worktree），判定范围是自己的 worktree；需要审批的命令在竞速运行期间当场询问（提示以 `[race a]`/`[race b]` 开头，两个方案同时要审批时依次问），没有终端时拒绝这一次、方案继续。方案因为时间用完停下时，报告写 `generation timed out`。
 - 费用记入当前会话和费用账本。
 - 两个方案完成后，在各自 worktree 运行同一组验证命令（不经 Shell，只看退出码）：配置了 `done_verify_commands` 时用它，否则按自动验证门禁的规则推断构建和测试命令（`cargo check`/`cargo test`、`go build`/`go test`、`npm run build`/测试脚本、`dotnet build`、Python 的 `compileall`/`pytest` 等）。推断不出时结果标为"未验证"。
 - 清理被忽略文件后捕获二进制补丁（符号链接、子模块、`.git` 路径会使方案失败），报告与补丁存到 `<data-dir>/race/<run>/`，worktree 随后删除。

@@ -405,6 +405,10 @@ async fn race_command(app: &mut Application, line: &str) -> Result<()> {
         true,
     )?;
     let hub = app.agents.clone();
+    let access = race::Access {
+        mode: app.permissions.mode(),
+        input: app.input.clone(),
+    };
     let cancel = CancellationToken::new();
     let result = foreground(
         app,
@@ -417,6 +421,7 @@ async fn race_command(app: &mut Application, line: &str) -> Result<()> {
             &lanes,
             verify,
             race::TIMEOUT,
+            &access,
             &cancel,
         ),
     )

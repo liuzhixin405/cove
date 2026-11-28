@@ -30,7 +30,7 @@ use crate::{
     agents::lifecycle::{AgentRecord, Kind, Lifecycle, Transition, project_key},
     agents::subagent::{AgentHub, AgentType, Exit},
     agents::worktree,
-    domain::{Error, Result},
+    domain::{Error, Result, UserInput},
     engine::agent::last_answer,
     engine::turn::TurnHook,
     safety::permission::{Authorizer, Decision, Effect, Mode},
@@ -68,10 +68,16 @@ impl ApprovalQueue {
         }
     }
 
+    /// The requests still waited for; one whose agent stopped waiting is dropped.
     pub fn take_all(&self) -> Vec<PendingApproval> {
         self.pending
             .lock()
-            .map(|mut pending| pending.drain(..).collect())
+            .map(|mut pending| {
+                pending
+                    .drain(..)
+                    .filter(|request| !request.reply.is_closed())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -79,6 +85,7 @@ impl ApprovalQueue {
         self.pending.lock().map_or(Vec::new(), |pending| {
             pending
                 .iter()
+                .filter(|request| !request.reply.is_closed())
                 .map(|request| format!("{}: {}", request.agent, request.description))
                 .collect()
         })
@@ -98,6 +105,9 @@ pub struct BackgroundAuthorizer {
     pub agent: String,
     /// Something this run was refused: scripts it wrote ask too.
     pub refused: std::sync::atomic::AtomicBool,
+    /// Asks here at once instead of queueing for between tasks: for runs the user is
+    /// waiting on in the foreground (`/race`).
+    pub live: Option<Arc<dyn UserInput>>,
 }
 
 impl Authorizer for BackgroundAuthorizer {
@@ -129,6 +139,20 @@ impl Authorizer for BackgroundAuthorizer {
             match decision {
                 Decision::Allow => Ok(()),
                 Decision::Deny(reason) => Err(Error::Approval(format!("{description}: {reason}"))),
+                Decision::Ask if self.live.is_some() => {
+                    let input = self.live.as_ref().expect("checked");
+                    let prompt = format!("[{}] 批准 {description}？[y/N] ", self.agent);
+                    let answer = tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        answer = input.answer(prompt, cancel.clone()) => answer?,
+                    };
+                    if answer.trim().eq_ignore_ascii_case("y") {
+                        Ok(())
+                    } else {
+                        refuse();
+                        Err(Error::Denied(description))
+                    }
+                }
                 Decision::Ask if !self.queue.interactive => {
                     refuse();
                     Err(Error::Unattended(format!(
@@ -719,6 +743,7 @@ impl AgentHub {
             queue: self.approvals.clone(),
             agent: format!("agent {short}"),
             refused: Default::default(),
+            live: None,
         });
         let (progress, events, forward) = self.forward_events(&short);
         let mut extra = BACKGROUND_NOTE.to_owned();
@@ -1436,6 +1461,7 @@ mod tests {
             queue: queue.clone(),
             agent: "agent x".into(),
             refused: Default::default(),
+            live: None,
         };
         let cancel = CancellationToken::new();
         let pending = tokio::spawn({
@@ -1462,6 +1488,7 @@ mod tests {
             queue: Arc::new(ApprovalQueue::new(false, Arc::default())),
             agent: "agent y".into(),
             refused: Default::default(),
+            live: None,
         };
         assert!(
             headless
@@ -1470,6 +1497,75 @@ mod tests {
                 .is_err()
         );
         assert!(headless.authorize(Effect::Read, cancel).await.is_ok());
+    }
+
+    struct Answers(std::sync::Mutex<Vec<String>>, std::sync::Mutex<Vec<String>>);
+
+    impl UserInput for Answers {
+        fn answer(&self, prompt: String, _: CancellationToken) -> BoxFuture<'_, Result<String>> {
+            self.1.lock().unwrap().push(prompt);
+            let answer = self.0.lock().unwrap().remove(0);
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    /// A run the user waits on asks at once, not between tasks; only `y` allows.
+    #[tokio::test]
+    async fn live_approvals_are_asked_at_once() {
+        let input = Arc::new(Answers(
+            std::sync::Mutex::new(vec!["y".into(), "".into()]),
+            std::sync::Mutex::default(),
+        ));
+        let queue = Arc::new(ApprovalQueue::new(true, Arc::default()));
+        let authorizer = BackgroundAuthorizer {
+            mode: Mode::Ask,
+            root: std::env::temp_dir(),
+            queue: queue.clone(),
+            agent: "race b".into(),
+            refused: Default::default(),
+            live: Some(input.clone()),
+        };
+        let effect = || Effect::Shell("cargo publish".into());
+        let cancel = CancellationToken::new();
+        assert!(authorizer.authorize(effect(), cancel.clone()).await.is_ok());
+        assert!(matches!(
+            authorizer.authorize(effect(), cancel).await,
+            Err(Error::Denied(_))
+        ));
+        let prompts = input.1.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].starts_with("[race b] 批准 "), "{prompts:?}");
+        assert!(queue.take_all().is_empty());
+    }
+
+    /// A request whose agent was cancelled is not asked afterwards.
+    #[tokio::test]
+    async fn requests_of_cancelled_runs_are_not_asked() {
+        let queue = Arc::new(ApprovalQueue::new(true, Arc::default()));
+        let authorizer = BackgroundAuthorizer {
+            mode: Mode::Ask,
+            root: std::env::temp_dir(),
+            queue: queue.clone(),
+            agent: "race b".into(),
+            refused: Default::default(),
+            live: None,
+        };
+        let cancel = CancellationToken::new();
+        let pending = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                authorizer
+                    .authorize(Effect::Shell("cargo publish".into()), cancel)
+                    .await
+            }
+        });
+        while queue.descriptions().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        assert!(matches!(pending.await.unwrap(), Err(Error::Cancelled)));
+        assert!(queue.descriptions().is_empty());
+        assert!(queue.take_all().is_empty());
     }
 
     /// A report the model already has is one line for the user.

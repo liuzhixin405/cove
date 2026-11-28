@@ -6,8 +6,9 @@
 //! is applied until an explicit `/changes apply race:<run>:<a|b> confirm`.
 //!
 //! The lanes run in this process: their spend reaches the session and the
-//! ledger, and they use the same tools as the main task. They run in `auto`
-//! permission mode inside their own worktree, never the user's tree.
+//! ledger, and they use the same tools as the main task. They run in the session's
+//! permission mode (`plan` as `default`) inside their own worktree, never the user's
+//! tree, and ask their approvals while the user waits on the race.
 
 use std::{
     path::{Path, PathBuf},
@@ -23,7 +24,7 @@ use crate::{
         background::BackgroundAuthorizer,
         subagent::{AgentHub, Exit, RunRequest},
     },
-    domain::{Error, Result},
+    domain::{Error, Result, UserInput},
     persist::{atomic_json, read_json},
     safety::permission::Mode,
     session::{new_id, now, workspace::Workspace},
@@ -39,6 +40,23 @@ pub const TIMEOUT: Duration = Duration::from_secs(900);
 const OTHER_APPROACH: &str = "\n\nAnother agent solves the same request in parallel with the most \
     direct approach. Take a clearly different approach (another design, algorithm or place to \
     change), and say in your final answer how it differs.";
+
+/// How the lanes are allowed to act: the session's permission mode, and the terminal
+/// that answers their approvals (none: they are refused, as for any unattended run).
+#[derive(Clone)]
+pub struct Access {
+    pub mode: Mode,
+    pub input: Option<Arc<dyn UserInput>>,
+}
+
+/// A lane writes only its own worktree, so the session's plan mode (which keeps the
+/// user's tree read-only) becomes `default` there: writes allowed, the rest asked.
+pub fn lane_mode(session: Mode) -> Mode {
+    match session {
+        Mode::Plan => Mode::Default,
+        mode => mode,
+    }
+}
 
 /// One way of solving the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +310,7 @@ async fn candidate(
     request: &str,
     verify: &[Vec<String>],
     deadline: tokio::time::Instant,
+    access: &Access,
     cancel: &CancellationToken,
 ) -> Candidate {
     let mut result = Candidate {
@@ -329,11 +348,12 @@ async fn candidate(
             prompt: lane.prompt.clone(),
             model: Some(lane.model.clone()),
             authorizer: Some(Arc::new(BackgroundAuthorizer {
-                mode: Mode::Auto,
+                mode: lane_mode(access.mode),
                 root: tree.clone(),
                 queue: hub.approvals.clone(),
                 agent: format!("race {}", lane.id),
                 refused: Default::default(),
+                live: access.input.clone(),
             })),
             detached: true,
             worktree: Some((tree.clone(), workspace)),
@@ -372,7 +392,9 @@ async fn candidate(
                 cost_usd: outcome.spent.cost,
                 summary: crate::text::short(&outcome.output, 300),
             });
-            if let Some(detail) = outcome.exit.detail() {
+            if timed_out {
+                result.error = Some("generation timed out".into());
+            } else if let Some(detail) = outcome.exit.detail() {
                 result.error = Some(crate::text::short(detail, 300));
             }
             !timed_out && matches!(outcome.exit, Exit::Completed | Exit::Unverified)
@@ -425,6 +447,7 @@ pub async fn run(
     lanes: &[Lane; 2],
     verify: Vec<Vec<String>>,
     timeout: Duration,
+    access: &Access,
     cancel: &CancellationToken,
 ) -> Result<Report> {
     if request.trim().is_empty() {
@@ -464,10 +487,10 @@ pub async fn run(
     };
     let (a, b) = tokio::join!(
         candidate(
-            hub, &baseline, &run_dir, &lanes[0], request, &verify, deadline, &race
+            hub, &baseline, &run_dir, &lanes[0], request, &verify, deadline, access, &race
         ),
         candidate(
-            hub, &baseline, &run_dir, &lanes[1], request, &verify, deadline, &race
+            hub, &baseline, &run_dir, &lanes[1], request, &verify, deadline, access, &race
         ),
     );
     timer.abort();
@@ -597,6 +620,14 @@ mod tests {
             let [_, b] = lanes("fix the bug", "opus", fast);
             assert_eq!(b.model, "opus");
             assert!(b.prompt.starts_with("fix the bug") && b.prompt.contains("different approach"));
+        }
+    }
+
+    #[test]
+    fn lanes_follow_the_session_mode_with_plan_as_default() {
+        assert_eq!(lane_mode(Mode::Plan), Mode::Default);
+        for mode in [Mode::Default, Mode::Auto, Mode::Bypass] {
+            assert_eq!(lane_mode(mode), mode);
         }
     }
 
