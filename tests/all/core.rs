@@ -1023,17 +1023,19 @@ async fn cancelled_shell_kills_its_spawned_child_before_late_writes() {
     let script = if cfg!(windows) {
         std::fs::write(dir.path().join("child.ps1"),
                 "Set-Content -LiteralPath child-ready -Value $PID; Start-Sleep -Seconds 3; Set-Content -LiteralPath leaked -Value bad").unwrap();
-        "Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-File','child.ps1') -WorkingDirectory (Get-Location).Path; Start-Sleep -Seconds 20"
+        "Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-File','child.ps1') -WorkingDirectory (Get-Location).Path; Start-Sleep -Seconds 120"
     } else {
-        "(echo ready > child-ready; sleep 3; echo bad > leaked) & sleep 20"
+        "(echo ready > child-ready; sleep 3; echo bad > leaked) & sleep 120"
     };
+    // Two PowerShell starts can take many seconds under a full parallel test run: the
+    // limits before cancelling leave room, the checks after it stay tight.
     let cancel = CancellationToken::new();
     let work_root = dir.path().to_path_buf();
     let work_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        process::shell(&work_root, script, Duration::from_secs(15), work_cancel).await
+        process::shell(&work_root, script, Duration::from_secs(120), work_cancel).await
     });
-    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+    let ready = tokio::time::timeout(Duration::from_secs(60), async {
         while !dir.path().join("child-ready").exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
