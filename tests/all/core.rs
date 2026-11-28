@@ -729,6 +729,124 @@ async fn steering_repeated_interruptions_preserve_both_messages_and_known_cost()
     }
 }
 
+/// Passes once, while `text` is typed: a user answering during the end-of-task checks.
+struct TypingVerifier {
+    steer: Arc<TestSteer>,
+    text: Mutex<Option<String>>,
+}
+
+impl cove::safety::verify::Verifier for TypingVerifier {
+    fn verify(
+        &self,
+        _: CancellationToken,
+    ) -> BoxFuture<'_, Result<Option<cove::safety::verify::Verification>>> {
+        Box::pin(async move {
+            Ok(self.text.lock().unwrap().take().map(|text| {
+                self.steer.push(&text);
+                cove::safety::verify::Verification {
+                    outcome: cove::safety::verify::Outcome::Passed,
+                    summary: String::new(),
+                    detail: String::new(),
+                }
+            }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn text_typed_during_the_final_checks_stays_in_the_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([
+            response(vec![Block::Text("which one?".into())]),
+            response(vec![Block::Text("went with the second".into())]),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    let verifier = Arc::new(TypingVerifier {
+        steer: steer.clone(),
+        text: Mutex::new(Some("the second one".into())),
+    });
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits(),
+    )
+    .unwrap()
+    .with_steer(steer.clone())
+    .with_verifier(Some(verifier));
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = agent
+        .run("pick one".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(report.model_calls, 2);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "the answer is handled in this task");
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == Role::User
+            && message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text(text) if text.contains("the second one")))
+    }));
+    assert!(cove::domain::SteerSource::take(&*steer).is_none());
+}
+
+/// Answers after a short wait, so a wake can arrive while the reply is in flight.
+struct Delayed(FakeProvider);
+
+impl Provider for Delayed {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ModelResponse>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.0.stream(request, events, cancel).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_wake_whose_text_was_already_delivered_keeps_the_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Delayed(FakeProvider {
+        responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
+        requests: Mutex::new(Vec::new()),
+    }));
+    let steer = Arc::new(TestSteer {
+        text: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+    });
+    // `!` text typed during a tool run and taken with its result leaves the wake behind.
+    steer.wake.notify_one();
+    let agent = Agent::new(
+        provider.clone(),
+        Arc::new(tools(dir.path(), Mode::Auto)),
+        limits(),
+    )
+    .unwrap()
+    .with_steer(steer.clone());
+    let (tx, mut rx) = mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = agent
+        .run("write a function".into(), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(report.model_calls, 1, "the reply was not restarted");
+    assert_eq!(provider.0.requests.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn steering_with_known_prices_does_not_wait_for_usage() {
     let dir = tempfile::tempdir().unwrap();
@@ -796,12 +914,12 @@ async fn steering_with_known_prices_does_not_wait_for_usage() {
 }
 
 #[tokio::test]
-async fn steering_empty_wakeup_counts_interrupted_request() {
+async fn steering_an_empty_wakeup_keeps_the_call_and_typed_text_still_interrupts() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(HangOnce {
         first: true.into(),
         inner: FakeProvider {
-            responses: Mutex::new(VecDeque::new()),
+            responses: Mutex::new(VecDeque::from([response(vec![Block::Text("done".into())])])),
             requests: Mutex::new(Vec::new()),
         },
     });
@@ -813,43 +931,44 @@ async fn steering_empty_wakeup_counts_interrupted_request() {
     let agent = Agent::new(
         provider.clone(),
         Arc::new(tools(dir.path(), Mode::Auto)),
-        Limits {
-            prices,
-            max_turns: 1,
-            ..limits()
-        },
+        Limits { prices, ..limits() },
     )
     .unwrap()
     .with_steer(steer.clone());
     let mut session = Session::new(dir.path().into(), "Openai".into(), "mock".into(), prices);
     let (tx, mut rx) = mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let (result, _) = tokio::join!(
-        agent.run_in(
-            &mut session,
-            Some("write a function".into()),
-            &Ephemeral,
-            tx,
-            CancellationToken::new()
-        ),
-        async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            steer.wake.notify_one();
-        }
-    );
+    let (result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            agent.run_in(
+                &mut session,
+                Some("write a function".into()),
+                &Ephemeral,
+                tx,
+                CancellationToken::new()
+            ),
+            async {
+                // A wake whose text was already delivered: the hung call goes on (0067).
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                steer.wake.notify_one();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                steer.push("use iteration");
+            }
+        )
+    })
+    .await
+    .expect("typed text must still interrupt after an empty wake");
     drain.await.unwrap();
-    assert!(
-        matches!(result, Err(Error::Stopped(stopped)) if stopped.stop == cove::engine::agent::Stop::Limit(1))
-    );
+    assert!(result.is_ok());
+    // The interrupted call and the answer; the empty wake cost nothing.
     assert_eq!(session.accounting.model_calls, 2);
-    assert_eq!(session.accounting.cost, Some(0.0));
     let requests = provider.inner.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].tools.is_empty());
     assert!(requests[0].messages.iter().any(|message| {
-        message.blocks.iter().any(
-            |block| matches!(block, Block::Text(text) if text.contains("model call limit reached")),
-        )
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text(text) if text.contains("use iteration")))
     }));
 }
 

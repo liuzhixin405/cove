@@ -449,6 +449,9 @@ fn retry_note(progress: &Progress) -> String {
     note
 }
 
+/// Wakes without text after which a model call stops listening for steering (0067).
+const EMPTY_WAKES: u32 = 8;
+
 /// Resolves when any steering source has text waiting.
 fn steer_waiting(
     sources: &[Arc<dyn crate::domain::SteerSource>],
@@ -2164,36 +2167,44 @@ impl Agent {
             let result = if self.steer.is_empty() {
                 stream.await
             } else {
-                let outcome =
-                    futures_util::future::select(stream, steer_waiting(&self.steer)).await;
-                match outcome {
-                    futures_util::future::Either::Left((result, _wait)) => result,
-                    futures_util::future::Either::Right(((), stream)) => {
-                        let texts: Vec<String> = self
-                            .steer
-                            .iter()
-                            .filter_map(|source| source.take())
-                            .collect();
-                        // Interrupted by the user: not charged against the call quota.
-                        // A wake with nothing taken still counts, so it cannot loop forever.
-                        if texts.is_empty() {
-                            calls_used += 1;
+                let mut stream = stream;
+                let mut empty_wakes = 0;
+                let typed = loop {
+                    match futures_util::future::select(stream, steer_waiting(&self.steer)).await {
+                        futures_util::future::Either::Left((result, _wait)) => break Ok(result),
+                        futures_util::future::Either::Right(((), rest)) => {
+                            match self.typed_meanwhile() {
+                                Some(text) => break Err(text),
+                                // A wake whose text a tool result already delivered: keep
+                                // this reply (0067). A source that keeps waking with nothing
+                                // must not spin: past a few, the reply is awaited alone.
+                                None => {
+                                    empty_wakes += 1;
+                                    if empty_wakes >= EMPTY_WAKES {
+                                        break Ok(rest.await);
+                                    }
+                                    stream = rest;
+                                }
+                            }
                         }
+                    }
+                };
+                match typed {
+                    Ok(result) => result,
+                    // Interrupted by the user: not charged against the call quota.
+                    Err(text) => {
                         report.model_calls += 1;
-                        if !texts.is_empty() {
-                            progress.user_input();
-                            session.messages.push(Message::steer(texts.join("\n")));
-                            persistence.save(session)?;
-                            emit(
-                                &events,
-                                &cancel,
-                                Event::Notice(
-                                    "[steer] 已中断当前生成，带着你刚输入的内容重新回答".into(),
-                                ),
-                            )
-                            .await?;
-                        }
-                        drop(stream);
+                        progress.user_input();
+                        session.messages.push(Message::steer(text));
+                        persistence.save(session)?;
+                        emit(
+                            &events,
+                            &cancel,
+                            Event::Notice(
+                                "[steer] 已中断当前生成，带着你刚输入的内容重新回答".into(),
+                            ),
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -2444,6 +2455,13 @@ impl Agent {
                         }
                     }
                 }
+                // Typed while the checks ran: the reply changes, so reviewing it now is waste.
+                if self
+                    .deliver_typed(session, persistence, &events, &cancel, &mut progress)
+                    .await?
+                {
+                    continue;
+                }
                 if !checked
                     && let Some(line) = self.review.as_ref().and_then(|review| review.unchecked())
                 {
@@ -2494,6 +2512,12 @@ impl Agent {
                             }
                             continue;
                         }
+                    }
+                    if self
+                        .deliver_typed(session, persistence, &events, &cancel, &mut progress)
+                        .await?
+                    {
+                        continue;
                     }
                 }
                 session.state = State::Completed;
@@ -2626,13 +2650,8 @@ impl Agent {
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
             // Text typed meanwhile is due now: the reply is done (`!` wakes at once).
-            let texts: Vec<String> = self
-                .steer
-                .iter()
-                .filter_map(|source| source.take())
-                .collect();
-            if !texts.is_empty() {
-                break Some(texts.join("\n"));
+            if let Some(text) = self.typed_meanwhile() {
+                break Some(text);
             }
         };
         emit(events, cancel, Event::Activity("思考中".into())).await?;
@@ -2672,6 +2691,41 @@ impl Agent {
     /// task, if any), with the warning when one is due; a stall is confirmed against the
     /// work tree, then put to the user when there is one. `true` when the task should stop.
     #[allow(clippy::too_many_arguments)]
+    /// What the user typed meanwhile, from every steering source.
+    fn typed_meanwhile(&self) -> Option<String> {
+        let texts: Vec<String> = self
+            .steer
+            .iter()
+            .filter_map(|source| source.take())
+            .collect();
+        (!texts.is_empty()).then(|| texts.join("\n"))
+    }
+
+    /// Hands text typed during the end-of-task checks to this task instead of leaving it
+    /// to become the next one (0067); true when there was some.
+    async fn deliver_typed(
+        &self,
+        session: &mut Session,
+        persistence: &dyn SessionPersistence,
+        events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
+        progress: &mut Progress,
+    ) -> Result<bool> {
+        let Some(text) = self.typed_meanwhile() else {
+            return Ok(false);
+        };
+        progress.user_input();
+        session.messages.push(Message::steer(text));
+        persistence.save(session)?;
+        emit(
+            events,
+            cancel,
+            Event::Notice("[steer] 收尾检查期间收到你的输入，在这一轮接着处理".into()),
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn settle_round(
         &self,
         session: &mut Session,
