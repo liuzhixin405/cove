@@ -804,7 +804,7 @@ pub fn load(path: &Path) -> Result<Vec<PolicyRule>> {
 }
 
 /// Remembered exact command lines kept in a policy file: almost all of them are
-/// one-off scripts (2% recurred in the history behind docs/optimizations/0011).
+/// one-off scripts (about 2% of them ever recurred).
 pub const EXACT_RULES: usize = 100;
 
 /// Adds `rule`, or moves the one with the same ID and scope to the end as the

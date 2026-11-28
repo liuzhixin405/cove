@@ -228,7 +228,7 @@ fn classify(key: &str, value: &Value, root: &Map<String, Value>) -> Class {
             }
             _ => Class::Sensitive,
         },
-        // A command or program cove runs (0053); turning the check off is safe.
+        // A command or program cove runs; turning the check off is safe.
         "overlay_check" => match value {
             Value::Null => Class::Safe,
             Value::String(text) if text.trim().is_empty() => Class::Safe,
@@ -437,7 +437,7 @@ mod tests {
         };
         assert_eq!(class("review_commands", json!(["bash x.sh"])), "sensitive");
         assert_eq!(class("review_commands", json!([])), "safe");
-        // Overlay plans (0053): a check command or a merge program runs only when trusted.
+        // Overlay plans: a check command or a merge program runs only when trusted.
         assert_eq!(class("overlay_check", json!("cargo check")), "sensitive");
         assert_eq!(class("overlay_check", json!("")), "safe");
         assert_eq!(

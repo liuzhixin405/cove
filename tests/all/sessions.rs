@@ -752,7 +752,7 @@ async fn continue_in_a_new_session_goes_back_to_the_last_task_and_shows_it() {
     assert!(!stderr.contains("这一轮没做完"), "{stderr}");
 }
 
-/// A resumed session says which turn "继续" picks up (0063).
+/// A resumed session says which turn "继续" picks up.
 #[tokio::test]
 async fn resuming_an_unfinished_session_marks_the_unfinished_turn() {
     let root = tempfile::tempdir().unwrap();

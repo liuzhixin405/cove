@@ -186,7 +186,7 @@ impl PathPattern {
     }
 }
 
-/// What an overlay stack changes for a search (docs/optimizations/0053): the disk
+/// What an overlay stack changes for a search: the disk
 /// entries of `hidden` do not count, and `files` are searched in memory instead.
 #[derive(Default)]
 pub struct Shadow {

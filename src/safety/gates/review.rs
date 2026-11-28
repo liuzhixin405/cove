@@ -1,5 +1,5 @@
 //! Reviews of a change, at two points, by one reviewer per point
-//! (docs/optimizations/0021, 0028):
+//!:
 //! - at the end of a task, after the automatic verification passed: the project's
 //!   review command (`review_commands`), up to `review_max_rounds` rounds, or else
 //!   the built-in self-review (`done_self_review`, off by default) once;
@@ -305,7 +305,7 @@ fn clipped_diff(diff: &str) -> String {
     )
 }
 
-/// Self-review of a task's diff; `callers` is the change impact's list (0031).
+/// Self-review of a task's diff; `callers` is the change impact's list.
 pub fn task(request: &str, diff: &str, callers: Option<&str>) -> String {
     let request = crate::text::clip_chars(request.trim(), MAX_REQUEST);
     let mut text = format!(
@@ -409,7 +409,7 @@ pub enum ReviewStep {
     /// The review is over for this task: the line for the user.
     Concluded(String),
     /// Send `message` to the model and go on; `digest` identifies the findings, so a
-    /// round that brings different ones counts as progress (0032).
+    /// round that brings different ones counts as progress.
     HandBack { message: String, digest: String },
 }
 
@@ -736,7 +736,7 @@ impl TurnHook for DoneReview {
     }
 }
 
-/// Refuses `write`/`edit` of the files the project review runs (0028 P8); shell
+/// Refuses `write`/`edit` of the files the project review runs; shell
 /// changes are caught when the next review finds the files changed.
 pub struct ReviewGuard(pub Arc<CommandReview>);
 
@@ -817,7 +817,7 @@ mod tests {
             assert!(prompt.contains("quote the rule"), "{prompt}");
             assert!(prompt.contains(NO_ISSUES), "{prompt}");
             assert!(prompt.contains("[SEVERITY] file:line"), "{prompt}");
-            // The user's preferences are working style, never a finding (0030).
+            // The user's preferences are working style, never a finding.
             assert!(
                 prompt.contains("\"User preferences\" section is how the user likes to work"),
                 "{prompt}"

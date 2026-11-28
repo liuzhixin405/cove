@@ -16,7 +16,7 @@ pub struct TaskStats {
     /// cove stopped the run for lack of progress.
     pub stalled: bool,
     /// The run sent the project context the session recorded in an earlier process,
-    /// not this process's different one (0036).
+    /// not this process's different one.
     pub system_reused: bool,
 }
 
@@ -40,7 +40,7 @@ pub trait TurnHook: Send + Sync {
         None
     }
 
-    /// A shell command that went on in the background has ended (docs/optimizations/0050);
+    /// A shell command that went on in the background has ended;
     /// `output` reads like the result of a `shell` call that ran it to the end.
     fn background_finished(&self, _command: &str, _output: &ToolOutput) {}
 

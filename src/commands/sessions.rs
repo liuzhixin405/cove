@@ -1016,7 +1016,7 @@ pub(crate) fn show_conversation(store: &Store, session: &Session) -> Result<()> 
     } else {
         turns(records.len())
     };
-    // Which turn "继续" picks up must be visible, not inferred (0063).
+    // Which turn "继续" picks up must be visible, not inferred.
     if session.unfinished() {
         text.push_str("（这一轮没做完：输入“继续”接着做；要做别的事，先用 /new 开新会话）\n");
     }

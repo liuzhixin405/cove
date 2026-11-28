@@ -1,4 +1,4 @@
-//! Write sets of plan items (docs/optimizations/0054): the files a `todo` item may change.
+//! Write sets of plan items: the files a `todo` item may change.
 //!
 //! An entry is a workspace-relative path or glob, optionally with a `::symbol` suffix that
 //! is shown to the model but not enforced: enforcement is per file. `execute_plan` rejects
@@ -363,7 +363,7 @@ pub fn overlaps(units: &[Unit], root: &Path) -> Vec<Overlap> {
         .collect()
 }
 
-/// A dependency the overlay schedule adds (0053): `later` builds on `earlier`'s layer
+/// A dependency the overlay schedule adds: `later` builds on `earlier`'s layer
 /// because both write `files` and the files are not split between them by `::symbol`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Implicit {

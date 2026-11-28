@@ -122,7 +122,7 @@ impl Plugins {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // A tool directory parked here is not broken: say how to silence it (0063).
+            // A tool directory parked here is not broken: say how to silence it.
             if !has_manifest(&dir) {
                 plugins.warnings.push(format!(
                     "{dir_name} 不是 cove 插件（没有 manifest.json 或 .claude-plugin/plugin.json），已跳过；不想看到这条提示，就把它移出 plugins 目录，或把目录名改成以 .disabled 结尾"

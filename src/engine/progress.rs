@@ -1,8 +1,8 @@
-//! Whether a task is getting anywhere (docs/optimizations/0032).
+//! Whether a task is getting anywhere.
 //!
 //! Counted per round: one model reply with all its tool calls and results, a text-only
 //! reply sent back by a finish nudge, a failed automatic verification, or review
-//! findings handed back (0028). A round makes progress when it brings a file change, a
+//! findings handed back. A round makes progress when it brings a file change, a
 //! result or an error not seen before in this run, a different verification result,
 //! different review findings, or the user's words. Refused calls (guardrail,
 //! loop detection, plan mode, deny rules, the user) and bookkeeping tools never do.
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn reading_different_images_is_progress() {
-        // C5: thirteen screenshots whose results differ only in numbers.
+        // Thirteen screenshots whose results differ only in numbers.
         let mut progress = Progress::new(STALL_ROUNDS);
         let verdicts = run(
             &mut progress,
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn refused_calls_never_progress() {
-        // C3: every edit refused by the guardrail.
+        // Every edit refused by the guardrail.
         let mut progress = Progress::new(STALL_ROUNDS);
         let verdicts = run(
             &mut progress,
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn new_review_findings_are_progress() {
-        // A review round that hands back different findings is not an idle round (0028).
+        // A review round that hands back different findings is not an idle round.
         let mut progress = Progress::new(STALL_ROUNDS);
         assert_eq!(progress.review("project:{(High, a.py)}"), Verdict::Progress);
         assert_eq!(progress.review("project:{(High, b.py)}"), Verdict::Progress);

@@ -101,7 +101,7 @@ pub fn may_rewrite_sources(command: &str, dialect: Dialect) -> bool {
 
 /// The first command of `command` that installs packages, generates code, migrates a
 /// database or formats/autofixes files, as written: a step that changes files no single
-/// plan item owns (docs/optimizations/0054). `None` when there is none; commands it does
+/// plan item owns. `None` when there is none; commands it does
 /// not know are not judged (their changes are caught after the fact).
 pub fn generates_files(command: &str, dialect: Dialect) -> Option<String> {
     let line = shell::parse(&shell::normalize_dashes(command), dialect);
@@ -1817,7 +1817,7 @@ pub fn line_group(command: &str, dialect: Dialect) -> Option<&'static Group> {
         .then_some(group)
 }
 
-/// The paths of a line that only deletes files named literally (docs/optimizations/0034):
+/// The paths of a line that only deletes files named literally:
 /// POSIX `rm`/`unlink`, PowerShell `Remove-Item`/`del`/`rm`, joined by `&&` or `;`, and
 /// possibly read-only commands around them (`rm a && ls`). `None` for anything else:
 /// recursion, other options, globs, variables, `~`, command substitution, redirects, a
@@ -1958,7 +1958,7 @@ fn powershell_deletes(name: &str, args: &[Word]) -> Option<Vec<String>> {
     path.map(|path| vec![path])
 }
 
-/// The files a line runs as code (docs/optimizations/0038), as written: the script of an
+/// The files a line runs as code, as written: the script of an
 /// interpreter (`python x.py`, `node a.js`, `bash s.sh`, `pwsh -File a.ps1`, `cmd /c
 /// x.bat`, `source s.sh`), a program named by a path (`./s.sh`, `.\x.ps1`), also inside
 /// `bash -c`/`cmd /c`/`pwsh -Command` text. A relative file follows a literal `cd`

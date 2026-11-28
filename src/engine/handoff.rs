@@ -1,4 +1,4 @@
-//! Handing a conversation over to a new session (`/handoff`, docs/optimizations/0026):
+//! Handing a conversation over to a new session (`/handoff`):
 //! the model writes a handoff note on the conversation's own prefix, so the request
 //! reads the prompt cache, and cove adds the facts it recorded itself (changed files,
 //! git commands, uncommitted changes), which do not depend on the model.

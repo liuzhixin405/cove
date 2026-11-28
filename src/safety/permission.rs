@@ -108,7 +108,7 @@ fn inside(roots: &[PathBuf], path: &Path) -> bool {
 
 tokio::task_local! {
     /// The shell command whose deletions the snapshot just taken before it can undo
-    /// (docs/optimizations/0034); set by the snapshot wrapper around that one call.
+    ///; set by the snapshot wrapper around that one call.
     static UNDOABLE: String;
 }
 
@@ -128,7 +128,7 @@ fn deletion_undoable(command: &str) -> bool {
 }
 
 /// The files the current task's file tools changed, and where the shell call being
-/// authorized runs (docs/optimizations/0038).
+/// authorized runs.
 struct Written {
     /// The shell's starting directory: relative files of the command resolve here.
     cwd: PathBuf,
@@ -218,8 +218,8 @@ fn runs_written(command: &str, dialect: Dialect) -> bool {
 pub const SCRIPT_HINT: &str = "本任务里已有操作被拒绝，运行本任务新建或修改的脚本、python -c 这类内联代码同样需要批准，不要用脚本绕过，也不要用内联代码绕过";
 
 /// Why a call the mode would allow asks: `refused` (something this task was refused)
-/// and it runs a script the task's file tools wrote (docs/optimizations/0038), or, in
-/// `auto`, code written out on the line (docs/optimizations/0043).
+/// and it runs a script the task's file tools wrote, or, in
+/// `auto`, code written out on the line.
 fn script_after_refusal(mode: Mode, effect: &Effect, refused: bool, dialect: Dialect) -> bool {
     let Effect::Shell(command) = effect else {
         return false;
@@ -256,7 +256,7 @@ pub fn mode_default(
             Decision::Allow
         }
         // Code written out on the line runs like a script would; after a refusal
-        // `script_after_refusal` asks first (docs/optimizations/0043).
+        // `script_after_refusal` asks first.
         (Mode::Auto, Effect::Shell(command)) if risk::inline_only(command, dialect) => {
             Decision::Allow
         }
@@ -312,7 +312,7 @@ pub struct Permissions {
     /// One question at a time: a new one would withdraw the one being answered.
     asking: tokio::sync::Mutex<()>,
     /// Something this task was refused (no terminal to ask, or the user said no):
-    /// running a script the task wrote asks too (docs/optimizations/0038).
+    /// running a script the task wrote asks too.
     refused: std::sync::atomic::AtomicBool,
 }
 
@@ -1335,7 +1335,7 @@ mod tests {
         assert!(permissions.exit_plan(PlanOrigin::Model).is_err());
     }
 
-    /// docs/optimizations/0043: inline code is in the command line like a script's text.
+    /// Inline code is in the command line like a script's text.
     #[test]
     fn inline_code_runs_in_auto_until_something_is_refused() {
         let d = |mode, refused, command: &str, dialect| {

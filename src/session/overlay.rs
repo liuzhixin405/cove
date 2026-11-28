@@ -1,4 +1,4 @@
-//! Overlay workspaces (docs/optimizations/0053): a sub-task's file changes kept in a
+//! Overlay workspaces: a sub-task's file changes kept in a
 //! private layer instead of the main workspace, so several sub-tasks can change the same
 //! files in parallel and be merged afterwards.
 //!

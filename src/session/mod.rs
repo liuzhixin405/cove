@@ -195,7 +195,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_model: Option<String>,
     /// When (Unix seconds) the latest request of a task was sent: whether its prompt
-    /// cache may still be alive, so a compaction can continue on it (0035).
+    /// cache may still be alive, so a compaction can continue on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_request_at: Option<u64>,
     /// The session this one was handed over from (`/handoff`); `/back` returns there.
@@ -204,12 +204,12 @@ pub struct Session {
     /// The session the latest `/handoff` from this one opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_to: Option<String>,
-    /// The cove builds that ran tasks in this session (0033), in the order first
+    /// The cove builds that ran tasks in this session, in the order first
     /// seen, without repeats, the latest `MAX_BUILDS`; empty in older sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builds: Vec<String>,
     /// The project context (`prompt::system_context`) this session's requests carry
-    /// (0036): recorded with the first task, kept across processes so a resumed
+    ///: recorded with the first task, kept across processes so a resumed
     /// conversation keeps its prompt cache, renewed by compaction. Journal records
     /// leave it out; a change is saved as a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,7 +277,7 @@ impl Session {
         }
     }
 
-    /// Records that `build` ran a task here (0033).
+    /// Records that `build` ran a task here.
     pub fn note_build(&mut self, build: &str) {
         if self.builds.iter().any(|known| known == build) {
             return;

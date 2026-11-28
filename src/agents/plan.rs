@@ -8,12 +8,12 @@
 //! are skipped. Concurrent items never write the same file at once (`Claims`), except in
 //! overlay plans: there each item writes its own layer and the merge settles overlaps.
 //!
-//! An item may declare `writes` (and `estimate_minutes`; 0054). A parallel plan whose
+//! An item may declare `writes` (and `estimate_minutes`). A parallel plan whose
 //! independent items declare overlapping writes is rejected before anything runs, and a
 //! declaring item's tools keep it to its writes (`agents::writes::ItemScope`); its result
 //! lists the files it wrote and anything outside its writes.
 //!
-//! `isolation: "overlay"` (0053, `agents::overlay_plan`) runs every item in a private
+//! `isolation: "overlay"` (`agents::overlay_plan`) runs every item in a private
 //! overlay layer and merges the layers into the workspace after all items end.
 
 use std::{
@@ -91,7 +91,7 @@ pub struct PlanItem {
     pub status: String,
     pub depends: Vec<String>,
     /// Declared write set (`writes` or the `writes:` content prefix), as written; empty
-    /// when none was declared. [`PlanItem::write_set`] compiles it (0054).
+    /// when none was declared. [`PlanItem::write_set`] compiles it.
     pub writes: Vec<String>,
     /// The model's estimate for the item (`estimate_minutes`).
     pub estimate_minutes: Option<u32>,
@@ -254,9 +254,9 @@ pub struct PlanTask {
     pub prompt: String,
     pub depends: Vec<String>,
     pub agent_type: AgentType,
-    /// The only files the item may write; `None` leaves it unconstrained (0054).
+    /// The only files the item may write; `None` leaves it unconstrained.
     pub writes: Option<WriteSet>,
-    /// The layers the item works in (overlay plans, 0053); `None`: the main workspace.
+    /// The layers the item works in (overlay plans); `None`: the main workspace.
     pub overlay: Option<Arc<OverlayStack>>,
     /// Runs just before the item starts (its dependencies done); an `Err` keeps it from
     /// running.
@@ -738,7 +738,7 @@ struct ExecuteArgs {
     max_agents: Option<u64>,
     #[serde(default, alias = "agent_type")]
     r#type: Option<String>,
-    /// `main` (default) or `overlay` (0053).
+    /// `main` (default) or `overlay`.
     #[serde(default)]
     isolation: Option<String>,
 }

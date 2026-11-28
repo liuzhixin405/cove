@@ -1,4 +1,4 @@
-//! Which build of cove this is (0033). `BUILD` is `<version>+<source hash>`; the
+//! Which build of cove this is. `BUILD` is `<version>+<source hash>`; the
 //! hash comes from `build.rs` and changes with any file that decides runtime
 //! behaviour, so records written by different builds can be told apart even
 //! though the version number stays the same. Traces, acceptance reports and

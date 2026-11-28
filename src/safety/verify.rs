@@ -666,7 +666,7 @@ fn java_tests(root: &Path, changed: &[PathBuf]) -> Option<String> {
 /// The tree `git add --all` would stage now, built in a throwaway copy of the index: the
 /// project's own staging rules (ignores, `autocrlf`, attributes) and the contents of
 /// untracked files, so it equals the staged tree exactly when a commit holds the content
-/// the checks ran on (0068). `None` outside a Git work tree or when Git fails.
+/// the checks ran on. `None` outside a Git work tree or when Git fails.
 pub async fn work_tree_hash(root: &Path, cancel: &CancellationToken) -> Option<String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // A hash that takes longer only costs a reuse; it must not hold up the checks.
@@ -906,7 +906,7 @@ impl CommandVerifier {
 
     /// Runs the checks for a `git commit`, whatever the file-tool fingerprint says.
     /// `staged`: the staged tree; checks that passed on exactly that content, in this
-    /// task or an earlier one, are reused (0068).
+    /// task or an earlier one, are reused.
     pub async fn verify_commit(
         &self,
         paths: &[PathBuf],
@@ -956,7 +956,7 @@ impl CommandVerifier {
         let mut summary = String::new();
         let mut detail = String::new();
         let mut outcome = Outcome::Passed;
-        // What the checks run on, and what they judge (0068).
+        // What the checks run on, and what they judge.
         let before = match &self.evidence {
             Some(_) => work_tree_hash(&self.root, &cancel).await,
             None => None,

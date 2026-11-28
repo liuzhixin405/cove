@@ -1,4 +1,4 @@
-//! Plan estimates and their calibration (docs/optimizations/0054).
+//! Plan estimates and their calibration.
 //!
 //! Every `execute_plan` run whose finished items carry `estimate_minutes` leaves one
 //! record in `<data dir>/estimates.jsonl` ([`record_plan`]): the estimates of those items

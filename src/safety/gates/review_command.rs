@@ -1,4 +1,4 @@
-//! The project's own review command (`review_commands`, docs/optimizations/0028): run
+//! The project's own review command (`review_commands`): run
 //! it, read its findings from the output (JSON, `[HIGH]`-style markers or
 //! `NO_ISSUES`), and keep the model from passing it by editing the command.
 //!
@@ -109,7 +109,7 @@ impl Finding {
 }
 
 /// The blocking findings' identity across rounds: wording and line numbers change
-/// from round to round, the level and the file do not (0028 P4).
+/// from round to round, the level and the file do not.
 pub fn identity(findings: &[Finding]) -> BTreeSet<(Severity, Option<String>)> {
     findings
         .iter()

@@ -21,7 +21,7 @@ const BASE_WINDOW: usize = 128_000;
 const MAX_SCALE: f64 = 4.0;
 /// Recent context never masked, whatever the window: scaled with a 1M window it
 /// kept ~390K tokens of old output in every request (OpenCode keeps 40K, Gemini
-/// CLI 50K; docs/optimizations/0012).
+/// CLI 50K).
 const PROTECTED_TOKENS: usize = 50_000;
 /// Old tool output worth a history rewrite.
 const MIN_PRUNABLE_TOKENS: usize = 30_000;
@@ -275,7 +275,7 @@ impl OutputPolicy {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        // Full output of background shell commands: `shell/<session>/<id>.log` (0050).
+        // Full output of background shell commands: `shell/<session>/<id>.log`.
         let Ok(scopes) = std::fs::read_dir(dir.join("shell")) else {
             return;
         };

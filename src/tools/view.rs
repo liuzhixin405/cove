@@ -1,4 +1,4 @@
-//! Where the file tools read and write (docs/optimizations/0053): the disk, or an
+//! Where the file tools read and write: the disk, or an
 //! overlay stack whose top layer takes the writes. Paths are absolute and already
 //! resolved inside the workspace (`LocalTools::resolve`).
 

@@ -312,7 +312,7 @@ pub struct ToolScope {
     pub progress: Arc<Progress>,
     pub authorizer: Arc<dyn Authorizer>,
     pub readonly: bool,
-    /// An overlay item's layers (0053): its file tools read through them and write only
+    /// An overlay item's layers: its file tools read through them and write only
     /// into the top one; nothing reaches the disk or the checkpoint.
     pub overlay: Option<Arc<OverlayStack>>,
 }
@@ -587,10 +587,10 @@ pub struct ScopedTools {
     pub allowed: Vec<String>,
     pub regression: Option<Arc<Regression>>,
     pub claims: Option<(Arc<Claims>, String)>,
-    /// The declared writes of a plan item (0054): writes outside them and file-generating
+    /// The declared writes of a plan item: writes outside them and file-generating
     /// commands are refused, files its shell commands change outside them recorded.
     pub scope: Option<Arc<ItemScope>>,
-    /// The `check` tool of an overlay item while `overlay_check` is configured (0053).
+    /// The `check` tool of an overlay item while `overlay_check` is configured.
     pub check: Option<CheckRun>,
     /// An overlay item: its shell commands only read, so they are not compared around.
     pub overlay: bool,
@@ -902,7 +902,7 @@ pub struct RunOutcome {
     pub readonly: bool,
     /// The model(s) that answered.
     pub model: String,
-    /// `citations: N ok, M invalid` of a read-only run's evidence (0029).
+    /// `citations: N ok, M invalid` of a read-only run's evidence.
     pub citations: Option<String>,
     /// Cancellation or an uncertain effect, which must reach the parent's journal.
     pub fatal: Option<Error>,
@@ -1042,7 +1042,7 @@ pub struct SubAgentSettings {
     pub catalog: Arc<dyn ModelCatalog>,
     /// `explore_model`: explore on the fast model (default) or the main one.
     pub explore_fast: bool,
-    /// `overlay_check`: the compile check of overlay items' shared check slot (0053).
+    /// `overlay_check`: the compile check of overlay items' shared check slot.
     pub overlay_check: Option<String>,
     /// `mergiraf_path` (trusted config only), else `mergiraf` on PATH; `None`: no
     /// structural merge.
@@ -1064,7 +1064,7 @@ pub struct HubParts {
     pub permission: crate::safety::permission::Mode,
     /// Whether a terminal can answer queued background approvals.
     pub interactive: bool,
-    /// The terminal, for questions such as the overlay plan confirmation (0053).
+    /// The terminal, for questions such as the overlay plan confirmation.
     pub input: Option<Arc<dyn UserInput>>,
 }
 
@@ -1120,7 +1120,7 @@ pub struct RunRequest {
     pub claims: Option<(Arc<Claims>, String)>,
     /// The write constraint of a plan item that declared writes.
     pub scope: Option<Arc<ItemScope>>,
-    /// The layers of an overlay plan item (0053).
+    /// The layers of an overlay plan item.
     pub overlay: Option<Arc<OverlayStack>>,
 }
 
@@ -1466,7 +1466,7 @@ impl AgentHub {
                 agent.run_detached_events(request.prompt.clone(), cancel, events),
             )
             .await;
-        // Its background shell commands end with it; the parent hears which (0050, 0051).
+        // Its background shell commands end with it; the parent hears which.
         let stopped = match tools.jobs() {
             Some(jobs) => jobs.close("stopped: the sub-agent ended").await,
             None => Vec::new(),

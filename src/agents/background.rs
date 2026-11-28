@@ -96,7 +96,7 @@ pub struct BackgroundAuthorizer {
     pub root: std::path::PathBuf,
     pub queue: Arc<ApprovalQueue>,
     pub agent: String,
-    /// Something this run was refused: scripts it wrote ask too (docs/optimizations/0038).
+    /// Something this run was refused: scripts it wrote ask too.
     pub refused: std::sync::atomic::AtomicBool,
 }
 
@@ -174,7 +174,7 @@ struct Notice {
     text: String,
     /// What the user gets while the model has not had it.
     user: String,
-    /// One line for the user once the model has the report (0056).
+    /// One line for the user once the model has the report.
     brief: String,
     user_seen: bool,
     model_seen: bool,
@@ -308,7 +308,7 @@ impl BackgroundState {
         (!text.is_empty()).then(|| text.join("\n\n"))
     }
 
-    /// The model already has the report: one line, not the report again (0056).
+    /// The model already has the report: one line, not the report again.
     fn for_user(&self) -> Vec<String> {
         self.notices.lock().map_or(Vec::new(), |mut notices| {
             notices
@@ -747,7 +747,7 @@ impl AgentHub {
                 agent.run_in(&mut session, prompt, &self.store, events, cancel),
             )
             .await;
-        // Its background shell commands end with it, as a sub-agent's do (0050, 0051).
+        // Its background shell commands end with it, as a sub-agent's do.
         let stopped = match crate::tools::ToolExecutor::jobs(tools.as_ref()) {
             Some(jobs) => jobs.close("stopped: the background agent ended").await,
             None => Vec::new(),
@@ -1348,7 +1348,7 @@ impl AgentHub {
     }
 
     /// The Alt+M panel's sub-agent rows: what is still going on, one Chinese row each;
-    /// finished ones fold into one count (`/status agents` keeps the full list) (0064).
+    /// finished ones fold into one count (`/status agents` keeps the full list).
     pub fn panel_lines(&self) -> Vec<String> {
         let records = self.records().unwrap_or_default();
         let mut items = Vec::new();
@@ -1472,7 +1472,7 @@ mod tests {
         assert!(headless.authorize(Effect::Read, cancel).await.is_ok());
     }
 
-    /// A report the model already has is one line for the user (0056).
+    /// A report the model already has is one line for the user.
     #[test]
     fn notices_show_the_user_one_line_once_the_model_has_the_report() {
         let notice = || Notice::new("model text".into(), "用户全文".into(), "一行".into());

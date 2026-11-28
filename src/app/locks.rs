@@ -104,7 +104,7 @@ impl LockWait for ToolLocks {
                 return;
             }
             // Our own background command holds it: it ends by itself, or the model or
-            // the user stops it; ending it from here would lose its result (0050).
+            // the user stops it; ending it from here would lose its result.
             if !ours.is_empty() {
                 let _ = print_text(
                     &format!(

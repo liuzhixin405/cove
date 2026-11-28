@@ -1,4 +1,4 @@
-//! Change impact (docs/optimizations/0031): the symbols a change removed or modified,
+//! Change impact: the symbols a change removed or modified,
 //! the other files that use them by name, and which of those callers no test file
 //! refers to. Local and deterministic: the `repo_map` index (regex definitions, the
 //! identifiers of each file), no model call. Name matching has false positives (two
@@ -962,7 +962,7 @@ impl Impact {
             .join("\n")
     }
 
-    /// The one notice for the model (0031 §3), when exposed callers exist.
+    /// The one notice for the model, when exposed callers exist.
     pub fn notice(&self) -> Option<String> {
         let exposed = self.exposed();
         if exposed.is_empty() {
@@ -1053,7 +1053,7 @@ pub struct UntestedCaller {
     pub symbol: String,
 }
 
-/// The change impact in the acceptance report (0031).
+/// The change impact in the acceptance report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactRecord {
     pub symbols: usize,
@@ -1672,7 +1672,7 @@ mod tests {
         assert_eq!(impact.callers.len(), 1);
     }
 
-    /// Known misses, written down so nobody takes them for supported (0031 P6).
+    /// Known misses, written down so nobody takes them for supported.
     #[test]
     fn csharp_properties_and_interface_members_are_not_symbols() {
         let symbols = changed_symbols(&change(

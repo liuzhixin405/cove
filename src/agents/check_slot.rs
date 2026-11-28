@@ -1,4 +1,4 @@
-//! The shared check slot of overlay plans (docs/optimizations/0053 §2): one persistent
+//! The shared check slot of overlay plans: one persistent
 //! copy of the project's source files under `<data dir>/check-slots/<project hash>/`, where
 //! `overlay_check` (a compile check such as `cargo check`) runs on the main workspace plus
 //! an overlay item's layers. Only one check runs at a time, in this process and across

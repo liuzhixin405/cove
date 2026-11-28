@@ -255,7 +255,7 @@ pub trait LockWait: Send + Sync {
 
 static LOCK_HANDLER: OnceLock<Arc<dyn LockWait>> = OnceLock::new();
 
-/// Commands of this process that run on in the background (0050): their own process
+/// Commands of this process that run on in the background: their own process
 /// id and a label, so a lock they hold is not mistaken for someone else's.
 static BACKGROUND: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
 
@@ -446,7 +446,7 @@ impl HeadTail {
     }
 }
 
-/// Full output held in memory before it goes to a file (docs/optimizations/0050).
+/// Full output held in memory before it goes to a file.
 const TAP_MEMORY: usize = 256 * 1024;
 /// Combined output kept for `shell_task output` and completion notices.
 const TAP_TAIL: usize = 16 * 1024;
@@ -918,7 +918,7 @@ pub async fn run_shell(
 }
 
 /// `run_shell` with owned arguments, so the run can be spawned and outlive the call
-/// that started it, copying its output to `tap` (background shell commands, 0050).
+/// that started it, copying its output to `tap` (background shell commands).
 pub async fn run_tapped(
     shell: Shell,
     cwd: std::path::PathBuf,
@@ -1130,7 +1130,7 @@ async fn run(
     let mut cancelled = false;
     let mut timed_out = false;
     let started = Instant::now();
-    // `Duration::MAX`: no total limit (a server started in the background, 0051).
+    // `Duration::MAX`: no total limit (a server started in the background).
     let deadline = tokio::time::Instant::now().checked_add(limit.total);
     // Idle watching needs samples of the tree; where there are none only `total` applies.
     let mut idle = limit.idle.map(|idle| Watch::new(idle, started));
@@ -1194,7 +1194,7 @@ async fn run(
             Some(line) = lock.recv(), if !asked => {
                 asked = true;
                 // Waiting for another process's lock is neither work nor a hang: only
-                // the total limit applies from here (0050).
+                // the total limit applies from here.
                 idle = None;
                 if let Some(tap) = &tap {
                     tap.set_quiet(None);

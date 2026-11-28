@@ -57,11 +57,11 @@ const SHELL_TIMEOUT: u64 = 120;
 /// (unless a whitespace-tolerant match applied the edit, which the model should see).
 const SHORT_SNIPPET: usize = 400;
 /// Longest foreground wait a call may ask for; the command runs on in the background
-/// after it either way (docs/optimizations/0050).
+/// after it either way.
 const SHELL_MAX_TIMEOUT: u64 = 3600;
 /// Most overlay paths grep hands ripgrep as exclusions; more fall back to the built-in search.
 const RG_EXCLUDES: usize = 200;
-/// Why an overlay sub-task's shell refused a command (docs/optimizations/0053).
+/// Why an overlay sub-task's shell refused a command.
 pub const OVERLAY_SHELL_REFUSED: &str =
     "overlay sub-tasks cannot change files on disk; put steps that generate files after the merge";
 /// Appended to an overlay sub-task's shell results.
@@ -113,7 +113,7 @@ fn dialect_mismatch(shell: &Shell, output: &process::CommandOutput) -> Option<&'
         .map(|(_, why)| *why)
 }
 
-/// Whether an overlay sub-task may run `command` (docs/optimizations/0053): auto-approvable
+/// Whether an overlay sub-task may run `command`: auto-approvable
 /// and read-only, so no redirect into a file, file-changing or build command, network
 /// fetch, formatter or deletion; the overlay's changes would never see its effects.
 fn overlay_shell_allowed(command: &str) -> bool {
@@ -163,7 +163,7 @@ pub struct ToolOutput {
 
 pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
-    /// The shell commands these tools run in the background, if any (docs/optimizations/0050):
+    /// The shell commands these tools run in the background, if any:
     /// the task loop delivers their results and waits for them. Required, so a wrapper
     /// cannot hide them.
     fn jobs(&self) -> Option<Arc<jobs::Jobs>>;
@@ -194,7 +194,7 @@ pub struct LocalTools {
     shell: Shell,
     ripgrep: bool,
     jobs: Arc<jobs::Jobs>,
-    /// Where file tools read and write: the disk, or an overlay sub-task's layers (0053).
+    /// Where file tools read and write: the disk, or an overlay sub-task's layers.
     view: view::FileView,
 }
 
@@ -290,7 +290,7 @@ struct ShellArgs {
     #[serde(default)]
     #[allow(dead_code)]
     description: Option<String>,
-    /// Start in the background and return after a few seconds (0051).
+    /// Start in the background and return after a few seconds.
     #[serde(default)]
     run_in_background: bool,
 }
@@ -403,7 +403,7 @@ fn edited(
 }
 
 /// Applies an overlay `Edit` intent to `existing` exactly as the `edit` tool would (the
-/// merge replays intents with it, docs/optimizations/0053); the error says why it does
+/// merge replays intents with it); the error says why it does
 /// not apply (no match, several matches, encoding).
 pub fn replay_edit(
     existing: &[u8],
@@ -451,7 +451,7 @@ impl LocalTools {
         })
     }
 
-    /// The tools of an overlay sub-task (docs/optimizations/0053): `read`, `glob`, `grep`
+    /// The tools of an overlay sub-task: `read`, `glob`, `grep`
     /// and `repo_map` see `stack` (its layers above the main workspace), `write` and `edit`
     /// go only into its top layer and record intents there. Nothing reaches the disk or a
     /// checkpoint: the workspace is dropped, `stack.changed_paths()` lists the writes.
@@ -1068,7 +1068,7 @@ impl LocalTools {
                 }
                 let mut answers = Vec::new();
                 // The first question answered in the user's own words: later ones may no
-                // longer apply, so the user may skip them; the user decides, not the tool (0069).
+                // longer apply, so the user may skip them; the user decides, not the tool.
                 let mut own_words = None;
                 for index in 0..args.len() {
                     if cancel.is_cancelled() {
@@ -1151,7 +1151,7 @@ impl LocalTools {
             &self.shell
         };
         // Every command runs while it keeps working (output, CPU or I/O); `seconds` is
-        // how long this call waits before it goes on in the background (0050).
+        // how long this call waits before it goes on in the background.
         let (kind, wait) = if args.run_in_background {
             (jobs::Kind::Detached, jobs::DETACHED_WAIT)
         } else {
@@ -1596,7 +1596,7 @@ impl ToolExecutor for LocalTools {
             };
             let approval = self.authorizer.authorize(effect, cancel.clone());
             match (&call, &self.workspace) {
-                // After a refusal, a script this task's file tools wrote asks (0038).
+                // After a refusal, a script this task's file tools wrote asks.
                 (Call::Shell(_), Some(workspace)) => {
                     let changed = workspace.changed_paths().unwrap_or_default();
                     crate::safety::permission::with_written(

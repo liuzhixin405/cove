@@ -1,4 +1,4 @@
-//! `execute_plan {isolation: "overlay"}` (docs/optimizations/0053): every item works in a
+//! `execute_plan {isolation: "overlay"}`: every item works in a
 //! private overlay layer, nothing reaches the main workspace while items run, and the
 //! layers are merged into it afterwards, in dependency order, as one checkpoint.
 //!

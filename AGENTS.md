@@ -29,7 +29,7 @@
 
 ## 三、流程
 
-1. **先写优化文档，再改代码。** 写在 `docs/optimizations/NNNN-*.md`，按那里 README 的模板写，并加进索引；改完回填验证结果和状态。拿本机数据（`~/.cove` 下的会话、trace、账本）当证据时，先确认问题在当前版本上还存在：数据来自旧版本，之后可能已经修了（README 规则 3）。
+1. **先写优化文档，再改代码。** 写在本机的 `.local/optimizations/NNNN-*.md`（`.local/` 不进仓库），按那里 README 的模板写，并加进索引；改完回填验证结果和状态。改出了长期成立的设计结论（模块边界、关键取舍、为什么不那样做），同一次改动里写进 `docs/design.md` 第 11 节，按模块归类，不按时间。0001 到 0069 的原文在 tag `optimizations-archive` 里（`git show optimizations-archive:docs/optimizations/<文件名>`），本文和代码里的"出处"编号指的就是它们。拿本机数据（`~/.cove` 下的会话、trace、账本）当证据时，先确认问题在当前版本上还存在：数据来自旧版本，之后可能已经修了（README 规则 3）。
 2. **禁止 `cargo fmt`**：它会重排 120 多个无关文件。只格式化自己改过的文件：
    `rustfmt --edition 2024 --config max_width=100 --emit stdout < 文件 > 临时文件`，确认后再拷回。
    **文件列表要用自己改过的文件，不要用 `grep -l` 搜出来的列表**：搜出来的会带上没改过的文件，曾因此误格式化 `safety/permission/risk.rs`。

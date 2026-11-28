@@ -363,7 +363,7 @@ pub(crate) fn supported(path: &Path) -> bool {
 }
 
 /// The parsed source files of a workspace, shared with the change-impact list
-/// (`safety::impact`, 0031): same cache, same limits as `repo_map`.
+/// (`safety::impact`): same cache, same limits as `repo_map`.
 pub(crate) struct Index {
     files: Vec<File>,
     /// The scan stopped at [`MAX_FILES`] source files.
@@ -398,7 +398,7 @@ pub(crate) fn index(
 }
 
 /// `index`, parsing the files in `contents` (by workspace-relative path) from that content
-/// instead of the disk: an overlay's changed files (docs/optimizations/0053).
+/// instead of the disk: an overlay's changed files.
 fn index_with(
     files: impl Iterator<Item = (PathBuf, PathBuf)>,
     contents: &HashMap<PathBuf, Arc<Vec<u8>>>,

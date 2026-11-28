@@ -457,7 +457,7 @@ impl Mcp {
             return Err(Error::Tool("MCP server is disabled".into()));
         }
         // Not something the user can approve on the spot, so a plain tool failure: the
-        // model reads it and tells the user, and the turn finishes (0063).
+        // model reads it and tells the user, and the turn finishes.
         if !self.trusted {
             return Err(Error::Tool(
                 "项目未信任，MCP 服务器不会启动：先执行 /config trust，再 /restart（或启动时加 --trust-extensions）".into(),

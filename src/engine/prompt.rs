@@ -365,7 +365,7 @@ const CHANGE_NOTE_LIMIT: usize = 16 * 1024;
 /// The key of the user preferences among [`announced_parts`]; no file is named so.
 const PREFERENCES_PART: &str = "\0preferences";
 
-/// The parts of a [`system_context`] that steer what the model does (0036): the user
+/// The parts of a [`system_context`] that steer what the model does: the user
 /// preferences and each instruction file, as `(name, text)`. The environment line,
 /// outline and skills are left out: they only orient the model, and it can look them
 /// up again.
@@ -418,7 +418,7 @@ pub fn announced_mark(context: &str) -> String {
 /// What changed in the user preferences and instruction files from the project
 /// context a resumed session keeps (`saved`) to the current one: a note for the next
 /// task's message, as `/rules` announces added rules; `None` when neither changed (the
-/// environment, outline and skills are not compared, 0036).
+/// environment, outline and skills are not compared).
 pub fn context_changes(saved: &str, current: &str) -> Option<String> {
     let before = announced_parts(saved);
     let after = announced_parts(current);

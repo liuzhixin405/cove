@@ -1,4 +1,4 @@
-//! Merges one file of an overlay layer into the main workspace (0053 §4). The levels, in
+//! Merges one file of an overlay layer into the main workspace. The levels, in
 //! order: a direct write when only one side changed; a line-level three-way merge by
 //! `git merge-file`; when that conflicts, anchor replay of the layer's `edit` calls on the
 //! current content (the `edit` tool's own matching), kept only when the replayed change is

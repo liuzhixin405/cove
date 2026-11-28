@@ -68,7 +68,7 @@ pub struct Meter {
     pub window: u64,
     /// Where the automatic compaction starts.
     pub compact_at: u64,
-    /// From where `/handoff` is suggested (0: never, docs/optimizations/0026).
+    /// From where `/handoff` is suggested (0: never).
     pub handoff_at: u64,
     /// Tokens the session has used, input and output.
     pub session: u64,
@@ -863,10 +863,10 @@ struct State {
     activity: String,
     tokens: (u64, u64),
     /// The running task's input line and the main agent's latest `todo` plan
-    /// (rendered rows), for the Alt+M panel (0060).
+    /// (rendered rows), for the Alt+M panel.
     task: String,
     plan: Vec<String>,
-    /// Background shell commands still running (0050), shown while idle too.
+    /// Background shell commands still running, shown while idle too.
     background: usize,
     /// The spinner frame last drawn.
     frame: u64,
@@ -879,7 +879,7 @@ struct State {
     drawn: Option<usize>,
     /// The width the block was drawn at, and the display widths of its lines from
     /// its top down to the cursor (the last one up to the cursor): a terminal that
-    /// rewraps on resize moves the block's top, so `erase` counts again (0060).
+    /// rewraps on resize moves the block's top, so `erase` counts again.
     drawn_columns: usize,
     drawn_lines: Vec<usize>,
     /// Column after the last output character; output resumes there.
@@ -3009,7 +3009,7 @@ mod tests {
         meter.compact_at = 765_000;
         meter.context = 732_600;
         assert!(meter.row(None).unwrap().0.contains("76.5%"));
-        // Below the compaction hint, a large context suggests a handoff (0026).
+        // Below the compaction hint, a large context suggests a handoff.
         meter.handoff_at = 150_000;
         assert!(!meter.row(None).unwrap().0.contains("/handoff"));
         meter.context = 160_000;

@@ -1,6 +1,6 @@
 //! Shell commands that run on after their tool call returned: moved to the background
-//! at `timeout_seconds` (docs/optimizations/0050) or started there with
-//! `run_in_background` (0051). Each `LocalTools` owns one registry, so the main session
+//! at `timeout_seconds` or started there with
+//! `run_in_background`. Each `LocalTools` owns one registry, so the main session
 //! and every sub-agent have their own; dropping it ends every command it still holds.
 
 use std::{

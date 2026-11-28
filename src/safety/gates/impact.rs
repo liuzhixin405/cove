@@ -1,4 +1,4 @@
-//! The change impact at the end of a task (`change_impact`, 0031): when the model
+//! The change impact at the end of a task (`change_impact`): when the model
 //! finishes after file-tool edits, lists the changed symbols' callers in other files
 //! for the user, and once per task hands the untested callers of a removed or
 //! re-signed symbol to the model. Runs after the finish nudges and before the

@@ -453,7 +453,7 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
         },
         "write" | "todo" => vec![clip(output, 160)],
         // `[Qn] question\nAnswer: choice` per question: the answers are what the user
-        // wants to see confirmed, not the question again (0069).
+        // wants to see confirmed, not the question again.
         "question" | "ask_user" if output.contains("\nAnswer: ") => {
             let answers: Vec<&str> = output
                 .lines()
@@ -482,7 +482,7 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
 /// row, with the last lines when they were not streamed or the command failed.
 fn shell_summary(failed: bool, output: &str, streamed: bool) -> Vec<String> {
     let header = output.lines().next().unwrap_or_default();
-    // Still running in the background (0050, 0051): the output so far, then where it went.
+    // Still running in the background: the output so far, then where it went.
     if let Some(rest) = header.strip_prefix("[background #") {
         let id = rest.split(']').next().unwrap_or_default();
         let stdout = output
@@ -1177,7 +1177,7 @@ mod tests {
         assert_eq!(lines[1].0, format!("{CODE}efgh{RESET}"));
     }
 
-    /// Cells break at spaces and around CJK, not inside a word (0055 P2).
+    /// Cells break at spaces and around CJK, not inside a word.
     #[test]
     fn cells_wrap_between_words() {
         let texts = |lines: Vec<(String, usize)>| -> Vec<String> {

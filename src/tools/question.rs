@@ -91,7 +91,7 @@ impl QuestionArgs {
 
     /// Whether the user answered a question that offers options with words of their
     /// own instead of choosing: such a reply can change what the remaining questions
-    /// should be, so they are still asked but may be skipped (0069).
+    /// should be, so they are still asked but may be skipped.
     pub(super) fn own_words(&self, index: usize, raw: &str) -> bool {
         let question = &self.questions[index];
         let raw = raw.trim();

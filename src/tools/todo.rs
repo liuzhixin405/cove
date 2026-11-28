@@ -51,7 +51,7 @@ pub struct Todo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends: Vec<String>,
     /// Files (paths or globs, maybe `file::symbol`) the item may write; execute_plan
-    /// enforces them per file (docs/optimizations/0054).
+    /// enforces them per file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes: Vec<String>,
     /// Whole minutes; a decimal is rounded.

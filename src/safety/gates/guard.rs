@@ -245,7 +245,7 @@ fn file_tool_hint(command: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// Rules for rare kinds of shell work, given after the first such command instead
-/// of in every request's system prompt (0044).
+/// of in every request's system prompt.
 fn scenario_hint(command: &str) -> Option<(&'static str, &'static str)> {
     static PATTERNS: std::sync::OnceLock<[regex::Regex; 2]> = std::sync::OnceLock::new();
     let [download, piped_build] = PATTERNS.get_or_init(|| {

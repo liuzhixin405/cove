@@ -948,7 +948,7 @@ async fn steering_an_empty_wakeup_keeps_the_call_and_typed_text_still_interrupts
                 CancellationToken::new()
             ),
             async {
-                // A wake whose text was already delivered: the hung call goes on (0067).
+                // A wake whose text was already delivered: the hung call goes on.
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 steer.wake.notify_one();
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1599,7 +1599,7 @@ async fn a_stalled_task_asks_and_each_choice_does_what_it_says() {
     let Err(Error::Stopped(stopped)) = result else {
         panic!("{result:?}");
     };
-    // Each choice says what it did: 3, 2 and Enter (0046).
+    // Each choice says what it did: 3, 2 and Enter.
     for said in ["照原样继续", "换个思路再试", "停下并总结"] {
         assert!(
             notices.iter().any(|notice| notice.contains(said)),
@@ -1626,7 +1626,7 @@ async fn a_stalled_task_asks_and_each_choice_does_what_it_says() {
         "doubled: {}",
         questions[1]
     );
-    // Counted in those 4 rounds, not the 7 of the whole run (0046).
+    // Counted in those 4 rounds, not the 7 of the whole run.
     assert!(questions[1].contains("×4"), "{}", questions[1]);
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 16);

@@ -227,7 +227,7 @@ async fn exit_codes_distinguish_usage_errors_and_dump_prints_the_system_prompt()
     let (output, stdout, stderr) = run(command).await;
     assert!(output.status.success(), "{stderr}");
     assert!(stdout.starts_with("You are Cove") && stdout.contains("Project rule: use tabs."));
-    // No built-in text after the project context (0044): it ends with the outline.
+    // No built-in text after the project context: it ends with the outline.
     assert!(!stdout.contains("User-configured instructions"), "{stdout}");
     assert!(sessions(data.path()).is_empty());
     std::fs::write(
@@ -248,7 +248,7 @@ async fn preferences_reach_the_system_prompt_and_the_language_memory_moves_there
     let data = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join(".git")).unwrap();
     std::fs::write(root.path().join("AGENTS.md"), "README is generated.").unwrap();
-    // A global memory from before 0030: the language preference, and a machine fact.
+    // A global memory from before global preferences existed: the language preference, and a machine fact.
     let global = data.path().join("memory").join("global");
     std::fs::create_dir_all(&global).unwrap();
     let language = "0123456789abcdef0123456789abcdef";
@@ -925,7 +925,7 @@ async fn cd_and_restart_start_the_binary_again() {
     assert!(output.status.success() && stdout.contains(ids[0]));
 }
 
-/// `/restart` resumes by itself: only the restarted run says "下次在这里输入“继续”" (0063).
+/// `/restart` resumes by itself: only the restarted run says "下次在这里输入“继续”".
 #[tokio::test]
 async fn restart_does_not_tell_the_user_to_continue_next_time() {
     let root = tempfile::tempdir().unwrap();

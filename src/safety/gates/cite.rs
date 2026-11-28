@@ -1,4 +1,4 @@
-//! Citation check for answers that change no files (0027): the `path:line` references of
+//! Citation check for answers that change no files: the `path:line` references of
 //! the final reply are verified against the workspace without calling the model (the file
 //! exists, the line is in range, the symbols named next to it are near that line), and the
 //! model is asked once to correct what does not hold. Repository symbols that cannot be
@@ -1664,7 +1664,7 @@ mod tests {
         )
     }
 
-    /// The suspicious references that people confirmed correct (0027, problem 3),
+    /// The suspicious references that people confirmed correct,
     /// reduced to minimal samples: none may be reported.
     #[test]
     fn replayed_correct_references_pass() {
@@ -1717,7 +1717,7 @@ mod tests {
         );
     }
 
-    /// A reference said NOT to contain a symbol is not checked for that symbol (0055 P1);
+    /// A reference said NOT to contain a symbol is not checked for that symbol;
     /// the same reference stated positively still is.
     #[test]
     fn negated_references_are_not_checked_for_their_symbols() {
@@ -1756,7 +1756,7 @@ mod tests {
         assert!(found.needs_fix(), "{:?}", found.results);
     }
 
-    /// Another line reference next to a citation is not a symbol to look for (0057).
+    /// Another line reference next to a citation is not a symbol to look for.
     #[test]
     fn line_references_are_not_anchors() {
         let (_dir, root) = fixture();
@@ -1979,7 +1979,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_records_unread_and_nudges_missing_symbols() {
-        // Unread is recorded, not nudged (0027, the replay of the real sessions).
+        // Unread is recorded, not nudged: replaying real sessions showed nudging it misfires.
         let mut unread = gate(50);
         unread.start(false).await;
         assert_eq!(unread.finish(GOOD).await, None);
@@ -2010,7 +2010,7 @@ mod tests {
     }
 
     /// Replays the final answers of saved sessions through the check, without calling a
-    /// model (0027 "回放"); the workspaces are read as they are now:
+    /// model; the workspaces are read as they are now:
     /// `COVE_REPLAY=<sessions dir> cargo test --release --lib replay_sessions -- --ignored --nocapture`
     #[test]
     #[ignore]

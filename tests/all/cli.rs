@@ -1134,7 +1134,7 @@ async fn verification_gate_feeds_failures_back_until_checks_pass() {
     assert!(!output.status.success());
 }
 
-/// A project review command (0028): HIGH until `a.py` says "fixed", then NO_ISSUES.
+/// A project review command: HIGH until `a.py` says "fixed", then NO_ISSUES.
 /// It logs its round and whether cove's API key reached it.
 const REVIEW_SCRIPT: &str = "import os\nfixed = 'fixed' in open('a.py', encoding='utf-8').read()\nwith open('runs.log', 'a') as log:\n    log.write('%s %s key=%s\\n' % (os.environ.get('COVE_REVIEW_POINT'), os.environ.get('COVE_REVIEW_ROUND'), 'present' if os.environ.get('COVE_API_KEY') else 'absent'))\nif fixed:\n    print('NO_ISSUES')\nelse:\n    print('## Findings\\n\\n**[HIGH] Not fixed yet**: `a.py:1` the draft divides by zero\\n\\n## Previous review\\n\\n**[LOW] old**: done')\n";
 

@@ -177,7 +177,7 @@ async fn auto_mode_without_a_terminal_refuses_the_call_and_the_task_goes_on() {
     );
 }
 
-/// docs/optimizations/0038: a refused install is not run through a script the task writes.
+/// A refused install is not run through a script the task writes.
 #[tokio::test]
 async fn after_a_refusal_a_script_the_task_wrote_is_not_run_either() {
     let script = "open('ran.txt', 'w').write('ran')\n";
@@ -253,7 +253,7 @@ async fn after_a_refusal_a_script_the_task_wrote_is_not_run_either() {
 
 #[tokio::test]
 async fn inline_code_runs_in_auto_until_something_is_refused() {
-    // docs/optimizations/0043: `python -c` runs like a script the task wrote.
+    // `python -c` runs like a script the task wrote.
     let inline = format!(r#"{} -c "open('ran.txt', 'w').write('ran')""#, python());
     let sequence = |refuse_first: bool| {
         let mut responses = Vec::new();

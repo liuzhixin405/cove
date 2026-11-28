@@ -1717,7 +1717,7 @@ async fn compaction_and_older_sessions_use_the_current_project_context() {
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("AGENTS.md"), "Run the tests.").unwrap();
     let store = Store::open(data.path()).unwrap();
-    // Saved before 0036: a conversation, no recorded context.
+    // Saved before sessions recorded their context: a conversation, no recorded context.
     let mut old = session(root.path());
     long_history(&mut old);
     assert!(old.system_context.is_none());

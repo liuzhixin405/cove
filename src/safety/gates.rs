@@ -83,7 +83,7 @@ pub struct GateConfig {
     /// Local check of the code references in answers that change no files (default
     /// `auto` = on, interactive or not, for every provider).
     pub cite_check: Switch,
-    /// The callers of the changed symbols at the end of a task (0031, default `auto`).
+    /// The callers of the changed symbols at the end of a task (default `auto`).
     pub change_impact: Switch,
 }
 
@@ -176,7 +176,7 @@ struct EvidenceState {
 pub struct Evidence {
     state: Mutex<EvidenceState>,
     /// Checks that passed on a work tree's exact content, by Git tree hash; kept across
-    /// tasks, so content tested once is not tested again before a commit (0068).
+    /// tasks, so content tested once is not tested again before a commit.
     by_tree: Mutex<VecDeque<(String, HashSet<String>)>>,
 }
 
@@ -273,7 +273,7 @@ impl Evidence {
         self.with(|state| state.review.clone()).flatten()
     }
 
-    /// The change impact of this task (0031): the record for the acceptance report and
+    /// The change impact of this task: the record for the acceptance report and
     /// the caller list for the built-in reviewer.
     pub fn set_impact(&self, record: crate::safety::impact::ImpactRecord, callers: Option<String>) {
         self.with(|state| {
@@ -523,7 +523,7 @@ impl Assembly {
             instructions: instructions.clone(),
         };
         // One reviewer per review point: a project review command replaces both
-        // built-in reviews (0028).
+        // built-in reviews.
         let project = (!review_config.commands.is_empty()).then(|| {
             Arc::new(
                 review_command::CommandReview::new(

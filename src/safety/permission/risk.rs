@@ -4,7 +4,7 @@
 //! building, running project scripts, unknown tools with ordinary arguments) runs
 //! without asking; an empty list means the line may run. Code written out on the line
 //! (`python -c`, a quoted here-document) is its own reason, [`INLINE_CODE`], which
-//! `auto` lets run like a script (docs/optimizations/0043).
+//! `auto` lets run like a script.
 
 use super::{
     classify,

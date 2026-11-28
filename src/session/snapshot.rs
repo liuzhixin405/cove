@@ -39,7 +39,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a tool call waits for the snapshot before it; a slower one is skipped for that
 /// call (the staging finishes in the background, so the next one is fast again).
 /// Tests run many Git processes at once and assert on the snapshot, so they only bound
-/// it (0066).
+/// it.
 pub const SNAPSHOT_BUDGET: Duration = Duration::from_secs(if cfg!(test) { 120 } else { 10 });
 /// Slow snapshots after which automatic snapshots stop for the session.
 const SLOW_LIMIT: u32 = 2;
@@ -735,7 +735,7 @@ impl Snapshots {
     }
 
     /// The work tree's hash now, recording no snapshot: whether shell commands or
-    /// sub-agents changed files (docs/optimizations/0032). `None` when automatic
+    /// sub-agents changed files. `None` when automatic
     /// snapshots are off or warming up, or staging takes longer than `budget`; a slow
     /// staging then finishes in the background (it only refreshes the private index).
     pub async fn tree_now(self: &Arc<Self>, budget: Duration) -> Option<String> {
@@ -1039,7 +1039,7 @@ impl Snapshots {
     }
 
     /// Whether `command` only deletes files the latest snapshot holds, so `/undo`
-    /// brings each back (docs/optimizations/0034). Called right after the snapshot
+    /// brings each back. Called right after the snapshot
     /// before that command: every path must be a regular file in the work tree, outside
     /// `.git`, not left out of snapshots, and a regular file in the snapshot itself.
     pub async fn undoes_deletion(&self, command: &str) -> bool {
@@ -1445,7 +1445,7 @@ impl ToolExecutor for Snapshotting {
                 }
             }
             // A deletion the snapshot just taken can undo runs in `auto` without asking
-            // (docs/optimizations/0034); only this call's own snapshot vouches for it.
+            //; only this call's own snapshot vouches for it.
             let mut undoable = None;
             if taken
                 && name == "shell"

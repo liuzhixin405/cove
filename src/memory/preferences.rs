@@ -1,4 +1,4 @@
-//! Cross-project preferences (0030): extraction proposes them, the user confirms them.
+//! Cross-project preferences: extraction proposes them, the user confirms them.
 //!
 //! A proposal is recorded at once as a project rule (so it applies in this project
 //! whatever the user answers) and queued in `<data dir>/preferences.pending.json`; the
@@ -500,7 +500,7 @@ fn is_language_preference(title: &str) -> bool {
         && preference.iter().any(|word| title.contains(word))
 }
 
-/// The one-time move (0030) of the language preference from global memory into the
+/// The one-time move of the language preference from global memory into the
 /// preferences file: each matching entry is copied to `<data>/backups/0030-global-
 /// preferences/` first, then written as a preference, then deleted. Runs once per data
 /// directory (a `migrated` file in the backup directory marks it). Returns a notice

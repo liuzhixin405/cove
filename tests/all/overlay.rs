@@ -1,4 +1,4 @@
-//! Overlay sub-tasks (docs/optimizations/0053): file tools through an overlay stack, and
+//! Overlay sub-tasks: file tools through an overlay stack, and
 //! the shell limits that come with it.
 
 use std::{

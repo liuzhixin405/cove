@@ -144,9 +144,8 @@ cove -p "分析这段代码的问题" --permission plan          # 只读
 
 - [技术参考](docs/reference.md)：所有命令、配置项和行为细节
 - [扩展](docs/extensions.md)：MCP、技能、Hooks、插件
-- [架构设计](docs/design.md)：模块划分与实现原理
+- [架构设计](docs/design.md)：模块划分、实现原理和各模块的设计取舍
 - [性能说明](docs/performance.md)：提速机制与测量口径
-- [优化记录](docs/optimizations/README.md)：每次改动要解决什么、怎么验证的
 - [开发须知](AGENTS.md)：改代码前必读
 
 MIT License

@@ -143,7 +143,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
             .with_progress(progress.clone())
             .with_job_dir(store.root().join("tool-outputs").join("shell")),
     );
-    // The status row counts the session's background shell commands (0050).
+    // The status row counts the session's background shell commands.
     local.background_jobs().on_count(Arc::new(|running: usize| {
         if let Some(console) = crate::app::console::active() {
             console.set_background(running);
@@ -165,7 +165,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         authorizer.clone(),
     )?);
     // The user's preferences (`<data dir>/preferences.md`), moved there from global
-    // memory once (0030) before anything reads either.
+    // memory once before anything reads either.
     let preferences = crate::memory::preferences::Preferences::open(store.root());
     match crate::memory::preferences::migrate_language(store.root(), &memory, &preferences.file) {
         Ok(Some(notice)) => print_text(&notice, true)?,
@@ -517,7 +517,7 @@ impl Application {
             print_text(&notice, true)?;
         }
         let result = self.repl_lines(reader).await;
-        // `/restart` resumes the session by itself; "next time" would mislead (0063).
+        // `/restart` resumes the session by itself; "next time" would mislead.
         if self.session.has_conversation() && !crate::app::launch::restart_requested() {
             print_text(
                 &format!(
@@ -739,7 +739,7 @@ impl Application {
         self.announce_rules();
     }
 
-    /// One question about a proposed cross-project preference (0030): before the next
+    /// One question about a proposed cross-project preference: before the next
     /// line is read, at most one between two tasks and a few per run. Returns text
     /// typed at the question that was not an answer: the next line.
     async fn ask_preference(&self) -> Result<Option<String>> {
@@ -922,7 +922,7 @@ impl Application {
         })
         .and_then(|r| r);
         let mcp = self.tools.mcp.close(None, None).await;
-        // Background shell commands belong to the session (0050, 0051).
+        // Background shell commands belong to the session.
         self.stop_background("stopped: the session ended", "会话结束")
             .await;
         let save = self.store.flush(&self.session);
@@ -1280,7 +1280,7 @@ impl Application {
             self.session.checkpoints.push(checkpoint.clone());
             self.session.current_checkpoint = Some(checkpoint);
             self.store.save(&self.session)?;
-            // Refusals tighten scripts only within their task (0038).
+            // Refusals tighten scripts only within their task.
             self.permissions.begin_task();
         }
         let cancel = CancellationToken::new();
@@ -1353,7 +1353,7 @@ impl Application {
         tokens(messages) + text_tokens(&self.agent.system_prompt_for(&self.session)) + tools
     }
 
-    /// `/handoff [focus]` (docs/optimizations/0026): the model writes a handoff note on
+    /// `/handoff [focus]`: the model writes a handoff note on
     /// this conversation's prefix, cove adds the facts it recorded, and the work goes
     /// on in a new session that starts from them. This session stays as it is;
     /// `/back` returns to it. Workspace, tools and MCP servers stay as they are, so
@@ -1424,7 +1424,7 @@ impl Application {
         self.session.handoff_to = Some(next.id.clone());
         self.store.flush(&self.session)?;
         // The old session's background commands are not handed over: the new session
-        // would never hear of their ends (0050, 0051).
+        // would never hear of their ends.
         self.stop_background("stopped: the session was handed off", "交接到新会话")
             .await;
         self.workspace.activate(None)?;

@@ -1,4 +1,4 @@
-//! Build identity (0033): a hash of the inputs that decide runtime behaviour, so
+//! Build identity: a hash of the inputs that decide runtime behaviour, so
 //! traces, sessions and acceptance reports can tell one build of cove from another
 //! without git. `COVE_SOURCE` is the first 12 hex digits of a sha256 over every
 //! file under `src/`, `assets/` and `marketplace/` plus `Cargo.toml` and

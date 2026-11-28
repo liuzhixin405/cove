@@ -527,7 +527,7 @@ async fn go_mcp_servers_over_streamable_http_list_tools_in_description() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("--trust-extensions"));
 }
 
-/// Untrusted MCP is a failed tool result the model can explain, not the end of the turn (0063).
+/// Untrusted MCP is a failed tool result the model can explain, not the end of the turn.
 #[tokio::test]
 async fn untrusted_mcp_call_fails_the_call_and_the_turn_finishes() {
     let (root, data, home) = (

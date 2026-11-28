@@ -51,14 +51,14 @@ pub struct Report {
     /// The citation check of an answer that changed no files; absent when none ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citations: Option<super::cite::CitationStats>,
-    /// The end-of-task review (0028); absent when none ran.
+    /// The end-of-task review; absent when none ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewRecord>,
-    /// The change impact (0031): counts and the callers no test refers to; absent
+    /// The change impact: counts and the callers no test refers to; absent
     /// when it was not computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact: Option<crate::safety::impact::ImpactRecord>,
-    /// The cove build that wrote the report (0033); absent in older reports.
+    /// The cove build that wrote the report; absent in older reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
 }

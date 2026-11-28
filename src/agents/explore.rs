@@ -1,4 +1,4 @@
-//! What the parent gets back from a delegated investigation (0029): the model tier of a
+//! What the parent gets back from a delegated investigation: the model tier of a
 //! sub-agent type, a hard cap on the answer that lands in the parent's context, a
 //! mechanical check of the `path:line` evidence in it, and a one-time hint when the main
 //! task reads many files itself.
