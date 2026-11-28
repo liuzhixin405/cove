@@ -452,6 +452,21 @@ fn summary(name: &str, failed: bool, output: &str, streamed: bool) -> Vec<String
             None => vec![clip(output, 160)],
         },
         "write" | "todo" => vec![clip(output, 160)],
+        // `[Qn] question\nAnswer: choice` per question: the answers are what the user
+        // wants to see confirmed, not the question again (0069).
+        "question" | "ask_user" if output.contains("\nAnswer: ") => {
+            let answers: Vec<&str> = output
+                .lines()
+                .filter_map(|line| line.strip_prefix("Answer: "))
+                .collect();
+            vec![match answers.as_slice() {
+                [one] => clip(&format!("答：{one}"), 160),
+                many => clip(
+                    &format!("{} 个问题，答：{}", many.len(), many.join("；")),
+                    160,
+                ),
+            }]
+        }
         _ => {
             let rows = lines_of(output);
             match rows.len() {
@@ -1312,6 +1327,17 @@ mod tests {
                 false
             ),
             ["改了 2 处"]
+        );
+    }
+
+    #[test]
+    fn question_receipts_show_the_answers() {
+        let one = "[Q1] 接下来怎么走？\nAnswer: 3. 先修测试";
+        assert_eq!(summary("question", false, one, false), ["答：3. 先修测试"]);
+        let two = "[Q1] 先做哪个？\nAnswer: 先修测试\n\n[Q2] 要提交吗？\nAnswer: (no answer)\n\nThe user answered Q1 in their own words; read the later answers in its light, and treat (no answer) as skipped.";
+        assert_eq!(
+            summary("question", false, two, false),
+            ["2 个问题，答：先修测试；(no answer)"]
         );
     }
 

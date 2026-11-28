@@ -1067,21 +1067,31 @@ impl LocalTools {
                     return Ok(failed(err.to_string()));
                 }
                 let mut answers = Vec::new();
+                // The first question answered in the user's own words: later ones may no
+                // longer apply, so the user may skip them; the user decides, not the tool (0069).
+                let mut own_words = None;
                 for index in 0..args.len() {
                     if cancel.is_cancelled() {
                         return Err(Error::Cancelled);
                     }
-                    let raw = input.answer(args.prompt(index), cancel.clone()).await?;
-                    answers.push(args.answer(index, &raw));
-                    if args.own_words(index, &raw) && index + 1 < args.len() {
-                        answers.push(format!(
-                            "The user answered Q{} in their own words instead of choosing, so Q{}..Q{} were not asked. Act on that reply first; ask the remaining questions again only if they still apply.",
-                            index + 1,
-                            index + 2,
-                            args.len()
-                        ));
-                        break;
+                    let mut prompt = args.prompt(index);
+                    if own_words.is_some() {
+                        prompt.insert_str(
+                            0,
+                            "（上一题是你自己写的回答；这题不再适用可直接回车跳过）\n",
+                        );
                     }
+                    let raw = input.answer(prompt, cancel.clone()).await?;
+                    answers.push(args.answer(index, &raw));
+                    if own_words.is_none() && args.own_words(index, &raw) && index + 1 < args.len()
+                    {
+                        own_words = Some(index + 1);
+                    }
+                }
+                if let Some(number) = own_words {
+                    answers.push(format!(
+                        "The user answered Q{number} in their own words; read the later answers in its light, and treat (no answer) as skipped."
+                    ));
                 }
                 Ok(ToolOutput {
                     content: answers.join("\n\n"),
@@ -1513,7 +1523,7 @@ impl ToolExecutor for LocalTools {
         if self.user_input.is_some() {
             definitions.push(definition(
                 "question",
-                "Ask the user one or more questions when requirements need clarification or a choice. The task waits for the answer and continues. Options are shown numbered; the user answers by number(s) or with free text.",
+                "Ask the user one or more questions when requirements need clarification or a choice. The task waits for the answer and continues. Options are shown numbered; the user answers by number(s) or with free text. Put questions together only when they do not depend on each other's answers.",
                 json!({"questions":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{
                     "question":{"type":"string"},
                     "header":{"type":"string","description":"short topic label"},

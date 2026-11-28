@@ -82,7 +82,7 @@ impl QuestionArgs {
             out.push_str(if question.multiple {
                 "输入编号（可多选，如 1,3），或直接输入你的回答\n"
             } else {
-                "Answer with a number or your own text\n"
+                "输入编号，或直接输入你的回答\n"
             });
         }
         out.push_str("> ");
@@ -91,7 +91,7 @@ impl QuestionArgs {
 
     /// Whether the user answered a question that offers options with words of their
     /// own instead of choosing: such a reply can change what the remaining questions
-    /// should be, so they are not asked.
+    /// should be, so they are still asked but may be skipped (0069).
     pub(super) fn own_words(&self, index: usize, raw: &str) -> bool {
         let question = &self.questions[index];
         let raw = raw.trim();

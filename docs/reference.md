@@ -11,7 +11,7 @@ cove 是聚焦编码任务的终端 Agent，用 Rust 编写，项目名和可执
 - OpenAI Chat Completions 兼容协议、Anthropic Messages 协议的 SSE 流式调用。
 - 文件工具：`read` 读文件（默认 2000 行，可用 `offset`/`limit` 续读）或列目录，支持 GBK/GB18030；`write` 自动建父目录，覆盖前必须读过当前版本；`edit` 支持 `replace_all`、空白容错匹配和缩进映射；`grep`（有 ripgrep 时优先用 rg）和 `glob`（支持 `**`）。详见下文“文件、输出与失败语义”。
 - Shell 自动选择解释器：Windows 上优先 Git Bash，没有时用 PowerShell；工具描述和系统提示的环境行会写明实际方言。命令明显是给另一种已安装的 Shell 写的（PowerShell cmdlet、cmd 的 `%VAR%`、bash 循环）时改用那个 Shell 运行，审批也按同一方言判断。
-- `question` 交互式提问：一次可问多个问题，每个问题可带编号选项，按编号或自由文本回答（仅交互模式）；对带选项的问题用自己的话回答时，问卷就此结束，剩下的问题不会拿这段话去作答。
+- `question` 交互式提问：一次可问多个问题，每个问题可带编号选项，按编号或自由文本回答（仅交互模式）；对带选项的问题用自己的话回答后，剩下的问题照常提问，提示里注明“这题不再适用可直接回车跳过”，空回答记为跳过。任务等回答后接着做这一轮。回执显示答案（“答：…”，多个问题时是“N 个问题，答：…；…”）。
 - `todo` 任务计划清单：多步任务中维护待办项，支持 `priority`、`cancelled`、`id` 和 `depends` 依赖，以及给 `execute_plan` 用的 `writes`（写集合）和 `estimate_minutes`（预估分钟数），见“计划执行”；同一时间至多一项进行中。
 - 连续的只读工具调用（read/glob/grep/repo_map/web_fetch/web_search）并发执行（最多 8 个），结果顺序和日志顺序保持确定；写入和 Shell 仍逐个执行。
 - `repo_map` 仓库结构索引：列出源文件中的类型、函数和方法（签名和行号），按跨文件引用做 PageRank 排序；可按路径片段或标识符查询，并带出调用方和被调用方所在的文件。支持 Rust、Go、Python、TS/JS、C#、Java。解析结果按文件的修改时间和大小缓存，再次查询只解析变化的文件，未命中缓存的文件在多个线程上并行解析。

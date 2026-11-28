@@ -693,6 +693,56 @@ async fn question_accepts_numbers_or_free_text_and_todo_shows_the_plan() {
     );
 }
 
+/// Answers in order and keeps the prompts it was shown.
+struct Recorded {
+    answers: Mutex<VecDeque<&'static str>>,
+    prompts: Mutex<Vec<String>>,
+}
+
+impl UserInput for Recorded {
+    fn answer(&self, prompt: String, _: CancellationToken) -> BoxFuture<'_, Result<String>> {
+        self.prompts.lock().unwrap().push(prompt);
+        Box::pin(async move {
+            Ok(self
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or("")
+                .into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_answer_in_own_words_still_asks_the_rest_and_lets_them_be_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = Arc::new(Recorded {
+        answers: Mutex::new(VecDeque::from(["neither, fix the tests first", "", "1"])),
+        prompts: Mutex::new(Vec::new()),
+    });
+    let tools = tools(dir.path()).with_user_input(Some(input.clone() as Arc<dyn UserInput>));
+    let out = run(
+        &tools,
+        "question",
+        json!({"questions":[
+            {"question":"Which plan?","options":[{"label":"A"},{"label":"B"}]},
+            {"question":"Commit now?","options":[{"label":"yes"},{"label":"no"}]},
+            {"question":"Push?","options":[{"label":"yes"},{"label":"no"}]}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        out.content,
+        "[Q1] Which plan?\nAnswer: neither, fix the tests first\n\n[Q2] Commit now?\nAnswer: (no answer)\n\n[Q3] Push?\nAnswer: yes\n\nThe user answered Q1 in their own words; read the later answers in its light, and treat (no answer) as skipped."
+    );
+    let prompts = input.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(!prompts[0].contains("直接回车跳过"));
+    assert!(prompts[1].starts_with("（上一题是你自己写的回答"));
+    assert!(prompts[2].contains("直接回车跳过"));
+}
+
 /// Read-only tool that records how many calls run at once.
 struct SlowReads {
     active: AtomicUsize,
