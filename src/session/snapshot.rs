@@ -38,7 +38,9 @@ const AGE_SLACK: u64 = 3 * 24 * 3600;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a tool call waits for the snapshot before it; a slower one is skipped for that
 /// call (the staging finishes in the background, so the next one is fast again).
-pub const SNAPSHOT_BUDGET: Duration = Duration::from_secs(10);
+/// Tests run many Git processes at once and assert on the snapshot, so they only bound
+/// it (0066).
+pub const SNAPSHOT_BUDGET: Duration = Duration::from_secs(if cfg!(test) { 120 } else { 10 });
 /// Slow snapshots after which automatic snapshots stop for the session.
 const SLOW_LIMIT: u32 = 2;
 /// How long worked-out exclusions are reused (each costs two runs of the project's Git).
